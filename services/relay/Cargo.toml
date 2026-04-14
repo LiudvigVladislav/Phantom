@@ -1,0 +1,19 @@
+[package]
+name = "phantom-relay"
+version = "0.1.0"
+edition = "2021"
+description = "PHANTOM relay — ciphertext store-and-forward. Stores only encrypted blobs. Never inspects plaintext."
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
