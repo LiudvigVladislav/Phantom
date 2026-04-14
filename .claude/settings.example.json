@@ -1,0 +1,28 @@
+{
+  "env": {
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf 'Session start checklist:\n- Read docs/doctrine and ADRs\n- Stay within Alpha-0 scope\n- Prefer thin vertical slices\n'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf 'Before finishing, confirm:\n- tests added or updated\n- scope not expanded\n- docs updated if contracts changed\n'"
+          }
+        ]
+      }
+    ]
+  }
+}

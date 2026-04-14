@@ -1,0 +1,43 @@
+# Claude Code
+.claude/settings.local.json
+
+# Gradle / KMP
+.gradle/
+build/
+*.gradle.kts.bak
+local.properties
+*.iml
+.idea/
+
+# Android
+apps/android/local.properties
+*.apk
+*.aab
+
+# iOS
+apps/ios/Pods/
+apps/ios/*.xcworkspace
+apps/ios/DerivedData/
+*.ipa
+
+# Node / Next.js (prototype)
+node_modules/
+.next/
+prototype/web/.next/
+prototype/web/node_modules/
+prototype/web/out/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
