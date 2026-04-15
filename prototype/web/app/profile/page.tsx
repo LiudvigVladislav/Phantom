@@ -22,7 +22,7 @@ export default function ProfilePage() {
         <div
           className="flex flex-col items-center pt-10 pb-8 px-6"
           style={{
-            background: "linear-gradient(180deg, #13161D 0%, #0B0D12 100%)",
+            background: "linear-gradient(180deg, #0F1318 0%, #0B0D12 100%)",
             borderBottom: "1px solid rgba(255,255,255,0.06)",
           }}
         >
@@ -30,13 +30,13 @@ export default function ProfilePage() {
 
           <h2
             className="mt-4 font-bold"
-            style={{ color: "#F4F7FB", fontSize: "22px" }}
+            style={{ color: "#E8F4F8", fontSize: "22px" }}
           >
             Aria Chen
           </h2>
           <p
             className="mt-1 font-medium"
-            style={{ color: "#6C5CE7", fontSize: "14px" }}
+            style={{ color: "#00D4FF", fontSize: "14px" }}
           >
             @aria_chen
           </p>
@@ -64,17 +64,17 @@ export default function ProfilePage() {
           <div
             className="mt-4 px-3 py-2 rounded-lg flex items-center gap-2"
             style={{
-              background: "#1A1D27",
+              background: "#141820",
               border: "1px solid rgba(255,255,255,0.06)",
             }}
           >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8A8FA3" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#6B8A9A" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
               <line x1="12" y1="18" x2="12.01" y2="18" />
             </svg>
             <span
               className="font-mono"
-              style={{ color: "#8A8FA3", fontSize: "11px", letterSpacing: "0.08em" }}
+              style={{ color: "#6B8A9A", fontSize: "11px", letterSpacing: "0.08em" }}
             >
               Device · 3F:A2:09:EC:71:44
             </span>
@@ -86,17 +86,17 @@ export default function ProfilePage() {
           <div className="mb-3 flex items-center justify-between">
             <span
               className="font-medium tracking-widest uppercase"
-              style={{ color: "#8A8FA3", fontSize: "10px", letterSpacing: "0.14em" }}
+              style={{ color: "#6B8A9A", fontSize: "10px", letterSpacing: "0.14em" }}
             >
               Safety Number
             </span>
-            <span style={{ color: "#8A8FA3", fontSize: "11px" }}>What is this?</span>
+            <span style={{ color: "#6B8A9A", fontSize: "11px" }}>What is this?</span>
           </div>
 
           <div
             className="rounded-2xl p-4"
             style={{
-              background: "#13161D",
+              background: "#0F1318",
               border: "1px solid rgba(255,255,255,0.06)",
             }}
           >
@@ -106,13 +106,13 @@ export default function ProfilePage() {
                   key={i}
                   className="flex items-center justify-center py-2.5 rounded-lg"
                   style={{
-                    background: "#1A1D27",
+                    background: "#141820",
                     border: "1px solid rgba(255,255,255,0.04)",
                   }}
                 >
                   <span
                     className="font-mono font-medium tracking-widest"
-                    style={{ color: "#F4F7FB", fontSize: "13px", letterSpacing: "0.12em" }}
+                    style={{ color: "#E8F4F8", fontSize: "13px", letterSpacing: "0.12em" }}
                   >
                     {num}
                   </span>
@@ -122,7 +122,7 @@ export default function ProfilePage() {
 
             <p
               className="mt-3 text-center"
-              style={{ color: "#8A8FA3", fontSize: "11px", lineHeight: "1.5" }}
+              style={{ color: "#6B8A9A", fontSize: "11px", lineHeight: "1.5" }}
             >
               Read these aloud with Aria to confirm your conversation is secure.
             </p>
@@ -134,8 +134,8 @@ export default function ProfilePage() {
           <button
             className="w-full py-3.5 rounded-2xl font-semibold transition-opacity active:opacity-70"
             style={{
-              border: "1px solid rgba(108,92,231,0.4)",
-              color: "#6C5CE7",
+              border: "1px solid rgba(0,212,255,0.4)",
+              color: "#00D4FF",
               fontSize: "14px",
               background: "transparent",
             }}
@@ -151,7 +151,7 @@ export default function ProfilePage() {
           >
             <span
               className="font-medium tracking-widest uppercase"
-              style={{ color: "#8A8FA3", fontSize: "10px", letterSpacing: "0.14em" }}
+              style={{ color: "#6B8A9A", fontSize: "10px", letterSpacing: "0.14em" }}
             >
               Info
             </span>
@@ -169,12 +169,12 @@ export default function ProfilePage() {
                 key={row.label}
                 className="flex items-center justify-between px-4 py-3.5"
                 style={{
-                  background: "#13161D",
+                  background: "#0F1318",
                   borderBottom: i < arr.length - 1 ? "1px solid rgba(255,255,255,0.06)" : "none",
                 }}
               >
-                <span style={{ color: "#8A8FA3", fontSize: "13px" }}>{row.label}</span>
-                <span style={{ color: "#F4F7FB", fontSize: "13px", fontWeight: 500 }}>{row.value}</span>
+                <span style={{ color: "#6B8A9A", fontSize: "13px" }}>{row.label}</span>
+                <span style={{ color: "#E8F4F8", fontSize: "13px", fontWeight: 500 }}>{row.value}</span>
               </div>
             ))}
           </div>

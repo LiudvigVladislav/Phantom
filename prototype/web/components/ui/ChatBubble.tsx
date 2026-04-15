@@ -45,8 +45,8 @@ function StatusIcon({ status }: { status: MessageStatus }) {
   if (status === "read") {
     return (
       <svg width="16" height="14" viewBox="0 0 28 24" fill="none" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-        <polyline points="4 12 9 17 20 6" stroke="#a29bfe" />
-        <polyline points="12 12 17 17 28 6" stroke="#a29bfe" />
+        <polyline points="4 12 9 17 20 6" stroke="#80E8FF" />
+        <polyline points="12 12 17 17 28 6" stroke="#80E8FF" />
       </svg>
     );
   }
@@ -75,16 +75,16 @@ export default function ChatBubble({ text, sent, status, ephemeral = false, time
           minWidth: "80px",
           padding: "10px 14px 8px",
           borderRadius: sent ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
-          background: sent ? "#6C5CE7" : "#1A1D27",
+          background: sent ? "#00D4FF" : "#141820",
           boxShadow: sent
-            ? "0 4px 16px rgba(108,92,231,0.25)"
+            ? "0 4px 16px rgba(0,212,255,0.25)"
             : "0 2px 8px rgba(0,0,0,0.3)",
         }}
       >
         {ephemeral && (
           <div
             className="flex items-center gap-1 mb-1.5"
-            style={{ color: sent ? "rgba(255,255,255,0.7)" : "#8A8FA3", fontSize: "11px" }}
+            style={{ color: sent ? "rgba(255,255,255,0.7)" : "#6B8A9A", fontSize: "11px" }}
           >
             <EphemeralIcon />
             <span className="font-medium">Disappears in 1h</span>
@@ -94,7 +94,7 @@ export default function ChatBubble({ text, sent, status, ephemeral = false, time
         <span
           className="leading-relaxed"
           style={{
-            color: sent ? "#ffffff" : "#F4F7FB",
+            color: sent ? "#ffffff" : "#E8F4F8",
             fontSize: "14px",
             lineHeight: "1.5",
           }}
@@ -104,7 +104,7 @@ export default function ChatBubble({ text, sent, status, ephemeral = false, time
 
         <div
           className="flex items-center justify-end gap-1 mt-1"
-          style={{ color: sent ? "rgba(255,255,255,0.55)" : "#8A8FA3" }}
+          style={{ color: sent ? "rgba(255,255,255,0.55)" : "#6B8A9A" }}
         >
           {time && (
             <span style={{ fontSize: "11px" }}>{time}</span>

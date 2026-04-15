@@ -21,11 +21,11 @@ function getInitials(name: string): string {
 // Deterministic gradient selection based on name
 function getGradient(name: string): string {
   const gradients = [
-    "linear-gradient(135deg, #6C5CE7 0%, #a29bfe 100%)",
-    "linear-gradient(135deg, #4a3fa8 0%, #6C5CE7 100%)",
-    "linear-gradient(135deg, #5a4fd0 0%, #8b7cf8 100%)",
-    "linear-gradient(135deg, #3d3580 0%, #6C5CE7 100%)",
-    "linear-gradient(135deg, #6C5CE7 0%, #4834d4 100%)",
+    "linear-gradient(135deg, #00D4FF 0%, #80E8FF 100%)",
+    "linear-gradient(135deg, #007AA3 0%, #00D4FF 100%)",
+    "linear-gradient(135deg, #009EC2 0%, #66DBFF 100%)",
+    "linear-gradient(135deg, #005F82 0%, #00D4FF 100%)",
+    "linear-gradient(135deg, #00D4FF 0%, #0099CC 100%)",
   ];
   const idx = name.split("").reduce((acc, ch) => acc + ch.charCodeAt(0), 0) % gradients.length;
   return gradients[idx];

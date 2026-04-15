@@ -17,7 +17,11 @@ export default function PhoneFrame({ children, className = "" }: PhoneFrameProps
           maxWidth: "390px",
           minHeight: "100svh",
           background: "#0B0D12",
-          boxShadow: "0 0 0 1px rgba(255,255,255,0.06), 0 32px 80px rgba(0,0,0,0.7)",
+          boxShadow: [
+            "0 0 0 1px rgba(255,255,255,0.05)",
+            "0 32px 80px rgba(0,0,0,0.75)",
+            "0 20px 60px rgba(0,212,255,0.08)",
+          ].join(", "),
           borderRadius: "clamp(0px, (100vw - 390px) * 999, 40px)",
         }}
       >

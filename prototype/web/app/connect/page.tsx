@@ -24,7 +24,7 @@ export default function ConnectPage() {
               key={tab}
               className="pb-3 px-1 relative font-medium"
               style={{
-                color: i === 0 ? "#F4F7FB" : "#8A8FA3",
+                color: i === 0 ? "#E8F4F8" : "#6B8A9A",
                 fontSize: "13px",
               }}
             >
@@ -32,7 +32,7 @@ export default function ConnectPage() {
               {i === 0 && (
                 <span
                   className="absolute bottom-0 left-0 right-0 h-0.5 rounded-full"
-                  style={{ background: "#6C5CE7" }}
+                  style={{ background: "#00D4FF" }}
                 />
               )}
             </div>
@@ -47,10 +47,10 @@ export default function ConnectPage() {
             style={{
               width: 240,
               height: 240,
-              background: "#13161D",
+              background: "#0F1318",
               borderRadius: "20px",
               border: "1px solid rgba(255,255,255,0.06)",
-              boxShadow: "0 0 60px rgba(108,92,231,0.08)",
+              boxShadow: "0 0 60px rgba(0,212,255,0.08)",
             }}
           >
             {/* Corner bracket marks */}
@@ -66,7 +66,7 @@ export default function ConnectPage() {
                 height="28"
                 viewBox="0 0 28 28"
                 fill="none"
-                stroke="#6C5CE7"
+                stroke="#00D4FF"
                 strokeWidth="2.5"
                 strokeLinecap="round"
                 style={{
@@ -85,7 +85,7 @@ export default function ConnectPage() {
                 position: "absolute",
                 inset: 0,
                 borderRadius: "20px",
-                background: "radial-gradient(circle at center, rgba(108,92,231,0.06) 0%, transparent 70%)",
+                background: "radial-gradient(circle at center, rgba(0,212,255,0.06) 0%, transparent 70%)",
               }}
             />
 
@@ -96,18 +96,18 @@ export default function ConnectPage() {
                 style={{
                   width: 52,
                   height: 52,
-                  background: "rgba(108,92,231,0.15)",
-                  border: "1px solid rgba(108,92,231,0.4)",
+                  background: "rgba(0,212,255,0.15)",
+                  border: "1px solid rgba(0,212,255,0.4)",
                 }}
               >
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#6C5CE7" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#00D4FF" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                 </svg>
               </div>
 
               <span
                 className="font-bold tracking-widest"
-                style={{ color: "#F4F7FB", fontSize: "12px", letterSpacing: "0.2em" }}
+                style={{ color: "#E8F4F8", fontSize: "12px", letterSpacing: "0.2em" }}
               >
                 PHANTOM
               </span>
@@ -130,7 +130,7 @@ export default function ConnectPage() {
                         width: 7,
                         height: 7,
                         borderRadius: "1.5px",
-                        background: isFilled ? "#6C5CE7" : "rgba(108,92,231,0.12)",
+                        background: isFilled ? "#00D4FF" : "rgba(0,212,255,0.12)",
                         opacity: isFilled ? 0.85 : 0.3,
                       }}
                     />
@@ -144,12 +144,12 @@ export default function ConnectPage() {
           <div
             className="flex items-center gap-2 px-4 py-2.5 rounded-xl mb-6"
             style={{
-              background: "#13161D",
+              background: "#0F1318",
               border: "1px solid rgba(255,255,255,0.06)",
             }}
           >
-            <span style={{ color: "#8A8FA3", fontSize: "13px" }}>Your identity:</span>
-            <span className="font-semibold" style={{ color: "#6C5CE7", fontSize: "14px" }}>
+            <span style={{ color: "#6B8A9A", fontSize: "13px" }}>Your identity:</span>
+            <span className="font-semibold" style={{ color: "#00D4FF", fontSize: "14px" }}>
               @phantom_user
             </span>
           </div>
@@ -159,10 +159,10 @@ export default function ConnectPage() {
             <button
               className="w-full py-3.5 rounded-2xl font-semibold transition-opacity active:opacity-80"
               style={{
-                background: "#6C5CE7",
+                background: "#00D4FF",
                 color: "#ffffff",
                 fontSize: "14px",
-                boxShadow: "0 8px 32px rgba(108,92,231,0.4)",
+                boxShadow: "0 8px 32px rgba(0,212,255,0.4)",
               }}
             >
               Copy invite link
@@ -171,8 +171,8 @@ export default function ConnectPage() {
             <button
               className="w-full py-3.5 rounded-2xl font-semibold transition-opacity active:opacity-80 flex items-center justify-center gap-2"
               style={{
-                border: "1px solid rgba(108,92,231,0.35)",
-                color: "#6C5CE7",
+                border: "1px solid rgba(0,212,255,0.35)",
+                color: "#00D4FF",
                 fontSize: "14px",
                 background: "transparent",
               }}
@@ -188,7 +188,7 @@ export default function ConnectPage() {
               className="w-full py-3.5 rounded-2xl font-semibold transition-opacity active:opacity-80 flex items-center justify-center gap-2"
               style={{
                 border: "1px solid rgba(255,255,255,0.08)",
-                color: "#8A8FA3",
+                color: "#6B8A9A",
                 fontSize: "14px",
                 background: "transparent",
               }}
@@ -215,7 +215,7 @@ export default function ConnectPage() {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#2FBF71" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
             </svg>
-            <span style={{ color: "#8A8FA3", fontSize: "12px", lineHeight: "1.5" }}>
+            <span style={{ color: "#6B8A9A", fontSize: "12px", lineHeight: "1.5" }}>
               Your phone number is never shared
             </span>
           </div>

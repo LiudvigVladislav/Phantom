@@ -107,7 +107,7 @@ export default function ChatPage() {
         className="flex items-center px-3 shrink-0"
         style={{
           height: "60px",
-          background: "#13161D",
+          background: "#0F1318",
           borderBottom: "1px solid rgba(255,255,255,0.06)",
         }}
       >
@@ -115,7 +115,7 @@ export default function ChatPage() {
         <Link
           href="/"
           className="flex items-center justify-center w-9 h-9 rounded-full mr-1 transition-colors"
-          style={{ color: "#8A8FA3" }}
+          style={{ color: "#6B8A9A" }}
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <polyline points="15 18 9 12 15 6" />
@@ -128,7 +128,7 @@ export default function ChatPage() {
           <div className="flex flex-col min-w-0">
             <span
               className="font-semibold truncate"
-              style={{ color: "#F4F7FB", fontSize: "15px" }}
+              style={{ color: "#E8F4F8", fontSize: "15px" }}
             >
               Aria Chen
             </span>
@@ -137,7 +137,7 @@ export default function ChatPage() {
                 className="block w-1.5 h-1.5 rounded-full"
                 style={{ background: "#2FBF71", boxShadow: "0 0 4px rgba(47,191,113,0.8)" }}
               />
-              <span style={{ color: "#8A8FA3", fontSize: "11px" }}>Online via relay</span>
+              <span style={{ color: "#6B8A9A", fontSize: "11px" }}>Online via relay</span>
             </div>
           </div>
         </Link>
@@ -162,7 +162,7 @@ export default function ChatPage() {
           {/* More */}
           <button
             className="flex items-center justify-center w-9 h-9 rounded-full"
-            style={{ color: "#8A8FA3" }}
+            style={{ color: "#6B8A9A" }}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
               <circle cx="12" cy="5" r="1.5" />
@@ -182,7 +182,7 @@ export default function ChatPage() {
           className="px-3 py-1 rounded-full"
           style={{
             background: "rgba(255,255,255,0.05)",
-            color: "#8A8FA3",
+            color: "#6B8A9A",
             fontSize: "11px",
           }}
         >
@@ -212,7 +212,7 @@ export default function ChatPage() {
       <div
         className="flex items-center gap-2 px-3 py-2 shrink-0"
         style={{
-          background: "#13161D",
+          background: "#0F1318",
           borderTop: "1px solid rgba(255,255,255,0.06)",
           paddingBottom: "calc(0.5rem + env(safe-area-inset-bottom, 0px))",
         }}
@@ -220,7 +220,7 @@ export default function ChatPage() {
         {/* Attachment */}
         <button
           className="flex items-center justify-center w-9 h-9 rounded-full shrink-0"
-          style={{ color: "#8A8FA3" }}
+          style={{ color: "#6B8A9A" }}
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
             <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
@@ -232,7 +232,7 @@ export default function ChatPage() {
           className="flex-1 flex items-center px-3 rounded-2xl"
           style={{
             minHeight: "40px",
-            background: "#1A1D27",
+            background: "#141820",
             border: "1px solid rgba(255,255,255,0.08)",
           }}
         >
@@ -244,13 +244,13 @@ export default function ChatPage() {
             placeholder="Message…"
             className="flex-1 bg-transparent outline-none"
             style={{
-              color: "#F4F7FB",
+              color: "#E8F4F8",
               fontSize: "14px",
-              caretColor: "#6C5CE7",
+              caretColor: "#00D4FF",
             }}
           />
           {/* Ephemeral toggle */}
-          <button style={{ color: "#8A8FA3", marginLeft: "6px" }}>
+          <button style={{ color: "#6B8A9A", marginLeft: "6px" }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <circle cx="12" cy="12" r="10" />
               <polyline points="12 6 12 12 16 14" />
@@ -263,8 +263,8 @@ export default function ChatPage() {
           onClick={handleSend}
           className="flex items-center justify-center w-9 h-9 rounded-full shrink-0 transition-all active:scale-95"
           style={{
-            background: inputText.trim() ? "#6C5CE7" : "rgba(108,92,231,0.2)",
-            boxShadow: inputText.trim() ? "0 4px 16px rgba(108,92,231,0.45)" : "none",
+            background: inputText.trim() ? "#00D4FF" : "rgba(0,212,255,0.2)",
+            boxShadow: inputText.trim() ? "0 4px 16px rgba(0,212,255,0.45)" : "none",
           }}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

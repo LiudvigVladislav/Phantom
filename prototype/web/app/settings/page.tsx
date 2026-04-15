@@ -14,9 +14,9 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void 
       style={{
         width: 44,
         height: 24,
-        background: checked ? "#6C5CE7" : "#1A1D27",
-        border: `2px solid ${checked ? "#6C5CE7" : "rgba(255,255,255,0.1)"}`,
-        boxShadow: checked ? "0 0 12px rgba(108,92,231,0.4)" : "none",
+        background: checked ? "#00D4FF" : "#141820",
+        border: `2px solid ${checked ? "#00D4FF" : "rgba(255,255,255,0.1)"}`,
+        boxShadow: checked ? "0 0 12px rgba(0,212,255,0.4)" : "none",
       }}
     >
       <span
@@ -37,7 +37,7 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
     <div className="px-4 pt-6 pb-2">
       <span
         className="font-medium tracking-widest uppercase"
-        style={{ color: "#8A8FA3", fontSize: "10px", letterSpacing: "0.14em" }}
+        style={{ color: "#6B8A9A", fontSize: "10px", letterSpacing: "0.14em" }}
       >
         {children}
       </span>
@@ -70,7 +70,7 @@ function SettingsRow({
       style={{
         height: "52px",
         borderBottom: last ? "none" : "1px solid rgba(255,255,255,0.06)",
-        background: "#13161D",
+        background: "#0F1318",
       }}
     >
       <div
@@ -78,26 +78,26 @@ function SettingsRow({
         style={{
           width: 32,
           height: 32,
-          background: danger ? "rgba(232,93,117,0.1)" : "rgba(108,92,231,0.12)",
-          color: danger ? "#E85D75" : "#6C5CE7",
+          background: danger ? "rgba(232,93,117,0.1)" : "rgba(0,212,255,0.12)",
+          color: danger ? "#E85D75" : "#00D4FF",
         }}
       >
         {icon}
       </div>
       <span
         className="flex-1 font-medium"
-        style={{ color: danger ? "#E85D75" : "#F4F7FB", fontSize: "14px" }}
+        style={{ color: danger ? "#E85D75" : "#E8F4F8", fontSize: "14px" }}
       >
         {label}
       </span>
       {value && (
-        <span style={{ color: "#8A8FA3", fontSize: "13px" }}>{value}</span>
+        <span style={{ color: "#6B8A9A", fontSize: "13px" }}>{value}</span>
       )}
       {toggle !== undefined && onToggle && (
         <Toggle checked={toggle} onChange={onToggle} />
       )}
       {chevron && (
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8A8FA3" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6B8A9A" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <polyline points="9 18 15 12 9 6" />
         </svg>
       )}
@@ -121,7 +121,7 @@ export default function SettingsPage() {
           <div
             className="flex items-center gap-3 p-4 rounded-2xl"
             style={{
-              background: "#13161D",
+              background: "#0F1318",
               border: "1px solid rgba(255,255,255,0.06)",
             }}
           >
@@ -130,7 +130,7 @@ export default function SettingsPage() {
               style={{
                 width: 52,
                 height: 52,
-                background: "linear-gradient(135deg, #6C5CE7 0%, #a29bfe 100%)",
+                background: "linear-gradient(135deg, #00D4FF 0%, #80E8FF 100%)",
                 color: "#fff",
                 fontSize: "20px",
               }}
@@ -138,10 +138,10 @@ export default function SettingsPage() {
               Y
             </div>
             <div className="flex-1 min-w-0">
-              <p className="font-semibold" style={{ color: "#F4F7FB", fontSize: "16px" }}>
+              <p className="font-semibold" style={{ color: "#E8F4F8", fontSize: "16px" }}>
                 @phantom_user
               </p>
-              <p style={{ color: "#8A8FA3", fontSize: "12px", marginTop: "2px" }}>
+              <p style={{ color: "#6B8A9A", fontSize: "12px", marginTop: "2px" }}>
                 Device · 3F:A2:09:EC:71:44
               </p>
             </div>
@@ -167,13 +167,13 @@ export default function SettingsPage() {
           {/* Relay address */}
           <div
             className="px-4 py-3"
-            style={{ background: "#13161D", borderBottom: "1px solid rgba(255,255,255,0.06)" }}
+            style={{ background: "#0F1318", borderBottom: "1px solid rgba(255,255,255,0.06)" }}
           >
             <div className="flex items-center justify-between mb-2">
-              <span style={{ color: "#8A8FA3", fontSize: "12px" }}>Relay address</span>
+              <span style={{ color: "#6B8A9A", fontSize: "12px" }}>Relay address</span>
               <span
                 className="font-mono"
-                style={{ color: "#6C5CE7", fontSize: "11px" }}
+                style={{ color: "#00D4FF", fontSize: "11px" }}
               >
                 relay.phantom.net
               </span>
@@ -197,7 +197,7 @@ export default function SettingsPage() {
               </div>
               <span style={{ color: "#2FBF71", fontSize: "11px", fontWeight: 600, minWidth: 28 }}>98%</span>
             </div>
-            <p style={{ color: "#8A8FA3", fontSize: "11px", marginTop: "4px" }}>
+            <p style={{ color: "#6B8A9A", fontSize: "11px", marginTop: "4px" }}>
               Latency 11ms · Berlin node
             </p>
           </div>

@@ -1,88 +1,103 @@
 import React from "react";
 import Link from "next/link";
-import Avatar from "./Avatar";
 
 interface ConversationItemProps {
   name: string;
-  lastMessage: string;
+  subline: string;
   time: string;
   unread?: number;
+  accentColor?: string;
   href?: string;
-  verified?: boolean;
 }
 
 export default function ConversationItem({
   name,
-  lastMessage,
+  subline,
   time,
-  unread,
+  unread = 0,
+  accentColor = "#00D4FF",
   href = "/chat",
-  verified = false,
 }: ConversationItemProps) {
   return (
     <Link
       href={href}
-      className="flex items-center gap-3 px-4 transition-colors active:opacity-80"
+      className="phantom-row flex items-stretch"
       style={{
-        height: "72px",
-        borderBottom: "1px solid rgba(255,255,255,0.06)",
-        background: "#13161D",
+        borderBottom: "1px solid rgba(255,255,255,0.04)",
+        background: "transparent",
+        textDecoration: "none",
       }}
     >
-      <Avatar name={name} size="md" />
+      {/* Left color strip */}
+      <div
+        style={{
+          width: 3,
+          background: accentColor,
+          flexShrink: 0,
+          opacity: unread > 0 ? 1 : 0.28,
+        }}
+      />
 
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between gap-2 mb-0.5">
-          <div className="flex items-center gap-1.5 min-w-0">
+      {/* Content */}
+      <div className="flex flex-col justify-center flex-1 min-w-0 py-4 pl-4 pr-4">
+        <div className="flex items-center justify-between gap-2">
+          {/* Name + unread dot */}
+          <div className="flex items-center gap-2 min-w-0">
             <span
-              className="font-semibold truncate"
-              style={{ color: "#F4F7FB", fontSize: "15px" }}
+              style={{
+                color: "#E8F4F8",
+                fontSize: "15px",
+                fontWeight: unread > 0 ? 400 : 300,
+                letterSpacing: "0.4px",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
             >
               {name}
             </span>
-            {verified && (
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="#6C5CE7"
-                style={{ flexShrink: 0 }}
-              >
-                <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" stroke="#6C5CE7" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
-              </svg>
+            {unread > 0 && (
+              <span
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: "50%",
+                  background: accentColor,
+                  flexShrink: 0,
+                  boxShadow: `0 0 5px ${accentColor}BB`,
+                }}
+              />
             )}
           </div>
+
+          {/* Time */}
           <span
-            className="text-xs shrink-0"
-            style={{ color: unread ? "#6C5CE7" : "#8A8FA3", fontSize: "12px" }}
+            style={{
+              color: "#6B8A9A",
+              fontSize: "10px",
+              letterSpacing: "1.2px",
+              textTransform: "uppercase",
+              flexShrink: 0,
+            }}
           >
             {time}
           </span>
         </div>
 
-        <div className="flex items-center justify-between gap-2">
-          <span
-            className="text-sm truncate"
-            style={{ color: "#8A8FA3", fontSize: "13px" }}
-          >
-            {lastMessage}
-          </span>
-          {unread && unread > 0 ? (
-            <span
-              className="flex items-center justify-center rounded-full shrink-0 font-semibold"
-              style={{
-                minWidth: "20px",
-                height: "20px",
-                padding: "0 6px",
-                background: "#6C5CE7",
-                color: "#ffffff",
-                fontSize: "11px",
-              }}
-            >
-              {unread}
-            </span>
-          ) : null}
-        </div>
+        {/* Subline */}
+        <span
+          style={{
+            color: "#6B8A9A",
+            fontSize: "11px",
+            letterSpacing: "0.3px",
+            marginTop: "4px",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {subline}
+        </span>
       </div>
     </Link>
   );

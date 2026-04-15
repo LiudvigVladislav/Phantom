@@ -4,348 +4,469 @@ import React, { useState } from "react";
 import PhoneFrame from "@/components/layout/PhoneFrame";
 import Link from "next/link";
 
+/* ── Step 1 ─────────────────────────────────────────────── */
 function Step1({ onNext }: { onNext: () => void }) {
   return (
-    <div className="flex flex-col flex-1 px-8 pt-20 pb-12">
-      {/* Wordmark */}
-      <div className="flex-1 flex flex-col items-center justify-center">
-        <div className="mb-12 flex flex-col items-center gap-6">
-          {/* Shield icon */}
-          <div
-            className="flex items-center justify-center rounded-3xl"
-            style={{
-              width: 80,
-              height: 80,
-              background: "rgba(108,92,231,0.15)",
-              border: "1px solid rgba(108,92,231,0.3)",
-            }}
-          >
-            <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#6C5CE7" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-            </svg>
-          </div>
-
-          <div className="text-center">
-            <h1
-              className="font-bold tracking-widest"
-              style={{
-                fontSize: "40px",
-                letterSpacing: "0.22em",
-                color: "#F4F7FB",
-              }}
-            >
-              PHANTOM
-            </h1>
-            <p
-              className="mt-3 font-light tracking-wide"
-              style={{ color: "#8A8FA3", fontSize: "16px", letterSpacing: "0.04em" }}
-            >
-              Your identity. Your keys.
-            </p>
-          </div>
-        </div>
-
-        {/* Feature list */}
-        <div className="flex flex-col gap-4 w-full max-w-xs">
-          {[
-            { icon: "🔑", text: "End-to-end encrypted by default" },
-            { icon: "🌐", text: "No phone number required" },
-            { icon: "⚡", text: "Relay mesh — works without servers" },
-          ].map((item) => (
-            <div
-              key={item.text}
-              className="flex items-center gap-3 px-4 py-3 rounded-xl"
-              style={{
-                background: "#13161D",
-                border: "1px solid rgba(255,255,255,0.06)",
-              }}
-            >
-              <span style={{ fontSize: "18px" }}>{item.icon}</span>
-              <span style={{ color: "#8A8FA3", fontSize: "13px" }}>{item.text}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <button
-        onClick={onNext}
-        className="w-full py-4 rounded-2xl font-semibold tracking-wide transition-opacity active:opacity-80"
+    <div
+      className="flex flex-col flex-1 animate-fade-in-up"
+      style={{ padding: "0 32px" }}
+    >
+      {/* Top label */}
+      <div
         style={{
-          background: "#6C5CE7",
-          color: "#ffffff",
-          fontSize: "15px",
-          letterSpacing: "0.04em",
-          boxShadow: "0 8px 32px rgba(108,92,231,0.4)",
+          marginTop: 72,
+          textAlign: "center",
         }}
       >
-        Get started
-      </button>
+        <span
+          style={{
+            color: "#6B8A9A",
+            fontSize: "11px",
+            letterSpacing: "3px",
+            textTransform: "uppercase",
+          }}
+        >
+          PHANTOM MESSENGER
+        </span>
+      </div>
 
+      {/* Headline */}
+      <div style={{ marginTop: 32, textAlign: "center" }}>
+        <p
+          style={{
+            color: "#E8F4F8",
+            fontSize: "32px",
+            fontWeight: 200,
+            lineHeight: "1.25",
+            letterSpacing: "-0.3px",
+            margin: 0,
+          }}
+        >
+          Your presence,
+        </p>
+        <p
+          style={{
+            color: "#E8F4F8",
+            fontSize: "32px",
+            fontWeight: 200,
+            lineHeight: "1.25",
+            letterSpacing: "-0.3px",
+            margin: 0,
+          }}
+        >
+          known to no one.
+        </p>
+      </div>
+
+      {/* Air */}
+      <div style={{ height: 40 }} />
+
+      {/* Descriptor */}
       <p
-        className="text-center mt-4"
-        style={{ color: "#8A8FA3", fontSize: "12px" }}
+        style={{
+          color: "#6B8A9A",
+          fontSize: "13px",
+          lineHeight: "1.7",
+          textAlign: "center",
+          margin: 0,
+        }}
       >
-        No account, no email, no number.
+        End-to-end encrypted.
+        <br />
+        No phone required. Uncensorable.
       </p>
+
+      {/* Spacer */}
+      <div style={{ flex: 1 }} />
+
+      {/* BEGIN button — thin horizontal line style */}
+      <button
+        onClick={onNext}
+        className="phantom-btn-outline"
+        style={{
+          display: "block",
+          width: "100%",
+          position: "relative",
+          padding: "18px 0",
+          background: "transparent",
+          border: "none",
+          borderTop: "1px solid rgba(255,255,255,0.12)",
+          borderBottom: "1px solid rgba(255,255,255,0.12)",
+          cursor: "pointer",
+          marginBottom: 48,
+        }}
+      >
+        <span
+          style={{
+            color: "#E8F4F8",
+            fontSize: "11px",
+            letterSpacing: "4px",
+            textTransform: "uppercase",
+            fontWeight: 400,
+          }}
+        >
+          BEGIN
+        </span>
+      </button>
     </div>
   );
 }
 
+/* ── Step 2 ─────────────────────────────────────────────── */
 function Step2({ onNext }: { onNext: () => void }) {
   const [username, setUsername] = useState("");
+  const valid = username.length >= 3;
 
   return (
-    <div className="flex flex-col flex-1 px-8 pt-16 pb-12">
-      <div className="mb-10">
+    <div
+      className="flex flex-col flex-1 animate-fade-in-up"
+      style={{ padding: "0 32px" }}
+    >
+      <div style={{ marginTop: 72 }}>
         <h2
-          className="font-bold mb-2"
-          style={{ color: "#F4F7FB", fontSize: "28px" }}
+          style={{
+            color: "#E8F4F8",
+            fontSize: "24px",
+            fontWeight: 300,
+            letterSpacing: "0.5px",
+            margin: 0,
+          }}
         >
-          Choose your handle
+          Choose your identity
         </h2>
-        <p style={{ color: "#8A8FA3", fontSize: "14px", lineHeight: "1.6" }}>
-          This is how others will find you. It is the only identity you need.
-        </p>
       </div>
 
-      <div className="flex flex-col gap-3 mb-6">
-        <label
-          className="font-medium tracking-wide uppercase"
-          style={{ color: "#8A8FA3", fontSize: "10px", letterSpacing: "0.12em" }}
-        >
-          Username
-        </label>
+      {/* Big underline input */}
+      <div style={{ marginTop: 48 }}>
         <div
-          className="flex items-center px-4 rounded-xl"
           style={{
-            height: "52px",
-            background: "#13161D",
-            border: `1px solid ${username ? "rgba(108,92,231,0.5)" : "rgba(255,255,255,0.08)"}`,
+            display: "flex",
+            alignItems: "baseline",
+            gap: 6,
+            borderBottom: `1px solid ${valid ? "#00D4FF" : "rgba(255,255,255,0.2)"}`,
+            paddingBottom: 12,
+            transition: "border-color 200ms",
           }}
         >
           <span
-            className="font-medium mr-1"
-            style={{ color: "#6C5CE7", fontSize: "16px" }}
+            style={{
+              color: "#00D4FF",
+              fontSize: "22px",
+              fontWeight: 300,
+              lineHeight: 1,
+            }}
           >
             @
           </span>
           <input
             type="text"
             value={username}
-            onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
-            placeholder="your_handle"
-            className="flex-1 bg-transparent outline-none"
+            onChange={(e) =>
+              setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))
+            }
+            placeholder="username"
             style={{
-              color: "#F4F7FB",
-              fontSize: "16px",
-              caretColor: "#6C5CE7",
+              flex: 1,
+              background: "transparent",
+              border: "none",
+              outline: "none",
+              color: "#E8F4F8",
+              fontSize: "22px",
+              fontWeight: 300,
+              caretColor: "#00D4FF",
+              letterSpacing: "0.5px",
+              fontFamily: "inherit",
             }}
           />
-          {username.length >= 3 && (
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2FBF71" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          )}
         </div>
-        <p style={{ color: "#8A8FA3", fontSize: "12px" }}>
-          Letters, numbers, and underscores. 3-24 characters.
+
+        <p
+          style={{
+            color: "#6B8A9A",
+            fontSize: "11px",
+            letterSpacing: "0.3px",
+            marginTop: 12,
+            lineHeight: "1.6",
+          }}
+        >
+          Your username is stored in the distributed network.
+          <br />
+          No server owns it.
         </p>
       </div>
 
-      <div className="flex-1" />
+      <div style={{ flex: 1 }} />
 
       <button
         onClick={onNext}
-        disabled={username.length < 3}
-        className="w-full py-4 rounded-2xl font-semibold tracking-wide transition-all active:opacity-80"
+        disabled={!valid}
+        className="phantom-btn-outline"
         style={{
-          background: username.length >= 3 ? "#6C5CE7" : "#1A1D27",
-          color: username.length >= 3 ? "#ffffff" : "#8A8FA3",
-          fontSize: "15px",
-          letterSpacing: "0.04em",
-          boxShadow: username.length >= 3 ? "0 8px 32px rgba(108,92,231,0.4)" : "none",
-          cursor: username.length >= 3 ? "pointer" : "default",
+          display: "block",
+          width: "100%",
+          position: "relative",
+          padding: "18px 0",
+          background: "transparent",
+          border: "none",
+          borderTop: `1px solid ${valid ? "rgba(0,212,255,0.6)" : "rgba(255,255,255,0.08)"}`,
+          borderBottom: `1px solid ${valid ? "rgba(0,212,255,0.6)" : "rgba(255,255,255,0.08)"}`,
+          cursor: valid ? "pointer" : "default",
+          marginBottom: 48,
+          transition: "border-color 200ms",
+          opacity: valid ? 1 : 0.4,
         }}
       >
-        Continue
+        <span
+          style={{
+            color: valid ? "#00D4FF" : "#6B8A9A",
+            fontSize: "11px",
+            letterSpacing: "4px",
+            textTransform: "uppercase",
+            fontWeight: 400,
+            transition: "color 200ms",
+          }}
+        >
+          CONTINUE
+        </span>
       </button>
     </div>
   );
 }
 
-function Step3() {
-  return (
-    <div className="flex flex-col flex-1 px-8 pt-12 pb-12">
-      <div className="mb-8">
-        <h2
-          className="font-bold mb-2"
-          style={{ color: "#F4F7FB", fontSize: "28px" }}
-        >
-          Your identity
-        </h2>
-        <p style={{ color: "#8A8FA3", fontSize: "14px", lineHeight: "1.6" }}>
-          Share this QR or link to let others add you securely.
-        </p>
-      </div>
+/* ── QR Decoration SVG ──────────────────────────────────── */
+function PhantomQR() {
+  // Decorative QR-like grid using a deterministic pattern
+  const size = 240;
+  const cellCount = 13;
+  const cellSize = Math.floor(size / cellCount);
+  const gap = 1;
 
-      {/* QR Placeholder */}
-      <div className="flex justify-center mb-6">
-        <div
-          className="relative flex items-center justify-center"
+  // Seed a pseudo-random pattern (deterministic)
+  const seed = [
+    1,1,1,1,1,1,1,0,1,1,1,1,1,
+    1,0,0,0,0,0,1,0,1,0,0,0,1,
+    1,0,1,1,1,0,1,0,1,0,1,0,1,
+    1,0,1,1,1,0,1,0,1,0,1,0,1,
+    1,0,1,1,1,0,1,0,1,0,1,0,1,
+    1,0,0,0,0,0,1,0,1,0,0,0,1,
+    1,1,1,1,1,1,1,0,1,1,1,1,1,
+    0,0,1,0,0,1,0,1,0,0,1,0,0,
+    1,1,0,1,0,1,1,0,1,1,0,1,1,
+    1,0,0,0,0,0,1,0,1,0,0,0,1,
+    1,0,1,1,1,0,1,0,1,0,1,0,1,
+    1,0,0,0,0,0,1,0,1,0,0,0,1,
+    1,1,1,1,1,1,1,0,1,1,1,1,1,
+  ];
+
+  const cells = seed.map((filled, i) => {
+    const row = Math.floor(i / cellCount);
+    const col = i % cellCount;
+    // Reserve center area for symbol (rows 5-7, cols 5-7)
+    const isCenterZone = row >= 5 && row <= 7 && col >= 5 && col <= 7;
+    if (isCenterZone) return null;
+    return {
+      x: col * (cellSize + gap),
+      y: row * (cellSize + gap),
+      filled,
+    };
+  });
+
+  return (
+    <div
+      style={{
+        position: "relative",
+        width: size,
+        height: size,
+        flexShrink: 0,
+      }}
+    >
+      {/* Corner brackets — animated */}
+      {[
+        { top: 0, left: 0, rotate: "0deg" },
+        { top: 0, right: 0, rotate: "90deg" },
+        { bottom: 0, right: 0, rotate: "180deg" },
+        { bottom: 0, left: 0, rotate: "270deg" },
+      ].map((pos, i) => (
+        <svg
+          key={i}
+          className="animate-corner-pulse"
+          width="28"
+          height="28"
+          viewBox="0 0 28 28"
+          fill="none"
+          stroke="#00D4FF"
+          strokeWidth="2.5"
+          strokeLinecap="round"
           style={{
-            width: 220,
-            height: 220,
-            background: "#13161D",
-            borderRadius: "16px",
-            border: "1px solid rgba(255,255,255,0.06)",
+            position: "absolute",
+            ...pos,
+            transform: `rotate(${pos.rotate})`,
+            animationDelay: `${i * 0.3}s`,
           }}
         >
-          {/* Corner marks */}
-          {[
-            { top: 12, left: 12, rotate: "0deg" },
-            { top: 12, right: 12, rotate: "90deg" },
-            { bottom: 12, right: 12, rotate: "180deg" },
-            { bottom: 12, left: 12, rotate: "270deg" },
-          ].map((pos, i) => (
-            <svg
+          <path d="M3 14 L3 3 L14 3" />
+        </svg>
+      ))}
+
+      {/* QR pixel grid */}
+      <svg
+        width={size}
+        height={size}
+        viewBox={`0 0 ${size} ${size}`}
+        style={{ position: "absolute", inset: 0 }}
+      >
+        {cells.map((cell, i) => {
+          if (!cell) return null;
+          return (
+            <rect
               key={i}
-              width="24"
-              height="24"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="#6C5CE7"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              style={{
-                position: "absolute",
-                ...pos,
-                transform: `rotate(${pos.rotate})`,
-              }}
-            >
-              <path d="M2 8 L2 2 L8 2" />
-            </svg>
-          ))}
+              x={cell.x}
+              y={cell.y}
+              width={cellSize - 1}
+              height={cellSize - 1}
+              rx={1}
+              fill={
+                cell.filled
+                  ? "rgba(0,212,255,0.82)"
+                  : "rgba(255,255,255,0.04)"
+              }
+            />
+          );
+        })}
+      </svg>
 
-          {/* Center content */}
-          <div className="flex flex-col items-center gap-2">
-            <div
-              className="flex items-center justify-center rounded-xl"
-              style={{
-                width: 48,
-                height: 48,
-                background: "rgba(108,92,231,0.2)",
-                border: "1px solid rgba(108,92,231,0.4)",
-              }}
-            >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#6C5CE7" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-              </svg>
-            </div>
-            <span
-              className="font-bold tracking-widest"
-              style={{ color: "#F4F7FB", fontSize: "11px", letterSpacing: "0.18em" }}
-            >
-              PHANTOM
-            </span>
-
-            {/* Mock QR dots pattern — deterministic */}
-            <div
-              className="grid gap-0.5 mt-1"
-              style={{ gridTemplateColumns: "repeat(8, 6px)" }}
-            >
-              {Array.from({ length: 48 }).map((_, i) => {
-                const filled = [0,1,2,5,6,7,8,9,14,15,17,19,20,21,22,23,24,25,26,28,30,31,33,35,36,37,38,39,40,42,44,45,46,47];
-                return (
-                <div
-                  key={i}
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: "1px",
-                    background: filled.includes(i) ? "#6C5CE7" : "transparent",
-                    opacity: 0.7,
-                  }}
-                />
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      </div>
-
+      {/* Center symbol ⬡ */}
       <div
-        className="flex items-center justify-center px-4 py-2 rounded-lg mb-6"
         style={{
-          background: "#13161D",
-          border: "1px solid rgba(255,255,255,0.06)",
+          position: "absolute",
+          top: "50%",
+          left: "50%",
+          transform: "translate(-50%,-50%)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 40,
+          height: 40,
+          background: "#0B0D12",
+          border: "1px solid rgba(0,212,255,0.4)",
         }}
       >
-        <span
-          className="font-medium"
-          style={{ color: "#6C5CE7", fontSize: "15px" }}
+        <svg
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="#00D4FF"
+          strokeWidth="1.5"
         >
-          @phantom_user
-        </span>
+          <polygon points="12 2 22 7 22 17 12 22 2 17 2 7" />
+        </svg>
       </div>
+    </div>
+  );
+}
 
-      {/* Action buttons */}
-      <div className="flex flex-col gap-3">
-        <button
-          className="w-full py-3.5 rounded-2xl font-semibold transition-opacity active:opacity-80"
+/* ── Step 3 ─────────────────────────────────────────────── */
+function Step3() {
+  return (
+    <div
+      className="flex flex-col flex-1 items-center animate-fade-in-up"
+      style={{ padding: "0 32px" }}
+    >
+      <div style={{ marginTop: 48, textAlign: "center" }}>
+        <h2
           style={{
-            background: "#6C5CE7",
-            color: "#ffffff",
-            fontSize: "14px",
-            boxShadow: "0 8px 32px rgba(108,92,231,0.4)",
+            color: "#E8F4F8",
+            fontSize: "28px",
+            fontWeight: 200,
+            letterSpacing: "0.5px",
+            margin: 0,
           }}
         >
-          Copy invite link
+          Your key
+        </h2>
+      </div>
+
+      {/* QR */}
+      <div style={{ marginTop: 32 }}>
+        <PhantomQR />
+      </div>
+
+      {/* Username */}
+      <span
+        style={{
+          color: "#00D4FF",
+          fontSize: "15px",
+          fontWeight: 400,
+          letterSpacing: "1px",
+          marginTop: 20,
+        }}
+      >
+        @phantom_user
+      </span>
+
+      <div style={{ flex: 1 }} />
+
+      {/* Two outline buttons in a row */}
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          width: "100%",
+          marginBottom: 48,
+        }}
+      >
+        <button
+          className="phantom-btn-outline"
+          style={{
+            flex: 1,
+            padding: "14px 0",
+            background: "transparent",
+            border: "1px solid rgba(0,212,255,0.35)",
+            color: "#00D4FF",
+            fontSize: "11px",
+            letterSpacing: "2px",
+            textTransform: "uppercase",
+            cursor: "pointer",
+            fontFamily: "inherit",
+          }}
+        >
+          Copy link
         </button>
         <Link
           href="/"
-          className="w-full py-3.5 rounded-2xl font-semibold text-center transition-opacity active:opacity-80"
           style={{
-            background: "transparent",
-            border: "1px solid rgba(108,92,231,0.4)",
-            color: "#6C5CE7",
-            fontSize: "14px",
+            flex: 1,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "14px 0",
+            border: "1px solid rgba(255,255,255,0.1)",
+            color: "#6B8A9A",
+            fontSize: "11px",
+            letterSpacing: "2px",
+            textTransform: "uppercase",
+            textDecoration: "none",
           }}
         >
-          Open PHANTOM
+          Open
         </Link>
       </div>
     </div>
   );
 }
 
+/* ── Page ────────────────────────────────────────────────── */
 export default function OnboardingPage() {
   const [step, setStep] = useState(0);
 
   return (
     <PhoneFrame>
-      {/* Step indicator */}
-      <div
-        className="flex items-center justify-center gap-2 pt-6 pb-2 shrink-0"
-        style={{ background: "#0B0D12" }}
-      >
-        {[0, 1, 2].map((i) => (
-          <div
-            key={i}
-            style={{
-              width: i === step ? 24 : 6,
-              height: 6,
-              borderRadius: 3,
-              background: i === step ? "#6C5CE7" : "rgba(108,92,231,0.25)",
-              transition: "all 0.3s ease",
-            }}
-          />
-        ))}
-      </div>
-
       <div
         className="flex flex-col flex-1 overflow-hidden"
         style={{ background: "#0B0D12" }}
       >
+        {/* Step 1 */}
         {step === 0 && <Step1 onNext={() => setStep(1)} />}
         {step === 1 && <Step2 onNext={() => setStep(2)} />}
         {step === 2 && <Step3 />}

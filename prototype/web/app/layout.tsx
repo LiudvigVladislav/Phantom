@@ -1,16 +1,17 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { DM_Sans } from "next/font/google";
 import "./globals.css";
 
-const inter = Inter({
+const dmSans = DM_Sans({
   subsets: ["latin"],
   display: "swap",
-  variable: "--font-inter",
+  variable: "--font-dm-sans",
+  weight: ["200", "300", "400", "500"],
 });
 
 export const metadata: Metadata = {
   title: "PHANTOM",
-  description: "Your identity. Your keys.",
+  description: "Your presence, known to no one.",
 };
 
 export default function RootLayout({
@@ -19,10 +20,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${inter.variable} h-full`}>
+    <html lang="en" className={`${dmSans.variable} h-full`}>
       <body
         className="h-full antialiased"
-        style={{ background: "#0B0D12", fontFamily: "'Inter', sans-serif" }}
+        style={{ background: "#0B0D12" }}
       >
         {children}
       </body>

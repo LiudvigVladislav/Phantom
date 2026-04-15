@@ -5,28 +5,38 @@ interface StatusBarProps {
   title?: string;
   showBack?: boolean;
   backHref?: string;
-  centerSlot?: React.ReactNode;
   rightSlot?: React.ReactNode;
   relayOnline?: boolean;
+  relayDirect?: boolean;
 }
 
-function RelayIndicator({ online }: { online: boolean }) {
+function RelayBadge({ online, direct }: { online: boolean; direct?: boolean }) {
+  const label = direct ? "DIRECT" : online ? "RELAY" : "OFFLINE";
+  const color = online ? "#2FBF71" : "#F4B740";
+
   return (
     <div className="flex items-center gap-1.5">
       <span
-        className="block w-2 h-2 rounded-full"
+        className="animate-relay-pulse"
         style={{
-          background: online ? "#2FBF71" : "#F4B740",
-          boxShadow: online
-            ? "0 0 6px rgba(47,191,113,0.7)"
-            : "0 0 6px rgba(244,183,64,0.7)",
+          display: "block",
+          width: 5,
+          height: 5,
+          borderRadius: "50%",
+          background: color,
+          boxShadow: `0 0 5px ${color}99`,
+          flexShrink: 0,
         }}
       />
       <span
-        className="text-xs font-medium tracking-wide"
-        style={{ color: online ? "#2FBF71" : "#F4B740", fontSize: "11px" }}
+        style={{
+          color,
+          fontSize: "10px",
+          letterSpacing: "1.5px",
+          fontWeight: 500,
+        }}
       >
-        {online ? "Relay" : "Connecting"}
+        {label}
       </span>
     </div>
   );
@@ -36,16 +46,16 @@ export default function StatusBar({
   title,
   showBack = false,
   backHref = "/",
-  centerSlot,
   rightSlot,
   relayOnline = true,
+  relayDirect = false,
 }: StatusBarProps) {
   return (
     <div
       className="flex items-center justify-between px-4 shrink-0"
       style={{
-        height: "56px",
-        background: "#13161D",
+        height: "52px",
+        background: "#0F1318",
         borderBottom: "1px solid rgba(255,255,255,0.06)",
       }}
     >
@@ -54,21 +64,31 @@ export default function StatusBar({
         {showBack && (
           <Link
             href={backHref}
-            className="flex items-center justify-center w-8 h-8 rounded-full transition-colors"
-            style={{ color: "#8A8FA3" }}
+            className="flex items-center justify-center shrink-0 transition-opacity hover:opacity-70"
+            style={{ color: "#6B8A9A", marginRight: 4 }}
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               <polyline points="15 18 9 12 15 6" />
             </svg>
           </Link>
         )}
         {title && (
           <span
-            className="font-semibold tracking-widest uppercase"
             style={{
-              color: "#F4F7FB",
-              fontSize: showBack ? "14px" : "13px",
-              letterSpacing: showBack ? "0.05em" : "0.2em",
+              color: "#E8F4F8",
+              fontSize: showBack ? "15px" : "13px",
+              fontWeight: showBack ? 300 : 400,
+              letterSpacing: showBack ? "0.5px" : "2px",
+              textTransform: showBack ? "none" : "uppercase",
             }}
           >
             {title}
@@ -76,17 +96,10 @@ export default function StatusBar({
         )}
       </div>
 
-      {/* Center slot */}
-      {centerSlot && (
-        <div className="flex items-center justify-center" style={{ flex: 1 }}>
-          {centerSlot}
-        </div>
-      )}
-
       {/* Right slot */}
-      <div className="flex items-center justify-end gap-3" style={{ flex: 1 }}>
+      <div className="flex items-center gap-3 justify-end" style={{ flex: 1 }}>
         {rightSlot}
-        <RelayIndicator online={relayOnline} />
+        <RelayBadge online={relayOnline} direct={relayDirect} />
       </div>
     </div>
   );
