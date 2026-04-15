@@ -16,9 +16,11 @@ kotlin {
             implementation(compose.ui)
             implementation(compose.components.resources)
             implementation(libs.kotlinx.coroutines.android)
-            // Core modules will be wired here as they are implemented:
-            // implementation(project(":shared:core:identity"))
-            // implementation(project(":shared:core:messaging"))
+            implementation(project(":shared:core:identity"))
+            implementation(project(":shared:core:crypto"))
+            implementation(project(":shared:core:storage"))
+            implementation(project(":shared:core:transport"))
+            implementation(project(":shared:core:messaging"))
         }
     }
 }

@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
+        android:name=".PhantomApplication"
         android:label="PHANTOM"
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.Phantom"

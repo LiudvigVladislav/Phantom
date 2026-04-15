@@ -4,49 +4,81 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.*
+import kotlinx.coroutines.launch
+import phantom.android.di.AppContainer
+import phantom.android.navigation.Screen
+import phantom.android.screens.chat.ChatScreen
+import phantom.android.screens.chatlist.ChatListScreen
+import phantom.android.screens.onboarding.OnboardingScreen
+import phantom.android.ui.theme.PhantomTheme
 
-/**
- * PHANTOM Android entry point.
- *
- * This is a thin shell — all business logic lives in shared/core and shared/features.
- * Replace the placeholder composable with the real navigation graph once
- * shared/features/onboarding and shared/features/chatlist are implemented.
- */
 class MainActivity : ComponentActivity() {
+
+    private lateinit var container: AppContainer
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        container = (application as PhantomApplication).container
         enableEdgeToEdge()
         setContent {
-            PhantomApp()
+            PhantomTheme {
+                PhantomApp(container)
+            }
         }
     }
 }
 
 @Composable
-private fun PhantomApp() {
-    // Placeholder — will be replaced by shared navigation graph (Alpha-0 task #18)
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0B0D12)),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = "PHANTOM",
-            color = Color(0xFF6C5CE7),
-            fontSize = 28.sp,
-            fontWeight = FontWeight.Light,
-            letterSpacing = 8.sp
+private fun PhantomApp(container: AppContainer) {
+    val scope = rememberCoroutineScope()
+    var startScreen by remember { mutableStateOf<Screen?>(null) }
+
+    // Determine starting screen based on whether identity exists
+    LaunchedEffect(Unit) {
+        val identity = container.identityRepo.loadIdentity()
+        startScreen = if (identity == null) {
+            Screen.Onboarding
+        } else {
+            Screen.ChatList
+        }
+    }
+
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.Onboarding) }
+
+    LaunchedEffect(startScreen) {
+        startScreen?.let { currentScreen = it }
+    }
+
+    // Connect transport when on ChatList or Chat
+    LaunchedEffect(currentScreen) {
+        if (currentScreen !is Screen.Onboarding) {
+            scope.launch {
+                runCatching {
+                    container.transport.connect(
+                        relayUrl = "ws://relay.phantom.net/ws",
+                        identityPublicKeyHex = container.identityRepo.loadIdentity()?.publicKeyHex ?: "",
+                    )
+                    container.messagingService?.startReceiving()
+                }
+            }
+        }
+    }
+
+    when (val screen = currentScreen) {
+        is Screen.Onboarding -> OnboardingScreen(
+            container = container,
+            onComplete = { currentScreen = Screen.ChatList },
+        )
+        is Screen.ChatList -> ChatListScreen(
+            container = container,
+            onNavigate = { currentScreen = it },
+        )
+        is Screen.Chat -> ChatScreen(
+            conversationId = screen.conversationId,
+            theirUsername = screen.theirUsername,
+            container = container,
+            onBack = { currentScreen = Screen.ChatList },
         )
     }
 }
