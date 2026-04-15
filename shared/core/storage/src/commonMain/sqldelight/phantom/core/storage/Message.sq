@@ -1,0 +1,23 @@
+CREATE TABLE message (
+    id TEXT NOT NULL PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    ciphertext BLOB NOT NULL,
+    plaintext_cache TEXT,
+    sent INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'queued',
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(conversation_id) REFERENCES conversation(id) ON DELETE CASCADE
+);
+
+getMessages:
+SELECT * FROM message WHERE conversation_id = ? ORDER BY created_at ASC;
+
+insertMessage:
+INSERT INTO message(id, conversation_id, ciphertext, plaintext_cache, sent, status, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+updateMessageStatus:
+UPDATE message SET status = ? WHERE id = ?;
+
+deleteMessagesForConversation:
+DELETE FROM message WHERE conversation_id = ?;

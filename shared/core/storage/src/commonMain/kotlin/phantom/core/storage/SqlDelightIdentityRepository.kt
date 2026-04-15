@@ -1,0 +1,55 @@
+package phantom.core.storage
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import phantom.core.identity.IdentityKeyPair
+import phantom.core.identity.IdentityRecord
+import phantom.core.storage.db.PhantomDatabase
+
+/**
+ * SQLDelight implementation of IdentityStorageRepository.
+ *
+ * Only one identity row is ever present (getIdentity uses LIMIT 1).
+ *
+ * createIdentity() throws UnsupportedOperationException — key generation is
+ * IdentityManager's responsibility, not the storage layer's. Callers must go
+ * through IdentityManager.createOrLoad() which produces the IdentityKeyPair and
+ * then calls saveIdentity().
+ */
+class SqlDelightIdentityRepository(
+    private val db: PhantomDatabase,
+) : IdentityStorageRepository {
+
+    override suspend fun createIdentity(username: String): IdentityKeyPair =
+        throw UnsupportedOperationException(
+            "Key generation is not the storage layer's responsibility. Use IdentityManager."
+        )
+
+    override suspend fun loadIdentity(): IdentityRecord? = withContext(Dispatchers.IO) {
+        db.identityQueries.getIdentity().executeAsOneOrNull()?.toRecord()
+    }
+
+    override suspend fun saveIdentity(record: IdentityRecord): Unit = withContext(Dispatchers.IO) {
+        db.identityQueries.insertIdentity(
+            id = record.id,
+            username = record.username,
+            public_key_hex = record.publicKeyHex,
+            created_at = record.createdAt,
+        )
+    }
+
+    override suspend fun deleteIdentity(): Unit = withContext(Dispatchers.IO) {
+        db.identityQueries.deleteIdentity()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Mapping
+    // ---------------------------------------------------------------------------
+
+    private fun phantom.core.storage.db.Identity.toRecord() = IdentityRecord(
+        id = id,
+        username = username,
+        publicKeyHex = public_key_hex,
+        createdAt = created_at,
+    )
+}

@@ -1,0 +1,27 @@
+CREATE TABLE conversation (
+    id TEXT NOT NULL PRIMARY KEY,
+    their_username TEXT NOT NULL,
+    their_public_key_hex TEXT NOT NULL,
+    last_message_preview TEXT,
+    last_message_at INTEGER,
+    unread_count INTEGER NOT NULL DEFAULT 0
+);
+
+getAllConversations:
+SELECT * FROM conversation ORDER BY last_message_at DESC;
+
+getConversation:
+SELECT * FROM conversation WHERE id = ?;
+
+upsertConversation:
+INSERT OR REPLACE INTO conversation(id, their_username, their_public_key_hex, last_message_preview, last_message_at, unread_count)
+VALUES (?, ?, ?, ?, ?, ?);
+
+incrementUnread:
+UPDATE conversation SET unread_count = unread_count + 1 WHERE id = ?;
+
+resetUnread:
+UPDATE conversation SET unread_count = 0 WHERE id = ?;
+
+deleteConversation:
+DELETE FROM conversation WHERE id = ?;

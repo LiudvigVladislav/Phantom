@@ -1,0 +1,14 @@
+CREATE TABLE ratchet_state (
+    conversation_id TEXT NOT NULL PRIMARY KEY,
+    state_blob TEXT NOT NULL
+);
+
+getRatchetState:
+SELECT state_blob FROM ratchet_state WHERE conversation_id = ?;
+
+upsertRatchetState:
+INSERT OR REPLACE INTO ratchet_state(conversation_id, state_blob)
+VALUES (?, ?);
+
+deleteRatchetState:
+DELETE FROM ratchet_state WHERE conversation_id = ?;

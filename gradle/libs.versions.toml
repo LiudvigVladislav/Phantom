@@ -70,7 +70,7 @@ sqldelight-native-driver = { module = "app.cash.sqldelight:native-driver", versi
 libsodium-bindings = { module = "com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings", version.ref = "libsodium-bindings" }
 
 # SQLCipher at-rest encryption (activate in core:storage implementation)
-# sqlcipher-android = { module = "net.zetetic:sqlcipher-android", version.ref = "sqlcipher-android" }
+sqlcipher-android = { module = "net.zetetic:sqlcipher-android", version.ref = "sqlcipher-android" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kmp-plugin" }
