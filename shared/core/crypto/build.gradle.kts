@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 kotlin {
@@ -12,12 +13,13 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             implementation(libs.kotlinx.coroutines.core)
-            // Audited crypto library bindings will be added here.
-            // DO NOT add custom crypto implementations.
-            // Candidates: libsignal-client JNI, libsodium multiplatform bindings.
+            implementation(libs.kotlinx.serialization.json)
+            implementation(libs.libsodium.bindings)
+            implementation(project(":shared:core:identity"))
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
+            implementation(libs.kotlinx.coroutines.test)
         }
     }
 }
