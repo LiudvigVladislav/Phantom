@@ -16,12 +16,11 @@ kotlin {
             implementation(libs.kotlinx.serialization.json)
             implementation(libs.kotlinx.datetime)
             implementation(libs.uuid)
-            // Depends on crypto and storage interfaces — NOT implementations
-            // implementation(project(":shared:core:crypto"))
-            // implementation(project(":shared:core:storage"))
+            implementation(libs.libsodium.bindings)
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
+            implementation(libs.kotlinx.coroutines.test)
         }
     }
 }
