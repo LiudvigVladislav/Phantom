@@ -8,7 +8,6 @@ import phantom.android.notifications.PhantomNotificationManager
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,6 +17,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.screens.splash.PhantomSplashScreen
 import phantom.android.navigation.Screen
 import phantom.android.qr.QrScanScreen
 import phantom.android.screens.chat.ChatScreen
@@ -87,12 +87,7 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
-                    else -> Box(
-                        modifier = Modifier.fillMaxSize().background(BgDeep),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator(color = CyanAccent, strokeWidth = 2.dp)
-                    }
+                    else -> PhantomSplashScreen()
                 }
             }
         }
