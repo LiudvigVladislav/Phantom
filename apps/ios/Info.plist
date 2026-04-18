@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Bundle identity -->
+    <key>CFBundleIdentifier</key>
+    <string>app.phantom.ios</string>
+    <key>CFBundleName</key>
+    <string>Phantom</string>
+    <key>CFBundleDisplayName</key>
+    <string>Phantom</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <!-- iOS deployment -->
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UIRequiresFullScreen</key>
+    <true/>
+
+    <!-- Appearance — force dark; no light mode support in Alpha-0 -->
+    <key>UIUserInterfaceStyle</key>
+    <string>Dark</string>
+
+    <!-- Supported orientations (phone) -->
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+    </array>
+    <!-- Supported orientations (iPad) -->
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <!-- SwiftUI lifecycle -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+        <key>UISceneConfigurations</key>
+        <dict/>
+    </dict>
+
+    <!-- Privacy usage descriptions -->
+    <key>NSCameraUsageDescription</key>
+    <string>PHANTOM uses camera to scan contact QR codes.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>PHANTOM uses microphone for voice messages.</string>
+
+    <!-- Launch screen (system default) -->
+    <key>UILaunchScreen</key>
+    <dict/>
+</dict>
+</plist>

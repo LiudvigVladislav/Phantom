@@ -7,6 +7,8 @@ plugins {
 kotlin {
     androidTarget()
     jvm()
+    iosArm64()
+    iosSimulatorArm64()
 
     sourceSets {
         commonMain.dependencies {
@@ -22,6 +24,13 @@ kotlin {
         }
         jvmMain.dependencies {
             implementation(libs.ktor.client.okhttp)
+        }
+        // iosMain covers both iosArm64Main and iosSimulatorArm64Main.
+        // Darwin engine wraps NSURLSession — no extra pod required.
+        val iosMain by getting {
+            dependencies {
+                implementation(libs.ktor.client.darwin)
+            }
         }
         commonTest.dependencies {
             implementation(kotlin("test"))

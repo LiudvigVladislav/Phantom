@@ -1,0 +1,11 @@
+platform :ios, '16.0'
+use_frameworks!
+
+target 'Phantom' do
+  # KMP XCFramework will be linked here in Alpha-1.
+  # Uncomment pods as each integration milestone is reached.
+
+  # SQLCipher — at-rest encryption for the KMP storage layer.
+  # Activate when NativeSqliteDriver is replaced by the SQLCipher bridge. See ADR-006.
+  # pod 'SQLCipher', '~> 4.5'
+end
