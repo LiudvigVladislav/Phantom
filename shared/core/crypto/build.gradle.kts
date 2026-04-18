@@ -7,8 +7,7 @@ plugins {
 kotlin {
     androidTarget()
     jvm()
-    iosArm64()
-    iosSimulatorArm64()
+    // iOS targets: add on macOS when building KMP XCFramework (Alpha-1).
 
     sourceSets {
         commonMain.dependencies {

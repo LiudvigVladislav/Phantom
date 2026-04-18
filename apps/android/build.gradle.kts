@@ -62,14 +62,14 @@ android {
         debug {
             buildConfigField("String", "RELAY_URL", "\"ws://10.0.2.2:8080/ws\"")
             // No token in dev — relay runs without RELAY_SECRET_TOKEN (backward compatible).
-            buildConfigField("String?", "RELAY_TOKEN", "null")
+            buildConfigField("String", "RELAY_TOKEN", "null")
         }
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             buildConfigField("String", "RELAY_URL", "\"wss://relay.phantom.app/ws\"")
             // Override this via CI secrets: -PRELAY_TOKEN=<value>
-            buildConfigField("String?", "RELAY_TOKEN", "null")
+            buildConfigField("String", "RELAY_TOKEN", "null")
         }
     }
 

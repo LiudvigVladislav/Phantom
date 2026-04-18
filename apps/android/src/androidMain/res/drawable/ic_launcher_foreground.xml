@@ -5,14 +5,6 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!--
-        Ghost / Phantom silhouette.
-        Body: rounded head transitions into a scalloped skirt with three downward waves.
-        Eyes: two dark oval cutouts that read as the accent colour showing through on dark bg.
-        Palette: fill #00D4FF (CyanAccent), eye cutouts #0B0D12 (BgDeep).
-        ViewBox 108×108, safe zone starts at ~14px from each edge (adaptive icon spec).
-    -->
-
     <!-- Ghost body + scalloped skirt -->
     <path
         android:fillColor="#00D4FF"
@@ -31,20 +23,14 @@
             L84,48
             C84,31 71,18 54,18 Z" />
 
-    <!-- Left eye -->
-    <ellipse
+    <!-- Left eye (oval via arc path: cx=44 cy=50 rx=5 ry=6) -->
+    <path
         android:fillColor="#0B0D12"
-        android:cx="44"
-        android:cy="50"
-        android:rx="5"
-        android:ry="6" />
+        android:pathData="M39,50 A5,6 0 1,0 49,50 A5,6 0 1,0 39,50 Z" />
 
-    <!-- Right eye -->
-    <ellipse
+    <!-- Right eye (oval via arc path: cx=64 cy=50 rx=5 ry=6) -->
+    <path
         android:fillColor="#0B0D12"
-        android:cx="64"
-        android:cy="50"
-        android:rx="5"
-        android:ry="6" />
+        android:pathData="M59,50 A5,6 0 1,0 69,50 A5,6 0 1,0 59,50 Z" />
 
 </vector>

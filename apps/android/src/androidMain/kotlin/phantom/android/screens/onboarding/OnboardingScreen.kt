@@ -38,7 +38,8 @@ fun OnboardingScreen(
     // On Android < 13 this lambda is invoked immediately without showing a dialog.
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* granted or denied — proceed either way; notifications are non-blocking */ ->
+    ) { _ ->
+        // granted or denied — proceed either way; notifications are non-blocking
         onComplete()
     }
 

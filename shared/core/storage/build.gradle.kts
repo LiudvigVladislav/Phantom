@@ -8,8 +8,8 @@ plugins {
 kotlin {
     androidTarget()
     jvm()
-    iosArm64()
-    iosSimulatorArm64()
+    // iOS targets added when building KMP XCFramework on macOS (Alpha-1).
+    // Kotlin/Native cross-compilation to iOS is not supported on Windows.
 
     sourceSets {
         commonMain.dependencies {
@@ -22,18 +22,7 @@ kotlin {
         }
         androidMain.dependencies {
             implementation(libs.sqldelight.android.driver)
-            // SQLCipher: dependency is present and ready.
-            // Replace AndroidSqliteDriver with SQLCipherDriver in DatabaseDriverFactory
-            // during the hardening phase (post Alpha-0). See ADR-006.
             implementation(libs.sqlcipher.android)
-        }
-        // iosMain covers both iosArm64Main and iosSimulatorArm64Main via the default
-        // hierarchy. NativeSqliteDriver uses the OS-bundled SQLite — no extra pod needed.
-        // SQLCipher integration is deferred to the hardening phase. See ADR-006.
-        val iosMain by getting {
-            dependencies {
-                implementation(libs.sqldelight.native.driver)
-            }
         }
         commonTest.dependencies {
             implementation(kotlin("test"))

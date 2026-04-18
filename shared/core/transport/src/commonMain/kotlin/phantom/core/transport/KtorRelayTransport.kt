@@ -61,7 +61,7 @@ class KtorRelayTransport(
     private var identityHex: String = ""
     private var relayToken: String? = null
 
-    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String? = null) {
+    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {
         this.relayUrl = relayUrl
         this.identityHex = identityPublicKeyHex
         this.relayToken = token
