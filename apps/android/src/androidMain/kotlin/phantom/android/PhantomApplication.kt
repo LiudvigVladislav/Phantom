@@ -23,6 +23,8 @@ class PhantomApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // SQLCipher native lib must be loaded before any database access.
+        System.loadLibrary("sqlcipher")
         // Channel must exist before the first notification — idempotent, safe to call here.
         PhantomNotificationManager.createChannel(this)
         Log.d("PHANTOM_INIT", "Application onCreate — starting background init")
