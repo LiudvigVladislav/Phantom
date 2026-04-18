@@ -1,42 +1,36 @@
 package phantom.core.identity
 
-import com.ionspin.kotlin.crypto.signature.Signature
+import com.ionspin.kotlin.crypto.box.Box
 
+/**
+ * Alpha-0: uses X25519 (Box.keypair) for both identity and DH.
+ * Ed25519 signing is deferred to Beta when secure key storage is available.
+ */
+@OptIn(ExperimentalUnsignedTypes::class)
 class LibsodiumIdentityCrypto : IdentityCrypto {
 
     override fun generateKeyPair(): IdentityKeyPair {
-        val kp = Signature.keypair()
+        val kp = Box.keypair()
         return IdentityKeyPair(
-            publicKey = PublicKey(kp.publicKey.toByteArray()),
+            publicKey  = PublicKey(kp.publicKey.toByteArray()),
             privateKey = PrivateKey(kp.secretKey.toByteArray()),
         )
     }
 
-    override fun sign(message: ByteArray, privateKey: PrivateKey): ByteArray {
-        return Signature.signDetached(
-            message = message.toUByteArray(),
-            secretKey = privateKey.bytes.toUByteArray(),
-        ).toByteArray()
-    }
+    // sign/verify not used in Alpha-0 — deferred to Beta
+    override fun sign(message: ByteArray, privateKey: PrivateKey): ByteArray =
+        throw NotImplementedError("Signing deferred to Beta")
 
-    override fun verify(message: ByteArray, signature: ByteArray, publicKey: PublicKey): Boolean {
-        return try {
-            Signature.verifyDetached(
-                message = message.toUByteArray(),
-                signature = signature.toUByteArray(),
-                publicKey = publicKey.bytes.toUByteArray(),
-            )
-        } catch (_: Exception) {
-            false
-        }
-    }
+    override fun verify(message: ByteArray, signature: ByteArray, publicKey: PublicKey): Boolean =
+        throw NotImplementedError("Verification deferred to Beta")
 
     override fun publicKeyToHex(key: PublicKey): String = key.bytes.toHexString()
 
     override fun hexToPublicKey(hex: String): PublicKey = PublicKey(hex.hexToByteArray())
 }
 
-private fun ByteArray.toHexString(): String = joinToString("") { it.toInt().and(0xFF).toString(16).padStart(2, '0') }
+private fun ByteArray.toHexString(): String =
+    joinToString("") { it.toInt().and(0xFF).toString(16).padStart(2, '0') }
 
 private fun String.hexToByteArray(): ByteArray {
     require(length % 2 == 0) { "Hex string must have even length" }

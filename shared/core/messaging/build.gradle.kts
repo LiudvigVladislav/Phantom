@@ -6,9 +6,7 @@ plugins {
 
 kotlin {
     androidTarget()
-    iosX64()
-    iosArm64()
-    iosSimulatorArm64()
+    jvm()
 
     sourceSets {
         commonMain.dependencies {
@@ -24,6 +22,7 @@ kotlin {
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
+            implementation(libs.libsodium.bindings)
         }
     }
 }

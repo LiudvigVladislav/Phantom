@@ -7,9 +7,7 @@ plugins {
 
 kotlin {
     androidTarget()
-    iosX64()
-    iosArm64()
-    iosSimulatorArm64()
+    jvm()
 
     sourceSets {
         commonMain.dependencies {
@@ -27,9 +25,6 @@ kotlin {
             // during the hardening phase (post Alpha-0). See ADR-006.
             implementation(libs.sqlcipher.android)
         }
-        iosMain.dependencies {
-            implementation(libs.sqldelight.native.driver)
-        }
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
@@ -42,6 +37,7 @@ sqldelight {
         create("PhantomDatabase") {
             packageName.set("phantom.core.storage.db")
             srcDirs("src/commonMain/sqldelight")
+            version = 3
         }
     }
 }

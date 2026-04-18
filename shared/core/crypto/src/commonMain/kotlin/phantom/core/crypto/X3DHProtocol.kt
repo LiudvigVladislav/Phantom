@@ -59,4 +59,11 @@ interface X3DHProtocol {
 
     /** Generates a fresh Curve25519 DH keypair. */
     fun generateDhKeyPair(): DhKeyPair
+
+    /**
+     * Raw X25519 scalar multiplication.
+     * Alpha-0 bootstrap: both parties independently derive the same shared secret
+     * from their identity keys without a prekey server.
+     */
+    fun computeSharedSecret(privateKey: DhPrivateKey, publicKey: DhPublicKey): ByteArray
 }

@@ -21,7 +21,7 @@ class FakeRelayTransportTest {
 
         val outbox = Channel<RelayMessage.Send>(capacity = Channel.UNLIMITED)
 
-        override suspend fun connect(relayUrl: String, identityPublicKeyHex: String) {
+        override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {
             _state.value = TransportState.Connected
         }
 

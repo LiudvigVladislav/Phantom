@@ -1,6 +1,7 @@
 package phantom.core.messaging
 
 import phantom.core.crypto.DhKeyPair
+import phantom.core.crypto.DhPublicKey
 import phantom.core.crypto.RatchetState
 import phantom.core.crypto.X3DHProtocol
 import phantom.core.storage.RatchetStateRepository
@@ -22,14 +23,20 @@ class SessionManager(
         if (existing != null) {
             return json.decodeFromString(existing)
         }
-        val remotePublicKey = phantom.core.crypto.DhPublicKey(
-            remoteIdentityPublicKeyHex.hexToByteArray()
-        )
-        val signedPreKey = x3dh.generateDhKeyPair()
-        val state = x3dh.initiatorHandshake(
-            initiatorIdentityKeyPair = localIdentityKeyPair,
-            recipientIdentityPublicKey = remotePublicKey,
-            recipientSignedPreKey = signedPreKey.publicKey,
+        val remotePublicKey = DhPublicKey(remoteIdentityPublicKeyHex.hexToByteArray())
+
+        // Alpha-0: static ECDH bootstrap. Both parties independently derive the
+        // same root key: DH(my_identity_private, their_identity_public).
+        // No prekey server required. Forward secrecy begins after the first
+        // DH ratchet step on the first message.
+        val sharedSecret = x3dh.computeSharedSecret(localIdentityKeyPair.privateKey, remotePublicKey)
+        val state = RatchetState(
+            rootKey = sharedSecret,
+            sendingChainKey = null,
+            receivingChainKey = null,
+            sendingRatchetPublicKey = localIdentityKeyPair.publicKey.bytes,
+            sendingRatchetPrivateKey = localIdentityKeyPair.privateKey.bytes,
+            receivingRatchetPublicKey = remotePublicKey.bytes,
         )
         saveSession(conversationId, state)
         return state

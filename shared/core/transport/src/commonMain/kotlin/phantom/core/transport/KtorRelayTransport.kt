@@ -42,22 +42,40 @@ class KtorRelayTransport(
     )
     override val incoming: Flow<RelayMessage.Deliver> = _incoming.asSharedFlow()
 
+    private val _acks = MutableSharedFlow<RelayMessage.Ack>(
+        replay = 0,
+        extraBufferCapacity = 64,
+    )
+    override val acks: Flow<RelayMessage.Ack> = _acks.asSharedFlow()
+
+    private val _readReceipts = MutableSharedFlow<RelayMessage.ReadReceipt>(
+        replay = 0,
+        extraBufferCapacity = 64,
+    )
+    override val readReceipts: Flow<RelayMessage.ReadReceipt> = _readReceipts.asSharedFlow()
+
     private var session: WebSocketSession? = null
     private var scope: CoroutineScope? = null
     private var pingJob: Job? = null
     private var relayUrl: String = ""
     private var identityHex: String = ""
+    private var relayToken: String? = null
 
-    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String) {
+    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String? = null) {
         this.relayUrl = relayUrl
         this.identityHex = identityPublicKeyHex
+        this.relayToken = token
         openWithRetry(attempt = 0)
     }
 
     private suspend fun openWithRetry(attempt: Int) {
         _state.value = TransportState.Connecting
+        val urlWithId = if (identityHex.isNotEmpty()) "$relayUrl?id=$identityHex" else relayUrl
+        // Append token only when one is provided.  The relay ignores the param
+        // when RELAY_SECRET_TOKEN is not set, so this stays backward compatible.
+        val urlWithToken = if (relayToken != null) "$urlWithId&token=$relayToken" else urlWithId
         try {
-            httpClient.webSocket(relayUrl) {
+            httpClient.webSocket(urlWithToken) {
                 session = this
                 _state.value = TransportState.Connected
                 val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -96,8 +114,9 @@ class KtorRelayTransport(
                 try {
                     when (val msg = json.decodeFromString<RelayMessage>(text)) {
                         is RelayMessage.Deliver -> _incoming.emit(msg)
+                        is RelayMessage.Ack -> _acks.emit(msg)
+                        is RelayMessage.ReadReceipt -> _readReceipts.emit(msg)
                         is RelayMessage.Pong -> Unit
-                        is RelayMessage.Ack -> Unit
                         else -> Unit
                     }
                 } catch (_: Exception) { /* malformed frame — skip */ }
@@ -107,6 +126,11 @@ class KtorRelayTransport(
     }
 
     override suspend fun send(message: RelayMessage.Send): Boolean {
+        if (!isConnected()) return false
+        return sendRaw(message)
+    }
+
+    override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean {
         if (!isConnected()) return false
         return sendRaw(message)
     }

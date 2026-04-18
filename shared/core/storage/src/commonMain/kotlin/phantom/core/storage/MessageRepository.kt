@@ -4,6 +4,8 @@ interface MessageRepository {
     suspend fun getMessages(conversationId: String): List<MessageEntity>
     suspend fun insertMessage(entity: MessageEntity)
     suspend fun updateStatus(messageId: String, status: MessageStatus)
+    suspend fun updateMessageText(messageId: String, text: String)
+    suspend fun deleteMessage(messageId: String)
     suspend fun deleteMessagesForConversation(conversationId: String)
 }
 

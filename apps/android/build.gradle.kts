@@ -6,7 +6,11 @@ plugins {
 }
 
 kotlin {
-    androidTarget()
+    androidTarget {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+        }
+    }
 
     sourceSets {
         androidMain.dependencies {
@@ -16,6 +20,19 @@ kotlin {
             implementation(compose.ui)
             implementation(compose.components.resources)
             implementation(libs.kotlinx.coroutines.android)
+            implementation(libs.kotlinx.serialization.json)
+            implementation(libs.uuid)
+            implementation(libs.ktor.client.core)
+            implementation(libs.ktor.client.okhttp)
+            implementation(libs.ktor.client.websockets)
+            implementation(libs.androidx.activity.compose)
+            implementation(libs.zxing.core)
+            implementation(libs.camerax.camera2)
+            implementation(libs.camerax.lifecycle)
+            implementation(libs.camerax.view)
+            implementation(libs.mlkit.barcode)
+            implementation(libs.libsodium.bindings)
+            implementation(libs.sqlcipher.android)
             implementation(project(":shared:core:identity"))
             implementation(project(":shared:core:crypto"))
             implementation(project(":shared:core:storage"))
@@ -37,15 +54,27 @@ android {
         versionName = "0.0.1-alpha"
     }
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     buildTypes {
+        debug {
+            buildConfigField("String", "RELAY_URL", "\"ws://10.0.2.2:8080/ws\"")
+            // No token in dev — relay runs without RELAY_SECRET_TOKEN (backward compatible).
+            buildConfigField("String?", "RELAY_TOKEN", "null")
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            buildConfigField("String", "RELAY_URL", "\"wss://relay.phantom.app/ws\"")
+            // Override this via CI secrets: -PRELAY_TOKEN=<value>
+            buildConfigField("String?", "RELAY_TOKEN", "null")
         }
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
 }

@@ -19,5 +19,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?);
 updateMessageStatus:
 UPDATE message SET status = ? WHERE id = ?;
 
+deleteMessage:
+DELETE FROM message WHERE id = ?;
+
+updateMessageText:
+UPDATE message SET plaintext_cache = ? WHERE id = ?;
+
 deleteMessagesForConversation:
 DELETE FROM message WHERE conversation_id = ?;

@@ -10,7 +10,6 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.datetime.Clock
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import phantom.core.crypto.CryptoKeys
 import phantom.core.crypto.DoubleRatchet
 import phantom.core.crypto.DhKeyPair
 import phantom.core.crypto.DhPublicKey
@@ -45,6 +44,11 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun updateStatus(messageId: String, status: MessageStatus) {
         statusUpdates[messageId] = status
     }
+    override suspend fun updateMessageText(messageId: String, text: String) {
+        val i = messages.indexOfFirst { it.id == messageId }
+        if (i != -1) messages[i] = messages[i].copy(plaintextCache = text)
+    }
+    override suspend fun deleteMessage(messageId: String) { messages.removeAll { it.id == messageId } }
     override suspend fun deleteMessagesForConversation(conversationId: String) {
         messages.removeAll { it.conversationId == conversationId }
     }
@@ -54,6 +58,8 @@ private class FakeConversationRepository : ConversationRepository {
     val store = mutableMapOf<String, ConversationEntity>()
 
     override suspend fun getAllConversations() = store.values.toList()
+    override suspend fun getActiveConversations() = store.values.filter { !it.blocked }.toList()
+    override suspend fun getMessageRequests() = store.values.filter { it.trustTier == phantom.core.storage.TrustTier.REQUEST }.toList()
     override suspend fun getConversation(id: String) = store[id]
     override suspend fun upsertConversation(entity: ConversationEntity) { store[entity.id] = entity }
     override suspend fun incrementUnread(conversationId: String) {
@@ -61,6 +67,15 @@ private class FakeConversationRepository : ConversationRepository {
     }
     override suspend fun resetUnread(conversationId: String) {
         store[conversationId]?.let { store[conversationId] = it.copy(unreadCount = 0) }
+    }
+    override suspend fun updateNotes(conversationId: String, notes: String?) {
+        store[conversationId]?.let { store[conversationId] = it.copy(notes = notes) }
+    }
+    override suspend fun blockConversation(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(blocked = true) }
+    }
+    override suspend fun acceptRequest(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(trustTier = phantom.core.storage.TrustTier.TRUSTED) }
     }
     override suspend fun deleteConversation(id: String) { store.remove(id) }
 }
@@ -76,10 +91,13 @@ private class FakeRelayTransport : RelayTransport {
     private val _state = MutableStateFlow<TransportState>(TransportState.Connected)
     override val state: StateFlow<TransportState> = _state
     override val incoming: Flow<RelayMessage.Deliver> = emptyFlow()
+    override val acks: Flow<RelayMessage.Ack> = emptyFlow()
+    override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
     val sent = mutableListOf<RelayMessage.Send>()
     override suspend fun connect(relayUrl: String, identityPublicKeyHex: String) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
+    override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
     override fun isConnected() = true
 }
 
@@ -102,6 +120,8 @@ private class PassthroughX3DH : X3DHProtocol {
         DhPublicKey(ByteArray(32) { 1 }),
         DhPrivateKey(ByteArray(32) { 2 }),
     )
+    override fun computeSharedSecret(privateKey: phantom.core.crypto.DhPrivateKey, publicKey: DhPublicKey): ByteArray =
+        ByteArray(32)
     override fun initiatorHandshake(
         initiatorIdentityKeyPair: DhKeyPair,
         recipientIdentityPublicKey: DhPublicKey,
@@ -131,6 +151,7 @@ class DefaultMessagingServiceTest {
         id = "id-1",
         username = "alice",
         publicKeyHex = "aabb",
+        dhPrivateKeyHex = "ccdd",
         createdAt = 0L,
     )
     private val localKeyPair = DhKeyPair(

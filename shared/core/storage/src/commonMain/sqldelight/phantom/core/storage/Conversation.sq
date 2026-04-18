@@ -4,24 +4,49 @@ CREATE TABLE conversation (
     their_public_key_hex TEXT NOT NULL,
     last_message_preview TEXT,
     last_message_at INTEGER,
-    unread_count INTEGER NOT NULL DEFAULT 0
+    unread_count INTEGER NOT NULL DEFAULT 0,
+    trust_tier TEXT NOT NULL DEFAULT 'TRUSTED',
+    blocked INTEGER NOT NULL DEFAULT 0,
+    notes TEXT DEFAULT NULL
 );
 
 getAllConversations:
 SELECT * FROM conversation ORDER BY last_message_at DESC;
 
+getActiveConversations:
+SELECT * FROM conversation
+WHERE blocked = 0 AND trust_tier = 'TRUSTED' AND their_public_key_hex != ''
+ORDER BY last_message_at DESC;
+
+getMessageRequests:
+SELECT * FROM conversation
+WHERE blocked = 0 AND trust_tier = 'REQUEST'
+ORDER BY last_message_at DESC;
+
 getConversation:
 SELECT * FROM conversation WHERE id = ?;
 
 upsertConversation:
-INSERT OR REPLACE INTO conversation(id, their_username, their_public_key_hex, last_message_preview, last_message_at, unread_count)
-VALUES (?, ?, ?, ?, ?, ?);
+INSERT OR REPLACE INTO conversation(
+    id, their_username, their_public_key_hex,
+    last_message_preview, last_message_at, unread_count,
+    trust_tier, blocked, notes
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateNotes:
+UPDATE conversation SET notes = ? WHERE id = ?;
 
 incrementUnread:
 UPDATE conversation SET unread_count = unread_count + 1 WHERE id = ?;
 
 resetUnread:
 UPDATE conversation SET unread_count = 0 WHERE id = ?;
+
+blockConversation:
+UPDATE conversation SET blocked = 1 WHERE id = ?;
+
+acceptRequest:
+UPDATE conversation SET trust_tier = 'TRUSTED' WHERE id = ?;
 
 deleteConversation:
 DELETE FROM conversation WHERE id = ?;

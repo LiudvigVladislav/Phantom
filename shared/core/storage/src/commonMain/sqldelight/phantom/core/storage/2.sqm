@@ -1,0 +1,3 @@
+-- Migration from schema version 2 → 3
+-- Adds personal notes field to conversation.
+ALTER TABLE conversation ADD COLUMN notes TEXT DEFAULT NULL;

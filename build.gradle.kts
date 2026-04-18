@@ -9,3 +9,15 @@ plugins {
     alias(libs.plugins.android.library) apply false
     alias(libs.plugins.sqldelight) apply false
 }
+
+// Align Java/Kotlin JVM target for all Android library modules.
+subprojects {
+    plugins.withId("com.android.library") {
+        configure<com.android.build.gradle.LibraryExtension> {
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_21
+                targetCompatibility = JavaVersion.VERSION_21
+            }
+        }
+    }
+}

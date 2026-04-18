@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Minimal window theme for PHANTOM.
+        Compose handles all UI theming via PhantomTheme.
+        On API 35+ the system enforces edge-to-edge automatically.
+    -->
+    <style name="Theme.Phantom" parent="android:Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">#0B0D12</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+    </style>
+</resources>

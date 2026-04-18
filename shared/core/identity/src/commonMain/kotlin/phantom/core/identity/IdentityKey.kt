@@ -18,5 +18,6 @@ data class IdentityRecord(
     val id: String,
     val username: String,
     val publicKeyHex: String,
+    val dhPrivateKeyHex: String,
     val createdAt: Long,
 )

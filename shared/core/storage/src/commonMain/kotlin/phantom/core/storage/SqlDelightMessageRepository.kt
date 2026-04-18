@@ -34,6 +34,16 @@ class SqlDelightMessageRepository(
             )
         }
 
+    override suspend fun updateMessageText(messageId: String, text: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.updateMessageText(plaintext_cache = text, id = messageId)
+        }
+
+    override suspend fun deleteMessage(messageId: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.deleteMessage(messageId)
+        }
+
     override suspend fun deleteMessagesForConversation(conversationId: String): Unit =
         withContext(Dispatchers.IO) {
             db.messageQueries.deleteMessagesForConversation(conversationId)
@@ -43,7 +53,7 @@ class SqlDelightMessageRepository(
     // Mapping
     // ---------------------------------------------------------------------------
 
-    private fun phantom.core.storage.db.Message.toEntity() = MessageEntity(
+    private fun Message.toEntity() = MessageEntity(
         id = id,
         conversationId = conversation_id,
         ciphertext = ciphertext,

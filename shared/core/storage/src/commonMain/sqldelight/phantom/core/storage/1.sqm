@@ -1,0 +1,4 @@
+-- Migration from schema version 1 → 2
+-- Adds trust_tier and blocked to existing conversation rows.
+ALTER TABLE conversation ADD COLUMN trust_tier TEXT NOT NULL DEFAULT 'TRUSTED';
+ALTER TABLE conversation ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0;

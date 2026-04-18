@@ -2,6 +2,7 @@ CREATE TABLE identity (
     id TEXT NOT NULL PRIMARY KEY,
     username TEXT NOT NULL,
     public_key_hex TEXT NOT NULL,
+    dh_private_key_hex TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
 
@@ -9,8 +10,8 @@ getIdentity:
 SELECT * FROM identity LIMIT 1;
 
 insertIdentity:
-INSERT OR REPLACE INTO identity(id, username, public_key_hex, created_at)
-VALUES (?, ?, ?, ?);
+INSERT OR REPLACE INTO identity(id, username, public_key_hex, dh_private_key_hex, created_at)
+VALUES (?, ?, ?, ?, ?);
 
 deleteIdentity:
 DELETE FROM identity;

@@ -31,6 +31,14 @@ sealed class RelayMessage {
     ) : RelayMessage()
 
     @Serializable
+    @SerialName("read")
+    data class ReadReceipt(
+        val to: String,         // recipient public key hex
+        val from: String,       // sender public key hex
+        val messageId: String,  // the message that was read
+    ) : RelayMessage()
+
+    @Serializable
     @SerialName("ping")
     object Ping : RelayMessage()
 
