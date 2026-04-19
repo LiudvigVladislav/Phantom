@@ -78,6 +78,10 @@ private class FakeConversationRepository : ConversationRepository {
         store[conversationId]?.let { store[conversationId] = it.copy(trustTier = phantom.core.storage.TrustTier.TRUSTED) }
     }
     override suspend fun deleteConversation(id: String) { store.remove(id) }
+    override suspend fun getBlockedConversations() = store.values.filter { it.blocked }.toList()
+    override suspend fun unblockConversation(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(blocked = false) }
+    }
 }
 
 private class FakeRatchetStateRepository : RatchetStateRepository {
@@ -94,7 +98,7 @@ private class FakeRelayTransport : RelayTransport {
     override val acks: Flow<RelayMessage.Ack> = emptyFlow()
     override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
     val sent = mutableListOf<RelayMessage.Send>()
-    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String) {}
+    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
