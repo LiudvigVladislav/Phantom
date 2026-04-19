@@ -87,12 +87,11 @@ fun ChatListScreen(
                     color = TextPrimary,
                 )
                 Spacer(Modifier.weight(1f))
-                IconButton(onClick = onScanQr, modifier = Modifier.size(36.dp)) {
-                    Icon(Icons.Default.Email, contentDescription = "Scan QR", tint = TextDim, modifier = Modifier.size(20.dp))
+                IconButton(onClick = onScanQr) {
+                    Icon(Icons.Default.Email, contentDescription = "Scan QR", tint = TextDim, modifier = Modifier.size(22.dp))
                 }
-                Spacer(Modifier.width(4.dp))
-                IconButton(onClick = onProfile, modifier = Modifier.size(36.dp)) {
-                    Icon(Icons.Default.Person, contentDescription = "Profile", tint = TextDim, modifier = Modifier.size(20.dp))
+                IconButton(onClick = onProfile) {
+                    Icon(Icons.Default.Person, contentDescription = "Profile", tint = TextDim, modifier = Modifier.size(22.dp))
                 }
             }
 
@@ -104,6 +103,7 @@ fun ChatListScreen(
                     .clip(RoundedCornerShape(10.dp))
                     .background(Surface)
                     .border(1.dp, Color.White.copy(alpha = 0.04f), RoundedCornerShape(10.dp))
+                    .clickable { /* search — TODO */ }
                     .padding(horizontal = 14.dp, vertical = 10.dp),
             ) {
                 Text(
@@ -115,6 +115,11 @@ fun ChatListScreen(
             }
 
             LazyColumn(modifier = Modifier.fillMaxSize()) {
+                // ── Notes (saved messages) ─────────────────────
+                item(key = "__notes__") {
+                    NotesRow(onClick = { onNavigate(Screen.SavedMessages) })
+                }
+
                 // ── Message requests banner ────────────────────
                 if (requestCount > 0) {
                     item {
@@ -220,6 +225,40 @@ fun ChatListScreen(
                 onNavigate(Screen.Chat(convId, username))
             },
         )
+    }
+}
+
+@Composable
+private fun NotesRow(onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(46.dp)
+                .clip(CircleShape)
+                .background(CyanAccent.copy(alpha = 0.12f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.size(22.dp)) {
+                val w = size.width; val h = size.height
+                val path = androidx.compose.ui.graphics.Path().apply {
+                    moveTo(w * 0.2f, 0f); lineTo(w * 0.8f, 0f)
+                    lineTo(w * 0.8f, h); lineTo(w * 0.5f, h * 0.72f)
+                    lineTo(w * 0.2f, h); close()
+                }
+                drawPath(path = path, color = CyanAccent)
+            }
+        }
+        Spacer(Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text("Notes", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Normal)
+            Text("Personal notes & saved", color = TextDim, fontSize = 13.sp)
+        }
     }
 }
 
