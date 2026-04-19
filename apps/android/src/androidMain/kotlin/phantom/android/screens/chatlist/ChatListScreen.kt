@@ -8,11 +8,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.Canvas
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.*
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +37,7 @@ import phantom.core.storage.ConversationEntity
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.TrustTier
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatListScreen(
     container: AppContainer,
@@ -68,33 +72,45 @@ fun ChatListScreen(
         container.messagingService?.incomingMessages?.collect { reload() }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(BgDeep)) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            // ── Top bar ───────────────────────────────────────
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Surface)
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
+    Scaffold(
+        containerColor = BgDeep,
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        text = "PHANTOM",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Light,
+                        letterSpacing = 6.sp,
+                        color = TextPrimary,
+                    )
+                },
+                actions = {
+                    IconButton(onClick = onScanQr) { QrScanIcon() }
+                    IconButton(onClick = onProfile) {
+                        Icon(Icons.Default.Person, contentDescription = "Profile", tint = TextDim)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Surface),
+            )
+        },
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = { showAddDialog = true },
+                containerColor = CyanAccent,
+                contentColor = BgDeep,
+                shape = CircleShape,
             ) {
-                Text(
-                    text = "PHANTOM",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Light,
-                    letterSpacing = 6.sp,
-                    color = TextPrimary,
-                )
-                Spacer(Modifier.weight(1f))
-                IconButton(onClick = onScanQr) {
-                    Icon(Icons.Default.Email, contentDescription = "Scan QR", tint = TextDim, modifier = Modifier.size(22.dp))
-                }
-                IconButton(onClick = onProfile) {
-                    Icon(Icons.Default.Person, contentDescription = "Profile", tint = TextDim, modifier = Modifier.size(22.dp))
-                }
+                Icon(Icons.Default.Add, contentDescription = "Add contact")
             }
-
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+        ) {
             // ── Search pill ───────────────────────────────────
             Box(
                 modifier = Modifier
@@ -141,7 +157,7 @@ fun ChatListScreen(
                                     .background(CyanAccent.copy(alpha = 0.15f)),
                                 contentAlignment = Alignment.Center,
                             ) {
-                                Icon(Icons.Default.Email, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(18.dp))
+                                Canvas(modifier = Modifier.size(18.dp)) { drawQrFinderDots(CyanAccent) }
                             }
                             Spacer(Modifier.width(12.dp))
                             Column(modifier = Modifier.weight(1f)) {
@@ -196,20 +212,6 @@ fun ChatListScreen(
                     }
                 }
             }
-        }
-
-        // ── FAB ───────────────────────────────────────────────
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp)
-                .size(56.dp)
-                .clip(CircleShape)
-                .background(CyanAccent)
-                .clickable { showAddDialog = true },
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(Icons.Default.Add, contentDescription = "Add contact", tint = BgDeep, modifier = Modifier.size(26.dp))
         }
     }
 
@@ -349,6 +351,33 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun QrScanIcon() {
+    Canvas(modifier = Modifier.size(24.dp)) { drawQrFinderDots(TextDim) }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawQrFinderDots(color: Color) {
+    val s = size
+    val sw = 1.8.dp.toPx()
+    val st = Stroke(width = sw)
+    val cr = androidx.compose.ui.geometry.CornerRadius(2.4.dp.toPx())
+    val box = s.width * 0.36f
+    val gap = sw / 2f
+    drawRoundRect(color = color, topLeft = Offset(gap, gap), size = Size(box, box), cornerRadius = cr, style = st)
+    drawRoundRect(color = color, topLeft = Offset(s.width - box - gap, gap), size = Size(box, box), cornerRadius = cr, style = st)
+    drawRoundRect(color = color, topLeft = Offset(gap, s.height - box - gap), size = Size(box, box), cornerRadius = cr, style = st)
+    val dotR = box * 0.22f
+    drawCircle(color = color, radius = dotR, center = Offset(gap + box / 2f, gap + box / 2f))
+    drawCircle(color = color, radius = dotR, center = Offset(s.width - box / 2f - gap, gap + box / 2f))
+    drawCircle(color = color, radius = dotR, center = Offset(gap + box / 2f, s.height - box / 2f - gap))
+    val br = s.width - box - gap
+    val bb = s.height - gap
+    val d = box / 3f
+    drawCircle(color = color, radius = sw * 0.9f, center = Offset(br + d, bb - box + d))
+    drawCircle(color = color, radius = sw * 0.9f, center = Offset(br + d * 2.4f, bb - box + d * 2.4f))
+    drawCircle(color = color, radius = sw * 0.9f, center = Offset(br + d, bb - d))
 }
 
 private fun formatChatTime(millis: Long): String {
