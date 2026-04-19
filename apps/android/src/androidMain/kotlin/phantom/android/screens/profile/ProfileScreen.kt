@@ -8,6 +8,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -44,9 +45,11 @@ fun ProfileScreen(
     var identity by remember { mutableStateOf<IdentityRecord?>(null) }
     var copied by remember { mutableStateOf(false) }
     var showLogoutDialog by remember { mutableStateOf(false) }
+    var blockedContacts by remember { mutableStateOf<List<phantom.core.storage.ConversationEntity>>(emptyList()) }
 
     LaunchedEffect(Unit) {
         identity = container.identityRepo.loadIdentity()
+        blockedContacts = container.conversationRepo.getBlockedConversations()
     }
 
     Scaffold(
@@ -265,6 +268,74 @@ fun ProfileScreen(
             }
 
             Spacer(Modifier.height(32.dp))
+
+            // Blocked contacts
+            if (blockedContacts.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Surface)
+                ) {
+                    Text(
+                        text = "BLOCKED CONTACTS",
+                        color = TextDim,
+                        fontSize = 11.sp,
+                        letterSpacing = 1.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    )
+                    HorizontalDivider(color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.05f))
+                    blockedContacts.forEach { contact ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(CircleShape)
+                                    .background(Surface2),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = contact.theirUsername.take(1).uppercase(),
+                                    color = TextDim,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Text(
+                                text = "@${contact.theirUsername}",
+                                color = TextPrimary,
+                                fontSize = 14.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = {
+                                    scope.launch {
+                                        container.conversationRepo.unblockConversation(contact.id)
+                                        blockedContacts = container.conversationRepo.getBlockedConversations()
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                            ) {
+                                Text("Unblock", color = CyanAccent, fontSize = 13.sp)
+                            }
+                        }
+                        if (contact != blockedContacts.last()) {
+                            HorizontalDivider(
+                                modifier = Modifier.padding(start = 64.dp),
+                                color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.04f),
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(24.dp))
+            }
 
             // Sign out button
             Box(
