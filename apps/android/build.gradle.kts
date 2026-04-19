@@ -60,7 +60,9 @@ android {
 
     buildTypes {
         debug {
-            buildConfigField("String", "RELAY_URL", "\"ws://10.0.2.2:8080/ws\"")
+            // localhost works for real USB device via: adb reverse tcp:8080 tcp:8080
+            // For emulator only, use: ws://10.0.2.2:8080/ws
+            buildConfigField("String", "RELAY_URL", "\"ws://localhost:8080/ws\"")
             // No token in dev — relay runs without RELAY_SECRET_TOKEN (backward compatible).
             buildConfigField("String", "RELAY_TOKEN", "null")
         }
