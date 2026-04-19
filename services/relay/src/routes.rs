@@ -1,4 +1,4 @@
-use crate::{envelope::*, error::RelayError, state::{AppState, RateEntry}};
+use crate::{envelope::*, error::RelayError, state::{AppState, AbuseReport, RateEntry}};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -27,6 +27,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/send",               post(send_envelope))
         .route("/fetch/{recipient}",  get(fetch_envelopes))
         .route("/ack/{id}",           delete(ack_envelope))
+        .route("/report",             post(submit_report))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
@@ -71,7 +72,16 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
     // Register client
     if !identity.is_empty() {
         state.clients.write().await.insert(identity.clone(), tx.clone());
-        tracing::info!(id = %&identity[..identity.len().min(16)], "client connected");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        tracing::info!(
+            event  = "connect",
+            key    = %&identity[..identity.len().min(16)],
+            ts_ms  = ts,
+            "metadata"
+        );
 
         // Flush queued messages
         let queued: Vec<Envelope> = {
@@ -127,7 +137,16 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
     // Unregister client
     if !identity.is_empty() {
         state.clients.write().await.remove(&identity);
-        tracing::info!(id = %&identity[..identity.len().min(16)], "client disconnected");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        tracing::info!(
+            event = "disconnect",
+            key   = %&identity[..identity.len().min(16)],
+            ts_ms = ts,
+            "metadata"
+        );
     }
 }
 
@@ -147,11 +166,18 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                 tracing::warn!(from = %&from[..from.len().min(16)], to = %&to[..to.len().min(16)], "send dropped: empty field");
                 return;
             }
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
             tracing::info!(
-                msg_id = %msg_id,
-                from = %&from[..from.len().min(16)],
-                to   = %&to[..to.len().min(16)],
-                "send received"
+                event    = "message",
+                msg_id   = %msg_id,
+                from_key = %&from[..from.len().min(16)],
+                to_key   = %&to[..to.len().min(16)],
+                size_b   = payload.len(),
+                ts_ms    = ts,
+                "metadata"
             );
 
             // Rate-limit check — sliding window per sender identity.
@@ -321,4 +347,47 @@ async fn ack_envelope(
 
     tracing::debug!(message_id = %id, "envelope acknowledged");
     Ok((StatusCode::OK, Json(AckResponse { acknowledged: id })))
+}
+
+// ── Abuse report ──────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct ReportRequest {
+    reporter_key: String,
+    reported_key: String,
+    category: String,
+}
+
+async fn submit_report(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ReportRequest>,
+) -> impl IntoResponse {
+    if req.reporter_key.is_empty() || req.reported_key.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "missing fields" })));
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let report = AbuseReport {
+        reporter_key: req.reporter_key[..req.reporter_key.len().min(64)].to_string(),
+        reported_key: req.reported_key[..req.reported_key.len().min(64)].to_string(),
+        category: req.category[..req.category.len().min(64)].to_string(),
+        timestamp_ms: ts,
+    };
+
+    tracing::warn!(
+        event        = "abuse_report",
+        reporter_key = %&report.reporter_key[..report.reporter_key.len().min(16)],
+        reported_key = %&report.reported_key[..report.reported_key.len().min(16)],
+        category     = %report.category,
+        ts_ms        = ts,
+        "report received"
+    );
+
+    state.reports.write().await.push(report);
+
+    (StatusCode::OK, Json(serde_json::json!({ "status": "received" })))
 }

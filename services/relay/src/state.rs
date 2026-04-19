@@ -1,19 +1,26 @@
 use crate::config::RelayConfig;
 use crate::envelope::Envelope;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, RwLock};
 
 /// Per-sender sliding-window rate-limit entry.
-/// The relay tracks only a counter and a window start timestamp —
-/// no message content is inspected or stored here.
 #[derive(Debug)]
 pub struct RateEntry {
     pub count: u32,
     pub window_start: std::time::Instant,
 }
 
+/// Abuse report submitted by a user. No message content is stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbuseReport {
+    pub reporter_key: String,
+    pub reported_key: String,
+    pub category: String,
+    pub timestamp_ms: u64,
+}
+
 /// In-memory store for Alpha-0.
-/// Post-Alpha-0: replace with Redis or a persistent store.
 pub struct AppState {
     pub config: RelayConfig,
     /// recipient_public_key_hex → queue of offline envelopes
@@ -21,8 +28,9 @@ pub struct AppState {
     /// identity_hex → sender channel for live WebSocket clients
     pub clients: RwLock<HashMap<String, mpsc::UnboundedSender<String>>>,
     /// Rate limiter: message count per sender identity in current window.
-    /// Only the sender's public-key hex and a counter are kept — no payload.
     pub rate_limiter: RwLock<HashMap<String, RateEntry>>,
+    /// Abuse reports received via /report endpoint.
+    pub reports: RwLock<Vec<AbuseReport>>,
 }
 
 impl AppState {
@@ -32,6 +40,7 @@ impl AppState {
             store: RwLock::new(HashMap::new()),
             clients: RwLock::new(HashMap::new()),
             rate_limiter: RwLock::new(HashMap::new()),
+            reports: RwLock::new(Vec::new()),
         }
     }
 }
