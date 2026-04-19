@@ -80,6 +80,9 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
             queue.retain(|e| !e.is_expired());
             std::mem::take(queue)
         };
+        if !queued.is_empty() {
+            tracing::info!(id = %&identity[..identity.len().min(16)], count = queued.len(), "flushing queued envelopes");
+        }
         for env in queued {
             let deliver = serde_json::json!({
                 "type": "deliver",
@@ -141,8 +144,15 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             let msg_id  = value["messageId"].as_str().unwrap_or("").to_string();
 
             if to.is_empty() || payload.is_empty() || msg_id.is_empty() {
+                tracing::warn!(from = %&from[..from.len().min(16)], to = %&to[..to.len().min(16)], "send dropped: empty field");
                 return;
             }
+            tracing::info!(
+                msg_id = %msg_id,
+                from = %&from[..from.len().min(16)],
+                to   = %&to[..to.len().min(16)],
+                "send received"
+            );
 
             // Rate-limit check — sliding window per sender identity.
             // On window expiry the counter resets; within the window it increments.
@@ -191,7 +201,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             };
 
             if delivered {
-                tracing::debug!(msg_id = %msg_id, to = %&to[..to.len().min(16)], "live delivery");
+                tracing::info!(msg_id = %msg_id, to = %&to[..to.len().min(16)], "live delivery OK");
             } else {
                 // Store for later
                 let envelope = Envelope::new(
@@ -201,12 +211,21 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                     payload,
                     state.config.envelope_ttl_secs,
                 );
+                {
+                    let clients = state.clients.read().await;
+                    let known: Vec<String> = clients.keys().map(|k| k[..k.len().min(16)].to_string()).collect();
+                    tracing::info!(
+                        msg_id = %msg_id,
+                        to = %&to[..to.len().min(16)],
+                        online_clients = ?known,
+                        "recipient offline — queuing"
+                    );
+                }
                 let mut store = state.store.write().await;
                 let queue = store.entry(to).or_default();
                 queue.retain(|e| !e.is_expired());
                 if queue.len() < state.config.max_envelopes_per_recipient {
                     queue.push(envelope);
-                    tracing::debug!(msg_id = %msg_id, "envelope queued");
                 }
             }
 

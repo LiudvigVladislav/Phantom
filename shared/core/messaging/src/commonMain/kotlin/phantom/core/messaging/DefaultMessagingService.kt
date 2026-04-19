@@ -166,10 +166,28 @@ class DefaultMessagingService(
             // Handle control messages — do not store as chat messages
             if (payload.type == "delete" && payload.targetMessageId.isNotEmpty()) {
                 messageRepository.deleteMessage(payload.targetMessageId)
+                _incomingMessages.emit(
+                    IncomingMessage(
+                        id = payload.targetMessageId,
+                        conversationId = conversationId,
+                        senderPublicKeyHex = deliver.from,
+                        text = "",
+                        receivedAt = Clock.System.now().toEpochMilliseconds(),
+                    )
+                )
                 return@runCatching
             }
             if (payload.type == "edit" && payload.targetMessageId.isNotEmpty()) {
                 messageRepository.updateMessageText(payload.targetMessageId, payload.text)
+                _incomingMessages.emit(
+                    IncomingMessage(
+                        id = payload.targetMessageId,
+                        conversationId = conversationId,
+                        senderPublicKeyHex = deliver.from,
+                        text = payload.text,
+                        receivedAt = Clock.System.now().toEpochMilliseconds(),
+                    )
+                )
                 return@runCatching
             }
 
