@@ -71,8 +71,6 @@ class KtorRelayTransport(
     private suspend fun openWithRetry(attempt: Int) {
         _state.value = TransportState.Connecting
         val urlWithId = if (identityHex.isNotEmpty()) "$relayUrl?id=$identityHex" else relayUrl
-        // Append token only when one is provided.  The relay ignores the param
-        // when RELAY_SECRET_TOKEN is not set, so this stays backward compatible.
         val urlWithToken = if (relayToken != null) "$urlWithId&token=$relayToken" else urlWithId
         try {
             httpClient.webSocket(urlWithToken) {
@@ -82,7 +80,14 @@ class KtorRelayTransport(
                 scope = transportScope
                 startPing(transportScope)
                 readLoop()
+                // readLoop() returns when the server closes the connection cleanly.
+                // Cancel ping so it doesn't try to write to a dead session.
+                transportScope.cancel()
             }
+            // Clean close — reconnect immediately from attempt 0.
+            _state.value = TransportState.Disconnected
+            delay(RelayTransportConfig.RECONNECT_BASE_DELAY_MS)
+            openWithRetry(0)
         } catch (e: Exception) {
             _state.value = TransportState.Error(e)
             if (attempt < RelayTransportConfig.RECONNECT_MAX_ATTEMPTS) {
