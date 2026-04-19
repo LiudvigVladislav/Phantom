@@ -42,8 +42,14 @@ UPDATE conversation SET unread_count = unread_count + 1 WHERE id = ?;
 resetUnread:
 UPDATE conversation SET unread_count = 0 WHERE id = ?;
 
+getBlockedConversations:
+SELECT * FROM conversation WHERE blocked = 1 ORDER BY their_username ASC;
+
 blockConversation:
 UPDATE conversation SET blocked = 1 WHERE id = ?;
+
+unblockConversation:
+UPDATE conversation SET blocked = 0 WHERE id = ?;
 
 acceptRequest:
 UPDATE conversation SET trust_tier = 'TRUSTED' WHERE id = ?;

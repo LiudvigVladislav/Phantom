@@ -242,14 +242,31 @@ fun ContactProfileScreen(
                     .fillMaxWidth()
                     .background(Surface)
             ) {
-                TextButton(
-                    onClick = { showBlockDialog = true },
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-                ) {
-                    Text("🚫", fontSize = 16.sp, modifier = Modifier.size(20.dp))
-                    Spacer(Modifier.width(12.dp))
-                    Text("Block @$theirUsername", color = Danger, fontSize = 14.sp)
-                    Spacer(Modifier.weight(1f))
+                if (conversation.blocked) {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                container.conversationRepo.unblockConversation(conversationId)
+                                conversation = conversation.copy(blocked = false)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                    ) {
+                        Text("✓", fontSize = 16.sp, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(12.dp))
+                        Text("Unblock @$theirUsername", color = Success, fontSize = 14.sp)
+                        Spacer(Modifier.weight(1f))
+                    }
+                } else {
+                    TextButton(
+                        onClick = { showBlockDialog = true },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                    ) {
+                        Text("🚫", fontSize = 16.sp, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(12.dp))
+                        Text("Block @$theirUsername", color = Danger, fontSize = 14.sp)
+                        Spacer(Modifier.weight(1f))
+                    }
                 }
                 HorizontalDivider(color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.04f), thickness = 1.dp)
                 TextButton(

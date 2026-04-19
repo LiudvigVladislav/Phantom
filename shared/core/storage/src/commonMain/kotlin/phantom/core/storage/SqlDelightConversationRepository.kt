@@ -58,9 +58,19 @@ class SqlDelightConversationRepository(
             db.conversationQueries.resetUnread(conversationId)
         }
 
+    override suspend fun getBlockedConversations(): List<ConversationEntity> =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.getBlockedConversations().executeAsList().map { it.toEntity() }
+        }
+
     override suspend fun blockConversation(conversationId: String): Unit =
         withContext(Dispatchers.IO) {
             db.conversationQueries.blockConversation(conversationId)
+        }
+
+    override suspend fun unblockConversation(conversationId: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.unblockConversation(conversationId)
         }
 
     override suspend fun acceptRequest(conversationId: String): Unit =

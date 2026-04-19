@@ -77,6 +77,7 @@ fun ChatScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showBlockDialog by remember { mutableStateOf(false) }
     var showReportDialog by remember { mutableStateOf(false) }
+    val snackbarHostState = remember { androidx.compose.material3.SnackbarHostState() }
 
     // Reply / Edit / Forward state
     var replyToMessage by remember { mutableStateOf<MessageEntity?>(null) }
@@ -247,7 +248,10 @@ fun ChatScreen(
     if (showReportDialog) {
         ReportDialog(
             username = theirUsername,
-            onReport = { _ -> showReportDialog = false },
+            onReport = { _ ->
+                showReportDialog = false
+                scope.launch { snackbarHostState.showSnackbar("Report sent. Thank you.") }
+            },
             onDismiss = { showReportDialog = false },
         )
     }
@@ -256,6 +260,7 @@ fun ChatScreen(
     Scaffold(
         containerColor = BgDeep,
         contentWindowInsets = WindowInsets(0),
+        snackbarHost = { androidx.compose.material3.SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
@@ -280,9 +285,9 @@ fun ChatScreen(
                         Box(
                             modifier = Modifier
                                 .offset(x = (-8).dp, y = 10.dp)
-                                .size(9.dp)
+                                .size(11.dp)
                                 .clip(CircleShape)
-                                .background(if (isConnected) Success else TextDim.copy(alpha = 0.4f))
+                                .background(if (isConnected) Success else CyanAccent.copy(alpha = 0.35f))
                         )
                         Spacer(Modifier.width(4.dp))
                         Column {
@@ -294,8 +299,8 @@ fun ChatScreen(
                             )
                             Text(
                                 text = if (isConnected) "end-to-end encrypted" else "connecting…",
-                                color = if (isConnected) Success.copy(alpha = 0.8f) else TextDim,
-                                fontSize = 10.sp,
+                                color = if (isConnected) Success.copy(alpha = 0.8f) else CyanAccent.copy(alpha = 0.6f),
+                                fontSize = 13.sp,
                                 letterSpacing = 0.3.sp,
                             )
                         }
@@ -1120,6 +1125,8 @@ private fun BlockConfirmDialog(username: String, onConfirm: () -> Unit, onDismis
 @Composable
 private fun ReportDialog(username: String, onReport: (SafetyReportCategory) -> Unit, onDismiss: () -> Unit) {
     var selected by remember { mutableStateOf<SafetyReportCategory?>(null) }
+    var otherText by remember { mutableStateOf("") }
+    val canSend = selected != null && (selected != SafetyReportCategory.OTHER || otherText.isNotBlank())
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface,
@@ -1143,14 +1150,32 @@ private fun ReportDialog(username: String, onReport: (SafetyReportCategory) -> U
                         )
                     }
                 }
+                if (selected == SafetyReportCategory.OTHER) {
+                    Spacer(Modifier.height(8.dp))
+                    androidx.compose.material3.OutlinedTextField(
+                        value = otherText,
+                        onValueChange = { otherText = it },
+                        placeholder = { Text("Describe the issue…", color = TextDim, fontSize = 13.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 2,
+                        maxLines = 4,
+                        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = CyanAccent,
+                            unfocusedBorderColor = TextDim.copy(alpha = 0.3f),
+                            focusedTextColor = TextPrimary,
+                            unfocusedTextColor = TextPrimary,
+                            cursorColor = CyanAccent,
+                        ),
+                    )
+                }
             }
         },
         confirmButton = {
             TextButton(
-                onClick = { selected?.let { onReport(it) } },
-                enabled = selected != null,
+                onClick = { if (canSend) onReport(selected!!) },
+                enabled = canSend,
             ) {
-                Text("Send Report", color = if (selected != null) CyanAccent else TextDim)
+                Text("Send Report", color = if (canSend) CyanAccent else TextDim)
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = TextDim) } },

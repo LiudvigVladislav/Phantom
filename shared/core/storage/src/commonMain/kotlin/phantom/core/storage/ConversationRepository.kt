@@ -11,7 +11,9 @@ interface ConversationRepository {
     suspend fun incrementUnread(conversationId: String)
     suspend fun resetUnread(conversationId: String)
     suspend fun updateNotes(conversationId: String, notes: String?)
+    suspend fun getBlockedConversations(): List<ConversationEntity>
     suspend fun blockConversation(conversationId: String)
+    suspend fun unblockConversation(conversationId: String)
     suspend fun acceptRequest(conversationId: String)
     suspend fun deleteConversation(id: String)
 }
