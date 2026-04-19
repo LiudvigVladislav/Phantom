@@ -1,4 +1,4 @@
-use crate::{envelope::*, error::RelayError, state::{AppState, AbuseReport, RateEntry}};
+use crate::{envelope::*, error::RelayError, state::{AppState, AbuseReport, RateEntry, append_report_to_disk, append_block_to_disk}};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -28,6 +28,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/fetch/{recipient}",  get(fetch_envelopes))
         .route("/ack/{id}",           delete(ack_envelope))
         .route("/report",             post(submit_report))
+        .route("/admin/reports",      get(admin_list_reports))
+        .route("/admin/block",        post(admin_block_key))
+        .route("/admin/blocklist",    get(admin_list_blocklist))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
@@ -205,7 +208,16 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
 
             if !rate_ok {
                 tracing::warn!(from = %&from[..from.len().min(16)], "rate limit exceeded");
-                return; // silent drop — do not inform the spammer
+                return;
+            }
+
+            // Blocklist check — silent drop for both sender and recipient
+            {
+                let bl = state.blocklist.read().await;
+                if bl.contains(&from) || bl.contains(&to) {
+                    tracing::warn!(from = %&from[..from.len().min(16)], to = %&to[..to.len().min(16)], "blocked key — message dropped");
+                    return;
+                }
             }
 
             let deliver = serde_json::json!({
@@ -387,7 +399,61 @@ async fn submit_report(
         "report received"
     );
 
+    append_report_to_disk(&report);
     state.reports.write().await.push(report);
 
     (StatusCode::OK, Json(serde_json::json!({ "status": "received" })))
+}
+
+// ── Admin endpoints (require ?token=ADMIN_SECRET) ─────────────────────────────
+
+fn check_admin_token(params: &HashMap<String, String>, state: &Arc<AppState>) -> bool {
+    match &state.config.secret_token {
+        Some(expected) => params.get("token").map(|s| s.as_str()) == Some(expected.as_str()),
+        None => false, // admin disabled if no token configured
+    }
+}
+
+async fn admin_list_reports(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !check_admin_token(&params, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" }))).into_response();
+    }
+    let reports = state.reports.read().await.clone();
+    (StatusCode::OK, Json(serde_json::json!({ "count": reports.len(), "reports": reports }))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct BlockRequest {
+    key: String,
+}
+
+async fn admin_block_key(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BlockRequest>,
+) -> impl IntoResponse {
+    if !check_admin_token(&params, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+    }
+    if req.key.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "key required" })));
+    }
+    tracing::warn!(event = "admin_block", key = %&req.key[..req.key.len().min(16)], "key blocked by admin");
+    append_block_to_disk(&req.key);
+    state.blocklist.write().await.insert(req.key.clone());
+    (StatusCode::OK, Json(serde_json::json!({ "blocked": req.key })))
+}
+
+async fn admin_list_blocklist(
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !check_admin_token(&params, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" }))).into_response();
+    }
+    let list: Vec<String> = state.blocklist.read().await.iter().cloned().collect();
+    (StatusCode::OK, Json(serde_json::json!({ "count": list.len(), "keys": list }))).into_response()
 }
