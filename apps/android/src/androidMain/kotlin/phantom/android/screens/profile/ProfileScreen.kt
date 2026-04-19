@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.qr.QrCodeImage
+import phantom.android.ui.GradientAvatar
 import phantom.android.ui.theme.*
 import phantom.core.identity.IdentityRecord
 
@@ -81,33 +82,23 @@ fun ProfileScreen(
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Spacer(Modifier.height(40.dp))
+            Spacer(Modifier.height(32.dp))
 
-            // Avatar
-            Box(
-                modifier = Modifier
-                    .size(80.dp)
-                    .clip(CircleShape)
-                    .background(CyanAccent.copy(alpha = 0.15f))
-                    .border(1.dp, CyanAccent.copy(alpha = 0.3f), CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = identity?.username?.take(1)?.uppercase() ?: "?",
-                    color = CyanAccent,
-                    fontSize = 32.sp,
-                    fontWeight = FontWeight.Light,
-                )
-            }
+            // Avatar + username hero
+            GradientAvatar(
+                name = identity?.username ?: "?",
+                size = 96.dp,
+                online = null,
+                ring = true,
+            )
 
             Spacer(Modifier.height(16.dp))
 
-            // Username
             Text(
                 text = identity?.username?.let { "@$it" } ?: "Loading…",
                 color = TextPrimary,
                 fontSize = 22.sp,
-                fontWeight = FontWeight.Light,
+                fontWeight = FontWeight.Medium,
             )
 
             Spacer(Modifier.height(4.dp))
@@ -118,96 +109,137 @@ fun ProfileScreen(
                 fontSize = 12.sp,
             )
 
-            Spacer(Modifier.height(32.dp))
+            Spacer(Modifier.height(28.dp))
 
-            // QR Code
-            identity?.let { id ->
-                Text(
-                    text = "INVITE QR",
-                    color = TextDim,
-                    fontSize = 10.sp,
-                    letterSpacing = 2.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-                Spacer(Modifier.height(12.dp))
-                QrCodeImage(content = "${id.username}:${id.publicKeyHex}", size = 200.dp)
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "Let your contact scan this",
-                    color = TextDim,
-                    fontSize = 11.sp,
-                )
-            }
-
-            Spacer(Modifier.height(32.dp))
-
-            // Identity key card
+            // QR card
             identity?.let { id ->
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp)
-                        .background(Surface, RoundedCornerShape(8.dp))
-                        .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(8.dp))
-                        .padding(16.dp),
+                        .background(Surface, RoundedCornerShape(16.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(16.dp))
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = "INVITE QR",
+                        color = TextDim,
+                        fontSize = 10.sp,
+                        letterSpacing = 2.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Box(contentAlignment = Alignment.Center) {
+                        QrCodeImage(content = "${id.username}:${id.publicKeyHex}", size = 200.dp)
+                        // Cyan center dot (brand mark)
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(BgDeep)
+                                .border(2.dp, CyanAccent.copy(alpha = 0.6f), CircleShape),
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        text = "Let your contact scan this to add you",
+                        color = TextDim,
+                        fontSize = 12.sp,
+                    )
+                }
+
+                Spacer(Modifier.height(12.dp))
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // Identity key card
+            identity?.let { id ->
+                val identityString = "${id.username}:${id.publicKeyHex}"
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .background(Surface, RoundedCornerShape(12.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
+                        .padding(20.dp),
                 ) {
                     Text(
                         text = "IDENTITY KEY",
                         color = TextDim,
                         fontSize = 10.sp,
-                        letterSpacing = 2.sp,
+                        letterSpacing = 2.5.sp,
                         fontWeight = FontWeight.Medium,
-                    )
-
-                    Spacer(Modifier.height(12.dp))
-
-                    // Short key display
-                    val shortKey = buildString {
-                        append(id.publicKeyHex.take(16))
-                        append(" ···· ")
-                        append(id.publicKeyHex.takeLast(8))
-                    }
-                    Text(
-                        text = shortKey,
-                        color = TextPrimary,
-                        fontSize = 15.sp,
                         fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Light,
                     )
 
                     Spacer(Modifier.height(12.dp))
 
-                    // Copy button — copies "username:pubkey_hex" so recipients see your name
+                    // Key preview with ed25519: prefix
+                    Row {
+                        Text(
+                            text = "ed25519:",
+                            color = CyanAccent.copy(alpha = 0.7f),
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                        Text(
+                            text = id.publicKeyHex.take(12) + "…" + id.publicKeyHex.takeLast(6),
+                            color = TextPrimary.copy(alpha = 0.75f),
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+
+                    // Share button (full width, cyan)
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(if (copied) Success.copy(alpha = 0.1f) else CyanAccent.copy(alpha = 0.08f))
-                            .border(
-                                1.dp,
-                                if (copied) Success.copy(alpha = 0.4f) else CyanAccent.copy(alpha = 0.25f),
-                                RoundedCornerShape(4.dp),
-                            )
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(CyanAccent)
                             .clickable {
-                                val identityString = "${id.username}:${id.publicKeyHex}"
-                                copyToClipboard(context, identityString)
                                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
                                     type = "text/plain"
                                     putExtra(Intent.EXTRA_TEXT, identityString)
                                     putExtra(Intent.EXTRA_SUBJECT, "PHANTOM identity key")
                                 }
                                 context.startActivity(Intent.createChooser(shareIntent, "Share via…"))
-                                copied = true
-                                scope.launch {
-                                    kotlinx.coroutines.delay(2000)
-                                    copied = false
-                                }
                             }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(vertical = 12.dp),
+                        contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            text = if (copied) "✓  Shared!" else "Share identity",
-                            color = if (copied) Success else CyanAccent,
-                            fontSize = 12.sp,
+                            text = "Share my key",
+                            color = BgDeep,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    // Copy button (outline)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .border(1.dp, if (copied) Success.copy(alpha = 0.4f) else Color.White.copy(alpha = 0.12f), RoundedCornerShape(8.dp))
+                            .clickable {
+                                copyToClipboard(context, identityString)
+                                copied = true
+                                scope.launch { kotlinx.coroutines.delay(2000); copied = false }
+                            }
+                            .padding(vertical = 12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = if (copied) "✓  Copied to clipboard" else "Copy key",
+                            color = if (copied) Success else TextDim,
+                            fontSize = 14.sp,
                         )
                     }
 
@@ -254,20 +286,28 @@ fun ProfileScreen(
                     InfoRow(label = "Created", value = formatTimestamp(id.createdAt))
                 }
 
-                Spacer(Modifier.height(24.dp))
-
-                // Security note
-                Text(
-                    text = "Share your key with contacts so they can send you encrypted messages.",
-                    color = TextDim.copy(alpha = 0.7f),
-                    fontSize = 12.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(horizontal = 32.dp),
-                    lineHeight = 18.sp,
-                )
             }
 
-            Spacer(Modifier.height(32.dp))
+            Spacer(Modifier.height(8.dp))
+
+            // Settings list
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .background(Surface, RoundedCornerShape(12.dp))
+                    .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(12.dp)),
+            ) {
+                ProfileSettingsRow(label = "Username", value = identity?.username?.let { "@$it" } ?: "")
+                HorizontalDivider(modifier = Modifier.padding(start = 20.dp), color = Color.White.copy(alpha = 0.04f))
+                ProfileSettingsRow(label = "Safety numbers", value = "")
+                HorizontalDivider(modifier = Modifier.padding(start = 20.dp), color = Color.White.copy(alpha = 0.04f))
+                ProfileSettingsRow(label = "Linked devices", value = "1 device")
+                HorizontalDivider(modifier = Modifier.padding(start = 20.dp), color = Color.White.copy(alpha = 0.04f))
+                ProfileSettingsRow(label = "Privacy", value = "")
+            }
+
+            Spacer(Modifier.height(24.dp))
 
             // Blocked contacts
             if (blockedContacts.isNotEmpty()) {
@@ -472,6 +512,27 @@ private fun InfoRow(label: String, value: String) {
     ) {
         Text(label, color = TextDim, fontSize = 12.sp)
         Text(value, color = TextPrimary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+    }
+}
+
+@Composable
+private fun ProfileSettingsRow(label: String, value: String, onClick: (() -> Unit)? = null) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .padding(horizontal = 20.dp, vertical = 15.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            color = TextPrimary,
+            fontSize = 14.sp,
+            modifier = Modifier.weight(1f),
+        )
+        if (value.isNotEmpty()) {
+            Text(text = value, color = TextDim, fontSize = 13.sp)
+        }
     }
 }
 

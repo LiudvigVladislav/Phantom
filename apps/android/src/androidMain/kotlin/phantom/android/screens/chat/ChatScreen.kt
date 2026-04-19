@@ -42,6 +42,8 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.border
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.IntOffset
@@ -51,6 +53,7 @@ import kotlin.math.roundToInt
 import com.benasher44.uuid.uuid4
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.ui.GradientAvatar
 import phantom.android.ui.theme.*
 import phantom.core.messaging.OutgoingMessage
 import phantom.core.messaging.SafetyReportCategory
@@ -268,28 +271,12 @@ fun ChatScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.clickable(onClick = onContactProfile),
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(CircleShape)
-                                .background(CyanAccent.copy(alpha = 0.15f)),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = theirUsername.take(1).uppercase(),
-                                color = CyanAccent,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium,
-                            )
-                        }
-                        Box(
-                            modifier = Modifier
-                                .offset(x = (-8).dp, y = 10.dp)
-                                .size(11.dp)
-                                .clip(CircleShape)
-                                .background(if (isConnected) Success else CyanAccent.copy(alpha = 0.35f))
+                        GradientAvatar(
+                            name = theirUsername,
+                            size = 36.dp,
+                            online = isConnected,
                         )
-                        Spacer(Modifier.width(4.dp))
+                        Spacer(Modifier.width(10.dp))
                         Column {
                             Text(
                                 text = theirUsername,
@@ -481,6 +468,19 @@ fun ChatScreen(
                     )
                 }
         ) {
+        // Pre-process: inject date separators into the item list
+        val chatItems = remember(messages) {
+            buildList<ChatItem> {
+                var lastDate = ""
+                messages.forEach { msg ->
+                    val dk = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                        .format(java.util.Date(msg.createdAt))
+                    if (dk != lastDate) { lastDate = dk; add(ChatItem.DateSep(dk, msg.createdAt)) }
+                    add(ChatItem.Msg(msg))
+                }
+            }
+        }
+
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -489,49 +489,121 @@ fun ChatScreen(
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            lazyItems(messages, key = { it.id }) { msg ->
-                MessageBubble(
-                    entity = msg,
-                    theirUsername = theirUsername,
-                    onReply = {
-                        replyToMessage = msg
-                        editingMessage = null
-                    },
-                    onEdit = {
-                        editingMessage = msg
-                        inputText = msg.plaintextCache ?: ""
-                        replyToMessage = null
-                    },
-                    onDeleteForMe = {
-                        scope.launch {
-                            container.messageRepo.deleteMessage(msg.id)
-                            reloadMessages()
-                        }
-                    },
-                    onDeleteForBoth = {
-                        scope.launch {
-                            val key = theirPublicKeyHex
-                            if (key.isNotEmpty()) {
-                                container.messagingService?.deleteMessageForBoth(msg.id, conversationId, key)
-                            } else {
-                                container.messageRepo.deleteMessage(msg.id)
-                            }
-                            reloadMessages()
-                        }
-                    },
-                    onCopy = { text ->
-                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboard.setPrimaryClip(ClipData.newPlainText("message", text))
-                    },
-                    onForward = { cleanText, senderLabel ->
-                        forwardText = cleanText
-                        forwardSenderLabel = senderLabel
-                    },
-                )
+            item(key = "__e2ee__") { E2EENoteRow() }
+            lazyItems(chatItems, key = {
+                when (it) {
+                    is ChatItem.DateSep -> "__date_${it.dateKey}"
+                    is ChatItem.Msg -> it.entity.id
+                }
+            }) { chatItem ->
+                when (chatItem) {
+                    is ChatItem.DateSep -> ChatDateSep(chatItem.millis)
+                    is ChatItem.Msg -> {
+                        val msg = chatItem.entity
+                        MessageBubble(
+                            entity = msg,
+                            theirUsername = theirUsername,
+                            onReply = {
+                                replyToMessage = msg
+                                editingMessage = null
+                            },
+                            onEdit = {
+                                editingMessage = msg
+                                inputText = msg.plaintextCache ?: ""
+                                replyToMessage = null
+                            },
+                            onDeleteForMe = {
+                                scope.launch {
+                                    container.messageRepo.deleteMessage(msg.id)
+                                    reloadMessages()
+                                }
+                            },
+                            onDeleteForBoth = {
+                                scope.launch {
+                                    val key = theirPublicKeyHex
+                                    if (key.isNotEmpty()) {
+                                        container.messagingService?.deleteMessageForBoth(msg.id, conversationId, key)
+                                    } else {
+                                        container.messageRepo.deleteMessage(msg.id)
+                                    }
+                                    reloadMessages()
+                                }
+                            },
+                            onCopy = { text ->
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("message", text))
+                            },
+                            onForward = { cleanText, senderLabel ->
+                                forwardText = cleanText
+                                forwardSenderLabel = senderLabel
+                            },
+                        )
+                    }
+                }
             }
         }
         } // end back-swipe Box
     }
+}
+
+private sealed class ChatItem {
+    data class DateSep(val dateKey: String, val millis: Long) : ChatItem()
+    data class Msg(val entity: MessageEntity) : ChatItem()
+}
+
+@Composable
+private fun E2EENoteRow() {
+    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(Color.White.copy(alpha = 0.03f))
+                .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(999.dp))
+                .padding(horizontal = 12.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Canvas(modifier = Modifier.size(10.dp)) {
+                val r = size.minDimension / 2f
+                drawCircle(color = Success, radius = r, style = Stroke(1.2.dp.toPx()))
+                drawCircle(color = Success, radius = r * 0.38f)
+            }
+            Text(
+                "messages are end-to-end encrypted",
+                color = TextDim, fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace, letterSpacing = 0.5.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChatDateSep(millis: Long) {
+    val label = when {
+        isToday(millis) -> "Today"
+        isYesterday(millis) -> "Yesterday"
+        else -> java.text.SimpleDateFormat("dd MMM yyyy", java.util.Locale.US).format(java.util.Date(millis))
+    }
+    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+        Text(label.uppercase(), color = TextDim, fontSize = 10.sp, fontFamily = FontFamily.Monospace, letterSpacing = 2.sp)
+    }
+}
+
+private fun isToday(millis: Long): Boolean {
+    val cal = java.util.Calendar.getInstance()
+    val today = java.util.Calendar.getInstance()
+    cal.timeInMillis = millis
+    return cal.get(java.util.Calendar.YEAR) == today.get(java.util.Calendar.YEAR) &&
+            cal.get(java.util.Calendar.DAY_OF_YEAR) == today.get(java.util.Calendar.DAY_OF_YEAR)
+}
+
+private fun isYesterday(millis: Long): Boolean {
+    val cal = java.util.Calendar.getInstance()
+    cal.timeInMillis = millis
+    val yesterday = java.util.Calendar.getInstance()
+    yesterday.add(java.util.Calendar.DAY_OF_YEAR, -1)
+    return cal.get(java.util.Calendar.YEAR) == yesterday.get(java.util.Calendar.YEAR) &&
+            cal.get(java.util.Calendar.DAY_OF_YEAR) == yesterday.get(java.util.Calendar.DAY_OF_YEAR)
 }
 
 // ── Emoji panel ───────────────────────────────────────────────────────────────
