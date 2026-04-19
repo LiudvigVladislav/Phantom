@@ -38,6 +38,10 @@ secrets/
 .DS_Store
 Thumbs.db
 
+# Rust / Cargo build artifacts
+services/target/
+target/
+
 # Logs
 *.log
 npm-debug.log*
