@@ -4,6 +4,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -21,18 +25,24 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import phantom.android.di.AppContainer
 import phantom.android.qr.QrCodeImage
 import phantom.android.ui.GradientAvatar
 import phantom.android.ui.theme.*
 import phantom.core.identity.IdentityRecord
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -47,10 +57,32 @@ fun ProfileScreen(
     var copied by remember { mutableStateOf(false) }
     var showLogoutDialog by remember { mutableStateOf(false) }
     var blockedContacts by remember { mutableStateOf<List<phantom.core.storage.ConversationEntity>>(emptyList()) }
+    var avatarBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
+
+    val avatarFile = remember { File(context.filesDir, "profile_avatar.jpg") }
+
+    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch(Dispatchers.IO) {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                avatarFile.outputStream().use { output -> input.copyTo(output) }
+            }
+            val bmp = BitmapFactory.decodeFile(avatarFile.absolutePath)
+            withContext(Dispatchers.Main) {
+                avatarBitmap = bmp?.asImageBitmap()
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         identity = container.identityRepo.loadIdentity()
         blockedContacts = container.conversationRepo.getBlockedConversations()
+        if (avatarFile.exists()) {
+            withContext(Dispatchers.IO) {
+                val bmp = BitmapFactory.decodeFile(avatarFile.absolutePath)
+                withContext(Dispatchers.Main) { avatarBitmap = bmp?.asImageBitmap() }
+            }
+        }
     }
 
     Scaffold(
@@ -84,13 +116,61 @@ fun ProfileScreen(
         ) {
             Spacer(Modifier.height(32.dp))
 
-            // Avatar + username hero
-            GradientAvatar(
-                name = identity?.username ?: "?",
-                size = 96.dp,
-                online = null,
-                ring = true,
-            )
+            // Avatar + username hero (tap to change photo)
+            Box(
+                modifier = Modifier
+                    .size(96.dp)
+                    .clip(CircleShape)
+                    .clickable { photoPicker.launch("image/*") },
+                contentAlignment = Alignment.Center,
+            ) {
+                if (avatarBitmap != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = avatarBitmap!!,
+                        contentDescription = "Profile photo",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize().clip(CircleShape),
+                    )
+                } else {
+                    GradientAvatar(
+                        name = identity?.username ?: "?",
+                        size = 96.dp,
+                        online = null,
+                        ring = true,
+                    )
+                }
+                // Camera overlay hint
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(CyanAccent)
+                        .border(2.dp, BgDeep, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Canvas(modifier = Modifier.size(14.dp)) {
+                        val cx = size.width / 2f
+                        val cy = size.height / 2f
+                        // camera body
+                        drawRoundRect(
+                            color = BgDeep,
+                            size = androidx.compose.ui.geometry.Size(size.width, size.height * 0.72f),
+                            topLeft = androidx.compose.ui.geometry.Offset(0f, cy * 0.4f),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx()),
+                        )
+                        // lens
+                        drawCircle(color = BgDeep, radius = size.width * 0.22f, center = androidx.compose.ui.geometry.Offset(cx, cy + cy * 0.15f), style = androidx.compose.ui.graphics.drawscope.Stroke(1.5.dp.toPx()))
+                        // viewfinder bump
+                        drawRoundRect(
+                            color = BgDeep,
+                            size = androidx.compose.ui.geometry.Size(size.width * 0.3f, cy * 0.35f),
+                            topLeft = androidx.compose.ui.geometry.Offset(cx - size.width * 0.15f, cy * 0.1f),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.dp.toPx()),
+                        )
+                    }
+                }
+            }
 
             Spacer(Modifier.height(16.dp))
 
