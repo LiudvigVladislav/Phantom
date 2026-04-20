@@ -1,5 +1,6 @@
 package phantom.android.screens.chatlist
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -8,19 +9,18 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.Canvas
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.*
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -29,13 +29,9 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
-import phantom.android.ui.DeliveryIcon
-import phantom.android.ui.DeliveryStatus
-import phantom.android.ui.GradientAvatar
+import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.core.storage.ConversationEntity
-import phantom.core.storage.MessageStatus
-import phantom.core.storage.TrustTier
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -52,6 +48,11 @@ fun ChatListScreen(
     var requestCount by remember { mutableStateOf(0) }
     var showAddDialog by remember { mutableStateOf(false) }
     var prefillContactString by remember { mutableStateOf("") }
+    var userName by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        userName = container.identityRepo.loadIdentity()?.username ?: ""
+    }
 
     LaunchedEffect(scannedQr) {
         if (scannedQr != null) {
@@ -75,68 +76,56 @@ fun ChatListScreen(
     Scaffold(
         containerColor = BgDeep,
         topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        text = "PHANTOM",
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Light,
-                        letterSpacing = 6.sp,
-                        color = TextPrimary,
-                    )
-                },
-                actions = {
-                    IconButton(onClick = onScanQr) { QrScanIcon() }
-                    IconButton(onClick = onProfile) {
-                        Icon(Icons.Default.Person, contentDescription = "Profile", tint = TextDim)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Surface),
+            PhantomTopBar(
+                userName = userName,
+                onProfile = onProfile,
+                onAddContact = { showAddDialog = true },
+                onScanQr = onScanQr,
             )
         },
-        floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showAddDialog = true },
-                containerColor = CyanAccent,
-                contentColor = BgDeep,
-                shape = CircleShape,
-            ) {
-                Icon(Icons.Default.Add, contentDescription = "Add contact")
-            }
-        },
     ) { padding ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            // ── Search pill ───────────────────────────────────
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(Surface)
-                    .border(1.dp, Color.White.copy(alpha = 0.04f), RoundedCornerShape(10.dp))
-                    .clickable { /* search — TODO */ }
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 110.dp),
             ) {
-                Text(
-                    text = "Search messages, contacts",
-                    color = TextDim,
-                    fontSize = 13.sp,
-                    fontFamily = FontFamily.Default,
-                )
-            }
+                // ── Search pill ──────────────────────────────
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp)
+                            .padding(top = 12.dp, bottom = 4.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Surface)
+                            .border(1.dp, Color.White.copy(alpha = 0.04f), RoundedCornerShape(10.dp))
+                            .clickable { /* search — TODO */ }
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = "Search messages, contacts",
+                            color = TextDim,
+                            fontSize = 13.sp,
+                        )
+                    }
+                }
 
-            LazyColumn(modifier = Modifier.fillMaxSize()) {
-                // ── Notes (saved messages) ─────────────────────
+                // ── PINNED section ───────────────────────────
+                item { SectionLabel(text = "Pinned", showPin = true) }
+
                 item(key = "__notes__") {
                     NotesRow(onClick = { onNavigate(Screen.SavedMessages) })
                 }
 
-                // ── Message requests banner ────────────────────
+                item(key = "__archive__") {
+                    ArchiveRow()
+                }
+
+                // ── Message requests banner ──────────────────
                 if (requestCount > 0) {
                     item {
                         Row(
@@ -181,10 +170,8 @@ fun ChatListScreen(
                     }
                 }
 
-                // ── Date separator ─────────────────────────────
-                if (conversations.isNotEmpty()) {
-                    item { DateSeparator("Chats") }
-                }
+                // ── CHATS section ────────────────────────────
+                item { SectionLabel(text = "Chats") }
 
                 items(conversations, key = { it.id }) { conv ->
                     ChatRow(
@@ -196,14 +183,16 @@ fun ChatListScreen(
                 if (conversations.isEmpty() && requestCount == 0) {
                     item {
                         Box(
-                            modifier = Modifier.fillParentMaxSize().padding(32.dp),
+                            modifier = Modifier
+                                .fillParentMaxSize()
+                                .padding(32.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text("No conversations yet", color = TextDim, fontSize = 15.sp)
                                 Spacer(Modifier.height(8.dp))
                                 Text(
-                                    text = "Tap + to add a contact by key or QR code",
+                                    text = "Tap the compose button to add a contact",
                                     color = TextDim.copy(alpha = 0.6f),
                                     fontSize = 13.sp,
                                 )
@@ -212,6 +201,19 @@ fun ChatListScreen(
                     }
                 }
             }
+
+            // ── Floating bottom nav ──────────────────────────
+            BottomNavPill(
+                activeTab = NavTab.CHATS,
+                onTabSelected = { tab ->
+                    when (tab) {
+                        NavTab.CALLS -> onNavigate(Screen.Calls)
+                        NavTab.SETTINGS -> onNavigate(Screen.Settings)
+                        NavTab.CHATS -> {}
+                    }
+                },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
     }
 
@@ -231,56 +233,145 @@ fun ChatListScreen(
 }
 
 @Composable
+private fun SectionLabel(text: String, showPin: Boolean = false) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .padding(top = 16.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (showPin) {
+            Canvas(modifier = Modifier.size(10.dp)) {
+                val w = size.width; val h = size.height
+                val path = Path().apply {
+                    moveTo(w * 0.67f, 0f)
+                    lineTo(w, h * 0.42f)
+                    lineTo(w * 0.60f, h * 0.42f)
+                    lineTo(w * 0.55f, h)
+                    lineTo(w * 0.45f, h)
+                    lineTo(w * 0.40f, h * 0.42f)
+                    lineTo(0f, h * 0.42f)
+                    close()
+                }
+                drawPath(path, color = TextDim)
+            }
+        }
+        Text(
+            text = text.uppercase(),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+            letterSpacing = 2.8.sp,
+            color = TextDim,
+        )
+    }
+}
+
+@Composable
 private fun NotesRow(onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
             modifier = Modifier
                 .size(46.dp)
                 .clip(CircleShape)
-                .background(CyanAccent.copy(alpha = 0.12f)),
+                .background(CyanAccent.copy(alpha = 0.10f))
+                .border(1.dp, CyanAccent.copy(alpha = 0.28f), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            androidx.compose.foundation.Canvas(modifier = Modifier.size(22.dp)) {
+            // Bookmark icon
+            Canvas(modifier = Modifier.size(22.dp)) {
                 val w = size.width; val h = size.height
-                val path = androidx.compose.ui.graphics.Path().apply {
-                    moveTo(w * 0.2f, 0f); lineTo(w * 0.8f, 0f)
-                    lineTo(w * 0.8f, h); lineTo(w * 0.5f, h * 0.72f)
-                    lineTo(w * 0.2f, h); close()
+                val path = Path().apply {
+                    moveTo(w * 0.25f, 0f)
+                    lineTo(w * 0.75f, 0f)
+                    lineTo(w * 0.75f, h)
+                    lineTo(w * 0.5f, h * 0.72f)
+                    lineTo(w * 0.25f, h)
+                    close()
                 }
-                drawPath(path = path, color = CyanAccent)
+                drawPath(path, color = CyanAccent)
             }
         }
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text("Notes", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Normal)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                Text("Notes", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Canvas(modifier = Modifier.size(9.dp)) {
+                    val path = Path().apply {
+                        moveTo(size.width * 0.67f, 0f)
+                        lineTo(size.width, size.height * 0.42f)
+                        lineTo(size.width * 0.60f, size.height * 0.42f)
+                        lineTo(size.width * 0.55f, size.height)
+                        lineTo(size.width * 0.45f, size.height)
+                        lineTo(size.width * 0.40f, size.height * 0.42f)
+                        lineTo(0f, size.height * 0.42f)
+                        close()
+                    }
+                    drawPath(path, color = CyanAccent)
+                }
+            }
+            Spacer(Modifier.height(3.dp))
             Text("Personal notes & saved", color = TextDim, fontSize = 13.sp)
         }
+        Text("Wed", color = TextDim, fontSize = 11.sp)
     }
 }
 
 @Composable
-private fun DateSeparator(label: String) {
+private fun ArchiveRow() {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { }
+            .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.04f))
-        Spacer(Modifier.width(12.dp))
+        Box(
+            modifier = Modifier
+                .size(46.dp)
+                .clip(CircleShape)
+                .background(Surface2)
+                .border(1.dp, Color.White.copy(alpha = 0.06f), CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            // Folder icon (Canvas)
+            Canvas(modifier = Modifier.size(20.dp)) {
+                val w = size.width; val h = size.height
+                val stroke = Stroke(width = 1.6.dp.toPx())
+                val path = Path().apply {
+                    moveTo(w * 0.125f, h * 0.292f)
+                    lineTo(w * 0.125f, h * 0.875f)
+                    lineTo(w * 0.875f, h * 0.875f)
+                    lineTo(w * 0.875f, h * 0.375f)
+                    lineTo(w * 0.5f, h * 0.375f)
+                    lineTo(w * 0.375f, h * 0.25f)
+                    lineTo(w * 0.125f, h * 0.25f)
+                    close()
+                }
+                drawPath(path, color = TextDim, style = stroke)
+            }
+        }
+        Spacer(Modifier.width(14.dp))
         Text(
-            text = label.uppercase(),
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.sp,
-            letterSpacing = 2.5.sp,
-            color = TextDim,
+            text = "Archive",
+            color = TextPrimary,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Normal,
+            modifier = Modifier.weight(1f),
         )
-        Spacer(Modifier.width(12.dp))
-        HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.04f))
+        Icon(
+            Icons.Default.KeyboardArrowRight,
+            contentDescription = null,
+            tint = TextDim,
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 
@@ -291,14 +382,10 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        GradientAvatar(
-            name = conv.theirUsername,
-            size = 46.dp,
-            online = null,
-        )
+        GradientAvatar(name = conv.theirUsername, size = 46.dp)
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -306,7 +393,7 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
                     text = conv.theirUsername,
                     color = TextPrimary,
                     fontSize = 15.sp,
-                    fontWeight = if (isUnread) FontWeight.Medium else FontWeight.Normal,
+                    fontWeight = if (isUnread) FontWeight.SemiBold else FontWeight.Normal,
                     modifier = Modifier.weight(1f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -317,7 +404,7 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
                     text = timeStr,
                     color = if (isUnread) CyanAccent else TextDim,
                     fontSize = 11.sp,
-                    fontFamily = FontFamily.Default,
+                    fontWeight = if (isUnread) FontWeight.Medium else FontWeight.Normal,
                 )
             }
             Spacer(Modifier.height(3.dp))
@@ -326,7 +413,6 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
                     text = conv.lastMessagePreview ?: "",
                     color = TextDim,
                     fontSize = 13.sp,
-                    fontWeight = if (isUnread) FontWeight.Normal else FontWeight.Light,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
@@ -353,11 +439,6 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
     }
 }
 
-@Composable
-private fun QrScanIcon() {
-    Canvas(modifier = Modifier.size(24.dp)) { drawQrFinderDots(TextDim) }
-}
-
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawQrFinderDots(color: Color) {
     val s = size
     val sw = 1.8.dp.toPx()
@@ -372,12 +453,6 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawQrFinderDots(co
     drawCircle(color = color, radius = dotR, center = Offset(gap + box / 2f, gap + box / 2f))
     drawCircle(color = color, radius = dotR, center = Offset(s.width - box / 2f - gap, gap + box / 2f))
     drawCircle(color = color, radius = dotR, center = Offset(gap + box / 2f, s.height - box / 2f - gap))
-    val br = s.width - box - gap
-    val bb = s.height - gap
-    val d = box / 3f
-    drawCircle(color = color, radius = sw * 0.9f, center = Offset(br + d, bb - box + d))
-    drawCircle(color = color, radius = sw * 0.9f, center = Offset(br + d * 2.4f, bb - box + d * 2.4f))
-    drawCircle(color = color, radius = sw * 0.9f, center = Offset(br + d, bb - d))
 }
 
 private fun formatChatTime(millis: Long): String {
@@ -385,17 +460,8 @@ private fun formatChatTime(millis: Long): String {
     val diff = now - millis
     val dayMs = 86_400_000L
     return when {
-        diff < dayMs -> {
-            val date = java.util.Date(millis)
-            java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(date)
-        }
-        diff < 7 * dayMs -> {
-            val date = java.util.Date(millis)
-            java.text.SimpleDateFormat("EEE", java.util.Locale.US).format(date)
-        }
-        else -> {
-            val date = java.util.Date(millis)
-            java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(date)
-        }
+        diff < dayMs -> java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(millis))
+        diff < 7 * dayMs -> java.text.SimpleDateFormat("EEE", java.util.Locale.US).format(java.util.Date(millis))
+        else -> java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(java.util.Date(millis))
     }
 }

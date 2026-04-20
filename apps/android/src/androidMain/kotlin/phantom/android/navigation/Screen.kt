@@ -3,6 +3,8 @@ package phantom.android.navigation
 sealed class Screen {
     object Onboarding : Screen()
     object ChatList : Screen()
+    object Calls : Screen()
+    object Settings : Screen()
     object MessageRequests : Screen()
     object Profile : Screen()
     object QrScan : Screen()

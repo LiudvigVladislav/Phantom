@@ -30,13 +30,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material3.*
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -265,59 +268,16 @@ fun ChatScreen(
         contentWindowInsets = WindowInsets(0),
         snackbarHost = { androidx.compose.material3.SnackbarHost(snackbarHostState) },
         topBar = {
-            TopAppBar(
-                title = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.clickable(onClick = onContactProfile),
-                    ) {
-                        GradientAvatar(
-                            name = theirUsername,
-                            size = 36.dp,
-                            online = isConnected,
-                        )
-                        Spacer(Modifier.width(10.dp))
-                        Column {
-                            Text(
-                                text = theirUsername,
-                                color = TextPrimary,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Normal,
-                            )
-                            Text(
-                                text = if (isConnected) "end-to-end encrypted" else "connecting…",
-                                color = if (isConnected) Success.copy(alpha = 0.8f) else CyanAccent.copy(alpha = 0.6f),
-                                fontSize = 13.sp,
-                                letterSpacing = 0.3.sp,
-                            )
-                        }
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextDim)
-                    }
-                },
-                actions = {
-                    IconButton(onClick = { showMenu = true }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "More", tint = TextDim)
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false },
-                        containerColor = Surface2,
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
-                            onClick = { showMenu = false; showReportDialog = true },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Block", color = Danger, fontSize = 14.sp) },
-                            onClick = { showMenu = false; showBlockDialog = true },
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Surface),
+            ChatTopBar(
+                theirUsername = theirUsername,
+                isConnected = isConnected,
+                onBack = onBack,
+                onContactProfile = onContactProfile,
+                onMoreMenu = { showMenu = true },
+                showMenu = showMenu,
+                onDismissMenu = { showMenu = false },
+                onReport = { showMenu = false; showReportDialog = true },
+                onBlock = { showMenu = false; showBlockDialog = true },
             )
         },
         bottomBar = {
@@ -829,16 +789,21 @@ private fun MessageBubble(
             // time "06:26" ≈ 28dp + gap 3dp + status icon ≈ 18dp = ~56dp for sent, ~36dp for received
             val timeReserve = if (isSent) 56.dp else 36.dp
             // Column wraps quote block + text+time — no overlapping content
+            val bubbleShape = RoundedCornerShape(
+                topStart = 16.dp, topEnd = 16.dp,
+                bottomStart = if (isSent) 16.dp else 4.dp,
+                bottomEnd = if (isSent) 4.dp else 16.dp,
+            )
             Column(
                 modifier = Modifier
                     .widthIn(min = 80.dp, max = 260.dp)
-                    .background(
-                        color = if (isSent) CyanAccent else Surface2,
-                        shape = RoundedCornerShape(
-                            topStart = 16.dp, topEnd = 16.dp,
-                            bottomStart = if (isSent) 16.dp else 4.dp,
-                            bottomEnd = if (isSent) 4.dp else 16.dp,
-                        )
+                    .then(
+                        if (isSent) Modifier.background(
+                            brush = Brush.linearGradient(
+                                colors = listOf(CyanAccent, Color(0xFF0099CC)),
+                            ),
+                            shape = bubbleShape,
+                        ) else Modifier.background(color = Surface2, shape = bubbleShape)
                     )
                     .combinedClickable(
                         onClick = {},
@@ -1079,14 +1044,25 @@ private fun InputBar(
     isEditing: Boolean = false,
     onSend: () -> Unit,
 ) {
-    Surface(color = Surface, tonalElevation = 0.dp) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(Color.White.copy(alpha = 0.05f)),
+        )
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .padding(bottom = 4.dp),
+            verticalAlignment = Alignment.Bottom,
         ) {
-            // Emoji toggle button — monochrome Canvas icon
+            // Left: emoji toggle (tap) + attachment look
             Box(
                 modifier = Modifier
                     .size(36.dp)
@@ -1094,71 +1070,58 @@ private fun InputBar(
                     .clickable(onClick = onEmojiToggle),
                 contentAlignment = Alignment.Center,
             ) {
-                if (emojiPanelOpen) {
-                    Canvas(modifier = Modifier.size(22.dp)) {
-                        val s = size
-                        val c = TextDim
-                        val stroke = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round)
-                        drawRoundRect(color = c, style = stroke, cornerRadius = androidx.compose.ui.geometry.CornerRadius(3.dp.toPx()))
-                        val keyW = s.width / 8f
-                        val row1Y = s.height * 0.32f
-                        for (i in 1..5) {
-                            drawCircle(color = c, radius = 1.4.dp.toPx(), center = Offset(i * keyW + keyW * 0.5f, row1Y))
-                        }
-                        val row2Y = s.height * 0.56f
-                        for (i in 1..4) {
-                            drawCircle(color = c, radius = 1.4.dp.toPx(), center = Offset(i * keyW + keyW, row2Y))
-                        }
-                        val spaceY = s.height * 0.78f
-                        drawLine(color = c, strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round,
-                            start = Offset(s.width * 0.25f, spaceY), end = Offset(s.width * 0.75f, spaceY))
+                // Paperclip icon (Canvas)
+                Canvas(modifier = Modifier.size(22.dp)) {
+                    val c = TextDim
+                    val sw = 1.6.dp.toPx()
+                    val st = Stroke(width = sw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        // simplified paperclip: curved line
+                        val cx = size.width * 0.55f
+                        val cy = size.height * 0.5f
+                        val r = size.width * 0.28f
+                        moveTo(cx - r * 0.5f, cy - r * 1.5f)
+                        cubicTo(cx + r * 1.2f, cy - r * 1.5f, cx + r * 1.2f, cy + r * 1.0f, cx - r * 0.1f, cy + r * 1.0f)
+                        cubicTo(cx - r * 1.1f, cy + r * 1.0f, cx - r * 1.1f, cy - r * 0.6f, cx - r * 0.1f, cy - r * 0.6f)
+                        cubicTo(cx + r * 0.6f, cy - r * 0.6f, cx + r * 0.6f, cy + r * 0.3f, cx - r * 0.1f, cy + r * 0.3f)
                     }
-                } else {
-                    Canvas(modifier = Modifier.size(22.dp)) {
-                        val r = size.minDimension / 2f
-                        val cx = size.width / 2f
-                        val cy = size.height / 2f
-                        val c = TextDim
-                        val stroke = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round)
-                        drawCircle(color = c, radius = r - 1.dp.toPx(), style = stroke)
-                        drawCircle(color = c, radius = 1.6.dp.toPx(), center = Offset(cx - r * 0.3f, cy - r * 0.2f))
-                        drawCircle(color = c, radius = 1.6.dp.toPx(), center = Offset(cx + r * 0.3f, cy - r * 0.2f))
-                        val path = androidx.compose.ui.graphics.Path().apply {
-                            moveTo(cx - r * 0.38f, cy + r * 0.12f)
-                            cubicTo(cx - r * 0.38f, cy + r * 0.55f, cx + r * 0.38f, cy + r * 0.55f, cx + r * 0.38f, cy + r * 0.12f)
-                        }
-                        drawPath(path = path, color = c, style = stroke)
-                    }
+                    drawPath(path, color = c, style = st)
                 }
             }
 
-            Spacer(Modifier.width(4.dp))
+            Spacer(Modifier.width(6.dp))
 
+            // Center: pill text field
             OutlinedTextField(
                 value = text,
                 onValueChange = onTextChange,
                 modifier = Modifier.weight(1f),
                 placeholder = { Text("Message…", color = TextDim, fontSize = 14.sp) },
                 singleLine = false,
-                maxLines = 4,
+                maxLines = 5,
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = TextPrimary,
                     unfocusedTextColor = TextPrimary,
-                    focusedBorderColor = CyanAccent.copy(alpha = 0.4f),
-                    unfocusedBorderColor = Color.White.copy(alpha = 0.08f),
+                    focusedBorderColor = Color.Transparent,
+                    unfocusedBorderColor = Color.Transparent,
                     cursorColor = CyanAccent,
+                    focusedContainerColor = Surface2,
+                    unfocusedContainerColor = Surface2,
                 ),
-                shape = RoundedCornerShape(20.dp),
+                shape = RoundedCornerShape(18.dp),
             )
 
+            Spacer(Modifier.width(8.dp))
+
+            // Right: mic (empty) or send button (has text)
             if (text.isNotBlank() || isEditing) {
-                Spacer(Modifier.width(6.dp))
-                IconButton(
-                    onClick = onSend,
+                Box(
                     modifier = Modifier
-                        .size(42.dp)
+                        .size(44.dp)
                         .clip(CircleShape)
-                        .background(color = CyanAccent),
+                        .background(CyanAccent)
+                        .clickable(onClick = onSend),
+                    contentAlignment = Alignment.Center,
                 ) {
                     if (isEditing) {
                         Canvas(modifier = Modifier.size(18.dp)) {
@@ -1167,12 +1130,45 @@ private fun InputBar(
                             drawLine(BgDeep, Offset(size.width * 0.42f, size.height * 0.76f), Offset(size.width * 0.85f, size.height * 0.24f), sw, StrokeCap.Round)
                         }
                     } else {
-                        Icon(
-                            Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Send",
-                            tint = BgDeep,
-                            modifier = Modifier.size(17.dp),
+                        // Arrow-up icon
+                        Canvas(modifier = Modifier.size(20.dp)) {
+                            val sw = 2.2.dp.toPx()
+                            val cap = StrokeCap.Round
+                            val cx = size.width / 2f
+                            drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
+                        }
+                    }
+                }
+            } else {
+                // Mic icon
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .clickable { },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Canvas(modifier = Modifier.size(22.dp)) {
+                        val c = TextDim
+                        val sw = 1.6.dp.toPx()
+                        val st = Stroke(width = sw, cap = StrokeCap.Round)
+                        // mic body (rect with rounded top)
+                        drawRoundRect(
+                            color = c, style = st,
+                            topLeft = Offset(size.width * 0.33f, size.height * 0.08f),
+                            size = Size(size.width * 0.34f, size.height * 0.52f),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width * 0.17f),
                         )
+                        // arc below mic
+                        val path = androidx.compose.ui.graphics.Path().apply {
+                            moveTo(size.width * 0.18f, size.height * 0.48f)
+                            cubicTo(size.width * 0.18f, size.height * 0.82f, size.width * 0.82f, size.height * 0.82f, size.width * 0.82f, size.height * 0.48f)
+                        }
+                        drawPath(path, color = c, style = st)
+                        // stem line
+                        drawLine(c, Offset(size.width * 0.5f, size.height * 0.78f), Offset(size.width * 0.5f, size.height * 0.95f), sw, StrokeCap.Round)
                     }
                 }
             }
@@ -1264,3 +1260,124 @@ private fun categoryLabel(category: SafetyReportCategory): String = when (catego
 }
 
 private val CircleShape = RoundedCornerShape(50)
+
+// ── Chat top bar ──────────────────────────────────────────────────────────────
+
+@Composable
+private fun ChatTopBar(
+    theirUsername: String,
+    isConnected: Boolean,
+    onBack: () -> Unit,
+    onContactProfile: () -> Unit,
+    onMoreMenu: () -> Unit,
+    showMenu: Boolean,
+    onDismissMenu: () -> Unit,
+    onReport: () -> Unit,
+    onBlock: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface)
+            .windowInsetsPadding(WindowInsets.statusBars),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp)
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Back button — 36dp Surface2 circle
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(Surface2)
+                    .clickable(onClick = onBack),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    tint = TextPrimary,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+
+            Spacer(Modifier.width(10.dp))
+
+            // Center — name + E2EE status pill
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = theirUsername,
+                    color = TextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Canvas(modifier = Modifier.size(7.dp)) {
+                        drawCircle(color = if (isConnected) Success else TextDim)
+                    }
+                    Text(
+                        text = "Ed25519 · Encrypted",
+                        color = TextDim,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+
+            Spacer(Modifier.width(10.dp))
+
+            // Phone icon (future: voice call)
+            Icon(
+                Icons.Default.Phone,
+                contentDescription = "Call",
+                tint = TextDim,
+                modifier = Modifier
+                    .size(20.dp)
+                    .clickable { },
+            )
+
+            Spacer(Modifier.width(12.dp))
+
+            // Avatar (tap → contact profile) + MoreVert dropdown
+            Box(modifier = Modifier.clickable(onClick = onContactProfile)) {
+                GradientAvatar(name = theirUsername, size = 36.dp)
+            }
+
+            Box {
+                IconButton(onClick = onMoreMenu, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Default.MoreVert,
+                        contentDescription = "More",
+                        tint = TextDim,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = onDismissMenu,
+                    containerColor = Surface2,
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
+                        onClick = onReport,
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Block", color = Danger, fontSize = 14.sp) },
+                        onClick = onBlock,
+                    )
+                }
+            }
+        }
+        HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+    }
+}

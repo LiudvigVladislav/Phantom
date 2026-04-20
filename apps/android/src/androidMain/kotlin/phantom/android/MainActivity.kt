@@ -20,6 +20,7 @@ import phantom.android.di.AppContainer
 import phantom.android.screens.splash.PhantomSplashScreen
 import phantom.android.navigation.Screen
 import phantom.android.qr.QrScanScreen
+import phantom.android.screens.calls.CallsScreen
 import phantom.android.screens.chat.ChatScreen
 import phantom.android.screens.chatlist.ChatListScreen
 import phantom.android.screens.contact.ContactProfileScreen
@@ -27,6 +28,7 @@ import phantom.android.screens.onboarding.OnboardingScreen
 import phantom.android.screens.profile.ProfileScreen
 import phantom.android.screens.requests.MessageRequestsScreen
 import phantom.android.screens.saved.SavedMessagesScreen
+import phantom.android.screens.settings.SettingsScreen
 import phantom.android.ui.theme.*
 
 class MainActivity : ComponentActivity() {
@@ -166,6 +168,16 @@ private fun PhantomApp(
             onScanQr = { currentScreen = Screen.QrScan },
             scannedQr = scannedQrValue,
             onScannedQrConsumed = { scannedQrValue = null },
+        )
+        is Screen.Calls -> CallsScreen(
+            container = container,
+            onNavigate = { currentScreen = it },
+            onProfile = { currentScreen = Screen.Profile },
+        )
+        is Screen.Settings -> SettingsScreen(
+            container = container,
+            onNavigate = { currentScreen = it },
+            onProfile = { currentScreen = Screen.Profile },
         )
         is Screen.Profile -> ProfileScreen(
             container = container,
