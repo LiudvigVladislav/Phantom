@@ -16,6 +16,8 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import phantom.core.crypto.DoubleRatchet
 import phantom.core.crypto.DhKeyPair
+import phantom.core.crypto.MessagePadding
+import phantom.core.crypto.SealedSender
 import phantom.core.identity.IdentityRecord
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.ConversationRepository
@@ -91,11 +93,22 @@ class DefaultMessagingService(
             )
         )
 
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val sealedSenderB64 = Base64.encode(
+            SealedSender.seal(
+                fromPubKeyHex = identity.publicKeyHex,
+                toPublicKeyBytes = hexToBytes(message.recipientPublicKeyHex),
+            )
+        )
+
+        val paddedCiphertext = MessagePadding.pad(ciphertext)
+
         val sent = transport.send(
             RelayMessage.Send(
                 to = message.recipientPublicKeyHex,
-                from = identity.publicKeyHex,
-                payload = ciphertext.encodeBase64(),
+                from = "",
+                sealedSender = sealedSenderB64,
+                payload = paddedCiphertext.encodeBase64(),
                 messageId = message.id,
             )
         )
@@ -148,16 +161,27 @@ class DefaultMessagingService(
 
     private suspend fun handleDeliver(deliver: RelayMessage.Deliver) {
         runCatching {
-            val ciphertext = deliver.payload.decodeBase64Bytes()
+            // Recover sender identity: sealed sender hides `from` from the relay.
+            @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+            val senderPubKeyHex = if (deliver.sealedSender.isNotEmpty()) {
+                val sealedBytes = Base64.decode(deliver.sealedSender)
+                SealedSender.unseal(sealedBytes, localKeyPair.privateKey.bytes)
+                    ?: return@runCatching // Drop — cannot identify sender; avoids leaking error.
+            } else {
+                deliver.from // Backward compat: relay-supplied `from` for non-sealed messages.
+            }
+
+            // Unpad ISO 7816-4 padding applied by the sender to hide message length.
+            val ciphertext = MessagePadding.unpad(deliver.payload.decodeBase64Bytes())
             val encrypted = json.decodeFromString<phantom.core.crypto.EncryptedMessage>(
                 ciphertext.decodeToString()
             )
 
-            val conversationId = deriveConversationId(deliver.from)
+            val conversationId = deriveConversationId(senderPubKeyHex)
             val state = sessionManager.getOrCreateSession(
                 conversationId = conversationId,
                 localIdentityKeyPair = localKeyPair,
-                remoteIdentityPublicKeyHex = deliver.from,
+                remoteIdentityPublicKeyHex = senderPubKeyHex,
             )
 
             val (newState, plainBytes) = ratchet.decrypt(state, encrypted)
@@ -172,7 +196,7 @@ class DefaultMessagingService(
                     IncomingMessage(
                         id = payload.targetMessageId,
                         conversationId = conversationId,
-                        senderPublicKeyHex = deliver.from,
+                        senderPublicKeyHex = senderPubKeyHex,
                         text = "",
                         receivedAt = Clock.System.now().toEpochMilliseconds(),
                     )
@@ -185,7 +209,7 @@ class DefaultMessagingService(
                     IncomingMessage(
                         id = payload.targetMessageId,
                         conversationId = conversationId,
-                        senderPublicKeyHex = deliver.from,
+                        senderPublicKeyHex = senderPubKeyHex,
                         text = payload.text,
                         receivedAt = Clock.System.now().toEpochMilliseconds(),
                     )
@@ -222,12 +246,12 @@ class DefaultMessagingService(
             // Create conversation as REQUEST if unknown sender, keep TRUSTED if already known.
             val existing = conversationRepository.getConversation(conversationId)
             if (existing == null) {
-                val senderName = payload.senderUsername.ifBlank { deliver.from.take(8) }
+                val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
                 conversationRepository.upsertConversation(
                     ConversationEntity(
                         id = conversationId,
                         theirUsername = senderName,
-                        theirPublicKeyHex = deliver.from,
+                        theirPublicKeyHex = senderPubKeyHex,
                         lastMessagePreview = previewText(payload.text),
                         lastMessageAt = Clock.System.now().toEpochMilliseconds(),
                         unreadCount = 1,
@@ -249,13 +273,13 @@ class DefaultMessagingService(
                 IncomingMessage(
                     id = deliver.messageId,
                     conversationId = conversationId,
-                    senderPublicKeyHex = deliver.from,
+                    senderPublicKeyHex = senderPubKeyHex,
                     text = payload.text,
                     receivedAt = Clock.System.now().toEpochMilliseconds(),
                 )
             )
 
-            val senderName = payload.senderUsername.ifBlank { deliver.from.take(8) }
+            val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
             onNewMessageNotification?.invoke(conversationId, senderName, previewText(payload.text))
         }.onFailure { _ ->
             // Decryption or storage failure — drop silently to avoid leaking error details.
@@ -305,11 +329,15 @@ class DefaultMessagingService(
         val (newState, encrypted) = ratchet.encrypt(state, payload)
         sessionManager.saveSession(conversationId, newState)
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(
             RelayMessage.Send(
                 to = recipientPublicKeyHex,
-                from = identity.publicKeyHex,
-                payload = ciphertext.encodeBase64(),
+                from = "",
+                sealedSender = Base64.encode(
+                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                ),
+                payload = MessagePadding.pad(ciphertext).encodeBase64(),
                 messageId = uuid4().toString(),
             )
         )
@@ -338,11 +366,15 @@ class DefaultMessagingService(
         val (newState, encrypted) = ratchet.encrypt(state, payload)
         sessionManager.saveSession(conversationId, newState)
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(
             RelayMessage.Send(
                 to = recipientPublicKeyHex,
-                from = identity.publicKeyHex,
-                payload = ciphertext.encodeBase64(),
+                from = "",
+                sealedSender = Base64.encode(
+                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                ),
+                payload = MessagePadding.pad(ciphertext).encodeBase64(),
                 messageId = uuid4().toString(),
             )
         )
@@ -371,11 +403,15 @@ class DefaultMessagingService(
         val (newState, encrypted) = ratchet.encrypt(state, payload)
         sessionManager.saveSession(conversationId, newState)
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(
             RelayMessage.Send(
                 to = recipientPublicKeyHex,
-                from = identity.publicKeyHex,
-                payload = ciphertext.encodeBase64(),
+                from = "",
+                sealedSender = Base64.encode(
+                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                ),
+                payload = MessagePadding.pad(ciphertext).encodeBase64(),
                 messageId = uuid4().toString(),
             )
         )
@@ -395,3 +431,6 @@ private fun ByteArray.encodeBase64(): String = Base64.encode(this)
 
 @OptIn(ExperimentalEncodingApi::class)
 private fun String.decodeBase64Bytes(): ByteArray = Base64.decode(this)
+
+private fun hexToBytes(hex: String): ByteArray =
+    ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }

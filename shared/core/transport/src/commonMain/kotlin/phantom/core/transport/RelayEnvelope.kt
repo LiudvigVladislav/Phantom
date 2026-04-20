@@ -10,16 +10,18 @@ sealed class RelayMessage {
     @SerialName("send")
     data class Send(
         val to: String,
-        val from: String,
-        val payload: String,   // base64-encoded ciphertext
+        val from: String = "",          // empty when using sealed sender
+        val sealedSender: String = "",  // base64 blob (eph_pub||nonce||ct); when set, `from` is empty
+        val payload: String,            // base64-encoded ciphertext (ISO 7816-4 padded)
         val messageId: String,
     ) : RelayMessage()
 
     @Serializable
     @SerialName("deliver")
     data class Deliver(
-        val from: String,
-        val payload: String,   // base64-encoded ciphertext
+        val from: String = "",          // empty when using sealed sender
+        val sealedSender: String = "",  // base64 blob (eph_pub||nonce||ct); when set, `from` is empty
+        val payload: String,            // base64-encoded ciphertext (ISO 7816-4 padded)
         val messageId: String,
     ) : RelayMessage()
 

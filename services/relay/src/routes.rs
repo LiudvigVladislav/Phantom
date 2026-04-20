@@ -106,10 +106,13 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
         }
         for env in queued {
             let deliver = serde_json::json!({
-                "type": "deliver",
-                "from": env.from,
-                "payload": env.payload,
-                "messageId": env.id,
+                "type":         "deliver",
+                // For sealed messages `from` is empty and the recipient recovers
+                // sender identity by decrypting `sealedSender` client-side.
+                "from":         if env.sealed_sender.is_empty() { &env.from } else { "" },
+                "sealedSender": env.sealed_sender,
+                "payload":      env.payload,
+                "messageId":    env.id,
             });
             let _ = tx.send(deliver.to_string());
         }
@@ -169,36 +172,48 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
     match value.get("type").and_then(|t| t.as_str()) {
         Some("send") => {
             let to      = value["to"].as_str().unwrap_or("").to_string();
-            // Always use the authenticated WS identity as the sender — never trust
-            // client-supplied "from" to prevent relay-layer sender spoofing.
-            let from    = from_identity.to_string();
+            // `from_identity` is the authenticated WS connection identity.
+            // It is used ONLY for rate-limiting and blocklist checks — it is
+            // never stored in the envelope or emitted in logs for sealed messages.
+            // Client-supplied "from" fields are intentionally ignored; spoofing
+            // prevention is enforced at the connection layer, not the frame layer.
+            let sealed_sender = value["sealedSender"].as_str().unwrap_or("").to_string();
             let payload = value["payload"].as_str().unwrap_or("").to_string();
             let msg_id  = value["messageId"].as_str().unwrap_or("").to_string();
 
             if to.is_empty() || payload.is_empty() || msg_id.is_empty() {
-                tracing::warn!(from = %&from[..from.len().min(16)], to = %&to[..to.len().min(16)], "send dropped: empty field");
+                tracing::warn!(
+                    to = %&to[..to.len().min(16)],
+                    sealed = !sealed_sender.is_empty(),
+                    "send dropped: empty field"
+                );
                 return;
             }
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
+            // Log only routing metadata — never from/to key prefixes for sealed
+            // messages, so the relay holds zero knowledge of who sent to whom.
             tracing::info!(
-                event    = "message",
-                msg_id   = %msg_id,
-                from_key = %&from[..from.len().min(16)],
-                to_key   = %&to[..to.len().min(16)],
-                size_b   = payload.len(),
-                ts_ms    = ts,
+                event  = "message",
+                msg_id = %msg_id,
+                size_b = payload.len(),
+                sealed = !sealed_sender.is_empty(),
+                ts_ms  = ts,
                 "metadata"
             );
 
             // Rate-limit check — sliding window per sender identity.
             // On window expiry the counter resets; within the window it increments.
             // Drops silently: informing the spammer about the limit is undesirable.
+            // Rate-limit and blocklist checks are keyed on `from_identity`
+            // (the authenticated WS connection), NOT on any client-supplied field.
+            // This remains true for sealed messages: the relay can throttle abuse
+            // without learning message content or envelope metadata.
             let rate_ok = {
                 let mut limiter = state.rate_limiter.write().await;
-                let entry = limiter.entry(from.clone()).or_insert(RateEntry {
+                let entry = limiter.entry(from_identity.to_string()).or_insert(RateEntry {
                     count: 0,
                     window_start: std::time::Instant::now(),
                 });
@@ -217,24 +232,35 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             };
 
             if !rate_ok {
-                tracing::warn!(from = %&from[..from.len().min(16)], "rate limit exceeded");
+                tracing::warn!("rate limit exceeded");
                 return;
             }
 
-            // Blocklist check — silent drop for both sender and recipient
+            // Blocklist check — silent drop for both sender and recipient.
+            // Sender is identified by the authenticated WS identity, not by any
+            // client-supplied field, so spoofed "from" values have no effect.
             {
                 let bl = state.blocklist.read().await;
-                if bl.contains(&from) || bl.contains(&to) {
-                    tracing::warn!(from = %&from[..from.len().min(16)], to = %&to[..to.len().min(16)], "blocked key — message dropped");
+                if bl.contains(from_identity) || bl.contains(&to) {
+                    tracing::warn!(to = %&to[..to.len().min(16)], "blocked key — message dropped");
                     return;
                 }
             }
 
+            // Build the delivery frame. For sealed messages `from` is empty so
+            // the relay never reveals the sender identity to anyone, including
+            // itself — the recipient decrypts `sealedSender` client-side.
+            let envelope_from = if sealed_sender.is_empty() {
+                from_identity.to_string()
+            } else {
+                String::new()
+            };
             let deliver = serde_json::json!({
-                "type": "deliver",
-                "from": from,
-                "payload": payload,
-                "messageId": msg_id,
+                "type":         "deliver",
+                "from":         envelope_from,
+                "sealedSender": sealed_sender,
+                "payload":      payload,
+                "messageId":    msg_id,
             })
             .to_string();
 
@@ -249,13 +275,14 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             };
 
             if delivered {
-                tracing::info!(msg_id = %msg_id, to = %&to[..to.len().min(16)], "live delivery OK");
+                tracing::info!(msg_id = %msg_id, "live delivery OK");
             } else {
                 // Store for later
                 let envelope = Envelope::new(
                     msg_id.clone(),
                     to.clone(),
-                    from,
+                    envelope_from,
+                    sealed_sender.clone(),
                     payload,
                     state.config.envelope_ttl_secs,
                 );
@@ -263,8 +290,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                     // Log only online_count, never key prefixes — presence metadata leak.
                     let online_count = state.clients.read().await.len();
                     tracing::info!(
-                        msg_id = %msg_id,
-                        to = %&to[..to.len().min(16)],
+                        msg_id       = %msg_id,
                         online_count,
                         "recipient offline — queuing"
                     );
@@ -348,17 +374,30 @@ async fn send_envelope(
     if !check_admin_token(&params, &state) {
         return Err(RelayError::BadRequest("unauthorized".into()));
     }
-    if req.id.is_empty() || req.to.is_empty() || req.from.is_empty() {
-        return Err(RelayError::BadRequest("id, to, from are required".into()));
+    // `from` is optional for sealed-sender messages; one of `from` or
+    // `sealed_sender` must be present so the envelope is attributable for
+    // abuse-response purposes (the relay stores neither for sealed messages
+    // — the sealed blob is opaque — but empty envelopes are useless).
+    let is_sealed = !req.sealed_sender.is_empty();
+    if req.id.is_empty() || req.to.is_empty() || (!is_sealed && req.from.is_empty()) {
+        return Err(RelayError::BadRequest(
+            "id and to are required; either from or sealedSender must be present".into(),
+        ));
     }
     if req.payload.len() > state.config.max_payload_bytes {
         return Err(RelayError::PayloadTooLarge);
     }
 
+    let envelope_from = if is_sealed {
+        String::new()
+    } else {
+        req.from
+    };
     let envelope = Envelope::new(
         req.id,
         req.to.clone(),
-        req.from,
+        envelope_from,
+        req.sealed_sender,
         req.payload,
         state.config.envelope_ttl_secs,
     );

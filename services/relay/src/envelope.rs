@@ -7,8 +7,14 @@ pub struct Envelope {
     pub id: String,
     /// Recipient's public key hex — used as routing key only.
     pub to: String,
-    /// Sender's public key hex — included for recipient's session lookup.
+    /// Sender's public key hex — populated only for legacy (non-sealed) messages.
+    /// For sealed-sender messages this is empty; the sender identity is hidden
+    /// inside `sealed_sender` and is never visible to the relay.
     pub from: String,
+    /// Opaque sealed-sender blob (base64). The relay never decrypts or inspects
+    /// this field. When present, `from` is always empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sealed_sender: String,
     /// Base64-encoded ciphertext blob.
     pub payload: String,
     /// Unix timestamp (seconds) when this envelope expires.
@@ -16,7 +22,14 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn new(id: String, to: String, from: String, payload: String, ttl_secs: u64) -> Self {
+    pub fn new(
+        id: String,
+        to: String,
+        from: String,
+        sealed_sender: String,
+        payload: String,
+        ttl_secs: u64,
+    ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -25,6 +38,7 @@ impl Envelope {
             id,
             to,
             from,
+            sealed_sender,
             payload,
             expires_at: now + ttl_secs,
         }
@@ -44,7 +58,13 @@ impl Envelope {
 pub struct SendRequest {
     pub id: String,
     pub to: String,
+    /// Empty string for sealed-sender messages.
+    #[serde(default)]
     pub from: String,
+    /// Opaque sealed-sender blob (base64). Mutually exclusive with `from`.
+    /// The relay stores this verbatim without inspection.
+    #[serde(default)]
+    pub sealed_sender: String,
     pub payload: String,
 }
 
