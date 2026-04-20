@@ -1,31 +1,34 @@
 package phantom.android.screens.contact
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Email
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.GradientAvatar
@@ -42,6 +45,8 @@ fun ContactProfileScreen(
     onDeleteConversation: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
     var conversation by remember {
         mutableStateOf(
             phantom.core.storage.ConversationEntity(
@@ -58,10 +63,8 @@ fun ContactProfileScreen(
     var savedNotesText by remember { mutableStateOf("") }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var showBlockDialog by remember { mutableStateOf(false) }
+    var showMoreMenu by remember { mutableStateOf(false) }
     var keyCopied by remember { mutableStateOf(false) }
-    val context = LocalContext.current
-
-    val notesSaved = notesText == savedNotesText
 
     LaunchedEffect(conversationId) {
         val conv = container.conversationRepo.getConversation(conversationId)
@@ -72,12 +75,19 @@ fun ContactProfileScreen(
         }
     }
 
+    // ── Dialogs ──────────────────────────────────────────────────────────────
+
     if (showDeleteDialog) {
         AlertDialog(
             onDismissRequest = { showDeleteDialog = false },
             containerColor = Surface,
-            title = { Text("Delete chat", color = TextPrimary) },
-            text = { Text("Delete conversation with @$theirUsername? This cannot be undone.", color = TextDim, fontSize = 14.sp) },
+            title = { Text("Delete conversation?", color = TextPrimary) },
+            text = {
+                Text(
+                    "This removes all messages locally. Contact won't be notified.",
+                    color = TextDim, fontSize = 14.sp,
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     showDeleteDialog = false
@@ -97,8 +107,13 @@ fun ContactProfileScreen(
         AlertDialog(
             onDismissRequest = { showBlockDialog = false },
             containerColor = Surface,
-            title = { Text("Block contact", color = TextPrimary) },
-            text = { Text("Block @$theirUsername? You will no longer receive messages from them.", color = TextDim, fontSize = 14.sp) },
+            title = { Text("Block @$theirUsername?", color = TextPrimary) },
+            text = {
+                Text(
+                    "You will no longer receive messages from them.",
+                    color = TextDim, fontSize = 14.sp,
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     showBlockDialog = false
@@ -114,19 +129,90 @@ fun ContactProfileScreen(
         )
     }
 
+    // ── Screen ───────────────────────────────────────────────────────────────
+
     Scaffold(
         containerColor = BgDeep,
+        contentWindowInsets = WindowInsets(0),
         topBar = {
-            TopAppBar(
-                title = {},
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextDim)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Surface)
+                    .windowInsetsPadding(WindowInsets.statusBars),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // Back
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(Surface2)
+                            .clickable(onClick = onBack),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                            tint = TextPrimary,
+                            modifier = Modifier.size(18.dp),
+                        )
                     }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Surface),
-            )
-        }
+
+                    // Title
+                    Text(
+                        text = "Contact",
+                        modifier = Modifier.weight(1f),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        color = TextDim,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = 3.sp,
+                        fontWeight = FontWeight.Normal,
+                    )
+
+                    // More menu
+                    Box {
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(Surface2)
+                                .clickable { showMoreMenu = true },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Default.MoreVert,
+                                contentDescription = "More",
+                                tint = TextPrimary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = showMoreMenu,
+                            onDismissRequest = { showMoreMenu = false },
+                            containerColor = Surface2,
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
+                                onClick = { showMoreMenu = false },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Block", color = Danger, fontSize = 14.sp) },
+                                onClick = { showMoreMenu = false; showBlockDialog = true },
+                            )
+                        }
+                    }
+                }
+                HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+            }
+        },
     ) { padding ->
         Column(
             modifier = Modifier
@@ -134,314 +220,516 @@ fun ContactProfileScreen(
                 .padding(padding)
                 .verticalScroll(rememberScrollState()),
         ) {
-            // ── Hero section ─────────────────────────────────────
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Surface)
-                    .padding(top = 32.dp, bottom = 28.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    GradientAvatar(
-                        name = theirUsername,
-                        size = 96.dp,
-                        online = null,
-                        ring = false,
+            // ── Hero card ─────────────────────────────────────────────────────
+            ContactCard(topPad = 24.dp, bottomPad = 20.dp) {
+                Box(contentAlignment = Alignment.Center) {
+                    GradientAvatar(name = theirUsername, size = 96.dp)
+                    // Online dot
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .offset(x = (-4).dp, y = (-4).dp)
+                            .size(18.dp)
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(Surface)
+                            .padding(3.dp)
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(Success),
                     )
-                    Spacer(Modifier.height(16.dp))
-                    Text(
-                        text = "@$theirUsername",
-                        color = TextPrimary,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = null,
-                            tint = Success.copy(alpha = 0.8f),
-                            modifier = Modifier.size(11.dp),
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(
-                            text = "end-to-end encrypted",
-                            color = Success.copy(alpha = 0.8f),
-                            fontSize = 12.sp,
-                            letterSpacing = 0.3.sp,
-                        )
-                    }
                 }
-            }
 
-            Spacer(Modifier.height(1.dp))
+                Spacer(Modifier.height(14.dp))
 
-            // ── Action buttons ────────────────────────────────────
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Surface)
-                    .padding(horizontal = 20.dp, vertical = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                // Message button
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(CyanAccent)
-                        .clickable { onMessage() }
-                        .padding(vertical = 12.dp),
-                    contentAlignment = Alignment.Center,
+                Text(
+                    text = "@$theirUsername",
+                    color = TextPrimary,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = (-0.3).sp,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Last seen recently",
+                    color = TextDim,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    letterSpacing = 0.4.sp,
+                )
+
+                Spacer(Modifier.height(18.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Email, contentDescription = null, tint = BgDeep, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(7.dp))
-                        Text("Message", color = BgDeep, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                    }
-                }
-                // Block/Unblock button
-                if (conversation.blocked) {
+                    // Message button
                     Box(
                         modifier = Modifier
                             .weight(1f)
-                            .clip(RoundedCornerShape(10.dp))
-                            .border(1.dp, Success.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
-                            .clickable {
-                                scope.launch {
-                                    container.conversationRepo.unblockConversation(conversationId)
-                                    conversation = conversation.copy(blocked = false)
-                                }
-                            }
-                            .padding(vertical = 12.dp),
+                            .height(46.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(CyanAccent)
+                            .clickable(onClick = onMessage),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Check, contentDescription = null, tint = Success, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(7.dp))
-                            Text("Unblock", color = Success, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Canvas(modifier = Modifier.size(16.dp)) {
+                                val path = androidx.compose.ui.graphics.Path().apply {
+                                    moveTo(size.width * 0.1f, size.height * 0.2f)
+                                    lineTo(size.width * 0.9f, size.height * 0.2f)
+                                    lineTo(size.width * 0.9f, size.height * 0.72f)
+                                    lineTo(size.width * 0.6f, size.height * 0.72f)
+                                    lineTo(size.width * 0.35f, size.height * 0.95f)
+                                    lineTo(size.width * 0.35f, size.height * 0.72f)
+                                    lineTo(size.width * 0.1f, size.height * 0.72f)
+                                    close()
+                                }
+                                drawPath(path, BgDeep, style = Stroke(1.6.dp.toPx(), cap = StrokeCap.Round))
+                            }
+                            Text("Message", color = BgDeep, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(10.dp))
-                            .border(1.dp, Danger.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
-                            .clickable { showBlockDialog = true }
-                            .padding(vertical = 12.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text("Block", color = Danger, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+
+                    // Block / Unblock button
+                    if (conversation.blocked) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .border(1.dp, Success.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                                .clickable {
+                                    scope.launch {
+                                        container.conversationRepo.unblockConversation(conversationId)
+                                        conversation = conversation.copy(blocked = false)
+                                    }
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Icon(Icons.Default.Check, contentDescription = null, tint = Success, modifier = Modifier.size(16.dp))
+                                Text("Unblock", color = Success, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .border(1.dp, Danger, RoundedCornerShape(12.dp))
+                                .clickable { showBlockDialog = true },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Canvas(modifier = Modifier.size(16.dp)) {
+                                    val r = size.minDimension / 2f - 1.dp.toPx()
+                                    val sw = 1.6.dp.toPx()
+                                    drawCircle(Danger, radius = r, style = Stroke(sw))
+                                    drawLine(Danger, androidx.compose.ui.geometry.Offset(size.width * 0.2f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.8f, size.height * 0.8f), sw, StrokeCap.Round)
+                                }
+                                Text("Block", color = Danger, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
                     }
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
+            // ── Public key card ───────────────────────────────────────────────
+            ContactCard {
+                CContactSectionHeader(label = "Public Key", icon = {
+                    Canvas(Modifier.size(12.dp)) {
+                        val r = size.minDimension / 2f - 0.5.dp.toPx()
+                        drawCircle(Success, radius = r * 0.55f)
+                        drawCircle(Success, radius = r, style = Stroke(1.dp.toPx()))
+                    }
+                })
 
-            // ── Public key card ───────────────────────────────────
-            if (conversation.theirPublicKeyHex.isNotEmpty()) {
-                Column(
+                // Key preview box
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Surface)
-                        .padding(horizontal = 20.dp, vertical = 16.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Surface2)
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
                 ) {
-                    Text(
-                        "IDENTITY KEY",
-                        color = TextDim,
-                        fontSize = 10.sp,
-                        letterSpacing = 2.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = "ed25519:",
-                            color = CyanAccent.copy(alpha = 0.7f),
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                        Text(
-                            text = conversation.theirPublicKeyHex.take(16) + "…",
-                            color = TextPrimary.copy(alpha = 0.75f),
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(if (keyCopied) Success.copy(alpha = 0.08f) else Surface2)
-                            .border(
-                                1.dp,
-                                if (keyCopied) Success.copy(alpha = 0.3f) else Color.White.copy(alpha = 0.06f),
-                                RoundedCornerShape(6.dp),
+                    Column {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                "ed25519",
+                                color = CyanAccent,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                letterSpacing = 2.sp,
+                                fontWeight = FontWeight.SemiBold,
                             )
-                            .clickable {
-                                val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("key", conversation.theirPublicKeyHex))
-                                keyCopied = true
-                                scope.launch { kotlinx.coroutines.delay(2000); keyCopied = false }
-                            }
-                            .padding(horizontal = 12.dp, vertical = 7.dp),
-                    ) {
+                            Text(
+                                "verified · ${java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(java.util.Date())}",
+                                color = TextDim,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                letterSpacing = 1.6.sp,
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        val keyPreview = if (conversation.theirPublicKeyHex.isNotEmpty()) {
+                            conversation.theirPublicKeyHex.chunked(4).take(8).joinToString("  ") + "  …"
+                        } else {
+                            "9C3F  4A2B  81E7  D05C  2F1A  B6E4  77D9  …"
+                        }
                         Text(
-                            text = if (keyCopied) "✓  Copied" else "Copy full key",
-                            color = if (keyCopied) Success else TextDim,
+                            text = keyPreview,
+                            color = TextPrimary,
                             fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = 0.6.sp,
+                            lineHeight = 18.sp,
                         )
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-            }
 
-            // ── Settings rows ─────────────────────────────────────
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Surface)
-            ) {
-                ContactSettingsRow(
-                    icon = Icons.Default.Lock,
-                    label = "Disappearing messages",
-                    value = "Off",
+                // Copy key row
+                CKeyRow(
+                    icon = {
+                        Canvas(Modifier.size(14.dp)) {
+                            val sw = 1.4.dp.toPx()
+                            val st = Stroke(sw, cap = StrokeCap.Round)
+                            drawRoundRect(CyanAccent, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.28f, 0f), size = androidx.compose.ui.geometry.Size(size.width * 0.72f, size.height * 0.72f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx()), style = st)
+                            drawRoundRect(CyanAccent, topLeft = androidx.compose.ui.geometry.Offset(0f, size.height * 0.28f), size = androidx.compose.ui.geometry.Size(size.width * 0.72f, size.height * 0.72f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx()), style = st)
+                        }
+                    },
+                    label = "Copy key",
+                    value = "32-byte fingerprint",
+                    right = {
+                        Text(
+                            text = if (keyCopied) "Copied" else "Copy",
+                            color = if (keyCopied) Success else CyanAccent,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            letterSpacing = 1.8.sp,
+                        )
+                    },
+                    onClick = {
+                        val key = conversation.theirPublicKeyHex.ifEmpty { "ed25519:placeholder" }
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("key", key))
+                        keyCopied = true
+                        scope.launch { delay(2000); keyCopied = false }
+                    },
                 )
-                HorizontalDivider(modifier = Modifier.padding(start = 56.dp), color = Color.White.copy(alpha = 0.04f))
-                ContactSettingsRow(
-                    icon = Icons.Default.Notifications,
-                    label = "Notifications",
-                    value = "On",
-                )
-                HorizontalDivider(modifier = Modifier.padding(start = 56.dp), color = Color.White.copy(alpha = 0.04f))
-                ContactSettingsRow(
-                    icon = Icons.Default.Check,
+
+                // Verify row
+                CKeyRow(
+                    icon = {
+                        Canvas(Modifier.size(16.dp)) {
+                            val sw = 1.4.dp.toPx()
+                            val st = Stroke(sw, cap = StrokeCap.Round)
+                            val r = size.minDimension / 2f - 1.dp.toPx()
+                            drawCircle(CyanAccent, radius = r, style = st)
+                            drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.35f), androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.62f), sw, StrokeCap.Round)
+                            drawCircle(CyanAccent, radius = 1.dp.toPx(), center = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.72f))
+                        }
+                    },
                     label = "Verify safety number",
-                    value = "",
-                    onClick = {},
+                    value = "Scan QR or compare 60 digits",
+                    right = {
+                        Canvas(Modifier.size(14.dp)) {
+                            val sw = 1.4.dp.toPx()
+                            drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), sw, StrokeCap.Round)
+                            drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
+                        }
+                    },
                 )
             }
 
-            Spacer(Modifier.height(8.dp))
+            // ── Notes card ────────────────────────────────────────────────────
+            ContactCard {
+                CContactSectionHeader(label = "Notes", icon = {
+                    Canvas(Modifier.size(12.dp)) {
+                        val sw = 1.3.dp.toPx()
+                        val st = Stroke(sw, cap = StrokeCap.Round)
+                        drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.15f, size.height * 0.3f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.3f), sw, StrokeCap.Round)
+                        drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.15f, size.height * 0.55f), androidx.compose.ui.geometry.Offset(size.width * 0.65f, size.height * 0.55f), sw, StrokeCap.Round)
+                        drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.15f, size.height * 0.8f), androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.8f), sw, StrokeCap.Round)
+                    }
+                })
 
-            // ── Notes ─────────────────────────────────────────────
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Surface)
-                    .padding(horizontal = 20.dp, vertical = 16.dp)
-            ) {
-                Text("NOTE", color = TextDim, fontSize = 10.sp, letterSpacing = 2.sp, fontWeight = FontWeight.Medium)
-                Text("Only visible to you — not synced", color = TextDim.copy(alpha = 0.5f), fontSize = 10.sp)
-                Spacer(Modifier.height(10.dp))
                 OutlinedTextField(
                     value = notesText,
                     onValueChange = { notesText = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("Add a note…", color = TextDim.copy(alpha = 0.5f), fontSize = 14.sp) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .defaultMinSize(minHeight = 76.dp),
+                    placeholder = { Text("Add private notes about this contact…", color = TextDim, fontSize = 14.sp) },
                     minLines = 3,
                     maxLines = 6,
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = TextPrimary,
                         unfocusedTextColor = TextPrimary,
-                        focusedBorderColor = CyanAccent.copy(alpha = 0.5f),
-                        unfocusedBorderColor = Color.White.copy(alpha = 0.08f),
+                        focusedBorderColor = Color.Transparent,
+                        unfocusedBorderColor = Color.Transparent,
                         cursorColor = CyanAccent,
                         focusedContainerColor = Surface2,
                         unfocusedContainerColor = Surface2,
                     ),
                     shape = RoundedCornerShape(10.dp),
                 )
-                Spacer(Modifier.height(10.dp))
-                Row(
-                    horizontalArrangement = Arrangement.End,
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    if (notesSaved && savedNotesText.isNotEmpty()) {
-                        Text("Saved", color = Success, fontSize = 12.sp)
-                        Spacer(Modifier.width(12.dp))
-                    }
-                    Button(
-                        onClick = {
-                            val textToSave = notesText
-                            scope.launch {
-                                container.conversationRepo.updateNotes(conversationId, textToSave.ifBlank { null })
-                                savedNotesText = textToSave
-                            }
-                        },
-                        enabled = !notesSaved,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = CyanAccent,
-                            contentColor = BgDeep,
-                            disabledContainerColor = TextDim.copy(alpha = 0.15f),
-                            disabledContentColor = TextDim,
-                        ),
-                        shape = RoundedCornerShape(8.dp),
+
+                if (notesText != savedNotesText) {
+                    Spacer(Modifier.height(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(CyanAccent)
+                            .clickable {
+                                val text = notesText
+                                scope.launch {
+                                    container.conversationRepo.updateNotes(conversationId, text.ifBlank { null })
+                                    savedNotesText = text
+                                }
+                            },
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Text("Save", fontSize = 13.sp)
+                        Text("Save note", color = BgDeep, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     }
+                }
+
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Canvas(Modifier.size(10.dp)) {
+                        drawCircle(Success, radius = size.minDimension / 2f - 0.5.dp.toPx(), style = Stroke(1.dp.toPx()))
+                        drawCircle(Success, radius = size.minDimension * 0.2f)
+                    }
+                    Text(
+                        "Encrypted · stored locally only",
+                        color = TextDim,
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = 1.8.sp,
+                    )
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
+            // ── Settings card ─────────────────────────────────────────────────
+            Box(
+                modifier = Modifier
+                    .padding(horizontal = 14.dp)
+                    .padding(top = 12.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Surface)
+                    .border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+            ) {
+                Column {
+                    CKeyRow(
+                        icon = {
+                            Canvas(Modifier.size(16.dp)) {
+                                val sw = 1.4.dp.toPx(); val st = Stroke(sw, cap = StrokeCap.Round)
+                                drawOval(CyanAccent, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.25f, size.height * 0.1f), size = androidx.compose.ui.geometry.Size(size.width * 0.5f, size.height * 0.5f), style = st)
+                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.6f), androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.9f), sw, StrokeCap.Round)
+                            }
+                        },
+                        label = "Disappearing messages",
+                        value = "Off",
+                        right = { ChevronIcon() },
+                    )
+                    CKeyRow(
+                        icon = {
+                            Canvas(Modifier.size(16.dp)) {
+                                val sw = 1.4.dp.toPx(); val st = Stroke(sw, cap = StrokeCap.Round)
+                                val path = androidx.compose.ui.graphics.Path().apply {
+                                    moveTo(size.width * 0.5f, size.height * 0.08f)
+                                    cubicTo(size.width * 0.2f, size.height * 0.08f, size.width * 0.08f, size.height * 0.35f, size.width * 0.08f, size.height * 0.58f)
+                                    cubicTo(size.width * 0.08f, size.height * 0.75f, size.width * 0.15f, size.height * 0.82f, size.width * 0.5f, size.height * 0.85f)
+                                    cubicTo(size.width * 0.85f, size.height * 0.82f, size.width * 0.92f, size.height * 0.75f, size.width * 0.92f, size.height * 0.58f)
+                                    cubicTo(size.width * 0.92f, size.height * 0.35f, size.width * 0.8f, size.height * 0.08f, size.width * 0.5f, size.height * 0.08f)
+                                    close()
+                                }
+                                drawPath(path, CyanAccent, style = st)
+                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.35f, size.height * 0.88f), androidx.compose.ui.geometry.Offset(size.width * 0.65f, size.height * 0.88f), sw, StrokeCap.Round)
+                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.88f), androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.98f), sw, StrokeCap.Round)
+                            }
+                        },
+                        label = "Notifications",
+                        value = "Default · with preview",
+                        right = { ChevronIcon() },
+                    )
+                    CKeyRow(
+                        icon = {
+                            Canvas(Modifier.size(16.dp)) {
+                                val sw = 1.4.dp.toPx(); val st = Stroke(sw, cap = StrokeCap.Round)
+                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.1f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.9f, size.height * 0.5f), sw, StrokeCap.Round)
+                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.15f), androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.85f), sw, StrokeCap.Round)
+                                drawCircle(CyanAccent, radius = size.minDimension / 2f - 0.5.dp.toPx(), style = st)
+                            }
+                        },
+                        label = "Media auto-download",
+                        value = "Wi-Fi only",
+                        right = { ChevronIcon() },
+                        showTopDivider = false,
+                    )
+                }
+            }
 
-            // ── Danger zone ───────────────────────────────────────
+            // ── Danger zone ───────────────────────────────────────────────────
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Surface)
+                    .padding(horizontal = 14.dp)
+                    .padding(top = 20.dp, bottom = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                TextButton(
-                    onClick = { showDeleteDialog = true },
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(46.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.dp, Danger, RoundedCornerShape(12.dp))
+                        .clickable { showDeleteDialog = true },
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text("Delete chat", color = Danger, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Canvas(Modifier.size(15.dp)) {
+                            val sw = 1.5.dp.toPx(); val st = Stroke(sw, cap = StrokeCap.Round)
+                            drawLine(Danger, androidx.compose.ui.geometry.Offset(size.width * 0.2f, size.height * 0.28f), androidx.compose.ui.geometry.Offset(size.width * 0.8f, size.height * 0.28f), sw, StrokeCap.Round)
+                            drawRoundRect(Danger, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.28f), size = androidx.compose.ui.geometry.Size(size.width * 0.4f, size.height * 0.65f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx()), style = st)
+                            drawLine(Danger, androidx.compose.ui.geometry.Offset(size.width * 0.38f, size.height * 0.12f), androidx.compose.ui.geometry.Offset(size.width * 0.62f, size.height * 0.12f), sw, StrokeCap.Round)
+                        }
+                        Text("Delete conversation", color = Danger, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "This removes all messages locally. Contact won't be notified.",
+                    color = TextDim,
+                    fontSize = 11.5.sp,
+                    lineHeight = 16.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+            }
+
+            Spacer(Modifier.height(20.dp))
+        }
+    }
+}
+
+// ── Shared composables ────────────────────────────────────────────────────────
+
+@Composable
+private fun ContactCard(
+    topPad: androidx.compose.ui.unit.Dp = 16.dp,
+    bottomPad: androidx.compose.ui.unit.Dp = 16.dp,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .padding(horizontal = 14.dp)
+            .padding(top = 12.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Surface)
+            .border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(16.dp))
+            .padding(horizontal = 16.dp)
+            .padding(top = topPad, bottom = bottomPad),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        content = content,
+    )
+}
+
+@Composable
+private fun CContactSectionHeader(label: String, icon: @Composable () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        icon()
+        Text(
+            text = label.uppercase(),
+            color = TextDim,
+            fontSize = 10.sp,
+            fontFamily = FontFamily.Monospace,
+            letterSpacing = 2.4.sp,
+        )
+    }
+}
+
+@Composable
+private fun CKeyRow(
+    icon: @Composable () -> Unit,
+    label: String,
+    value: String = "",
+    right: (@Composable () -> Unit)? = null,
+    onClick: (() -> Unit)? = null,
+    showTopDivider: Boolean = true,
+) {
+    Column {
+        if (showTopDivider) {
+            HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+                .padding(vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Surface2),
+                contentAlignment = Alignment.Center,
+            ) { icon() }
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(text = label, color = TextPrimary, fontSize = 14.sp, letterSpacing = (-0.1).sp)
+                if (value.isNotEmpty()) {
+                    Text(
+                        text = value,
+                        color = TextDim,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = 0.2.sp,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
                 }
             }
 
-            Spacer(Modifier.height(40.dp))
+            right?.invoke()
         }
     }
 }
 
 @Composable
-private fun ContactSettingsRow(
-    icon: ImageVector,
-    label: String,
-    value: String,
-    onClick: (() -> Unit)? = null,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            .padding(horizontal = 20.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(32.dp)
-                .clip(CircleShape)
-                .background(Surface2),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(icon, contentDescription = null, tint = TextDim, modifier = Modifier.size(15.dp))
-        }
-        Spacer(Modifier.width(14.dp))
-        Text(
-            text = label,
-            color = TextPrimary,
-            fontSize = 14.sp,
-            modifier = Modifier.weight(1f),
-        )
-        if (value.isNotEmpty()) {
-            Text(text = value, color = TextDim, fontSize = 13.sp)
-        }
+private fun ChevronIcon() {
+    Canvas(Modifier.size(14.dp)) {
+        val sw = 1.4.dp.toPx()
+        drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), sw, StrokeCap.Round)
+        drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
     }
 }
