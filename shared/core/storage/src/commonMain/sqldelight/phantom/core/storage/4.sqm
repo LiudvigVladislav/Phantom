@@ -1,0 +1,4 @@
+-- Migration from schema version 4 → 5
+-- Adds per-message expiry and per-conversation disappearing-timer setting.
+ALTER TABLE message ADD COLUMN expires_at_ms INTEGER;
+ALTER TABLE conversation ADD COLUMN disappearing_timer_secs INTEGER NOT NULL DEFAULT 0;

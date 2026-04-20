@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -53,6 +54,14 @@ class KtorRelayTransport(
         extraBufferCapacity = 64,
     )
     override val readReceipts: Flow<RelayMessage.ReadReceipt> = _readReceipts.asSharedFlow()
+
+    // Typing events are ephemeral and never stored or encrypted.
+    // extraBufferCapacity = 10 ensures rapid keystrokes never block the read loop.
+    private val _typingEvents = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 10,
+    )
+    override val typingEvents: SharedFlow<String> = _typingEvents.asSharedFlow()
 
     private var session: WebSocketSession? = null
     private var scope: CoroutineScope? = null
@@ -117,6 +126,25 @@ class KtorRelayTransport(
             if (frame is Frame.Text) {
                 val text = frame.readText()
                 try {
+                    // Typing events are ephemeral and are NOT part of the RelayMessage sealed
+                    // class (no E2EE, not stored). Handle them before sealed-class decoding.
+                    val rawType = json.parseToJsonElement(text)
+                        .let { it as? kotlinx.serialization.json.JsonObject }
+                        ?.get("type")
+                        ?.let { it as? kotlinx.serialization.json.JsonPrimitive }
+                        ?.content
+                    if (rawType == "typing") {
+                        val from = json.parseToJsonElement(text)
+                            .let { it as? kotlinx.serialization.json.JsonObject }
+                            ?.get("from")
+                            ?.let { it as? kotlinx.serialization.json.JsonPrimitive }
+                            ?.content
+                        if (!from.isNullOrEmpty()) {
+                            _typingEvents.emit(from)
+                        }
+                        continue
+                    }
+
                     when (val msg = json.decodeFromString<RelayMessage>(text)) {
                         is RelayMessage.Deliver -> _incoming.emit(msg)
                         is RelayMessage.Ack -> _acks.emit(msg)
@@ -138,6 +166,21 @@ class KtorRelayTransport(
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean {
         if (!isConnected()) return false
         return sendRaw(message)
+    }
+
+    /**
+     * Sends an ephemeral typing notification over the existing WebSocket session.
+     * The relay is responsible for live forwarding; if the recipient is offline the
+     * relay drops the frame silently — no storage, no queue.
+     */
+    override suspend fun sendTyping(toPubKeyHex: String): Boolean {
+        if (!isConnected()) return false
+        return try {
+            session?.send(Frame.Text("""{"type":"typing","to":"$toPubKeyHex"}"""))
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private suspend fun sendRaw(message: RelayMessage): Boolean {

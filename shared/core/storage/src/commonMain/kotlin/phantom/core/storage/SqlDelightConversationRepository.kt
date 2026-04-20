@@ -83,6 +83,27 @@ class SqlDelightConversationRepository(
             db.conversationQueries.deleteConversation(id)
         }
 
+    override suspend fun setVerified(conversationId: String, verified: Boolean): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.setVerified(
+                isVerified = if (verified) 1L else 0L,
+                id = conversationId,
+            )
+        }
+
+    override suspend fun setDisappearingTimer(conversationId: String, secs: Long): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.setDisappearingTimer(secs = secs, id = conversationId)
+        }
+
+    override suspend fun getDisappearingTimer(conversationId: String): Long =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.getDisappearingTimer(conversationId)
+                .executeAsOneOrNull()
+                ?.disappearing_timer_secs
+                ?: 0L
+        }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------
@@ -97,5 +118,7 @@ class SqlDelightConversationRepository(
         trustTier = runCatching { TrustTier.valueOf(trust_tier) }.getOrDefault(TrustTier.TRUSTED),
         blocked = blocked != 0L,
         notes = notes,
+        isVerified = is_verified != 0L,
+        disappearingTimerSecs = disappearing_timer_secs,
     )
 }

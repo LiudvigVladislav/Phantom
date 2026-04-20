@@ -2,8 +2,11 @@ package phantom.core.transport
 
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runTest
@@ -18,8 +21,14 @@ class FakeRelayTransportTest {
         private val _state = MutableStateFlow<TransportState>(TransportState.Disconnected)
         override val state: StateFlow<TransportState> = _state.asStateFlow()
         override val incoming: Flow<RelayMessage.Deliver> = emptyFlow()
+        override val acks: Flow<RelayMessage.Ack> = emptyFlow()
+        override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
+
+        private val _typingEvents = MutableSharedFlow<String>(extraBufferCapacity = 10)
+        override val typingEvents: SharedFlow<String> = _typingEvents.asSharedFlow()
 
         val outbox = Channel<RelayMessage.Send>(capacity = Channel.UNLIMITED)
+        val typingOutbox = Channel<String>(capacity = Channel.UNLIMITED)
 
         override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {
             _state.value = TransportState.Connected
@@ -32,6 +41,15 @@ class FakeRelayTransportTest {
         override suspend fun send(message: RelayMessage.Send): Boolean {
             if (!isConnected()) return false
             outbox.trySend(message)
+            return true
+        }
+
+        override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = false
+
+        override suspend fun sendTyping(toPubKeyHex: String): Boolean {
+            if (!isConnected()) return false
+            typingOutbox.trySend(toPubKeyHex)
+            _typingEvents.tryEmit(toPubKeyHex)
             return true
         }
 
@@ -70,5 +88,45 @@ class FakeRelayTransportTest {
         transport.connect("ws://relay", "pubkey")
         transport.disconnect()
         assertEquals(TransportState.Disconnected, transport.state.value)
+    }
+
+    // ── Typing indicator tests ────────────────────────────────────────────────
+
+    @Test
+    fun sendTyping_appearsInTypingOutbox_whenConnected() = runTest {
+        val transport = FakeRelayTransport()
+        transport.connect("ws://relay", "pubkey")
+        val result = transport.sendTyping("bob-pubkey-hex")
+        assertTrue(result)
+        assertEquals("bob-pubkey-hex", transport.typingOutbox.receive())
+    }
+
+    @Test
+    fun sendTyping_returnsFalse_whenDisconnected() = runTest {
+        val transport = FakeRelayTransport()
+        val result = transport.sendTyping("bob-pubkey-hex")
+        assertFalse(result)
+        assertTrue(transport.typingOutbox.isEmpty)
+    }
+
+    @Test
+    fun typingEvents_emitsRecipientKey_whenSendTypingCalled() = runTest {
+        val transport = FakeRelayTransport()
+        transport.connect("ws://relay", "pubkey")
+
+        val collected = mutableListOf<String>()
+        val job = kotlinx.coroutines.launch {
+            transport.typingEvents.collect { collected.add(it) }
+        }
+
+        transport.sendTyping("alice-key")
+        transport.sendTyping("alice-key")
+
+        // Allow emissions to propagate
+        kotlinx.coroutines.yield()
+        job.cancel()
+
+        assertEquals(2, collected.size)
+        assertTrue(collected.all { it == "alice-key" })
     }
 }

@@ -293,6 +293,43 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                 let _ = tx.send(r#"{"type":"pong"}"#.to_string());
             }
         }
+        Some("typing") => {
+            // Ephemeral event — forward live to recipient if online, drop silently if not.
+            // Never stored, never queued: typing indicators have no value after the fact.
+            // The "from" field is always the authenticated WS identity to prevent spoofing.
+            // Rate-limit typing events using the same sliding-window limiter as sends.
+            let rate_ok = {
+                let mut limiter = state.rate_limiter.write().await;
+                let entry = limiter.entry(from_identity.to_string()).or_insert(RateEntry {
+                    count: 0,
+                    window_start: std::time::Instant::now(),
+                });
+                if entry.window_start.elapsed().as_secs() >= state.config.rate_limit_window_secs {
+                    entry.count = 1;
+                    entry.window_start = std::time::Instant::now();
+                    true
+                } else if entry.count < state.config.rate_limit_per_window {
+                    entry.count += 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !rate_ok { return; }
+
+            let to = value["to"].as_str().unwrap_or("").to_string();
+            if !to.is_empty() {
+                let clients = state.clients.read().await;
+                if let Some(tx) = clients.get(&to) {
+                    let typing_msg = serde_json::json!({
+                        "type": "typing",
+                        "from": from_identity,
+                    });
+                    let _ = tx.send(typing_msg.to_string());
+                }
+                // If recipient is offline: drop silently — no warn, no queue.
+            }
+        }
         _ => {}
     }
 }
@@ -304,9 +341,13 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn send_envelope(
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendRequest>,
 ) -> Result<impl IntoResponse, RelayError> {
+    if !check_admin_token(&params, &state) {
+        return Err(RelayError::BadRequest("unauthorized".into()));
+    }
     if req.id.is_empty() || req.to.is_empty() || req.from.is_empty() {
         return Err(RelayError::BadRequest("id, to, from are required".into()));
     }
@@ -338,9 +379,13 @@ async fn send_envelope(
 }
 
 async fn fetch_envelopes(
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
     Path(recipient): Path<String>,
 ) -> impl IntoResponse {
+    if !check_admin_token(&params, &state) {
+        return Json(FetchResponse { envelopes: vec![] }).into_response();
+    }
     let mut store = state.store.write().await;
     let queue = store.entry(recipient).or_default();
     queue.retain(|e| !e.is_expired());
@@ -353,6 +398,9 @@ async fn ack_envelope(
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, RelayError> {
+    if !check_admin_token(&params, &state) {
+        return Err(RelayError::BadRequest("unauthorized".into()));
+    }
     let recipient = params
         .get("recipient")
         .ok_or_else(|| RelayError::BadRequest("recipient query param required".into()))?

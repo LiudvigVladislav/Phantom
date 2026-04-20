@@ -4,6 +4,7 @@ import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
@@ -51,6 +52,7 @@ private class BufferingRelayTransport : RelayTransport {
     override val incoming: Flow<RelayMessage.Deliver> = _incoming
     override val acks: Flow<RelayMessage.Ack> = emptyFlow()
     override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
+    override val typingEvents: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 10)
 
     val sent = mutableListOf<RelayMessage.Send>()
     val queue = mutableListOf<RelayMessage.Send>()
@@ -84,6 +86,7 @@ private class BufferingRelayTransport : RelayTransport {
     }
 
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
+    override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
 
     override fun isConnected(): Boolean = _state.value is TransportState.Connected
 

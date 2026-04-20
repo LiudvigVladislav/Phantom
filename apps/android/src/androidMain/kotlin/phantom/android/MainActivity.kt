@@ -1,6 +1,8 @@
 package phantom.android
 
+import android.content.Intent
 import android.os.Bundle
+import android.util.Base64
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -15,8 +17,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.service.PhantomMessagingService
 import phantom.android.screens.splash.PhantomSplashScreen
 import phantom.android.navigation.Screen
 import phantom.android.qr.QrScanScreen
@@ -34,13 +36,50 @@ import phantom.android.ui.theme.*
 
 class MainActivity : ComponentActivity() {
 
+    /**
+     * Parses a `phantom://invite/{base64url(username:pubkeyHex)}` URI from an incoming Intent.
+     * Returns the decoded payload as-is (`"username:pubkeyHex"`) — the same format the QR
+     * scanner produces — so it can be fed directly into [scannedQrValue] / [AddContactDialog].
+     */
+    private fun parseInviteIntent(intent: Intent?): String? {
+        val uri = intent?.data ?: return null
+        if (uri.scheme != "phantom" || uri.host != "invite") return null
+        val encoded = uri.lastPathSegment ?: return null
+        return try {
+            val decoded = String(Base64.decode(encoded, Base64.URL_SAFE), Charsets.UTF_8)
+            // Require at least one colon separating username from pubkey
+            if (decoded.indexOf(':') < 0) null else decoded
+        } catch (e: Exception) {
+            Log.w("PHANTOM", "parseInviteIntent: malformed payload — ${e.message}")
+            null
+        }
+    }
+
+    // Mutable state hoisted to Activity level so onNewIntent can update Compose state.
+    private val pendingInviteQr = androidx.compose.runtime.mutableStateOf<String?>(null)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        parseInviteIntent(intent)?.let { payload ->
+            pendingInviteQr.value = payload
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.d("PHANTOM_INIT", "MainActivity onCreate")
+        // Start the foreground service that owns the WebSocket connection lifetime.
+        // The service awaits app.ready internally, so it is safe to launch before init completes.
+        startForegroundService(Intent(this, PhantomMessagingService::class.java))
         val app = application as PhantomApplication
         // Read notification extras once — intent is immutable after activity creation.
         val notifConversationId = intent.getStringExtra(PhantomNotificationManager.EXTRA_CONVERSATION_ID)
         val notifSenderName     = intent.getStringExtra(PhantomNotificationManager.EXTRA_THEIR_USERNAME)
+        // Parse invite deep link from cold-start intent (warm-start handled by onNewIntent).
+        parseInviteIntent(intent)?.let { payload ->
+            pendingInviteQr.value = payload
+        }
         // enableEdgeToEdge() conflicts with API 35+ system-enforced edge-to-edge.
         // On API 35+, the system handles it automatically; calling it again
         // corrupts the EGL surface setup (GFXSTREAM / Unknown dataspace 0).
@@ -75,6 +114,7 @@ class MainActivity : ComponentActivity() {
                         container              = c,
                         notifConversationId    = notifConversationId,
                         notifSenderName        = notifSenderName,
+                        pendingInviteQr        = pendingInviteQr,
                     )
 
                     initError != null -> Box(
@@ -102,8 +142,8 @@ private fun PhantomApp(
     container: AppContainer,
     notifConversationId: String? = null,
     notifSenderName: String? = null,
+    pendingInviteQr: androidx.compose.runtime.MutableState<String?> = androidx.compose.runtime.mutableStateOf(null),
 ) {
-    val scope = rememberCoroutineScope()
     var startScreen by remember { mutableStateOf<Screen?>(null) }
 
     LaunchedEffect(Unit) {
@@ -112,7 +152,18 @@ private fun PhantomApp(
     }
 
     var currentScreen by remember { mutableStateOf<Screen>(Screen.Onboarding) }
+    // scannedQrValue carries both QR-scanner results and decoded invite deep links —
+    // both resolve to the same "username:pubkeyHex" format consumed by AddContactDialog.
     var scannedQrValue by remember { mutableStateOf<String?>(null) }
+
+    // Drain any invite deep link that arrived before Compose was ready (cold-start)
+    // or while the app was running (onNewIntent forwards to pendingInviteQr).
+    LaunchedEffect(pendingInviteQr.value) {
+        pendingInviteQr.value?.let { payload ->
+            scannedQrValue = payload
+            pendingInviteQr.value = null
+        }
+    }
 
     LaunchedEffect(startScreen) {
         startScreen?.let { screen ->
@@ -135,27 +186,9 @@ private fun PhantomApp(
         }
     }
 
-    LaunchedEffect(container.messagingService) {
-        val service = container.messagingService ?: return@LaunchedEffect
-        val pubKey = container.identityRepo.loadIdentity()?.publicKeyHex ?: return@LaunchedEffect
-        Log.d("PHANTOM", "Starting transport, pubKey=${pubKey.take(12)}")
-
-        runCatching { service.startReceiving() }
-            .onSuccess { Log.d("PHANTOM", "startReceiving OK") }
-            .onFailure { e -> Log.e("PHANTOM", "startReceiving failed: ${e.message}") }
-
-        scope.launch {
-            runCatching {
-                container.transport.connect(
-                    relayUrl = phantom.android.BuildConfig.RELAY_URL,
-                    identityPublicKeyHex = pubKey,
-                    token = phantom.android.BuildConfig.RELAY_TOKEN,
-                )
-            }.onFailure { e ->
-                Log.e("PHANTOM", "Transport connect failed: ${e.message}", e)
-            }
-        }
-    }
+    // Transport connect and startReceiving are now owned by PhantomMessagingService (foreground
+    // service). Calling them here would create a second competing connection loop. The service
+    // is started from MainActivity.onCreate() and runs independently of Activity lifecycle.
 
     when (val screen = currentScreen) {
         is Screen.Onboarding -> OnboardingScreen(

@@ -16,6 +16,9 @@ interface ConversationRepository {
     suspend fun unblockConversation(conversationId: String)
     suspend fun acceptRequest(conversationId: String)
     suspend fun deleteConversation(id: String)
+    suspend fun setVerified(conversationId: String, verified: Boolean)
+    suspend fun setDisappearingTimer(conversationId: String, secs: Long)
+    suspend fun getDisappearingTimer(conversationId: String): Long
 }
 
 data class ConversationEntity(
@@ -28,4 +31,6 @@ data class ConversationEntity(
     val trustTier: TrustTier = TrustTier.TRUSTED,
     val blocked: Boolean = false,
     val notes: String? = null,
+    val isVerified: Boolean = false,
+    val disappearingTimerSecs: Long = 0L,
 )

@@ -1,7 +1,9 @@
 package phantom.core.messaging
 
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
@@ -52,6 +54,16 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun deleteMessagesForConversation(conversationId: String) {
         messages.removeAll { it.conversationId == conversationId }
     }
+    override suspend fun setExpiresAt(messageId: String, expiresAtMs: Long) {
+        val i = messages.indexOfFirst { it.id == messageId }
+        if (i != -1) messages[i] = messages[i].copy(expiresAtMs = expiresAtMs)
+    }
+    override suspend fun getNextExpiry(): Long? =
+        messages.mapNotNull { it.expiresAtMs }.minOrNull()
+    override suspend fun deleteExpiredMessages() {
+        val now = System.currentTimeMillis()
+        messages.removeAll { it.expiresAtMs != null && it.expiresAtMs <= now }
+    }
 }
 
 private class FakeConversationRepository : ConversationRepository {
@@ -82,6 +94,14 @@ private class FakeConversationRepository : ConversationRepository {
     override suspend fun unblockConversation(conversationId: String) {
         store[conversationId]?.let { store[conversationId] = it.copy(blocked = false) }
     }
+    override suspend fun setVerified(conversationId: String, verified: Boolean) {
+        store[conversationId]?.let { store[conversationId] = it.copy(isVerified = verified) }
+    }
+    override suspend fun setDisappearingTimer(conversationId: String, secs: Long) {
+        store[conversationId]?.let { store[conversationId] = it.copy(disappearingTimerSecs = secs) }
+    }
+    override suspend fun getDisappearingTimer(conversationId: String): Long =
+        store[conversationId]?.disappearingTimerSecs ?: 0L
 }
 
 private class FakeRatchetStateRepository : RatchetStateRepository {
@@ -97,11 +117,13 @@ private class FakeRelayTransport : RelayTransport {
     override val incoming: Flow<RelayMessage.Deliver> = emptyFlow()
     override val acks: Flow<RelayMessage.Ack> = emptyFlow()
     override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
+    override val typingEvents: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 10)
     val sent = mutableListOf<RelayMessage.Send>()
     override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
+    override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
     override fun isConnected() = true
 }
 

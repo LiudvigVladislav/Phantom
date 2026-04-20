@@ -74,6 +74,10 @@ class DefaultMessagingService(
 
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
 
+        val insertedAtMs = Clock.System.now().toEpochMilliseconds()
+        val outgoingTimerSecs = conversationRepository.getDisappearingTimer(message.conversationId)
+        val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) insertedAtMs + outgoingTimerSecs * 1_000L else null
+
         messageRepository.insertMessage(
             MessageEntity(
                 id = message.id,
@@ -82,7 +86,8 @@ class DefaultMessagingService(
                 plaintextCache = message.text,
                 sent = true,
                 status = MessageStatus.QUEUED,
-                createdAt = Clock.System.now().toEpochMilliseconds(),
+                createdAt = insertedAtMs,
+                expiresAtMs = outgoingExpiresAtMs,
             )
         )
 
@@ -142,7 +147,6 @@ class DefaultMessagingService(
     }
 
     private suspend fun handleDeliver(deliver: RelayMessage.Deliver) {
-        println("[PHANTOM] handleDeliver from=${deliver.from.take(12)} msgId=${deliver.messageId}")
         runCatching {
             val ciphertext = deliver.payload.decodeBase64Bytes()
             val encrypted = json.decodeFromString<phantom.core.crypto.EncryptedMessage>(
@@ -156,15 +160,13 @@ class DefaultMessagingService(
                 remoteIdentityPublicKeyHex = deliver.from,
             )
 
-            println("[PHANTOM] decrypting convId=${conversationId.take(16)}")
             val (newState, plainBytes) = ratchet.decrypt(state, encrypted)
             sessionManager.saveSession(conversationId, newState)
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
-            println("[PHANTOM] decrypted OK type=${payload.type} text=${payload.text.take(30)}")
 
             // Handle control messages — do not store as chat messages
-            if (payload.type == "delete" && payload.targetMessageId.isNotEmpty()) {
+            if (payload.type == MessagePayload.TYPE_DELETE && payload.targetMessageId.isNotEmpty()) {
                 messageRepository.deleteMessage(payload.targetMessageId)
                 _incomingMessages.emit(
                     IncomingMessage(
@@ -177,7 +179,7 @@ class DefaultMessagingService(
                 )
                 return@runCatching
             }
-            if (payload.type == "edit" && payload.targetMessageId.isNotEmpty()) {
+            if (payload.type == MessagePayload.TYPE_EDIT && payload.targetMessageId.isNotEmpty()) {
                 messageRepository.updateMessageText(payload.targetMessageId, payload.text)
                 _incomingMessages.emit(
                     IncomingMessage(
@@ -190,6 +192,19 @@ class DefaultMessagingService(
                 )
                 return@runCatching
             }
+            if (payload.type == MessagePayload.TYPE_DISAPPEARING_TIMER) {
+                val secs = payload.disappearingTimerSecs ?: 0L
+                // Only apply non-zero timers from peers — peer cannot silently disable
+                // disappearing messages on the local device (local user controls Off via UI).
+                if (secs > 0L) {
+                    conversationRepository.setDisappearingTimer(conversationId, secs)
+                }
+                return@runCatching
+            }
+
+            val nowMs = Clock.System.now().toEpochMilliseconds()
+            val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
+            val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
 
             messageRepository.insertMessage(
                 MessageEntity(
@@ -199,7 +214,8 @@ class DefaultMessagingService(
                     plaintextCache = payload.text,
                     sent = false,
                     status = MessageStatus.DELIVERED,
-                    createdAt = Clock.System.now().toEpochMilliseconds(),
+                    createdAt = nowMs,
+                    expiresAtMs = expiresAtMs,
                 )
             )
 
@@ -241,8 +257,8 @@ class DefaultMessagingService(
 
             val senderName = payload.senderUsername.ifBlank { deliver.from.take(8) }
             onNewMessageNotification?.invoke(conversationId, senderName, previewText(payload.text))
-        }.onFailure { e ->
-            println("[PHANTOM] handleDeliver FAILED: ${e::class.simpleName}: ${e.message}")
+        }.onFailure { _ ->
+            // Decryption or storage failure — drop silently to avoid leaking error details.
         }
     }
 
@@ -282,7 +298,7 @@ class DefaultMessagingService(
                 text = "",
                 sentAt = Clock.System.now().toEpochMilliseconds(),
                 senderUsername = identity.username,
-                type = "delete",
+                type = MessagePayload.TYPE_DELETE,
                 targetMessageId = messageId,
             )
         ).encodeToByteArray()
@@ -298,6 +314,38 @@ class DefaultMessagingService(
             )
         )
         messageRepository.deleteMessage(messageId)
+    }
+
+    override suspend fun sendDisappearingTimerUpdate(
+        timerSecs: Long,
+        conversationId: String,
+        recipientPublicKeyHex: String,
+    ): Result<Unit> = runCatching {
+        val state = sessionManager.getOrCreateSession(
+            conversationId = conversationId,
+            localIdentityKeyPair = localKeyPair,
+            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
+        )
+        val payload = json.encodeToString(
+            MessagePayload(
+                text = "",
+                sentAt = Clock.System.now().toEpochMilliseconds(),
+                senderUsername = identity.username,
+                type = MessagePayload.TYPE_DISAPPEARING_TIMER,
+                disappearingTimerSecs = timerSecs,
+            )
+        ).encodeToByteArray()
+        val (newState, encrypted) = ratchet.encrypt(state, payload)
+        sessionManager.saveSession(conversationId, newState)
+        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+        transport.send(
+            RelayMessage.Send(
+                to = recipientPublicKeyHex,
+                from = identity.publicKeyHex,
+                payload = ciphertext.encodeBase64(),
+                messageId = uuid4().toString(),
+            )
+        )
     }
 
     override suspend fun editMessageForBoth(
@@ -316,7 +364,7 @@ class DefaultMessagingService(
                 text = newText,
                 sentAt = Clock.System.now().toEpochMilliseconds(),
                 senderUsername = identity.username,
-                type = "edit",
+                type = MessagePayload.TYPE_EDIT,
                 targetMessageId = messageId,
             )
         ).encodeToByteArray()

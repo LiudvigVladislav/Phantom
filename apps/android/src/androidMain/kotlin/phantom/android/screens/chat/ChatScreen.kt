@@ -6,10 +6,14 @@ import android.content.Context
 import org.json.JSONException
 import org.json.JSONObject
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -56,6 +60,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import com.benasher44.uuid.uuid4
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.GradientAvatar
@@ -116,6 +122,11 @@ fun ChatScreen(
     var conversations by remember { mutableStateOf<List<phantom.core.storage.ConversationEntity>>(emptyList()) }
     var theirPublicKeyHex by remember { mutableStateOf("") }
 
+    // Typing indicator state — true while the remote party is actively typing
+    var isContactTyping by remember { mutableStateOf(false) }
+    // Job reference for debouncing outgoing typing events
+    var typingJob by remember { mutableStateOf<Job?>(null) }
+
     LaunchedEffect(Unit) {
         conversations = container.conversationRepo.getActiveConversations()
         theirPublicKeyHex = container.conversationRepo.getConversation(conversationId)?.theirPublicKeyHex ?: ""
@@ -161,6 +172,19 @@ fun ChatScreen(
     DisposableEffect(conversationId) {
         onDispose {
             scope.launch { container.conversationRepo.resetUnread(conversationId) }
+        }
+    }
+
+    // Collect incoming typing events from the contact in this conversation.
+    // The indicator auto-clears after 3 s with no new event (matches standard messenger UX).
+    LaunchedEffect(conversationId, theirPublicKeyHex) {
+        if (theirPublicKeyHex.isEmpty()) return@LaunchedEffect
+        container.transport.typingEvents.collect { senderKey ->
+            if (senderKey == theirPublicKeyHex) {
+                isContactTyping = true
+                delay(3_000)
+                isContactTyping = false
+            }
         }
     }
 
@@ -339,6 +363,7 @@ fun ChatScreen(
             ChatTopBar(
                 theirUsername = theirUsername,
                 isConnected = isConnected,
+                isTyping = isContactTyping,
                 onBack = onBack,
                 onContactProfile = onContactProfile,
                 onMoreMenu = { showMenu = true },
@@ -423,9 +448,17 @@ fun ChatScreen(
                 }
                 InputBar(
                     text = inputText,
-                    onTextChange = {
-                        inputText = it
+                    onTextChange = { newText ->
+                        inputText = newText
                         if (showEmojiPanel) showEmojiPanel = false
+                        // Debounced typing event: cancel any pending send and schedule a new one.
+                        // One event per keystroke burst is enough — the relay drops if offline.
+                        if (newText.isNotEmpty() && theirPublicKeyHex.isNotEmpty()) {
+                            typingJob?.cancel()
+                            typingJob = scope.launch {
+                                container.transport.sendTyping(theirPublicKeyHex)
+                            }
+                        }
                     },
                     onEmojiToggle = { showEmojiPanel = !showEmojiPanel },
                     emojiPanelOpen = showEmojiPanel,
@@ -511,6 +544,15 @@ fun ChatScreen(
             }
         }
 
+        // Snapshot of message IDs present at first composition — used to skip animation for
+        // messages that were already in the list when the screen opened.
+        val initialIds = remember {
+            chatItems
+                .filterIsInstance<ChatItem.Msg>()
+                .map { it.entity.id }
+                .toHashSet()
+        }
+
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -530,6 +572,18 @@ fun ChatScreen(
                     is ChatItem.DateSep -> ChatDateSep(chatItem.millis)
                     is ChatItem.Msg -> {
                         val msg = chatItem.entity
+                        val isNew = msg.id !in initialIds
+                        AnimatedVisibility(
+                            visible = true,
+                            enter = if (isNew) {
+                                slideInHorizontally(
+                                    initialOffsetX = { fullWidth -> if (msg.sent) fullWidth else -fullWidth },
+                                    animationSpec = tween(durationMillis = 150),
+                                ) + fadeIn(animationSpec = tween(durationMillis = 150))
+                            } else {
+                                EnterTransition.None
+                            },
+                        ) {
                         MessageBubble(
                             entity = msg,
                             theirUsername = theirUsername,
@@ -568,6 +622,7 @@ fun ChatScreen(
                                 forwardSenderLabel = senderLabel
                             },
                         )
+                        } // end AnimatedVisibility
                     }
                 }
             }
@@ -1337,6 +1392,7 @@ private val CircleShape = RoundedCornerShape(50)
 private fun ChatTopBar(
     theirUsername: String,
     isConnected: Boolean,
+    isTyping: Boolean = false,
     onBack: () -> Unit,
     onContactProfile: () -> Unit,
     onMoreMenu: () -> Unit,
@@ -1377,7 +1433,7 @@ private fun ChatTopBar(
 
             Spacer(Modifier.width(10.dp))
 
-            // Center — name + E2EE status pill
+            // Center — name + E2EE status pill / typing indicator
             Column(
                 modifier = Modifier.weight(1f),
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -1388,19 +1444,28 @@ private fun ChatTopBar(
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
                 )
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Canvas(modifier = Modifier.size(7.dp)) {
-                        drawCircle(color = if (isConnected) Success else TextDim)
-                    }
+                if (isTyping) {
                     Text(
-                        text = "Ed25519 · Encrypted",
-                        color = TextDim,
-                        fontSize = 10.sp,
+                        text = "typing...",
+                        color = CyanAccent.copy(alpha = 0.8f),
+                        fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                     )
+                } else {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Canvas(modifier = Modifier.size(7.dp)) {
+                            drawCircle(color = if (isConnected) Success else TextDim)
+                        }
+                        Text(
+                            text = "Ed25519 · Encrypted",
+                            color = TextDim,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
                 }
             }
 

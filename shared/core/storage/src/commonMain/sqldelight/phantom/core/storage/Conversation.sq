@@ -7,7 +7,8 @@ CREATE TABLE conversation (
     unread_count INTEGER NOT NULL DEFAULT 0,
     trust_tier TEXT NOT NULL DEFAULT 'TRUSTED',
     blocked INTEGER NOT NULL DEFAULT 0,
-    notes TEXT DEFAULT NULL
+    notes TEXT DEFAULT NULL,
+    is_verified INTEGER NOT NULL DEFAULT 0
 );
 
 getAllConversations:
@@ -56,3 +57,12 @@ UPDATE conversation SET trust_tier = 'TRUSTED' WHERE id = ?;
 
 deleteConversation:
 DELETE FROM conversation WHERE id = ?;
+
+setVerified:
+UPDATE conversation SET is_verified = :isVerified WHERE id = :id;
+
+setDisappearingTimer:
+UPDATE conversation SET disappearing_timer_secs = :secs WHERE id = :id;
+
+getDisappearingTimer:
+SELECT disappearing_timer_secs FROM conversation WHERE id = :id;

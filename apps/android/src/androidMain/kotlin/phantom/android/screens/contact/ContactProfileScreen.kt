@@ -14,6 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -65,6 +66,22 @@ fun ContactProfileScreen(
     var showBlockDialog by remember { mutableStateOf(false) }
     var showMoreMenu by remember { mutableStateOf(false) }
     var keyCopied by remember { mutableStateOf(false) }
+    var showVerifySheet by remember { mutableStateOf(false) }
+    var isVerified by remember { mutableStateOf(false) }
+    var showTimerSheet by remember { mutableStateOf(false) }
+    var disappearingTimer by remember { mutableStateOf(0L) }
+
+    val timerOptions = listOf(
+        0L to "Off",
+        30L to "30 seconds",
+        300L to "5 minutes",
+        3600L to "1 hour",
+        86400L to "1 day",
+        604800L to "1 week",
+    )
+
+    fun timerLabel(secs: Long): String =
+        timerOptions.firstOrNull { it.first == secs }?.second ?: "Off"
 
     LaunchedEffect(conversationId) {
         val conv = container.conversationRepo.getConversation(conversationId)
@@ -72,6 +89,8 @@ fun ContactProfileScreen(
             conversation = conv
             notesText = conv.notes ?: ""
             savedNotesText = conv.notes ?: ""
+            isVerified = conv.isVerified
+            disappearingTimer = conv.disappearingTimerSecs
         }
     }
 
@@ -433,24 +452,35 @@ fun ContactProfileScreen(
                 // Verify row
                 CKeyRow(
                     icon = {
-                        Canvas(Modifier.size(16.dp)) {
-                            val sw = 1.4.dp.toPx()
-                            val st = Stroke(sw, cap = StrokeCap.Round)
-                            val r = size.minDimension / 2f - 1.dp.toPx()
-                            drawCircle(CyanAccent, radius = r, style = st)
-                            drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.35f), androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.62f), sw, StrokeCap.Round)
-                            drawCircle(CyanAccent, radius = 1.dp.toPx(), center = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.72f))
+                        if (isVerified) {
+                            Icon(
+                                Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = Success,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        } else {
+                            Canvas(Modifier.size(16.dp)) {
+                                val sw = 1.4.dp.toPx()
+                                val st = Stroke(sw, cap = StrokeCap.Round)
+                                val r = size.minDimension / 2f - 1.dp.toPx()
+                                drawCircle(CyanAccent, radius = r, style = st)
+                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.35f), androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.62f), sw, StrokeCap.Round)
+                                drawCircle(CyanAccent, radius = 1.dp.toPx(), center = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.72f))
+                            }
                         }
                     },
-                    label = "Verify safety number",
-                    value = "Scan QR or compare 60 digits",
+                    label = "Safety number",
+                    value = if (isVerified) "Verified" else "Tap to verify",
                     right = {
                         Canvas(Modifier.size(14.dp)) {
                             val sw = 1.4.dp.toPx()
-                            drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), sw, StrokeCap.Round)
-                            drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
+                            val tint = if (isVerified) Success else TextDim
+                            drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), sw, StrokeCap.Round)
+                            drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
                         }
                     },
+                    onClick = { showVerifySheet = true },
                 )
             }
 
@@ -548,8 +578,9 @@ fun ContactProfileScreen(
                             }
                         },
                         label = "Disappearing messages",
-                        value = "Off",
+                        value = timerLabel(disappearingTimer),
                         right = { ChevronIcon() },
+                        onClick = { showTimerSheet = true },
                     )
                     CKeyRow(
                         icon = {
@@ -630,6 +661,149 @@ fun ContactProfileScreen(
             }
 
             Spacer(Modifier.height(20.dp))
+        }
+    }
+
+    // ── Safety-number verification sheet ─────────────────────────────────────
+    if (showVerifySheet) {
+        val theirPublicKeyHex = conversation.theirPublicKeyHex
+
+        // Load own public key once when the sheet opens.
+        val myPubKeyHex by produceState(initialValue = "") {
+            value = container.identityRepo.loadIdentity()?.publicKeyHex ?: ""
+        }
+
+        val fingerprint = remember(myPubKeyHex, theirPublicKeyHex) {
+            if (myPubKeyHex.isNotEmpty() && theirPublicKeyHex.isNotEmpty()) {
+                phantom.core.crypto.SafetyNumber.compute(myPubKeyHex, theirPublicKeyHex)
+            } else {
+                "loading…"
+            }
+        }
+
+        ModalBottomSheet(
+            onDismissRequest = { showVerifySheet = false },
+            containerColor = Surface,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp)
+                    .padding(bottom = 32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(
+                    "SAFETY NUMBER",
+                    color = TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    letterSpacing = 2.sp,
+                )
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Surface2, RoundedCornerShape(12.dp))
+                        .padding(20.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = fingerprint,
+                        color = TextPrimary,
+                        fontSize = 18.sp,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = 3.sp,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                }
+
+                Text(
+                    text = "Compare this number with your contact in person or via another channel.",
+                    color = TextDim,
+                    fontSize = 12.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+
+                Button(
+                    onClick = {
+                        scope.launch {
+                            container.conversationRepo.setVerified(conversationId, true)
+                            isVerified = true
+                            showVerifySheet = false
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Success),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = if (isVerified) "Verified" else "Mark as Verified",
+                        color = Color.Black,
+                    )
+                }
+            }
+        }
+    }
+
+    // ── Disappearing-messages timer sheet ────────────────────────────────────
+    if (showTimerSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showTimerSheet = false },
+            containerColor = Surface,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 32.dp),
+            ) {
+                Text(
+                    text = "DISAPPEARING MESSAGES",
+                    color = TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    letterSpacing = 2.sp,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
+                )
+                timerOptions.forEach { (secs, label) ->
+                    val selected = disappearingTimer == secs
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                scope.launch {
+                                    container.conversationRepo.setDisappearingTimer(conversationId, secs)
+                                    val recipientKey = conversation.theirPublicKeyHex
+                                    if (recipientKey.isNotEmpty()) {
+                                        container.messagingService?.sendDisappearingTimerUpdate(
+                                            timerSecs = secs,
+                                            conversationId = conversationId,
+                                            recipientPublicKeyHex = recipientKey,
+                                        )
+                                    }
+                                    disappearingTimer = secs
+                                    showTimerSheet = false
+                                }
+                            }
+                            .padding(horizontal = 24.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = label,
+                            color = if (selected) CyanAccent else TextPrimary,
+                            fontSize = 14.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (selected) {
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = null,
+                                tint = CyanAccent,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }

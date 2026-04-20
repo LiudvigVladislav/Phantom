@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.serialization.json.Json
 import phantom.android.notifications.PhantomNotificationManager
+import phantom.android.service.DisappearingMessageScheduler
 import phantom.android.security.KeystoreManager
 import phantom.core.crypto.LibsodiumDoubleRatchet
 import phantom.core.crypto.LibsodiumX3DH
@@ -44,6 +45,10 @@ class AppContainer(private val context: Context) {
     val conversationRepo = SqlDelightConversationRepository(dbHolder.database)
     val messageRepo    = SqlDelightMessageRepository(dbHolder.database)
     private val ratchetRepo = SqlDelightRatchetStateRepository(dbHolder.database)
+
+    // Starts immediately — deletes expired messages while the app is alive.
+    private val disappearingMessageScheduler = DisappearingMessageScheduler(messageRepo, appScope)
+        .also { it.start() }
 
     // ── Crypto ────────────────────────────────────────────────────────────────
     private val x3dh    = LibsodiumX3DH()
@@ -86,8 +91,13 @@ class AppContainer(private val context: Context) {
         messagingService = service
     }
 
-    /** Called on app restart when identity already exists — restores messaging from stored keys. */
+    /**
+     * Called on app restart when identity already exists — restores messaging from stored keys.
+     * Idempotent: no-op if [messagingService] is already initialised (e.g. by the foreground
+     * service before the Activity's LaunchedEffect fires).
+     */
     suspend fun initMessagingFromStorage() {
+        if (messagingService != null) return
         val record = identityRepo.loadIdentity() ?: return
         val dhKeyPair = phantom.core.crypto.DhKeyPair(
             phantom.core.crypto.DhPublicKey(record.publicKeyHex.hexToByteArray()),

@@ -7,6 +7,9 @@ interface MessageRepository {
     suspend fun updateMessageText(messageId: String, text: String)
     suspend fun deleteMessage(messageId: String)
     suspend fun deleteMessagesForConversation(conversationId: String)
+    suspend fun setExpiresAt(messageId: String, expiresAtMs: Long)
+    suspend fun getNextExpiry(): Long?
+    suspend fun deleteExpiredMessages()
 }
 
 enum class MessageStatus {
@@ -25,6 +28,7 @@ data class MessageEntity(
     val sent: Boolean,
     val status: MessageStatus,
     val createdAt: Long,
+    val expiresAtMs: Long? = null,
 ) {
     // ByteArray requires explicit equals/hashCode to avoid identity comparison.
     override fun equals(other: Any?): Boolean {
@@ -36,7 +40,8 @@ data class MessageEntity(
             plaintextCache == other.plaintextCache &&
             sent == other.sent &&
             status == other.status &&
-            createdAt == other.createdAt
+            createdAt == other.createdAt &&
+            expiresAtMs == other.expiresAtMs
     }
 
     override fun hashCode(): Int {
@@ -47,6 +52,7 @@ data class MessageEntity(
         result = 31 * result + sent.hashCode()
         result = 31 * result + status.hashCode()
         result = 31 * result + createdAt.hashCode()
+        result = 31 * result + (expiresAtMs?.hashCode() ?: 0)
         return result
     }
 }

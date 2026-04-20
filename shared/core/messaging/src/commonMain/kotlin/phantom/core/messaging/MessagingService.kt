@@ -25,4 +25,11 @@ interface MessagingService {
         conversationId: String,
         recipientPublicKeyHex: String,
     ): Result<Unit>
+
+    // Notify the peer of the new disappearing-message timer for this conversation
+    suspend fun sendDisappearingTimerUpdate(
+        timerSecs: Long,
+        conversationId: String,
+        recipientPublicKeyHex: String,
+    ): Result<Unit>
 }

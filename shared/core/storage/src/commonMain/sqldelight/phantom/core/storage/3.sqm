@@ -1,0 +1,3 @@
+-- Migration from schema version 3 → 4
+-- Adds key-verification flag to conversation.
+ALTER TABLE conversation ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0;

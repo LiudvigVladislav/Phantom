@@ -23,6 +23,7 @@ class SqlDelightMessageRepository(
                 sent = if (entity.sent) 1L else 0L,
                 status = entity.status.name.lowercase(),
                 created_at = entity.createdAt,
+                expires_at_ms = entity.expiresAtMs,
             )
         }
 
@@ -49,6 +50,24 @@ class SqlDelightMessageRepository(
             db.messageQueries.deleteMessagesForConversation(conversationId)
         }
 
+    override suspend fun setExpiresAt(messageId: String, expiresAtMs: Long): Unit =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.setExpiresAt(expiresAtMs = expiresAtMs, id = messageId)
+        }
+
+    override suspend fun getNextExpiry(): Long? =
+        withContext(Dispatchers.IO) {
+            val nowMs = System.currentTimeMillis()
+            db.messageQueries.getNextExpiry(nowMs).executeAsOneOrNull()
+                ?.next_expiry
+        }
+
+    override suspend fun deleteExpiredMessages(): Unit =
+        withContext(Dispatchers.IO) {
+            val nowMs = System.currentTimeMillis()
+            db.messageQueries.deleteExpiredMessages(nowMs)
+        }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------
@@ -61,6 +80,7 @@ class SqlDelightMessageRepository(
         sent = sent != 0L,
         status = statusFromString(status),
         createdAt = created_at,
+        expiresAtMs = expires_at_ms,
     )
 
     private fun statusFromString(raw: String): MessageStatus =

@@ -247,6 +247,33 @@ fun ProfileScreen(
                     ) {
                         Text("Send text key", color = CyanAccent)
                     }
+                    TextButton(
+                        onClick = {
+                            showShareDialog = false
+                            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                val id = container.identityRepo.loadIdentity()
+                                if (id != null) {
+                                    val payload = "${id.username}:${id.publicKeyHex}"
+                                    val encoded = android.util.Base64.encodeToString(
+                                        payload.toByteArray(Charsets.UTF_8),
+                                        android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP,
+                                    )
+                                    val link = "phantom://invite/$encoded"
+                                    val intent = Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(Intent.EXTRA_TEXT, link)
+                                        putExtra(Intent.EXTRA_SUBJECT, "Join me on PHANTOM")
+                                    }
+                                    withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                        context.startActivity(Intent.createChooser(intent, "Share invite link via…"))
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Share invite link", color = CyanAccent)
+                    }
                 }
             },
             confirmButton = {},
