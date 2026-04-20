@@ -3,6 +3,7 @@ package phantom.android.screens.saved
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -24,8 +25,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -42,7 +49,6 @@ import phantom.core.storage.TrustTier
 private const val SAVED_CONV_ID = "saved_messages_local"
 private const val SAVED_USERNAME = "Notes"
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SavedMessagesScreen(
     container: AppContainer,
@@ -143,159 +149,239 @@ fun SavedMessagesScreen(
         )
     }
 
-    Scaffold(
-        containerColor = BgDeep,
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("Notes", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Normal)
-                        Text("only for you", color = TextDim, fontSize = 10.sp)
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextDim)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Surface),
-            )
-        },
-        bottomBar = {
-            Surface(color = Surface, tonalElevation = 0.dp) {
-                Row(
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgDeep),
+    ) {
+        // Custom top bar — matches ArchiveScreen style
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Surface)
+                .windowInsetsPadding(WindowInsets.statusBars),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(Surface2)
+                        .clickable(onClick = onBack),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    OutlinedTextField(
-                        value = inputText,
-                        onValueChange = { inputText = it },
-                        modifier = Modifier.weight(1f),
-                        placeholder = {
-                            Text(
-                                if (editingMessageId != null) "Edit note…" else "New note…",
-                                color = TextDim, fontSize = 14.sp,
-                            )
-                        },
-                        singleLine = false,
-                        maxLines = 4,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = TextPrimary,
-                            unfocusedTextColor = TextPrimary,
-                            focusedBorderColor = CyanAccent.copy(alpha = 0.4f),
-                            unfocusedBorderColor = Color.White.copy(alpha = 0.08f),
-                            cursorColor = CyanAccent,
-                        ),
-                        shape = RoundedCornerShape(20.dp),
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back",
+                        tint = TextPrimary,
+                        modifier = Modifier.size(18.dp),
                     )
-                    Spacer(Modifier.width(8.dp))
-                    if (inputText.isNotBlank()) {
-                        IconButton(
-                            onClick = {
-                                val text = inputText.trim()
-                                if (text.isEmpty()) return@IconButton
-                                val editId = editingMessageId
-                                inputText = ""
-                                editingMessageId = null
+                }
+                Text(
+                    text = "NOTES",
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.Center,
+                    color = TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    letterSpacing = 3.sp,
+                )
+                Spacer(Modifier.size(36.dp))
+            }
+            HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+        }
+
+        // Bottom bar
+        Box(modifier = Modifier.weight(1f)) {
+            if (messages.isEmpty()) {
+                // Canvas-drawn empty state — no emoji
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Canvas(modifier = Modifier.size(48.dp)) {
+                            val sw = 2.dp.toPx()
+                            val stroke = Stroke(
+                                width = sw,
+                                cap = StrokeCap.Round,
+                                join = StrokeJoin.Round,
+                            )
+                            val iconColor = TextDim.copy(alpha = 0.4f)
+                            val w = size.width
+                            val h = size.height
+
+                            // Bookmark / pin shape:
+                            // Outer rectangle body with a V-notch cut from the bottom
+                            val path = Path().apply {
+                                // top-left corner
+                                moveTo(w * 0.18f, 0f)
+                                // top-right corner
+                                lineTo(w * 0.82f, 0f)
+                                // right side down to bottom-right
+                                lineTo(w * 0.82f, h * 0.86f)
+                                // V-notch bottom-right to tip
+                                lineTo(w * 0.50f, h * 0.64f)
+                                // V-notch tip to bottom-left
+                                lineTo(w * 0.18f, h * 0.86f)
+                                // left side back up
+                                close()
+                            }
+                            drawPath(path, iconColor, style = stroke)
+
+                            // Horizontal rule inside bookmark (like a page line)
+                            drawLine(
+                                color = iconColor,
+                                start = androidx.compose.ui.geometry.Offset(w * 0.30f, h * 0.30f),
+                                end = androidx.compose.ui.geometry.Offset(w * 0.70f, h * 0.30f),
+                                strokeWidth = sw,
+                                cap = StrokeCap.Round,
+                            )
+                            drawLine(
+                                color = iconColor,
+                                start = androidx.compose.ui.geometry.Offset(w * 0.30f, h * 0.44f),
+                                end = androidx.compose.ui.geometry.Offset(w * 0.60f, h * 0.44f),
+                                strokeWidth = sw,
+                                cap = StrokeCap.Round,
+                            )
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Text("Your personal notes", color = TextDim, fontSize = 14.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Save texts, links, ideas",
+                            color = TextDim.copy(alpha = 0.6f),
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 12.dp),
+                    contentPadding = PaddingValues(vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    items(messages, key = { it.id }) { msg ->
+                        SavedMessageBubble(
+                            entity = msg,
+                            onDelete = {
                                 scope.launch {
-                                    if (editId != null) {
-                                        container.messageRepo.updateMessageText(editId, text)
-                                    } else {
-                                        val now = System.currentTimeMillis()
-                                        container.messageRepo.insertMessage(
-                                            MessageEntity(
-                                                id = uuid4().toString(),
-                                                conversationId = SAVED_CONV_ID,
-                                                ciphertext = ByteArray(0),
-                                                plaintextCache = text,
-                                                sent = true,
-                                                status = MessageStatus.DELIVERED,
-                                                createdAt = now,
-                                            )
-                                        )
-                                        container.conversationRepo.upsertConversation(
-                                            ConversationEntity(
-                                                id = SAVED_CONV_ID,
-                                                theirUsername = SAVED_USERNAME,
-                                                theirPublicKeyHex = "",
-                                                lastMessagePreview = text.take(60),
-                                                lastMessageAt = now,
-                                                unreadCount = 0,
-                                                trustTier = TrustTier.TRUSTED,
-                                                blocked = false,
-                                            )
-                                        )
-                                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
-                                    }
+                                    container.messageRepo.deleteMessage(msg.id)
                                     reload()
                                 }
                             },
-                            modifier = Modifier
-                                .size(42.dp)
-                                .clip(CircleShape)
-                                .background(color = CyanAccent),
-                        ) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "Save",
-                                tint = BgDeep,
-                                modifier = Modifier.size(17.dp),
-                            )
-                        }
+                            onCopy = { text ->
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("note", text))
+                            },
+                            onEdit = { text ->
+                                editingMessageId = msg.id
+                                inputText = text
+                            },
+                            onForward = { text ->
+                                forwardNoteText = text
+                            },
+                            onPin = {
+                                android.widget.Toast.makeText(context, "Pin — coming soon", android.widget.Toast.LENGTH_SHORT).show()
+                            },
+                        )
                     }
                 }
             }
-        },
-    ) { padding ->
-        if (messages.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("📌", fontSize = 40.sp)
-                    Spacer(Modifier.height(12.dp))
-                    Text("Your personal notes", color = TextDim, fontSize = 14.sp)
-                    Spacer(Modifier.height(4.dp))
-                    Text("Save texts, links, ideas", color = TextDim.copy(alpha = 0.6f), fontSize = 12.sp)
-                }
-            }
-        } else {
-            LazyColumn(
-                state = listState,
+        }
+
+        // Input bar
+        Surface(color = Surface, tonalElevation = 0.dp) {
+            Row(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .padding(horizontal = 12.dp),
-                contentPadding = PaddingValues(vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                items(messages, key = { it.id }) { msg ->
-                    SavedMessageBubble(
-                        entity = msg,
-                        onDelete = {
+                OutlinedTextField(
+                    value = inputText,
+                    onValueChange = { inputText = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = {
+                        Text(
+                            if (editingMessageId != null) "Edit note…" else "New note…",
+                            color = TextDim, fontSize = 14.sp,
+                        )
+                    },
+                    singleLine = false,
+                    maxLines = 4,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary,
+                        focusedBorderColor = CyanAccent.copy(alpha = 0.4f),
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.08f),
+                        cursorColor = CyanAccent,
+                    ),
+                    shape = RoundedCornerShape(20.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                if (inputText.isNotBlank()) {
+                    IconButton(
+                        onClick = {
+                            val text = inputText.trim()
+                            if (text.isEmpty()) return@IconButton
+                            val editId = editingMessageId
+                            inputText = ""
+                            editingMessageId = null
                             scope.launch {
-                                container.messageRepo.deleteMessage(msg.id)
+                                if (editId != null) {
+                                    container.messageRepo.updateMessageText(editId, text)
+                                } else {
+                                    val now = System.currentTimeMillis()
+                                    container.messageRepo.insertMessage(
+                                        MessageEntity(
+                                            id = uuid4().toString(),
+                                            conversationId = SAVED_CONV_ID,
+                                            ciphertext = ByteArray(0),
+                                            plaintextCache = text,
+                                            sent = true,
+                                            status = MessageStatus.DELIVERED,
+                                            createdAt = now,
+                                        )
+                                    )
+                                    container.conversationRepo.upsertConversation(
+                                        ConversationEntity(
+                                            id = SAVED_CONV_ID,
+                                            theirUsername = SAVED_USERNAME,
+                                            theirPublicKeyHex = "",
+                                            lastMessagePreview = text.take(60),
+                                            lastMessageAt = now,
+                                            unreadCount = 0,
+                                            trustTier = TrustTier.TRUSTED,
+                                            blocked = false,
+                                        )
+                                    )
+                                    if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                }
                                 reload()
                             }
                         },
-                        onCopy = { text ->
-                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            clipboard.setPrimaryClip(ClipData.newPlainText("note", text))
-                        },
-                        onEdit = { text ->
-                            editingMessageId = msg.id
-                            inputText = text
-                        },
-                        onForward = { text ->
-                            forwardNoteText = text
-                        },
-                        onPin = {
-                            android.widget.Toast.makeText(context, "Pin — coming soon", android.widget.Toast.LENGTH_SHORT).show()
-                        },
-                    )
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(CircleShape)
+                            .background(color = CyanAccent),
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Save",
+                            tint = BgDeep,
+                            modifier = Modifier.size(17.dp),
+                        )
+                    }
                 }
             }
         }

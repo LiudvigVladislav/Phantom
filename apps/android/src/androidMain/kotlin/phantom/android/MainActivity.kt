@@ -28,6 +28,7 @@ import phantom.android.screens.onboarding.OnboardingScreen
 import phantom.android.screens.profile.ProfileScreen
 import phantom.android.screens.requests.MessageRequestsScreen
 import phantom.android.screens.saved.SavedMessagesScreen
+import phantom.android.screens.archive.ArchiveScreen
 import phantom.android.screens.settings.SettingsScreen
 import phantom.android.ui.theme.*
 
@@ -212,6 +213,9 @@ private fun PhantomApp(
         )
         is Screen.SavedMessages -> SavedMessagesScreen(
             container = container,
+            onBack = { currentScreen = Screen.ChatList },
+        )
+        is Screen.Archive -> ArchiveScreen(
             onBack = { currentScreen = Screen.ChatList },
         )
     }

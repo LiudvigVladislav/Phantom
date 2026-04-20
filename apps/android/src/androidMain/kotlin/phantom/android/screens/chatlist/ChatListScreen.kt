@@ -21,12 +21,15 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import org.json.JSONException
+import org.json.JSONObject
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -122,7 +125,7 @@ fun ChatListScreen(
                 }
 
                 item(key = "__archive__") {
-                    ArchiveRow()
+                    ArchiveRow(onClick = { onNavigate(Screen.Archive) })
                 }
 
                 // ── Message requests banner ──────────────────
@@ -325,11 +328,11 @@ private fun NotesRow(onClick: () -> Unit) {
 }
 
 @Composable
-private fun ArchiveRow() {
+private fun ArchiveRow(onClick: () -> Unit = {}) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { }
+            .clickable(onClick = onClick)
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -378,6 +381,31 @@ private fun ArchiveRow() {
 @Composable
 private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
     val isUnread = conv.unreadCount > 0
+    val context = LocalContext.current
+
+    // Read contact real name from persisted profile card
+    val contactDisplayName = remember(conv.id) {
+        val raw = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
+            .getString("contact_profile_${conv.id}", null)
+        if (raw != null) {
+            try {
+                val obj = JSONObject(raw)
+                val fn = obj.optString("fn", "")
+                val ln = obj.optString("ln", "")
+                when {
+                    fn.isNotEmpty() && ln.isNotEmpty() -> "$fn $ln"
+                    fn.isNotEmpty() -> fn
+                    ln.isNotEmpty() -> ln
+                    else -> null
+                }
+            } catch (_: JSONException) {
+                null
+            }
+        } else {
+            null
+        }
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -405,6 +433,16 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
                     color = if (isUnread) CyanAccent else TextDim,
                     fontSize = 11.sp,
                     fontWeight = if (isUnread) FontWeight.Medium else FontWeight.Normal,
+                )
+            }
+            // Real name subtitle — shown only when profile card has been received
+            if (contactDisplayName != null) {
+                Text(
+                    text = contactDisplayName,
+                    color = TextDim,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
             Spacer(Modifier.height(3.dp))

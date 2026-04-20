@@ -3,6 +3,8 @@ package phantom.android.screens.chat
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import org.json.JSONException
+import org.json.JSONObject
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.spring
@@ -64,6 +66,9 @@ import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
 import phantom.core.transport.TransportState
 
+private const val PROFILE_MSG_PREFIX = "\u200B__PHANTOM_PROFILE__\u200B"
+private const val PREFS_NAME = "phantom_prefs"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -84,6 +89,24 @@ fun ChatScreen(
     var showBlockDialog by remember { mutableStateOf(false) }
     var showReportDialog by remember { mutableStateOf(false) }
     val snackbarHostState = remember { androidx.compose.material3.SnackbarHostState() }
+
+    // Own profile fields — read once from SharedPreferences
+    val ownFirstName = remember {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString("profile_first_name", "") ?: ""
+    }
+    val ownLastName = remember {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString("profile_last_name", "") ?: ""
+    }
+    val ownCity = remember {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString("profile_city", "") ?: ""
+    }
+    val ownCountry = remember {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString("profile_country", "") ?: ""
+    }
 
     // Reply / Edit / Forward state
     var replyToMessage by remember { mutableStateOf<MessageEntity?>(null) }
@@ -111,6 +134,28 @@ fun ChatScreen(
         if (conv != null) {
             container.messagingService?.markConversationRead(conversationId, conv.theirPublicKeyHex)
         }
+
+        // Send profile card once per conversation if own profile has at least one name field
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val profileAlreadySent = prefs.getString("profile_sent_$conversationId", null) == "true"
+        val hasProfileData = ownFirstName.isNotEmpty() || ownLastName.isNotEmpty()
+        if (!profileAlreadySent && hasProfileData && conv != null) {
+            val json = JSONObject().apply {
+                put("fn", ownFirstName)
+                put("ln", ownLastName)
+                put("city", ownCity)
+                put("country", ownCountry)
+            }.toString()
+            container.messagingService?.sendMessage(
+                OutgoingMessage(
+                    id = uuid4().toString(),
+                    conversationId = conversationId,
+                    recipientPublicKeyHex = conv.theirPublicKeyHex,
+                    text = PROFILE_MSG_PREFIX + json,
+                )
+            )
+            prefs.edit().putString("profile_sent_$conversationId", "true").apply()
+        }
     }
 
     DisposableEffect(conversationId) {
@@ -122,6 +167,29 @@ fun ChatScreen(
     LaunchedEffect(container.messagingService) {
         container.messagingService?.incomingMessages?.collect { incoming ->
             if (incoming.conversationId == conversationId) {
+                // Check if this is a profile card — handle silently, do not display
+                val plaintext = incoming.text
+                if (plaintext.startsWith(PROFILE_MSG_PREFIX)) {
+                    val jsonStr = plaintext.removePrefix(PROFILE_MSG_PREFIX)
+                    try {
+                        val obj = JSONObject(jsonStr)
+                        val profileJson = JSONObject().apply {
+                            put("fn", obj.optString("fn", ""))
+                            put("ln", obj.optString("ln", ""))
+                            put("city", obj.optString("city", ""))
+                            put("country", obj.optString("country", ""))
+                        }.toString()
+                        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .edit()
+                            .putString("contact_profile_$conversationId", profileJson)
+                            .apply()
+                    } catch (_: JSONException) {
+                        // Malformed profile payload — ignore silently
+                    }
+                    // Do not reload or scroll — profile card is invisible
+                    return@collect
+                }
+
                 reloadMessages()
                 val conv = container.conversationRepo.getConversation(conversationId)
                 if (conv != null) {
@@ -428,16 +496,18 @@ fun ChatScreen(
                     )
                 }
         ) {
-        // Pre-process: inject date separators into the item list
+        // Pre-process: filter out invisible profile cards, then inject date separators
         val chatItems = remember(messages) {
             buildList<ChatItem> {
                 var lastDate = ""
-                messages.forEach { msg ->
-                    val dk = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
-                        .format(java.util.Date(msg.createdAt))
-                    if (dk != lastDate) { lastDate = dk; add(ChatItem.DateSep(dk, msg.createdAt)) }
-                    add(ChatItem.Msg(msg))
-                }
+                messages
+                    .filter { msg -> !(msg.plaintextCache?.startsWith(PROFILE_MSG_PREFIX) ?: false) }
+                    .forEach { msg ->
+                        val dk = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                            .format(java.util.Date(msg.createdAt))
+                        if (dk != lastDate) { lastDate = dk; add(ChatItem.DateSep(dk, msg.createdAt)) }
+                        add(ChatItem.Msg(msg))
+                    }
             }
         }
 

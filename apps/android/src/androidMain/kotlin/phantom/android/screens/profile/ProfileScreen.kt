@@ -5,9 +5,11 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -41,6 +43,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import phantom.android.di.AppContainer
 import phantom.android.qr.QrCodeImage
+import phantom.android.qr.generateQrBitmap
 import phantom.android.ui.gradientBrushForName
 import phantom.android.ui.nameInitials
 import phantom.android.ui.theme.*
@@ -92,8 +95,9 @@ fun ProfileScreen(
     // Dialog state
     var showAvatarChoiceDialog by remember { mutableStateOf(false) }
     var showGradientPicker by remember { mutableStateOf(false) }
+    var showShareDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
-    var editingField by remember { mutableStateOf<String?>(null) }    // field label
+    var editingField by remember { mutableStateOf<String?>(null) }
     var editingValue by remember { mutableStateOf("") }
     var copied by remember { mutableStateOf(false) }
 
@@ -175,14 +179,7 @@ fun ProfileScreen(
                 QrKeyCard(
                     identityString = identityString,
                     copied = copied,
-                    onShare = {
-                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"
-                            putExtra(Intent.EXTRA_TEXT, identityString)
-                            putExtra(Intent.EXTRA_SUBJECT, "PHANTOM identity key")
-                        }
-                        context.startActivity(Intent.createChooser(shareIntent, "Share via…"))
-                    },
+                    onShare = { showShareDialog = true },
                     onCopy = {
                         copyToClipboard(context, identityString)
                         copied = true
@@ -199,6 +196,66 @@ fun ProfileScreen(
             // ── Delete section ───────────────────────────────────────────────
             DeleteSection(onDeleteTap = { showDeleteDialog = true })
         }
+    }
+
+    // ── Share choice dialog ──────────────────────────────────────────────────
+    val shareIdentityString = identity?.let { "${it.username}:${it.publicKeyHex}" } ?: ""
+    if (showShareDialog) {
+        AlertDialog(
+            onDismissRequest = { showShareDialog = false },
+            containerColor = Surface,
+            title = { Text("Share contact", color = TextPrimary, fontWeight = FontWeight.Medium) },
+            text = {
+                Column {
+                    TextButton(
+                        onClick = {
+                            showShareDialog = false
+                            scope.launch(Dispatchers.IO) {
+                                val qrBitmap = generateQrBitmap(shareIdentityString, sizePx = 512)
+                                val file = File(context.cacheDir, "phantom_qr.png")
+                                file.outputStream().use { qrBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                                val uri = FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    file,
+                                )
+                                val intent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "image/png"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                withContext(Dispatchers.Main) {
+                                    context.startActivity(Intent.createChooser(intent, "Share QR via…"))
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Send QR code (image)", color = CyanAccent)
+                    }
+                    TextButton(
+                        onClick = {
+                            showShareDialog = false
+                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, shareIdentityString)
+                                putExtra(Intent.EXTRA_SUBJECT, "PHANTOM identity key")
+                            }
+                            context.startActivity(Intent.createChooser(intent, "Share key via…"))
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Send text key", color = CyanAccent)
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showShareDialog = false }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
     }
 
     // ── Avatar choice dialog ─────────────────────────────────────────────────

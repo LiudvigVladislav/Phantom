@@ -4,9 +4,11 @@ import android.Manifest
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -18,15 +20,19 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
@@ -54,30 +60,40 @@ private fun TermsScreen(onAccept: () -> Unit) {
     val scrollState = rememberScrollState()
     val readEnough = scrollState.value > scrollState.maxValue * 0.6f || scrollState.maxValue == 0
 
+    val arrowAlpha by animateFloatAsState(
+        targetValue = if (scrollState.value > 40) 0f else 1f,
+        animationSpec = tween(durationMillis = 400),
+        label = "arrowFade",
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(BgDeep)
+            .windowInsetsPadding(WindowInsets.statusBars)
             .padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(Modifier.height(52.dp))
+        Spacer(Modifier.height(40.dp))
 
+        // Wordmark
         Text(
             text = "PHANTOM",
-            color = TextDim,
-            fontSize = 11.sp,
-            letterSpacing = 4.sp,
+            color = CyanAccent.copy(alpha = 0.55f),
+            fontSize = 10.sp,
+            letterSpacing = 5.sp,
             fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Normal,
         )
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(28.dp))
 
         Text(
             text = "Terms of Use",
             color = TextPrimary,
-            fontSize = 24.sp,
+            fontSize = 26.sp,
             fontWeight = FontWeight.Light,
+            letterSpacing = (-0.5).sp,
         )
 
         Spacer(Modifier.height(6.dp))
@@ -86,19 +102,24 @@ private fun TermsScreen(onAccept: () -> Unit) {
             text = "Please read before continuing",
             color = TextDim,
             fontSize = 13.sp,
+            fontWeight = FontWeight.Normal,
         )
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(24.dp))
 
         // Scrollable ToS card
         Column(
             modifier = Modifier
                 .weight(1f)
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(16.dp))
                 .background(Surface)
-                .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(12.dp))
+                .border(
+                    width = 1.dp,
+                    color = Color.White.copy(alpha = 0.05f),
+                    shape = RoundedCornerShape(16.dp),
+                )
                 .verticalScroll(scrollState)
-                .padding(20.dp),
+                .padding(horizontal = 20.dp, vertical = 22.dp),
         ) {
             TosSection(
                 title = "1. Acceptable Use",
@@ -123,44 +144,77 @@ private fun TermsScreen(onAccept: () -> Unit) {
             TosSection(
                 title = "6. Changes",
                 body = "These terms may be updated. Continued use of the service after changes constitutes acceptance of the revised terms.",
+                isLast = true,
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(16.dp))
             Text(
                 text = "By tapping \"Accept & Continue\" you confirm that you are at least 16 years old and agree to these terms.",
-                color = TextDim.copy(alpha = 0.7f),
+                color = TextDim.copy(alpha = 0.6f),
                 fontSize = 11.sp,
-                lineHeight = 16.sp,
+                lineHeight = 17.sp,
+                fontFamily = FontFamily.Monospace,
             )
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(12.dp))
 
+        // Scroll hint with drawn arrow
         if (!readEnough) {
-            Text(
-                text = "Scroll to read all terms",
-                color = TextDim.copy(alpha = 0.6f),
-                fontSize = 11.sp,
-            )
-            Spacer(Modifier.height(8.dp))
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.alpha(arrowAlpha),
+            ) {
+                Text(
+                    text = "scroll to read all terms",
+                    color = TextDim.copy(alpha = 0.5f),
+                    fontSize = 10.sp,
+                    letterSpacing = 1.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Spacer(Modifier.height(6.dp))
+                // Drawn chevron-down arrow — no material icon
+                Canvas(modifier = Modifier.size(16.dp, 8.dp)) {
+                    val w = size.width
+                    val h = size.height
+                    val stroke = Stroke(
+                        width = 1.5.dp.toPx(),
+                        cap = StrokeCap.Round,
+                    )
+                    val path = Path().apply {
+                        moveTo(0f, 0f)
+                        lineTo(w / 2f, h)
+                        lineTo(w, 0f)
+                    }
+                    drawPath(
+                        path = path,
+                        color = TextDim.copy(alpha = 0.4f),
+                        style = stroke,
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+            }
         }
 
         Button(
             onClick = onAccept,
             enabled = readEnough,
-            modifier = Modifier.fillMaxWidth().height(52.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = CyanAccent,
                 contentColor = BgDeep,
-                disabledContainerColor = CyanAccent.copy(alpha = 0.2f),
-                disabledContentColor = TextDim,
+                disabledContainerColor = CyanAccent.copy(alpha = 0.15f),
+                disabledContentColor = TextDim.copy(alpha = 0.5f),
             ),
-            shape = RoundedCornerShape(8.dp),
+            shape = RoundedCornerShape(12.dp),
         ) {
             Text(
                 text = "ACCEPT & CONTINUE",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 2.sp,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 2.5.sp,
+                fontFamily = FontFamily.Monospace,
             )
         }
 
@@ -169,22 +223,30 @@ private fun TermsScreen(onAccept: () -> Unit) {
 }
 
 @Composable
-private fun TosSection(title: String, body: String) {
+private fun TosSection(title: String, body: String, isLast: Boolean = false) {
     Text(
         text = title,
-        color = CyanAccent.copy(alpha = 0.9f),
-        fontSize = 12.sp,
+        color = CyanAccent.copy(alpha = 0.85f),
+        fontSize = 11.sp,
         fontWeight = FontWeight.Medium,
-        letterSpacing = 0.5.sp,
+        letterSpacing = 1.sp,
+        fontFamily = FontFamily.Monospace,
     )
-    Spacer(Modifier.height(6.dp))
+    Spacer(Modifier.height(7.dp))
     Text(
         text = body,
         color = TextDim,
         fontSize = 13.sp,
-        lineHeight = 19.sp,
+        lineHeight = 20.sp,
     )
-    Spacer(Modifier.height(18.dp))
+    if (!isLast) {
+        Spacer(Modifier.height(14.dp))
+        HorizontalDivider(
+            color = Color.White.copy(alpha = 0.04f),
+            thickness = 1.dp,
+        )
+        Spacer(Modifier.height(14.dp))
+    }
 }
 
 // ── Step 2: Identity creation ─────────────────────────────────────────────────
@@ -214,53 +276,84 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(BgDeep)
+            .windowInsetsPadding(WindowInsets.statusBars)
             .padding(horizontal = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(Modifier.height(60.dp))
+        Spacer(Modifier.height(52.dp))
 
+        // Wordmark
         Text(
             text = "PHANTOM",
-            color = TextDim,
-            fontSize = 11.sp,
+            color = CyanAccent.copy(alpha = 0.55f),
+            fontSize = 10.sp,
             fontWeight = FontWeight.Normal,
-            letterSpacing = 4.sp,
+            letterSpacing = 5.sp,
+            fontFamily = FontFamily.Monospace,
         )
 
-        Spacer(Modifier.height(32.dp))
+        Spacer(Modifier.height(40.dp))
 
+        // Hero tagline
         Text(
             text = "Your presence,\nknown to no one.",
             color = TextPrimary,
-            fontSize = 30.sp,
+            fontSize = 32.sp,
             fontWeight = FontWeight.Light,
-            lineHeight = 38.sp,
+            lineHeight = 42.sp,
             textAlign = TextAlign.Center,
+            letterSpacing = (-0.8).sp,
         )
 
-        Spacer(Modifier.height(48.dp))
+        Spacer(Modifier.height(28.dp))
+
+        // Trust badge pills
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.wrapContentWidth(),
+        ) {
+            FeaturePill("E2E ENCRYPTED")
+            FeaturePill("NO PHONE")
+            FeaturePill("ZERO METADATA")
+        }
+
+        Spacer(Modifier.height(52.dp))
 
         Text(
             text = "Choose your identity",
             color = TextDim,
-            fontSize = 13.sp,
+            fontSize = 12.sp,
             fontWeight = FontWeight.Normal,
+            letterSpacing = 0.5.sp,
+            fontFamily = FontFamily.Monospace,
         )
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(14.dp))
 
+        // Username input field — Surface2 box with CyanAccent left border
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .clip(RoundedCornerShape(topEnd = 10.dp, bottomEnd = 10.dp))
+                .background(Surface2)
                 .border(
                     width = 1.dp,
-                    color = if (valid) CyanAccent.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.15f),
+                    color = if (valid) CyanAccent.copy(alpha = 0.25f) else Color.White.copy(alpha = 0.06f),
+                    shape = RoundedCornerShape(topEnd = 10.dp, bottomEnd = 10.dp),
                 )
-                .padding(horizontal = 16.dp, vertical = 14.dp),
+                // 2dp CyanAccent left border via inner padding trick with a drawn line
+                .drawLeftBorder(color = CyanAccent.copy(alpha = if (valid) 0.9f else 0.35f), width = 2.dp)
+                .padding(horizontal = 16.dp, vertical = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(text = "@", color = CyanAccent, fontSize = 20.sp, fontWeight = FontWeight.Light)
-            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "@",
+                color = CyanAccent,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Light,
+                fontFamily = FontFamily.Monospace,
+            )
+            Spacer(Modifier.width(10.dp))
             BasicTextField(
                 value = username,
                 onValueChange = {
@@ -271,8 +364,9 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                 singleLine = true,
                 textStyle = LocalTextStyle.current.copy(
                     color = TextPrimary,
-                    fontSize = 20.sp,
+                    fontSize = 18.sp,
                     fontWeight = FontWeight.Light,
+                    fontFamily = FontFamily.Monospace,
                 ),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = {
@@ -285,7 +379,13 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                 }),
                 decorationBox = { inner ->
                     if (username.isEmpty()) {
-                        Text("username", color = TextDim, fontSize = 20.sp, fontWeight = FontWeight.Light)
+                        Text(
+                            text = "username",
+                            color = TextDim.copy(alpha = 0.5f),
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Light,
+                            fontFamily = FontFamily.Monospace,
+                        )
                     }
                     inner()
                 },
@@ -293,8 +393,13 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
         }
 
         if (error != null) {
-            Spacer(Modifier.height(8.dp))
-            Text(text = error!!, color = Danger, fontSize = 12.sp)
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = error!!,
+                color = Danger,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+            )
         }
 
         Spacer(Modifier.weight(1f))
@@ -309,25 +414,76 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                 }
             },
             enabled = valid && !loading,
-            modifier = Modifier.fillMaxWidth().height(52.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = CyanAccent,
                 contentColor = BgDeep,
-                disabledContainerColor = CyanAccent.copy(alpha = 0.2f),
-                disabledContentColor = TextDim,
+                disabledContainerColor = CyanAccent.copy(alpha = 0.15f),
+                disabledContentColor = TextDim.copy(alpha = 0.5f),
             ),
-            shape = MaterialTheme.shapes.extraSmall,
+            shape = RoundedCornerShape(12.dp),
         ) {
             if (loading) {
-                CircularProgressIndicator(modifier = Modifier.size(18.dp), color = BgDeep, strokeWidth = 2.dp)
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    color = BgDeep,
+                    strokeWidth = 2.dp,
+                )
             } else {
-                Text(text = "BEGIN", fontSize = 11.sp, fontWeight = FontWeight.Medium, letterSpacing = 3.sp)
+                Text(
+                    text = "BEGIN",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 3.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
             }
         }
 
         Spacer(Modifier.height(32.dp))
     }
 }
+
+// ── Reusable sub-components ───────────────────────────────────────────────────
+
+@Composable
+private fun FeaturePill(label: String) {
+    Box(
+        modifier = Modifier
+            .border(
+                width = 1.dp,
+                color = CyanAccent.copy(alpha = 0.25f),
+                shape = RoundedCornerShape(4.dp),
+            )
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+    ) {
+        Text(
+            text = label,
+            color = CyanAccent.copy(alpha = 0.55f),
+            fontSize = 8.sp,
+            letterSpacing = 1.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
+
+/**
+ * Draws a solid left border stripe directly on the Modifier draw layer,
+ * avoiding the need for a nested Box or extra composable.
+ */
+private fun Modifier.drawLeftBorder(color: Color, width: Dp): Modifier =
+    this.drawWithContent {
+        drawContent()
+        drawRect(
+            color = color,
+            size = Size(width.toPx(), size.height),
+        )
+    }
+
+// ── Business logic (unchanged) ────────────────────────────────────────────────
 
 private suspend fun runOnboarding(
     container: AppContainer,

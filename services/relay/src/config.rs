@@ -1,5 +1,5 @@
 /// Relay configuration loaded from environment variables.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RelayConfig {
     pub host: String,
     pub port: u16,
@@ -50,5 +50,20 @@ impl RelayConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
         }
+    }
+}
+
+impl std::fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("max_payload_bytes", &self.max_payload_bytes)
+            .field("envelope_ttl_secs", &self.envelope_ttl_secs)
+            .field("max_envelopes_per_recipient", &self.max_envelopes_per_recipient)
+            .field("secret_token", &self.secret_token.as_ref().map(|_| "[REDACTED]"))
+            .field("rate_limit_per_window", &self.rate_limit_per_window)
+            .field("rate_limit_window_secs", &self.rate_limit_window_secs)
+            .finish()
     }
 }

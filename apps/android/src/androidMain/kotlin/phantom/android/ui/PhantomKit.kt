@@ -68,6 +68,7 @@ fun GradientAvatar(
     size: Dp = 44.dp,
     online: Boolean? = null,
     ring: Boolean = false,
+    brushOverride: Brush? = null,
 ) {
     Box(
         modifier = Modifier.size(size),
@@ -76,7 +77,7 @@ fun GradientAvatar(
             modifier = Modifier
                 .fillMaxSize()
                 .clip(CircleShape)
-                .background(gradientBrushForName(name))
+                .background(brushOverride ?: gradientBrushForName(name))
                 .then(
                     if (ring) Modifier.border(2.dp, CyanAccent, CircleShape)
                     else Modifier

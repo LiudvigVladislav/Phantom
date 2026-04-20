@@ -18,6 +18,7 @@ use tower_http::{
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
+use axum::http::Request;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let max_body = state.config.max_payload_bytes + 1024;
@@ -31,7 +32,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/reports",      get(admin_list_reports))
         .route("/admin/block",        post(admin_block_key))
         .route("/admin/blocklist",    get(admin_list_blocklist))
-        .layer(TraceLayer::new_for_http())
+        // Log only method + path — never query string, to avoid leaking ?token= secrets.
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
+            tracing::info_span!(
+                "request",
+                method = %req.method(),
+                path   = %req.uri().path(),
+            )
+        }))
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
@@ -161,7 +169,9 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
     match value.get("type").and_then(|t| t.as_str()) {
         Some("send") => {
             let to      = value["to"].as_str().unwrap_or("").to_string();
-            let from    = value["from"].as_str().unwrap_or(from_identity).to_string();
+            // Always use the authenticated WS identity as the sender — never trust
+            // client-supplied "from" to prevent relay-layer sender spoofing.
+            let from    = from_identity.to_string();
             let payload = value["payload"].as_str().unwrap_or("").to_string();
             let msg_id  = value["messageId"].as_str().unwrap_or("").to_string();
 
@@ -250,12 +260,12 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                     state.config.envelope_ttl_secs,
                 );
                 {
-                    let clients = state.clients.read().await;
-                    let known: Vec<String> = clients.keys().map(|k| k[..k.len().min(16)].to_string()).collect();
+                    // Log only online_count, never key prefixes — presence metadata leak.
+                    let online_count = state.clients.read().await.len();
                     tracing::info!(
                         msg_id = %msg_id,
                         to = %&to[..to.len().min(16)],
-                        online_clients = ?known,
+                        online_count,
                         "recipient offline — queuing"
                     );
                 }

@@ -8,8 +8,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Phone
@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -40,6 +41,24 @@ fun PhantomTopBar(
 ) {
     var showAvatarMenu by remember { mutableStateOf(false) }
     var showComposeMenu by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val gradientBrush = remember(userName) {
+        val prefs = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
+        val idx = prefs.getInt("profile_gradient_index", -1)
+        if (idx >= 0) {
+            val presets = listOf(
+                Pair(androidx.compose.ui.graphics.Color(0xFF00D4FF), androidx.compose.ui.graphics.Color(0xFF0055CC)),
+                Pair(androidx.compose.ui.graphics.Color(0xFF8B5CF6), androidx.compose.ui.graphics.Color(0xFFEC4899)),
+                Pair(androidx.compose.ui.graphics.Color(0xFF2FBF71), androidx.compose.ui.graphics.Color(0xFF0099AA)),
+                Pair(androidx.compose.ui.graphics.Color(0xFFF97316), androidx.compose.ui.graphics.Color(0xFFE85D75)),
+                Pair(androidx.compose.ui.graphics.Color(0xFFF59E0B), androidx.compose.ui.graphics.Color(0xFFD97706)),
+                Pair(androidx.compose.ui.graphics.Color(0xFF3B82F6), androidx.compose.ui.graphics.Color(0xFF1D4ED8)),
+                Pair(androidx.compose.ui.graphics.Color(0xFFFB7185), androidx.compose.ui.graphics.Color(0xFFF43F5E)),
+                Pair(androidx.compose.ui.graphics.Color(0xFF10B981), androidx.compose.ui.graphics.Color(0xFF065F46)),
+            )
+            presets.getOrNull(idx)?.let { (a, b) -> Brush.linearGradient(listOf(a, b)) }
+        } else null
+    }
 
     Column(
         modifier = Modifier
@@ -56,7 +75,7 @@ fun PhantomTopBar(
             // Avatar + dropdown
             Box {
                 Box(modifier = Modifier.clickable { showAvatarMenu = !showAvatarMenu }) {
-                    GradientAvatar(name = userName.ifEmpty { "?" }, size = 36.dp)
+                    GradientAvatar(name = userName.ifEmpty { "?" }, size = 36.dp, brushOverride = gradientBrush)
                 }
                 DropdownMenu(
                     expanded = showAvatarMenu,
@@ -336,11 +355,12 @@ fun SettingsRowItem(
     iconTint: Color = CyanAccent,
     label: String,
     value: String? = null,
+    onClick: () -> Unit = {},
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { }
+            .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
