@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "525381685173",
+    "project_id": "phantom-app-a1ca0",
+    "storage_bucket": "phantom-app-a1ca0.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:525381685173:android:0ceb409afb0c93ebc6d3fc",
+        "android_client_info": {
+          "package_name": "phantom.android"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDIeZsakPqrnx1Yzhl-aG3UMM-fdqaqxLs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

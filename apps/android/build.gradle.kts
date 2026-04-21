@@ -3,8 +3,7 @@ plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
-    // TODO: Add google-services.json to apps/android/ then uncomment:
-    // id("com.google.gms.google-services")
+    id("com.google.gms.google-services")
 }
 
 kotlin {
