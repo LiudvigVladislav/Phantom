@@ -8,7 +8,8 @@ CREATE TABLE conversation (
     trust_tier TEXT NOT NULL DEFAULT 'TRUSTED',
     blocked INTEGER NOT NULL DEFAULT 0,
     notes TEXT DEFAULT NULL,
-    is_verified INTEGER NOT NULL DEFAULT 0
+    is_verified INTEGER NOT NULL DEFAULT 0,
+    disappearing_timer_secs INTEGER NOT NULL DEFAULT 0
 );
 
 getAllConversations:

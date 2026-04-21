@@ -143,11 +143,23 @@ fun SettingsScreen(
                 // Privacy
                 item { SettingsGroupHeader("Privacy") }
                 item {
+                    val prefs = context.getSharedPreferences(
+                        "phantom_prefs",
+                        android.content.Context.MODE_PRIVATE,
+                    )
+                    var appLockEnabled by remember {
+                        mutableStateOf(prefs.getBoolean("app_lock_enabled", false))
+                    }
                     SettingsGroupCard {
                         SettingsRowItem(
                             icon = Icons.Default.Lock,
-                            label = "Confidentiality settings",
-                            onClick = { showComingSoon() },
+                            label = "App Lock",
+                            value = if (appLockEnabled) "On" else "Off",
+                            onClick = {
+                                val newVal = !appLockEnabled
+                                appLockEnabled = newVal
+                                prefs.edit().putBoolean("app_lock_enabled", newVal).apply()
+                            },
                         )
                     }
                 }

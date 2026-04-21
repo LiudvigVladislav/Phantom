@@ -100,7 +100,6 @@ class SqlDelightConversationRepository(
         withContext(Dispatchers.IO) {
             db.conversationQueries.getDisappearingTimer(conversationId)
                 .executeAsOneOrNull()
-                ?.disappearing_timer_secs
                 ?: 0L
         }
 

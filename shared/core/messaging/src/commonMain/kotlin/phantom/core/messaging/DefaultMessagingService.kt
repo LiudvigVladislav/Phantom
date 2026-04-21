@@ -244,6 +244,10 @@ class DefaultMessagingService(
                 }
                 return@runCatching
             }
+            if (payload.type == MessagePayload.TYPE_PIN && payload.targetMessageId.isNotEmpty()) {
+                messageRepository.pinMessage(payload.targetMessageId, payload.pinned ?: false)
+                return@runCatching
+            }
 
             val nowMs = Clock.System.now().toEpochMilliseconds()
             val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
@@ -487,6 +491,46 @@ class DefaultMessagingService(
                 )
             }
         }
+    }
+
+    override suspend fun pinMessageForBoth(
+        messageId: String,
+        conversationId: String,
+        recipientPublicKeyHex: String,
+        pinned: Boolean,
+    ): Result<Unit> = runCatching {
+        val state = sessionManager.getOrCreateSession(
+            conversationId = conversationId,
+            localIdentityKeyPair = localKeyPair,
+            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
+        )
+        val payload = json.encodeToString(
+            MessagePayload(
+                text = "",
+                sentAt = Clock.System.now().toEpochMilliseconds(),
+                senderUsername = identity.username,
+                type = MessagePayload.TYPE_PIN,
+                targetMessageId = messageId,
+                pinned = pinned,
+            )
+        ).encodeToByteArray()
+        val (newState, encrypted) = ratchet.encrypt(state, payload)
+        sessionManager.saveSession(conversationId, newState)
+        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        transport.send(
+            RelayMessage.Send(
+                to = recipientPublicKeyHex,
+                from = "",
+                sealedSender = Base64.encode(
+                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                ),
+                payload = MessagePadding.pad(ciphertext).encodeBase64(),
+                messageId = uuid4().toString(),
+            )
+        )
+        // Apply locally so the sender sees the pin state immediately
+        messageRepository.pinMessage(messageId, pinned)
     }
 
     /** Strip reply prefix "> quote\n" so chat list shows the actual message. */

@@ -40,4 +40,12 @@ interface MessagingService {
         recipientPublicKeyHex: String,
         emoji: String,
     ): Result<Unit>
+
+    // Pin or unpin a message for both parties; propagated as an encrypted control message
+    suspend fun pinMessageForBoth(
+        messageId: String,
+        conversationId: String,
+        recipientPublicKeyHex: String,
+        pinned: Boolean,
+    ): Result<Unit>
 }

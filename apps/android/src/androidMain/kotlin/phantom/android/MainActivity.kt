@@ -1,5 +1,6 @@
 package phantom.android
 
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.util.Base64
@@ -26,6 +27,7 @@ import phantom.android.screens.calls.CallsScreen
 import phantom.android.screens.chat.ChatScreen
 import phantom.android.screens.chatlist.ChatListScreen
 import phantom.android.screens.contact.ContactProfileScreen
+import phantom.android.screens.lock.AppLockScreen
 import phantom.android.screens.onboarding.OnboardingScreen
 import phantom.android.screens.profile.ProfileScreen
 import phantom.android.screens.requests.MessageRequestsScreen
@@ -58,6 +60,27 @@ class MainActivity : ComponentActivity() {
     // Mutable state hoisted to Activity level so onNewIntent can update Compose state.
     private val pendingInviteQr = androidx.compose.runtime.mutableStateOf<String?>(null)
 
+    // App Lock — hoisted to Activity so onResume can trigger re-lock after background timeout.
+    // Initialised to false; set to true in onCreate when the pref is enabled.
+    private val isLockedState = androidx.compose.runtime.mutableStateOf(false)
+    private var backgroundedAt: Long = 0
+
+    override fun onPause() {
+        super.onPause()
+        backgroundedAt = System.currentTimeMillis()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val prefs = getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("app_lock_enabled", false)) {
+            val elapsed = System.currentTimeMillis() - backgroundedAt
+            if (backgroundedAt > 0 && elapsed > 60_000) {
+                isLockedState.value = true
+            }
+        }
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -83,54 +106,68 @@ class MainActivity : ComponentActivity() {
         // enableEdgeToEdge() conflicts with API 35+ system-enforced edge-to-edge.
         // On API 35+, the system handles it automatically; calling it again
         // corrupts the EGL surface setup (GFXSTREAM / Unknown dataspace 0).
+
+        // Initialise lock state from prefs before Compose renders its first frame.
+        val prefs = getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("app_lock_enabled", false)) {
+            isLockedState.value = true
+        }
+
         setContent {
             PhantomTheme {
-                var container by remember { mutableStateOf<AppContainer?>(null) }
-                var initError by remember { mutableStateOf<String?>(null) }
+                // Observe the activity-level lock flag inside Compose.
+                val isLocked by isLockedState
 
-                LaunchedEffect(Unit) {
-                    Log.d("PHANTOM_INIT", "MainActivity: awaiting ready…")
-                    runCatching { app.ready.await() }
-                        .onSuccess {
-                            Log.d("PHANTOM_INIT", "MainActivity: ready — rendering app")
-                            container = app.container
-                        }
-                        .onFailure { t ->
-                            Log.e("PHANTOM_INIT", "MainActivity: init failed: ${t.message}", t)
-                            initError = when (t) {
-                                is SecurityException ->
-                                    "Encryption keys could not be unlocked.\nTry restarting the app."
-                                is android.database.sqlite.SQLiteException ->
-                                    "Database error. Please reinstall the app."
-                                else ->
-                                    "Startup failed. Please restart."
+                if (isLocked) {
+                    AppLockScreen(onUnlocked = { isLockedState.value = false })
+                } else {
+                    var container by remember { mutableStateOf<AppContainer?>(null) }
+                    var initError by remember { mutableStateOf<String?>(null) }
+
+                    LaunchedEffect(Unit) {
+                        Log.d("PHANTOM_INIT", "MainActivity: awaiting ready…")
+                        runCatching { app.ready.await() }
+                            .onSuccess {
+                                Log.d("PHANTOM_INIT", "MainActivity: ready — rendering app")
+                                container = app.container
                             }
-                        }
-                }
-
-                val c = container
-                when {
-                    c != null -> PhantomApp(
-                        container              = c,
-                        notifConversationId    = notifConversationId,
-                        notifSenderName        = notifSenderName,
-                        pendingInviteQr        = pendingInviteQr,
-                    )
-
-                    initError != null -> Box(
-                        modifier = Modifier.fillMaxSize().background(BgDeep).padding(24.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = "Startup error:\n\n$initError",
-                            color = Danger,
-                            fontSize = 13.sp,
-                            textAlign = TextAlign.Center,
-                            lineHeight = 20.sp,
-                        )
+                            .onFailure { t ->
+                                Log.e("PHANTOM_INIT", "MainActivity: init failed: ${t.message}", t)
+                                initError = when (t) {
+                                    is SecurityException ->
+                                        "Encryption keys could not be unlocked.\nTry restarting the app."
+                                    is android.database.sqlite.SQLiteException ->
+                                        "Database error. Please reinstall the app."
+                                    else ->
+                                        "Startup failed. Please restart."
+                                }
+                            }
                     }
 
-                    else -> PhantomSplashScreen()
+                    val c = container
+                    when {
+                        c != null -> PhantomApp(
+                            container              = c,
+                            notifConversationId    = notifConversationId,
+                            notifSenderName        = notifSenderName,
+                            pendingInviteQr        = pendingInviteQr,
+                        )
+
+                        initError != null -> Box(
+                            modifier = Modifier.fillMaxSize().background(BgDeep).padding(24.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "Startup error:\n\n$initError",
+                                color = Danger,
+                                fontSize = 13.sp,
+                                textAlign = TextAlign.Center,
+                                lineHeight = 20.sp,
+                            )
+                        }
+
+                        else -> PhantomSplashScreen()
+                    }
                 }
             }
         }

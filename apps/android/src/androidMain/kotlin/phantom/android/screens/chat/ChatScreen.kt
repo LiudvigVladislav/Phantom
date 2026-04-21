@@ -62,9 +62,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import com.benasher44.uuid.uuid4
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.window.Popup
 import phantom.android.di.AppContainer
@@ -131,6 +133,13 @@ fun ChatScreen(
     var isContactTyping by remember { mutableStateOf(false) }
     // Job reference for debouncing outgoing typing events
     var typingJob by remember { mutableStateOf<Job?>(null) }
+
+    // Pinned messages banner state — loaded once and refreshed after pin/unpin actions
+    var pinnedMessages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
+
+    LaunchedEffect(conversationId) {
+        pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+    }
 
     LaunchedEffect(Unit) {
         conversations = container.conversationRepo.getActiveConversations()
@@ -576,6 +585,53 @@ fun ChatScreen(
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             item(key = "__e2ee__") { E2EENoteRow() }
+
+            // Pinned message banner — shown when at least one message is pinned
+            if (pinnedMessages.isNotEmpty()) {
+                item(key = "pinned_banner") {
+                    val msg = pinnedMessages.last() // most recently pinned
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Surface2)
+                            .clickable { /* TODO: scroll to pinned message */ }
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Canvas(modifier = Modifier.size(16.dp)) {
+                            drawLine(
+                                color = CyanAccent,
+                                start = Offset(size.width / 2, 0f),
+                                end = Offset(size.width / 2, size.height * 0.6f),
+                                strokeWidth = 2.dp.toPx(),
+                            )
+                            drawCircle(
+                                color = CyanAccent,
+                                radius = size.width * 0.35f,
+                                center = Offset(size.width / 2, size.height * 0.3f),
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Pinned message",
+                                color = CyanAccent,
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                            Text(
+                                text = msg.plaintextCache?.take(60) ?: "•••",
+                                color = TextDim,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                }
+            }
+
             lazyItems(chatItems, key = {
                 when (it) {
                     is ChatItem.DateSep -> "__date_${it.dateKey}"
@@ -637,6 +693,17 @@ fun ChatScreen(
                             onForward = { cleanText, senderLabel ->
                                 forwardText = cleanText
                                 forwardSenderLabel = senderLabel
+                            },
+                            onPin = {
+                                scope.launch {
+                                    container.messagingService?.pinMessageForBoth(
+                                        messageId = msg.id,
+                                        conversationId = conversationId,
+                                        recipientPublicKeyHex = theirPublicKeyHex,
+                                        pinned = !msg.pinned,
+                                    )
+                                    pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+                                }
                             },
                         )
                         } // end AnimatedVisibility
@@ -820,6 +887,7 @@ private fun MessageBubble(
     onDeleteForBoth: () -> Unit,
     onCopy: (String) -> Unit,
     onForward: (cleanText: String, senderLabel: String) -> Unit,
+    onPin: () -> Unit,
 ) {
     val context = LocalContext.current
     val bubbleCoroutineScope = rememberCoroutineScope()
@@ -1065,6 +1133,64 @@ private fun MessageBubble(
                         if (isSent) StatusIcon(status = entity.status)
                     }
                 }
+
+                // Link preview — shown for messages that contain a URL
+                val urlInMsg = remember(entity.id) { extractUrl(rawText) }
+                var linkPreview by remember(entity.id) { mutableStateOf<LinkPreview?>(null) }
+
+                if (urlInMsg != null) {
+                    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+                    LaunchedEffect(entity.id) {
+                        linkPreview = fetchLinkPreview(urlInMsg)
+                    }
+                    val preview = linkPreview
+                    if (preview != null) {
+                        Spacer(Modifier.height(6.dp))
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(
+                                    if (isSent) BgDeep.copy(alpha = 0.30f) else Surface.copy(alpha = 0.8f)
+                                )
+                                .border(
+                                    1.dp,
+                                    Color.White.copy(alpha = 0.06f),
+                                    RoundedCornerShape(8.dp),
+                                )
+                                .clickable { runCatching { uriHandler.openUri(urlInMsg) } }
+                                .padding(10.dp),
+                        ) {
+                            Text(
+                                text = preview.title,
+                                color = if (isSent) Color.White else TextPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 2,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            )
+                            if (preview.description.isNotEmpty()) {
+                                Spacer(Modifier.height(2.dp))
+                                Text(
+                                    text = preview.description,
+                                    color = if (isSent) Color.White.copy(alpha = 0.75f) else TextDim,
+                                    fontSize = 11.sp,
+                                    maxLines = 2,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                )
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = preview.url.take(50),
+                                color = if (isSent) Color.White.copy(alpha = 0.6f) else CyanAccent.copy(alpha = 0.7f),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
             } // end bubble Column
 
             // Reaction pills — shown below the bubble when reactions exist
@@ -1165,10 +1291,16 @@ private fun MessageBubble(
                 )
                 DropdownMenuItem(
                     leadingIcon = { MenuIcon(0x1F4CC) }, // 📌
-                    text = { Text("Pin", color = TextPrimary, fontSize = 14.sp) },
+                    text = {
+                        Text(
+                            text = if (entity.pinned) "Unpin" else "Pin message",
+                            color = TextPrimary,
+                            fontSize = 14.sp,
+                        )
+                    },
                     onClick = {
                         showActions = false
-                        android.widget.Toast.makeText(context, "Coming soon", android.widget.Toast.LENGTH_SHORT).show()
+                        onPin()
                     },
                 )
                 DropdownMenuItem(
@@ -1491,6 +1623,47 @@ private fun categoryLabel(category: SafetyReportCategory): String = when (catego
     SafetyReportCategory.CSAM            -> "Child safety"
     SafetyReportCategory.ILLEGAL_CONTENT -> "Illegal content"
     SafetyReportCategory.OTHER           -> "Other"
+}
+
+// ── Link preview ──────────────────────────────────────────────────────────────
+
+private data class LinkPreview(
+    val url: String,
+    val title: String,
+    val description: String,
+)
+
+private val URL_REGEX = Regex("""https?://[^\s]+""")
+
+private fun extractUrl(text: String): String? = URL_REGEX.find(text)?.value
+
+private suspend fun fetchLinkPreview(url: String): LinkPreview? = withContext(Dispatchers.IO) {
+    runCatching {
+        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        conn.connectTimeout = 3_000
+        conn.readTimeout = 3_000
+        conn.setRequestProperty("User-Agent", "PHANTOM/1.0")
+        conn.instanceFollowRedirects = true
+        if (conn.responseCode !in 200..299) return@runCatching null
+        val html = conn.inputStream.bufferedReader().use { r ->
+            val sb = StringBuilder()
+            val buf = CharArray(1024)
+            var read: Int
+            var total = 0
+            while (r.read(buf).also { read = it } != -1 && total < 32_768) {
+                sb.appendRange(buf, 0, read); total += read
+            }
+            sb.toString()
+        }
+        val title = Regex("""<title[^>]*>([^<]*)</title>""", RegexOption.IGNORE_CASE)
+            .find(html)?.groupValues?.getOrNull(1)?.trim()?.take(80)
+            ?: return@runCatching null
+        val desc = Regex(
+            """<meta[^>]+name=.description.[^>]+content=.([^"']{1,200})""",
+            RegexOption.IGNORE_CASE,
+        ).find(html)?.groupValues?.getOrNull(1)?.trim() ?: ""
+        LinkPreview(url = url, title = title, description = desc)
+    }.getOrNull()
 }
 
 private val CircleShape = RoundedCornerShape(50)

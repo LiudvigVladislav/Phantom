@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
+    // TODO: Add google-services.json to apps/android/ then uncomment:
+    // id("com.google.gms.google-services")
 }
 
 kotlin {
@@ -33,6 +35,10 @@ kotlin {
             implementation(libs.mlkit.barcode)
             implementation(libs.libsodium.bindings)
             implementation(libs.sqlcipher.android)
+            implementation("androidx.biometric:biometric:1.1.0")
+            // FCM — silent push wakes the device so the WebSocket drains queued messages.
+            // Requires google-services.json in apps/android/ and the plugin uncommented above.
+            implementation("com.google.firebase:firebase-messaging-ktx:23.4.1")
             implementation(project(":shared:core:identity"))
             implementation(project(":shared:core:crypto"))
             implementation(project(":shared:core:storage"))

@@ -66,6 +66,12 @@ private class FakeMessageRepository : MessageRepository {
         val now = System.currentTimeMillis()
         messages.removeAll { it.expiresAtMs != null && it.expiresAtMs <= now }
     }
+    override suspend fun pinMessage(messageId: String, pinned: Boolean) {
+        val i = messages.indexOfFirst { it.id == messageId }
+        if (i != -1) messages[i] = messages[i].copy(pinned = pinned)
+    }
+    override suspend fun getPinnedMessages(conversationId: String): List<MessageEntity> =
+        messages.filter { it.conversationId == conversationId && it.pinned }
 }
 
 private class FakeConversationRepository : ConversationRepository {
@@ -298,5 +304,72 @@ class DefaultMessagingServiceTest {
         assertEquals("👍", reactions[0].emoji)
         // Control message sent to the relay
         assertEquals(1, transport.sent.size)
+    }
+
+    @Test
+    fun pinMessageForBoth_storesLocallyAndSendsViaTransport() = runTest {
+        val msgRepo = FakeMessageRepository()
+        val transport = FakeRelayTransport()
+        val service = buildService(this, msgRepo = msgRepo, transport = transport)
+
+        // Seed a message so pinMessage has a target to update
+        msgRepo.insertMessage(
+            MessageEntity(
+                id = "msg-pin-1",
+                conversationId = "conv-1",
+                ciphertext = ByteArray(0),
+                plaintextCache = "Hello",
+                sent = false,
+                status = MessageStatus.DELIVERED,
+                createdAt = 0L,
+            )
+        )
+
+        val result = service.pinMessageForBoth(
+            messageId = "msg-pin-1",
+            conversationId = "conv-1",
+            recipientPublicKeyHex = "ccdd",
+            pinned = true,
+        )
+
+        // Result must be successful
+        assertEquals(true, result.isSuccess)
+        // Local pin state updated
+        val pinned = msgRepo.getPinnedMessages("conv-1")
+        assertEquals(1, pinned.size)
+        assertEquals("msg-pin-1", pinned[0].id)
+        assertEquals(true, pinned[0].pinned)
+        // Exactly one control message sent to relay
+        assertEquals(1, transport.sent.size)
+        assertEquals("ccdd", transport.sent[0].to)
+    }
+
+    @Test
+    fun pinMessageForBoth_unpin_clearsLocalPinState() = runTest {
+        val msgRepo = FakeMessageRepository()
+        val service = buildService(this, msgRepo = msgRepo)
+
+        msgRepo.insertMessage(
+            MessageEntity(
+                id = "msg-pin-2",
+                conversationId = "conv-1",
+                ciphertext = ByteArray(0),
+                plaintextCache = "World",
+                sent = false,
+                status = MessageStatus.DELIVERED,
+                createdAt = 0L,
+                pinned = true,
+            )
+        )
+
+        service.pinMessageForBoth(
+            messageId = "msg-pin-2",
+            conversationId = "conv-1",
+            recipientPublicKeyHex = "ccdd",
+            pinned = false,
+        )
+
+        val pinned = msgRepo.getPinnedMessages("conv-1")
+        assertEquals(0, pinned.size)
     }
 }

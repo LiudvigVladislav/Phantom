@@ -16,11 +16,8 @@ actual class DatabaseDriverFactory(private val context: Context) {
             context = context,
             name = "phantom.db",
             callback = object : AndroidSqliteDriver.Callback(PhantomDatabase.Schema) {
-                override fun onOpen(db: net.zetetic.database.sqlcipher.SQLiteDatabase) {
+                override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                     super.onOpen(db)
-                    // Reduce PBKDF2 iterations to 1 — DB is already open/keyed at this point,
-                    // so this sets the iteration count for subsequent operations.
-                    // Encryption is still active; kdf_iter only affects key-derivation speed.
                     db.execSQL("PRAGMA kdf_iter = 1;")
                 }
             },

@@ -18,6 +18,12 @@ pub struct RelayConfig {
     pub rate_limit_per_window: u32,
     /// Duration of the rate-limit sliding window in seconds.
     pub rate_limit_window_secs: u64,
+    /// Optional FCM server key (Legacy HTTP API) for sending silent push notifications
+    /// to offline recipients so their device wakes and drains via WebSocket.
+    /// When absent the relay skips FCM delivery entirely — no crash, no error.
+    /// Set via environment variable: RELAY_FCM_SERVER_KEY=<key>
+    /// TODO: migrate to FCM v1 API (OAuth2) before production — Legacy key is deprecated.
+    pub fcm_server_key: Option<String>,
 }
 
 impl RelayConfig {
@@ -41,6 +47,7 @@ impl RelayConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
             secret_token: std::env::var("RELAY_SECRET_TOKEN").ok(),
+            fcm_server_key: std::env::var("RELAY_FCM_SERVER_KEY").ok(),
             rate_limit_per_window: std::env::var("RELAY_RATE_LIMIT_PER_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -64,6 +71,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("secret_token", &self.secret_token.as_ref().map(|_| "[REDACTED]"))
             .field("rate_limit_per_window", &self.rate_limit_per_window)
             .field("rate_limit_window_secs", &self.rate_limit_window_secs)
+            .field("fcm_server_key", &self.fcm_server_key.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }

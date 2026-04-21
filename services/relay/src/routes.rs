@@ -301,6 +301,18 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                 if queue.len() < state.config.max_envelopes_per_recipient {
                     queue.push(envelope);
                 }
+
+                // TODO: Send FCM silent push so the offline device wakes and drains via WebSocket.
+                // Gated on RELAY_FCM_SERVER_KEY being set (state.config.fcm_server_key.is_some()).
+                // Requires: reqwest = { version = "0.11", features = ["json"] } added to
+                //           services/relay/Cargo.toml (and the workspace Cargo.toml if needed).
+                // Once reqwest is present, use the Legacy HTTP API:
+                //   POST https://fcm.googleapis.com/fcm/send
+                //   Authorization: key=<fcm_server_key>
+                //   Body: { "to": "/topics/user_<recipient_prefix>", "priority": "high",
+                //           "data": { "type": "new_message" } }
+                // Migration note: Legacy FCM key is deprecated — switch to FCM v1 (OAuth2)
+                // before production. ADR required before implementing.
             }
 
             // Ack back to sender
@@ -429,7 +441,7 @@ async fn fetch_envelopes(
     let queue = store.entry(recipient).or_default();
     queue.retain(|e| !e.is_expired());
     let envelopes: Vec<Envelope> = queue.clone();
-    Json(FetchResponse { envelopes })
+    Json(FetchResponse { envelopes }).into_response()
 }
 
 async fn ack_envelope(
