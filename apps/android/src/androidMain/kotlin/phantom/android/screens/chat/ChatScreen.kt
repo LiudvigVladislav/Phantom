@@ -830,9 +830,12 @@ private fun MessageBubble(
     var showDeleteDialog by remember { mutableStateOf(false) }
     var showReactionPicker by remember { mutableStateOf(false) }
 
-    // Load reactions for this message; refreshes whenever the message id changes
+    // Load reactions; polls every 2 s so real-time reactions appear without a full DB Flow.
     val reactions by produceState(initialValue = emptyList<ReactionEntry>(), key1 = entity.id) {
-        value = container.reactionRepo.getReactions(entity.id)
+        while (true) {
+            value = container.reactionRepo.getReactions(entity.id)
+            delay(2_000)
+        }
     }
 
     // Parse reply prefix: "> quote\nmessage"
