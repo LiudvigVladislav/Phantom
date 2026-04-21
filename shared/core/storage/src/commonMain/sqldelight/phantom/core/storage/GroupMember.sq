@@ -1,0 +1,21 @@
+CREATE TABLE group_member (
+    group_id TEXT NOT NULL,
+    pubkey_hex TEXT NOT NULL,
+    username TEXT NOT NULL,
+    joined_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, pubkey_hex),
+    FOREIGN KEY(group_id) REFERENCES phantom_group(id) ON DELETE CASCADE
+);
+
+getGroupMembers:
+SELECT * FROM group_member WHERE group_id = ? ORDER BY username ASC;
+
+getMemberCount:
+SELECT COUNT(*) AS count FROM group_member WHERE group_id = ?;
+
+insertMember:
+INSERT OR REPLACE INTO group_member(group_id, pubkey_hex, username, joined_at)
+VALUES (?, ?, ?, ?);
+
+deleteMember:
+DELETE FROM group_member WHERE group_id = ? AND pubkey_hex = ?;

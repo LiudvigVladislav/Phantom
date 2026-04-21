@@ -1,0 +1,28 @@
+CREATE TABLE phantom_group (
+    id TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    my_role TEXT NOT NULL DEFAULT 'member',
+    is_channel INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    last_message_preview TEXT,
+    last_message_at INTEGER,
+    unread_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE group_member (
+    group_id TEXT NOT NULL,
+    pubkey_hex TEXT NOT NULL,
+    username TEXT NOT NULL,
+    joined_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, pubkey_hex)
+);
+
+CREATE TABLE sender_key_store (
+    group_id TEXT NOT NULL,
+    member_pubkey_hex TEXT NOT NULL,
+    chain_key_hex TEXT NOT NULL,
+    iteration INTEGER NOT NULL DEFAULT 0,
+    signing_pub_hex TEXT NOT NULL,
+    signing_priv_hex TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (group_id, member_pubkey_hex)
+);

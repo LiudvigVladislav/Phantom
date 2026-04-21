@@ -1,0 +1,32 @@
+CREATE TABLE phantom_group (
+    id TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    my_role TEXT NOT NULL DEFAULT 'member',
+    is_channel INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    last_message_preview TEXT,
+    last_message_at INTEGER,
+    unread_count INTEGER NOT NULL DEFAULT 0
+);
+
+getGroups:
+SELECT * FROM phantom_group ORDER BY last_message_at DESC;
+
+getChannels:
+SELECT * FROM phantom_group WHERE is_channel = 1 ORDER BY last_message_at DESC;
+
+getGroup:
+SELECT * FROM phantom_group WHERE id = ?;
+
+insertGroup:
+INSERT OR REPLACE INTO phantom_group(id, name, my_role, is_channel, created_at)
+VALUES (?, ?, ?, ?, ?);
+
+deleteGroup:
+DELETE FROM phantom_group WHERE id = ?;
+
+updateGroupLastMessage:
+UPDATE phantom_group SET last_message_preview = :preview, last_message_at = :at, unread_count = unread_count + 1 WHERE id = :id;
+
+resetGroupUnread:
+UPDATE phantom_group SET unread_count = 0 WHERE id = ?;

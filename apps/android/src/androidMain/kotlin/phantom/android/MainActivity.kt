@@ -33,6 +33,9 @@ import phantom.android.screens.profile.ProfileScreen
 import phantom.android.screens.requests.MessageRequestsScreen
 import phantom.android.screens.saved.SavedMessagesScreen
 import phantom.android.screens.archive.ArchiveScreen
+import phantom.android.screens.channel.CreateChannelScreen
+import phantom.android.screens.group.CreateGroupScreen
+import phantom.android.screens.group.GroupChatScreen
 import phantom.android.screens.settings.SettingsScreen
 import phantom.android.ui.theme.*
 
@@ -287,6 +290,23 @@ private fun PhantomApp(
         )
         is Screen.Archive -> ArchiveScreen(
             onBack = { currentScreen = Screen.ChatList },
+        )
+        is Screen.GroupChat -> GroupChatScreen(
+            groupId   = screen.groupId,
+            groupName = screen.groupName,
+            isChannel = screen.isChannel,
+            container = container,
+            onBack    = { currentScreen = Screen.ChatList },
+        )
+        is Screen.CreateGroup -> CreateGroupScreen(
+            container = container,
+            onCreated = { groupId, groupName -> currentScreen = Screen.GroupChat(groupId, groupName, false) },
+            onBack    = { currentScreen = Screen.ChatList },
+        )
+        is Screen.CreateChannel -> CreateChannelScreen(
+            container = container,
+            onCreated = { groupId, groupName -> currentScreen = Screen.GroupChat(groupId, groupName, true) },
+            onBack    = { currentScreen = Screen.ChatList },
         )
     }
 }

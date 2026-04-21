@@ -11,6 +11,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -33,9 +34,13 @@ import org.json.JSONException
 import org.json.JSONObject
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
+import phantom.android.screens.group.GroupInitialsAvatar
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.core.storage.ConversationEntity
+import phantom.core.storage.GroupEntity
+
+private enum class ChatTab { CHATS, GROUPS, CHANNELS }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -50,6 +55,7 @@ fun ChatListScreen(
     val scope = rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
     var conversations by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
+    var groups by remember { mutableStateOf<List<GroupEntity>>(emptyList()) }
     val filtered = remember(conversations, searchQuery) {
         if (searchQuery.isBlank()) conversations
         else conversations.filter { conv ->
@@ -57,10 +63,20 @@ fun ChatListScreen(
             (conv.lastMessagePreview ?: "").contains(searchQuery, ignoreCase = true)
         }
     }
+    val filteredGroups = remember(groups, searchQuery) {
+        if (searchQuery.isBlank()) groups.filter { !it.isChannel }
+        else groups.filter { !it.isChannel && it.name.contains(searchQuery, ignoreCase = true) }
+    }
+    val filteredChannels = remember(groups, searchQuery) {
+        if (searchQuery.isBlank()) groups.filter { it.isChannel }
+        else groups.filter { it.isChannel && it.name.contains(searchQuery, ignoreCase = true) }
+    }
+
     var requestCount by remember { mutableStateOf(0) }
     var showAddDialog by remember { mutableStateOf(false) }
     var prefillContactString by remember { mutableStateOf("") }
     var userName by remember { mutableStateOf("") }
+    var activeTab by remember { mutableStateOf(ChatTab.CHATS) }
 
     LaunchedEffect(Unit) {
         userName = container.identityRepo.loadIdentity()?.username ?: ""
@@ -77,12 +93,20 @@ fun ChatListScreen(
     suspend fun reload() {
         conversations = container.conversationRepo.getActiveConversations()
         requestCount = container.conversationRepo.getMessageRequests().size
+        // Load groups from groupRepo — fallback to empty list if API not yet available
+        groups = runCatching {
+            container.groupRepo.getGroups()
+        }.getOrElse { emptyList() }
     }
 
     LaunchedEffect(Unit) { reload() }
 
     LaunchedEffect(container.messagingService) {
         container.messagingService?.incomingMessages?.collect { reload() }
+    }
+
+    LaunchedEffect(container.groupMessagingService) {
+        container.groupMessagingService?.groupMessageFlow?.collect { _ -> reload() }
     }
 
     Scaffold(
@@ -95,158 +119,100 @@ fun ChatListScreen(
                 onScanQr = onScanQr,
             )
         },
+        floatingActionButton = {
+            // FAB only on Groups and Channels tabs
+            when (activeTab) {
+                ChatTab.GROUPS -> {
+                    FloatingActionButton(
+                        onClick = { onNavigate(Screen.CreateGroup) },
+                        containerColor = CyanAccent,
+                        contentColor = BgDeep,
+                        shape = CircleShape,
+                        modifier = Modifier.padding(bottom = 72.dp),
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = "New Group")
+                    }
+                }
+                ChatTab.CHANNELS -> {
+                    FloatingActionButton(
+                        onClick = { onNavigate(Screen.CreateChannel) },
+                        containerColor = CyanAccent,
+                        contentColor = BgDeep,
+                        shape = CircleShape,
+                        modifier = Modifier.padding(bottom = 72.dp),
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = "New Channel")
+                    }
+                }
+                else -> {}
+            }
+        },
     ) { padding ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 110.dp),
-            ) {
-                // ── Search pill ──────────────────────────────
-                item {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp)
-                            .padding(top = 12.dp, bottom = 4.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Surface)
-                            .border(1.dp, Color.White.copy(alpha = 0.04f), RoundedCornerShape(10.dp))
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                    ) {
-                        BasicTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            singleLine = true,
-                            textStyle = androidx.compose.ui.text.TextStyle(
-                                color = TextPrimary,
-                                fontSize = 13.sp,
-                            ),
-                            cursorBrush = androidx.compose.ui.graphics.SolidColor(CyanAccent),
-                            modifier = Modifier.fillMaxWidth(),
-                            decorationBox = { inner ->
-                                if (searchQuery.isEmpty()) {
-                                    Text(
-                                        text = "Search messages, contacts",
-                                        color = TextDim,
-                                        fontSize = 13.sp,
-                                    )
-                                }
-                                inner()
+            Column(modifier = Modifier.fillMaxSize()) {
+                // ── Tab row ─────────────────────────────────────────────────────
+                TabRow(
+                    selectedTabIndex = activeTab.ordinal,
+                    containerColor = Surface,
+                    contentColor = CyanAccent,
+                    indicator = { tabPositions ->
+                        val pos = tabPositions[activeTab.ordinal]
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .wrapContentSize(Alignment.BottomStart)
+                                .offset(x = pos.left)
+                                .width(pos.width)
+                                .height(2.dp)
+                                .background(CyanAccent, RoundedCornerShape(topStart = 2.dp, topEnd = 2.dp)),
+                        )
+                    },
+                    divider = { HorizontalDivider(color = Color.White.copy(alpha = 0.05f)) },
+                ) {
+                    ChatTab.entries.forEach { tab ->
+                        Tab(
+                            selected = activeTab == tab,
+                            onClick = { activeTab = tab },
+                            text = {
+                                Text(
+                                    text = tab.name.lowercase().replaceFirstChar { it.uppercase() },
+                                    fontSize = 13.sp,
+                                    fontWeight = if (activeTab == tab) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (activeTab == tab) CyanAccent else TextDim,
+                                )
                             },
                         )
                     }
                 }
 
-                // ── PINNED section ───────────────────────────
-                item { SectionLabel(text = "Pinned", showPin = true) }
-
-                item(key = "__notes__") {
-                    NotesRow(onClick = { onNavigate(Screen.SavedMessages) })
-                }
-
-                item(key = "__archive__") {
-                    ArchiveRow(onClick = { onNavigate(Screen.Archive) })
-                }
-
-                // ── Message requests banner ──────────────────
-                if (requestCount > 0) {
-                    item {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 6.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(CyanAccent.copy(alpha = 0.07f))
-                                .border(1.dp, CyanAccent.copy(alpha = 0.18f), RoundedCornerShape(12.dp))
-                                .clickable { onNavigate(Screen.MessageRequests) }
-                                .padding(horizontal = 14.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(CyanAccent.copy(alpha = 0.15f)),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Canvas(modifier = Modifier.size(18.dp)) { drawQrFinderDots(CyanAccent) }
-                            }
-                            Spacer(Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Message requests", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                                Text("$requestCount new from unverified peers", color = TextDim, fontSize = 12.sp)
-                            }
-                            Box(
-                                modifier = Modifier
-                                    .clip(CircleShape)
-                                    .background(CyanAccent)
-                                    .padding(horizontal = 7.dp, vertical = 3.dp),
-                            ) {
-                                Text(
-                                    text = if (requestCount > 99) "99+" else requestCount.toString(),
-                                    color = BgDeep,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // ── CHATS section ────────────────────────────
-                item { SectionLabel(text = "Chats") }
-
-                items(filtered, key = { it.id }) { conv ->
-                    ChatRow(
-                        conv = conv,
-                        onClick = { onNavigate(Screen.Chat(conv.id, conv.theirUsername)) },
+                when (activeTab) {
+                    ChatTab.CHATS -> ChatsTab(
+                        searchQuery = searchQuery,
+                        onSearchChange = { searchQuery = it },
+                        filtered = filtered,
+                        conversations = conversations,
+                        requestCount = requestCount,
+                        onNavigate = onNavigate,
+                        onShowAddDialog = { showAddDialog = true },
+                        scope = scope,
+                        container = container,
                     )
-                }
-
-                if (filtered.isEmpty() && searchQuery.isNotBlank()) {
-                    item {
-                        Box(
-                            modifier = Modifier
-                                .fillParentMaxSize()
-                                .padding(32.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = "No results for \"$searchQuery\"",
-                                color = TextDim,
-                                fontSize = 13.sp,
-                            )
-                        }
-                    }
-                }
-
-                if (conversations.isEmpty() && requestCount == 0 && searchQuery.isBlank()) {
-                    item {
-                        Box(
-                            modifier = Modifier
-                                .fillParentMaxSize()
-                                .padding(32.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text("No conversations yet", color = TextDim, fontSize = 15.sp)
-                                Spacer(Modifier.height(8.dp))
-                                Text(
-                                    text = "Tap the compose button to add a contact",
-                                    color = TextDim.copy(alpha = 0.6f),
-                                    fontSize = 13.sp,
-                                )
-                            }
-                        }
-                    }
+                    ChatTab.GROUPS -> GroupsTab(
+                        groups = filteredGroups,
+                        onNavigate = onNavigate,
+                    )
+                    ChatTab.CHANNELS -> ChannelsTab(
+                        channels = filteredChannels,
+                        onNavigate = onNavigate,
+                    )
                 }
             }
 
-            // ── Floating bottom nav ──────────────────────────
+            // ── Floating bottom nav ──────────────────────────────────────────
             BottomNavPill(
                 activeTab = NavTab.CHATS,
                 onTabSelected = { tab ->
@@ -275,6 +241,301 @@ fun ChatListScreen(
         )
     }
 }
+
+// ── Chats tab ─────────────────────────────────────────────────────────────────
+
+@Composable
+private fun ChatsTab(
+    searchQuery: String,
+    onSearchChange: (String) -> Unit,
+    filtered: List<ConversationEntity>,
+    conversations: List<ConversationEntity>,
+    requestCount: Int,
+    onNavigate: (Screen) -> Unit,
+    onShowAddDialog: () -> Unit,
+    scope: kotlinx.coroutines.CoroutineScope,
+    container: AppContainer,
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 110.dp),
+    ) {
+        // Search pill
+        item {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .padding(top = 12.dp, bottom = 4.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Surface)
+                    .border(1.dp, Color.White.copy(alpha = 0.04f), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+            ) {
+                BasicTextField(
+                    value = searchQuery,
+                    onValueChange = onSearchChange,
+                    singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        color = TextPrimary,
+                        fontSize = 13.sp,
+                    ),
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(CyanAccent),
+                    modifier = Modifier.fillMaxWidth(),
+                    decorationBox = { inner ->
+                        if (searchQuery.isEmpty()) {
+                            Text("Search messages, contacts", color = TextDim, fontSize = 13.sp)
+                        }
+                        inner()
+                    },
+                )
+            }
+        }
+
+        item { SectionLabel(text = "Pinned", showPin = true) }
+
+        item(key = "__notes__") {
+            NotesRow(onClick = { onNavigate(Screen.SavedMessages) })
+        }
+
+        item(key = "__archive__") {
+            ArchiveRow(onClick = { onNavigate(Screen.Archive) })
+        }
+
+        if (requestCount > 0) {
+            item {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(CyanAccent.copy(alpha = 0.07f))
+                        .border(1.dp, CyanAccent.copy(alpha = 0.18f), RoundedCornerShape(12.dp))
+                        .clickable { onNavigate(Screen.MessageRequests) }
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(CyanAccent.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Canvas(modifier = Modifier.size(18.dp)) { drawQrFinderDots(CyanAccent) }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Message requests", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text("$requestCount new from unverified peers", color = TextDim, fontSize = 12.sp)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(CyanAccent)
+                            .padding(horizontal = 7.dp, vertical = 3.dp),
+                    ) {
+                        Text(
+                            text = if (requestCount > 99) "99+" else requestCount.toString(),
+                            color = BgDeep,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            }
+        }
+
+        item { SectionLabel(text = "Chats") }
+
+        items(filtered, key = { it.id }) { conv ->
+            ChatRow(
+                conv = conv,
+                onClick = { onNavigate(Screen.Chat(conv.id, conv.theirUsername)) },
+            )
+        }
+
+        if (filtered.isEmpty() && searchQuery.isNotBlank()) {
+            item {
+                Box(
+                    modifier = Modifier
+                        .fillParentMaxSize()
+                        .padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("No results for \"$searchQuery\"", color = TextDim, fontSize = 13.sp)
+                }
+            }
+        }
+
+        if (conversations.isEmpty() && requestCount == 0 && searchQuery.isBlank()) {
+            item {
+                Box(
+                    modifier = Modifier
+                        .fillParentMaxSize()
+                        .padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("No conversations yet", color = TextDim, fontSize = 15.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = "Tap the compose button to add a contact",
+                            color = TextDim.copy(alpha = 0.6f),
+                            fontSize = 13.sp,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Groups tab ────────────────────────────────────────────────────────────────
+
+@Composable
+private fun GroupsTab(groups: List<GroupEntity>, onNavigate: (Screen) -> Unit) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 110.dp),
+    ) {
+        if (groups.isEmpty()) {
+            item {
+                Box(
+                    modifier = Modifier.fillParentMaxSize().padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("No groups yet", color = TextDim, fontSize = 15.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = "Tap + to create a new group",
+                            color = TextDim.copy(alpha = 0.6f),
+                            fontSize = 13.sp,
+                        )
+                    }
+                }
+            }
+        } else {
+            item { SectionLabel(text = "Groups") }
+            items(groups, key = { it.id }) { group ->
+                GroupRow(
+                    group = group,
+                    onClick = { onNavigate(Screen.GroupChat(group.id, group.name, false)) },
+                )
+            }
+        }
+    }
+}
+
+// ── Channels tab ──────────────────────────────────────────────────────────────
+
+@Composable
+private fun ChannelsTab(channels: List<GroupEntity>, onNavigate: (Screen) -> Unit) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 110.dp),
+    ) {
+        if (channels.isEmpty()) {
+            item {
+                Box(
+                    modifier = Modifier.fillParentMaxSize().padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("No channels yet", color = TextDim, fontSize = 15.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = "Tap + to create a new channel",
+                            color = TextDim.copy(alpha = 0.6f),
+                            fontSize = 13.sp,
+                        )
+                    }
+                }
+            }
+        } else {
+            item { SectionLabel(text = "Channels") }
+            items(channels, key = { it.id }) { channel ->
+                GroupRow(
+                    group = channel,
+                    onClick = { onNavigate(Screen.GroupChat(channel.id, channel.name, true)) },
+                )
+            }
+        }
+    }
+}
+
+// ── Group/Channel row ─────────────────────────────────────────────────────────
+
+@Composable
+private fun GroupRow(group: GroupEntity, onClick: () -> Unit) {
+    val isUnread = group.unreadCount > 0
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        GroupInitialsAvatar(name = group.name, size = 46.dp)
+        Spacer(Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = group.name,
+                    color = TextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = if (isUnread) FontWeight.SemiBold else FontWeight.Normal,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.width(8.dp))
+                val timeStr = group.lastMessageAt?.let { formatChatTime(it) } ?: ""
+                Text(
+                    text = timeStr,
+                    color = if (isUnread) CyanAccent else TextDim,
+                    fontSize = 11.sp,
+                )
+            }
+            Spacer(Modifier.height(3.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val subtitle = buildString {
+                    if (!group.lastMessagePreview.isNullOrBlank()) {
+                        append(group.lastMessagePreview)
+                    }
+                }
+                Text(
+                    text = subtitle.ifBlank { if (group.isChannel) "Channel" else "Group" },
+                    color = TextDim,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (isUnread) {
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(CyanAccent)
+                            .padding(horizontal = 7.dp, vertical = 3.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = if (group.unreadCount > 99) "99+" else group.unreadCount.toString(),
+                            color = BgDeep,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Section label ─────────────────────────────────────────────────────────────
 
 @Composable
 private fun SectionLabel(text: String, showPin: Boolean = false) {
@@ -312,6 +573,8 @@ private fun SectionLabel(text: String, showPin: Boolean = false) {
     }
 }
 
+// ── Notes row ─────────────────────────────────────────────────────────────────
+
 @Composable
 private fun NotesRow(onClick: () -> Unit) {
     Row(
@@ -329,7 +592,6 @@ private fun NotesRow(onClick: () -> Unit) {
                 .border(1.dp, CyanAccent.copy(alpha = 0.28f), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            // Bookmark icon
             Canvas(modifier = Modifier.size(22.dp)) {
                 val w = size.width; val h = size.height
                 val path = Path().apply {
@@ -368,6 +630,8 @@ private fun NotesRow(onClick: () -> Unit) {
     }
 }
 
+// ── Archive row ───────────────────────────────────────────────────────────────
+
 @Composable
 private fun ArchiveRow(onClick: () -> Unit = {}) {
     Row(
@@ -385,7 +649,6 @@ private fun ArchiveRow(onClick: () -> Unit = {}) {
                 .border(1.dp, Color.White.copy(alpha = 0.06f), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            // Folder icon (Canvas)
             Canvas(modifier = Modifier.size(20.dp)) {
                 val w = size.width; val h = size.height
                 val stroke = Stroke(width = 1.6.dp.toPx())
@@ -419,12 +682,13 @@ private fun ArchiveRow(onClick: () -> Unit = {}) {
     }
 }
 
+// ── Chat row ──────────────────────────────────────────────────────────────────
+
 @Composable
 private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
     val isUnread = conv.unreadCount > 0
     val context = LocalContext.current
 
-    // Read contact real name from persisted profile card
     val contactDisplayName = remember(conv.id) {
         val raw = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
             .getString("contact_profile_${conv.id}", null)
@@ -476,7 +740,6 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
                     fontWeight = if (isUnread) FontWeight.Medium else FontWeight.Normal,
                 )
             }
-            // Real name subtitle — shown only when profile card has been received
             if (contactDisplayName != null) {
                 Text(
                     text = contactDisplayName,
@@ -517,6 +780,8 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
         }
     }
 }
+
+// ── Draw helpers ──────────────────────────────────────────────────────────────
 
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawQrFinderDots(color: Color) {
     val s = size

@@ -5,6 +5,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import org.json.JSONException
 import org.json.JSONObject
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.core.Animatable
@@ -97,6 +100,44 @@ fun ChatScreen(
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     var showEmojiPanel by remember { mutableStateOf(false) }
+
+    // Voice recording state
+    var isRecording by remember { mutableStateOf(false) }
+    var recordingDurationMs by remember { mutableStateOf(0L) }
+    var audioFile by remember { mutableStateOf<java.io.File?>(null) }
+    var mediaRecorder by remember { mutableStateOf<android.media.MediaRecorder?>(null) }
+
+    // Release recorder on screen dispose
+    DisposableEffect(Unit) {
+        onDispose {
+            mediaRecorder?.stop()
+            mediaRecorder?.release()
+            mediaRecorder = null
+        }
+    }
+
+    // RECORD_AUDIO permission launcher
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            val result = startChatRecording(context)
+            audioFile = result.first
+            mediaRecorder = result.second
+            isRecording = true
+        }
+    }
+
+    // Recording duration counter
+    LaunchedEffect(isRecording) {
+        if (isRecording) {
+            recordingDurationMs = 0L
+            while (isRecording) {
+                delay(100)
+                recordingDurationMs += 100
+            }
+        }
+    }
 
     var showMenu by remember { mutableStateOf(false) }
     var showBlockDialog by remember { mutableStateOf(false) }
@@ -486,6 +527,51 @@ fun ChatScreen(
                     onEmojiToggle = { showEmojiPanel = !showEmojiPanel },
                     emojiPanelOpen = showEmojiPanel,
                     isEditing = editingMessage != null,
+                    isRecording = isRecording,
+                    recordingDurationMs = recordingDurationMs,
+                    onMicClick = {
+                        if (isRecording) {
+                            // Stop recording and send audio
+                            mediaRecorder?.stop()
+                            mediaRecorder?.release()
+                            mediaRecorder = null
+                            isRecording = false
+                            val file = audioFile
+                            if (file != null && file.exists()) {
+                                scope.launch {
+                                    val bytes = file.readBytes()
+                                    val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                                    val audioPayload = "[AUDIO:$base64]"
+                                    val conversation = container.conversationRepo.getConversation(conversationId)
+                                    if (conversation != null) {
+                                        container.messagingService?.sendMessage(
+                                            OutgoingMessage(
+                                                id = com.benasher44.uuid.uuid4().toString(),
+                                                conversationId = conversationId,
+                                                recipientPublicKeyHex = conversation.theirPublicKeyHex,
+                                                text = audioPayload,
+                                            )
+                                        )
+                                        reloadMessages()
+                                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                    }
+                                }
+                            }
+                            audioFile = null
+                        } else {
+                            val hasPermission = ContextCompat.checkSelfPermission(
+                                context, android.Manifest.permission.RECORD_AUDIO
+                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                            if (hasPermission) {
+                                val result = startChatRecording(context)
+                                audioFile = result.first
+                                mediaRecorder = result.second
+                                isRecording = true
+                            } else {
+                                permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                            }
+                        }
+                    },
                     onSend = {
                         val text = inputText.trim()
                         if (text.isEmpty()) return@InputBar
@@ -1110,6 +1196,18 @@ private fun MessageBubble(
                     Spacer(Modifier.height(6.dp))
                 }
 
+                // Audio bubble — detected by [AUDIO:...] prefix in plaintext cache
+                val isAudio = rawText.startsWith("[AUDIO:")
+                if (isAudio) {
+                    val base64Data = rawText.removePrefix("[AUDIO:").removeSuffix("]")
+                    AudioBubble(
+                        base64Data = base64Data,
+                        isSent = isSent,
+                        timeStr = timeStr,
+                        status = entity.status,
+                        context = context,
+                    )
+                } else {
                 // Text + time in a Box so time overlays bottom-right corner
                 Box {
                     Text(
@@ -1133,6 +1231,7 @@ private fun MessageBubble(
                         if (isSent) StatusIcon(status = entity.status)
                     }
                 }
+                } // end audio/text branch
 
                 // Link preview — shown for messages that contain a URL
                 val urlInMsg = remember(entity.id) { extractUrl(rawText) }
@@ -1395,6 +1494,143 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCheckmark(
     drawLine(color = color, start = Offset(x1, y1), end = Offset(x2, y2), strokeWidth = sw, cap = StrokeCap.Round)
 }
 
+// ── Audio message bubble ──────────────────────────────────────────────────────
+
+@Composable
+private fun AudioBubble(
+    base64Data: String,
+    isSent: Boolean,
+    timeStr: String,
+    status: MessageStatus,
+    context: android.content.Context,
+) {
+    val scope = rememberCoroutineScope()
+    var isPlaying by remember { mutableStateOf(false) }
+    var progress by remember { mutableStateOf(0f) }
+    var mediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
+    var durationMs by remember { mutableStateOf(0) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            mediaPlayer?.release()
+            mediaPlayer = null
+        }
+    }
+
+    fun formatDur(ms: Int): String {
+        val s = ms / 1000
+        return "%d:%02d".format(s / 60, s % 60)
+    }
+
+    Row(
+        modifier = Modifier.width(200.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        // Play/pause button
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(50))
+                .background(
+                    if (isSent) Color.White.copy(alpha = 0.2f)
+                    else CyanAccent.copy(alpha = 0.15f)
+                )
+                .clickable {
+                    if (isPlaying) {
+                        mediaPlayer?.pause()
+                        isPlaying = false
+                    } else {
+                        if (mediaPlayer == null) {
+                            try {
+                                val bytes = android.util.Base64.decode(base64Data, android.util.Base64.NO_WRAP)
+                                val file = java.io.File(context.cacheDir, "play_${System.currentTimeMillis()}.3gp")
+                                file.writeBytes(bytes)
+                                val mp = android.media.MediaPlayer().apply {
+                                    setDataSource(file.absolutePath)
+                                    prepare()
+                                    setOnCompletionListener {
+                                        isPlaying = false
+                                        progress = 0f
+                                    }
+                                }
+                                mediaPlayer = mp
+                                durationMs = mp.duration
+                                mp.start()
+                            } catch (_: Exception) {}
+                        } else {
+                            mediaPlayer?.start()
+                        }
+                        isPlaying = true
+                        scope.launch {
+                            while (isPlaying) {
+                                val mp = mediaPlayer ?: break
+                                progress = if (mp.duration > 0) mp.currentPosition / mp.duration.toFloat() else 0f
+                                delay(200)
+                            }
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            if (isPlaying) {
+                // Pause icon
+                Canvas(modifier = Modifier.size(16.dp)) {
+                    val col = if (isSent) BgDeep else CyanAccent
+                    val sw = 2.5.dp.toPx()
+                    drawLine(col, Offset(size.width * 0.3f, size.height * 0.2f), Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
+                    drawLine(col, Offset(size.width * 0.7f, size.height * 0.2f), Offset(size.width * 0.7f, size.height * 0.8f), sw, StrokeCap.Round)
+                }
+            } else {
+                // Play triangle
+                Canvas(modifier = Modifier.size(16.dp)) {
+                    val col = if (isSent) BgDeep else CyanAccent
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(size.width * 0.25f, size.height * 0.15f)
+                        lineTo(size.width * 0.85f, size.height * 0.5f)
+                        lineTo(size.width * 0.25f, size.height * 0.85f)
+                        close()
+                    }
+                    drawPath(path, color = col)
+                }
+            }
+        }
+
+        // Waveform progress + time
+        Column(modifier = Modifier.weight(1f)) {
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.fillMaxWidth().height(3.dp),
+                color = if (isSent) BgDeep else CyanAccent,
+                trackColor = if (isSent) BgDeep.copy(alpha = 0.3f) else Surface,
+            )
+            Spacer(Modifier.height(5.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = formatDur(durationMs),
+                    color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
+                    fontSize = 10.sp,
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    Text(
+                        text = timeStr,
+                        color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
+                        fontSize = 10.sp,
+                    )
+                    if (isSent) StatusIcon(status = status)
+                }
+            }
+        }
+    }
+}
+
 // ── Input bar ─────────────────────────────────────────────────────────────────
 
 @Composable
@@ -1404,9 +1640,13 @@ private fun InputBar(
     onEmojiToggle: () -> Unit,
     emojiPanelOpen: Boolean,
     isEditing: Boolean = false,
+    isRecording: Boolean = false,
+    recordingDurationMs: Long = 0L,
+    onMicClick: () -> Unit = {},
     onSend: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
+    val recordingSeconds = recordingDurationMs / 1000
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1425,59 +1665,84 @@ private fun InputBar(
                 .padding(bottom = 4.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            // Left: emoji toggle (tap) + attachment look
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .clickable(onClick = onEmojiToggle),
-                contentAlignment = Alignment.Center,
-            ) {
-                // Paperclip icon (Canvas)
-                Canvas(modifier = Modifier.size(22.dp)) {
-                    val c = TextDim
-                    val sw = 1.6.dp.toPx()
-                    val st = Stroke(width = sw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
-                    val path = androidx.compose.ui.graphics.Path().apply {
-                        // simplified paperclip: curved line
-                        val cx = size.width * 0.55f
-                        val cy = size.height * 0.5f
-                        val r = size.width * 0.28f
-                        moveTo(cx - r * 0.5f, cy - r * 1.5f)
-                        cubicTo(cx + r * 1.2f, cy - r * 1.5f, cx + r * 1.2f, cy + r * 1.0f, cx - r * 0.1f, cy + r * 1.0f)
-                        cubicTo(cx - r * 1.1f, cy + r * 1.0f, cx - r * 1.1f, cy - r * 0.6f, cx - r * 0.1f, cy - r * 0.6f)
-                        cubicTo(cx + r * 0.6f, cy - r * 0.6f, cx + r * 0.6f, cy + r * 0.3f, cx - r * 0.1f, cy + r * 0.3f)
+            // Left: emoji toggle / hidden during recording
+            if (!isRecording) {
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .clickable(onClick = onEmojiToggle),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    // Paperclip icon (Canvas)
+                    Canvas(modifier = Modifier.size(22.dp)) {
+                        val c = TextDim
+                        val sw = 1.6.dp.toPx()
+                        val st = Stroke(width = sw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+                        val path = androidx.compose.ui.graphics.Path().apply {
+                            val cx = size.width * 0.55f
+                            val cy = size.height * 0.5f
+                            val r = size.width * 0.28f
+                            moveTo(cx - r * 0.5f, cy - r * 1.5f)
+                            cubicTo(cx + r * 1.2f, cy - r * 1.5f, cx + r * 1.2f, cy + r * 1.0f, cx - r * 0.1f, cy + r * 1.0f)
+                            cubicTo(cx - r * 1.1f, cy + r * 1.0f, cx - r * 1.1f, cy - r * 0.6f, cx - r * 0.1f, cy - r * 0.6f)
+                            cubicTo(cx + r * 0.6f, cy - r * 0.6f, cx + r * 0.6f, cy + r * 0.3f, cx - r * 0.1f, cy + r * 0.3f)
+                        }
+                        drawPath(path, color = c, style = st)
                     }
-                    drawPath(path, color = c, style = st)
                 }
+                Spacer(Modifier.width(6.dp))
             }
 
-            Spacer(Modifier.width(6.dp))
-
-            // Center: pill text field
-            OutlinedTextField(
-                value = text,
-                onValueChange = onTextChange,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Message…", color = TextDim, fontSize = 14.sp) },
-                singleLine = false,
-                maxLines = 5,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = TextPrimary,
-                    unfocusedTextColor = TextPrimary,
-                    focusedBorderColor = Color.Transparent,
-                    unfocusedBorderColor = Color.Transparent,
-                    cursorColor = CyanAccent,
-                    focusedContainerColor = Surface2,
-                    unfocusedContainerColor = Surface2,
-                ),
-                shape = RoundedCornerShape(18.dp),
-            )
+            // Center: text field or recording indicator
+            if (isRecording) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(Surface2)
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Canvas(modifier = Modifier.size(10.dp)) {
+                            drawCircle(color = Danger)
+                        }
+                        Text(
+                            text = "Recording %d:%02d".format(recordingSeconds / 60, recordingSeconds % 60),
+                            color = TextPrimary,
+                            fontSize = 14.sp,
+                        )
+                    }
+                }
+            } else {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = onTextChange,
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Message…", color = TextDim, fontSize = 14.sp) },
+                    singleLine = false,
+                    maxLines = 5,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary,
+                        focusedBorderColor = Color.Transparent,
+                        unfocusedBorderColor = Color.Transparent,
+                        cursorColor = CyanAccent,
+                        focusedContainerColor = Surface2,
+                        unfocusedContainerColor = Surface2,
+                    ),
+                    shape = RoundedCornerShape(18.dp),
+                )
+            }
 
             Spacer(Modifier.width(8.dp))
 
-            // Right: mic (empty) or send button (has text)
-            if (text.isNotBlank() || isEditing) {
+            // Right: send button (text/edit) or mic button (empty/recording)
+            if ((text.isNotBlank() || isEditing) && !isRecording) {
                 Box(
                     modifier = Modifier
                         .size(44.dp)
@@ -1508,38 +1773,63 @@ private fun InputBar(
                     }
                 }
             } else {
-                // Mic icon
+                // Mic button — tap to start/stop recording
                 Box(
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(44.dp)
                         .clip(CircleShape)
-                        .clickable { },
+                        .background(if (isRecording) Danger else Surface2)
+                        .clickable(onClick = onMicClick),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Canvas(modifier = Modifier.size(22.dp)) {
-                        val c = TextDim
-                        val sw = 1.6.dp.toPx()
-                        val st = Stroke(width = sw, cap = StrokeCap.Round)
-                        // mic body (rect with rounded top)
-                        drawRoundRect(
-                            color = c, style = st,
-                            topLeft = Offset(size.width * 0.33f, size.height * 0.08f),
-                            size = Size(size.width * 0.34f, size.height * 0.52f),
-                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width * 0.17f),
-                        )
-                        // arc below mic
-                        val path = androidx.compose.ui.graphics.Path().apply {
-                            moveTo(size.width * 0.18f, size.height * 0.48f)
-                            cubicTo(size.width * 0.18f, size.height * 0.82f, size.width * 0.82f, size.height * 0.82f, size.width * 0.82f, size.height * 0.48f)
+                    if (isRecording) {
+                        // Stop icon (square)
+                        Canvas(modifier = Modifier.size(14.dp)) {
+                            drawRoundRect(
+                                color = Color.White,
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(3.dp.toPx()),
+                            )
                         }
-                        drawPath(path, color = c, style = st)
-                        // stem line
-                        drawLine(c, Offset(size.width * 0.5f, size.height * 0.78f), Offset(size.width * 0.5f, size.height * 0.95f), sw, StrokeCap.Round)
+                    } else {
+                        // Mic icon (Canvas)
+                        Canvas(modifier = Modifier.size(22.dp)) {
+                            val c = TextDim
+                            val sw = 1.6.dp.toPx()
+                            val st = Stroke(width = sw, cap = StrokeCap.Round)
+                            drawRoundRect(
+                                color = c, style = st,
+                                topLeft = Offset(size.width * 0.33f, size.height * 0.08f),
+                                size = Size(size.width * 0.34f, size.height * 0.52f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width * 0.17f),
+                            )
+                            val path = androidx.compose.ui.graphics.Path().apply {
+                                moveTo(size.width * 0.18f, size.height * 0.48f)
+                                cubicTo(size.width * 0.18f, size.height * 0.82f, size.width * 0.82f, size.height * 0.82f, size.width * 0.82f, size.height * 0.48f)
+                            }
+                            drawPath(path, color = c, style = st)
+                            drawLine(c, Offset(size.width * 0.5f, size.height * 0.78f), Offset(size.width * 0.5f, size.height * 0.95f), sw, StrokeCap.Round)
+                        }
                     }
                 }
             }
         }
     }
+}
+
+// ── Recording helper ──────────────────────────────────────────────────────────
+
+private fun startChatRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder> {
+    val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.3gp")
+    @Suppress("DEPRECATION")
+    val recorder = android.media.MediaRecorder().apply {
+        setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
+        setOutputFormat(android.media.MediaRecorder.OutputFormat.THREE_GPP)
+        setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AMR_NB)
+        setOutputFile(file.absolutePath)
+        prepare()
+        start()
+    }
+    return file to recorder
 }
 
 // ── Dialogs ───────────────────────────────────────────────────────────────────

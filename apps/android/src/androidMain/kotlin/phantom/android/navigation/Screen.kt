@@ -10,6 +10,9 @@ sealed class Screen {
     object QrScan : Screen()
     object SavedMessages : Screen()
     object Archive : Screen()
+    object CreateGroup : Screen()
+    object CreateChannel : Screen()
     data class Chat(val conversationId: String, val theirUsername: String) : Screen()
     data class ContactProfile(val conversationId: String, val theirUsername: String) : Screen()
+    data class GroupChat(val groupId: String, val groupName: String, val isChannel: Boolean) : Screen()
 }

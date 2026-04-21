@@ -15,16 +15,20 @@ import phantom.core.crypto.LibsodiumX3DH
 import phantom.core.identity.IdentityManager
 import phantom.core.identity.IdentityRecord
 import phantom.core.identity.IdentityRepository
+import phantom.core.messaging.DefaultGroupMessagingService
 import phantom.core.messaging.DefaultMessagingService
+import phantom.core.messaging.GroupMessagingService
 import phantom.core.messaging.MessagingService
 import phantom.core.messaging.SessionManager
 import phantom.core.storage.DatabaseDriverFactory
 import phantom.core.storage.PhantomDatabaseHolder
 import phantom.core.storage.SqlDelightConversationRepository
+import phantom.core.storage.SqlDelightGroupRepository
 import phantom.core.storage.SqlDelightIdentityRepository
 import phantom.core.storage.SqlDelightMessageRepository
 import phantom.core.storage.SqlDelightRatchetStateRepository
 import phantom.core.storage.SqlDelightReactionRepository
+import phantom.core.storage.SqlDelightSenderKeyRepository
 import phantom.core.transport.KtorRelayTransport
 import phantom.core.transport.createHttpClient
 
@@ -44,9 +48,11 @@ class AppContainer(private val context: Context) {
         SqlDelightIdentityRepository(dbHolder.database)
     )
     val conversationRepo = SqlDelightConversationRepository(dbHolder.database)
-    val messageRepo    = SqlDelightMessageRepository(dbHolder.database)
+    val messageRepo      = SqlDelightMessageRepository(dbHolder.database)
     private val ratchetRepo = SqlDelightRatchetStateRepository(dbHolder.database)
-    val reactionRepo   = SqlDelightReactionRepository(dbHolder.database)
+    val reactionRepo     = SqlDelightReactionRepository(dbHolder.database)
+    val groupRepo        = SqlDelightGroupRepository(dbHolder.database)
+    val senderKeyRepo    = SqlDelightSenderKeyRepository(dbHolder.database)
 
     // Starts immediately — deletes expired messages while the app is alive.
     private val disappearingMessageScheduler = DisappearingMessageScheduler(messageRepo, appScope)
@@ -68,6 +74,10 @@ class AppContainer(private val context: Context) {
     // ── Messaging (initialised after identity is loaded) ──────────────────────
     // Nullable until onboarding completes and we have a real identity.
     var messagingService: MessagingService? = null
+        private set
+
+    // Initialised together with messagingService — requires identity for myPubKeyHex.
+    var groupMessagingService: GroupMessagingService? = null
         private set
 
     // ── FCM token (read-only reference — registration is a TODO) ─────────────
@@ -104,6 +114,21 @@ class AppContainer(private val context: Context) {
         service.onNewMessageNotification = { convId, sender, preview, senderPubKeyHex ->
             PhantomNotificationManager.showMessageNotification(context, convId, sender, preview, senderPubKeyHex)
         }
+
+        // Wire group messaging delegate so DefaultMessagingService can route
+        // group-type payloads to DefaultGroupMessagingService after decryption.
+        val groupService = DefaultGroupMessagingService(
+            myPubKeyHex = identity.publicKeyHex,
+            myUsername = identity.username,
+            groupRepo = groupRepo,
+            senderKeyRepo = senderKeyRepo,
+            messageRepo = messageRepo,
+            transport = transport,
+            json = json,
+        )
+        service.groupMessagingService = groupService
+        groupMessagingService = groupService
+
         messagingService = service
     }
 

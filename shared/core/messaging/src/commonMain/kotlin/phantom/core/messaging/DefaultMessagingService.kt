@@ -60,6 +60,13 @@ class DefaultMessagingService(
      */
     @Volatile var onNewMessageNotification: ((conversationId: String, senderName: String, preview: String, senderPublicKeyHex: String) -> Unit)? = null
 
+    /**
+     * Optional group messaging delegate. When set, any incoming payload whose type is in
+     * [MessagePayload.GROUP_TYPES] is forwarded here instead of being processed as a 1:1
+     * message. Set by AppContainer after identity is loaded.
+     */
+    @Volatile var groupMessagingService: GroupMessagingService? = null
+
     override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> = runCatching {
         val state = sessionManager.getOrCreateSession(
             conversationId = message.conversationId,
@@ -192,6 +199,12 @@ class DefaultMessagingService(
             sessionManager.saveSession(conversationId, newState)
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
+
+            // Route group-related messages to GroupMessagingService before 1:1 handling.
+            if (payload.type in MessagePayload.GROUP_TYPES) {
+                groupMessagingService?.handleIncoming(payload, senderPubKeyHex)
+                return@runCatching
+            }
 
             // Handle control messages — do not store as chat messages
             if (payload.type == MessagePayload.TYPE_DELETE && payload.targetMessageId.isNotEmpty()) {
