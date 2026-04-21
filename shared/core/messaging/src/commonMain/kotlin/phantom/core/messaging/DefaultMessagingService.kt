@@ -24,6 +24,7 @@ import phantom.core.storage.ConversationRepository
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
+import phantom.core.storage.ReactionRepository
 import phantom.core.storage.TrustTier
 import phantom.core.transport.RelayMessage
 import phantom.core.transport.RelayTransport
@@ -38,6 +39,7 @@ class DefaultMessagingService(
     private val conversationRepository: ConversationRepository,
     private val scope: CoroutineScope,
     private val json: Json = Json { ignoreUnknownKeys = true },
+    private val reactionRepository: ReactionRepository? = null,
 ) : MessagingService {
 
     private val _incomingMessages = MutableSharedFlow<IncomingMessage>(
@@ -53,8 +55,10 @@ class DefaultMessagingService(
      * Set by the Android AppContainer after [initMessaging]; null on other platforms.
      * Called on the scope's thread after a message is successfully decrypted and stored.
      * The callback must be non-blocking (fire-and-forget on the platform side).
+     *
+     * Parameters: conversationId, senderName, preview, senderPublicKeyHex
      */
-    @Volatile var onNewMessageNotification: ((conversationId: String, senderName: String, preview: String) -> Unit)? = null
+    @Volatile var onNewMessageNotification: ((conversationId: String, senderName: String, preview: String, senderPublicKeyHex: String) -> Unit)? = null
 
     override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> = runCatching {
         val state = sessionManager.getOrCreateSession(
@@ -225,6 +229,21 @@ class DefaultMessagingService(
                 }
                 return@runCatching
             }
+            if (payload.type == MessagePayload.TYPE_REACTION && payload.targetMessageId.isNotEmpty()) {
+                val em = payload.emoji ?: return@runCatching
+                val repo = reactionRepository ?: return@runCatching
+                if (em.isEmpty()) {
+                    repo.deleteReaction(payload.targetMessageId, senderPubKeyHex)
+                } else {
+                    repo.upsertReaction(
+                        messageId = payload.targetMessageId,
+                        senderKeyHex = senderPubKeyHex,
+                        emoji = em,
+                        createdAt = Clock.System.now().toEpochMilliseconds(),
+                    )
+                }
+                return@runCatching
+            }
 
             val nowMs = Clock.System.now().toEpochMilliseconds()
             val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
@@ -280,7 +299,7 @@ class DefaultMessagingService(
             )
 
             val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
-            onNewMessageNotification?.invoke(conversationId, senderName, previewText(payload.text))
+            onNewMessageNotification?.invoke(conversationId, senderName, previewText(payload.text), senderPubKeyHex)
         }.onFailure { _ ->
             // Decryption or storage failure — drop silently to avoid leaking error details.
         }
@@ -416,6 +435,58 @@ class DefaultMessagingService(
             )
         )
         messageRepository.updateMessageText(messageId, newText)
+    }
+
+    override suspend fun sendReaction(
+        messageId: String,
+        conversationId: String,
+        recipientPublicKeyHex: String,
+        emoji: String,
+    ): Result<Unit> = runCatching {
+        val state = sessionManager.getOrCreateSession(
+            conversationId = conversationId,
+            localIdentityKeyPair = localKeyPair,
+            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
+        )
+        val payload = json.encodeToString(
+            MessagePayload(
+                text = "",
+                sentAt = Clock.System.now().toEpochMilliseconds(),
+                senderUsername = identity.username,
+                type = MessagePayload.TYPE_REACTION,
+                targetMessageId = messageId,
+                emoji = emoji,
+            )
+        ).encodeToByteArray()
+        val (newState, encrypted) = ratchet.encrypt(state, payload)
+        sessionManager.saveSession(conversationId, newState)
+        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        transport.send(
+            RelayMessage.Send(
+                to = recipientPublicKeyHex,
+                from = "",
+                sealedSender = Base64.encode(
+                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                ),
+                payload = MessagePadding.pad(ciphertext).encodeBase64(),
+                messageId = uuid4().toString(),
+            )
+        )
+        // Also apply locally so the sender sees their own reaction immediately
+        val repo = reactionRepository
+        if (repo != null) {
+            if (emoji.isEmpty()) {
+                repo.deleteReaction(messageId, identity.publicKeyHex)
+            } else {
+                repo.upsertReaction(
+                    messageId = messageId,
+                    senderKeyHex = identity.publicKeyHex,
+                    emoji = emoji,
+                    createdAt = Clock.System.now().toEpochMilliseconds(),
+                )
+            }
+        }
     }
 
     /** Strip reply prefix "> quote\n" so chat list shows the actual message. */

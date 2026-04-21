@@ -24,6 +24,7 @@ import phantom.core.storage.SqlDelightConversationRepository
 import phantom.core.storage.SqlDelightIdentityRepository
 import phantom.core.storage.SqlDelightMessageRepository
 import phantom.core.storage.SqlDelightRatchetStateRepository
+import phantom.core.storage.SqlDelightReactionRepository
 import phantom.core.transport.KtorRelayTransport
 import phantom.core.transport.createHttpClient
 
@@ -45,6 +46,7 @@ class AppContainer(private val context: Context) {
     val conversationRepo = SqlDelightConversationRepository(dbHolder.database)
     val messageRepo    = SqlDelightMessageRepository(dbHolder.database)
     private val ratchetRepo = SqlDelightRatchetStateRepository(dbHolder.database)
+    val reactionRepo   = SqlDelightReactionRepository(dbHolder.database)
 
     // Starts immediately — deletes expired messages while the app is alive.
     private val disappearingMessageScheduler = DisappearingMessageScheduler(messageRepo, appScope)
@@ -83,10 +85,11 @@ class AppContainer(private val context: Context) {
             conversationRepository = conversationRepo,
             scope = appScope,
             json = json,
+            reactionRepository = reactionRepo,
         )
         // Wire local notification callback — Android-only side-effect, not part of the KMP interface.
-        service.onNewMessageNotification = { convId, sender, preview ->
-            PhantomNotificationManager.showMessageNotification(context, convId, sender, preview)
+        service.onNewMessageNotification = { convId, sender, preview, senderPubKeyHex ->
+            PhantomNotificationManager.showMessageNotification(context, convId, sender, preview, senderPubKeyHex)
         }
         messagingService = service
     }

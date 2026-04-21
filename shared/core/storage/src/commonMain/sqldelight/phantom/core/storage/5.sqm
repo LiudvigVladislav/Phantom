@@ -1,0 +1,10 @@
+-- Migration from schema version 5 → 6
+-- Adds emoji reactions table.
+CREATE TABLE reaction (
+    message_id TEXT NOT NULL,
+    sender_key_hex TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (message_id, sender_key_hex),
+    FOREIGN KEY(message_id) REFERENCES message(id) ON DELETE CASCADE
+);

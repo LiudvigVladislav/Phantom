@@ -32,4 +32,12 @@ interface MessagingService {
         conversationId: String,
         recipientPublicKeyHex: String,
     ): Result<Unit>
+
+    // Send an emoji reaction to a specific message; emoji="" means remove the reaction
+    suspend fun sendReaction(
+        messageId: String,
+        conversationId: String,
+        recipientPublicKeyHex: String,
+        emoji: String,
+    ): Result<Unit>
 }

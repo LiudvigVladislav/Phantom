@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import phantom.android.MainActivity
 
@@ -30,8 +31,12 @@ object PhantomNotificationManager {
     const val CHANNEL_NAME = "Messages"
 
     // Intent extra keys — must match what MainActivity reads
-    const val EXTRA_CONVERSATION_ID = "conversationId"
+    const val EXTRA_CONVERSATION_ID  = "conversationId"
     const val EXTRA_THEIR_USERNAME   = "theirUsername"
+
+    // Quick-reply extras — used by QuickReplyReceiver
+    const val KEY_REPLY_TEXT         = "reply_text"
+    const val EXTRA_RECIPIENT_PUB_KEY = "their_pub_key"
 
     /**
      * Creates the notification channel. Safe to call multiple times — Android is idempotent.
@@ -68,6 +73,7 @@ object PhantomNotificationManager {
         conversationId: String,
         senderName: String,
         preview: String,
+        recipientPubKey: String,
     ) {
         // Permission guard — POST_NOTIFICATIONS is runtime on API 33+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -94,6 +100,29 @@ object PhantomNotificationManager {
         // Truncate to 30 chars — privacy: show only enough to identify the sender's message
         val safePreview = if (preview.length > 30) preview.take(30) + "…" else preview
 
+        // Inline reply action — lets users respond without opening the app
+        val remoteInput = RemoteInput.Builder(KEY_REPLY_TEXT)
+            .setLabel("Reply…")
+            .build()
+
+        val replyIntent = Intent(context, QuickReplyReceiver::class.java).apply {
+            putExtra(EXTRA_CONVERSATION_ID, conversationId)
+            putExtra(EXTRA_RECIPIENT_PUB_KEY, recipientPubKey)
+        }
+        // FLAG_MUTABLE is required so the system can write the RemoteInput result into the Intent.
+        val replyPendingIntent = PendingIntent.getBroadcast(
+            context,
+            conversationId.hashCode(),
+            replyIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+        )
+
+        val replyAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_menu_send,
+            "Reply",
+            replyPendingIntent,
+        ).addRemoteInput(remoteInput).build()
+
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_email)
             .setContentTitle(senderName)
@@ -101,6 +130,7 @@ object PhantomNotificationManager {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
+            .addAction(replyAction)
             .build()
 
         NotificationManagerCompat.from(context)

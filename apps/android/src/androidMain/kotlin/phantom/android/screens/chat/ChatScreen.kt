@@ -51,6 +51,8 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.foundation.border
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -63,6 +65,8 @@ import com.benasher44.uuid.uuid4
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.window.Popup
 import phantom.android.di.AppContainer
 import phantom.android.ui.GradientAvatar
 import phantom.android.ui.theme.*
@@ -70,6 +74,7 @@ import phantom.core.messaging.OutgoingMessage
 import phantom.core.messaging.SafetyReportCategory
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
+import phantom.core.storage.ReactionEntry
 import phantom.core.transport.TransportState
 
 private const val PROFILE_MSG_PREFIX = "\u200B__PHANTOM_PROFILE__\u200B"
@@ -151,11 +156,13 @@ fun ChatScreen(
         val profileAlreadySent = prefs.getString("profile_sent_$conversationId", null) == "true"
         val hasProfileData = ownFirstName.isNotEmpty() || ownLastName.isNotEmpty()
         if (!profileAlreadySent && hasProfileData && conv != null) {
+            val myGradientIndex = prefs.getInt("gradient_index", 0)
             val json = JSONObject().apply {
                 put("fn", ownFirstName)
                 put("ln", ownLastName)
                 put("city", ownCity)
                 put("country", ownCountry)
+                put("gradientIndex", myGradientIndex)
             }.toString()
             container.messagingService?.sendMessage(
                 OutgoingMessage(
@@ -203,10 +210,17 @@ fun ChatScreen(
                             put("city", obj.optString("city", ""))
                             put("country", obj.optString("country", ""))
                         }.toString()
+                        val gradientIndex = if (obj.has("gradientIndex")) obj.getInt("gradientIndex") else -1
                         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                             .edit()
                             .putString("contact_profile_$conversationId", profileJson)
                             .apply()
+                        if (gradientIndex >= 0) {
+                            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                                .edit()
+                                .putInt("${conversationId}_gradient_index", gradientIndex)
+                                .apply()
+                        }
                     } catch (_: JSONException) {
                         // Malformed profile payload — ignore silently
                     }
@@ -587,6 +601,9 @@ fun ChatScreen(
                         MessageBubble(
                             entity = msg,
                             theirUsername = theirUsername,
+                            conversationId = conversationId,
+                            theirPublicKeyHex = theirPublicKeyHex,
+                            container = container,
                             onReply = {
                                 replyToMessage = msg
                                 editingMessage = null
@@ -787,11 +804,16 @@ private fun EmojiPanel(onEmoji: (String) -> Unit) {
 
 // ── Message bubble ────────────────────────────────────────────────────────────
 
+private val REACTION_EMOJIS = listOf("👍", "❤️", "😂", "😮", "😢", "👎")
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
     entity: MessageEntity,
     theirUsername: String,
+    conversationId: String,
+    theirPublicKeyHex: String,
+    container: AppContainer,
     onReply: () -> Unit,
     onEdit: () -> Unit,
     onDeleteForMe: () -> Unit,
@@ -800,11 +822,18 @@ private fun MessageBubble(
     onForward: (cleanText: String, senderLabel: String) -> Unit,
 ) {
     val context = LocalContext.current
+    val bubbleCoroutineScope = rememberCoroutineScope()
     val isSent = entity.sent
     val rawText = entity.plaintextCache ?: "•••"
     val timeStr = formatMessageTime(entity.createdAt)
     var showActions by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
+    var showReactionPicker by remember { mutableStateOf(false) }
+
+    // Load reactions for this message; refreshes whenever the message id changes
+    val reactions by produceState(initialValue = emptyList<ReactionEntry>(), key1 = entity.id) {
+        value = container.reactionRepo.getReactions(entity.id)
+    }
 
     // Parse reply prefix: "> quote\nmessage"
     val isReply = rawText.startsWith("> ")
@@ -913,6 +942,8 @@ private fun MessageBubble(
         Box {
             // time "06:26" ≈ 28dp + gap 3dp + status icon ≈ 18dp = ~56dp for sent, ~36dp for received
             val timeReserve = if (isSent) 56.dp else 36.dp
+            // Outer column: bubble + reaction pills stacked vertically
+            Column {
             // Column wraps quote block + text+time — no overlapping content
             val bubbleShape = RoundedCornerShape(
                 topStart = 16.dp, topEnd = 16.dp,
@@ -932,7 +963,7 @@ private fun MessageBubble(
                     )
                     .combinedClickable(
                         onClick = {},
-                        onLongClick = { showActions = true },
+                        onLongClick = { showReactionPicker = true },
                     )
                     .padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp),
             ) {
@@ -1029,6 +1060,77 @@ private fun MessageBubble(
                             lineHeight = 12.sp,
                         )
                         if (isSent) StatusIcon(status = entity.status)
+                    }
+                }
+            } // end bubble Column
+
+            // Reaction pills — shown below the bubble when reactions exist
+            if (reactions.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.padding(top = 2.dp, start = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    reactions.forEach { entry ->
+                        Text(
+                            text = entry.emoji,
+                            fontSize = 14.sp,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Surface2)
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                        )
+                    }
+                }
+            }
+            } // end outer Column (bubble + pills)
+
+            // Reaction emoji picker popup — shown on long-press
+            if (showReactionPicker) {
+                Popup(onDismissRequest = { showReactionPicker = false }) {
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(24.dp))
+                            .background(Surface2)
+                            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(24.dp))
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        REACTION_EMOJIS.forEach { emoji ->
+                            Text(
+                                text = emoji,
+                                fontSize = 22.sp,
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .clickable {
+                                        showReactionPicker = false
+                                        if (theirPublicKeyHex.isNotEmpty()) {
+                                            bubbleCoroutineScope.launch {
+                                                container.messagingService?.sendReaction(
+                                                    messageId = entity.id,
+                                                    conversationId = conversationId,
+                                                    recipientPublicKeyHex = theirPublicKeyHex,
+                                                    emoji = emoji,
+                                                )
+                                            }
+                                        }
+                                    }
+                                    .padding(6.dp),
+                            )
+                        }
+                        // More actions — opens the full context menu
+                        Text(
+                            text = "•••",
+                            fontSize = 14.sp,
+                            color = TextDim,
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .clickable {
+                                    showReactionPicker = false
+                                    showActions = true
+                                }
+                                .padding(6.dp),
+                        )
                     }
                 }
             }
@@ -1169,6 +1271,7 @@ private fun InputBar(
     isEditing: Boolean = false,
     onSend: () -> Unit,
 ) {
+    val haptic = LocalHapticFeedback.current
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1245,7 +1348,10 @@ private fun InputBar(
                         .size(44.dp)
                         .clip(CircleShape)
                         .background(CyanAccent)
-                        .clickable(onClick = onSend),
+                        .clickable(onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onSend()
+                        }),
                     contentAlignment = Alignment.Center,
                 ) {
                     if (isEditing) {

@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.*
@@ -47,7 +48,15 @@ fun ChatListScreen(
     onScannedQrConsumed: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
+    var searchQuery by remember { mutableStateOf("") }
     var conversations by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
+    val filtered = remember(conversations, searchQuery) {
+        if (searchQuery.isBlank()) conversations
+        else conversations.filter { conv ->
+            conv.theirUsername.contains(searchQuery, ignoreCase = true) ||
+            (conv.lastMessagePreview ?: "").contains(searchQuery, ignoreCase = true)
+        }
+    }
     var requestCount by remember { mutableStateOf(0) }
     var showAddDialog by remember { mutableStateOf(false) }
     var prefillContactString by remember { mutableStateOf("") }
@@ -106,13 +115,28 @@ fun ChatListScreen(
                             .clip(RoundedCornerShape(10.dp))
                             .background(Surface)
                             .border(1.dp, Color.White.copy(alpha = 0.04f), RoundedCornerShape(10.dp))
-                            .clickable { /* search — TODO */ }
                             .padding(horizontal = 14.dp, vertical = 10.dp),
                     ) {
-                        Text(
-                            text = "Search messages, contacts",
-                            color = TextDim,
-                            fontSize = 13.sp,
+                        BasicTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            singleLine = true,
+                            textStyle = androidx.compose.ui.text.TextStyle(
+                                color = TextPrimary,
+                                fontSize = 13.sp,
+                            ),
+                            cursorBrush = androidx.compose.ui.graphics.SolidColor(CyanAccent),
+                            modifier = Modifier.fillMaxWidth(),
+                            decorationBox = { inner ->
+                                if (searchQuery.isEmpty()) {
+                                    Text(
+                                        text = "Search messages, contacts",
+                                        color = TextDim,
+                                        fontSize = 13.sp,
+                                    )
+                                }
+                                inner()
+                            },
                         )
                     }
                 }
@@ -176,14 +200,31 @@ fun ChatListScreen(
                 // ── CHATS section ────────────────────────────
                 item { SectionLabel(text = "Chats") }
 
-                items(conversations, key = { it.id }) { conv ->
+                items(filtered, key = { it.id }) { conv ->
                     ChatRow(
                         conv = conv,
                         onClick = { onNavigate(Screen.Chat(conv.id, conv.theirUsername)) },
                     )
                 }
 
-                if (conversations.isEmpty() && requestCount == 0) {
+                if (filtered.isEmpty() && searchQuery.isNotBlank()) {
+                    item {
+                        Box(
+                            modifier = Modifier
+                                .fillParentMaxSize()
+                                .padding(32.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "No results for \"$searchQuery\"",
+                                color = TextDim,
+                                fontSize = 13.sp,
+                            )
+                        }
+                    }
+                }
+
+                if (conversations.isEmpty() && requestCount == 0 && searchQuery.isBlank()) {
                     item {
                         Box(
                             modifier = Modifier

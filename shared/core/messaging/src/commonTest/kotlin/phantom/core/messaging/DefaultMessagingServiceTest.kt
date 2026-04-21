@@ -26,6 +26,8 @@ import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.RatchetStateRepository
+import phantom.core.storage.ReactionEntry
+import phantom.core.storage.ReactionRepository
 import phantom.core.transport.RelayMessage
 import phantom.core.transport.RelayTransport
 import phantom.core.transport.TransportState
@@ -102,6 +104,22 @@ private class FakeConversationRepository : ConversationRepository {
     }
     override suspend fun getDisappearingTimer(conversationId: String): Long =
         store[conversationId]?.disappearingTimerSecs ?: 0L
+}
+
+private class FakeReactionRepository : ReactionRepository {
+    data class Key(val messageId: String, val senderKeyHex: String)
+    val store = mutableMapOf<Key, ReactionEntry>()
+
+    override suspend fun upsertReaction(messageId: String, senderKeyHex: String, emoji: String, createdAt: Long) {
+        store[Key(messageId, senderKeyHex)] = ReactionEntry(emoji = emoji, senderKeyHex = senderKeyHex)
+    }
+    override suspend fun deleteReaction(messageId: String, senderKeyHex: String) {
+        store.remove(Key(messageId, senderKeyHex))
+    }
+    override suspend fun getReactions(messageId: String): List<ReactionEntry> =
+        store.entries
+            .filter { (k, _) -> k.messageId == messageId }
+            .map { (_, v) -> v }
 }
 
 private class FakeRatchetStateRepository : RatchetStateRepository {
@@ -190,6 +208,7 @@ class DefaultMessagingServiceTest {
         msgRepo: FakeMessageRepository = FakeMessageRepository(),
         convRepo: FakeConversationRepository = FakeConversationRepository(),
         transport: FakeRelayTransport = FakeRelayTransport(),
+        reactionRepo: FakeReactionRepository? = null,
     ): DefaultMessagingService {
         val ratchetRepo = FakeRatchetStateRepository()
         val sessionManager = SessionManager(PassthroughX3DH(), ratchetRepo, json)
@@ -203,6 +222,7 @@ class DefaultMessagingServiceTest {
             conversationRepository = convRepo,
             scope = testScope,
             json = json,
+            reactionRepository = reactionRepo,
         )
     }
 
@@ -231,8 +251,12 @@ class DefaultMessagingServiceTest {
             OutgoingMessage(id = "msg-2", conversationId = "conv-1", recipientPublicKeyHex = "ccdd", text = "Hi")
         )
         assertEquals(1, transport.sent.size)
-        assertEquals("aabb", transport.sent[0].from)
+        // With sealed sender, `from` is empty — identity is hidden from the relay.
+        assertEquals("", transport.sent[0].from)
         assertEquals("ccdd", transport.sent[0].to)
+        // sealedSender blob must be present (identity is sealed, not omitted).
+        assertNotNull(transport.sent[0].sealedSender.takeIf { it.isNotEmpty() },
+            "sealedSender must be non-empty when sealed sender is used")
     }
 
     @Test
@@ -255,5 +279,24 @@ class DefaultMessagingServiceTest {
             OutgoingMessage(id = "msg-4", conversationId = "conv-1", recipientPublicKeyHex = "ccdd", text = "x")
         )
         assertEquals(MessageStatus.SENT, msgRepo.statusUpdates["msg-4"])
+    }
+
+    @Test
+    fun sendReaction_storesReactionLocallyAndSendsViaTransport() = runTest {
+        val transport = FakeRelayTransport()
+        val reactionRepo = FakeReactionRepository()
+        val service = buildService(this, transport = transport, reactionRepo = reactionRepo)
+        service.sendReaction(
+            messageId = "msg-1",
+            conversationId = "conv-1",
+            recipientPublicKeyHex = "ccdd",
+            emoji = "👍",
+        )
+        // Reaction stored locally under the sender's own identity key
+        val reactions = reactionRepo.getReactions("msg-1")
+        assertEquals(1, reactions.size)
+        assertEquals("👍", reactions[0].emoji)
+        // Control message sent to the relay
+        assertEquals(1, transport.sent.size)
     }
 }
