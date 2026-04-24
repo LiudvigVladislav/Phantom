@@ -20,6 +20,18 @@ kotlin {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
         }
+
+        // Instrumented tests for libsodium-backed crypto — must run on a real
+        // Android runtime because the libsodium native binding cannot be
+        // resolved on the JVM test classpath (see docs/tech_debt.md Bug H).
+        val androidInstrumentedTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+                implementation(libs.kotlinx.coroutines.test)
+                implementation(libs.androidx.test.runner)
+                implementation(libs.androidx.test.ext.junit)
+            }
+        }
     }
 }
 
@@ -28,5 +40,9 @@ android {
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
+        // AndroidJUnitRunner is the runner shipped with androidx.test:runner.
+        // It is what `connectedAndroidTest` uses to execute @RunWith(AndroidJUnit4)
+        // classes on a connected emulator or device.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 }

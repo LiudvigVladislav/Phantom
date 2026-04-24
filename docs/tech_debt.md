@@ -138,7 +138,29 @@ java.lang.NullPointerException: Cannot invoke "java.net.URL.getFile()" because "
 
 **Когда делать:** После VPS-деплоя релея, перед подачей заявки в NLnet (до 1 июня 2026). Причина такого порядка: NLnet-ревьюеры захотят видеть зелёный CI — инструментированные тесты на Android эмуляторе закрывают и unit-тестирование crypto, и демонстрируют что production-стек проверяется целиком.
 
-**Статус:** Вне скоупа Этапа 2. Компиляция зелёная, build зелёный — runtime failure существовал задолго до текущих изменений. Отдельная инфраструктурная задача, запланирована.
+**Статус:** ✅ **ЗАКРЫТ 2026-04-24** на ветке `fix/bug-h-libsodium-jni`.
+
+**Что сделано:**
+- `gradle/libs.versions.toml`: добавлены `androidx-test-runner 1.6.2` и `androidx-test-ext-junit 1.2.1`.
+- `shared/core/crypto/build.gradle.kts`: добавлен `androidInstrumentedTest` sourceSet с AndroidX Test зависимостями; `testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"` в `android.defaultConfig`.
+- Перемещены 4 тестовых класса (16 тестов): `LibsodiumX3DHTest`, `LibsodiumDoubleRatchetTest`, `SafetyNumberTest`, `SealedSenderTest` → `shared/core/crypto/src/androidInstrumentedTest/kotlin/phantom/core/crypto/`. Все аннотированы `@RunWith(AndroidJUnit4::class)`.
+- `commonTest` крипто-модуля пуст — больше не провоцирует красное в `./gradlew allTests` на JVM.
+- Компиляция: `./gradlew :shared:core:crypto:compileDebugAndroidTestKotlinAndroid` — BUILD SUCCESSFUL.
+- `assembleDebug` / `assembleRelease` — без регрессий.
+
+**Запуск на эмуляторе:** `./gradlew :shared:core:crypto:connectedDebugAndroidTest` (требует running AVD).
+
+---
+
+### Bug H-follow-up — `Alpha0IntegrationTest` also uses libsodium on JVM
+
+**File:** `shared/core/messaging/src/commonTest/kotlin/phantom/core/messaging/Alpha0IntegrationTest.kt`
+
+**Symptom (predicted):** Will fail at runtime on `./gradlew :shared:core:messaging:testDebugUnitTest` with the same `ResourceLoader.getFileFromFileSystem` NPE because it performs a real X3DH + Double Ratchet exchange using `LibsodiumInitializer`.
+
+**Scope:** Outside `fix/bug-h-libsodium-jni` — that branch only touches the crypto module to keep the change surgical. The messaging-module integration test needs the same treatment (move to `androidInstrumentedTest` + add AndroidX Test deps + `@RunWith(AndroidJUnit4::class)`).
+
+**When to do it:** After the VPS relay is deployed and before the NLnet submission (2026-06-01). The relay deploy unblocks end-to-end testing against a real server, at which point the integration test's value is much higher and the migration effort pays off.
 
 ---
 

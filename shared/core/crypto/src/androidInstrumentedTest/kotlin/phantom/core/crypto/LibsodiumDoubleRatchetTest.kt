@@ -1,32 +1,27 @@
 package phantom.core.crypto
 
+import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.coroutines.test.runTest
+import org.junit.runner.RunWith
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 
 /**
- * Tests for [LibsodiumDoubleRatchet].
+ * Instrumented tests for [LibsodiumDoubleRatchet].
  *
- * All tests perform a real X3DH handshake first to obtain a shared [RatchetState],
- * then exercise the ratchet. This mirrors the actual usage flow and avoids
- * constructing RatchetState manually (which would require exact byte-length knowledge
- * of internal keys that may change).
+ * All tests perform a real X3DH handshake first, then exercise the ratchet.
+ * Runs on Android runtime where libsodium.so is loaded from the test APK.
  *
- * VERIFY AT FIRST BUILD:
- * - LibsodiumInitializer.initialize() — see note in LibsodiumX3DHTest.
- * - SecretBox.openEasy throws a typed exception on MAC failure; the catch clause
- *   in LibsodiumDoubleRatchet maps it to IllegalArgumentException. Confirm the
- *   exception type thrown by the library and adjust the catch if needed.
+ * Invoke with: ./gradlew :shared:core:crypto:connectedDebugAndroidTest
  */
+@RunWith(AndroidJUnit4::class)
 class LibsodiumDoubleRatchetTest {
 
     private val x3dh = LibsodiumX3DH()
     private val ratchet = LibsodiumDoubleRatchet()
-
-    // --- Shared session setup helpers ---
 
     private suspend fun sharedSession(): Pair<RatchetState, RatchetState> {
         LibsodiumInitializer.initialize()
@@ -50,8 +45,6 @@ class LibsodiumDoubleRatchetTest {
         )
         return Pair(aliceState, bobState)
     }
-
-    // --- Tests ---
 
     @Test
     fun singleMessage_aliceEncryptsBobDecrypts_plaintextMatches() = runTest {
@@ -95,12 +88,10 @@ class LibsodiumDoubleRatchetTest {
         val alicePlaintext = "Hello from Alice".encodeToByteArray()
         val bobPlaintext = "Hello from Bob".encodeToByteArray()
 
-        // Alice sends to Bob
         val (aliceState1, aliceMsg) = ratchet.encrypt(aliceState0, alicePlaintext)
         val (bobState1, aliceDecrypted) = ratchet.decrypt(bobState0, aliceMsg)
         assertContentEquals(alicePlaintext, aliceDecrypted, "Bob must decrypt Alice's message")
 
-        // Bob replies to Alice
         val (_, bobMsg) = ratchet.encrypt(bobState1, bobPlaintext)
         val (_, bobDecrypted) = ratchet.decrypt(aliceState1, bobMsg)
         assertContentEquals(bobPlaintext, bobDecrypted, "Alice must decrypt Bob's reply")
@@ -113,8 +104,6 @@ class LibsodiumDoubleRatchetTest {
 
         val (_, encryptedMessage) = ratchet.encrypt(aliceState0, plaintext)
 
-        // The ciphertext should not contain the raw plaintext bytes as a subsequence.
-        // This is a sanity check, not a cryptographic proof.
         val ciphertextStr = encryptedMessage.ciphertext.decodeToString()
         assertFalse(
             ciphertextStr.contains("secret message"),
@@ -129,8 +118,9 @@ class LibsodiumDoubleRatchetTest {
 
         val (_, encryptedMessage) = ratchet.encrypt(aliceState0, plaintext)
 
-        // Flip a byte in the ciphertext to simulate tampering.
-        val tamperedCiphertext = encryptedMessage.ciphertext.copyOf().also { it[0] = (it[0].toInt() xor 0xFF).toByte() }
+        val tamperedCiphertext = encryptedMessage.ciphertext.copyOf().also {
+            it[0] = (it[0].toInt() xor 0xFF).toByte()
+        }
         val tampered = encryptedMessage.copy(ciphertext = tamperedCiphertext)
 
         assertFailsWith<IllegalArgumentException>(
