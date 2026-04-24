@@ -9,6 +9,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -23,9 +25,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
@@ -257,6 +262,12 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
     var username by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(300)
+        runCatching { focusRequester.requestFocus() }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -277,6 +288,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
             .fillMaxSize()
             .background(BgDeep)
             .windowInsetsPadding(WindowInsets.statusBars)
+            .imePadding()
             .padding(horizontal = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -331,6 +343,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
         Spacer(Modifier.height(14.dp))
 
         // Username input field — Surface2 box with CyanAccent left border
+        val fieldInteraction = remember { MutableInteractionSource() }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -343,6 +356,13 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                 )
                 // 2dp CyanAccent left border via inner padding trick with a drawn line
                 .drawLeftBorder(color = CyanAccent.copy(alpha = if (valid) 0.9f else 0.35f), width = 2.dp)
+                // Entire pill area forwards taps to the text field — avoids the problem
+                // where the tight BasicTextField hit box misses taps on the "@" prefix
+                // or on the padding zone around it.
+                .clickable(
+                    interactionSource = fieldInteraction,
+                    indication = null,
+                ) { focusRequester.requestFocus() }
                 .padding(horizontal = 16.dp, vertical = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -360,7 +380,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                     username = it.lowercase().filter { c -> c.isLetterOrDigit() || c == '_' }
                     error = null
                 },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).focusRequester(focusRequester),
                 singleLine = true,
                 textStyle = LocalTextStyle.current.copy(
                     color = TextPrimary,
@@ -368,6 +388,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                     fontWeight = FontWeight.Light,
                     fontFamily = FontFamily.Monospace,
                 ),
+                cursorBrush = SolidColor(CyanAccent),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = {
                     if (valid && !loading) {

@@ -2,6 +2,7 @@ package phantom.android
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
@@ -9,6 +10,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import phantom.android.notifications.PhantomNotificationManager
 import androidx.activity.enableEdgeToEdge
+import androidx.core.view.WindowCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
@@ -115,6 +117,15 @@ class MainActivity : ComponentActivity() {
         // enableEdgeToEdge() conflicts with API 35+ system-enforced edge-to-edge.
         // On API 35+, the system handles it automatically; calling it again
         // corrupts the EGL surface setup (GFXSTREAM / Unknown dataspace 0).
+        //
+        // For API 26–34 we still need the window to carry IME insets down to
+        // Compose so Modifier.imePadding() can resize content when the
+        // keyboard appears. setDecorFitsSystemWindows(false) is the minimal
+        // configuration that enables this without touching edge-to-edge
+        // drawing behaviour in a way that breaks API 35+.
+        if (Build.VERSION.SDK_INT < 35) {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+        }
 
         // Initialise lock state from prefs before Compose renders its first frame.
         val prefs = getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
