@@ -130,7 +130,7 @@ class LibsodiumDoubleRatchetTest {
         val (_, encryptedMessage) = ratchet.encrypt(aliceState0, plaintext)
 
         // Flip a byte in the ciphertext to simulate tampering.
-        val tamperedCiphertext = encryptedMessage.ciphertext.copyOf().also { it[0] = it[0].xor(0xFF.toByte()) }
+        val tamperedCiphertext = encryptedMessage.ciphertext.copyOf().also { it[0] = (it[0].toInt() xor 0xFF).toByte() }
         val tampered = encryptedMessage.copy(ciphertext = tamperedCiphertext)
 
         assertFailsWith<IllegalArgumentException>(
