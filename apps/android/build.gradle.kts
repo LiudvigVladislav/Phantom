@@ -110,7 +110,10 @@ android {
         }
         release {
             isMinifyEnabled = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             buildConfigField("String", "RELAY_URL", "\"wss://relay.phntm.pro/ws\"")
             // Override this via CI secrets: -PRELAY_TOKEN=<value>
             buildConfigField("String", "RELAY_TOKEN", "null")
