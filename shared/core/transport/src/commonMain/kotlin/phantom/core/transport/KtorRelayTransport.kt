@@ -74,6 +74,10 @@ class KtorRelayTransport(
         this.relayUrl = relayUrl
         this.identityHex = identityPublicKeyHex
         this.relayToken = token
+        relayLog(
+            RelayLogLevel.INFO,
+            "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… tokenSet=${token != null}",
+        )
         openWithRetry(attempt = 0)
     }
 
@@ -81,10 +85,20 @@ class KtorRelayTransport(
         _state.value = TransportState.Connecting
         val urlWithId = if (identityHex.isNotEmpty()) "$relayUrl?id=$identityHex" else relayUrl
         val urlWithToken = if (relayToken != null) "$urlWithId&token=$relayToken" else urlWithId
+        // Redact the id + token query params from the logged URL so we do not leak them to logcat
+        // but still confirm the endpoint, scheme, and port the client actually tries to reach.
+        val redactedUrl = urlWithToken
+            .replace(Regex("""id=[^&]+"""),    "id=<redacted>")
+            .replace(Regex("""token=[^&]+"""), "token=<redacted>")
+        relayLog(
+            RelayLogLevel.INFO,
+            "Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
+        )
         try {
             httpClient.webSocket(urlWithToken) {
                 session = this
                 _state.value = TransportState.Connected
+                relayLog(RelayLogLevel.INFO, "WebSocket connected successfully")
                 val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
                 scope = transportScope
                 startPing(transportScope)
@@ -92,21 +106,33 @@ class KtorRelayTransport(
                 // readLoop() returns when the server closes the connection cleanly.
                 // Cancel ping so it doesn't try to write to a dead session.
                 transportScope.cancel()
+                relayLog(RelayLogLevel.WARN, "WebSocket closed by remote (clean)")
             }
             // Clean close — reconnect immediately from attempt 0.
             _state.value = TransportState.Disconnected
             delay(RelayTransportConfig.RECONNECT_BASE_DELAY_MS)
+            relayLog(RelayLogLevel.INFO, "Reconnecting after clean close")
             openWithRetry(0)
         } catch (e: Exception) {
             _state.value = TransportState.Error(e)
+            relayLog(
+                RelayLogLevel.ERROR,
+                "WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
+                e,
+            )
             if (attempt < RelayTransportConfig.RECONNECT_MAX_ATTEMPTS) {
                 val delayMs = min(
                     RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1 shl attempt),
                     RelayTransportConfig.RECONNECT_MAX_DELAY_MS,
                 )
+                relayLog(RelayLogLevel.INFO, "Retry attempt #${attempt + 1} in ${delayMs}ms")
                 delay(delayMs)
                 openWithRetry(attempt + 1)
             } else {
+                relayLog(
+                    RelayLogLevel.ERROR,
+                    "Max retry attempts (${RelayTransportConfig.RECONNECT_MAX_ATTEMPTS}) reached — giving up",
+                )
                 _state.value = TransportState.Disconnected
             }
         }
@@ -146,21 +172,58 @@ class KtorRelayTransport(
                     }
 
                     when (val msg = json.decodeFromString<RelayMessage>(text)) {
-                        is RelayMessage.Deliver -> _incoming.emit(msg)
-                        is RelayMessage.Ack -> _acks.emit(msg)
-                        is RelayMessage.ReadReceipt -> _readReceipts.emit(msg)
+                        is RelayMessage.Deliver -> {
+                            relayLog(
+                                RelayLogLevel.INFO,
+                                "Received envelope: id=${msg.messageId.take(12)}… sealed=${msg.sealedSender.isNotEmpty()} payloadBytes=${msg.payload.length}",
+                            )
+                            _incoming.emit(msg)
+                        }
+                        is RelayMessage.Ack -> {
+                            relayLog(
+                                RelayLogLevel.INFO,
+                                "Ack from relay: id=${msg.messageId.take(12)}… status=${msg.status}",
+                            )
+                            _acks.emit(msg)
+                        }
+                        is RelayMessage.ReadReceipt -> {
+                            relayLog(
+                                RelayLogLevel.INFO,
+                                "ReadReceipt: messageId=${msg.messageId.take(12)}…",
+                            )
+                            _readReceipts.emit(msg)
+                        }
                         is RelayMessage.Pong -> Unit
                         else -> Unit
                     }
-                } catch (_: Exception) { /* malformed frame — skip */ }
+                } catch (e: Exception) {
+                    // Malformed frame — log but do not crash the read loop.
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "Malformed frame dropped (${e::class.simpleName}): ${e.message}",
+                    )
+                }
             }
         }
+        relayLog(RelayLogLevel.WARN, "readLoop exited — connection lost")
         _state.value = TransportState.Disconnected
     }
 
     override suspend fun send(message: RelayMessage.Send): Boolean {
-        if (!isConnected()) return false
-        return sendRaw(message)
+        if (!isConnected()) {
+            relayLog(
+                RelayLogLevel.WARN,
+                "send() skipped — not connected. state=${_state.value::class.simpleName} to=${message.to.take(16)}… id=${message.messageId.take(12)}…",
+            )
+            return false
+        }
+        relayLog(
+            RelayLogLevel.INFO,
+            "Sending envelope: to=${message.to.take(16)}… id=${message.messageId.take(12)}… payloadBytes=${message.payload.length} sealed=${message.sealedSender.isNotEmpty()}",
+        )
+        val ok = sendRaw(message)
+        if (!ok) relayLog(RelayLogLevel.ERROR, "Envelope send returned false (frame write failed)")
+        return ok
     }
 
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean {
@@ -187,12 +250,18 @@ class KtorRelayTransport(
         return try {
             session?.send(Frame.Text(json.encodeToString(message)))
             true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            relayLog(
+                RelayLogLevel.ERROR,
+                "sendRaw failed (${e::class.simpleName}): ${e.message}",
+                e,
+            )
             false
         }
     }
 
     override suspend fun disconnect() {
+        relayLog(RelayLogLevel.INFO, "disconnect() called")
         pingJob?.cancel()
         scope?.cancel()
         session?.close()

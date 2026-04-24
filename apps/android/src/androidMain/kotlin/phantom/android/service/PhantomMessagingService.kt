@@ -71,15 +71,27 @@ class PhantomMessagingService : Service() {
 
             // connect() runs an infinite suspend loop with internal reconnect — it only
             // returns on unrecoverable failure or when disconnect() is called.
+            val myPubKey = container.identityRepo.loadIdentity()?.publicKeyHex
+            if (myPubKey == null) {
+                Log.w(TAG, "No local identity — cannot open WebSocket")
+                return@launch
+            }
+            Log.i(
+                "PhantomRelay",
+                "PhantomMessagingService about to connect: " +
+                    "BuildConfig.RELAY_URL=${BuildConfig.RELAY_URL} " +
+                    "tokenSet=${BuildConfig.RELAY_TOKEN != null} " +
+                    "myPubKey=${myPubKey.take(16)}…",
+            )
             runCatching {
                 container.transport.connect(
                     relayUrl = BuildConfig.RELAY_URL,
-                    identityPublicKeyHex = container.identityRepo.loadIdentity()?.publicKeyHex
-                        ?: return@launch,
+                    identityPublicKeyHex = myPubKey,
                     token = BuildConfig.RELAY_TOKEN,
                 )
             }.onFailure { e ->
                 Log.e(TAG, "Transport connect loop exited: ${e.message}", e)
+                Log.e("PhantomRelay", "Transport connect loop exited: ${e.message}", e)
             }
         }
         return START_STICKY

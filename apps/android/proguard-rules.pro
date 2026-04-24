@@ -87,6 +87,15 @@
 
 
 # --------------------------------------------------------------------------
+# PHANTOM transport — keep logger helpers so R8 does not inline them away
+# when isMinifyEnabled is on, otherwise diagnostic output disappears in
+# release builds exactly when we need it most.
+# --------------------------------------------------------------------------
+-keep class phantom.core.transport.RelayLog_androidKt { *; }
+-keep class phantom.core.transport.KtorRelayTransport { *; }
+
+
+# --------------------------------------------------------------------------
 # Ktor
 # --------------------------------------------------------------------------
 # Ktor uses kotlinx.serialization, coroutines, and reflective plugin
