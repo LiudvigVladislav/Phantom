@@ -129,12 +129,16 @@ java.lang.NullPointerException: Cannot invoke "java.net.URL.getFile()" because "
 
 **Cause:** `com.ionspin.kotlin:kotlin-crypto-libsodium-bindings` на JVM использует lazysodium-java, которая ищет нативную библиотеку (`.so`/`.dll`/`.dylib`) через `ResourceLoader`. В Android `testDebugUnitTest` runtime classpath не содержит нативных бинарей, поэтому `URL` резолвится в null.
 
-**Workarounds (нужно исследовать отдельно):**
-1. Явно добавить `testImplementation("com.goterl:lazysodium-java:5.1.4")` и JNA в `shared/core/crypto/build.gradle.kts` — даст локальный fallback через JNA.
-2. Или использовать Robolectric + нативные бинари.
-3. Или перенести libsodium-зависимые тесты из `commonTest` в `androidInstrumentedTest` (запуск на устройстве/эмуляторе).
+**Workarounds (рассмотрены):**
+1. ~~Добавить `testImplementation("com.goterl:lazysodium-java:5.1.4")` + JNA.~~ Локальный JVM fallback, но тестирует НЕ ту libsodium, что едет пользователям → ложное зелёное.
+2. ~~Robolectric + нативные бинари.~~ Добавляет прослойку; снова не тот же рантайм.
+3. ✅ **Перенести libsodium-зависимые тесты в `androidInstrumentedTest` (запуск на устройстве/эмуляторе).**
 
-**Статус:** Вне скоупа Этапа 2. Компиляция зелёная, build зелёный — runtime failure существовал задолго до текущих изменений. Отдельная задача инфраструктуры.
+**Решение (2026-04-24):** Вариант 3 — тесты запускаются на реальной Android-машине с той же libsodium-биндингой, что уходит в production. Никаких fake-раннтаймов. Честное E2E тестирование.
+
+**Когда делать:** После VPS-деплоя релея, перед подачей заявки в NLnet (до 1 июня 2026). Причина такого порядка: NLnet-ревьюеры захотят видеть зелёный CI — инструментированные тесты на Android эмуляторе закрывают и unit-тестирование crypto, и демонстрируют что production-стек проверяется целиком.
+
+**Статус:** Вне скоупа Этапа 2. Компиляция зелёная, build зелёный — runtime failure существовал задолго до текущих изменений. Отдельная инфраструктурная задача, запланирована.
 
 ---
 

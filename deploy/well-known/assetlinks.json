@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "phantom.android",
+      "sha256_cert_fingerprints": [
+        "REPLACE_ME_WITH_RELEASE_KEY_SHA256_FINGERPRINT"
+      ]
+    }
+  }
+]

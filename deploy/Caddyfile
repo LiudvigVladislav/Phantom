@@ -1,0 +1,96 @@
+# PHANTOM Caddy configuration.
+#
+# Two virtual hosts:
+#   relay.phntm.pro — reverse-proxy WebSocket + HTTP to the relay container.
+#                     Cloudflare is set to DNS-only for this host; Caddy
+#                     handles TLS via Let's Encrypt directly (WebSocket-
+#                     friendly).
+#   phntm.pro       — static file serving for /.well-known/assetlinks.json
+#                     (Android Universal Links) and a placeholder landing.
+#                     Cloudflare is Proxied in front of this host.
+
+{
+    # Global options.
+    # Email for Let's Encrypt account + cert renewal notices.
+    email hello@phntm.pro
+    # Turn off automatic HTTPS redirect for /health to keep uptime probes cheap,
+    # but still serve over TLS.
+    # (Caddy auto-HTTPS is on by default; this is just the admin email.)
+}
+
+# -----------------------------------------------------------------------------
+# relay.phntm.pro — WebSocket + HTTP relay
+# -----------------------------------------------------------------------------
+relay.phntm.pro {
+    # Enforce HSTS (12 months) — once a client hits this host over TLS,
+    # the browser/app remembers and refuses plaintext fallback.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        # Relay serves no HTML, so CSP/X-Frame-Options are defense-in-depth.
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options        "DENY"
+        Referrer-Policy        "no-referrer"
+        # Remove Caddy's default Server banner to reveal less about the stack.
+        -Server
+    }
+
+    # Reverse-proxy everything to the relay container on the internal network.
+    # Caddy upgrades WebSocket connections automatically; no special `@ws`
+    # matcher is needed in v2.
+    reverse_proxy relay:8080 {
+        # Forward the real client IP so the relay's rate limiter can key on it.
+        header_up X-Real-IP        {remote_host}
+        header_up X-Forwarded-For  {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Structured access log — method + path only. No query string, no body.
+    # Matches the relay's in-process TraceLayer policy (never logs ?token=).
+    log {
+        output stdout
+        format json
+        level  INFO
+    }
+}
+
+# -----------------------------------------------------------------------------
+# phntm.pro — assetlinks.json + placeholder landing
+# -----------------------------------------------------------------------------
+# NOTE on Cloudflare:
+# For the first `docker compose up`, temporarily set the phntm.pro A record
+# to "DNS only" in Cloudflare so Caddy can complete the HTTP-01 ACME challenge.
+# Once the cert is issued (check /data/caddy/certificates/ in the caddy-data
+# volume), re-enable the orange cloud. Full (strict) mode in Cloudflare will
+# then accept Caddy's Let's Encrypt cert.
+# Alternative: use DNS-01 via Cloudflare API — see deploy/README.md.
+
+phntm.pro, www.phntm.pro {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        Referrer-Policy           "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    # Android App Links + Apple Universal Links live under /.well-known/.
+    # Android requires Content-Type: application/json on assetlinks.json.
+    handle_path /.well-known/* {
+        root   * /srv/well-known
+        header Content-Type application/json
+        file_server
+    }
+
+    # Placeholder landing. Replace with the actual Next.js build in Этап 4.3.
+    handle {
+        root * /srv/landing
+        try_files {path} /index.html
+        file_server
+    }
+
+    log {
+        output stdout
+        format json
+        level  INFO
+    }
+}
