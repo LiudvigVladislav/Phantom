@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.multiplatform)
@@ -5,6 +7,17 @@ plugins {
     alias(libs.plugins.compose.compiler)
     id("com.google.gms.google-services")
 }
+
+// Load release signing credentials from keystores/signing.properties (gitignored)
+// or fall back to SIGNING_* env vars (for CI). If neither is available, the
+// release build falls back to the debug signing config — lets contributors
+// build release APKs locally without access to the production key.
+val signingProps = Properties().apply {
+    val f = rootProject.file("keystores/signing.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun signingValue(propertyKey: String, envKey: String): String? =
+    signingProps.getProperty(propertyKey) ?: System.getenv(envKey)
 
 kotlin {
     androidTarget {
@@ -68,6 +81,26 @@ android {
         buildConfig = true
     }
 
+    signingConfigs {
+        create("release") {
+            val storeFileProp = signingValue("storeFile", "SIGNING_STORE_FILE")
+            val storePasswordProp = signingValue("storePassword", "SIGNING_STORE_PASSWORD")
+            val keyAliasProp = signingValue("keyAlias", "SIGNING_KEY_ALIAS")
+            val keyPasswordProp = signingValue("keyPassword", "SIGNING_KEY_PASSWORD")
+
+            if (storeFileProp != null && storePasswordProp != null &&
+                keyAliasProp != null && keyPasswordProp != null
+            ) {
+                storeFile = rootProject.file(storeFileProp)
+                storePassword = storePasswordProp
+                keyAlias = keyAliasProp
+                keyPassword = keyPasswordProp
+            }
+            // If any field is null, this config is left unusable and release
+            // below falls back to the debug signing config.
+        }
+    }
+
     buildTypes {
         debug {
             // Local network IP of the dev machine — phone and PC must be on same Wi-Fi.
@@ -81,6 +114,18 @@ android {
             buildConfigField("String", "RELAY_URL", "\"wss://relay.phntm.pro/ws\"")
             // Override this via CI secrets: -PRELAY_TOKEN=<value>
             buildConfigField("String", "RELAY_TOKEN", "null")
+
+            // Use the release key if keystores/signing.properties or SIGNING_*
+            // env vars supplied valid credentials; otherwise fall back to debug
+            // signing so contributors without the production key can still
+            // build a release APK locally (it just won't be Play Store-ready).
+            val releaseConfig = signingConfigs.getByName("release")
+            signingConfig = if (releaseConfig.storeFile != null) {
+                releaseConfig
+            } else {
+                logger.warn("No release keystore configured — falling back to debug signing for release build.")
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
