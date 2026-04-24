@@ -36,6 +36,10 @@ kotlin {
             implementation(libs.libsodium.bindings)
             implementation(libs.sqlcipher.android)
             implementation("androidx.biometric:biometric:1.1.0")
+            // WebRTC for voice calls — provides PeerConnectionFactory, AudioTrack, IceCandidate.
+            // stream/webrtc-android wraps Google's pre-built libwebrtc .aar so we avoid
+            // compiling WebRTC from source (which requires depot_tools + Linux host).
+            implementation("io.getstream:stream-webrtc-android:1.1.1")
             // FCM — silent push wakes the device so the WebSocket drains queued messages.
             // Requires google-services.json in apps/android/ and the plugin uncommented above.
             implementation("com.google.firebase:firebase-messaging-ktx:23.4.1")
@@ -74,7 +78,7 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            buildConfigField("String", "RELAY_URL", "\"wss://relay.phantom.app/ws\"")
+            buildConfigField("String", "RELAY_URL", "\"wss://relay.phntm.pro/ws\"")
             // Override this via CI secrets: -PRELAY_TOKEN=<value>
             buildConfigField("String", "RELAY_TOKEN", "null")
         }

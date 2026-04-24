@@ -6,7 +6,9 @@ import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
+import phantom.android.calls.CallManager
 import phantom.android.notifications.PhantomNotificationManager
 import phantom.android.service.DisappearingMessageScheduler
 import phantom.android.security.KeystoreManager
@@ -18,6 +20,11 @@ import phantom.core.identity.IdentityRepository
 import phantom.core.messaging.DefaultGroupMessagingService
 import phantom.core.messaging.DefaultMessagingService
 import phantom.core.messaging.GroupMessagingService
+import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_ANSWER
+import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_HANGUP
+import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_ICE
+import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_OFFER
+import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_REJECT
 import phantom.core.messaging.MessagingService
 import phantom.core.messaging.SessionManager
 import phantom.core.storage.DatabaseDriverFactory
@@ -80,6 +87,10 @@ class AppContainer(private val context: Context) {
     var groupMessagingService: GroupMessagingService? = null
         private set
 
+    // Initialised in initMessaging — requires identity.publicKeyHex and transport.
+    var callManager: CallManager? = null
+        private set
+
     // ── FCM token (read-only reference — registration is a TODO) ─────────────
     // Once google-services.json is added and the plugin is active, the token is
     // stored by PhantomFirebaseMessagingService.onNewToken under "fcm_token".
@@ -128,6 +139,29 @@ class AppContainer(private val context: Context) {
         )
         service.groupMessagingService = groupService
         groupMessagingService = groupService
+
+        // Initialise CallManager and wire call-signalling routing.
+        val cm = CallManager(
+            context = context,
+            myPubKeyHex = identity.publicKeyHex,
+            transport = transport,
+        )
+        cm.initialize()
+        callManager = cm
+
+        service.onCallMessage = { payload, fromPubKeyHex ->
+            appScope.launch {
+                val fromUsername = conversationRepo.getConversation(fromPubKeyHex)
+                    ?.theirUsername ?: fromPubKeyHex.take(8)
+                when (payload.type) {
+                    TYPE_CALL_OFFER  -> cm.handleOffer(fromPubKeyHex, fromUsername, payload.callId ?: "", payload.sdp ?: "")
+                    TYPE_CALL_ANSWER -> cm.handleAnswer(payload.sdp ?: "")
+                    TYPE_CALL_ICE    -> cm.handleIce(payload.iceCandidateJson ?: "")
+                    TYPE_CALL_HANGUP -> cm.handleRemoteHangup()
+                    TYPE_CALL_REJECT -> cm.handleRemoteReject()
+                }
+            }
+        }
 
         messagingService = service
     }

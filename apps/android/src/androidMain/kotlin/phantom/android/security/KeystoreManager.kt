@@ -31,6 +31,9 @@ object KeystoreManager {
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setKeySize(256)
+                // TODO Beta: add setUnlockedDeviceRequired(true) once we gate on
+                // BiometricManager.canAuthenticate() at first launch — without a
+                // secure lock screen the key generation throws InvalidAlgorithmParameterException.
                 .build()
         )
         return keyGen.generateKey()

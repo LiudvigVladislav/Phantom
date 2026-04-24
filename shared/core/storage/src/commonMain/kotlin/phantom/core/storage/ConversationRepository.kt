@@ -19,6 +19,11 @@ interface ConversationRepository {
     suspend fun setVerified(conversationId: String, verified: Boolean)
     suspend fun setDisappearingTimer(conversationId: String, secs: Long)
     suspend fun getDisappearingTimer(conversationId: String): Long
+    suspend fun archiveConversation(id: String)
+    suspend fun unarchiveConversation(id: String)
+    suspend fun getArchivedConversations(): List<ConversationEntity>
+    suspend fun setIdentityKeyChangedAt(conversationId: String, ts: Long)
+    suspend fun clearIdentityKeyChangedAt(conversationId: String)
 }
 
 data class ConversationEntity(
@@ -33,4 +38,6 @@ data class ConversationEntity(
     val notes: String? = null,
     val isVerified: Boolean = false,
     val disappearingTimerSecs: Long = 0L,
+    val archived: Boolean = false,
+    val identityKeyChangedAt: Long? = null,
 )

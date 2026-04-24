@@ -8,6 +8,7 @@ CREATE TABLE message (
     created_at INTEGER NOT NULL,
     expires_at_ms INTEGER,
     pinned INTEGER NOT NULL DEFAULT 0,
+    saved INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(conversation_id) REFERENCES conversation(id) ON DELETE CASCADE
 );
 
@@ -47,3 +48,12 @@ UPDATE message SET pinned = :pinned WHERE id = :id;
 
 getPinnedMessages:
 SELECT * FROM message WHERE conversation_id = :conversationId AND pinned = 1 ORDER BY created_at ASC;
+
+saveMessage:
+UPDATE message SET saved = 1 WHERE id = ?;
+
+unsaveMessage:
+UPDATE message SET saved = 0 WHERE id = ?;
+
+getSavedMessages:
+SELECT * FROM message WHERE saved = 1 ORDER BY created_at DESC;

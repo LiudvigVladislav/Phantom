@@ -12,6 +12,9 @@ interface MessageRepository {
     suspend fun deleteExpiredMessages()
     suspend fun pinMessage(messageId: String, pinned: Boolean)
     suspend fun getPinnedMessages(conversationId: String): List<MessageEntity>
+    suspend fun saveMessage(id: String)
+    suspend fun unsaveMessage(id: String)
+    suspend fun getSavedMessages(): List<MessageEntity>
 }
 
 enum class MessageStatus {
@@ -32,6 +35,7 @@ data class MessageEntity(
     val createdAt: Long,
     val expiresAtMs: Long? = null,
     val pinned: Boolean = false,
+    val saved: Boolean = false,
 ) {
     // ByteArray requires explicit equals/hashCode to avoid identity comparison.
     override fun equals(other: Any?): Boolean {
@@ -45,7 +49,8 @@ data class MessageEntity(
             status == other.status &&
             createdAt == other.createdAt &&
             expiresAtMs == other.expiresAtMs &&
-            pinned == other.pinned
+            pinned == other.pinned &&
+            saved == other.saved
     }
 
     override fun hashCode(): Int {
@@ -58,6 +63,7 @@ data class MessageEntity(
         result = 31 * result + createdAt.hashCode()
         result = 31 * result + (expiresAtMs?.hashCode() ?: 0)
         result = 31 * result + pinned.hashCode()
+        result = 31 * result + saved.hashCode()
         return result
     }
 }

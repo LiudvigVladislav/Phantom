@@ -35,11 +35,6 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material3.*
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.runtime.*
@@ -57,6 +52,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.foundation.border
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpOffset
@@ -73,7 +69,7 @@ import kotlinx.coroutines.withContext
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.window.Popup
 import phantom.android.di.AppContainer
-import phantom.android.ui.GradientAvatar
+import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.core.messaging.OutgoingMessage
 import phantom.core.messaging.SafetyReportCategory
@@ -471,7 +467,7 @@ fun ChatScreen(
                             )
                         }
                         IconButton(onClick = { replyToMessage = null }, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Отмена", tint = TextDim, modifier = Modifier.size(18.dp))
+                            PhIconBack(color = TextDim, size = 18.dp)
                         }
                     }
                 }
@@ -498,7 +494,7 @@ fun ChatScreen(
                             Text(editing.plaintextCache ?: "•••", color = TextDim, fontSize = 12.sp, maxLines = 1)
                         }
                         IconButton(onClick = { editingMessage = null; inputText = "" }, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Отмена", tint = TextDim, modifier = Modifier.size(18.dp))
+                            PhIconBack(color = TextDim, size = 18.dp)
                         }
                     }
                 }
@@ -529,6 +525,14 @@ fun ChatScreen(
                     isEditing = editingMessage != null,
                     isRecording = isRecording,
                     recordingDurationMs = recordingDurationMs,
+                    onCancelRecording = {
+                        mediaRecorder?.stop()
+                        mediaRecorder?.release()
+                        mediaRecorder = null
+                        isRecording = false
+                        audioFile?.delete()
+                        audioFile = null
+                    },
                     onMicClick = {
                         if (isRecording) {
                             // Stop recording and send audio
@@ -1114,9 +1118,11 @@ private fun MessageBubble(
                         if (isSent) Modifier.background(
                             brush = Brush.linearGradient(
                                 colors = listOf(CyanAccent, Color(0xFF0099CC)),
+                                start = Offset(0f, 0f),
+                                end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY),
                             ),
                             shape = bubbleShape,
-                        ) else Modifier.background(color = Surface2, shape = bubbleShape)
+                        ) else Modifier.background(color = Surface, shape = bubbleShape)
                     )
                     .combinedClickable(
                         onClick = {},
@@ -1411,6 +1417,27 @@ private fun MessageBubble(
                         onForward(text, senderLabel)
                     },
                 )
+                DropdownMenuItem(
+                    leadingIcon = { MenuIcon(0x1F516) }, // 🔖
+                    text = { Text("Save", color = TextPrimary, fontSize = 14.sp) },
+                    onClick = {
+                        showActions = false
+                        bubbleCoroutineScope.launch {
+                            val savedConvId = "saved_messages_local"
+                            container.messageRepo.insertMessage(
+                                phantom.core.storage.MessageEntity(
+                                    id = com.benasher44.uuid.uuid4().toString(),
+                                    conversationId = savedConvId,
+                                    ciphertext = ByteArray(0),
+                                    plaintextCache = "↩ from @${if (entity.sent) "You" else theirUsername}\n$text",
+                                    sent = true,
+                                    status = phantom.core.storage.MessageStatus.DELIVERED,
+                                    createdAt = System.currentTimeMillis(),
+                                )
+                            )
+                        }
+                    },
+                )
                 HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
                 DropdownMenuItem(
                     leadingIcon = { MenuIcon(0x1F5D1) }, // 🗑
@@ -1448,29 +1475,28 @@ private fun StatusIcon(status: MessageStatus) {
             }
         }
         MessageStatus.SENT -> {
-            // Single checkmark
+            // Single checkmark — dim on cyan bubble
             Canvas(modifier = Modifier.size(14.dp)) {
                 drawCheckmark(
-                    color = Color.White.copy(alpha = 0.55f),
+                    color = BgDeep.copy(alpha = 0.62f),
                     offsetX = size.width * 0.1f,
                 )
             }
         }
         MessageStatus.RELAYED, MessageStatus.DELIVERED -> {
-            // Double checkmark, white
+            // Double checkmark — dim or slightly brighter
             val color = if (status == MessageStatus.DELIVERED)
-                Color.White.copy(alpha = 0.9f) else Color.White.copy(alpha = 0.7f)
+                BgDeep.copy(alpha = 0.75f) else BgDeep.copy(alpha = 0.55f)
             Canvas(modifier = Modifier.size(18.dp)) {
                 drawCheckmark(color = color, offsetX = 0f)
                 drawCheckmark(color = color, offsetX = size.width * 0.3f)
             }
         }
         MessageStatus.READ -> {
-            // Double checkmark, green
-            val green = Color(0xFF4FC97B)
+            // Double checkmark — cyan accent (matches design spec)
             Canvas(modifier = Modifier.size(18.dp)) {
-                drawCheckmark(color = green, offsetX = 0f)
-                drawCheckmark(color = green, offsetX = size.width * 0.3f)
+                drawCheckmark(color = CyanAccent, offsetX = 0f)
+                drawCheckmark(color = CyanAccent, offsetX = size.width * 0.3f)
             }
         }
     }
@@ -1643,6 +1669,7 @@ private fun InputBar(
     isRecording: Boolean = false,
     recordingDurationMs: Long = 0L,
     onMicClick: () -> Unit = {},
+    onCancelRecording: () -> Unit = {},
     onSend: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
@@ -1665,34 +1692,27 @@ private fun InputBar(
                 .padding(bottom = 4.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            // Left: emoji toggle / hidden during recording
-            if (!isRecording) {
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(CircleShape)
-                        .clickable(onClick = onEmojiToggle),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    // Paperclip icon (Canvas)
-                    Canvas(modifier = Modifier.size(22.dp)) {
-                        val c = TextDim
-                        val sw = 1.6.dp.toPx()
-                        val st = Stroke(width = sw, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
-                        val path = androidx.compose.ui.graphics.Path().apply {
-                            val cx = size.width * 0.55f
-                            val cy = size.height * 0.5f
-                            val r = size.width * 0.28f
-                            moveTo(cx - r * 0.5f, cy - r * 1.5f)
-                            cubicTo(cx + r * 1.2f, cy - r * 1.5f, cx + r * 1.2f, cy + r * 1.0f, cx - r * 0.1f, cy + r * 1.0f)
-                            cubicTo(cx - r * 1.1f, cy + r * 1.0f, cx - r * 1.1f, cy - r * 0.6f, cx - r * 0.1f, cy - r * 0.6f)
-                            cubicTo(cx + r * 0.6f, cy - r * 0.6f, cx + r * 0.6f, cy + r * 0.3f, cx - r * 0.1f, cy + r * 0.3f)
-                        }
-                        drawPath(path, color = c, style = st)
+            // Left: cancel (X) during recording, emoji toggle otherwise
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .clickable(onClick = if (isRecording) onCancelRecording else onEmojiToggle),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (isRecording) {
+                    // X — cancel recording
+                    Canvas(modifier = Modifier.size(18.dp)) {
+                        val sw = 2.dp.toPx()
+                        val pad = size.width * 0.18f
+                        drawLine(Danger, Offset(pad, pad), Offset(size.width - pad, size.height - pad), sw, StrokeCap.Round)
+                        drawLine(Danger, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
                     }
+                } else {
+                    PhIconPaperclip(color = TextDim, size = 22.dp)
                 }
-                Spacer(Modifier.width(6.dp))
             }
+            if (!isRecording) Spacer(Modifier.width(6.dp))
 
             // Center: text field or recording indicator
             if (isRecording) {
@@ -1746,6 +1766,13 @@ private fun InputBar(
                 Box(
                     modifier = Modifier
                         .size(44.dp)
+                        .shadow(
+                            elevation = 12.dp,
+                            shape = CircleShape,
+                            clip = false,
+                            spotColor = CyanAccent.copy(alpha = 0.5f),
+                            ambientColor = CyanAccent.copy(alpha = 0.2f),
+                        )
                         .clip(CircleShape)
                         .background(CyanAccent)
                         .clickable(onClick = {
@@ -1773,22 +1800,33 @@ private fun InputBar(
                     }
                 }
             } else {
-                // Mic button — tap to start/stop recording
+                // Mic button — tap to start recording; send arrow when recording
                 Box(
                     modifier = Modifier
-                        .size(44.dp)
+                        .size(if (isRecording) 44.dp else 36.dp)
+                        .then(
+                            if (isRecording) Modifier.shadow(
+                                elevation = 12.dp,
+                                shape = CircleShape,
+                                clip = false,
+                                spotColor = CyanAccent.copy(alpha = 0.4f),
+                                ambientColor = CyanAccent.copy(alpha = 0.15f),
+                            ) else Modifier
+                        )
                         .clip(CircleShape)
-                        .background(if (isRecording) Danger else Surface2)
+                        .background(if (isRecording) CyanAccent else Color.Transparent)
                         .clickable(onClick = onMicClick),
                     contentAlignment = Alignment.Center,
                 ) {
                     if (isRecording) {
-                        // Stop icon (square)
-                        Canvas(modifier = Modifier.size(14.dp)) {
-                            drawRoundRect(
-                                color = Color.White,
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(3.dp.toPx()),
-                            )
+                        // Send arrow (same as text send)
+                        Canvas(modifier = Modifier.size(20.dp)) {
+                            val sw = 2.2.dp.toPx()
+                            val cap = StrokeCap.Round
+                            val cx = size.width / 2f
+                            drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
                         }
                     } else {
                         // Mic icon (Canvas)
@@ -1995,12 +2033,7 @@ private fun ChatTopBar(
                     .clickable(onClick = onBack),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back",
-                    tint = TextPrimary,
-                    modifier = Modifier.size(18.dp),
-                )
+                PhIconBack(color = TextPrimary, size = 18.dp)
             }
 
             Spacer(Modifier.width(10.dp))
@@ -2043,15 +2076,7 @@ private fun ChatTopBar(
 
             Spacer(Modifier.width(10.dp))
 
-            // Phone icon (future: voice call)
-            Icon(
-                Icons.Default.Phone,
-                contentDescription = "Call",
-                tint = TextDim,
-                modifier = Modifier
-                    .size(20.dp)
-                    .clickable { },
-            )
+            PhIconPhone(color = TextDim, modifier = Modifier.clickable { }, size = 20.dp)
 
             Spacer(Modifier.width(12.dp))
 
@@ -2062,12 +2087,7 @@ private fun ChatTopBar(
 
             Box {
                 IconButton(onClick = onMoreMenu, modifier = Modifier.size(32.dp)) {
-                    Icon(
-                        Icons.Default.MoreVert,
-                        contentDescription = "More",
-                        tint = TextDim,
-                        modifier = Modifier.size(18.dp),
-                    )
+                    PhIconMoreVert(color = TextDim, size = 18.dp)
                 }
                 DropdownMenu(
                     expanded = showMenu,

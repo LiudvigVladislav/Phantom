@@ -37,6 +37,7 @@ class LibsodiumDoubleRatchet : DoubleRatchet {
             nonce   = nonce.toUByteArray(),
             key     = messageKey.toUByteArray(),
         ).toByteArray()
+        messageKey.zeroize()
 
         val newState = stateWithChain.copy(
             sendingChainKey = nextChainKey,
@@ -77,8 +78,10 @@ class LibsodiumDoubleRatchet : DoubleRatchet {
                 key        = messageKey.toUByteArray(),
             ).toByteArray()
         } catch (e: Exception) {
+            messageKey.zeroize()
             throw IllegalArgumentException("Decryption failed: MAC verification error", e)
         }
+        messageKey.zeroize()
 
         val newState = stateAfterDh.copy(
             receivingChainKey = nextChainKey,
@@ -100,6 +103,7 @@ class LibsodiumDoubleRatchet : DoubleRatchet {
         ).toByteArray()
 
         val (newRoot, newChain) = kdfRatchet(state.rootKey, dhOutput)
+        dhOutput.zeroize()
 
         return state.copy(
             rootKey                  = newRoot,
@@ -119,6 +123,7 @@ class LibsodiumDoubleRatchet : DoubleRatchet {
         ).toByteArray()
 
         val (newRoot, newReceivingChain) = kdfRatchet(state.rootKey, dhOutput)
+        dhOutput.zeroize()
 
         return state.copy(
             rootKey                   = newRoot,

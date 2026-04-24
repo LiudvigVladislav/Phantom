@@ -2,13 +2,12 @@ package phantom.android.screens.calls
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -19,27 +18,15 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import phantom.android.calls.ActiveCall
+import phantom.android.calls.CallState
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
-
-private data class CallEntry(
-    val name: String,
-    val direction: String, // "in" | "out" | "missed"
-    val type: String,       // "voice" | "video"
-    val time: String,
-    val duration: String?,
-)
-
-private val sampleCalls = listOf(
-    CallEntry("Alex",     "out",    "voice", "17:42", "12:04"),
-    CallEntry("Mikhail",  "in",     "video", "15:30", "03:18"),
-    CallEntry("Dr.Raven", "missed", "voice", "14:12", null),
-    CallEntry("Karel",    "out",    "voice", "Tue",   "00:42"),
-    CallEntry("Ghost",    "in",     "video", "Tue",   "08:55"),
-    CallEntry("Sasha",    "out",    "voice", "Sun",   "01:07"),
-)
+import phantom.core.storage.ConversationEntity
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -48,9 +35,23 @@ fun CallsScreen(
     onNavigate: (Screen) -> Unit,
     onProfile: () -> Unit = {},
 ) {
+    val scope = rememberCoroutineScope()
     var userName by remember { mutableStateOf("") }
+    var contacts by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
+
     LaunchedEffect(Unit) {
         userName = container.identityRepo.loadIdentity()?.username ?: ""
+        contacts = runCatching { container.conversationRepo.getActiveConversations() }.getOrElse { emptyList() }
+    }
+
+    // Monitor incoming calls — navigate to IncomingCallScreen when RINGING
+    val cm = container.callManager
+    val activeCall by (cm?.activeCall ?: MutableStateFlow<ActiveCall?>(null)).collectAsState()
+    LaunchedEffect(activeCall) {
+        val call = activeCall
+        if (call != null && call.state == CallState.RINGING) {
+            onNavigate(Screen.IncomingCall(call.remotePubKeyHex, call.remoteUsername))
+        }
     }
 
     Scaffold(
@@ -69,61 +70,34 @@ fun CallsScreen(
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                // Filter chips
-                LazyRow(
-                    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    item { FilterChip(label = "All", active = true) }
-                    item { FilterChip(label = "Incoming") }
-                    item { FilterChip(label = "Outgoing") }
-                    item { FilterChip(label = "Missed") }
-                }
-
-                // Call list
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 180.dp),
-                ) {
-                    items(sampleCalls) { call ->
-                        CallRow(call)
-                    }
-                }
-            }
-
-            // COMING SOON overlay — covers filter chips + list
-            ComingSoonOverlay(kicker = "CALLS · α 0.1")
-
-            // Start a Call button — visible through overlay? No — above overlay
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 20.dp)
-                    .padding(bottom = 100.dp),
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 180.dp),
             ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(54.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(CyanAccent),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Icon(Icons.Default.Phone, contentDescription = null, tint = BgDeep, modifier = Modifier.size(16.dp))
-                        Text(
-                            text = "START A CALL",
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            letterSpacing = 2.8.sp,
-                            color = BgDeep,
+                // ── Contact list with "Call" button ─────────────────────
+                if (contacts.isNotEmpty()) {
+                    item {
+                        SectionHeader(text = "Contacts")
+                    }
+                    items(contacts, key = { it.id }) { conv ->
+                        ContactCallRow(
+                            conv = conv,
+                            onCall = {
+                                scope.launch {
+                                    container.callManager?.startCall(conv.theirPublicKeyHex, conv.theirUsername)
+                                }
+                                onNavigate(Screen.ActiveCall(conv.id, conv.theirUsername))
+                            },
                         )
                     }
+                }
+
+                // ── Recent call history — coming soon ──────────────────
+                item {
+                    SectionHeader(text = "Recent")
+                }
+                item {
+                    ComingSoonBanner()
                 }
             }
 
@@ -132,9 +106,9 @@ fun CallsScreen(
                 activeTab = NavTab.CALLS,
                 onTabSelected = { tab ->
                     when (tab) {
-                        NavTab.CHATS -> onNavigate(Screen.ChatList)
+                        NavTab.CHATS    -> onNavigate(Screen.ChatList)
                         NavTab.SETTINGS -> onNavigate(Screen.Settings)
-                        NavTab.CALLS -> {}
+                        NavTab.CALLS    -> {}
                     }
                 },
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -144,82 +118,91 @@ fun CallsScreen(
 }
 
 @Composable
-private fun FilterChip(label: String, active: Boolean = false) {
+private fun ComingSoonBanner() {
     Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(if (active) CyanAccent else Color.Transparent)
-            .border(
-                width = if (active) 0.dp else 1.dp,
-                color = Color.White.copy(alpha = if (active) 0f else 0.08f),
-                shape = RoundedCornerShape(999.dp),
-            )
-            .padding(horizontal = 14.dp, vertical = 7.dp),
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 24.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Surface)
+            .border(1.dp, CyanAccent.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
+            .padding(horizontal = 20.dp, vertical = 24.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = label,
-            fontSize = 12.sp,
-            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-            color = if (active) BgDeep else TextDim,
-            letterSpacing = 0.2.sp,
-        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            PhIconPhone(color = CyanAccent.copy(alpha = 0.5f), size = 36.dp)
+            Text(
+                text = "Call history — coming soon",
+                color = TextPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "Stay tuned for updates",
+                color = TextDim,
+                fontSize = 13.sp,
+            )
+        }
     }
 }
 
 @Composable
-private fun CallRow(call: CallEntry) {
-    val nameColor = if (call.direction == "missed") Danger else TextPrimary
+private fun SectionHeader(text: String) {
+    Text(
+        text = text.uppercase(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .padding(top = 16.dp, bottom = 6.dp),
+        fontFamily = FontFamily.Monospace,
+        fontSize = 10.sp,
+        letterSpacing = 2.8.sp,
+        color = TextDim,
+    )
+}
+
+@Composable
+private fun ContactCallRow(conv: ConversationEntity, onCall: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        GradientAvatar(name = call.name, size = 44.dp)
+        GradientAvatar(name = conv.theirUsername, size = 44.dp)
 
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = call.name,
-                color = nameColor,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Spacer(Modifier.height(3.dp))
+        Text(
+            text = conv.theirUsername,
+            color = TextPrimary,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(1f),
+        )
+
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(CyanAccent.copy(alpha = 0.12f))
+                .border(1.dp, CyanAccent.copy(alpha = 0.3f), RoundedCornerShape(999.dp))
+                .clickable(onClick = onCall)
+                .padding(horizontal = 14.dp, vertical = 7.dp),
+        ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                val arrowColor = when (call.direction) {
-                    "in"     -> Success
-                    "out"    -> CyanAccent
-                    else     -> Danger
-                }
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(arrowColor),
-                )
+                PhIconPhone(color = CyanAccent, size = 14.dp)
                 Text(
-                    text = when {
-                        call.direction == "missed" -> "Missed"
-                        call.type == "video" -> "Video · ${call.duration}"
-                        else -> call.duration ?: ""
-                    },
-                    color = TextDim,
+                    text = "Call",
+                    color = CyanAccent,
                     fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
                 )
             }
         }
-
-        Text(text = call.time, color = TextDim, fontSize = 11.sp)
-
-        Icon(
-            Icons.Default.Phone,
-            contentDescription = "Call back",
-            tint = CyanAccent,
-            modifier = Modifier.size(18.dp),
-        )
     }
 }

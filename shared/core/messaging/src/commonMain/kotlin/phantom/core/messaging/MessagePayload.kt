@@ -31,6 +31,14 @@ data class MessagePayload(
     // ── Voice / Audio ─────────────────────────────────────────────────────────
     val audioDataB64: String? = null,                  // base64 OGG audio for audio type
     val audioDurationMs: Long? = null,
+
+    // ── Voice Calls (WebRTC signalling over relay) ────────────────────────────
+    val sdp: String? = null,                           // SDP offer or answer
+    val iceCandidateJson: String? = null,              // JSON {"sdpMid":"...","sdpMLineIndex":0,"candidate":"..."}
+    val callId: String? = null,                        // UUID for the call session
+
+    // ── Key Rotation ──────────────────────────────────────────────────────────
+    val newPublicKeyHex: String? = null,               // key_rotation: sender's new identity key
 ) {
     companion object {
         // 1:1 message types (pre-existing)
@@ -51,6 +59,25 @@ data class MessagePayload(
 
         // Media types (new)
         const val TYPE_AUDIO = "audio"
+
+        // Key rotation — sender announces a new identity key
+        const val TYPE_KEY_ROTATION = "key_rotation"
+
+        // Voice call signalling — these are never stored as chat messages
+        const val TYPE_CALL_OFFER  = "call_offer"
+        const val TYPE_CALL_ANSWER = "call_answer"
+        const val TYPE_CALL_ICE    = "call_ice"
+        const val TYPE_CALL_HANGUP = "call_hangup"
+        const val TYPE_CALL_REJECT = "call_reject"
+
+        /** All call-signalling types that must be routed to CallManager, not stored. */
+        val CALL_TYPES = setOf(
+            TYPE_CALL_OFFER,
+            TYPE_CALL_ANSWER,
+            TYPE_CALL_ICE,
+            TYPE_CALL_HANGUP,
+            TYPE_CALL_REJECT,
+        )
 
         /** All group-related types that must be routed to GroupMessagingService. */
         val GROUP_TYPES = setOf(

@@ -16,9 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Send
+import phantom.android.ui.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -176,12 +174,7 @@ fun SavedMessagesScreen(
                         .clickable(onClick = onBack),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back",
-                        tint = TextPrimary,
-                        modifier = Modifier.size(18.dp),
-                    )
+                    PhIconBack(color = TextPrimary, size = 18.dp)
                 }
                 Text(
                     text = "NOTES",
@@ -375,12 +368,7 @@ fun SavedMessagesScreen(
                             .clip(CircleShape)
                             .background(color = CyanAccent),
                     ) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Save",
-                            tint = BgDeep,
-                            modifier = Modifier.size(17.dp),
-                        )
+                        PhIconArrowUp(color = BgDeep, size = 17.dp)
                     }
                 }
             }

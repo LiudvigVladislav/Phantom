@@ -1,4 +1,5 @@
 use crate::{envelope::*, error::RelayError, state::{AppState, AbuseReport, RateEntry, append_report_to_disk, append_block_to_disk}};
+use subtle::ConstantTimeEq;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -63,7 +64,8 @@ async fn ws_handler(
     // demo relay; it is not a replacement for per-user authentication.
     if let Some(expected) = &state.config.secret_token {
         let provided = params.get("token").map(|s| s.as_str()).unwrap_or("");
-        if provided != expected.as_str() {
+        let token_ok: bool = provided.as_bytes().ct_eq(expected.as_bytes()).into();
+        if !token_ok {
             tracing::warn!(id = %&id[..id.len().min(16)], "ws rejected: bad or missing token");
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
@@ -518,8 +520,11 @@ async fn submit_report(
 
 fn check_admin_token(params: &HashMap<String, String>, state: &Arc<AppState>) -> bool {
     match &state.config.secret_token {
-        Some(expected) => params.get("token").map(|s| s.as_str()) == Some(expected.as_str()),
-        None => false, // admin disabled if no token configured
+        Some(expected) => params.get("token").map_or(false, |provided| {
+            let ok: bool = provided.as_bytes().ct_eq(expected.as_bytes()).into();
+            ok
+        }),
+        None => false,
     }
 }
 

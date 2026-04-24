@@ -67,6 +67,16 @@ class DefaultMessagingService(
      */
     @Volatile var groupMessagingService: GroupMessagingService? = null
 
+    /**
+     * Platform hook for call signalling.
+     * Set by the Android AppContainer after [initMessaging].
+     * Called for any incoming payload whose type is in [MessagePayload.CALL_TYPES].
+     * The callback must be non-blocking (delegate processing to a coroutine scope).
+     *
+     * Parameters: payload, senderPublicKeyHex
+     */
+    @Volatile var onCallMessage: ((MessagePayload, String) -> Unit)? = null
+
     override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> = runCatching {
         val state = sessionManager.getOrCreateSession(
             conversationId = message.conversationId,
@@ -206,6 +216,12 @@ class DefaultMessagingService(
                 return@runCatching
             }
 
+            // Route call-signalling messages to CallManager; never store as chat messages.
+            if (payload.type in MessagePayload.CALL_TYPES) {
+                onCallMessage?.invoke(payload, senderPubKeyHex)
+                return@runCatching
+            }
+
             // Handle control messages — do not store as chat messages
             if (payload.type == MessagePayload.TYPE_DELETE && payload.targetMessageId.isNotEmpty()) {
                 messageRepository.deleteMessage(payload.targetMessageId)
@@ -261,6 +277,20 @@ class DefaultMessagingService(
                 messageRepository.pinMessage(payload.targetMessageId, payload.pinned ?: false)
                 return@runCatching
             }
+            if (payload.type == MessagePayload.TYPE_KEY_ROTATION) {
+                val existing = conversationRepository.getConversation(conversationId)
+                if (existing != null && existing.theirPublicKeyHex != senderPubKeyHex) {
+                    conversationRepository.upsertConversation(
+                        existing.copy(
+                            theirPublicKeyHex = senderPubKeyHex,
+                            isVerified = false,
+                            identityKeyChangedAt = Clock.System.now().toEpochMilliseconds(),
+                        )
+                    )
+                    sessionManager.deleteSession(conversationId)
+                }
+                return@runCatching
+            }
 
             val nowMs = Clock.System.now().toEpochMilliseconds()
             val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
@@ -283,6 +313,10 @@ class DefaultMessagingService(
             val existing = conversationRepository.getConversation(conversationId)
             if (existing == null) {
                 val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
+                // Detect key rotation: existing conversation with same username but different key.
+                val prevByName = conversationRepository.getActiveConversations()
+                    .firstOrNull { it.theirUsername == senderName && it.theirPublicKeyHex != senderPubKeyHex }
+                val keyChangedAt = if (prevByName != null) Clock.System.now().toEpochMilliseconds() else null
                 conversationRepository.upsertConversation(
                     ConversationEntity(
                         id = conversationId,
@@ -293,6 +327,7 @@ class DefaultMessagingService(
                         unreadCount = 1,
                         trustTier = TrustTier.REQUEST,
                         blocked = false,
+                        identityKeyChangedAt = keyChangedAt,
                     )
                 )
             } else {

@@ -15,4 +15,6 @@ sealed class Screen {
     data class Chat(val conversationId: String, val theirUsername: String) : Screen()
     data class ContactProfile(val conversationId: String, val theirUsername: String) : Screen()
     data class GroupChat(val groupId: String, val groupName: String, val isChannel: Boolean) : Screen()
+    data class ActiveCall(val conversationId: String, val username: String) : Screen()
+    data class IncomingCall(val conversationId: String, val username: String) : Screen()
 }

@@ -40,6 +40,10 @@ class SqlDelightConversationRepository(
                 trust_tier = entity.trustTier.name,
                 blocked = if (entity.blocked) 1L else 0L,
                 notes = entity.notes,
+                is_verified = if (entity.isVerified) 1L else 0L,
+                disappearing_timer_secs = entity.disappearingTimerSecs,
+                archived = if (entity.archived) 1L else 0L,
+                identity_key_changed_at = entity.identityKeyChangedAt,
             )
         }
 
@@ -103,6 +107,31 @@ class SqlDelightConversationRepository(
                 ?: 0L
         }
 
+    override suspend fun archiveConversation(id: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.archiveConversation(id)
+        }
+
+    override suspend fun unarchiveConversation(id: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.unarchiveConversation(id)
+        }
+
+    override suspend fun getArchivedConversations(): List<ConversationEntity> =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.getArchivedConversations().executeAsList().map { it.toEntity() }
+        }
+
+    override suspend fun setIdentityKeyChangedAt(conversationId: String, ts: Long): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.setIdentityKeyChangedAt(ts = ts, id = conversationId)
+        }
+
+    override suspend fun clearIdentityKeyChangedAt(conversationId: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.clearIdentityKeyChangedAt(id = conversationId)
+        }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------
@@ -119,5 +148,7 @@ class SqlDelightConversationRepository(
         notes = notes,
         isVerified = is_verified != 0L,
         disappearingTimerSecs = disappearing_timer_secs,
+        archived = archived != 0L,
+        identityKeyChangedAt = identity_key_changed_at,
     )
 }

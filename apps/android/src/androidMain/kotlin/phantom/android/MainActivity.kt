@@ -18,12 +18,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.service.PhantomMessagingService
 import phantom.android.screens.splash.PhantomSplashScreen
 import phantom.android.navigation.Screen
 import phantom.android.qr.QrScanScreen
+import phantom.android.calls.ActiveCall
+import phantom.android.calls.CallState
+import phantom.android.screens.calls.ActiveCallScreen
 import phantom.android.screens.calls.CallsScreen
+import phantom.android.screens.calls.IncomingCallScreen
 import phantom.android.screens.chat.ChatScreen
 import phantom.android.screens.chatlist.ChatListScreen
 import phantom.android.screens.contact.ContactProfileScreen
@@ -184,6 +190,7 @@ private fun PhantomApp(
     notifSenderName: String? = null,
     pendingInviteQr: androidx.compose.runtime.MutableState<String?> = androidx.compose.runtime.mutableStateOf(null),
 ) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     var startScreen by remember { mutableStateOf<Screen?>(null) }
 
     LaunchedEffect(Unit) {
@@ -289,7 +296,9 @@ private fun PhantomApp(
             onBack = { currentScreen = Screen.ChatList },
         )
         is Screen.Archive -> ArchiveScreen(
+            container = container,
             onBack = { currentScreen = Screen.ChatList },
+            onNavigateToChat = { chatScreen -> currentScreen = chatScreen },
         )
         is Screen.GroupChat -> GroupChatScreen(
             groupId   = screen.groupId,
@@ -308,5 +317,43 @@ private fun PhantomApp(
             onCreated = { groupId, groupName -> currentScreen = Screen.GroupChat(groupId, groupName, true) },
             onBack    = { currentScreen = Screen.ChatList },
         )
+        is Screen.ActiveCall -> {
+            val cm = container.callManager
+            val noCallFlow = remember { MutableStateFlow<ActiveCall?>(null) }
+            val callState by (cm?.activeCall ?: noCallFlow).collectAsState()
+            val call = callState
+            if (call != null && cm != null) {
+                ActiveCallScreen(
+                    call = call,
+                    onHangup = { scope.launch { cm.hangup() }; currentScreen = Screen.ChatList },
+                    onToggleMute = { cm.toggleMute() },
+                    onToggleSpeaker = { cm.toggleSpeaker() },
+                    onBack = { currentScreen = Screen.ChatList },
+                )
+            }
+        }
+        is Screen.IncomingCall -> IncomingCallScreen(
+            username = screen.username,
+            onAnswer = {
+                scope.launch { container.callManager?.answerCall() }
+                currentScreen = Screen.ActiveCall(screen.conversationId, screen.username)
+            },
+            onReject = {
+                scope.launch { container.callManager?.rejectCall() }
+                currentScreen = Screen.ChatList
+            },
+        )
+    }
+
+    // Global observer — navigate to IncomingCall when a RINGING call arrives from any screen
+    LaunchedEffect(container.callManager) {
+        container.callManager?.activeCall?.collect { call ->
+            if (call != null &&
+                call.state == CallState.RINGING &&
+                currentScreen !is Screen.IncomingCall
+            ) {
+                currentScreen = Screen.IncomingCall(call.remotePubKeyHex, call.remoteUsername)
+            }
+        }
     }
 }

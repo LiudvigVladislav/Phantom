@@ -81,6 +81,21 @@ class SqlDelightMessageRepository(
             db.messageQueries.getPinnedMessages(conversationId).executeAsList().map { it.toEntity() }
         }
 
+    override suspend fun saveMessage(id: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.saveMessage(id)
+        }
+
+    override suspend fun unsaveMessage(id: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.unsaveMessage(id)
+        }
+
+    override suspend fun getSavedMessages(): List<MessageEntity> =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.getSavedMessages().executeAsList().map { it.toEntity() }
+        }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------
@@ -95,6 +110,7 @@ class SqlDelightMessageRepository(
         createdAt = created_at,
         expiresAtMs = expires_at_ms,
         pinned = pinned != 0L,
+        saved = saved != 0L,
     )
 
     private fun statusFromString(raw: String): MessageStatus =

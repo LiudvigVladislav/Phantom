@@ -6,8 +6,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -21,7 +19,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
-import phantom.android.ui.GradientAvatar
+import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.core.storage.ConversationEntity
 
@@ -67,12 +65,7 @@ fun MessageRequestsScreen(
                         .clickable(onClick = onBack),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back",
-                        tint = TextPrimary,
-                        modifier = Modifier.size(18.dp),
-                    )
+                    PhIconBack(color = TextPrimary, size = 18.dp)
                 }
                 Text(
                     text = "REQUESTS",

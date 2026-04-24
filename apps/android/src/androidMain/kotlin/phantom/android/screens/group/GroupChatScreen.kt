@@ -16,13 +16,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
+import phantom.android.ui.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -75,7 +69,7 @@ fun GroupChatScreen(
     // Release recorder if screen is disposed while recording
     DisposableEffect(Unit) {
         onDispose {
-            mediaRecorder?.stop()
+            runCatching { mediaRecorder?.stop() }
             mediaRecorder?.release()
             mediaRecorder = null
         }
@@ -87,9 +81,11 @@ fun GroupChatScreen(
     ) { granted ->
         if (granted) {
             val result = startGroupRecording(context)
-            audioFile = result.first
-            mediaRecorder = result.second
-            isRecording = true
+            if (result != null) {
+                audioFile = result.first
+                mediaRecorder = result.second
+                isRecording = true
+            }
         }
     }
 
@@ -99,6 +95,8 @@ fun GroupChatScreen(
 
     LaunchedEffect(groupId) {
         reloadMessages()
+        memberCount = container.groupRepo.getMemberCount(groupId).toInt()
+        myRole = container.groupRepo.getGroup(groupId)?.myRole ?: "member"
     }
 
     // Poll groupMessageFlow for new messages matching this groupId
@@ -166,14 +164,14 @@ fun GroupChatScreen(
                     onMicClick = {
                         if (isRecording) {
                             // Stop recording and send
-                            mediaRecorder?.stop()
+                            runCatching { mediaRecorder?.stop() }
                             mediaRecorder?.release()
                             mediaRecorder = null
                             isRecording = false
                             val file = audioFile
                             if (file != null && file.exists()) {
                                 scope.launch {
-                                    val bytes = file.readBytes()
+                                    val bytes = runCatching { file.readBytes() }.getOrNull() ?: return@launch
                                     val base64 = android.util.Base64.encodeToString(
                                         bytes, android.util.Base64.NO_WRAP
                                     )
@@ -191,9 +189,11 @@ fun GroupChatScreen(
                             ) == android.content.pm.PackageManager.PERMISSION_GRANTED
                             if (hasPermission) {
                                 val result = startGroupRecording(context)
-                                audioFile = result.first
-                                mediaRecorder = result.second
-                                isRecording = true
+                                if (result != null) {
+                                    audioFile = result.first
+                                    mediaRecorder = result.second
+                                    isRecording = true
+                                }
                             } else {
                                 permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
                             }
@@ -279,7 +279,7 @@ fun GroupChatScreen(
 
 // ── Helper: start recording ────────────────────────────────────────────────────
 
-private fun startGroupRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder> {
+private fun startGroupRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder>? = runCatching {
     val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.3gp")
     @Suppress("DEPRECATION")
     val recorder = android.media.MediaRecorder().apply {
@@ -290,8 +290,8 @@ private fun startGroupRecording(context: android.content.Context): Pair<java.io.
         prepare()
         start()
     }
-    return file to recorder
-}
+    file to recorder
+}.getOrNull()
 
 // ── Sealed list items ──────────────────────────────────────────────────────────
 
@@ -464,7 +464,7 @@ private fun GroupAudioBubble(
                         val player = playGroupAudio(context, base64Data) {
                             isPlaying = false
                             progress = 0f
-                        }
+                        } ?: return@IconButton
                         mediaPlayer = player
                         durationSec = player.duration
                     } else {
@@ -482,12 +482,9 @@ private fun GroupAudioBubble(
             },
             modifier = Modifier.size(32.dp),
         ) {
-            Icon(
-                imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                contentDescription = if (isPlaying) "Pause" else "Play",
-                tint = if (isSent) BgDeep else CyanAccent,
-                modifier = Modifier.size(20.dp),
-            )
+            val iconColor = if (isSent) BgDeep else CyanAccent
+            if (isPlaying) PhIconPause(color = iconColor, size = 20.dp)
+            else PhIconPlay(color = iconColor, size = 20.dp)
         }
 
         Column(modifier = Modifier.weight(1f)) {
@@ -521,17 +518,17 @@ private fun playGroupAudio(
     context: android.content.Context,
     base64Data: String,
     onComplete: () -> Unit,
-): android.media.MediaPlayer {
+): android.media.MediaPlayer? = runCatching {
     val bytes = android.util.Base64.decode(base64Data, android.util.Base64.NO_WRAP)
     val file = java.io.File(context.cacheDir, "play_${System.currentTimeMillis()}.3gp")
     file.writeBytes(bytes)
-    return android.media.MediaPlayer().apply {
+    android.media.MediaPlayer().apply {
         setDataSource(file.absolutePath)
         prepare()
         setOnCompletionListener { onComplete() }
         start()
     }
-}
+}.getOrNull()
 
 // ── Top bar ────────────────────────────────────────────────────────────────────
 
@@ -568,12 +565,7 @@ private fun GroupTopBar(
                     .clickable(onClick = onBack),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back",
-                    tint = TextPrimary,
-                    modifier = Modifier.size(18.dp),
-                )
+                PhIconBack(color = TextPrimary, size = 18.dp)
             }
 
             Spacer(Modifier.width(10.dp))
@@ -602,12 +594,7 @@ private fun GroupTopBar(
 
             Box {
                 IconButton(onClick = onMoreMenu, modifier = Modifier.size(32.dp)) {
-                    Icon(
-                        Icons.Default.MoreVert,
-                        contentDescription = "More",
-                        tint = TextDim,
-                        modifier = Modifier.size(18.dp),
-                    )
+                    PhIconMoreVert(color = TextDim, size = 18.dp)
                 }
                 DropdownMenu(
                     expanded = showMenu,
@@ -759,12 +746,7 @@ private fun GroupInputBar(
                         .clickable(onClick = onMicClick),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Mic,
-                        contentDescription = if (isRecording) "Stop recording" else "Record voice",
-                        tint = if (isRecording) Color.White else TextDim,
-                        modifier = Modifier.size(20.dp),
-                    )
+                    PhIconMic(color = if (isRecording) Color.White else TextDim, size = 20.dp)
                 }
             }
         }

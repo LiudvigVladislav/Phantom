@@ -9,7 +9,9 @@ CREATE TABLE conversation (
     blocked INTEGER NOT NULL DEFAULT 0,
     notes TEXT DEFAULT NULL,
     is_verified INTEGER NOT NULL DEFAULT 0,
-    disappearing_timer_secs INTEGER NOT NULL DEFAULT 0
+    disappearing_timer_secs INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    identity_key_changed_at INTEGER
 );
 
 getAllConversations:
@@ -17,7 +19,7 @@ SELECT * FROM conversation ORDER BY last_message_at DESC;
 
 getActiveConversations:
 SELECT * FROM conversation
-WHERE blocked = 0 AND trust_tier = 'TRUSTED' AND their_public_key_hex != ''
+WHERE blocked = 0 AND trust_tier = 'TRUSTED' AND their_public_key_hex != '' AND archived = 0
 ORDER BY last_message_at DESC;
 
 getMessageRequests:
@@ -32,8 +34,10 @@ upsertConversation:
 INSERT OR REPLACE INTO conversation(
     id, their_username, their_public_key_hex,
     last_message_preview, last_message_at, unread_count,
-    trust_tier, blocked, notes
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    trust_tier, blocked, notes,
+    is_verified, disappearing_timer_secs, archived,
+    identity_key_changed_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 updateNotes:
 UPDATE conversation SET notes = ? WHERE id = ?;
@@ -67,3 +71,18 @@ UPDATE conversation SET disappearing_timer_secs = :secs WHERE id = :id;
 
 getDisappearingTimer:
 SELECT disappearing_timer_secs FROM conversation WHERE id = :id;
+
+archiveConversation:
+UPDATE conversation SET archived = 1 WHERE id = ?;
+
+unarchiveConversation:
+UPDATE conversation SET archived = 0 WHERE id = ?;
+
+getArchivedConversations:
+SELECT * FROM conversation WHERE archived = 1 ORDER BY last_message_at DESC;
+
+setIdentityKeyChangedAt:
+UPDATE conversation SET identity_key_changed_at = :ts, is_verified = 0 WHERE id = :id;
+
+clearIdentityKeyChangedAt:
+UPDATE conversation SET identity_key_changed_at = NULL WHERE id = :id;
