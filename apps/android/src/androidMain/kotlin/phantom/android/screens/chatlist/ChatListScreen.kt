@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -35,6 +36,7 @@ import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
 import phantom.android.di.AppContainer
+import phantom.android.ui.ConnectionBanner
 import phantom.android.navigation.Screen
 import phantom.android.screens.group.GroupInitialsAvatar
 import phantom.android.ui.*
@@ -124,12 +126,14 @@ fun ChatListScreen(
             )
         },
     ) { padding ->
+        val transportState = container.transport.state.collectAsState()
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
+                ConnectionBanner(stateFlow = transportState)
                 ChatsTab(
                     searchQuery = searchQuery,
                     onSearchChange = { searchQuery = it },

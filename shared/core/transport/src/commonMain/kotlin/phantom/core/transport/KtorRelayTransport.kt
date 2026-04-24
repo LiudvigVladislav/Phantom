@@ -21,9 +21,12 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlin.math.min
+import kotlin.time.TimeSource
 
 class KtorRelayTransport(
     private val httpClient: HttpClient,
@@ -69,79 +72,116 @@ class KtorRelayTransport(
     private var relayUrl: String = ""
     private var identityHex: String = ""
     private var relayToken: String? = null
+    private var disconnectRequested: Boolean = false
+
+    // In-memory outbox for envelopes and read receipts that were enqueued while
+    // the WebSocket was not in the Connected state. Drained in FIFO order when
+    // the session next becomes Connected. Not persisted to disk — on process
+    // restart, MessageRepository (status = QUEUED) is the source of truth and
+    // DefaultMessagingService re-submits via send().
+    private val outboxMutex = Mutex()
+    private val pendingOutbox: ArrayDeque<RelayMessage> = ArrayDeque()
+
+    // Pong timestamp tracking — drives the heartbeat / dead-peer detection.
+    // Updated every time the relay emits a Pong frame. If the gap exceeds
+    // RelayTransportConfig.PONG_TIMEOUT_MS, the client closes the session,
+    // which wakes openWithRetry() and triggers a reconnect.
+    private val timeSource = TimeSource.Monotonic
+    @Volatile private var lastPongMark: TimeSource.Monotonic.ValueTimeMark = timeSource.markNow()
 
     override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {
         this.relayUrl = relayUrl
         this.identityHex = identityPublicKeyHex
         this.relayToken = token
+        disconnectRequested = false
         relayLog(
             RelayLogLevel.INFO,
             "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… tokenSet=${token != null}",
         )
-        openWithRetry(attempt = 0)
+        runReconnectLoop()
     }
 
-    private suspend fun openWithRetry(attempt: Int) {
-        _state.value = TransportState.Connecting
-        val urlWithId = if (identityHex.isNotEmpty()) "$relayUrl?id=$identityHex" else relayUrl
-        val urlWithToken = if (relayToken != null) "$urlWithId&token=$relayToken" else urlWithId
-        // Redact the id + token query params from the logged URL so we do not leak them to logcat
-        // but still confirm the endpoint, scheme, and port the client actually tries to reach.
-        val redactedUrl = urlWithToken
-            .replace(Regex("""id=[^&]+"""),    "id=<redacted>")
-            .replace(Regex("""token=[^&]+"""), "token=<redacted>")
-        relayLog(
-            RelayLogLevel.INFO,
-            "Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
-        )
-        try {
-            httpClient.webSocket(urlWithToken) {
-                session = this
-                _state.value = TransportState.Connected
-                relayLog(RelayLogLevel.INFO, "WebSocket connected successfully")
-                val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-                scope = transportScope
-                startPing(transportScope)
-                readLoop()
-                // readLoop() returns when the server closes the connection cleanly.
-                // Cancel ping so it doesn't try to write to a dead session.
-                transportScope.cancel()
-                relayLog(RelayLogLevel.WARN, "WebSocket closed by remote (clean)")
-            }
-            // Clean close — reconnect immediately from attempt 0.
-            _state.value = TransportState.Disconnected
-            delay(RelayTransportConfig.RECONNECT_BASE_DELAY_MS)
-            relayLog(RelayLogLevel.INFO, "Reconnecting after clean close")
-            openWithRetry(0)
-        } catch (e: Exception) {
-            _state.value = TransportState.Error(e)
+    /**
+     * Reconnect loop. Retries forever with exponential backoff up to
+     * RelayTransportConfig.RECONNECT_MAX_DELAY_MS. The loop exits only when
+     * the caller explicitly asks for disconnect() — a messenger transport
+     * that "gives up" after N attempts is worse than one that keeps trying
+     * quietly in the background.
+     */
+    private suspend fun runReconnectLoop() {
+        var attempt = 0
+        while (!disconnectRequested) {
+            _state.value = TransportState.Connecting
+            val urlWithId = if (identityHex.isNotEmpty()) "$relayUrl?id=$identityHex" else relayUrl
+            val urlWithToken = if (relayToken != null) "$urlWithId&token=$relayToken" else urlWithId
+            val redactedUrl = urlWithToken
+                .replace(Regex("""id=[^&]+"""),    "id=<redacted>")
+                .replace(Regex("""token=[^&]+"""), "token=<redacted>")
             relayLog(
-                RelayLogLevel.ERROR,
-                "WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
-                e,
+                RelayLogLevel.INFO,
+                "Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
             )
-            if (attempt < RelayTransportConfig.RECONNECT_MAX_ATTEMPTS) {
+            try {
+                httpClient.webSocket(urlWithToken) {
+                    session = this
+                    lastPongMark = timeSource.markNow()
+                    _state.value = TransportState.Connected
+                    relayLog(RelayLogLevel.INFO, "WebSocket connected successfully")
+                    attempt = 0 // reset backoff on successful connect
+
+                    val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+                    scope = transportScope
+                    startPing(transportScope)
+
+                    // Drain anything the app queued while the socket was down.
+                    flushPendingOutbox()
+
+                    readLoop()
+                    transportScope.cancel()
+                    relayLog(RelayLogLevel.WARN, "WebSocket closed by remote (clean)")
+                }
+                _state.value = TransportState.Disconnected
+                if (disconnectRequested) break
+                delay(RelayTransportConfig.RECONNECT_BASE_DELAY_MS)
+                relayLog(RelayLogLevel.INFO, "Reconnecting after clean close")
+                // attempt was reset to 0 above; restart backoff from base.
+                continue
+            } catch (e: Exception) {
+                _state.value = TransportState.Error(e)
+                relayLog(
+                    RelayLogLevel.ERROR,
+                    "WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
+                    e,
+                )
+                if (disconnectRequested) break
                 val delayMs = min(
-                    RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1 shl attempt),
+                    RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
                     RelayTransportConfig.RECONNECT_MAX_DELAY_MS,
                 )
                 relayLog(RelayLogLevel.INFO, "Retry attempt #${attempt + 1} in ${delayMs}ms")
                 delay(delayMs)
-                openWithRetry(attempt + 1)
-            } else {
-                relayLog(
-                    RelayLogLevel.ERROR,
-                    "Max retry attempts (${RelayTransportConfig.RECONNECT_MAX_ATTEMPTS}) reached — giving up",
-                )
-                _state.value = TransportState.Disconnected
+                attempt++
             }
         }
+        relayLog(RelayLogLevel.INFO, "Reconnect loop exited (disconnect requested)")
+        _state.value = TransportState.Disconnected
     }
 
     private fun startPing(scope: CoroutineScope) {
         pingJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.PING_INTERVAL_MS)
+                val sinceLastPong = lastPongMark.elapsedNow().inWholeMilliseconds
+                if (sinceLastPong > RelayTransportConfig.PONG_TIMEOUT_MS) {
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "Pong timeout (${sinceLastPong}ms without Pong) — forcing reconnect",
+                    )
+                    // Close the session; readLoop returns, webSocket block exits,
+                    // runReconnectLoop schedules the next attempt.
+                    runCatching { session?.close() }
+                    break
+                }
                 sendRaw(RelayMessage.Ping)
             }
         }
@@ -193,7 +233,9 @@ class KtorRelayTransport(
                             )
                             _readReceipts.emit(msg)
                         }
-                        is RelayMessage.Pong -> Unit
+                        is RelayMessage.Pong -> {
+                            lastPongMark = timeSource.markNow()
+                        }
                         else -> Unit
                     }
                 } catch (e: Exception) {
@@ -211,10 +253,15 @@ class KtorRelayTransport(
 
     override suspend fun send(message: RelayMessage.Send): Boolean {
         if (!isConnected()) {
+            outboxMutex.withLock { pendingOutbox.addLast(message) }
             relayLog(
-                RelayLogLevel.WARN,
-                "send() skipped — not connected. state=${_state.value::class.simpleName} to=${message.to.take(16)}… id=${message.messageId.take(12)}…",
+                RelayLogLevel.INFO,
+                "Queued until reconnect: id=${message.messageId.take(12)}… to=${message.to.take(16)}… " +
+                    "state=${_state.value::class.simpleName} outboxSize=${pendingOutbox.size}",
             )
+            // Returns false so MessageRepository keeps status = QUEUED and the
+            // UI can render a pending indicator. The relay's Ack will promote
+            // status to RELAYED once the envelope actually reaches the server.
             return false
         }
         relayLog(
@@ -227,14 +274,25 @@ class KtorRelayTransport(
     }
 
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean {
-        if (!isConnected()) return false
+        if (!isConnected()) {
+            // Read receipts are also queued — the recipient wants to know their
+            // message was read even if the sender of the receipt was briefly offline.
+            outboxMutex.withLock { pendingOutbox.addLast(message) }
+            relayLog(
+                RelayLogLevel.INFO,
+                "Queued read receipt until reconnect: messageId=${message.messageId.take(12)}…",
+            )
+            return false
+        }
         return sendRaw(message)
     }
 
     /**
      * Sends an ephemeral typing notification over the existing WebSocket session.
      * The relay is responsible for live forwarding; if the recipient is offline the
-     * relay drops the frame silently — no storage, no queue.
+     * relay drops the frame silently — no storage, no queue. Typing events are
+     * deliberately NOT queued: a stale "typing…" indicator that arrives after the
+     * message itself is noise.
      */
     override suspend fun sendTyping(toPubKeyHex: String): Boolean {
         if (!isConnected()) return false
@@ -243,6 +301,40 @@ class KtorRelayTransport(
             true
         } catch (_: Exception) {
             false
+        }
+    }
+
+    /**
+     * Drains the in-memory outbox in FIFO order after a successful reconnect.
+     * Each entry goes through sendRaw directly; failures leave the remaining
+     * items in the queue only if we add explicit re-enqueue logic — for now a
+     * single write failure per entry is accepted (an immediate reconnect will
+     * cover the case where the session dies mid-flush).
+     */
+    private suspend fun flushPendingOutbox() {
+        val toFlush = outboxMutex.withLock {
+            if (pendingOutbox.isEmpty()) return
+            val snapshot = pendingOutbox.toList()
+            pendingOutbox.clear()
+            snapshot
+        }
+        relayLog(
+            RelayLogLevel.INFO,
+            "Flushing ${toFlush.size} queued item(s) after reconnect",
+        )
+        for (msg in toFlush) {
+            when (msg) {
+                is RelayMessage.Send -> relayLog(
+                    RelayLogLevel.INFO,
+                    "Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}…",
+                )
+                is RelayMessage.ReadReceipt -> relayLog(
+                    RelayLogLevel.INFO,
+                    "Flush → send read receipt: id=${msg.messageId.take(12)}…",
+                )
+                else -> Unit
+            }
+            sendRaw(msg)
         }
     }
 
@@ -262,6 +354,7 @@ class KtorRelayTransport(
 
     override suspend fun disconnect() {
         relayLog(RelayLogLevel.INFO, "disconnect() called")
+        disconnectRequested = true
         pingJob?.cancel()
         scope?.cancel()
         session?.close()

@@ -421,8 +421,14 @@ fun ChatScreen(
         )
     }
 
-    // adjustResize in manifest handles keyboard — no imePadding needed
+    // adjustResize in the manifest is not enough once
+    // WindowCompat.setDecorFitsSystemWindows(window, false) is active on API < 35
+    // (it is, see MainActivity.onCreate). Compose then has to opt in to IME insets
+    // explicitly. Without Modifier.imePadding() on the Scaffold root the bottomBar
+    // with the input field slides underneath the soft keyboard — exactly the
+    // "input field runs off the screen" report from the 2026-04-24 QA pass.
     Scaffold(
+        modifier = Modifier.imePadding(),
         containerColor = BgDeep,
         contentWindowInsets = WindowInsets(0),
         snackbarHost = { androidx.compose.material3.SnackbarHost(snackbarHostState) },
