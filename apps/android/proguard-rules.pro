@@ -133,6 +133,20 @@
 
 
 # --------------------------------------------------------------------------
+# CameraX + ML Kit (QR scanner)
+# --------------------------------------------------------------------------
+# CameraX uses reflection to resolve camera extension implementations. ML Kit's
+# Barcode Scanning module loads model files and wires JNI callbacks whose names
+# must survive R8 — failure here produces NPE in the ML Kit Task callback which
+# surfaces as 'jb2.run' in the Handler main-thread stack trace.
+-keep class androidx.camera.** { *; }
+-dontwarn androidx.camera.**
+-keep class com.google.mlkit.** { *; }
+-keep class com.google.android.gms.vision.** { *; }
+-dontwarn com.google.mlkit.**
+
+
+# --------------------------------------------------------------------------
 # Stack traces — keep line numbers for crash reporting
 # --------------------------------------------------------------------------
 -keepattributes SourceFile,LineNumberTable

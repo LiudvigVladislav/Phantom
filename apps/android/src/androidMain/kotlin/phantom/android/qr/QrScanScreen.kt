@@ -2,6 +2,7 @@ package phantom.android.qr
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -29,7 +30,10 @@ import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import phantom.android.ui.theme.*
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+
+private const val TAG = "PhantomQR"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -79,7 +83,6 @@ fun QrScanScreen(
                         .size(260.dp)
                         .background(Color.Transparent),
                 ) {
-                    // Corner brackets
                     CornerBrackets()
                 }
 
@@ -113,43 +116,108 @@ fun QrScanScreen(
 private fun CameraPreview(onScanned: (String) -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    var scanned by remember { mutableStateOf(false) }
+    // A scanned-flag outside the analyzer closure — captured by remember so the
+    // same instance survives recomposition. Prevents the rare race where two
+    // barcode frames resolve simultaneously and both try to navigate away.
+    val scannedState = remember { mutableStateOf(false) }
+    // Hold the executor in state so onDispose can shut it down cleanly. Without
+    // this, the analyzer thread stays alive after the composable is gone and
+    // any in-flight ML Kit callback lands on a dead UI with a null context,
+    // which matches the NPE seen at jb2.run on the physical phone.
+    val executorState = remember { mutableStateOf<ExecutorService?>(null) }
+    val cameraProviderState = remember { mutableStateOf<ProcessCameraProvider?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            Log.i(TAG, "Disposing QR preview — unbinding camera + shutting down executor")
+            runCatching { cameraProviderState.value?.unbindAll() }
+                .onFailure { Log.w(TAG, "unbindAll threw: ${it.message}") }
+            runCatching { executorState.value?.shutdown() }
+                .onFailure { Log.w(TAG, "executor shutdown threw: ${it.message}") }
+            cameraProviderState.value = null
+            executorState.value = null
+        }
+    }
 
     AndroidView(
         factory = { ctx ->
             val previewView = PreviewView(ctx)
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
             cameraProviderFuture.addListener({
-                val cameraProvider = cameraProviderFuture.get()
-                val preview = Preview.Builder().build().also {
-                    it.surfaceProvider = previewView.surfaceProvider
-                }
-                val scanner = BarcodeScanning.getClient()
-                val executor = Executors.newSingleThreadExecutor()
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-                analysis.setAnalyzer(executor) { imageProxy ->
-                    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
-                    val mediaImage = imageProxy.image
-                    if (mediaImage != null && !scanned) {
-                        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-                        scanner.process(image)
-                            .addOnSuccessListener { barcodes ->
-                                val qr = barcodes.firstOrNull { it.format == Barcode.FORMAT_QR_CODE }
-                                val value = qr?.rawValue
-                                if (!value.isNullOrBlank() && !scanned) {
-                                    scanned = true
-                                    onScanned(value)
-                                }
-                            }
-                            .addOnCompleteListener { imageProxy.close() }
-                    } else {
-                        imageProxy.close()
+                // Every step below is inside this outer try/catch because the
+                // listener runs on the main executor and an uncaught exception
+                // here becomes a FATAL crash with the obfuscated jb2.run frame
+                // that was observed in the 2026-04-24 QA pass.
+                try {
+                    val cameraProvider = cameraProviderFuture.get()
+                        ?: run {
+                            Log.e(TAG, "cameraProviderFuture.get() returned null — aborting preview setup")
+                            return@addListener
+                        }
+                    cameraProviderState.value = cameraProvider
+
+                    val preview = Preview.Builder().build().also {
+                        it.surfaceProvider = previewView.surfaceProvider
                     }
+                    val scanner = BarcodeScanning.getClient()
+                    val executor = Executors.newSingleThreadExecutor()
+                    executorState.value = executor
+
+                    val analysis = ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+
+                    analysis.setAnalyzer(executor) { imageProxy ->
+                        // Every branch below must close the imageProxy exactly
+                        // once. Failure to close drives the analyzer into a
+                        // starved state where no further frames arrive.
+                        try {
+                            @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+                            val mediaImage = imageProxy.image
+                            if (mediaImage == null || scannedState.value) {
+                                imageProxy.close()
+                                return@setAnalyzer
+                            }
+                            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+                            scanner.process(image)
+                                .addOnSuccessListener { barcodes ->
+                                    try {
+                                        if (scannedState.value) return@addOnSuccessListener
+                                        val qr = barcodes.firstOrNull { it.format == Barcode.FORMAT_QR_CODE }
+                                        val value = qr?.rawValue
+                                        if (!value.isNullOrBlank()) {
+                                            scannedState.value = true
+                                            onScanned(value)
+                                        }
+                                    } catch (e: Throwable) {
+                                        Log.e(TAG, "Barcode success handler threw: ${e.message}", e)
+                                    }
+                                }
+                                .addOnFailureListener { e ->
+                                    Log.w(TAG, "Barcode scan failed: ${e.message}")
+                                }
+                                .addOnCompleteListener {
+                                    runCatching { imageProxy.close() }
+                                        .onFailure { Log.w(TAG, "imageProxy.close threw: ${it.message}") }
+                                }
+                        } catch (e: Throwable) {
+                            Log.e(TAG, "Analyzer frame handler threw: ${e.message}", e)
+                            runCatching { imageProxy.close() }
+                        }
+                    }
+
+                    runCatching { cameraProvider.unbindAll() }
+                        .onFailure { Log.w(TAG, "unbindAll (pre-bind) threw: ${it.message}") }
+                    cameraProvider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis,
+                    )
+                    Log.i(TAG, "QR camera preview bound to lifecycle")
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Camera preview setup FAILED (${e::class.simpleName}): ${e.message}", e)
                 }
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
             }, ContextCompat.getMainExecutor(ctx))
             previewView
         },
@@ -163,18 +231,13 @@ private fun CornerBrackets() {
     val strokeWidth = 3.dp
     val bracketSize = 24.dp
 
-    // Top-left
     Box(Modifier.fillMaxSize()) {
-        // TL
         HorizontalDivider(Modifier.width(bracketSize).align(Alignment.TopStart), thickness = strokeWidth, color = color)
         VerticalDivider(Modifier.height(bracketSize).align(Alignment.TopStart), thickness = strokeWidth, color = color)
-        // TR
         HorizontalDivider(Modifier.width(bracketSize).align(Alignment.TopEnd), thickness = strokeWidth, color = color)
         VerticalDivider(Modifier.height(bracketSize).align(Alignment.TopEnd), thickness = strokeWidth, color = color)
-        // BL
         HorizontalDivider(Modifier.width(bracketSize).align(Alignment.BottomStart), thickness = strokeWidth, color = color)
         VerticalDivider(Modifier.height(bracketSize).align(Alignment.BottomStart), thickness = strokeWidth, color = color)
-        // BR
         HorizontalDivider(Modifier.width(bracketSize).align(Alignment.BottomEnd), thickness = strokeWidth, color = color)
         VerticalDivider(Modifier.height(bracketSize).align(Alignment.BottomEnd), thickness = strokeWidth, color = color)
     }
