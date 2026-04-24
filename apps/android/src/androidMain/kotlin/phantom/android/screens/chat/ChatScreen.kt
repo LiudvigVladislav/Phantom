@@ -3,6 +3,9 @@ package phantom.android.screens.chat
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.util.Log
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.onEach
 import org.json.JSONException
 import org.json.JSONObject
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -242,7 +245,11 @@ fun ChatScreen(
     }
 
     LaunchedEffect(container.messagingService) {
-        container.messagingService?.incomingMessages?.collect { incoming ->
+        container.messagingService?.incomingMessages
+            ?.catch { e ->
+                Log.e("PhantomUI", "incomingMessages flow error in ChatScreen: ${e.message}", e)
+            }
+            ?.collect { incoming ->
             if (incoming.conversationId == conversationId) {
                 // Check if this is a profile card — handle silently, do not display
                 val plaintext = incoming.text

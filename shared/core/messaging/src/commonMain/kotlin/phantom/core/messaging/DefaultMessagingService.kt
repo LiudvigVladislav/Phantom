@@ -181,16 +181,30 @@ class DefaultMessagingService(
     }
 
     private suspend fun handleDeliver(deliver: RelayMessage.Deliver) {
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "handleDeliver start: id=${deliver.messageId.take(12)}… sealed=${deliver.sealedSender.isNotEmpty()} payloadBytes=${deliver.payload.length}",
+        )
         runCatching {
             // Recover sender identity: sealed sender hides `from` from the relay.
             @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
             val senderPubKeyHex = if (deliver.sealedSender.isNotEmpty()) {
                 val sealedBytes = Base64.decode(deliver.sealedSender)
                 SealedSender.unseal(sealedBytes, localKeyPair.privateKey.bytes)
-                    ?: return@runCatching // Drop — cannot identify sender; avoids leaking error.
+                    ?: run {
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "Sealed Sender unseal returned null — dropping envelope id=${deliver.messageId.take(12)}…",
+                        )
+                        return@runCatching
+                    }
             } else {
                 deliver.from // Backward compat: relay-supplied `from` for non-sealed messages.
             }
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "Sender identified: ${senderPubKeyHex.take(16)}…",
+            )
 
             // Unpad ISO 7816-4 padding applied by the sender to hide message length.
             val ciphertext = MessagePadding.unpad(deliver.payload.decodeBase64Bytes())
@@ -204,11 +218,23 @@ class DefaultMessagingService(
                 localIdentityKeyPair = localKeyPair,
                 remoteIdentityPublicKeyHex = senderPubKeyHex,
             )
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "Session loaded: conv=${conversationId.take(24)}… decrypting…",
+            )
 
             val (newState, plainBytes) = ratchet.decrypt(state, encrypted)
             sessionManager.saveSession(conversationId, newState)
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "Decrypt OK: plaintextBytes=${plainBytes.size}",
+            )
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "Payload parsed: type=${payload.type} textLen=${payload.text.length}",
+            )
 
             // Route group-related messages to GroupMessagingService before 1:1 handling.
             if (payload.type in MessagePayload.GROUP_TYPES) {
@@ -296,6 +322,10 @@ class DefaultMessagingService(
             val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
             val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
 
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "Inserting message into DB: id=${deliver.messageId.take(12)}… conv=${conversationId.take(24)}…",
+            )
             messageRepository.insertMessage(
                 MessageEntity(
                     id = deliver.messageId,
@@ -308,6 +338,7 @@ class DefaultMessagingService(
                     expiresAtMs = expiresAtMs,
                 )
             )
+            messagingLog(MessagingLogLevel.INFO, "DB insertMessage OK")
 
             // Create conversation as REQUEST if unknown sender, keep TRUSTED if already known.
             val existing = conversationRepository.getConversation(conversationId)
@@ -340,6 +371,7 @@ class DefaultMessagingService(
                 )
             }
 
+            messagingLog(MessagingLogLevel.INFO, "Emitting IncomingMessage to UI flow")
             _incomingMessages.emit(
                 IncomingMessage(
                     id = deliver.messageId,
@@ -351,9 +383,36 @@ class DefaultMessagingService(
             )
 
             val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
-            onNewMessageNotification?.invoke(conversationId, senderName, previewText(payload.text), senderPubKeyHex)
-        }.onFailure { _ ->
-            // Decryption or storage failure — drop silently to avoid leaking error details.
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "Invoking onNewMessageNotification callback (null=${onNewMessageNotification == null})",
+            )
+            // Defensive: the platform notification callback may throw on pre-signed URLs
+            // or when background restrictions kick in. A thrown exception here used to
+            // propagate into the silent onFailure below and lose the stack entirely.
+            runCatching {
+                onNewMessageNotification?.invoke(conversationId, senderName, previewText(payload.text), senderPubKeyHex)
+            }.onFailure { notifErr ->
+                messagingLog(
+                    MessagingLogLevel.ERROR,
+                    "onNewMessageNotification threw (${notifErr::class.simpleName}): ${notifErr.message}",
+                    notifErr,
+                )
+            }
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "handleDeliver DONE for id=${deliver.messageId.take(12)}…",
+            )
+        }.onFailure { e ->
+            // Previously this branch was silent ("avoids leaking error details"). That policy hides
+            // legitimate bugs (decrypt mismatch, DB unique-constraint, parse error, UI callback
+            // throwing) and produces crashes with no context. Log with full stack so a future QA
+            // run on a physical device yields actionable diagnostics.
+            messagingLog(
+                MessagingLogLevel.ERROR,
+                "handleDeliver FAILED for id=${deliver.messageId.take(12)}… (${e::class.simpleName}): ${e.message}",
+                e,
+            )
         }
     }
 

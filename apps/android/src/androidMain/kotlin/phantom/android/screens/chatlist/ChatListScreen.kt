@@ -29,6 +29,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.util.Log
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
@@ -96,11 +98,19 @@ fun ChatListScreen(
     }
 
     LaunchedEffect(container.messagingService) {
-        container.messagingService?.incomingMessages?.collect { reloadKey++ }
+        container.messagingService?.incomingMessages
+            ?.catch { e ->
+                Log.e("PhantomUI", "incomingMessages flow error in ChatListScreen: ${e.message}", e)
+            }
+            ?.collect { reloadKey++ }
     }
 
     LaunchedEffect(container.groupMessagingService) {
-        container.groupMessagingService?.groupMessageFlow?.collect { _ -> reloadKey++ }
+        container.groupMessagingService?.groupMessageFlow
+            ?.catch { e ->
+                Log.e("PhantomUI", "groupMessageFlow error in ChatListScreen: ${e.message}", e)
+            }
+            ?.collect { _ -> reloadKey++ }
     }
 
     Scaffold(

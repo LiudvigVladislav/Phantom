@@ -123,7 +123,15 @@ class AppContainer(private val context: Context) {
         )
         // Wire local notification callback — Android-only side-effect, not part of the KMP interface.
         service.onNewMessageNotification = { convId, sender, preview, senderPubKeyHex ->
-            PhantomNotificationManager.showMessageNotification(context, convId, sender, preview, senderPubKeyHex)
+            try {
+                PhantomNotificationManager.showMessageNotification(context, convId, sender, preview, senderPubKeyHex)
+            } catch (e: Throwable) {
+                android.util.Log.e(
+                    "PhantomMessaging",
+                    "showMessageNotification threw (${e::class.simpleName}): ${e.message}",
+                    e,
+                )
+            }
         }
 
         // Wire group messaging delegate so DefaultMessagingService can route

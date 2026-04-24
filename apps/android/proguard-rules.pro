@@ -93,6 +93,8 @@
 # --------------------------------------------------------------------------
 -keep class phantom.core.transport.RelayLog_androidKt { *; }
 -keep class phantom.core.transport.KtorRelayTransport { *; }
+-keep class phantom.core.messaging.MessagingLog_androidKt { *; }
+-keep class phantom.core.messaging.DefaultMessagingService { *; }
 
 
 # --------------------------------------------------------------------------
