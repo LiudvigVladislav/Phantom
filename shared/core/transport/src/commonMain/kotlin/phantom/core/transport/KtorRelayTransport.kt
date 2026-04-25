@@ -21,7 +21,6 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.encodeToString
@@ -201,9 +200,11 @@ class KtorRelayTransport(
                         RelayLogLevel.WARN,
                         "Pong timeout (${sinceLastPong}ms without Pong) — forcing reconnect",
                     )
-                    // Close the session; readLoop returns, webSocket block exits,
-                    // runReconnectLoop schedules the next attempt.
-                    runCatching { withTimeoutOrNull(2_000L) { session?.close() } }
+                    // session.cancel() triggers OkHttp webSocket.cancel() immediately
+                    // (via Ktor's invokeOnCompletion handler) — no 60s CLOSE handshake wait.
+                    // scope.cancel() stops ackWatchdogJob so it doesn't fire on the dead session.
+                    session?.cancel()
+                    scope.cancel()
                     break
                 }
                 sendRaw(RelayMessage.Ping)
@@ -235,7 +236,8 @@ class KtorRelayTransport(
                 }
                 // Force the session closed so the reconnect loop opens a
                 // fresh WebSocket and flushPendingOutbox re-sends them.
-                runCatching { withTimeoutOrNull(2_000L) { session?.close() } }
+                session?.cancel()
+                scope.cancel()
                 break
             }
         }
