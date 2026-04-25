@@ -19,6 +19,20 @@ val signingProps = Properties().apply {
 fun signingValue(propertyKey: String, envKey: String): String? =
     signingProps.getProperty(propertyKey) ?: System.getenv(envKey)
 
+// Local dev overrides — values in local.properties or env vars override the
+// defaults below. local.properties is gitignored (Android Studio default).
+// Example for local relay on emulator: relay.url=ws://10.0.2.2:8080/ws
+// Example for local relay on physical device: relay.url=ws://192.168.x.y:8080/ws
+// Note: cleartext (ws://) is allowed to 10.0.2.2 and localhost only by
+//       network_security_config.xml. Physical device local testing requires
+//       adding the LAN IP there (not committed) or using wss:// via a tunnel.
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun localOrEnv(propKey: String, envKey: String, default: String): String =
+    localProps.getProperty(propKey) ?: System.getenv(envKey) ?: default
+
 kotlin {
     androidTarget {
         compilerOptions {
@@ -103,9 +117,13 @@ android {
 
     buildTypes {
         debug {
-            // Local network IP of the dev machine — phone and PC must be on same Wi-Fi.
-            buildConfigField("String", "RELAY_URL", "\"ws://192.168.0.105:8080/ws\"")
-            // No token in dev — relay runs without RELAY_SECRET_TOKEN (backward compatible).
+            // Default: production relay. Override in local.properties (gitignored):
+            //   relay.url=ws://10.0.2.2:8080/ws     ← emulator → host machine
+            //   relay.url=ws://192.168.x.y:8080/ws  ← physical device → host machine
+            // Cleartext (ws://) is only allowed to 10.0.2.2 / localhost by
+            // network_security_config.xml; for a LAN IP you must also add it there locally.
+            val relayUrl = localOrEnv("relay.url", "RELAY_URL", "wss://relay.phntm.pro/ws")
+            buildConfigField("String", "RELAY_URL", "\"$relayUrl\"")
             buildConfigField("String", "RELAY_TOKEN", "null")
         }
         release {
