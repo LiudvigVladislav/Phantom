@@ -2,6 +2,7 @@ use crate::config::RelayConfig;
 use crate::envelope::Envelope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{mpsc, RwLock};
 
 /// Per-sender sliding-window rate-limit entry.
@@ -25,8 +26,13 @@ pub struct AppState {
     pub config: RelayConfig,
     /// recipient_public_key_hex → queue of offline envelopes
     pub store: RwLock<HashMap<String, Vec<Envelope>>>,
-    /// identity_hex → sender channel for live WebSocket clients
-    pub clients: RwLock<HashMap<String, mpsc::UnboundedSender<String>>>,
+    /// identity_hex → (connection_id, sender channel) for live WebSocket clients.
+    /// connection_id is a monotonically increasing u64 minted at connect time.
+    /// Cleanup only removes the entry if the stored connection_id matches, so a
+    /// reconnect that inserts a new entry before the old cleanup runs is safe.
+    pub clients: RwLock<HashMap<String, (u64, mpsc::UnboundedSender<String>)>>,
+    /// Monotonic counter — each new WebSocket connection gets a unique ID.
+    pub conn_counter: AtomicU64,
     /// Rate limiter: message count per sender identity in current window.
     pub rate_limiter: RwLock<HashMap<String, RateEntry>>,
     /// Abuse reports received via /report endpoint (also persisted to reports.jsonl).
@@ -45,6 +51,7 @@ impl AppState {
             config,
             store: RwLock::new(HashMap::new()),
             clients: RwLock::new(HashMap::new()),
+            conn_counter: AtomicU64::new(0),
             rate_limiter: RwLock::new(HashMap::new()),
             reports: RwLock::new(persisted),
             blocklist: RwLock::new(blocked),

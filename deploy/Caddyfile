@@ -51,10 +51,9 @@ relay.phntm.pro {
         # tells Caddy to flush every frame to the upstream immediately,
         # which keeps streaming WS frames responsive on slow cellular.
         transport http {
-            read_timeout    0
-            write_timeout   0
-            dial_timeout    10s
-            response_header_timeout 30s
+            read_timeout  0
+            write_timeout 0
+            dial_timeout  10s
         }
         flush_interval -1
     }

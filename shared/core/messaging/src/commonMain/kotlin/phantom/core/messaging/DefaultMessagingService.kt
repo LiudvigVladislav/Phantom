@@ -52,6 +52,14 @@ class DefaultMessagingService(
 
     @Volatile private var receiving = false
 
+    // Guard against duplicate in-flight delivery: if startReceiving() is somehow
+    // called twice a SharedFlow delivers to both collectors simultaneously. The
+    // DB-level INSERT OR IGNORE is the last line of defence, but it fires after
+    // ratchet.decrypt which irreversibly advances chain state. This set prevents
+    // two coroutines from entering handleDeliver for the same messageId at all.
+    private val processingLock = Mutex()
+    private val activeProcessing = mutableSetOf<String>()
+
     // Per-conversation Mutex protects every load → encrypt/decrypt → save sequence
     // on the Double Ratchet state. Without this lock two concurrent sendMessage()
     // calls (e.g. user typing + automatic profile-card sync) could both load the
@@ -219,6 +227,18 @@ class DefaultMessagingService(
     }
 
     private suspend fun handleDeliver(deliver: RelayMessage.Deliver) {
+        val claimed = processingLock.withLock {
+            if (deliver.messageId in activeProcessing) false
+            else { activeProcessing.add(deliver.messageId); true }
+        }
+        if (!claimed) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "Duplicate in-flight delivery skipped: id=${deliver.messageId.take(12)}…",
+            )
+            return
+        }
+        try {
         messagingLog(
             MessagingLogLevel.INFO,
             "handleDeliver start: id=${deliver.messageId.take(12)}… sealed=${deliver.sealedSender.isNotEmpty()} payloadBytes=${deliver.payload.length}",
@@ -495,6 +515,9 @@ class DefaultMessagingService(
                 "handleDeliver FAILED for id=${deliver.messageId.take(12)}… (${e::class.simpleName}): ${e.message}",
                 e,
             )
+        }
+        } finally {
+            processingLock.withLock { activeProcessing.remove(deliver.messageId) }
         }
     }
 

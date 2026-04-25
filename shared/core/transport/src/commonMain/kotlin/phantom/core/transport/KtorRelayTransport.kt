@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.encodeToString
@@ -202,7 +203,7 @@ class KtorRelayTransport(
                     )
                     // Close the session; readLoop returns, webSocket block exits,
                     // runReconnectLoop schedules the next attempt.
-                    runCatching { session?.close() }
+                    runCatching { withTimeoutOrNull(2_000L) { session?.close() } }
                     break
                 }
                 sendRaw(RelayMessage.Ping)
@@ -234,7 +235,7 @@ class KtorRelayTransport(
                 }
                 // Force the session closed so the reconnect loop opens a
                 // fresh WebSocket and flushPendingOutbox re-sends them.
-                runCatching { session?.close() }
+                runCatching { withTimeoutOrNull(2_000L) { session?.close() } }
                 break
             }
         }
@@ -359,7 +360,7 @@ class KtorRelayTransport(
             // pendingAcks entry is meaningless — drop it and re-enqueue at
             // the front of the outbox.
             pendingAcksLock.withLock { pendingAcks.remove(message.messageId) }
-            outboxMutex.withLock { pendingOutbox.addFirst(message) }
+            outboxMutex.withLock { pendingOutbox.addLast(message) }
         }
         return ok
     }

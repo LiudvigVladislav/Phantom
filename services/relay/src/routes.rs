@@ -20,12 +20,16 @@ use tower_http::{
     trace::TraceLayer,
 };
 use axum::http::Request;
+use std::sync::atomic::Ordering;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let max_body = state.config.max_payload_bytes + 1024;
-    Router::new()
+
+    // TimeoutLayer must NOT apply to /ws — WebSocket connections are long-lived
+    // and a 30-second timeout would kill idle-but-healthy sessions. Scope it
+    // to the HTTP sub-router only; /ws is mounted separately with no timeout.
+    let http_routes = Router::new()
         .route("/health",             get(health))
-        .route("/ws",                 get(ws_handler))
         .route("/send",               post(send_envelope))
         .route("/fetch/{recipient}",  get(fetch_envelopes))
         .route("/ack/{id}",           delete(ack_envelope))
@@ -33,6 +37,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/reports",      get(admin_list_reports))
         .route("/admin/block",        post(admin_block_key))
         .route("/admin/blocklist",    get(admin_list_blocklist))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ));
+
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .merge(http_routes)
         // Log only method + path — never query string, to avoid leaking ?token= secrets.
         .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
             tracing::info_span!(
@@ -41,10 +53,6 @@ pub fn router(state: Arc<AppState>) -> Router {
                 path   = %req.uri().path(),
             )
         }))
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(30),
-        ))
         .layer(RequestBodyLimitLayer::new(max_body))
         .with_state(state)
 }
@@ -82,9 +90,11 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
     // Channel: relay → this client
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Register client
+    // Register client — mint a unique connection ID so the cleanup path can
+    // distinguish this session from a later reconnect that races with our exit.
+    let conn_id = state.conn_counter.fetch_add(1, Ordering::Relaxed);
     if !identity.is_empty() {
-        state.clients.write().await.insert(identity.clone(), tx.clone());
+        state.clients.write().await.insert(identity.clone(), (conn_id, tx.clone()));
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -159,9 +169,16 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
         _ = &mut recv_task => send_task.abort(),
     }
 
-    // Unregister client
+    // Unregister client — only remove if the stored conn_id still matches ours.
+    // If the client reconnected before this cleanup ran, the new session has
+    // already inserted a fresh (conn_id, tx) entry; removing it blindly would
+    // cause the new session to go silent (no live delivery) until its next
+    // reconnect. Comparing conn_id is the minimal fix for this race.
     if !identity.is_empty() {
-        state.clients.write().await.remove(&identity);
+        let mut clients = state.clients.write().await;
+        if clients.get(&identity).map(|(id, _)| *id) == Some(conn_id) {
+            clients.remove(&identity);
+        }
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -311,7 +328,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             // Attempt live delivery — best-effort.
             let delivered = {
                 let clients = state.clients.read().await;
-                if let Some(recipient_tx) = clients.get(&to) {
+                if let Some((_, recipient_tx)) = clients.get(&to) {
                     recipient_tx.send(deliver.clone()).is_ok()
                 } else {
                     false
@@ -342,7 +359,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             }
 
             // Ack back to sender
-            if let Some(sender_tx) = state.clients.read().await.get(from_identity) {
+            if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
                 let ack = serde_json::json!({
                     "type": "ack",
                     "messageId": msg_id,
@@ -353,7 +370,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             }
         }
         Some("ping") => {
-            if let Some(tx) = state.clients.read().await.get(from_identity) {
+            if let Some((_, tx)) = state.clients.read().await.get(from_identity) {
                 let _ = tx.send(r#"{"type":"pong"}"#.to_string());
             }
         }
@@ -414,7 +431,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             let to = value["to"].as_str().unwrap_or("").to_string();
             if !to.is_empty() {
                 let clients = state.clients.read().await;
-                if let Some(tx) = clients.get(&to) {
+                if let Some((_, tx)) = clients.get(&to) {
                     let typing_msg = serde_json::json!({
                         "type": "typing",
                         "from": from_identity,
