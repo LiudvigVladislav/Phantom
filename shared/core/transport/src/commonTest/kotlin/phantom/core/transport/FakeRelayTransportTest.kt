@@ -46,6 +46,8 @@ class FakeRelayTransportTest {
 
         override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = false
 
+        override suspend fun sendDeliveryAck(messageId: String): Boolean = isConnected()
+
         override suspend fun sendTyping(toPubKeyHex: String): Boolean {
             if (!isConnected()) return false
             typingOutbox.trySend(toPubKeyHex)

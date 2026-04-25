@@ -96,15 +96,24 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
             "metadata"
         );
 
-        // Flush queued messages
+        // Re-flush every envelope the store still holds for this recipient.
+        // We deliberately do NOT drain the queue here — envelopes stay in the
+        // store until the client confirms each one with {"type":"ack-deliver"}.
+        // This makes reconnect-redelivery durable across:
+        //   • mpsc-channel-pushed-but-WS-write-failed gaps,
+        //   • client-process-killed-after-receive-but-before-decrypt gaps,
+        //   • client-decrypted-but-DB-insert-failed gaps.
+        // The client deduplicates on the messages.id PRIMARY KEY (INSERT OR
+        // IGNORE), so a recipient that successfully processed an envelope on
+        // a prior session simply ignores the duplicate on reconnect.
         let queued: Vec<Envelope> = {
             let mut store = state.store.write().await;
             let queue = store.entry(identity.clone()).or_default();
             queue.retain(|e| !e.is_expired());
-            std::mem::take(queue)
+            queue.clone()
         };
         if !queued.is_empty() {
-            tracing::info!(id = %&identity[..identity.len().min(16)], count = queued.len(), "flushing queued envelopes");
+            tracing::info!(id = %&identity[..identity.len().min(16)], count = queued.len(), "flushing queued envelopes (retained until ack-deliver)");
         }
         for env in queued {
             let deliver = serde_json::json!({
@@ -266,7 +275,40 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             })
             .to_string();
 
-            // Try live delivery first
+            // Persist FIRST. Live delivery via the in-memory mpsc channel is a
+            // best-effort optimisation; a recipient WS that silently dies
+            // between mpsc.send() and the actual ws_tx.send() must not lose the
+            // envelope. The store is the source of truth — the client removes
+            // an envelope only by sending {"type":"ack-deliver", ...} after
+            // successful decrypt + DB insert. On reconnect the client gets
+            // every envelope still in the store, deduped at the message_id
+            // level on the client side (INSERT OR IGNORE on the messages
+            // table). This keeps the QA-observed loss-after-idle-disconnect
+            // bug from happening again.
+            let envelope = Envelope::new(
+                msg_id.clone(),
+                to.clone(),
+                envelope_from,
+                sealed_sender.clone(),
+                payload.clone(),
+                state.config.envelope_ttl_secs,
+            );
+            {
+                let mut store = state.store.write().await;
+                let queue = store.entry(to.clone()).or_default();
+                queue.retain(|e| !e.is_expired() && e.id != msg_id);
+                if queue.len() < state.config.max_envelopes_per_recipient {
+                    queue.push(envelope);
+                } else {
+                    tracing::warn!(
+                        msg_id = %msg_id,
+                        cap    = state.config.max_envelopes_per_recipient,
+                        "store at capacity — envelope dropped"
+                    );
+                }
+            }
+
+            // Attempt live delivery — best-effort.
             let delivered = {
                 let clients = state.clients.read().await;
                 if let Some(recipient_tx) = clients.get(&to) {
@@ -277,32 +319,14 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             };
 
             if delivered {
-                tracing::info!(msg_id = %msg_id, "live delivery OK");
+                tracing::info!(msg_id = %msg_id, "live delivery dispatched (envelope retained until client ack-deliver)");
             } else {
-                // Store for later
-                let envelope = Envelope::new(
-                    msg_id.clone(),
-                    to.clone(),
-                    envelope_from,
-                    sealed_sender.clone(),
-                    payload,
-                    state.config.envelope_ttl_secs,
+                let online_count = state.clients.read().await.len();
+                tracing::info!(
+                    msg_id       = %msg_id,
+                    online_count,
+                    "recipient offline — queued for next reconnect"
                 );
-                {
-                    // Log only online_count, never key prefixes — presence metadata leak.
-                    let online_count = state.clients.read().await.len();
-                    tracing::info!(
-                        msg_id       = %msg_id,
-                        online_count,
-                        "recipient offline — queuing"
-                    );
-                }
-                let mut store = state.store.write().await;
-                let queue = store.entry(to).or_default();
-                queue.retain(|e| !e.is_expired());
-                if queue.len() < state.config.max_envelopes_per_recipient {
-                    queue.push(envelope);
-                }
 
                 // TODO: Send FCM silent push so the offline device wakes and drains via WebSocket.
                 // Gated on RELAY_FCM_SERVER_KEY being set (state.config.fcm_server_key.is_some()).
@@ -331,6 +355,36 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
         Some("ping") => {
             if let Some(tx) = state.clients.read().await.get(from_identity) {
                 let _ = tx.send(r#"{"type":"pong"}"#.to_string());
+            }
+        }
+        // ── Client → Relay delivery acknowledgement ────────────────────────────
+        // The recipient client sends this after it has fully processed an
+        // inbound envelope (Sealed-Sender unseal → decrypt → DB insert). The
+        // relay then removes the envelope from the per-recipient store so that
+        // the next reconnect does not redeliver it. Without this handler the
+        // store grows unboundedly and the client is forced to handle the same
+        // ciphertext on every reconnect.
+        //
+        // Identity check: a client may only ack-deliver envelopes addressed to
+        // its own connection identity. Otherwise an attacker could erase
+        // somebody else's pending mail.
+        Some("ack-deliver") => {
+            let msg_id = value["messageId"].as_str().unwrap_or("").to_string();
+            if msg_id.is_empty() {
+                return;
+            }
+            let removed = {
+                let mut store = state.store.write().await;
+                if let Some(queue) = store.get_mut(from_identity) {
+                    let before = queue.len();
+                    queue.retain(|e| e.id != msg_id);
+                    before != queue.len()
+                } else {
+                    false
+                }
+            };
+            if removed {
+                tracing::debug!(msg_id = %msg_id, "client ack-deliver — envelope removed from store");
             }
         }
         Some("typing") => {

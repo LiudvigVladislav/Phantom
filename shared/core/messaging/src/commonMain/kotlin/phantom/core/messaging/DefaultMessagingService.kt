@@ -244,6 +244,22 @@ class DefaultMessagingService(
                 "Sender identified: ${senderPubKeyHex.take(16)}…",
             )
 
+            // Idempotent receive. The relay re-delivers every still-stored
+            // envelope on reconnect; without this guard a duplicate would
+            // fall into ratchet.decrypt with a chain key that has already
+            // advanced past it (MAC failure) and the message would never get
+            // ack-deliver'd, so the relay would replay it forever.
+            // Sending ack-deliver here breaks the loop cleanly.
+            val alreadyProcessed = messageRepository.getMessageById(deliver.messageId) != null
+            if (alreadyProcessed) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "Duplicate envelope (already in DB): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping",
+                )
+                transport.sendDeliveryAck(deliver.messageId)
+                return@runCatching
+            }
+
             // Unpad ISO 7816-4 padding applied by the sender to hide message length.
             val ciphertext = MessagePadding.unpad(deliver.payload.decodeBase64Bytes())
             val encrypted = json.decodeFromString<phantom.core.crypto.EncryptedMessage>(
@@ -457,9 +473,17 @@ class DefaultMessagingService(
                     notifErr,
                 )
             }
+            // Tell the relay to drop this envelope from its store now that we
+            // have safely persisted + emitted it. Without this the relay will
+            // re-deliver the same message on every reconnect for up to
+            // RELAY_ENVELOPE_TTL_SECS (7 days). INSERT OR IGNORE in the
+            // messages table makes any duplication harmless, but explicit
+            // ack-deliver is what actually frees server-side memory.
+            transport.sendDeliveryAck(deliver.messageId)
+
             messagingLog(
                 MessagingLogLevel.INFO,
-                "handleDeliver DONE for id=${deliver.messageId.take(12)}…",
+                "handleDeliver DONE for id=${deliver.messageId.take(12)}… (ack-deliver sent)",
             )
         }.onFailure { e ->
             // Previously this branch was silent ("avoids leaking error details"). That policy hides

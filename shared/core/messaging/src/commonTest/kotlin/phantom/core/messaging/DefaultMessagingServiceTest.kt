@@ -44,7 +44,13 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun getMessages(conversationId: String) =
         messages.filter { it.conversationId == conversationId }
 
-    override suspend fun insertMessage(entity: MessageEntity) { messages += entity }
+    override suspend fun getMessageById(id: String): MessageEntity? =
+        messages.firstOrNull { it.id == id }
+
+    override suspend fun insertMessage(entity: MessageEntity) {
+        if (messages.any { it.id == entity.id }) return
+        messages += entity
+    }
     override suspend fun updateStatus(messageId: String, status: MessageStatus) {
         statusUpdates[messageId] = status
     }
@@ -169,6 +175,7 @@ private class FakeRelayTransport : RelayTransport {
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
+    override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
     override fun isConnected() = true
 }

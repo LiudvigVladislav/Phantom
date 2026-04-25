@@ -2,6 +2,7 @@ package phantom.core.storage
 
 interface MessageRepository {
     suspend fun getMessages(conversationId: String): List<MessageEntity>
+    suspend fun getMessageById(id: String): MessageEntity?
     suspend fun insertMessage(entity: MessageEntity)
     suspend fun updateStatus(messageId: String, status: MessageStatus)
     suspend fun updateMessageText(messageId: String, text: String)

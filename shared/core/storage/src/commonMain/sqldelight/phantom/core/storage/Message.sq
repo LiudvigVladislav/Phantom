@@ -15,8 +15,17 @@ CREATE TABLE message (
 getMessages:
 SELECT * FROM message WHERE conversation_id = ? ORDER BY created_at ASC;
 
+getMessageById:
+SELECT * FROM message WHERE id = ?;
+
+-- INSERT OR IGNORE: the relay re-delivers every still-stored envelope on
+-- reconnect, so the same message_id can arrive more than once if a previous
+-- session processed it but the WS died before "ack-deliver" reached the
+-- relay. Idempotent insert lets the receive pipeline tolerate that
+-- duplication without surfacing duplicate UI events or violating the
+-- message.id PRIMARY KEY constraint.
 insertMessage:
-INSERT INTO message(id, conversation_id, ciphertext, plaintext_cache, sent, status, created_at, expires_at_ms)
+INSERT OR IGNORE INTO message(id, conversation_id, ciphertext, plaintext_cache, sent, status, created_at, expires_at_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
 updateMessageStatus:

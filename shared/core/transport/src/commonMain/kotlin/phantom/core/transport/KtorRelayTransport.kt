@@ -287,6 +287,27 @@ class KtorRelayTransport(
         return sendRaw(message)
     }
 
+    override suspend fun sendDeliveryAck(messageId: String): Boolean {
+        val msg = RelayMessage.AckDelivery(messageId = messageId)
+        if (!isConnected()) {
+            // Queue the ack: it MUST eventually reach the relay or the envelope
+            // will be redelivered forever. The outbox is FIFO, so by the time
+            // the next connect drains it the relay will see this ack right
+            // after the envelope it concerns.
+            outboxMutex.withLock { pendingOutbox.addLast(msg) }
+            relayLog(
+                RelayLogLevel.INFO,
+                "Queued delivery ack until reconnect: messageId=${messageId.take(12)}…",
+            )
+            return false
+        }
+        relayLog(
+            RelayLogLevel.INFO,
+            "Sending delivery ack: messageId=${messageId.take(12)}…",
+        )
+        return sendRaw(msg)
+    }
+
     /**
      * Sends an ephemeral typing notification over the existing WebSocket session.
      * The relay is responsible for live forwarding; if the recipient is offline the
@@ -332,9 +353,19 @@ class KtorRelayTransport(
                     RelayLogLevel.INFO,
                     "Flush → send read receipt: id=${msg.messageId.take(12)}…",
                 )
+                is RelayMessage.AckDelivery -> relayLog(
+                    RelayLogLevel.INFO,
+                    "Flush → send delivery ack: id=${msg.messageId.take(12)}…",
+                )
                 else -> Unit
             }
-            sendRaw(msg)
+            val ok = sendRaw(msg)
+            if (!ok) {
+                relayLog(
+                    RelayLogLevel.ERROR,
+                    "Flush failed for one queued item — message will not be retried in this cycle",
+                )
+            }
         }
     }
 

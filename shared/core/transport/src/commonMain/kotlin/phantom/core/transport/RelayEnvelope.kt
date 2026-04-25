@@ -40,6 +40,21 @@ sealed class RelayMessage {
         val messageId: String,  // the message that was read
     ) : RelayMessage()
 
+    /**
+     * Sent by the recipient AFTER an inbound envelope has been fully processed
+     * (Sealed-Sender unseal → Double-Ratchet decrypt → DB insert succeeded).
+     * The relay removes the corresponding envelope from its per-recipient
+     * store on receipt, so reconnect-redelivery does not endlessly replay
+     * already-processed messages. The recipient identity is the
+     * authenticated WS connection identity, so a client can only ack-deliver
+     * envelopes addressed to itself.
+     */
+    @Serializable
+    @SerialName("ack-deliver")
+    data class AckDelivery(
+        val messageId: String,
+    ) : RelayMessage()
+
     @Serializable
     @SerialName("ping")
     object Ping : RelayMessage()

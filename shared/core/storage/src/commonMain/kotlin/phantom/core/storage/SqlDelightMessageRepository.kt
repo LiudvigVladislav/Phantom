@@ -13,6 +13,11 @@ class SqlDelightMessageRepository(
             db.messageQueries.getMessages(conversationId).executeAsList().map { it.toEntity() }
         }
 
+    override suspend fun getMessageById(id: String): MessageEntity? =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.getMessageById(id).executeAsOneOrNull()?.toEntity()
+        }
+
     override suspend fun insertMessage(entity: MessageEntity): Unit =
         withContext(Dispatchers.IO) {
             db.messageQueries.insertMessage(

@@ -98,7 +98,11 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun getMessages(conversationId: String): List<MessageEntity> =
         store.filter { it.conversationId == conversationId }.sortedBy { it.createdAt }
 
+    override suspend fun getMessageById(id: String): MessageEntity? =
+        store.firstOrNull { it.id == id }
+
     override suspend fun insertMessage(entity: MessageEntity) {
+        if (store.any { it.id == entity.id }) return
         store.add(entity)
     }
 

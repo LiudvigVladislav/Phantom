@@ -86,6 +86,7 @@ private class BufferingRelayTransport : RelayTransport {
     }
 
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
+    override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
 
     override fun isConnected(): Boolean = _state.value is TransportState.Connected
