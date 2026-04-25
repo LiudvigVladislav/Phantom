@@ -191,9 +191,17 @@ fun ChatScreen(
 
     suspend fun reloadMessages() {
         messages = container.messageRepo.getMessages(conversationId)
+        Log.i(
+            "PhantomUI",
+            "ChatScreen reloadMessages: conv=${conversationId.take(24)}… loaded=${messages.size}",
+        )
     }
 
     LaunchedEffect(conversationId) {
+        Log.i(
+            "PhantomUI",
+            "ChatScreen subscribed to conv=${conversationId.take(24)}… theirUsername=$theirUsername",
+        )
         reloadMessages()
         val conv = container.conversationRepo.getConversation(conversationId)
         if (conv != null) {
@@ -250,6 +258,11 @@ fun ChatScreen(
                 Log.e("PhantomUI", "incomingMessages flow error in ChatScreen: ${e.message}", e)
             }
             ?.collect { incoming ->
+                Log.i(
+                    "PhantomUI",
+                    "ChatScreen received incoming for conv=${incoming.conversationId.take(24)}… " +
+                        "(my conv=${conversationId.take(24)}…, match=${incoming.conversationId == conversationId})",
+                )
             if (incoming.conversationId == conversationId) {
                 // Check if this is a profile card — handle silently, do not display
                 val plaintext = incoming.text

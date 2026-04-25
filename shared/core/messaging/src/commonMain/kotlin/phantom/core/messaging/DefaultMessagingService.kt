@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.datetime.Clock
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
@@ -50,6 +52,45 @@ class DefaultMessagingService(
 
     @Volatile private var receiving = false
 
+    // Per-conversation Mutex protects every load → encrypt/decrypt → save sequence
+    // on the Double Ratchet state. Without this lock two concurrent sendMessage()
+    // calls (e.g. user typing + automatic profile-card sync) could both load the
+    // same starting RatchetState, both derive the same chain key, and both ship
+    // a ciphertext encrypted with that key. The receiver advances its chain on
+    // the first message and then fails MAC verification on the second — the
+    // exact symptom reported in the 2026-04-25 QA pass.
+    private val sessionMutexesLock = Mutex()
+    private val sessionMutexes = mutableMapOf<String, Mutex>()
+
+    private suspend fun mutexFor(conversationId: String): Mutex =
+        sessionMutexesLock.withLock {
+            sessionMutexes.getOrPut(conversationId) { Mutex() }
+        }
+
+    /**
+     * Loads the ratchet state for the conversation, encrypts [plaintext] with the
+     * Double Ratchet, and persists the advanced state — all under the per-
+     * conversation mutex so concurrent callers cannot derive the same chain key.
+     * Returns the wire-ready EncryptedMessage. The DH keypair argument is
+     * threaded through so this helper stays usable from outgoing call sites
+     * that already have it on the stack.
+     */
+    private suspend fun encryptUnderLock(
+        conversationId: String,
+        recipientPublicKeyHex: String,
+        plaintext: ByteArray,
+    ): phantom.core.crypto.EncryptedMessage =
+        mutexFor(conversationId).withLock {
+            val state = sessionManager.getOrCreateSession(
+                conversationId = conversationId,
+                localIdentityKeyPair = localKeyPair,
+                remoteIdentityPublicKeyHex = recipientPublicKeyHex,
+            )
+            val (newState, encrypted) = ratchet.encrypt(state, plaintext)
+            sessionManager.saveSession(conversationId, newState)
+            encrypted
+        }
+
     /**
      * Platform hook for local push notifications.
      * Set by the Android AppContainer after [initMessaging]; null on other platforms.
@@ -78,12 +119,6 @@ class DefaultMessagingService(
     @Volatile var onCallMessage: ((MessagePayload, String) -> Unit)? = null
 
     override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> = runCatching {
-        val state = sessionManager.getOrCreateSession(
-            conversationId = message.conversationId,
-            localIdentityKeyPair = localKeyPair,
-            remoteIdentityPublicKeyHex = message.recipientPublicKeyHex,
-        )
-
         val payload = json.encodeToString(
             MessagePayload(
                 text = message.text,
@@ -92,8 +127,11 @@ class DefaultMessagingService(
             )
         ).encodeToByteArray()
 
-        val (newState, encrypted) = ratchet.encrypt(state, payload)
-        sessionManager.saveSession(message.conversationId, newState)
+        val encrypted = encryptUnderLock(
+            conversationId = message.conversationId,
+            recipientPublicKeyHex = message.recipientPublicKeyHex,
+            plaintext = payload,
+        )
 
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
 
@@ -213,22 +251,31 @@ class DefaultMessagingService(
             )
 
             val conversationId = deriveConversationId(senderPubKeyHex)
-            val state = sessionManager.getOrCreateSession(
-                conversationId = conversationId,
-                localIdentityKeyPair = localKeyPair,
-                remoteIdentityPublicKeyHex = senderPubKeyHex,
-            )
-            messagingLog(
-                MessagingLogLevel.INFO,
-                "Session loaded: conv=${conversationId.take(24)}… decrypting…",
-            )
+            // The same per-conversation mutex protects the receive path so that an
+            // outgoing send (which advances the local sending chain and saves) cannot
+            // race with an inbound decrypt. Receive itself is already serialised by
+            // transport.incoming.onEach, but a parallel sendMessage on the same
+            // conversation could still observe a half-saved state.
+            val mutex = mutexFor(conversationId)
+            val plainBytes = mutex.withLock {
+                val state = sessionManager.getOrCreateSession(
+                    conversationId = conversationId,
+                    localIdentityKeyPair = localKeyPair,
+                    remoteIdentityPublicKeyHex = senderPubKeyHex,
+                )
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "Session loaded: conv=${conversationId.take(24)}… decrypting…",
+                )
 
-            val (newState, plainBytes) = ratchet.decrypt(state, encrypted)
-            sessionManager.saveSession(conversationId, newState)
-            messagingLog(
-                MessagingLogLevel.INFO,
-                "Decrypt OK: plaintextBytes=${plainBytes.size}",
-            )
+                val (newState, decrypted) = ratchet.decrypt(state, encrypted)
+                sessionManager.saveSession(conversationId, newState)
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "Decrypt OK: plaintextBytes=${decrypted.size}",
+                )
+                decrypted
+            }
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
             messagingLog(
@@ -348,6 +395,12 @@ class DefaultMessagingService(
                 val prevByName = conversationRepository.getActiveConversations()
                     .firstOrNull { it.theirUsername == senderName && it.theirPublicKeyHex != senderPubKeyHex }
                 val keyChangedAt = if (prevByName != null) Clock.System.now().toEpochMilliseconds() else null
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "Creating new conversation as REQUEST: conv=${conversationId.take(24)}… " +
+                        "sender=$senderName — will appear in Message Requests, NOT in main chat list " +
+                        "until accepted (this is by design; see qa_report_2026_04_24.md BUG-A).",
+                )
                 conversationRepository.upsertConversation(
                     ConversationEntity(
                         id = conversationId,
@@ -362,6 +415,11 @@ class DefaultMessagingService(
                     )
                 )
             } else {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "Updating existing conversation: conv=${conversationId.take(24)}… " +
+                        "trustTier=${existing.trustTier} (kept) unreadCount=${existing.unreadCount + 1}",
+                )
                 conversationRepository.upsertConversation(
                     existing.copy(
                         lastMessagePreview = previewText(payload.text),
@@ -442,11 +500,6 @@ class DefaultMessagingService(
         conversationId: String,
         recipientPublicKeyHex: String,
     ): Result<Unit> = runCatching {
-        val state = sessionManager.getOrCreateSession(
-            conversationId = conversationId,
-            localIdentityKeyPair = localKeyPair,
-            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
-        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = "",
@@ -456,8 +509,11 @@ class DefaultMessagingService(
                 targetMessageId = messageId,
             )
         ).encodeToByteArray()
-        val (newState, encrypted) = ratchet.encrypt(state, payload)
-        sessionManager.saveSession(conversationId, newState)
+        val encrypted = encryptUnderLock(
+            conversationId = conversationId,
+            recipientPublicKeyHex = recipientPublicKeyHex,
+            plaintext = payload,
+        )
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(
@@ -479,11 +535,6 @@ class DefaultMessagingService(
         conversationId: String,
         recipientPublicKeyHex: String,
     ): Result<Unit> = runCatching {
-        val state = sessionManager.getOrCreateSession(
-            conversationId = conversationId,
-            localIdentityKeyPair = localKeyPair,
-            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
-        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = "",
@@ -493,8 +544,11 @@ class DefaultMessagingService(
                 disappearingTimerSecs = timerSecs,
             )
         ).encodeToByteArray()
-        val (newState, encrypted) = ratchet.encrypt(state, payload)
-        sessionManager.saveSession(conversationId, newState)
+        val encrypted = encryptUnderLock(
+            conversationId = conversationId,
+            recipientPublicKeyHex = recipientPublicKeyHex,
+            plaintext = payload,
+        )
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(
@@ -516,11 +570,6 @@ class DefaultMessagingService(
         conversationId: String,
         recipientPublicKeyHex: String,
     ): Result<Unit> = runCatching {
-        val state = sessionManager.getOrCreateSession(
-            conversationId = conversationId,
-            localIdentityKeyPair = localKeyPair,
-            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
-        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = newText,
@@ -530,8 +579,11 @@ class DefaultMessagingService(
                 targetMessageId = messageId,
             )
         ).encodeToByteArray()
-        val (newState, encrypted) = ratchet.encrypt(state, payload)
-        sessionManager.saveSession(conversationId, newState)
+        val encrypted = encryptUnderLock(
+            conversationId = conversationId,
+            recipientPublicKeyHex = recipientPublicKeyHex,
+            plaintext = payload,
+        )
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(
@@ -554,11 +606,6 @@ class DefaultMessagingService(
         recipientPublicKeyHex: String,
         emoji: String,
     ): Result<Unit> = runCatching {
-        val state = sessionManager.getOrCreateSession(
-            conversationId = conversationId,
-            localIdentityKeyPair = localKeyPair,
-            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
-        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = "",
@@ -569,8 +616,11 @@ class DefaultMessagingService(
                 emoji = emoji,
             )
         ).encodeToByteArray()
-        val (newState, encrypted) = ratchet.encrypt(state, payload)
-        sessionManager.saveSession(conversationId, newState)
+        val encrypted = encryptUnderLock(
+            conversationId = conversationId,
+            recipientPublicKeyHex = recipientPublicKeyHex,
+            plaintext = payload,
+        )
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(
@@ -606,11 +656,6 @@ class DefaultMessagingService(
         recipientPublicKeyHex: String,
         pinned: Boolean,
     ): Result<Unit> = runCatching {
-        val state = sessionManager.getOrCreateSession(
-            conversationId = conversationId,
-            localIdentityKeyPair = localKeyPair,
-            remoteIdentityPublicKeyHex = recipientPublicKeyHex,
-        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = "",
@@ -621,8 +666,11 @@ class DefaultMessagingService(
                 pinned = pinned,
             )
         ).encodeToByteArray()
-        val (newState, encrypted) = ratchet.encrypt(state, payload)
-        sessionManager.saveSession(conversationId, newState)
+        val encrypted = encryptUnderLock(
+            conversationId = conversationId,
+            recipientPublicKeyHex = recipientPublicKeyHex,
+            plaintext = payload,
+        )
         val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         transport.send(

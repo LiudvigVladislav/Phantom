@@ -97,6 +97,11 @@ fun ChatListScreen(
         conversations = container.conversationRepo.getActiveConversations()
         requestCount = container.conversationRepo.getMessageRequests().size
         groups = runCatching { container.groupRepo.getGroups() }.getOrElse { emptyList() }
+        Log.i(
+            "PhantomUI",
+            "ChatListScreen reload (key=$reloadKey): activeConversations=${conversations.size} " +
+                "messageRequests=$requestCount groups=${groups.size}",
+        )
     }
 
     LaunchedEffect(container.messagingService) {
