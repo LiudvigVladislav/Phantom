@@ -248,10 +248,19 @@ private fun PhantomApp(
     // service). Calling them here would create a second competing connection loop. The service
     // is started from MainActivity.onCreate() and runs independently of Activity lifecycle.
 
+    val context = androidx.compose.ui.platform.LocalContext.current
     when (val screen = currentScreen) {
         is Screen.Onboarding -> OnboardingScreen(
             container = container,
-            onComplete = { currentScreen = Screen.ChatList },
+            onComplete = {
+                // Identity is now persisted. Restart the foreground service so it
+                // picks up the new identity, calls startReceiving(), and opens the
+                // WebSocket — the earlier onStartCommand bailed out via stopSelf()
+                // because no identity existed yet. Without this kick the user has
+                // to fully restart the app before messages can flow.
+                context.startForegroundService(Intent(context, PhantomMessagingService::class.java))
+                currentScreen = Screen.ChatList
+            },
         )
         is Screen.ChatList -> ChatListScreen(
             container = container,

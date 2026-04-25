@@ -52,10 +52,21 @@ fun ConnectionBanner(
 ) {
     val transportState by stateFlow
     var showAfterGrace by remember { mutableStateOf(false) }
+    // Suppresses the banner until we have evidence the transport has actually
+    // tried to connect. Otherwise the very first frame after onboarding (or after
+    // a process restart that is racing with the foreground service) renders
+    // "Offline — messages queued" purely because TransportState defaults to
+    // Disconnected — a false alarm the user has no action to take on.
+    var hasEverConnected by remember { mutableStateOf(false) }
 
     // Reset the grace timer on every state change so brief Connecting blips
     // are hidden but a persistent Connecting is revealed within DELAYED_SHOW_MS.
     LaunchedEffect(transportState) {
+        if (transportState is TransportState.Connecting ||
+            transportState is TransportState.Connected
+        ) {
+            hasEverConnected = true
+        }
         if (transportState is TransportState.Connected) {
             showAfterGrace = false
         } else {
@@ -65,7 +76,9 @@ fun ConnectionBanner(
         }
     }
 
-    val visible = transportState !is TransportState.Connected && showAfterGrace
+    val visible = transportState !is TransportState.Connected &&
+        showAfterGrace &&
+        hasEverConnected
     val label: String
     val dotColor: Color
     when (transportState) {
