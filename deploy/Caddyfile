@@ -42,6 +42,21 @@ relay.phntm.pro {
         header_up X-Real-IP        {remote_host}
         header_up X-Forwarded-For  {remote_host}
         header_up X-Forwarded-Proto {scheme}
+
+        # Disable proxy-side timeouts so a quiet WebSocket session does not
+        # get killed mid-conversation. Heartbeats are handled at the
+        # application level (RelayTransportConfig.PING_INTERVAL_MS) and at
+        # the WS protocol level (Ktor pingIntervalMillis); Caddy must not
+        # second-guess them with a 60-second idle close. flush_interval=-1
+        # tells Caddy to flush every frame to the upstream immediately,
+        # which keeps streaming WS frames responsive on slow cellular.
+        transport http {
+            read_timeout    0
+            write_timeout   0
+            dial_timeout    10s
+            response_header_timeout 30s
+        }
+        flush_interval -1
     }
 
     # Structured access log — method + path only. No query string, no body.

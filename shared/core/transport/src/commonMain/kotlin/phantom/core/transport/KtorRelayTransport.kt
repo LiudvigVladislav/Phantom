@@ -69,6 +69,7 @@ class KtorRelayTransport(
     private var session: WebSocketSession? = null
     private var scope: CoroutineScope? = null
     private var pingJob: Job? = null
+    private var ackWatchdogJob: Job? = null
     private var relayUrl: String = ""
     private var identityHex: String = ""
     private var relayToken: String? = null
@@ -88,6 +89,20 @@ class KtorRelayTransport(
     // which wakes openWithRetry() and triggers a reconnect.
     private val timeSource = TimeSource.Monotonic
     @Volatile private var lastPongMark: TimeSource.Monotonic.ValueTimeMark = timeSource.markNow()
+
+    // Sent-but-unacknowledged envelopes. Frame.send() can succeed against a
+    // half-dead socket without throwing — the bytes sit in the OkHttp buffer
+    // and never reach the wire. The ACK watchdog promotes that silent loss
+    // to an explicit retry: every entry older than ACK_TIMEOUT_MS is moved
+    // back to the front of pendingOutbox and the session is force-closed,
+    // which makes runReconnectLoop open a fresh socket and flushPendingOutbox
+    // re-send the envelope on top of the new session.
+    private data class AckPending(
+        val message: RelayMessage.Send,
+        val sentAt: TimeSource.Monotonic.ValueTimeMark,
+    )
+    private val pendingAcksLock = Mutex()
+    private val pendingAcks = mutableMapOf<String, AckPending>()
 
     override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {
         this.relayUrl = relayUrl
@@ -132,6 +147,14 @@ class KtorRelayTransport(
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
                     scope = transportScope
                     startPing(transportScope)
+                    startAckWatchdog(transportScope)
+
+                    // Move every still-unacknowledged envelope back to the
+                    // head of the outbox. They were sent on the previous
+                    // session and never confirmed — most likely lost in
+                    // transit. flushPendingOutbox below will re-send them
+                    // before any new outbound traffic.
+                    requeueUnackedToOutboxFront()
 
                     // Drain anything the app queued while the socket was down.
                     flushPendingOutbox()
@@ -187,6 +210,52 @@ class KtorRelayTransport(
         }
     }
 
+    private fun startAckWatchdog(scope: CoroutineScope) {
+        ackWatchdogJob = scope.launch {
+            while (isActive) {
+                delay(RelayTransportConfig.ACK_WATCHDOG_INTERVAL_MS)
+                val expired = pendingAcksLock.withLock {
+                    val toExpire = pendingAcks.values.filter {
+                        it.sentAt.elapsedNow().inWholeMilliseconds > RelayTransportConfig.ACK_TIMEOUT_MS
+                    }
+                    toExpire.forEach { pendingAcks.remove(it.message.messageId) }
+                    toExpire
+                }
+                if (expired.isEmpty()) continue
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and force-reconnecting. " +
+                        "First id=${expired.first().message.messageId.take(12)}…",
+                )
+                // Push back to the front so retried envelopes are re-sent
+                // before any new outbound traffic queued in the meantime.
+                outboxMutex.withLock {
+                    expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
+                }
+                // Force the session closed so the reconnect loop opens a
+                // fresh WebSocket and flushPendingOutbox re-sends them.
+                runCatching { session?.close() }
+                break
+            }
+        }
+    }
+
+    private suspend fun requeueUnackedToOutboxFront() {
+        val drained = pendingAcksLock.withLock {
+            val list = pendingAcks.values.map { it.message }
+            pendingAcks.clear()
+            list
+        }
+        if (drained.isEmpty()) return
+        relayLog(
+            RelayLogLevel.INFO,
+            "Re-queueing ${drained.size} unacknowledged envelope(s) from previous session",
+        )
+        outboxMutex.withLock {
+            drained.asReversed().forEach { pendingOutbox.addFirst(it) }
+        }
+    }
+
     private suspend fun WebSocketSession.readLoop() {
         for (frame in incoming) {
             if (frame is Frame.Text) {
@@ -220,6 +289,12 @@ class KtorRelayTransport(
                             _incoming.emit(msg)
                         }
                         is RelayMessage.Ack -> {
+                            // Clear the watchdog entry — relay confirms the
+                            // envelope landed. Whether it was live-delivered
+                            // or queued is an upper-layer concern; for our
+                            // purposes any Ack tells us the wire roundtrip
+                            // worked.
+                            pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
                             relayLog(
                                 RelayLogLevel.INFO,
                                 "Ack from relay: id=${msg.messageId.take(12)}… status=${msg.status}",
@@ -268,8 +343,24 @@ class KtorRelayTransport(
             RelayLogLevel.INFO,
             "Sending envelope: to=${message.to.take(16)}… id=${message.messageId.take(12)}… payloadBytes=${message.payload.length} sealed=${message.sealedSender.isNotEmpty()}",
         )
+        // Track BEFORE the wire write so the ACK watchdog covers the case
+        // where sendRaw silently writes into a half-dead socket (no exception
+        // on the local buffer, no frame on the wire). The relay will
+        // eventually emit its own Ack frame when the envelope reaches it; if
+        // that Ack does not arrive within ACK_TIMEOUT_MS the watchdog
+        // requeues this entry on a fresh socket.
+        pendingAcksLock.withLock {
+            pendingAcks[message.messageId] = AckPending(message, timeSource.markNow())
+        }
         val ok = sendRaw(message)
-        if (!ok) relayLog(RelayLogLevel.ERROR, "Envelope send returned false (frame write failed)")
+        if (!ok) {
+            relayLog(RelayLogLevel.ERROR, "Envelope send returned false (frame write failed)")
+            // sendRaw threw and was logged. The frame did not go out, so the
+            // pendingAcks entry is meaningless — drop it and re-enqueue at
+            // the front of the outbox.
+            pendingAcksLock.withLock { pendingAcks.remove(message.messageId) }
+            outboxMutex.withLock { pendingOutbox.addFirst(message) }
+        }
         return ok
     }
 
@@ -387,6 +478,7 @@ class KtorRelayTransport(
         relayLog(RelayLogLevel.INFO, "disconnect() called")
         disconnectRequested = true
         pingJob?.cancel()
+        ackWatchdogJob?.cancel()
         scope?.cancel()
         session?.close()
         session = null

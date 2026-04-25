@@ -2,14 +2,28 @@ package phantom.core.transport
 
 object RelayTransportConfig {
     // Application-level heartbeat: client sends RelayMessage.Ping on this cadence.
-    // Kept short enough that relay-side idle timeouts (Caddy default 60s) do not
-    // close the socket on quiet conversations.
-    const val PING_INTERVAL_MS = 20_000L
+    // Aggressive interval so a half-dead socket (TCP write buffer accepts the
+    // frame but the wire is broken) is detected within ~25 s instead of the
+    // 60-70 s the previous 20 s/50 s pair gave us.
+    const val PING_INTERVAL_MS = 10_000L
 
     // If the relay has not emitted a Pong for this long, declare the connection
-    // dead and force a reconnect. Tuned to roughly 2.5 * PING_INTERVAL so a single
-    // dropped ping does not thrash the reconnect state machine.
-    const val PONG_TIMEOUT_MS = 50_000L
+    // dead and force a reconnect. ~2.5 × PING_INTERVAL_MS so a single dropped
+    // ping does not thrash the reconnect state machine; first detection happens
+    // on the next ping iteration after the timeout elapses.
+    const val PONG_TIMEOUT_MS = 25_000L
+
+    // How long a sent envelope may sit unacknowledged before it is treated as
+    // lost in transit. The frame may have been written into a half-dead socket
+    // that does not surface an exception; without this watchdog the envelope
+    // would never reach the relay and never be retried. On expiry the socket
+    // is closed (force-reconnect) and the envelope is re-enqueued at the head
+    // of pendingOutbox so it lands first on the next session.
+    const val ACK_TIMEOUT_MS = 15_000L
+
+    // How often the watchdog scans pendingAcks for envelopes that have aged
+    // past ACK_TIMEOUT_MS.
+    const val ACK_WATCHDOG_INTERVAL_MS = 5_000L
 
     // Base delay for exponential backoff on reconnect.
     const val RECONNECT_BASE_DELAY_MS = 2_000L
