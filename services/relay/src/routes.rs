@@ -82,10 +82,25 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, id, state))
 }
 
-async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>) {
-    use futures_util::{SinkExt, StreamExt};
+async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppState>) {
+    use futures_util::StreamExt;
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    // Single-task select! loop instead of split() + two spawned tasks.
+    //
+    // Why: after `socket.split()`, the read half (SplitStream) and write half
+    // (SplitSink) share the underlying tungstenite connection through a BiLock.
+    // tungstenite enqueues an auto-PONG when a PING is received, but that PONG
+    // is only flushed to the wire on the *next write attempt* through the Sink
+    // half. If the relay has nothing to forward (idle period — no live delivery,
+    // no ack to send), the auto-PONG sits in the queue forever and the client's
+    // OkHttp pingInterval(15s) trips a SocketTimeoutException after 15 seconds
+    // of "sent ping but didn't receive pong" — visible in QA-v5 as a fixed
+    // ~45-60-second reconnect cycle on every client (after_3-4_successful_ping_pongs)
+    // regardless of network path (cellular vs. WiFi vs. emulator-on-host).
+    //
+    // The single-task select! reads frames AND writes frames from the same
+    // future, so an explicit `socket.send(Message::Pong(payload))` on every
+    // received PING fires immediately — no auto-PONG queue, no idle starvation.
 
     // Channel: relay → this client
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -139,34 +154,36 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
         }
     }
 
-    // Task: forward outbound channel → WebSocket
-    let mut send_task = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Task: receive frames from WebSocket
-    let state_rx = Arc::clone(&state);
-    let identity_rx = identity.clone();
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Text(text) => {
-                    handle_message(text.as_str(), &identity_rx, &state_rx).await;
+    // Single-task read/write loop.
+    loop {
+        tokio::select! {
+            // Outbound: forward whatever the relay queued for this client.
+            outbound = rx.recv() => {
+                let Some(text) = outbound else { break };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
                 }
-                Message::Close(_) => break,
-                _ => {}
+            }
+            // Inbound: process frames from the client.
+            inbound = socket.next() => {
+                match inbound {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_message(text.as_str(), &identity, &state).await;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        // Explicit, immediate PONG — required because we no
+                        // longer rely on tungstenite's queued auto-PONG (see
+                        // top-of-fn comment).
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}             // Pong/Binary: ignored.
+                    Some(Err(_)) | None => break, // Read error or stream end.
+                }
             }
         }
-    });
-
-    // Wait for either task to finish
-    tokio::select! {
-        _ = &mut send_task => recv_task.abort(),
-        _ = &mut recv_task => send_task.abort(),
     }
 
     // Unregister client — only remove if the stored conn_id still matches ours.
