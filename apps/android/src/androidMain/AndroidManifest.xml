@@ -11,6 +11,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--
+        Required so PhantomMessagingService can hold a partial CPU wake lock
+        and a high-performance Wi-Fi lock for the lifetime of its foreground
+        notification. Without this, some OEM Android builds suspend the Wi-Fi
+        radio after ~60 s even with a foreground service active, which makes
+        the WebSocket appear dead from the relay's side and forces a
+        client-driven reconnect every minute.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".PhantomApplication"

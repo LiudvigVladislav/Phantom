@@ -3,8 +3,11 @@ package phantom.android.service
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -33,11 +36,54 @@ class PhantomMessagingService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // Held for the lifetime of the foreground service. Without these, QA-v7
+    // showed a real Wi-Fi-connected phone losing its WebSocket every ~64 s
+    // while an emulator on the same Wi-Fi router stayed connected for hours
+    // — the difference being that the OEM Android build was parking the
+    // Wi-Fi radio between transmissions to save power, even with a
+    // foreground notification visible. WIFI_MODE_FULL_HIGH_PERF disables
+    // that parking; PARTIAL_WAKE_LOCK keeps the CPU available so the
+    // OkHttp ping/pong scheduler is not deferred into doze windows.
+    //
+    // Both locks are released in onDestroy(). They are scoped tightly to
+    // this service, so they only contribute to battery drain while the
+    // user has chosen to keep the messenger running.
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate")
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
+        acquireKeepAliveLocks()
+    }
+
+    private fun acquireKeepAliveLocks() {
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "phantom:wifi").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.d(TAG, "WifiLock acquired (FULL_HIGH_PERF)")
+        }.onFailure { Log.w(TAG, "WifiLock acquire failed: ${it.message}") }
+
+        runCatching {
+            val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "phantom:cpu").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.d(TAG, "WakeLock acquired (PARTIAL)")
+        }.onFailure { Log.w(TAG, "WakeLock acquire failed: ${it.message}") }
+    }
+
+    private fun releaseKeepAliveLocks() {
+        runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+        runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        wifiLock = null
+        wakeLock = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -100,6 +146,7 @@ class PhantomMessagingService : Service() {
     override fun onDestroy() {
         Log.d(TAG, "onDestroy — disconnecting transport")
         super.onDestroy()
+        releaseKeepAliveLocks()
         serviceScope.launch {
             runCatching { (application as PhantomApplication).container.transport.disconnect() }
         }
