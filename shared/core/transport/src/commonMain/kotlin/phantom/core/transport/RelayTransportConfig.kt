@@ -26,7 +26,12 @@ object RelayTransportConfig {
     const val ACK_WATCHDOG_INTERVAL_MS = 5_000L
 
     // Base delay for exponential backoff on reconnect.
-    const val RECONNECT_BASE_DELAY_MS = 2_000L
+    // Lowered from 2 s to 1 s after QA-v6 showed every reconnect on cellular
+    // costs the user ~3 s of message-delivery latency end-to-end (2 s here +
+    // 1 s WS handshake). Halving this halves the user-visible reconnect gap
+    // without making backoff useless when the relay is genuinely down — the
+    // exponential climb still reaches 30 s within ~5 attempts.
+    const val RECONNECT_BASE_DELAY_MS = 1_000L
 
     // Upper cap on the backoff delay. Even after a long outage the client retries
     // at most this often.

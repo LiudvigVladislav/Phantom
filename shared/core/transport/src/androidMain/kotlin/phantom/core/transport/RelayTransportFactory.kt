@@ -17,14 +17,21 @@ private val sharedOkHttpClient: OkHttpClient = OkHttpClient.Builder()
     // OkHttp WebSocket protocol-level ping. If a pong does not arrive within
     // pingInterval, OkHttp forcefully cancels the call (calls webSocket.cancel()
     // internally, NOT graceful close), which closes the socket immediately.
-    // This is the dead-network detection path; ~15 s is fast enough for users
-    // and large enough to avoid spurious cancels on a slow but alive cellular
-    // link.
-    .pingInterval(15, TimeUnit.SECONDS)
+    //
+    // 8 s is a deliberate compromise:
+    //   - long enough that we burn ~7 % power vs always-on idle radio,
+    //   - short enough to keep cellular carrier NAT mappings alive (typical
+    //     mobile NAT idle timeout is 30 s; some carriers go as low as 20 s
+    //     even on TCP). QA-v6 showed the phone losing its connection every
+    //     60–90 s with pingInterval=15s — frequent enough to NOT be a
+    //     server-side issue (the emulator on Wi-Fi was rock-stable in the
+    //     same run) but slow enough that an aggressive carrier NAT killed
+    //     the path between two of our pings.
+    .pingInterval(8, TimeUnit.SECONDS)
     // Backstop: if OkHttp's reader thread blocks on a silent socket for
     // longer than this, throw SocketTimeoutException. With pingInterval at
-    // 15 s the socket should never go fully silent for 40 s while alive.
-    .readTimeout(40, TimeUnit.SECONDS)
+    // 8 s the socket should never go fully silent for 25 s while alive.
+    .readTimeout(25, TimeUnit.SECONDS)
     .build()
 
 actual fun forceCancelAllEngineCalls() {
