@@ -13,3 +13,7 @@ import io.ktor.client.plugins.websocket.WebSockets
 actual fun createHttpClient(): HttpClient = HttpClient(OkHttp) {
     install(WebSockets)
 }
+
+actual fun forceCancelAllEngineCalls() {
+    // No-op on the JVM target — used only for tests/desktop placeholder.
+}

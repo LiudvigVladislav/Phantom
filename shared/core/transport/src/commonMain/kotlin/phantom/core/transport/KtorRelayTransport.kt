@@ -200,9 +200,15 @@ class KtorRelayTransport(
                         RelayLogLevel.WARN,
                         "Pong timeout (${sinceLastPong}ms without Pong) — forcing reconnect",
                     )
-                    // session.cancel() triggers OkHttp webSocket.cancel() immediately
-                    // (via Ktor's invokeOnCompletion handler) — no 60s CLOSE handshake wait.
-                    // scope.cancel() stops ackWatchdogJob so it doesn't fire on the dead session.
+                    // session.cancel() alone is NOT enough on the OkHttp engine: Ktor's
+                    // OkHttpWebsocketSession.outgoing is an actor whose finally block calls
+                    // websocket.close() (graceful), which blocks on OkHttp's hardcoded
+                    // 60-second CANCEL_AFTER_CLOSE_MILLIS waiting for the server's CLOSE.
+                    // forceCancelAllEngineCalls() goes around the actor by cancelling the
+                    // OkHttp dispatcher's calls directly — this fires onFailure on the
+                    // listener and the actor's finally then sees a failed websocket and
+                    // returns instantly. scope.cancel() stops ackWatchdogJob.
+                    forceCancelAllEngineCalls()
                     session?.cancel()
                     scope.cancel()
                     break
@@ -235,7 +241,10 @@ class KtorRelayTransport(
                     expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
                 }
                 // Force the session closed so the reconnect loop opens a
-                // fresh WebSocket and flushPendingOutbox re-sends them.
+                // fresh WebSocket and flushPendingOutbox re-sends them. See the
+                // comment in startPing() above for why forceCancelAllEngineCalls()
+                // is required in addition to session.cancel().
+                forceCancelAllEngineCalls()
                 session?.cancel()
                 scope.cancel()
                 break
