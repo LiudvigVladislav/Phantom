@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -136,6 +137,14 @@ class KtorRelayTransport(
                 RelayLogLevel.INFO,
                 "Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
             )
+            // Per-generation scope. Hoisted out of the webSocket{} block so the
+            // finally below can cancelAndJoin it whether the block returned
+            // cleanly OR threw — without that guarantee, the previous
+            // generation's pingJob keeps running, ages out via PONG_TIMEOUT_MS
+            // a few seconds into the next generation, and force-cancels its
+            // brand-new session (visible in QA-v4 as a cascade of pong
+            // timeouts firing across 1–2 seconds).
+            var generationScope: CoroutineScope? = null
             try {
                 httpClient.webSocket(urlWithToken) {
                     session = this
@@ -145,6 +154,7 @@ class KtorRelayTransport(
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+                    generationScope = transportScope
                     scope = transportScope
                     startPing(transportScope)
                     startAckWatchdog(transportScope)
@@ -160,7 +170,6 @@ class KtorRelayTransport(
                     flushPendingOutbox()
 
                     readLoop()
-                    transportScope.cancel()
                     relayLog(RelayLogLevel.WARN, "WebSocket closed by remote (clean)")
                 }
                 _state.value = TransportState.Disconnected
@@ -184,6 +193,12 @@ class KtorRelayTransport(
                 relayLog(RelayLogLevel.INFO, "Retry attempt #${attempt + 1} in ${delayMs}ms")
                 delay(delayMs)
                 attempt++
+            } finally {
+                // Cancel the previous generation's coroutines and WAIT for them
+                // to actually complete before the next iteration creates new
+                // ones. cancel() alone is asynchronous and lets stale pingJobs
+                // race the new connection.
+                generationScope?.coroutineContext?.get(Job)?.cancelAndJoin()
             }
         }
         relayLog(RelayLogLevel.INFO, "Reconnect loop exited (disconnect requested)")
@@ -191,6 +206,12 @@ class KtorRelayTransport(
     }
 
     private fun startPing(scope: CoroutineScope) {
+        // Capture the session/sink for *this* generation. Reading the
+        // `session` field at timeout time would race with runReconnectLoop's
+        // next iteration overwriting it — a stale pingJob that fires a few
+        // hundred ms into the next session would otherwise force-cancel the
+        // brand-new connection.
+        val mySession = session
         pingJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.PING_INTERVAL_MS)
@@ -209,7 +230,7 @@ class KtorRelayTransport(
                     // listener and the actor's finally then sees a failed websocket and
                     // returns instantly. scope.cancel() stops ackWatchdogJob.
                     forceCancelAllEngineCalls()
-                    session?.cancel()
+                    mySession?.cancel()
                     scope.cancel()
                     break
                 }
@@ -219,6 +240,8 @@ class KtorRelayTransport(
     }
 
     private fun startAckWatchdog(scope: CoroutineScope) {
+        // Capture session for the same reason as startPing — see comment there.
+        val mySession = session
         ackWatchdogJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.ACK_WATCHDOG_INTERVAL_MS)
@@ -245,7 +268,7 @@ class KtorRelayTransport(
                 // comment in startPing() above for why forceCancelAllEngineCalls()
                 // is required in addition to session.cancel().
                 forceCancelAllEngineCalls()
-                session?.cancel()
+                mySession?.cancel()
                 scope.cancel()
                 break
             }
