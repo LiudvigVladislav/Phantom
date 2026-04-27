@@ -104,6 +104,35 @@
   header nav a:hover { color: var(--accent-cyan); }
   header nav a[aria-current="page"] { color: var(--text-primary); }
 
+  /* Language switcher pill — sits at the right of the header next to nav.
+     Active language is solid; the inactive one is a subtle ghost link. */
+  header .lang {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+  }
+  header .lang a {
+    padding: 4px 10px;
+    border-radius: 999px;
+    color: var(--text-tertiary);
+    text-decoration: none;
+    transition: color 150ms ease-out, background 150ms ease-out;
+  }
+  header .lang a:hover { color: var(--text-primary); }
+  header .lang a.active {
+    background: var(--accent-cyan);
+    color: var(--surface-deep);
+  }
+  header .lang a.active:hover { color: var(--surface-deep); }
+
   /* ─── Main / article ────────────────────────────────────────────────── */
   main {
     max-width: 720px;
@@ -285,6 +314,10 @@
     <nav aria-label="Legal navigation">
       <a href="/terms" aria-current="page">Terms</a>
       <a href="/privacy">Privacy</a>
+      <span class="lang" role="group" aria-label="Language">
+        <a href="/terms" class="active" aria-current="page" hreflang="en">EN</a>
+        <a href="/terms/ru" hreflang="ru">RU</a>
+      </span>
     </nav>
   </div>
 </header>

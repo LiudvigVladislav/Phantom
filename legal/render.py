@@ -35,11 +35,73 @@ from pathlib import Path
 
 LEGAL_DIR = Path(__file__).resolve().parent
 
-# Map source filenames to (output filename, page title) for the public
-# /terms and /privacy URLs Caddy will serve.
-TARGETS = {
-    "TERMS_OF_SERVICE_EN.md": ("terms.html", "Terms of Service — PHANTOM"),
-    "PRIVACY_POLICY_EN.md":   ("privacy.html", "Privacy Policy — PHANTOM"),
+# Description of every page we render.
+#   src        — source Markdown file under legal/.
+#   out        — generated HTML filename (sibling of the source).
+#   title      — <title> tag.
+#   locale     — "en" / "ru" — drives chrome strings and HTML lang attribute.
+#   page       — "terms" / "privacy" — drives nav-current and language-switch
+#                URL (so /terms ↔ /terms/ru, /privacy ↔ /privacy/ru).
+TARGETS = [
+    {
+        "src":    "TERMS_OF_SERVICE_EN.md",
+        "out":    "terms.html",
+        "title":  "Terms of Service — PHANTOM",
+        "locale": "en",
+        "page":   "terms",
+    },
+    {
+        "src":    "TERMS_OF_SERVICE_RU.md",
+        "out":    "terms-ru.html",
+        "title":  "Условия использования — PHANTOM",
+        "locale": "ru",
+        "page":   "terms",
+    },
+    {
+        "src":    "PRIVACY_POLICY_EN.md",
+        "out":    "privacy.html",
+        "title":  "Privacy Policy — PHANTOM",
+        "locale": "en",
+        "page":   "privacy",
+    },
+    {
+        "src":    "PRIVACY_POLICY_RU.md",
+        "out":    "privacy-ru.html",
+        "title":  "Политика приватности — PHANTOM",
+        "locale": "ru",
+        "page":   "privacy",
+    },
+]
+
+# Per-locale chrome (header / footer / language switcher labels).
+# The Russian copy follows the informal "ты" tone the legal drafts use,
+# matching the project's casual-but-precise voice (see legal/README.md
+# "Tone: casual but legally weighted").
+LOCALES = {
+    "en": {
+        "html_lang":         "en",
+        "nav_terms":         "Terms",
+        "nav_privacy":       "Privacy",
+        "footer_terms":      "Terms of Service",
+        "footer_privacy":    "Privacy Policy",
+        "footer_github":     "GitHub",
+        "footer_legal":      "© 2026 Willen LLC · Wyoming, United States",
+        "switch_label":      "Language",
+        "terms_path":        "/terms",
+        "privacy_path":      "/privacy",
+    },
+    "ru": {
+        "html_lang":         "ru",
+        "nav_terms":         "Условия",
+        "nav_privacy":       "Приватность",
+        "footer_terms":      "Условия использования",
+        "footer_privacy":    "Политика приватности",
+        "footer_github":     "GitHub",
+        "footer_legal":      "© 2026 Willen LLC · Вайоминг, США",
+        "switch_label":      "Язык",
+        "terms_path":        "/terms/ru",
+        "privacy_path":      "/privacy/ru",
+    },
 }
 
 # ── HTML template ──────────────────────────────────────────────────────────────
@@ -48,7 +110,7 @@ TARGETS = {
 # privacy-first project, so the marketing pages must not leak font requests to
 # Google or any other third party. We use the OS sans/mono stack instead.
 TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="{html_lang}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -152,6 +214,35 @@ TEMPLATE = """<!DOCTYPE html>
   }}
   header nav a:hover {{ color: var(--accent-cyan); }}
   header nav a[aria-current="page"] {{ color: var(--text-primary); }}
+
+  /* Language switcher pill — sits at the right of the header next to nav.
+     Active language is solid; the inactive one is a subtle ghost link. */
+  header .lang {{
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+  }}
+  header .lang a {{
+    padding: 4px 10px;
+    border-radius: 999px;
+    color: var(--text-tertiary);
+    text-decoration: none;
+    transition: color 150ms ease-out, background 150ms ease-out;
+  }}
+  header .lang a:hover {{ color: var(--text-primary); }}
+  header .lang a.active {{
+    background: var(--accent-cyan);
+    color: var(--surface-deep);
+  }}
+  header .lang a.active:hover {{ color: var(--surface-deep); }}
 
   /* ─── Main / article ────────────────────────────────────────────────── */
   main {{
@@ -332,8 +423,12 @@ TEMPLATE = """<!DOCTYPE html>
       <span class="word">PHANTOM</span>
     </a>
     <nav aria-label="Legal navigation">
-      <a href="/terms"{terms_current}>Terms</a>
-      <a href="/privacy"{privacy_current}>Privacy</a>
+      <a href="{nav_terms_url}"{terms_current}>{nav_terms_label}</a>
+      <a href="{nav_privacy_url}"{privacy_current}>{nav_privacy_label}</a>
+      <span class="lang" role="group" aria-label="{switch_label}">
+        <a href="{lang_en_url}"{lang_en_active} hreflang="en">EN</a>
+        <a href="{lang_ru_url}"{lang_ru_active} hreflang="ru">RU</a>
+      </span>
     </nav>
   </div>
 </header>
@@ -349,11 +444,11 @@ TEMPLATE = """<!DOCTYPE html>
       <span class="word">PHANTOM</span>
     </div>
     <nav aria-label="Footer navigation">
-      <a href="/terms">Terms of Service</a>
-      <a href="/privacy">Privacy Policy</a>
-      <a href="https://github.com/WladislaWLE/Phantom">GitHub</a>
+      <a href="{nav_terms_url}">{footer_terms_label}</a>
+      <a href="{nav_privacy_url}">{footer_privacy_label}</a>
+      <a href="https://github.com/WladislaWLE/Phantom">{footer_github_label}</a>
     </nav>
-    <div class="legal">© 2026 Willen LLC · Wyoming, United States</div>
+    <div class="legal">{footer_legal}</div>
   </div>
 </footer>
 </body>
@@ -450,14 +545,20 @@ def render_markdown(md: str) -> tuple[str, str, str]:
                 h1_title = text
             html_parts.append(f"<h1>{render_inline(text)}</h1>")
             i += 1
-            # Look ahead for **Effective:** / **Last updated:** meta lines
+            # Look ahead for meta lines — any line that looks like
+            # `**Some Label:** value` immediately following the H1 (with
+            # optional blank lines between them). This covers the EN
+            # `**Effective date:** ... **Last updated:** ...` shape and
+            # the RU `**Дата вступления в силу:** ... **Последнее
+            # обновление:** ...` shape without hard-coding either set
+            # of label words.
             meta_lines: list[str] = []
             while i < len(lines):
                 nxt = lines[i].strip()
                 if not nxt:
                     i += 1
                     continue
-                if re.match(r"\*\*(Effective|Last updated|Дата|Обновлено|Действует)", nxt):
+                if re.match(r"^\*\*[^*]+:\*\*\s*\S", nxt):
                     meta_lines.append(nxt)
                     i += 1
                     continue
@@ -521,8 +622,18 @@ def render_markdown(md: str) -> tuple[str, str, str]:
     return "\n".join(html_parts), h1_title, meta_html
 
 
-def render_file(md_path: Path, html_path: Path, page_title: str) -> None:
-    md = md_path.read_text(encoding="utf-8")
+def render_file(target: dict) -> None:
+    src = LEGAL_DIR / target["src"]
+    out = LEGAL_DIR / target["out"]
+    locale = target["locale"]
+    page = target["page"]
+    page_title = target["title"]
+
+    if not src.exists():
+        print(f"Skip {target['src']}: not found")
+        return
+
+    md = src.read_text(encoding="utf-8")
     body, h1, meta = render_markdown(md)
     if meta:
         body = body.replace(
@@ -530,29 +641,52 @@ def render_file(md_path: Path, html_path: Path, page_title: str) -> None:
             f"<h1>{render_inline(h1)}</h1>\n{meta}",
             1,
         )
-    # Highlight the active nav item — aria-current="page" + style hook.
-    is_terms = "terms" in html_path.stem.lower()
-    is_privacy = "privacy" in html_path.stem.lower()
+
+    chrome = LOCALES[locale]
+    other = LOCALES["ru" if locale == "en" else "en"]
+
+    # Build URLs:
+    #   nav_terms_url / nav_privacy_url — links inside the same locale.
+    #   lang_en_url / lang_ru_url       — same page, opposite locale.
+    #     (e.g. on terms.html → /terms vs /terms/ru)
+    page_path_in = chrome["terms_path"] if page == "terms" else chrome["privacy_path"]
+    page_path_other = other["terms_path"] if page == "terms" else other["privacy_path"]
+
+    en_url = page_path_in if locale == "en" else page_path_other
+    ru_url = page_path_in if locale == "ru" else page_path_other
+
+    is_terms = page == "terms"
+    is_privacy = page == "privacy"
+
     description = h1.lower()
-    out = TEMPLATE.format(
+    out_text = TEMPLATE.format(
         title=page_title,
         description=description,
         body=body,
+        html_lang=chrome["html_lang"],
+        nav_terms_url=chrome["terms_path"],
+        nav_privacy_url=chrome["privacy_path"],
+        nav_terms_label=chrome["nav_terms"],
+        nav_privacy_label=chrome["nav_privacy"],
         terms_current=' aria-current="page"' if is_terms else "",
         privacy_current=' aria-current="page"' if is_privacy else "",
+        switch_label=chrome["switch_label"],
+        lang_en_url=en_url,
+        lang_ru_url=ru_url,
+        lang_en_active=' class="active" aria-current="page"' if locale == "en" else "",
+        lang_ru_active=' class="active" aria-current="page"' if locale == "ru" else "",
+        footer_terms_label=chrome["footer_terms"],
+        footer_privacy_label=chrome["footer_privacy"],
+        footer_github_label=chrome["footer_github"],
+        footer_legal=chrome["footer_legal"],
     )
-    html_path.write_text(out, encoding="utf-8")
-    print(f"Rendered: {md_path.name} -> {html_path.name}  ({len(out):,} bytes)")
+    out.write_text(out_text, encoding="utf-8")
+    print(f"Rendered: {src.name} -> {out.name}  ({len(out_text):,} bytes, {locale})")
 
 
 def main() -> None:
-    for src_name, (out_name, title) in TARGETS.items():
-        src = LEGAL_DIR / src_name
-        if not src.exists():
-            print(f"Skip {src_name}: not found")
-            continue
-        out = LEGAL_DIR / out_name
-        render_file(src, out, title)
+    for target in TARGETS:
+        render_file(target)
 
 
 if __name__ == "__main__":
