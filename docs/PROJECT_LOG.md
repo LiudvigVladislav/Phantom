@@ -20,9 +20,13 @@
 
 **Released:** `v0.1.0-alpha.1` (tag → commit `0246b50f`, GitHub Release published)
 **Branch state:** `master` is the only active branch; all Alpha 1 feature
-branches merged. Latest commit at the time of writing: `b3629bed`.
+branches merged. Latest commit at the time of writing: `0bc715e1`.
 **Production:** `relay.phntm.pro` running master, `phntm.pro/terms` and
 `/privacy` serving themed HTML in EN + RU.
+**Licensing:** AGPL-3.0-or-later established as the formal project
+licence (LICENSE + NOTICE + SPDX headers on every .kt and .rs file +
+README §License — all shipped in the four-commit licence-hygiene
+patch on 2026-04-27).
 
 ### What works (proven in QA-v10 / 2026-04-27)
 
@@ -66,7 +70,7 @@ Also tracked:
 - ⏳ Legal review by qualified attorney (Wyoming / US privacy law)
 - ⏳ GDPR review for EU compliance (Art. 13/14 disclosures)
 - ⏳ Russian translation review for legal-terminology accuracy
-- ⏳ `LICENSE` file at repo root matching the AGPL-3.0 intent of [ADR-006](adr/ADR-006-Crypto-Library-Decision.md)
+- ✅ ~~`LICENSE` file at repo root matching the AGPL-3.0 intent of [ADR-006](adr/ADR-006-Crypto-Library-Decision.md)~~ shipped 2026-04-27 (`e99aac0e` + `c403b7cf` + `27cd9bd1` + `0bc715e1`)
 - ⏳ NLnet grant submission (deadline 2026-06-01)
 - ⏳ Locale-aware in-app linking from Onboarding to `/terms/ru` / `/privacy/ru` based on `Locale.getDefault()` (currently always English)
 
@@ -257,6 +261,52 @@ on advice that references prior commits — even from another LLM.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-04-27 (sat, evening) · Licence hygiene before NLnet submission
+
+- **Goal:** establish formal AGPL-3.0 licensing across the repo so the
+  NLnet grant reviewer (deadline 2026-06-01) does not see absent /
+  ambiguous licensing as a red flag. The user reported a perception
+  that the previous LICENSE file carried a Vercel copyright (likely a
+  half-remembered reference to the `prototype/web` Next.js scaffold);
+  on inspection there was no top-level LICENSE at all, which is
+  arguably worse for a grant submission.
+- **Outcomes:** four-commit patch series shipped:
+  1. **`e99aac0e`** — `LICENSE` at the repo root: PHANTOM header
+     naming Willen LLC + Vladislav Liudvig (both 2026), the AGPL
+     grant / warranty paragraph, and the verbatim 661-line GNU
+     AGPL-3.0 text fetched from `gnu.org/licenses/agpl-3.0.txt`.
+  2. **`c403b7cf`** — SPDX headers on **121** source files (113 .kt
+     + 8 .rs). Format: `// SPDX-License-Identifier: AGPL-3.0-or-later`
+     and `// Copyright (c) 2026 Willen LLC`. Driven by a small
+     idempotent helper `scripts/add-spdx-headers.py` that walks
+     `apps/`, `shared/`, `services/`, skips build outputs, checks
+     the first 5 lines for an existing SPDX tag before prepending.
+     Verified clean by `cargo build --release` (3.56 s) and
+     `:apps:android:compileDebugKotlinAndroid`.
+  3. **`27cd9bd1`** — `NOTICE` listing every bundled / linked
+     third-party dependency with upstream URL and licence: libsodium
+     (ISC), Kotlin / kotlinx / Compose Multiplatform / AndroidX /
+     Ktor / OkHttp / SQLDelight (Apache-2.0), SQLCipher (BSD 3-Clause),
+     tokio / axum / tokio-tungstenite / tower / serde / tracing /
+     futures-util (MIT), subtle (BSD 3-Clause), Caddy (Apache-2.0),
+     Inter / JetBrains Mono (SIL OFL-1.1, mock-ups only — explicitly
+     not bundled).
+  4. **`0bc715e1`** — `Releases/README.md` §License updated from the
+     "to be finalized" placeholder to the canonical AGPL-3.0 statement
+     with rationale (relay-side §13 Remote Network Interaction
+     protection) and a commercial-dual-licensing escape hatch contact.
+- **Decision:** AGPL-3.0 over GPL-3.0 — recorded in the LICENSE
+  commit message and now mirrored in `Releases/README.md` §License.
+  See ADR-006 for the original rationale.
+- **Follow-ups:**
+  - Keep `scripts/add-spdx-headers.py` idempotent — re-run it any
+    time new `.kt` / `.rs` files land. Could be wired into a pre-commit
+    hook in a later session.
+  - The four legal-doc TODOs (lawyer review, GDPR review, RU
+    translation review, ownership approval) are unaffected by this
+    licence work — they live in `legal/README.md` and remain on the
+    Active backlog.
 
 ### 2026-04-27 (sat) · QA-v10 polish + RU localisation + correct Russian legal terminology
 
