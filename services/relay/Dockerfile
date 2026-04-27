@@ -7,7 +7,12 @@
 # -----------------------------------------------------------------------------
 # Stage 1 — builder
 # -----------------------------------------------------------------------------
-FROM rust:1.83-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
+# Rust 1.85+ is required because the workspace transitively pulls
+# `time = 0.3.47` (and other crates) that opted into edition2024, which
+# Cargo 1.83 cannot parse — the build aborts in the registry-fetch step
+# with `feature `edition2024` is required`. 1.88 is the smallest version
+# that comfortably covers anything pinned via Cargo.lock right now.
 
 WORKDIR /build
 
