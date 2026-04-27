@@ -154,22 +154,6 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
         }
     }
 
-    // Server-driven keepalive heartbeat. WS PING/PONG control frames are
-    // sometimes treated as "not real data" by carrier-side DPI / stateful
-    // firewalls and ignored when refreshing TCP NAT entries. QA-v7 showed a
-    // mobile-carrier client losing its connection on a strict ~60-second
-    // cycle (8 successful WS ping/pongs in a row, then a 7th ping with no
-    // pong) while a Wi-Fi client through the same relay was rock-stable —
-    // classic "control frames don't count" symptom. A Text frame at the
-    // application layer cannot plausibly be filtered the same way, so we
-    // poke a small JSON heartbeat through the socket every 30 seconds. The
-    // client silently ignores `type: heartbeat` (see KtorRelayTransport
-    // readLoop) — the side effect we want is purely to keep the path warm.
-    let mut heartbeat = tokio::time::interval(tokio::time::Duration::from_secs(30));
-    // The first tick fires immediately; skip it so the heartbeat does not
-    // race with the queued-envelope flush above.
-    heartbeat.tick().await;
-
     // Single-task read/write loop.
     loop {
         tokio::select! {
@@ -197,17 +181,6 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                     Some(Ok(Message::Close(_))) => break,
                     Some(Ok(_)) => {}             // Pong/Binary: ignored.
                     Some(Err(_)) | None => break, // Read error or stream end.
-                }
-            }
-            // Application-layer keepalive — see comment above the loop.
-            _ = heartbeat.tick() => {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let frame = format!(r#"{{"type":"heartbeat","ts":{}}}"#, now_ms);
-                if socket.send(Message::Text(frame.into())).await.is_err() {
-                    break;
                 }
             }
         }

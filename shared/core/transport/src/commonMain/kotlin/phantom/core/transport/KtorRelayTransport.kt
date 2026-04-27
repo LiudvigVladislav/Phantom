@@ -303,15 +303,6 @@ class KtorRelayTransport(
                         ?.get("type")
                         ?.let { it as? kotlinx.serialization.json.JsonPrimitive }
                         ?.content
-                    if (rawType == "heartbeat") {
-                        // Server-driven keepalive Text frame. Carrier DPI on
-                        // some mobile networks does not refresh NAT state on
-                        // WS PING/PONG control frames — the relay sends a
-                        // small Text frame every 30 s as visible application
-                        // traffic. We just need it to arrive; the contents
-                        // are intentionally inert.
-                        continue
-                    }
                     if (rawType == "typing") {
                         val from = json.parseToJsonElement(text)
                             .let { it as? kotlinx.serialization.json.JsonObject }
