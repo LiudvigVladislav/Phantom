@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy Policy — PHANTOM</title>
+<meta name="theme-color" content="#08090C">
+<meta name="description" content="PHANTOM — privacy-focused, end-to-end encrypted messenger. privacy policy">
+<link rel="icon" type="image/png" href="/assets/phantom-logo.png">
+<link rel="apple-touch-icon" href="/assets/phantom-logo.png">
+<style>
+  /* ─── Design tokens (Brief §03) ─────────────────────────────────────── */
+  :root {
+    --surface-deep:     #08090C;
+    --surface:          #0E1014;
+    --surface-elevated: #161A20;
+    --border-subtle:    #1F242C;
+    --border:           #2A2F38;
+    --text-primary:     #F5F7FA;
+    --text-secondary:   #A4ACBA;
+    --text-tertiary:    #6B7385;
+    --accent-cyan:      #00D4FF;
+
+    /* Type stacks. PP Neue Montreal / Inter / JetBrains Mono are licensed,
+       so we use OS-native equivalents that match the design feel:
+        * Sans:    San Francisco / Segoe UI Variable / Roboto. Modern,
+                   high-quality, ship with every supported platform.
+        * Mono:    SF Mono / Cascadia Code / Roboto Mono. Used only for
+                   the brand wordmark and overline labels per Brief §04. */
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Display",
+                 "Segoe UI", Roboto, "Helvetica Neue", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono",
+                 "Liberation Mono", Menlo, Consolas, monospace;
+  }
+
+  /* ─── Reset ─────────────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--surface-deep);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    /* Body 15/22 per Brief §04 type scale. */
+    font-size: 15px;
+    line-height: 1.6;
+    font-feature-settings: "tnum" 1, "ss01" 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* ─── Header ────────────────────────────────────────────────────────── */
+  header {
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--surface-deep);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    backdrop-filter: saturate(160%) blur(8px);
+    -webkit-backdrop-filter: saturate(160%) blur(8px);
+    background-color: rgba(8, 9, 12, 0.85);
+  }
+  header .inner {
+    max-width: 768px;
+    margin: 0 auto;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+  }
+  header .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--text-primary);
+    text-decoration: none;
+  }
+  header .brand img {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    display: block;
+  }
+  header .brand .word {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 5px;
+    color: var(--text-primary);
+  }
+  header nav {
+    display: flex;
+    gap: 24px;
+    align-items: center;
+  }
+  header nav a {
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    transition: color 150ms ease-out;
+  }
+  header nav a:hover { color: var(--accent-cyan); }
+  header nav a[aria-current="page"] { color: var(--text-primary); }
+
+  /* ─── Main / article ────────────────────────────────────────────────── */
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 64px 24px 96px;
+  }
+  article h1 {
+    /* Display 32/38 Medium per Brief §04. */
+    font-size: 32px;
+    line-height: 1.18;
+    font-weight: 500;
+    letter-spacing: -0.012em;
+    margin: 0;
+    color: var(--text-primary);
+    text-wrap: balance;
+  }
+  article .meta {
+    /* Overline 11/14 Mono uppercase +8% per Brief §04. */
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin: 12px 0 48px;
+    padding-bottom: 32px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  article .meta span { color: var(--text-secondary); }
+
+  article h2 {
+    /* Headline 20/28 Medium. */
+    font-size: 20px;
+    line-height: 1.4;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    margin: 48px 0 14px;
+    color: var(--text-primary);
+  }
+  article h3 {
+    /* Title 17/24 Semibold. */
+    font-size: 17px;
+    line-height: 1.4;
+    font-weight: 600;
+    margin: 32px 0 8px;
+    color: var(--text-primary);
+  }
+  article p {
+    margin: 14px 0;
+    color: var(--text-secondary);
+  }
+  article ul, article ol {
+    padding-left: 24px;
+    margin: 14px 0;
+  }
+  article li {
+    margin: 8px 0;
+    color: var(--text-secondary);
+  }
+  article li::marker { color: var(--text-tertiary); }
+  article strong { color: var(--text-primary); font-weight: 500; }
+  article em { font-style: italic; }
+
+  /* Accent for inline links — single underline so the page stays calm
+     (Brief §02: "Animation communicates, doesn't decorate"). */
+  article a {
+    color: var(--accent-cyan);
+    text-decoration: none;
+    border-bottom: 1px solid rgba(0, 212, 255, 0.28);
+    transition: border-color 150ms ease-out;
+  }
+  article a:hover { border-bottom-color: var(--accent-cyan); }
+
+  article code {
+    font-family: var(--font-mono);
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 1px 6px;
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  /* Table — Brief radius Medium 12pt, Surface Elevated for header. */
+  article table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    margin: 24px 0;
+    font-size: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  article th, article td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: top;
+  }
+  article tr:last-child td { border-bottom: 0; }
+  article th {
+    background: var(--surface-elevated);
+    color: var(--text-primary);
+    font-weight: 500;
+    font-size: 13px;
+    letter-spacing: 0.2px;
+  }
+  article td { color: var(--text-secondary); }
+
+  /* ─── Footer ────────────────────────────────────────────────────────── */
+  footer {
+    border-top: 1px solid var(--border-subtle);
+    padding: 40px 24px 64px;
+    text-align: center;
+  }
+  footer .inner { max-width: 720px; margin: 0 auto; }
+  footer .brand-mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 24px;
+    color: var(--text-secondary);
+  }
+  footer .brand-mark img {
+    width: 24px;
+    height: 24px;
+    border-radius: 5px;
+    opacity: 0.9;
+    display: block;
+  }
+  footer .brand-mark .word {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 4px;
+    color: var(--text-secondary);
+  }
+  footer nav { margin-bottom: 18px; display: flex; justify-content: center; gap: 28px; flex-wrap: wrap; }
+  footer nav a {
+    color: var(--text-secondary);
+    text-decoration: none;
+    font-size: 13px;
+    transition: color 150ms ease-out;
+  }
+  footer nav a:hover { color: var(--accent-cyan); }
+  footer .legal {
+    color: var(--text-tertiary);
+    font-size: 11px;
+    font-family: var(--font-mono);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+  }
+
+  /* ─── Mobile (Brief §05: 16pt margin) ───────────────────────────────── */
+  @media (max-width: 600px) {
+    main { padding: 48px 18px 64px; }
+    article h1 { font-size: 26px; }
+    article h2 { font-size: 18px; margin-top: 36px; }
+    article .meta { margin-bottom: 36px; padding-bottom: 24px; }
+    header .inner { padding: 14px 18px; gap: 12px; }
+    header nav { gap: 16px; }
+    footer nav { gap: 18px; }
+  }
+
+  /* ─── Reduced motion ─────────────────────────────────────────────────── */
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="inner">
+    <a class="brand" href="https://phntm.pro/" aria-label="PHANTOM home">
+      <img src="/assets/phantom-logo.png" alt="" width="28" height="28">
+      <span class="word">PHANTOM</span>
+    </a>
+    <nav aria-label="Legal navigation">
+      <a href="/terms">Terms</a>
+      <a href="/privacy" aria-current="page">Privacy</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <article>
+<h1>Privacy Policy</h1>
+<p class="meta">Effective date:<span> </span> April 27, 2026 · Last updated:<span> </span> April 27, 2026</p>
+<p>This Privacy Policy explains how PHANTOM (&quot;the Service&quot;), operated by Willen LLC, handles information when you use our messenger.</p>
+<p>The short version: <strong>we are designed to know as little about you as possible</strong>. The rest of this document explains exactly what that means.</p>
+<h2>What we do not collect</h2>
+<p>PHANTOM does not collect, store, or have access to:</p>
+<ul>
+<li>Your <strong>message content</strong> — all messages are end-to-end encrypted; only sender and recipient can read them</li>
+<li><strong>Phone numbers, email addresses, or real names</strong> — none are required to use the Service</li>
+<li><strong>Contact lists or address books</strong> from your device</li>
+<li><strong>Read receipts, typing indicators, or presence information</strong> — these stay between you and your contact, not on our servers</li>
+<li><strong>Device identifiers</strong> (IMEI, Android ID, advertising ID)</li>
+<li><strong>Location data</strong></li>
+<li><strong>Behavioral analytics, marketing tracking, or third-party trackers</strong></li>
+<li><strong>Crash reports</strong> — the application does not transmit crash data to us</li>
+<li><strong>Profile information</strong> (display name, date of birth, etc.) entered in the app — this is stored on your device and shared only with contacts you choose, end-to-end encrypted</li>
+</ul>
+<h2>What we technically need</h2>
+<p>To deliver encrypted messages between users, our relay servers temporarily process:</p>
+<table><thead><tr><th>Data</th><th>Purpose</th><th>Retention</th></tr></thead><tbody><tr><td><strong>Public key</strong></td><td>To identify you on the network so others can send you encrypted messages</td><td>As long as your account is active</td></tr><tr><td><strong>Encrypted message envelope</strong></td><td>To deliver to the recipient</td><td>Maximum 7 days, then permanently deleted</td></tr><tr><td><strong>IP address (during connection)</strong></td><td>TCP/TLS connection routing</td><td>Not logged, not stored</td></tr><tr><td><strong>Recipient public key</strong></td><td>To route the envelope</td><td>Not retained after delivery</td></tr></tbody></table>
+<p>We do not maintain access logs that link IP addresses to public keys.</p>
+<h2>We cannot disclose what we do not have</h2>
+<p>If we receive a request from law enforcement, government, or any third party for user data, we will respond truthfully: the requested data does not exist in our systems. We cannot provide:</p>
+<ul>
+<li>Message content (we cannot decrypt it)</li>
+<li>Message history (we do not retain delivered messages)</li>
+<li>Conversation partners (we do not log who you communicate with)</li>
+<li>Connection history (we do not log IPs against accounts)</li>
+</ul>
+<p>We may receive valid legal requests; we will respond to them in accordance with applicable law, but our technical architecture limits what we are able to provide to essentially nothing beyond what is publicly known (your public key, if specifically asked).</p>
+<h2>Your rights under GDPR and similar laws</h2>
+<p>If you are in the European Union, United Kingdom, California, or another jurisdiction with privacy laws, you have rights regarding your personal data, including the right to access, correct, delete, or port your data.</p>
+<p>Because we minimize data collection by design, exercising these rights is largely automatic:</p>
+<ul>
+<li><strong>Right to access:</strong> We can confirm your public key (if you provide it). We hold no other data about you.</li>
+<li><strong>Right to deletion:</strong> Delete the application from your device. We retain no profile data to erase. Encrypted envelopes awaiting delivery expire automatically within 7 days.</li>
+<li><strong>Right to portability:</strong> Your account <em>is</em> your cryptographic keys, stored on your device. They are inherently portable.</li>
+<li><strong>Right to object:</strong> Stop using the Service.</li>
+</ul>
+<p>To make any privacy request, contact privacy@phntm.pro.</p>
+<h2>Children&#x27;s privacy</h2>
+<p>PHANTOM is not directed at children under 16, and we do not knowingly collect data from anyone under 16.</p>
+<h2>Security</h2>
+<p>We use industry-standard cryptography:</p>
+<ul>
+<li><strong>Double Ratchet protocol</strong> for forward secrecy</li>
+<li><strong>X3DH key agreement</strong> for initial session setup</li>
+<li><strong>libsodium</strong> primitives (XChaCha20-Poly1305, Curve25519, Blake2b)</li>
+<li><strong>TLS 1.3</strong> for transport security between client and relay</li>
+</ul>
+<p>Our relay servers run in containers on hardened Linux infrastructure, with TLS-only access through Caddy reverse proxy.</p>
+<h2>International data transfers</h2>
+<p>Our relay infrastructure is currently hosted in the European Union (Helsinki, Finland). When you use PHANTOM, your encrypted message envelopes briefly transit through these servers regardless of your location.</p>
+<h2>Changes to this Policy</h2>
+<p>We may update this Privacy Policy. Material changes will be communicated through the application before they take effect.</p>
+<h2>Contact</h2>
+<ul>
+<li><strong>Privacy questions or requests:</strong> privacy@phntm.pro</li>
+<li><strong>Legal matters:</strong> legal@phntm.pro</li>
+<li><strong>Security disclosure:</strong> security@phntm.pro</li>
+</ul>
+<p>Willen LLC, Wyoming, United States.</p>
+  </article>
+</main>
+<footer>
+  <div class="inner">
+    <div class="brand-mark">
+      <img src="/assets/phantom-logo.png" alt="" width="24" height="24">
+      <span class="word">PHANTOM</span>
+    </div>
+    <nav aria-label="Footer navigation">
+      <a href="/terms">Terms of Service</a>
+      <a href="/privacy">Privacy Policy</a>
+      <a href="https://github.com/WladislaWLE/Phantom">GitHub</a>
+    </nav>
+    <div class="legal">© 2026 Willen LLC · Wyoming, United States</div>
+  </div>
+</footer>
+</body>
+</html>
