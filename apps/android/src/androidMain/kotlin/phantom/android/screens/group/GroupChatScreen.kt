@@ -122,7 +122,15 @@ fun GroupChatScreen(
 
     val canWrite = !(isChannel && myRole != "admin")
 
+    // Same window-inset pattern as 1:1 ChatScreen — `union(ime, navigationBars)`
+    // so the GroupInputBar sits above the keyboard when it is open and above
+    // the system nav bar when it is closed, without double-padding when both
+    // insets are reported simultaneously. Without this the input clipped the
+    // same way the 1:1 chat did on Tecno HiOS.
     Scaffold(
+        modifier = Modifier.windowInsetsPadding(
+            WindowInsets.ime.union(WindowInsets.navigationBars)
+        ),
         containerColor = BgDeep,
         contentWindowInsets = WindowInsets(0),
         topBar = {

@@ -437,11 +437,17 @@ fun ChatScreen(
     // adjustResize in the manifest is not enough once
     // WindowCompat.setDecorFitsSystemWindows(window, false) is active on API < 35
     // (it is, see MainActivity.onCreate). Compose then has to opt in to IME insets
-    // explicitly. Without Modifier.imePadding() on the Scaffold root the bottomBar
-    // with the input field slides underneath the soft keyboard — exactly the
-    // "input field runs off the screen" report from the 2026-04-24 QA pass.
+    // explicitly. We use the union of `ime` and `navigationBars` so that:
+    //   - IME open  → padding = IME height (which already covers the nav bar visually)
+    //   - IME closed → padding = nav bar height (3-button or gesture indicator)
+    // `union` takes the per-side maximum, so they never stack — without that, the
+    // QA-v9 Tecno-HiOS phone showed the InputBar peeking from underneath the
+    // 3-button nav bar with the keyboard closed (Modifier.imePadding() alone
+    // does nothing once IME is hidden, so the 48 dp nav bar covered the input).
     Scaffold(
-        modifier = Modifier.imePadding(),
+        modifier = Modifier.windowInsetsPadding(
+            WindowInsets.ime.union(WindowInsets.navigationBars)
+        ),
         containerColor = BgDeep,
         contentWindowInsets = WindowInsets(0),
         snackbarHost = { androidx.compose.material3.SnackbarHost(snackbarHostState) },
@@ -460,15 +466,12 @@ fun ChatScreen(
             )
         },
         bottomBar = {
-            // windowInsetsPadding(navigationBars) keeps the input bar above the
-            // 3-button system bar on devices that don't use gesture nav (Tecno
-            // HiOS, classic Samsung One UI mode, etc.). When the keyboard is
-            // open the IME inset already covers the nav bar, so this resolves
-            // to 0 padding and `Modifier.imePadding()` on the Scaffold takes
-            // over. Without it the InputBar slid under the nav bar — visible
-            // in QA-v8 as "Message" placeholder peeking out the bottom edge.
-            // See PHANTOM_Design_Brief_v2.pdf §05 "Safe Areas & Margins".
-            Column(modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars)) {
+            // Inset padding lives on the Scaffold modifier (above) via
+            // `WindowInsets.ime.union(WindowInsets.navigationBars)`, so the
+            // bottomBar slot is already positioned above both the keyboard and
+            // the nav bar by the time we render here. Keep this Column inset-
+            // free to avoid double-padding.
+            Column {
                 // Reply bar
                 val reply = replyToMessage
                 if (reply != null) {
