@@ -1,0 +1,187 @@
+PHANTOM Messenger
+Copyright (c) 2026 Willen LLC
+Copyright (c) 2026 Vladislav Liudvig
+
+This product is licensed under the GNU Affero General Public License
+version 3 or later (AGPL-3.0-or-later). See the LICENSE file for the
+full text of the AGPL.
+
+================================================================================
+THIRD-PARTY SOFTWARE NOTICES AND ATTRIBUTIONS
+================================================================================
+
+This product bundles or links against the following third-party
+software components. Each retains its original license; the list below
+acknowledges them, names the upstream project, and points at the
+governing licence text.
+
+If you redistribute PHANTOM in source or binary form, you must
+preserve this NOTICE alongside the LICENSE file (AGPL-3.0 §5(a),
+Apache-2.0 §4(d), and equivalent clauses in MIT / ISC / BSD).
+
+────────────────────────────────────────────────────────────────────────────────
+Cryptographic primitives
+────────────────────────────────────────────────────────────────────────────────
+
+libsodium
+  Upstream:  https://libsodium.org · https://github.com/jedisct1/libsodium
+  Licence:   ISC
+  Used in:   Cryptographic core (Curve25519, XChaCha20-Poly1305, BLAKE2b,
+             X3DH key agreement, Double Ratchet primitives) on every
+             platform PHANTOM ships to. Linked through the
+             multiplatform-crypto-libsodium-bindings wrapper described
+             below.
+
+multiplatform-crypto-libsodium-bindings (com.ionspin.kotlin)
+  Upstream:  https://github.com/ionspin/kotlin-multiplatform-libsodium
+  Licence:   Apache-2.0
+  Used in:   Kotlin Multiplatform thin wrapper around libsodium
+             (`shared/core/crypto/`).
+
+────────────────────────────────────────────────────────────────────────────────
+Application framework — Kotlin / Compose Multiplatform
+────────────────────────────────────────────────────────────────────────────────
+
+Kotlin (org.jetbrains.kotlin) and kotlinx libraries
+  Upstream:  https://github.com/JetBrains/kotlin
+             https://github.com/Kotlin/kotlinx.coroutines
+             https://github.com/Kotlin/kotlinx.serialization
+  Licence:   Apache-2.0
+  Used in:   The entire shared/* and apps/android/* surface.
+
+Compose Multiplatform (org.jetbrains.compose)
+  Upstream:  https://github.com/JetBrains/compose-multiplatform
+  Licence:   Apache-2.0
+  Used in:   Android UI in `apps/android/`.
+
+AndroidX libraries (androidx.*)
+  Upstream:  https://android.googlesource.com/platform/frameworks/support/
+  Licence:   Apache-2.0
+  Used in:   Activity-Compose, biometric, lifecycle, test runner,
+             material-icons-extended, etc.
+
+────────────────────────────────────────────────────────────────────────────────
+Network transport
+────────────────────────────────────────────────────────────────────────────────
+
+Ktor client (io.ktor)
+  Upstream:  https://github.com/ktorio/ktor
+  Licence:   Apache-2.0
+  Used in:   `shared/core/transport/` — WebSocket client (OkHttp engine
+             on Android, Darwin engine on iOS).
+
+OkHttp (com.squareup.okhttp3)
+  Upstream:  https://github.com/square/okhttp
+  Licence:   Apache-2.0
+  Used in:   Underlies the Ktor OkHttp engine on Android. Also used
+             directly for low-level WebSocket inset workarounds
+             (forceCancelAllEngineCalls).
+
+────────────────────────────────────────────────────────────────────────────────
+Local storage
+────────────────────────────────────────────────────────────────────────────────
+
+SQLDelight (app.cash.sqldelight)
+  Upstream:  https://github.com/cashapp/sqldelight
+  Licence:   Apache-2.0
+  Used in:   `shared/core/storage/` — typed SQL bindings, schema
+             migrations, repository implementations.
+
+SQLCipher for Android (net.zetetic)
+  Upstream:  https://github.com/sqlcipher/android-database-sqlcipher
+  Licence:   BSD 3-Clause
+  Used in:   Encrypts the on-device SQLDelight database with a
+             per-install key derived from the Android Keystore.
+
+────────────────────────────────────────────────────────────────────────────────
+Server (services/relay)
+────────────────────────────────────────────────────────────────────────────────
+
+tokio (rust)
+  Upstream:  https://github.com/tokio-rs/tokio
+  Licence:   MIT
+  Used in:   Async runtime for the relay server.
+
+axum (rust)
+  Upstream:  https://github.com/tokio-rs/axum
+  Licence:   MIT
+  Used in:   HTTP / WebSocket router, request body limiting,
+             timeout-layer scoping.
+
+tokio-tungstenite (rust)
+  Upstream:  https://github.com/snapview/tokio-tungstenite
+  Licence:   MIT
+  Used in:   WebSocket protocol implementation reached via axum's
+             `extract::ws` module.
+
+tower / tower-http (rust)
+  Upstream:  https://github.com/tower-rs/tower
+             https://github.com/tower-rs/tower-http
+  Licence:   MIT
+  Used in:   Service composition layers (TraceLayer, TimeoutLayer,
+             RequestBodyLimitLayer).
+
+serde / serde_json (rust)
+  Upstream:  https://github.com/serde-rs/serde
+  Licence:   MIT OR Apache-2.0 (dual-licensed; PHANTOM uses MIT)
+  Used in:   Wire-format encoding for relay envelopes and admin
+             endpoints.
+
+tracing / tracing-subscriber (rust)
+  Upstream:  https://github.com/tokio-rs/tracing
+  Licence:   MIT
+  Used in:   Structured relay logging (metadata-only — never frame
+             payloads).
+
+futures-util (rust)
+  Upstream:  https://github.com/rust-lang/futures-rs
+  Licence:   MIT OR Apache-2.0 (PHANTOM uses MIT)
+  Used in:   Stream / Sink combinators in the WebSocket loop.
+
+subtle (rust)
+  Upstream:  https://github.com/dalek-cryptography/subtle
+  Licence:   BSD 3-Clause
+  Used in:   Constant-time comparison of the optional shared-secret
+             relay token.
+
+================================================================================
+Infrastructure (deploy/)
+================================================================================
+
+Caddy
+  Upstream:  https://github.com/caddyserver/caddy
+  Licence:   Apache-2.0
+  Used in:   Reverse proxy in front of the relay; serves static
+             /terms and /privacy pages and Android App Links
+             /.well-known/assetlinks.json. Runs as a Docker
+             container, not bundled into the PHANTOM binaries.
+
+Docker (Linux Foundation, Apache-2.0)
+  Used purely as the container runtime in the production deploy.
+  PHANTOM does not redistribute Docker.
+
+================================================================================
+Brand fonts (used in design mocks only — not bundled with the app)
+================================================================================
+
+Inter
+  Upstream:  https://github.com/rsms/inter
+  Licence:   SIL Open Font License 1.1
+  Used in:   Design Brief mock-ups. The shipped Android app uses the
+             OS sans-serif stack; no font binary is embedded.
+
+JetBrains Mono
+  Upstream:  https://github.com/JetBrains/JetBrainsMono
+  Licence:   SIL Open Font License 1.1
+  Used in:   Design Brief mock-ups for system / overline labels. Not
+             bundled.
+
+================================================================================
+Reporting third-party-licence issues
+================================================================================
+
+If you believe an upstream component is missing from this NOTICE, or
+that the listed licence is incorrect, please open an issue on the
+project's public tracker or email legal@phntm.pro. We treat licence
+hygiene as part of the security disclosure surface and respond on
+the same SLA documented in SECURITY.md.
