@@ -121,6 +121,24 @@ under the same license as the file it touches: GPL-3.0 for the client
 modules, AGPL-3.0 for `services/relay/`. A top-level `LICENSE` file
 will be added before the first public release.
 
+## Getting in touch
+
+For most contributor questions, please open a GitHub issue or draft
+PR — public discussion is the default and helps everyone learn from
+the answer. Use email when an issue would not be appropriate:
+
+| Topic | Address |
+|---|---|
+| Security vulnerabilities (do **not** open a public issue) | `security@phntm.pro` |
+| Privacy / GDPR / data-handling questions | `privacy@phntm.pro` |
+| Legal correspondence, DMCA | `legal@phntm.pro` |
+| Code of Conduct reports | `abuse@phntm.pro` |
+| Anything else | `support@phntm.pro` |
+
+See [SECURITY.md](SECURITY.md) for the full disclosure policy and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community-conduct
+expectations.
+
 ## Thank you
 
 Early contributors will be named in the Kickstarter campaign and in

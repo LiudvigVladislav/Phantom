@@ -1,6 +1,19 @@
 # Security Policy
 
-Last updated: 2026-04-24
+Last updated: 2026-04-27
+
+## Where to write
+
+| Purpose | Address |
+|---|---|
+| **Security vulnerabilities** (this document) | `security@phntm.pro` |
+| Privacy / GDPR data requests | `privacy@phntm.pro` |
+| Legal correspondence, DMCA, lawful-process requests | `legal@phntm.pro` |
+| Abuse reports per RFC 2142 (spam, harassment, illegal content) | `abuse@phntm.pro` |
+| User support, general help | `support@phntm.pro` |
+| Press / media inquiries | `press@phntm.pro` |
+
+If a report mixes categories (e.g. a vulnerability that also has privacy implications), `security@phntm.pro` takes precedence and we will route internally.
 
 ## Supported versions
 

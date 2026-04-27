@@ -103,7 +103,9 @@ not just by lack of time.
   solved. Feature requests that conflict with the doctrine will be
   closed with an explanation; no judgement implied.
 - **Grants.** If you represent a funder interested in a specific item
-  above, reach out: `hello@phntm.pro`.
+  above, reach out via `support@phntm.pro` (general) or
+  `press@phntm.pro` (media / public-facing inquiries).
 - **Security priorities.** Credible threat-model input that would
   reshuffle priorities is taken very seriously.
-  See [SECURITY.md](SECURITY.md).
+  See [SECURITY.md](SECURITY.md) for the full contact-routing table
+  including `security@`, `privacy@`, `legal@`, and `abuse@`.

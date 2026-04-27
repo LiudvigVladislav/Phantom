@@ -460,7 +460,15 @@ fun ChatScreen(
             )
         },
         bottomBar = {
-            Column {
+            // windowInsetsPadding(navigationBars) keeps the input bar above the
+            // 3-button system bar on devices that don't use gesture nav (Tecno
+            // HiOS, classic Samsung One UI mode, etc.). When the keyboard is
+            // open the IME inset already covers the nav bar, so this resolves
+            // to 0 padding and `Modifier.imePadding()` on the Scaffold takes
+            // over. Without it the InputBar slid under the nav bar — visible
+            // in QA-v8 as "Message" placeholder peeking out the bottom edge.
+            // See PHANTOM_Design_Brief_v2.pdf §05 "Safe Areas & Margins".
+            Column(modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars)) {
                 // Reply bar
                 val reply = replyToMessage
                 if (reply != null) {

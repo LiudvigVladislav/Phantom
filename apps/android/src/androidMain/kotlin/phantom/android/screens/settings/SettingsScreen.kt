@@ -1,5 +1,7 @@
 package phantom.android.screens.settings
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -17,6 +19,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import phantom.android.BuildConfig
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -188,6 +191,72 @@ fun SettingsScreen(
                         )
                     }
                 }
+
+                // About — version + categorised contact addresses (per
+                // SECURITY.md / Releases/README.md routing table). Each entry
+                // launches an ACTION_SENDTO intent so the user picks their own
+                // mail client; we never embed an email body or attachment, so
+                // these links carry no app data of their own.
+                item { SettingsGroupHeader("About") }
+                item {
+                    SettingsGroupCard {
+                        SettingsRowItem(
+                            icon = { PhIconGlobe(color = CyanAccent, size = 16.dp) },
+                            label = "App version",
+                            value = BuildConfig.VERSION_NAME,
+                            onClick = { /* no-op: read-only */ },
+                        )
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        SettingsRowItem(
+                            icon = { PhIconMessage(color = CyanAccent, size = 16.dp) },
+                            label = "Send feedback",
+                            value = "support@phntm.pro",
+                            onClick = { context.openMailto("support@phntm.pro", subject = "PHANTOM feedback") },
+                        )
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        SettingsRowItem(
+                            icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
+                            label = "Report abuse",
+                            value = "abuse@phntm.pro",
+                            onClick = { context.openMailto("abuse@phntm.pro", subject = "PHANTOM abuse report") },
+                        )
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        SettingsRowItem(
+                            icon = { PhIconLock(color = CyanAccent, size = 16.dp) },
+                            label = "Security disclosure",
+                            value = "security@phntm.pro",
+                            onClick = { context.openMailto("security@phntm.pro", subject = "PHANTOM security report") },
+                        )
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        SettingsRowItem(
+                            icon = { PhIconShieldCheck(color = CyanAccent, size = 16.dp) },
+                            label = "Privacy & data",
+                            value = "privacy@phntm.pro",
+                            onClick = { context.openMailto("privacy@phntm.pro", subject = "PHANTOM privacy request") },
+                        )
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        SettingsRowItem(
+                            icon = { PhIconBookmark(color = CyanAccent, size = 16.dp) },
+                            label = "Legal",
+                            value = "legal@phntm.pro",
+                            onClick = { context.openMailto("legal@phntm.pro", subject = "PHANTOM legal inquiry") },
+                        )
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        SettingsRowItem(
+                            icon = { PhIconMegaphone(color = CyanAccent, size = 16.dp) },
+                            label = "Press",
+                            value = "press@phntm.pro",
+                            onClick = { context.openMailto("press@phntm.pro", subject = "PHANTOM press inquiry") },
+                        )
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        SettingsRowItem(
+                            icon = { PhIconShare(color = CyanAccent, size = 14.dp) },
+                            label = "Source code on GitHub",
+                            value = "WladislaWLE/Phantom",
+                            onClick = { context.openUrl("https://github.com/WladislaWLE/Phantom") },
+                        )
+                    }
+                }
             }
 
             BottomNavPill(
@@ -203,4 +272,28 @@ fun SettingsScreen(
             )
         }
     }
+}
+
+/**
+ * Launches the user's mail client with a pre-addressed message. Uses
+ * `mailto:` via `ACTION_SENDTO` rather than `ACTION_SEND`, so only apps
+ * registered as email handlers (not arbitrary share targets) appear in the
+ * chooser. The body is left empty on purpose — the relay-routing addresses
+ * are categorised enough that the recipient inbox tag tells us what the
+ * user is reporting; we never want PHANTOM to leak local context into an
+ * outgoing draft.
+ */
+private fun android.content.Context.openMailto(address: String, subject: String) {
+    val uri = Uri.parse("mailto:$address?subject=${Uri.encode(subject)}")
+    val intent = Intent(Intent.ACTION_SENDTO, uri).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { startActivity(intent) }
+}
+
+private fun android.content.Context.openUrl(url: String) {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { startActivity(intent) }
 }
