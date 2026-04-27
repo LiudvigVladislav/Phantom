@@ -67,7 +67,7 @@ TARGETS = [
     {
         "src":    "PRIVACY_POLICY_RU.md",
         "out":    "privacy-ru.html",
-        "title":  "Политика приватности — PHANTOM",
+        "title":  "Политика конфиденциальности — PHANTOM",
         "locale": "ru",
         "page":   "privacy",
     },
@@ -93,9 +93,9 @@ LOCALES = {
     "ru": {
         "html_lang":         "ru",
         "nav_terms":         "Условия",
-        "nav_privacy":       "Приватность",
+        "nav_privacy":       "Конфиденциальность",
         "footer_terms":      "Условия использования",
-        "footer_privacy":    "Политика приватности",
+        "footer_privacy":    "Политика конфиденциальности",
         "footer_github":     "GitHub",
         "footer_legal":      "© 2026 Willen LLC · Вайоминг, США",
         "switch_label":      "Язык",
