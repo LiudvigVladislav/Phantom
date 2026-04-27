@@ -15,12 +15,6 @@ actual class DatabaseDriverFactory(private val context: Context) {
             schema = PhantomDatabase.Schema,
             context = context,
             name = "phantom.db",
-            callback = object : AndroidSqliteDriver.Callback(PhantomDatabase.Schema) {
-                override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {
-                    super.onOpen(db)
-                    db.execSQL("PRAGMA kdf_iter = 1;")
-                }
-            },
             factory = factory,
         )
     }

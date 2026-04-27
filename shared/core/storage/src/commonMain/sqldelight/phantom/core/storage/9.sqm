@@ -1,0 +1,1 @@
+ALTER TABLE conversation ADD COLUMN identity_key_changed_at INTEGER;

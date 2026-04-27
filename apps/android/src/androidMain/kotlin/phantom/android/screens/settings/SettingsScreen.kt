@@ -1,17 +1,10 @@
 package phantom.android.screens.settings
 
-import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Notifications
-import androidx.compose.material.icons.filled.Phone
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,8 +13,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -35,6 +30,8 @@ fun SettingsScreen(
     onProfile: () -> Unit = {},
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     var userName by remember { mutableStateOf("") }
     var privacyMode by remember { mutableStateOf("Standard") }
 
@@ -44,10 +41,32 @@ fun SettingsScreen(
         privacyMode = prefs.getString("privacy_mode", "Standard") ?: "Standard"
     }
 
-    fun showComingSoon() = Toast.makeText(context, "Coming soon", Toast.LENGTH_SHORT).show()
+    fun showComingSoon() {
+        scope.launch {
+            snackbarHostState.currentSnackbarData?.dismiss()
+            snackbarHostState.showSnackbar("Coming soon — stay tuned for updates")
+        }
+    }
 
     Scaffold(
         containerColor = BgDeep,
+        snackbarHost = {
+            SnackbarHost(snackbarHostState) { data ->
+                Snackbar(
+                    modifier = androidx.compose.ui.Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                    containerColor = Surface,
+                    contentColor = TextPrimary,
+                    shape = RoundedCornerShape(12.dp),
+                    action = {
+                        TextButton(onClick = { data.dismiss() }) {
+                            Text("OK", color = CyanAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    },
+                ) {
+                    Text(data.visuals.message, fontSize = 13.sp)
+                }
+            }
+        },
         topBar = {
             PhantomTopBar(
                 userName = userName,
@@ -84,15 +103,21 @@ fun SettingsScreen(
                                     Box(
                                         modifier = Modifier
                                             .clip(RoundedCornerShape(20.dp))
-                                            .background(if (active) CyanAccent.copy(alpha = 0.5f) else Color.Transparent)
-                                            .border(1.dp, if (active) CyanAccent.copy(alpha = 0.5f) else TextDim.copy(alpha = 0.15f), RoundedCornerShape(20.dp))
-                                            .padding(horizontal = 14.dp, vertical = 6.dp),
+                                            .background(if (active) CyanAccent else Color.Transparent)
+                                            .border(
+                                                1.dp,
+                                                if (active) Color.Transparent else Color.White.copy(alpha = 0.12f),
+                                                RoundedCornerShape(20.dp),
+                                            )
+                                            .padding(horizontal = 10.dp, vertical = 4.dp),
                                     ) {
                                         Text(
-                                            mode,
-                                            color = if (active) BgDeep.copy(alpha = 0.7f) else TextDim.copy(alpha = 0.4f),
-                                            fontSize = 12.sp,
+                                            mode.uppercase(),
+                                            color = if (active) BgDeep else TextDim,
+                                            fontSize = 9.sp,
+                                            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
                                             fontFamily = FontFamily.Monospace,
+                                            letterSpacing = 1.8.sp,
                                         )
                                     }
                                 }
@@ -100,7 +125,7 @@ fun SettingsScreen(
                         }
                         HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
                         SettingsRowItem(
-                            icon = Icons.Default.Phone,
+                            icon = { PhIconDevice(color = CyanAccent, size = 16.dp) },
                             label = "Linked Devices",
                             value = "Add device",
                             onClick = { showComingSoon() },
@@ -113,14 +138,14 @@ fun SettingsScreen(
                 item {
                     SettingsGroupCard {
                         SettingsRowItem(
-                            icon = Icons.Default.Search,
+                            icon = { PhIconGlobe(color = CyanAccent, size = 16.dp) },
                             label = "Language",
                             value = "English",
                             onClick = { showComingSoon() },
                         )
                         HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
                         SettingsRowItem(
-                            icon = Icons.Default.Star,
+                            icon = { PhIconSun(color = CyanAccent, size = 16.dp) },
                             label = "Theme",
                             value = "Dark",
                             onClick = { showComingSoon() },
@@ -133,7 +158,7 @@ fun SettingsScreen(
                 item {
                     SettingsGroupCard {
                         SettingsRowItem(
-                            icon = Icons.Default.Notifications,
+                            icon = { PhIconBell(color = CyanAccent, size = 16.dp) },
                             label = "Notifications & Sounds",
                             onClick = { showComingSoon() },
                         )
@@ -152,7 +177,7 @@ fun SettingsScreen(
                     }
                     SettingsGroupCard {
                         SettingsRowItem(
-                            icon = Icons.Default.Lock,
+                            icon = { PhIconLock(color = CyanAccent, size = 16.dp) },
                             label = "App Lock",
                             value = if (appLockEnabled) "On" else "Off",
                             onClick = {

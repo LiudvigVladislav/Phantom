@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- API 29+ overrides — disable system contrast overlay on nav/status bars. -->
+    <style name="Theme.Phantom" parent="android:Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">#0B0D12</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+    </style>
+</resources>

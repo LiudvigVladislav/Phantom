@@ -22,6 +22,13 @@ interface RelayTransport {
     suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean
 
     /**
+     * Tells the relay that [messageId] has been fully processed on the recipient.
+     * The relay removes that envelope from its per-recipient store. Best-effort —
+     * if the WS is not connected the call is enqueued and retried on reconnect.
+     */
+    suspend fun sendDeliveryAck(messageId: String): Boolean
+
+    /**
      * Sends an ephemeral typing notification to [toPubKeyHex].
      * The relay forwards it live if the recipient is online, drops it silently otherwise.
      * Returns false if not connected.

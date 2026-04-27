@@ -46,6 +46,7 @@ class LibsodiumX3DH : X3DHProtocol {
         val dh2 = dh(ephemeralKeyPair.privateKey, recipientIdentityPublicKey)
         val dh3 = dh(ephemeralKeyPair.privateKey, recipientSignedPreKey)
         val masterSecret = kdf(dh1, dh2, dh3)
+        dh1.zeroize(); dh2.zeroize(); dh3.zeroize()
         val sendingRatchet = generateDhKeyPair()
         return RatchetState(
             rootKey                   = masterSecret,
@@ -67,6 +68,7 @@ class LibsodiumX3DH : X3DHProtocol {
         val dh2 = dh(recipientIdentityKeyPair.privateKey, initiatorEphemeralPublicKey)
         val dh3 = dh(recipientSignedPreKeyPair.privateKey, initiatorEphemeralPublicKey)
         val masterSecret = kdf(dh1, dh2, dh3)
+        dh1.zeroize(); dh2.zeroize(); dh3.zeroize()
         return RatchetState(
             rootKey                   = masterSecret,
             sendingChainKey           = null,

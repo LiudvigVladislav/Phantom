@@ -1,23 +1,25 @@
 package phantom.core.crypto
 
+import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.coroutines.test.runTest
+import org.junit.runner.RunWith
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
- * Tests for [LibsodiumX3DH].
+ * Instrumented tests for [LibsodiumX3DH].
  *
- * Each test initializes LibsodiumInitializer because the native backing must be
- * loaded before any call. runTest allows the suspend initializer.
+ * Runs on a connected Android device or emulator. The libsodium JNI binding
+ * (libsodium.so) is bundled into the test APK and loaded by the Android
+ * runtime — this is the scenario that fails on the JVM test classpath where
+ * ResourceLoader cannot locate the native library.
  *
- * VERIFY AT FIRST BUILD:
- * - LibsodiumInitializer.initialize() — if it is not a suspend function in the
- *   installed version, remove the suspend call site or use the callback form:
- *   LibsodiumInitializer.initializeWithCallback { }.
+ * Invoke with: ./gradlew :shared:core:crypto:connectedDebugAndroidTest
  */
+@RunWith(AndroidJUnit4::class)
 class LibsodiumX3DHTest {
 
     private val x3dh = LibsodiumX3DH()
@@ -51,10 +53,6 @@ class LibsodiumX3DHTest {
     /**
      * Full X3DH handshake: Alice initiates, Bob responds.
      * Both parties must derive the same rootKey.
-     *
-     * The ephemeral keypair is generated externally so its public key can be
-     * forwarded to Bob via [LibsodiumX3DH.initiatorHandshakeWithEphemeral].
-     * In production the ephemeral public key travels in the initial message header.
      */
     @Test
     fun fullHandshake_aliceAndBobDeriveTheSameRootKey() = runTest {

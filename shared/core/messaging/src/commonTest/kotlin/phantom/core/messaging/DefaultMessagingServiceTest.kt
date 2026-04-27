@@ -44,7 +44,13 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun getMessages(conversationId: String) =
         messages.filter { it.conversationId == conversationId }
 
-    override suspend fun insertMessage(entity: MessageEntity) { messages += entity }
+    override suspend fun getMessageById(id: String): MessageEntity? =
+        messages.firstOrNull { it.id == id }
+
+    override suspend fun insertMessage(entity: MessageEntity) {
+        if (messages.any { it.id == entity.id }) return
+        messages += entity
+    }
     override suspend fun updateStatus(messageId: String, status: MessageStatus) {
         statusUpdates[messageId] = status
     }
@@ -64,7 +70,7 @@ private class FakeMessageRepository : MessageRepository {
         messages.mapNotNull { it.expiresAtMs }.minOrNull()
     override suspend fun deleteExpiredMessages() {
         val now = System.currentTimeMillis()
-        messages.removeAll { it.expiresAtMs != null && it.expiresAtMs <= now }
+        messages.removeAll { msg -> msg.expiresAtMs?.let { it <= now } == true }
     }
     override suspend fun pinMessage(messageId: String, pinned: Boolean) {
         val i = messages.indexOfFirst { it.id == messageId }
@@ -72,6 +78,15 @@ private class FakeMessageRepository : MessageRepository {
     }
     override suspend fun getPinnedMessages(conversationId: String): List<MessageEntity> =
         messages.filter { it.conversationId == conversationId && it.pinned }
+    override suspend fun saveMessage(id: String) {
+        val i = messages.indexOfFirst { it.id == id }
+        if (i != -1) messages[i] = messages[i].copy(saved = true)
+    }
+    override suspend fun unsaveMessage(id: String) {
+        val i = messages.indexOfFirst { it.id == id }
+        if (i != -1) messages[i] = messages[i].copy(saved = false)
+    }
+    override suspend fun getSavedMessages(): List<MessageEntity> = messages.filter { it.saved }
 }
 
 private class FakeConversationRepository : ConversationRepository {
@@ -110,6 +125,19 @@ private class FakeConversationRepository : ConversationRepository {
     }
     override suspend fun getDisappearingTimer(conversationId: String): Long =
         store[conversationId]?.disappearingTimerSecs ?: 0L
+    override suspend fun archiveConversation(id: String) {
+        store[id]?.let { store[id] = it.copy(archived = true) }
+    }
+    override suspend fun unarchiveConversation(id: String) {
+        store[id]?.let { store[id] = it.copy(archived = false) }
+    }
+    override suspend fun getArchivedConversations() = store.values.filter { it.archived }.toList()
+    override suspend fun setIdentityKeyChangedAt(conversationId: String, ts: Long) {
+        store[conversationId]?.let { store[conversationId] = it.copy(identityKeyChangedAt = ts) }
+    }
+    override suspend fun clearIdentityKeyChangedAt(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(identityKeyChangedAt = null) }
+    }
 }
 
 private class FakeReactionRepository : ReactionRepository {
@@ -147,6 +175,7 @@ private class FakeRelayTransport : RelayTransport {
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
+    override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
     override fun isConnected() = true
 }

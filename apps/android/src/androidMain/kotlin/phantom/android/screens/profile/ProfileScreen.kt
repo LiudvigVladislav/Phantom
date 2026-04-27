@@ -22,8 +22,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -44,8 +42,7 @@ import kotlinx.coroutines.withContext
 import phantom.android.di.AppContainer
 import phantom.android.qr.QrCodeImage
 import phantom.android.qr.generateQrBitmap
-import phantom.android.ui.gradientBrushForName
-import phantom.android.ui.nameInitials
+import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.core.identity.IdentityRecord
 import java.io.File
@@ -407,12 +404,7 @@ private fun ProfileTopBar(onBack: () -> Unit) {
                     .clickable { onBack() },
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back",
-                    tint = TextPrimary,
-                    modifier = Modifier.size(18.dp),
-                )
+                PhIconBack(color = TextPrimary, size = 18.dp)
             }
 
             // Title

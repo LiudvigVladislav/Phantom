@@ -1,5 +1,6 @@
 package phantom.android.service
 
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -25,14 +26,19 @@ class DisappearingMessageScheduler(
     fun start() {
         scope.launch {
             while (isActive) {
-                val nextExpiry = messageRepo.getNextExpiry()
-                if (nextExpiry == null) {
+                try {
+                    val nextExpiry = messageRepo.getNextExpiry()
+                    if (nextExpiry == null) {
+                        delay(60_000L)
+                        continue
+                    }
+                    val delayMs = nextExpiry - System.currentTimeMillis()
+                    if (delayMs > 0L) delay(delayMs)
+                    messageRepo.deleteExpiredMessages()
+                } catch (e: Exception) {
+                    Log.w("PHANTOM", "DisappearingMessageScheduler: DB error, retrying in 60s — ${e.message}")
                     delay(60_000L)
-                    continue
                 }
-                val delayMs = nextExpiry - System.currentTimeMillis()
-                if (delayMs > 0L) delay(delayMs)
-                messageRepo.deleteExpiredMessages()
             }
         }
     }

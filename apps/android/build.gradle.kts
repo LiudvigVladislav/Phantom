@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.multiplatform)
@@ -5,6 +7,31 @@ plugins {
     alias(libs.plugins.compose.compiler)
     id("com.google.gms.google-services")
 }
+
+// Load release signing credentials from keystores/signing.properties (gitignored)
+// or fall back to SIGNING_* env vars (for CI). If neither is available, the
+// release build falls back to the debug signing config — lets contributors
+// build release APKs locally without access to the production key.
+val signingProps = Properties().apply {
+    val f = rootProject.file("keystores/signing.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun signingValue(propertyKey: String, envKey: String): String? =
+    signingProps.getProperty(propertyKey) ?: System.getenv(envKey)
+
+// Local dev overrides — values in local.properties or env vars override the
+// defaults below. local.properties is gitignored (Android Studio default).
+// Example for local relay on emulator: relay.url=ws://10.0.2.2:8080/ws
+// Example for local relay on physical device: relay.url=ws://192.168.x.y:8080/ws
+// Note: cleartext (ws://) is allowed to 10.0.2.2 and localhost only by
+//       network_security_config.xml. Physical device local testing requires
+//       adding the LAN IP there (not committed) or using wss:// via a tunnel.
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun localOrEnv(propKey: String, envKey: String, default: String): String =
+    localProps.getProperty(propKey) ?: System.getenv(envKey) ?: default
 
 kotlin {
     androidTarget {
@@ -36,6 +63,10 @@ kotlin {
             implementation(libs.libsodium.bindings)
             implementation(libs.sqlcipher.android)
             implementation("androidx.biometric:biometric:1.1.0")
+            // WebRTC for voice calls — provides PeerConnectionFactory, AudioTrack, IceCandidate.
+            // stream/webrtc-android wraps Google's pre-built libwebrtc .aar so we avoid
+            // compiling WebRTC from source (which requires depot_tools + Linux host).
+            implementation("io.getstream:stream-webrtc-android:1.1.1")
             // FCM — silent push wakes the device so the WebSocket drains queued messages.
             // Requires google-services.json in apps/android/ and the plugin uncommented above.
             implementation("com.google.firebase:firebase-messaging-ktx:23.4.1")
@@ -64,19 +95,58 @@ android {
         buildConfig = true
     }
 
+    signingConfigs {
+        create("release") {
+            val storeFileProp = signingValue("storeFile", "SIGNING_STORE_FILE")
+            val storePasswordProp = signingValue("storePassword", "SIGNING_STORE_PASSWORD")
+            val keyAliasProp = signingValue("keyAlias", "SIGNING_KEY_ALIAS")
+            val keyPasswordProp = signingValue("keyPassword", "SIGNING_KEY_PASSWORD")
+
+            if (storeFileProp != null && storePasswordProp != null &&
+                keyAliasProp != null && keyPasswordProp != null
+            ) {
+                storeFile = rootProject.file(storeFileProp)
+                storePassword = storePasswordProp
+                keyAlias = keyAliasProp
+                keyPassword = keyPasswordProp
+            }
+            // If any field is null, this config is left unusable and release
+            // below falls back to the debug signing config.
+        }
+    }
+
     buildTypes {
         debug {
-            // Local network IP of the dev machine — phone and PC must be on same Wi-Fi.
-            buildConfigField("String", "RELAY_URL", "\"ws://192.168.0.105:8080/ws\"")
-            // No token in dev — relay runs without RELAY_SECRET_TOKEN (backward compatible).
+            // Default: production relay. Override in local.properties (gitignored):
+            //   relay.url=ws://10.0.2.2:8080/ws     ← emulator → host machine
+            //   relay.url=ws://192.168.x.y:8080/ws  ← physical device → host machine
+            // Cleartext (ws://) is only allowed to 10.0.2.2 / localhost by
+            // network_security_config.xml; for a LAN IP you must also add it there locally.
+            val relayUrl = localOrEnv("relay.url", "RELAY_URL", "wss://relay.phntm.pro/ws")
+            buildConfigField("String", "RELAY_URL", "\"$relayUrl\"")
             buildConfigField("String", "RELAY_TOKEN", "null")
         }
         release {
             isMinifyEnabled = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            buildConfigField("String", "RELAY_URL", "\"wss://relay.phantom.app/ws\"")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            buildConfigField("String", "RELAY_URL", "\"wss://relay.phntm.pro/ws\"")
             // Override this via CI secrets: -PRELAY_TOKEN=<value>
             buildConfigField("String", "RELAY_TOKEN", "null")
+
+            // Use the release key if keystores/signing.properties or SIGNING_*
+            // env vars supplied valid credentials; otherwise fall back to debug
+            // signing so contributors without the production key can still
+            // build a release APK locally (it just won't be Play Store-ready).
+            val releaseConfig = signingConfigs.getByName("release")
+            signingConfig = if (releaseConfig.storeFile != null) {
+                releaseConfig
+            } else {
+                logger.warn("No release keystore configured — falling back to debug signing for release build.")
+                signingConfigs.getByName("debug")
+            }
         }
     }
 

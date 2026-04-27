@@ -17,6 +17,13 @@ private class FakeConversationRepository : ConversationRepository {
     override suspend fun getAllConversations(): List<ConversationEntity> =
         store.values.sortedByDescending { it.lastMessageAt ?: 0L }
 
+    override suspend fun getActiveConversations(): List<ConversationEntity> =
+        store.values.filter { !it.blocked && it.trustTier == TrustTier.TRUSTED && !it.archived }
+            .sortedByDescending { it.lastMessageAt ?: 0L }
+
+    override suspend fun getMessageRequests(): List<ConversationEntity> =
+        store.values.filter { it.trustTier == TrustTier.REQUEST }.sortedByDescending { it.lastMessageAt ?: 0L }
+
     override suspend fun getConversation(id: String): ConversationEntity? = store[id]
 
     override suspend fun upsertConversation(entity: ConversationEntity) {
@@ -31,8 +38,57 @@ private class FakeConversationRepository : ConversationRepository {
         store[conversationId]?.let { store[conversationId] = it.copy(unreadCount = 0) }
     }
 
+    override suspend fun updateNotes(conversationId: String, notes: String?) {
+        store[conversationId]?.let { store[conversationId] = it.copy(notes = notes) }
+    }
+
+    override suspend fun getBlockedConversations(): List<ConversationEntity> =
+        store.values.filter { it.blocked }.sortedBy { it.theirUsername }
+
+    override suspend fun blockConversation(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(blocked = true) }
+    }
+
+    override suspend fun unblockConversation(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(blocked = false) }
+    }
+
+    override suspend fun acceptRequest(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(trustTier = TrustTier.TRUSTED) }
+    }
+
     override suspend fun deleteConversation(id: String) {
         store.remove(id)
+    }
+
+    override suspend fun setVerified(conversationId: String, verified: Boolean) {
+        store[conversationId]?.let { store[conversationId] = it.copy(isVerified = verified) }
+    }
+
+    override suspend fun setDisappearingTimer(conversationId: String, secs: Long) {
+        store[conversationId]?.let { store[conversationId] = it.copy(disappearingTimerSecs = secs) }
+    }
+
+    override suspend fun getDisappearingTimer(conversationId: String): Long =
+        store[conversationId]?.disappearingTimerSecs ?: 0L
+
+    override suspend fun archiveConversation(id: String) {
+        store[id]?.let { store[id] = it.copy(archived = true) }
+    }
+
+    override suspend fun unarchiveConversation(id: String) {
+        store[id]?.let { store[id] = it.copy(archived = false) }
+    }
+
+    override suspend fun getArchivedConversations(): List<ConversationEntity> =
+        store.values.filter { it.archived }.sortedByDescending { it.lastMessageAt ?: 0L }
+
+    override suspend fun setIdentityKeyChangedAt(conversationId: String, ts: Long) {
+        store[conversationId]?.let { store[conversationId] = it.copy(identityKeyChangedAt = ts) }
+    }
+
+    override suspend fun clearIdentityKeyChangedAt(conversationId: String) {
+        store[conversationId]?.let { store[conversationId] = it.copy(identityKeyChangedAt = null) }
     }
 }
 
@@ -42,7 +98,11 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun getMessages(conversationId: String): List<MessageEntity> =
         store.filter { it.conversationId == conversationId }.sortedBy { it.createdAt }
 
+    override suspend fun getMessageById(id: String): MessageEntity? =
+        store.firstOrNull { it.id == id }
+
     override suspend fun insertMessage(entity: MessageEntity) {
+        if (store.any { it.id == entity.id }) return
         store.add(entity)
     }
 
@@ -51,9 +111,51 @@ private class FakeMessageRepository : MessageRepository {
         if (index != -1) store[index] = store[index].copy(status = status)
     }
 
+    override suspend fun updateMessageText(messageId: String, text: String) {
+        val index = store.indexOfFirst { it.id == messageId }
+        if (index != -1) store[index] = store[index].copy(plaintextCache = text)
+    }
+
+    override suspend fun deleteMessage(messageId: String) {
+        store.removeAll { it.id == messageId }
+    }
+
     override suspend fun deleteMessagesForConversation(conversationId: String) {
         store.removeAll { it.conversationId == conversationId }
     }
+
+    override suspend fun setExpiresAt(messageId: String, expiresAtMs: Long) {
+        val index = store.indexOfFirst { it.id == messageId }
+        if (index != -1) store[index] = store[index].copy(expiresAtMs = expiresAtMs)
+    }
+
+    override suspend fun getNextExpiry(): Long? =
+        store.mapNotNull { it.expiresAtMs }.minOrNull()
+
+    override suspend fun deleteExpiredMessages() {
+        val now = 0L // test stub — uses injected clock in real impl
+        store.removeAll { msg -> msg.expiresAtMs?.let { it <= now } == true }
+    }
+
+    override suspend fun pinMessage(messageId: String, pinned: Boolean) {
+        val index = store.indexOfFirst { it.id == messageId }
+        if (index != -1) store[index] = store[index].copy(pinned = pinned)
+    }
+
+    override suspend fun getPinnedMessages(conversationId: String): List<MessageEntity> =
+        store.filter { it.conversationId == conversationId && it.pinned }
+
+    override suspend fun saveMessage(id: String) {
+        val index = store.indexOfFirst { it.id == id }
+        if (index != -1) store[index] = store[index].copy(saved = true)
+    }
+
+    override suspend fun unsaveMessage(id: String) {
+        val index = store.indexOfFirst { it.id == id }
+        if (index != -1) store[index] = store[index].copy(saved = false)
+    }
+
+    override suspend fun getSavedMessages(): List<MessageEntity> = store.filter { it.saved }
 }
 
 private class FakeRatchetStateRepository : RatchetStateRepository {

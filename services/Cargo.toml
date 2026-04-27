@@ -28,6 +28,7 @@ config = "0.14"
 time = { version = "0.3", features = ["serde"] }
 
 futures-util = "0.3"
+subtle = "2"
 
 # Testing
 tokio-test = "0.4"

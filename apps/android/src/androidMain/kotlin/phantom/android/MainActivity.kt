@@ -2,6 +2,7 @@ package phantom.android
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
@@ -9,6 +10,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import phantom.android.notifications.PhantomNotificationManager
 import androidx.activity.enableEdgeToEdge
+import androidx.core.view.WindowCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
@@ -18,12 +20,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.service.PhantomMessagingService
 import phantom.android.screens.splash.PhantomSplashScreen
 import phantom.android.navigation.Screen
 import phantom.android.qr.QrScanScreen
+import phantom.android.calls.ActiveCall
+import phantom.android.calls.CallState
+import phantom.android.screens.calls.ActiveCallScreen
 import phantom.android.screens.calls.CallsScreen
+import phantom.android.screens.calls.IncomingCallScreen
 import phantom.android.screens.chat.ChatScreen
 import phantom.android.screens.chatlist.ChatListScreen
 import phantom.android.screens.contact.ContactProfileScreen
@@ -109,6 +117,15 @@ class MainActivity : ComponentActivity() {
         // enableEdgeToEdge() conflicts with API 35+ system-enforced edge-to-edge.
         // On API 35+, the system handles it automatically; calling it again
         // corrupts the EGL surface setup (GFXSTREAM / Unknown dataspace 0).
+        //
+        // For API 26–34 we still need the window to carry IME insets down to
+        // Compose so Modifier.imePadding() can resize content when the
+        // keyboard appears. setDecorFitsSystemWindows(false) is the minimal
+        // configuration that enables this without touching edge-to-edge
+        // drawing behaviour in a way that breaks API 35+.
+        if (Build.VERSION.SDK_INT < 35) {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+        }
 
         // Initialise lock state from prefs before Compose renders its first frame.
         val prefs = getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
@@ -184,6 +201,7 @@ private fun PhantomApp(
     notifSenderName: String? = null,
     pendingInviteQr: androidx.compose.runtime.MutableState<String?> = androidx.compose.runtime.mutableStateOf(null),
 ) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     var startScreen by remember { mutableStateOf<Screen?>(null) }
 
     LaunchedEffect(Unit) {
@@ -230,10 +248,19 @@ private fun PhantomApp(
     // service). Calling them here would create a second competing connection loop. The service
     // is started from MainActivity.onCreate() and runs independently of Activity lifecycle.
 
+    val context = androidx.compose.ui.platform.LocalContext.current
     when (val screen = currentScreen) {
         is Screen.Onboarding -> OnboardingScreen(
             container = container,
-            onComplete = { currentScreen = Screen.ChatList },
+            onComplete = {
+                // Identity is now persisted. Restart the foreground service so it
+                // picks up the new identity, calls startReceiving(), and opens the
+                // WebSocket — the earlier onStartCommand bailed out via stopSelf()
+                // because no identity existed yet. Without this kick the user has
+                // to fully restart the app before messages can flow.
+                context.startForegroundService(Intent(context, PhantomMessagingService::class.java))
+                currentScreen = Screen.ChatList
+            },
         )
         is Screen.ChatList -> ChatListScreen(
             container = container,
@@ -289,7 +316,9 @@ private fun PhantomApp(
             onBack = { currentScreen = Screen.ChatList },
         )
         is Screen.Archive -> ArchiveScreen(
+            container = container,
             onBack = { currentScreen = Screen.ChatList },
+            onNavigateToChat = { chatScreen -> currentScreen = chatScreen },
         )
         is Screen.GroupChat -> GroupChatScreen(
             groupId   = screen.groupId,
@@ -308,5 +337,43 @@ private fun PhantomApp(
             onCreated = { groupId, groupName -> currentScreen = Screen.GroupChat(groupId, groupName, true) },
             onBack    = { currentScreen = Screen.ChatList },
         )
+        is Screen.ActiveCall -> {
+            val cm = container.callManager
+            val noCallFlow = remember { MutableStateFlow<ActiveCall?>(null) }
+            val callState by (cm?.activeCall ?: noCallFlow).collectAsState()
+            val call = callState
+            if (call != null && cm != null) {
+                ActiveCallScreen(
+                    call = call,
+                    onHangup = { scope.launch { cm.hangup() }; currentScreen = Screen.ChatList },
+                    onToggleMute = { cm.toggleMute() },
+                    onToggleSpeaker = { cm.toggleSpeaker() },
+                    onBack = { currentScreen = Screen.ChatList },
+                )
+            }
+        }
+        is Screen.IncomingCall -> IncomingCallScreen(
+            username = screen.username,
+            onAnswer = {
+                scope.launch { container.callManager?.answerCall() }
+                currentScreen = Screen.ActiveCall(screen.conversationId, screen.username)
+            },
+            onReject = {
+                scope.launch { container.callManager?.rejectCall() }
+                currentScreen = Screen.ChatList
+            },
+        )
+    }
+
+    // Global observer — navigate to IncomingCall when a RINGING call arrives from any screen
+    LaunchedEffect(container.callManager) {
+        container.callManager?.activeCall?.collect { call ->
+            if (call != null &&
+                call.state == CallState.RINGING &&
+                currentScreen !is Screen.IncomingCall
+            ) {
+                currentScreen = Screen.IncomingCall(call.remotePubKeyHex, call.remoteUsername)
+            }
+        }
     }
 }

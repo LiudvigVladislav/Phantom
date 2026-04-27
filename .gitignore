@@ -34,6 +34,15 @@ prototype/web/out/
 *.key
 secrets/
 
+# Keystores — NEVER commit (loss = cannot update app in Play Store)
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystores/*
+!keystores/README.md
+signing.properties
+
 # OS
 .DS_Store
 Thumbs.db

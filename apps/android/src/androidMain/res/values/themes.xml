@@ -5,10 +5,9 @@
         Compose handles all UI theming via PhantomTheme.
         On API 35+ the system enforces edge-to-edge automatically.
     -->
+    <!-- Base theme for API 26+. Contrast enforcement attributes added in values-v29/. -->
     <style name="Theme.Phantom" parent="android:Theme.DeviceDefault.NoActionBar">
         <item name="android:windowBackground">#0B0D12</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
-        <item name="android:enforceNavigationBarContrast">false</item>
-        <item name="android:enforceStatusBarContrast">false</item>
     </style>
 </resources>

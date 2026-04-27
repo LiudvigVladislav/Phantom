@@ -6,10 +6,20 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--
+        Required so PhantomMessagingService can hold a partial CPU wake lock
+        and a high-performance Wi-Fi lock for the lifetime of its foreground
+        notification. Without this, some OEM Android builds suspend the Wi-Fi
+        radio after ~60 s even with a foreground service active, which makes
+        the WebSocket appear dead from the relay's side and forces a
+        client-driven reconnect every minute.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".PhantomApplication"
@@ -19,7 +29,7 @@
         android:theme="@style/Theme.Phantom"
         android:allowBackup="false"
         android:supportsRtl="true"
-        android:usesCleartextTraffic="true">
+        android:networkSecurityConfig="@xml/network_security_config">
 
         <activity
             android:name=".MainActivity"
@@ -30,11 +40,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <intent-filter android:autoVerify="true">
+            <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="phantom" android:host="invite" />
+            </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="phntm.pro" android:pathPrefix="/invite/" />
             </intent-filter>
         </activity>
 

@@ -1,17 +1,20 @@
 package phantom.core.crypto
 
+import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.coroutines.test.runTest
+import org.junit.runner.RunWith
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
+@RunWith(AndroidJUnit4::class)
 class SafetyNumberTest {
 
     // Fake public-key hex strings (64 hex chars = 32 bytes).
-    private val keyA = "aabbccdd" .repeat(8)
-    private val keyB = "11223344" .repeat(8)
+    private val keyA = "aabbccdd".repeat(8)
+    private val keyB = "11223344".repeat(8)
 
     @Test
     fun fingerprintIsDeterministic() = runTest {
@@ -24,7 +27,6 @@ class SafetyNumberTest {
     @Test
     fun fingerprintIsSymmetric() = runTest {
         LibsodiumInitializer.initialize()
-        // Both sides call compute() with their own key first — result must be identical.
         val fromA = SafetyNumber.compute(keyA, keyB)
         val fromB = SafetyNumber.compute(keyB, keyA)
         assertEquals(fromA, fromB, "Fingerprint must be order-independent")
@@ -34,7 +36,6 @@ class SafetyNumberTest {
     fun fingerprintHasCorrectFormat() = runTest {
         LibsodiumInitializer.initialize()
         val fp = SafetyNumber.compute(keyA, keyB)
-        // Expect 5 groups of 12 digits separated by two spaces.
         val groups = fp.split("  ")
         assertEquals(5, groups.size, "Expected 5 groups, got: $fp")
         groups.forEach { group ->

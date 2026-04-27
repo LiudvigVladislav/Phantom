@@ -8,14 +8,24 @@ CREATE TABLE message (
     created_at INTEGER NOT NULL,
     expires_at_ms INTEGER,
     pinned INTEGER NOT NULL DEFAULT 0,
+    saved INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(conversation_id) REFERENCES conversation(id) ON DELETE CASCADE
 );
 
 getMessages:
 SELECT * FROM message WHERE conversation_id = ? ORDER BY created_at ASC;
 
+getMessageById:
+SELECT * FROM message WHERE id = ?;
+
+-- INSERT OR IGNORE: the relay re-delivers every still-stored envelope on
+-- reconnect, so the same message_id can arrive more than once if a previous
+-- session processed it but the WS died before "ack-deliver" reached the
+-- relay. Idempotent insert lets the receive pipeline tolerate that
+-- duplication without surfacing duplicate UI events or violating the
+-- message.id PRIMARY KEY constraint.
 insertMessage:
-INSERT INTO message(id, conversation_id, ciphertext, plaintext_cache, sent, status, created_at, expires_at_ms)
+INSERT OR IGNORE INTO message(id, conversation_id, ciphertext, plaintext_cache, sent, status, created_at, expires_at_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
 updateMessageStatus:
@@ -47,3 +57,12 @@ UPDATE message SET pinned = :pinned WHERE id = :id;
 
 getPinnedMessages:
 SELECT * FROM message WHERE conversation_id = :conversationId AND pinned = 1 ORDER BY created_at ASC;
+
+saveMessage:
+UPDATE message SET saved = 1 WHERE id = ?;
+
+unsaveMessage:
+UPDATE message SET saved = 0 WHERE id = ?;
+
+getSavedMessages:
+SELECT * FROM message WHERE saved = 1 ORDER BY created_at DESC;

@@ -1,4 +1,5 @@
 use crate::{envelope::*, error::RelayError, state::{AppState, AbuseReport, RateEntry, append_report_to_disk, append_block_to_disk}};
+use subtle::ConstantTimeEq;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -19,12 +20,16 @@ use tower_http::{
     trace::TraceLayer,
 };
 use axum::http::Request;
+use std::sync::atomic::Ordering;
 
 pub fn router(state: Arc<AppState>) -> Router {
     let max_body = state.config.max_payload_bytes + 1024;
-    Router::new()
+
+    // TimeoutLayer must NOT apply to /ws — WebSocket connections are long-lived
+    // and a 30-second timeout would kill idle-but-healthy sessions. Scope it
+    // to the HTTP sub-router only; /ws is mounted separately with no timeout.
+    let http_routes = Router::new()
         .route("/health",             get(health))
-        .route("/ws",                 get(ws_handler))
         .route("/send",               post(send_envelope))
         .route("/fetch/{recipient}",  get(fetch_envelopes))
         .route("/ack/{id}",           delete(ack_envelope))
@@ -32,6 +37,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/reports",      get(admin_list_reports))
         .route("/admin/block",        post(admin_block_key))
         .route("/admin/blocklist",    get(admin_list_blocklist))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ));
+
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .merge(http_routes)
         // Log only method + path — never query string, to avoid leaking ?token= secrets.
         .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
             tracing::info_span!(
@@ -40,10 +53,6 @@ pub fn router(state: Arc<AppState>) -> Router {
                 path   = %req.uri().path(),
             )
         }))
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(30),
-        ))
         .layer(RequestBodyLimitLayer::new(max_body))
         .with_state(state)
 }
@@ -63,7 +72,8 @@ async fn ws_handler(
     // demo relay; it is not a replacement for per-user authentication.
     if let Some(expected) = &state.config.secret_token {
         let provided = params.get("token").map(|s| s.as_str()).unwrap_or("");
-        if provided != expected.as_str() {
+        let token_ok: bool = provided.as_bytes().ct_eq(expected.as_bytes()).into();
+        if !token_ok {
             tracing::warn!(id = %&id[..id.len().min(16)], "ws rejected: bad or missing token");
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
@@ -72,17 +82,34 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, id, state))
 }
 
-async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>) {
-    use futures_util::{SinkExt, StreamExt};
+async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppState>) {
+    use futures_util::StreamExt;
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    // Single-task select! loop instead of split() + two spawned tasks.
+    //
+    // Why: after `socket.split()`, the read half (SplitStream) and write half
+    // (SplitSink) share the underlying tungstenite connection through a BiLock.
+    // tungstenite enqueues an auto-PONG when a PING is received, but that PONG
+    // is only flushed to the wire on the *next write attempt* through the Sink
+    // half. If the relay has nothing to forward (idle period — no live delivery,
+    // no ack to send), the auto-PONG sits in the queue forever and the client's
+    // OkHttp pingInterval(15s) trips a SocketTimeoutException after 15 seconds
+    // of "sent ping but didn't receive pong" — visible in QA-v5 as a fixed
+    // ~45-60-second reconnect cycle on every client (after_3-4_successful_ping_pongs)
+    // regardless of network path (cellular vs. WiFi vs. emulator-on-host).
+    //
+    // The single-task select! reads frames AND writes frames from the same
+    // future, so an explicit `socket.send(Message::Pong(payload))` on every
+    // received PING fires immediately — no auto-PONG queue, no idle starvation.
 
     // Channel: relay → this client
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Register client
+    // Register client — mint a unique connection ID so the cleanup path can
+    // distinguish this session from a later reconnect that races with our exit.
+    let conn_id = state.conn_counter.fetch_add(1, Ordering::Relaxed);
     if !identity.is_empty() {
-        state.clients.write().await.insert(identity.clone(), tx.clone());
+        state.clients.write().await.insert(identity.clone(), (conn_id, tx.clone()));
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -94,15 +121,24 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
             "metadata"
         );
 
-        // Flush queued messages
+        // Re-flush every envelope the store still holds for this recipient.
+        // We deliberately do NOT drain the queue here — envelopes stay in the
+        // store until the client confirms each one with {"type":"ack-deliver"}.
+        // This makes reconnect-redelivery durable across:
+        //   • mpsc-channel-pushed-but-WS-write-failed gaps,
+        //   • client-process-killed-after-receive-but-before-decrypt gaps,
+        //   • client-decrypted-but-DB-insert-failed gaps.
+        // The client deduplicates on the messages.id PRIMARY KEY (INSERT OR
+        // IGNORE), so a recipient that successfully processed an envelope on
+        // a prior session simply ignores the duplicate on reconnect.
         let queued: Vec<Envelope> = {
             let mut store = state.store.write().await;
             let queue = store.entry(identity.clone()).or_default();
             queue.retain(|e| !e.is_expired());
-            std::mem::take(queue)
+            queue.clone()
         };
         if !queued.is_empty() {
-            tracing::info!(id = %&identity[..identity.len().min(16)], count = queued.len(), "flushing queued envelopes");
+            tracing::info!(id = %&identity[..identity.len().min(16)], count = queued.len(), "flushing queued envelopes (retained until ack-deliver)");
         }
         for env in queued {
             let deliver = serde_json::json!({
@@ -118,39 +154,48 @@ async fn handle_socket(socket: WebSocket, identity: String, state: Arc<AppState>
         }
     }
 
-    // Task: forward outbound channel → WebSocket
-    let mut send_task = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Task: receive frames from WebSocket
-    let state_rx = Arc::clone(&state);
-    let identity_rx = identity.clone();
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Text(text) => {
-                    handle_message(text.as_str(), &identity_rx, &state_rx).await;
+    // Single-task read/write loop.
+    loop {
+        tokio::select! {
+            // Outbound: forward whatever the relay queued for this client.
+            outbound = rx.recv() => {
+                let Some(text) = outbound else { break };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
                 }
-                Message::Close(_) => break,
-                _ => {}
+            }
+            // Inbound: process frames from the client.
+            inbound = socket.next() => {
+                match inbound {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_message(text.as_str(), &identity, &state).await;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        // Explicit, immediate PONG — required because we no
+                        // longer rely on tungstenite's queued auto-PONG (see
+                        // top-of-fn comment).
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}             // Pong/Binary: ignored.
+                    Some(Err(_)) | None => break, // Read error or stream end.
+                }
             }
         }
-    });
-
-    // Wait for either task to finish
-    tokio::select! {
-        _ = &mut send_task => recv_task.abort(),
-        _ = &mut recv_task => send_task.abort(),
     }
 
-    // Unregister client
+    // Unregister client — only remove if the stored conn_id still matches ours.
+    // If the client reconnected before this cleanup ran, the new session has
+    // already inserted a fresh (conn_id, tx) entry; removing it blindly would
+    // cause the new session to go silent (no live delivery) until its next
+    // reconnect. Comparing conn_id is the minimal fix for this race.
     if !identity.is_empty() {
-        state.clients.write().await.remove(&identity);
+        let mut clients = state.clients.write().await;
+        if clients.get(&identity).map(|(id, _)| *id) == Some(conn_id) {
+            clients.remove(&identity);
+        }
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -264,10 +309,43 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             })
             .to_string();
 
-            // Try live delivery first
+            // Persist FIRST. Live delivery via the in-memory mpsc channel is a
+            // best-effort optimisation; a recipient WS that silently dies
+            // between mpsc.send() and the actual ws_tx.send() must not lose the
+            // envelope. The store is the source of truth — the client removes
+            // an envelope only by sending {"type":"ack-deliver", ...} after
+            // successful decrypt + DB insert. On reconnect the client gets
+            // every envelope still in the store, deduped at the message_id
+            // level on the client side (INSERT OR IGNORE on the messages
+            // table). This keeps the QA-observed loss-after-idle-disconnect
+            // bug from happening again.
+            let envelope = Envelope::new(
+                msg_id.clone(),
+                to.clone(),
+                envelope_from,
+                sealed_sender.clone(),
+                payload.clone(),
+                state.config.envelope_ttl_secs,
+            );
+            {
+                let mut store = state.store.write().await;
+                let queue = store.entry(to.clone()).or_default();
+                queue.retain(|e| !e.is_expired() && e.id != msg_id);
+                if queue.len() < state.config.max_envelopes_per_recipient {
+                    queue.push(envelope);
+                } else {
+                    tracing::warn!(
+                        msg_id = %msg_id,
+                        cap    = state.config.max_envelopes_per_recipient,
+                        "store at capacity — envelope dropped"
+                    );
+                }
+            }
+
+            // Attempt live delivery — best-effort.
             let delivered = {
                 let clients = state.clients.read().await;
-                if let Some(recipient_tx) = clients.get(&to) {
+                if let Some((_, recipient_tx)) = clients.get(&to) {
                     recipient_tx.send(deliver.clone()).is_ok()
                 } else {
                     false
@@ -275,32 +353,14 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             };
 
             if delivered {
-                tracing::info!(msg_id = %msg_id, "live delivery OK");
+                tracing::info!(msg_id = %msg_id, "live delivery dispatched (envelope retained until client ack-deliver)");
             } else {
-                // Store for later
-                let envelope = Envelope::new(
-                    msg_id.clone(),
-                    to.clone(),
-                    envelope_from,
-                    sealed_sender.clone(),
-                    payload,
-                    state.config.envelope_ttl_secs,
+                let online_count = state.clients.read().await.len();
+                tracing::info!(
+                    msg_id       = %msg_id,
+                    online_count,
+                    "recipient offline — queued for next reconnect"
                 );
-                {
-                    // Log only online_count, never key prefixes — presence metadata leak.
-                    let online_count = state.clients.read().await.len();
-                    tracing::info!(
-                        msg_id       = %msg_id,
-                        online_count,
-                        "recipient offline — queuing"
-                    );
-                }
-                let mut store = state.store.write().await;
-                let queue = store.entry(to).or_default();
-                queue.retain(|e| !e.is_expired());
-                if queue.len() < state.config.max_envelopes_per_recipient {
-                    queue.push(envelope);
-                }
 
                 // TODO: Send FCM silent push so the offline device wakes and drains via WebSocket.
                 // Gated on RELAY_FCM_SERVER_KEY being set (state.config.fcm_server_key.is_some()).
@@ -316,7 +376,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             }
 
             // Ack back to sender
-            if let Some(sender_tx) = state.clients.read().await.get(from_identity) {
+            if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
                 let ack = serde_json::json!({
                     "type": "ack",
                     "messageId": msg_id,
@@ -327,8 +387,38 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             }
         }
         Some("ping") => {
-            if let Some(tx) = state.clients.read().await.get(from_identity) {
+            if let Some((_, tx)) = state.clients.read().await.get(from_identity) {
                 let _ = tx.send(r#"{"type":"pong"}"#.to_string());
+            }
+        }
+        // ── Client → Relay delivery acknowledgement ────────────────────────────
+        // The recipient client sends this after it has fully processed an
+        // inbound envelope (Sealed-Sender unseal → decrypt → DB insert). The
+        // relay then removes the envelope from the per-recipient store so that
+        // the next reconnect does not redeliver it. Without this handler the
+        // store grows unboundedly and the client is forced to handle the same
+        // ciphertext on every reconnect.
+        //
+        // Identity check: a client may only ack-deliver envelopes addressed to
+        // its own connection identity. Otherwise an attacker could erase
+        // somebody else's pending mail.
+        Some("ack-deliver") => {
+            let msg_id = value["messageId"].as_str().unwrap_or("").to_string();
+            if msg_id.is_empty() {
+                return;
+            }
+            let removed = {
+                let mut store = state.store.write().await;
+                if let Some(queue) = store.get_mut(from_identity) {
+                    let before = queue.len();
+                    queue.retain(|e| e.id != msg_id);
+                    before != queue.len()
+                } else {
+                    false
+                }
+            };
+            if removed {
+                tracing::debug!(msg_id = %msg_id, "client ack-deliver — envelope removed from store");
             }
         }
         Some("typing") => {
@@ -358,7 +448,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             let to = value["to"].as_str().unwrap_or("").to_string();
             if !to.is_empty() {
                 let clients = state.clients.read().await;
-                if let Some(tx) = clients.get(&to) {
+                if let Some((_, tx)) = clients.get(&to) {
                     let typing_msg = serde_json::json!({
                         "type": "typing",
                         "from": from_identity,
@@ -518,8 +608,11 @@ async fn submit_report(
 
 fn check_admin_token(params: &HashMap<String, String>, state: &Arc<AppState>) -> bool {
     match &state.config.secret_token {
-        Some(expected) => params.get("token").map(|s| s.as_str()) == Some(expected.as_str()),
-        None => false, // admin disabled if no token configured
+        Some(expected) => params.get("token").map_or(false, |provided| {
+            let ok: bool = provided.as_bytes().ct_eq(expected.as_bytes()).into();
+            ok
+        }),
+        None => false,
     }
 }
 

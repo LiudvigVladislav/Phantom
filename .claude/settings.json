@@ -2,6 +2,13 @@
   "env": {
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"
   },
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew :shared:core:transport:compileDebugKotlinAndroid)",
+      "Bash(grep -nA2 \"getActiveConversations:\" shared/core/storage/src/commonMain/sqldelight/phantom/core/storage/Conversation.sq)",
+      "Bash(./gradlew :shared:core:messaging:compileDebugKotlinAndroid)"
+    ]
+  },
   "hooks": {
     "SessionStart": [
       {

@@ -39,6 +39,12 @@ android-compileSdk = "35"
 android-minSdk = "26"
 android-targetSdk = "35"
 
+# AndroidX Test (Apache-2.0) — needed for androidInstrumentedTest on Android emulator.
+# Used by shared/core/crypto to run libsodium-backed tests on the real Android
+# runtime where the native library loads correctly. See docs/tech_debt.md Bug H.
+androidx-test-runner    = "1.6.2"
+androidx-test-ext-junit = "1.2.1"
+
 [libraries]
 # Kotlin
 kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
@@ -90,6 +96,10 @@ camerax-view = { module = "androidx.camera:camera-view", version.ref = "camerax"
 
 # ML Kit Barcode Scanning (Apache 2.0)
 mlkit-barcode = { module = "com.google.mlkit:barcode-scanning", version.ref = "mlkit-barcode" }
+
+# AndroidX Test — androidInstrumentedTest support
+androidx-test-runner    = { module = "androidx.test:runner",           version.ref = "androidx-test-runner" }
+androidx-test-ext-junit = { module = "androidx.test.ext:junit",        version.ref = "androidx-test-ext-junit" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kmp-plugin" }

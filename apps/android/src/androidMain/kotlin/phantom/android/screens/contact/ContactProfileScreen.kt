@@ -11,11 +11,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -32,7 +27,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
-import phantom.android.ui.GradientAvatar
+import phantom.android.ui.*
 import phantom.android.ui.theme.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -68,6 +63,7 @@ fun ContactProfileScreen(
     var keyCopied by remember { mutableStateOf(false) }
     var showVerifySheet by remember { mutableStateOf(false) }
     var isVerified by remember { mutableStateOf(false) }
+    var keyChangedAt by remember { mutableStateOf<Long?>(null) }
     var showTimerSheet by remember { mutableStateOf(false) }
     var disappearingTimer by remember { mutableStateOf(0L) }
 
@@ -91,6 +87,7 @@ fun ContactProfileScreen(
             savedNotesText = conv.notes ?: ""
             isVerified = conv.isVerified
             disappearingTimer = conv.disappearingTimerSecs
+            keyChangedAt = conv.identityKeyChangedAt
         }
     }
 
@@ -176,12 +173,7 @@ fun ContactProfileScreen(
                             .clickable(onClick = onBack),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = TextPrimary,
-                            modifier = Modifier.size(18.dp),
-                        )
+                        PhIconBack(color = TextPrimary, size = 18.dp)
                     }
 
                     // Title
@@ -206,12 +198,7 @@ fun ContactProfileScreen(
                                 .clickable { showMoreMenu = true },
                             contentAlignment = Alignment.Center,
                         ) {
-                            Icon(
-                                Icons.Default.MoreVert,
-                                contentDescription = "More",
-                                tint = TextPrimary,
-                                modifier = Modifier.size(18.dp),
-                            )
+                            PhIconMoreVert(color = TextPrimary, size = 18.dp)
                         }
                         DropdownMenu(
                             expanded = showMoreMenu,
@@ -239,6 +226,35 @@ fun ContactProfileScreen(
                 .padding(padding)
                 .verticalScroll(rememberScrollState()),
         ) {
+            // ── Key change warning banner ──────────────────────────────────────
+            if (conversation.identityKeyChangedAt != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Danger.copy(alpha = 0.12f))
+                        .clickable { showVerifySheet = true }
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    PhIconShield(color = Danger, size = 18.dp)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Safety number changed",
+                            color = Danger,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = "This contact may have reinstalled. Tap to re-verify.",
+                            color = Danger.copy(alpha = 0.8f),
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp,
+                        )
+                    }
+                }
+            }
+
             // ── Hero card ─────────────────────────────────────────────────────
             ContactCard(topPad = 24.dp, bottomPad = 20.dp) {
                 Box(contentAlignment = Alignment.Center) {
@@ -332,7 +348,7 @@ fun ContactProfileScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Icon(Icons.Default.Check, contentDescription = null, tint = Success, modifier = Modifier.size(16.dp))
+                                PhIconCheck(color = Success, size = 16.dp)
                                 Text("Unblock", color = Success, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                             }
                         }
@@ -453,12 +469,7 @@ fun ContactProfileScreen(
                 CKeyRow(
                     icon = {
                         if (isVerified) {
-                            Icon(
-                                Icons.Default.CheckCircle,
-                                contentDescription = null,
-                                tint = Success,
-                                modifier = Modifier.size(16.dp),
-                            )
+                            PhIconShieldCheck(color = Success, size = 16.dp)
                         } else {
                             Canvas(Modifier.size(16.dp)) {
                                 val sw = 1.4.dp.toPx()
@@ -729,7 +740,10 @@ fun ContactProfileScreen(
                     onClick = {
                         scope.launch {
                             container.conversationRepo.setVerified(conversationId, true)
+                            container.conversationRepo.clearIdentityKeyChangedAt(conversationId)
                             isVerified = true
+                            keyChangedAt = null
+                            conversation = conversation.copy(identityKeyChangedAt = null)
                             showVerifySheet = false
                         }
                     },
@@ -794,12 +808,7 @@ fun ContactProfileScreen(
                             modifier = Modifier.weight(1f),
                         )
                         if (selected) {
-                            Icon(
-                                Icons.Default.Check,
-                                contentDescription = null,
-                                tint = CyanAccent,
-                                modifier = Modifier.size(18.dp),
-                            )
+                            PhIconCheck(color = CyanAccent, size = 18.dp)
                         }
                     }
                 }

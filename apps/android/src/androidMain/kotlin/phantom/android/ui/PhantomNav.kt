@@ -6,14 +6,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Email
-import androidx.compose.material.icons.filled.KeyboardArrowRight
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Notifications
-import androidx.compose.material.icons.filled.Phone
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -22,7 +14,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -82,15 +73,18 @@ fun PhantomTopBar(
                     onDismissRequest = { showAvatarMenu = false },
                 ) {
                     DropdownMenuItem(
+                        leadingIcon = { PhIconFunnel(color = TextDim, size = 15.dp) },
                         text = { Text("Filter unread", fontSize = 14.sp) },
                         onClick = { showAvatarMenu = false },
                     )
                     DropdownMenuItem(
+                        leadingIcon = { PhIconCheck3(color = TextDim, size = 15.dp) },
                         text = { Text("Select chats", fontSize = 14.sp) },
                         onClick = { showAvatarMenu = false },
                     )
                     HorizontalDivider()
                     DropdownMenuItem(
+                        leadingIcon = { PhIconPerson(color = CyanAccent, size = 15.dp) },
                         text = {
                             Text(
                                 "Profile",
@@ -119,12 +113,7 @@ fun PhantomTopBar(
             // Compose button + dropdown
             Box {
                 IconButton(onClick = { showComposeMenu = !showComposeMenu }) {
-                    Icon(
-                        Icons.Default.Edit,
-                        contentDescription = "Compose",
-                        tint = CyanAccent,
-                        modifier = Modifier.size(22.dp),
-                    )
+                    PhIconPencilCompose(color = CyanAccent, size = 22.dp)
                 }
                 DropdownMenu(
                     expanded = showComposeMenu,
@@ -215,19 +204,19 @@ fun BottomNavPill(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             NavPillItem(
-                icon = Icons.Default.Phone,
+                icon = { color -> PhIconPhone(color = color, size = 18.dp) },
                 label = "Calls",
                 active = activeTab == NavTab.CALLS,
                 onClick = { onTabSelected(NavTab.CALLS) },
             )
             NavPillItem(
-                icon = Icons.Default.Email,
+                icon = { color -> PhIconMessage(color = color, size = 18.dp) },
                 label = "Chats",
                 active = activeTab == NavTab.CHATS,
                 onClick = { onTabSelected(NavTab.CHATS) },
             )
             NavPillItem(
-                icon = Icons.Default.Settings,
+                icon = { color -> PhIconGear(color = color, size = 18.dp) },
                 label = "Settings",
                 active = activeTab == NavTab.SETTINGS,
                 onClick = { onTabSelected(NavTab.SETTINGS) },
@@ -238,7 +227,7 @@ fun BottomNavPill(
 
 @Composable
 private fun NavPillItem(
-    icon: ImageVector,
+    icon: @Composable (color: Color) -> Unit,
     label: String,
     active: Boolean,
     onClick: () -> Unit,
@@ -253,12 +242,7 @@ private fun NavPillItem(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(7.dp),
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = label,
-            tint = color,
-            modifier = Modifier.size(18.dp),
-        )
+        icon(color)
         Text(
             text = label,
             color = color,
@@ -351,8 +335,7 @@ fun SettingsGroupCard(content: @Composable ColumnScope.() -> Unit) {
 
 @Composable
 fun SettingsRowItem(
-    icon: ImageVector,
-    iconTint: Color = CyanAccent,
+    icon: @Composable () -> Unit,
     label: String,
     value: String? = null,
     onClick: () -> Unit = {},
@@ -372,7 +355,7 @@ fun SettingsRowItem(
                 .background(Surface2),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(16.dp))
+            icon()
         }
         Text(
             text = label,
@@ -383,12 +366,7 @@ fun SettingsRowItem(
         if (value != null) {
             Text(text = value, color = TextDim, fontSize = 13.sp)
         }
-        Icon(
-            Icons.Default.KeyboardArrowRight,
-            contentDescription = null,
-            tint = TextDim,
-            modifier = Modifier.size(18.dp),
-        )
+        PhIconChevron(color = TextDim, size = 14.dp)
     }
 }
 
@@ -409,12 +387,7 @@ fun PrivacySettingsRow() {
                 .background(Surface2),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(
-                Icons.Default.Lock,
-                contentDescription = null,
-                tint = CyanAccent,
-                modifier = Modifier.size(16.dp),
-            )
+            PhIconShield(color = CyanAccent, size = 16.dp)
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -429,12 +402,7 @@ fun PrivacySettingsRow() {
                 ModePill(label = "Ghost", active = false)
             }
         }
-        Icon(
-            Icons.Default.KeyboardArrowRight,
-            contentDescription = null,
-            tint = TextDim,
-            modifier = Modifier.size(18.dp),
-        )
+        PhIconChevron(color = TextDim, size = 14.dp)
     }
 }
 

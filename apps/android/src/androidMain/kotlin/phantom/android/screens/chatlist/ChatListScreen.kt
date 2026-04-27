@@ -1,20 +1,20 @@
 package phantom.android.screens.chatlist
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -27,20 +27,22 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.util.Log
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
 import phantom.android.di.AppContainer
+import phantom.android.ui.ConnectionBanner
 import phantom.android.navigation.Screen
 import phantom.android.screens.group.GroupInitialsAvatar
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.GroupEntity
-
-private enum class ChatTab { CHATS, GROUPS, CHANNELS }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -76,7 +78,6 @@ fun ChatListScreen(
     var showAddDialog by remember { mutableStateOf(false) }
     var prefillContactString by remember { mutableStateOf("") }
     var userName by remember { mutableStateOf("") }
-    var activeTab by remember { mutableStateOf(ChatTab.CHATS) }
 
     LaunchedEffect(Unit) {
         userName = container.identityRepo.loadIdentity()?.username ?: ""
@@ -90,23 +91,33 @@ fun ChatListScreen(
         }
     }
 
-    suspend fun reload() {
+    var reloadKey by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(reloadKey) {
         conversations = container.conversationRepo.getActiveConversations()
         requestCount = container.conversationRepo.getMessageRequests().size
-        // Load groups from groupRepo — fallback to empty list if API not yet available
-        groups = runCatching {
-            container.groupRepo.getGroups()
-        }.getOrElse { emptyList() }
+        groups = runCatching { container.groupRepo.getGroups() }.getOrElse { emptyList() }
+        Log.i(
+            "PhantomUI",
+            "ChatListScreen reload (key=$reloadKey): activeConversations=${conversations.size} " +
+                "messageRequests=$requestCount groups=${groups.size}",
+        )
     }
 
-    LaunchedEffect(Unit) { reload() }
-
     LaunchedEffect(container.messagingService) {
-        container.messagingService?.incomingMessages?.collect { reload() }
+        container.messagingService?.incomingMessages
+            ?.catch { e ->
+                Log.e("PhantomUI", "incomingMessages flow error in ChatListScreen: ${e.message}", e)
+            }
+            ?.collect { reloadKey++ }
     }
 
     LaunchedEffect(container.groupMessagingService) {
-        container.groupMessagingService?.groupMessageFlow?.collect { _ -> reload() }
+        container.groupMessagingService?.groupMessageFlow
+            ?.catch { e ->
+                Log.e("PhantomUI", "groupMessageFlow error in ChatListScreen: ${e.message}", e)
+            }
+            ?.collect { _ -> reloadKey++ }
     }
 
     Scaffold(
@@ -119,97 +130,29 @@ fun ChatListScreen(
                 onScanQr = onScanQr,
             )
         },
-        floatingActionButton = {
-            // FAB only on Groups and Channels tabs
-            when (activeTab) {
-                ChatTab.GROUPS -> {
-                    FloatingActionButton(
-                        onClick = { onNavigate(Screen.CreateGroup) },
-                        containerColor = CyanAccent,
-                        contentColor = BgDeep,
-                        shape = CircleShape,
-                        modifier = Modifier.padding(bottom = 72.dp),
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = "New Group")
-                    }
-                }
-                ChatTab.CHANNELS -> {
-                    FloatingActionButton(
-                        onClick = { onNavigate(Screen.CreateChannel) },
-                        containerColor = CyanAccent,
-                        contentColor = BgDeep,
-                        shape = CircleShape,
-                        modifier = Modifier.padding(bottom = 72.dp),
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = "New Channel")
-                    }
-                }
-                else -> {}
-            }
-        },
     ) { padding ->
+        val transportState = container.transport.state.collectAsState()
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // ── Tab row ─────────────────────────────────────────────────────
-                TabRow(
-                    selectedTabIndex = activeTab.ordinal,
-                    containerColor = Surface,
-                    contentColor = CyanAccent,
-                    indicator = { tabPositions ->
-                        val pos = tabPositions[activeTab.ordinal]
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .wrapContentSize(Alignment.BottomStart)
-                                .offset(x = pos.left)
-                                .width(pos.width)
-                                .height(2.dp)
-                                .background(CyanAccent, RoundedCornerShape(topStart = 2.dp, topEnd = 2.dp)),
-                        )
-                    },
-                    divider = { HorizontalDivider(color = Color.White.copy(alpha = 0.05f)) },
-                ) {
-                    ChatTab.entries.forEach { tab ->
-                        Tab(
-                            selected = activeTab == tab,
-                            onClick = { activeTab = tab },
-                            text = {
-                                Text(
-                                    text = tab.name.lowercase().replaceFirstChar { it.uppercase() },
-                                    fontSize = 13.sp,
-                                    fontWeight = if (activeTab == tab) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = if (activeTab == tab) CyanAccent else TextDim,
-                                )
-                            },
-                        )
-                    }
-                }
-
-                when (activeTab) {
-                    ChatTab.CHATS -> ChatsTab(
-                        searchQuery = searchQuery,
-                        onSearchChange = { searchQuery = it },
-                        filtered = filtered,
-                        conversations = conversations,
-                        requestCount = requestCount,
-                        onNavigate = onNavigate,
-                        onShowAddDialog = { showAddDialog = true },
-                        scope = scope,
-                        container = container,
-                    )
-                    ChatTab.GROUPS -> GroupsTab(
-                        groups = filteredGroups,
-                        onNavigate = onNavigate,
-                    )
-                    ChatTab.CHANNELS -> ChannelsTab(
-                        channels = filteredChannels,
-                        onNavigate = onNavigate,
-                    )
-                }
+                ConnectionBanner(stateFlow = transportState)
+                ChatsTab(
+                    searchQuery = searchQuery,
+                    onSearchChange = { searchQuery = it },
+                    filtered = filtered,
+                    conversations = conversations,
+                    requestCount = requestCount,
+                    groups = filteredGroups,
+                    channels = filteredChannels,
+                    onNavigate = onNavigate,
+                    onShowAddDialog = { showAddDialog = true },
+                    onReload = { reloadKey++ },
+                    scope = scope,
+                    container = container,
+                )
             }
 
             // ── Floating bottom nav ──────────────────────────────────────────
@@ -235,7 +178,7 @@ fun ChatListScreen(
             onAdded = { convId: String, username: String ->
                 showAddDialog = false
                 prefillContactString = ""
-                scope.launch { reload() }
+                reloadKey++
                 onNavigate(Screen.Chat(convId, username))
             },
         )
@@ -251,8 +194,11 @@ private fun ChatsTab(
     filtered: List<ConversationEntity>,
     conversations: List<ConversationEntity>,
     requestCount: Int,
+    groups: List<GroupEntity>,
+    channels: List<GroupEntity>,
     onNavigate: (Screen) -> Unit,
     onShowAddDialog: () -> Unit,
+    onReload: () -> Unit,
     scope: kotlinx.coroutines.CoroutineScope,
     container: AppContainer,
 ) {
@@ -352,6 +298,12 @@ private fun ChatsTab(
             ChatRow(
                 conv = conv,
                 onClick = { onNavigate(Screen.Chat(conv.id, conv.theirUsername)) },
+                onArchive = {
+                    scope.launch {
+                        container.conversationRepo.archiveConversation(conv.id)
+                        onReload()
+                    }
+                },
             )
         }
 
@@ -372,7 +324,7 @@ private fun ChatsTab(
             item {
                 Box(
                     modifier = Modifier
-                        .fillParentMaxSize()
+                        .fillMaxWidth()
                         .padding(32.dp),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -388,74 +340,22 @@ private fun ChatsTab(
                 }
             }
         }
-    }
-}
 
-// ── Groups tab ────────────────────────────────────────────────────────────────
-
-@Composable
-private fun GroupsTab(groups: List<GroupEntity>, onNavigate: (Screen) -> Unit) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(bottom = 110.dp),
-    ) {
-        if (groups.isEmpty()) {
-            item {
-                Box(
-                    modifier = Modifier.fillParentMaxSize().padding(32.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("No groups yet", color = TextDim, fontSize = 15.sp)
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = "Tap + to create a new group",
-                            color = TextDim.copy(alpha = 0.6f),
-                            fontSize = 13.sp,
-                        )
-                    }
-                }
-            }
-        } else {
+        // ── Groups ────────────────────────────────────────────────────────────
+        if (groups.isNotEmpty()) {
             item { SectionLabel(text = "Groups") }
-            items(groups, key = { it.id }) { group ->
+            items(groups, key = { "g_${it.id}" }) { group ->
                 GroupRow(
                     group = group,
                     onClick = { onNavigate(Screen.GroupChat(group.id, group.name, false)) },
                 )
             }
         }
-    }
-}
 
-// ── Channels tab ──────────────────────────────────────────────────────────────
-
-@Composable
-private fun ChannelsTab(channels: List<GroupEntity>, onNavigate: (Screen) -> Unit) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(bottom = 110.dp),
-    ) {
-        if (channels.isEmpty()) {
-            item {
-                Box(
-                    modifier = Modifier.fillParentMaxSize().padding(32.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("No channels yet", color = TextDim, fontSize = 15.sp)
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = "Tap + to create a new channel",
-                            color = TextDim.copy(alpha = 0.6f),
-                            fontSize = 13.sp,
-                        )
-                    }
-                }
-            }
-        } else {
+        // ── Channels ──────────────────────────────────────────────────────────
+        if (channels.isNotEmpty()) {
             item { SectionLabel(text = "Channels") }
-            items(channels, key = { it.id }) { channel ->
+            items(channels, key = { "c_${it.id}" }) { channel ->
                 GroupRow(
                     group = channel,
                     onClick = { onNavigate(Screen.GroupChat(channel.id, channel.name, true)) },
@@ -502,7 +402,8 @@ private fun GroupRow(group: GroupEntity, onClick: () -> Unit) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 val subtitle = buildString {
                     if (!group.lastMessagePreview.isNullOrBlank()) {
-                        append(group.lastMessagePreview)
+                        val p = group.lastMessagePreview!!
+                        append(if (p.startsWith("[AUDIO:")) "🎤 Voice message" else p)
                     }
                 }
                 Text(
@@ -673,21 +574,22 @@ private fun ArchiveRow(onClick: () -> Unit = {}) {
             fontWeight = FontWeight.Normal,
             modifier = Modifier.weight(1f),
         )
-        Icon(
-            Icons.Default.KeyboardArrowRight,
-            contentDescription = null,
-            tint = TextDim,
-            modifier = Modifier.size(18.dp),
-        )
+        PhIconChevron(color = TextDim, size = 18.dp)
     }
 }
 
 // ── Chat row ──────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
+private fun ChatRow(
+    conv: ConversationEntity,
+    onClick: () -> Unit,
+    onArchive: () -> Unit = {},
+) {
     val isUnread = conv.unreadCount > 0
     val context = LocalContext.current
+    var showContextMenu by remember { mutableStateOf(false) }
 
     val contactDisplayName = remember(conv.id) {
         val raw = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
@@ -711,10 +613,14 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
         }
     }
 
+    Box {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { showContextMenu = true },
+            )
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -752,7 +658,10 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
             Spacer(Modifier.height(3.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = conv.lastMessagePreview ?: "",
+                    text = run {
+                        val p = conv.lastMessagePreview ?: ""
+                        if (p.startsWith("[AUDIO:")) "🎤 Voice message" else p
+                    },
                     color = TextDim,
                     fontSize = 13.sp,
                     maxLines = 1,
@@ -779,6 +688,22 @@ private fun ChatRow(conv: ConversationEntity, onClick: () -> Unit) {
             }
         }
     }
+
+    DropdownMenu(
+        expanded = showContextMenu,
+        onDismissRequest = { showContextMenu = false },
+        containerColor = Surface2,
+        offset = DpOffset(20.dp, 0.dp),
+    ) {
+        DropdownMenuItem(
+            text = { Text("Archive", color = TextPrimary, fontSize = 14.sp) },
+            onClick = {
+                showContextMenu = false
+                onArchive()
+            },
+        )
+    }
+    } // end Box
 }
 
 // ── Draw helpers ──────────────────────────────────────────────────────────────

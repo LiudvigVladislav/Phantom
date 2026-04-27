@@ -1,12 +1,15 @@
 package phantom.core.crypto
 
+import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import com.ionspin.kotlin.crypto.box.Box
+import org.junit.runner.RunWith
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 
+@RunWith(AndroidJUnit4::class)
 class SealedSenderTest {
 
     private fun initLibsodium() {
