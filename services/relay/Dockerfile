@@ -26,8 +26,13 @@ COPY services/Cargo.toml services/Cargo.lock ./
 COPY services/relay ./relay
 
 # Patch workspace members so only the relay crate is built in this stage
-# (avoids needing other workspace crates in the build context).
-RUN sed -i 's|members = \[.*\]|members = ["relay"]|' Cargo.toml
+# (avoids needing other workspace crates in the build context). The sed
+# uses -z (null-record mode) so it tolerates the multi-line `members = [
+#   "relay",
+#   "bootstrap",
+#   ...
+# ]` layout the workspace switched to once it grew past one crate.
+RUN sed -i -z 's|members = \[[^]]*\]|members = ["relay"]|' Cargo.toml
 
 RUN cargo build --release --package phantom-relay \
     && strip target/release/phantom-relay
