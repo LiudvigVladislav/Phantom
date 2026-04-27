@@ -10,6 +10,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -126,34 +127,97 @@ private fun TermsScreen(onAccept: () -> Unit) {
                 .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp, vertical = 22.dp),
         ) {
+            // Welcome line — sets the casual tone of the new TOS_SUMMARY drafts.
+            Text(
+                text = "Welcome to PHANTOM",
+                color = TextPrimary,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "A quick read before you start:",
+                color = TextDim,
+                fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(20.dp))
+
             TosSection(
-                title = "1. Acceptable Use",
-                body = "You may use PHANTOM only for lawful purposes. You must not use the service to transmit, store, or distribute content that is illegal under applicable law, including but not limited to: child sexual abuse material (CSAM), content that facilitates violence or terrorism, fraud, harassment, or spam.",
+                title = "1. End-to-end encrypted",
+                body = "Your messages are encrypted on your device and only the recipient can decrypt them. Our servers cannot read your conversations — and we built it that way on purpose.",
             )
             TosSection(
-                title = "2. No Illegal Content",
-                body = "Transmission of material that violates local, national, or international law is strictly prohibited. This includes but is not limited to: sale of controlled substances, distribution of malware, identity theft, and financial fraud. Violations will be reported to appropriate law enforcement authorities.",
+                title = "2. We cannot give away what we do not have",
+                body = "PHANTOM is designed so that we have no access to your messages, contacts, or activity. If anyone — including authorities — asks us for your data, we have nothing to provide.",
             )
             TosSection(
-                title = "3. Privacy & Encryption",
-                body = "PHANTOM uses end-to-end encryption. The service operator cannot read your messages. However, connection metadata (timestamps, pseudonymous key identifiers, message sizes) may be logged by the relay service for security and legal compliance purposes. This data may be disclosed in response to valid legal process.",
+                title = "3. You must be 16 or older",
+                body = "We require all users to be at least 16. This is for safety and legal compliance reasons.",
             )
             TosSection(
-                title = "4. Report & Abuse",
-                body = "Use the in-app report function to flag abuse. Reports are forwarded to the relay operator and may result in blocking of the reported identity. We cooperate with law enforcement on valid requests.",
+                title = "4. Your keys, your account",
+                body = "Your identity is cryptographic keys stored only on your device. We cannot reset, recover, or transfer them. Lose your device without backup — lose your account.",
             )
             TosSection(
-                title = "5. Liability",
-                body = "PHANTOM is provided as-is. The operator is not responsible for content transmitted by users. You are solely responsible for your use of the service and any consequences thereof.",
+                title = "5. No phone number, no email, no real name",
+                body = "Pick a username and you are in. We do not link your account to any other identifier.",
             )
             TosSection(
-                title = "6. Changes",
-                body = "These terms may be updated. Continued use of the service after changes constitutes acceptance of the revised terms.",
+                title = "6. Use PHANTOM responsibly",
+                body = "We do not endorse illegal use of the service. Reports of abuse can be sent to abuse@phntm.pro.",
+            )
+            TosSection(
+                title = "7. PHANTOM is in Alpha",
+                body = "Things may break. Bugs happen. Updates may change how the app works.",
+            )
+            TosSection(
+                title = "8. We collect the bare minimum",
+                body = "Only your public key and the IP you connect from — needed to route messages. None of it is logged or stored long-term. See the full Privacy Policy below for details.",
                 isLast = true,
             )
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(20.dp))
+
+            // Tappable links to full ToS / Privacy Policy hosted at phntm.pro.
+            // These open in the user's browser — see Caddyfile for the routes.
+            val linkContext = LocalContext.current
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Read full Terms",
+                    color = CyanAccent,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.clickable {
+                        linkContext.startActivity(
+                            android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse("https://phntm.pro/terms"),
+                            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    },
+                )
+                Text(
+                    text = "Privacy Policy",
+                    color = CyanAccent,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.clickable {
+                        linkContext.startActivity(
+                            android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse("https://phntm.pro/privacy"),
+                            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    },
+                )
+            }
+            Spacer(Modifier.height(12.dp))
             Text(
-                text = "By tapping \"Accept & Continue\" you confirm that you are at least 16 years old and agree to these terms.",
+                text = "By tapping \"Accept & Continue\" you confirm that you are at least 16 years old and agree to these terms and the Privacy Policy.",
                 color = TextDim.copy(alpha = 0.6f),
                 fontSize = 11.sp,
                 lineHeight = 17.sp,

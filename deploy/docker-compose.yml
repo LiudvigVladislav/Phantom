@@ -53,6 +53,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./well-known:/srv/well-known:ro
       - ./landing:/srv/landing:ro
+      # Legal documents (Terms of Service + Privacy Policy) served at
+      # /terms and /privacy on phntm.pro. Source of truth: /legal at the
+      # repository root, mounted read-only.
+      - ../legal:/srv/legal:ro
       - caddy-data:/data        # Let's Encrypt certs + keys
       - caddy-config:/config
     networks:

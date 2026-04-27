@@ -10,7 +10,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import phantom.android.notifications.PhantomNotificationManager
 import androidx.activity.enableEdgeToEdge
-import androidx.core.view.WindowCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
@@ -114,17 +113,23 @@ class MainActivity : ComponentActivity() {
         parseInviteIntent(intent)?.let { payload ->
             pendingInviteQr.value = payload
         }
-        // enableEdgeToEdge() conflicts with API 35+ system-enforced edge-to-edge.
-        // On API 35+, the system handles it automatically; calling it again
-        // corrupts the EGL surface setup (GFXSTREAM / Unknown dataspace 0).
+        // Edge-to-edge configuration.
         //
-        // For API 26–34 we still need the window to carry IME insets down to
-        // Compose so Modifier.imePadding() can resize content when the
-        // keyboard appears. setDecorFitsSystemWindows(false) is the minimal
-        // configuration that enables this without touching edge-to-edge
-        // drawing behaviour in a way that breaks API 35+.
+        // API 35+: the system enforces edge-to-edge automatically; calling
+        // enableEdgeToEdge() ourselves there corrupts the EGL surface setup
+        // (observed: GFXSTREAM / Unknown dataspace 0).
+        //
+        // API 26–34: we have to opt in. We previously tried just
+        // `WindowCompat.setDecorFitsSystemWindows(window, false)` — that drew
+        // under the bars but left IME inset reporting unreliable on some OEM
+        // builds (Tecno HiOS / Android 12 in QA-v9: `Modifier.imePadding()`
+        // resolved to 0 with the keyboard open, so the chat input slid under
+        // the keyboard). enableEdgeToEdge() is the AndroidX-managed wrapper
+        // that combines decor-fits-system-windows + the OnApplyWindowInsets
+        // listener Compose needs for `WindowInsets.ime` and
+        // `WindowInsets.navigationBars` to be populated.
         if (Build.VERSION.SDK_INT < 35) {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
+            enableEdgeToEdge()
         }
 
         // Initialise lock state from prefs before Compose renders its first frame.

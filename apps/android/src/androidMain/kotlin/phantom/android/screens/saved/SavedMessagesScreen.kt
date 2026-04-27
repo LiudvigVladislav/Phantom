@@ -147,10 +147,19 @@ fun SavedMessagesScreen(
         )
     }
 
+    // Notes screen has no Scaffold — it's a plain Column. We need explicit
+    // inset handling so the input bar stays above both the keyboard and the
+    // 3-button system nav bar on devices like Tecno HiOS.
+    // `WindowInsets.ime.union(WindowInsets.navigationBars)` returns the
+    // per-side maximum, so IME-open and IME-closed both resolve correctly
+    // without double-padding.
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(BgDeep),
+            .background(BgDeep)
+            .windowInsetsPadding(
+                WindowInsets.ime.union(WindowInsets.navigationBars)
+            ),
     ) {
         // Custom top bar — matches ArchiveScreen style
         Column(

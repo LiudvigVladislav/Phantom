@@ -1,0 +1,58 @@
+# PHANTOM Legal Documents — Draft v1
+
+This folder contains the initial legal/privacy documentation drafts for PHANTOM Alpha 1.
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `TOS_SUMMARY_EN.md` | Short ToS summary shown on the **onboarding screen** (English) |
+| `TOS_SUMMARY_RU.md` | Same — Russian version |
+| `TERMS_OF_SERVICE_EN.md` | Full Terms of Service — linked from the summary as "Read full Terms" |
+| `TERMS_OF_SERVICE_RU.md` | Full ToS — Russian |
+| `PRIVACY_POLICY_EN.md` | Privacy Policy — linked from "Privacy Policy" |
+| `PRIVACY_POLICY_RU.md` | Privacy Policy — Russian |
+
+## Where these will live
+
+- **In the app (onboarding screen):** the SUMMARY versions.
+- **On phntm.pro:**
+  - `https://phntm.pro/terms` — full Terms of Service
+  - `https://phntm.pro/privacy` — full Privacy Policy
+- **In the GitHub repo:** under `Legal/` folder for transparency.
+
+## Key design decisions
+
+1. **"We cannot disclose what we do not have"** — central legal/marketing principle. PHANTOM is technically architected to retain the absolute minimum of data. This protects against subpoenas the way Telegram cannot.
+
+2. **Data minimization explicitly listed.** Privacy Policy includes a clear "What we do NOT collect" section with phone numbers, emails, contacts, location, analytics, etc. — making the privacy posture concrete.
+
+3. **GDPR rights are "largely automatic"** — because the data does not exist on our side, GDPR access/deletion/portability are trivially satisfied.
+
+4. **Wyoming jurisdiction** — Willen LLC is registered in Wyoming. Wyoming chosen for privacy-friendly LLC laws.
+
+5. **Age 16+** — aligns with EU GDPR effective age. Higher than US COPPA's 13, lower than 18 (which would unnecessarily exclude privacy-conscious teens).
+
+6. **Tone: casual but legally weighted** — Signal-style readability without losing legal precision. Russian version uses informal "ты" since the audience is end-users, not corporations.
+
+7. **Six contact emails** (security/support/legal/abuse/privacy/press) — RFC 2142 compliant, separates concerns.
+
+## What still needs to be done
+
+These are **drafts**. Before going live:
+
+- [ ] Legal review by qualified attorney (Wyoming, US privacy law)
+- [ ] GDPR review for EU compliance (especially Article 13/14 disclosures)
+- [ ] Final wording approval by Willen LLC ownership
+- [ ] Translation review for Russian version (legal terminology accuracy)
+- [ ] Implementation in the app (onboarding screen + Settings → Legal)
+- [ ] Hosting on phntm.pro at the URLs referenced in documents
+- [ ] Update version dates if changes are made before publication
+
+## License clause TBD
+
+The Terms of Service references "the license specified in our public repository." Confirm which license PHANTOM uses (AGPL-3.0? MIT? GPL-3.0?) and ensure the repo `LICENSE` file matches before publishing.
+
+## Contact for questions
+
+These drafts were written collaboratively. For revisions, contact the project lead.

@@ -95,6 +95,24 @@ phntm.pro, www.phntm.pro {
         file_server
     }
 
+    # Terms of Service — served from /srv/legal/TERMS_OF_SERVICE_EN.md by
+    # default; locale-specific routes (/terms/ru) can be added later.
+    # The OnboardingScreen "Read full Terms" link points here.
+    handle_path /terms* {
+        root * /srv/legal
+        rewrite * /TERMS_OF_SERVICE_EN.md
+        header Content-Type "text/markdown; charset=utf-8"
+        file_server
+    }
+
+    # Privacy Policy — same model as /terms.
+    handle_path /privacy* {
+        root * /srv/legal
+        rewrite * /PRIVACY_POLICY_EN.md
+        header Content-Type "text/markdown; charset=utf-8"
+        file_server
+    }
+
     # Placeholder landing. Replace with the actual Next.js build in Этап 4.3.
     handle {
         root * /srv/landing
