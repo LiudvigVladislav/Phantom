@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
 use crate::config::RelayConfig;
 use crate::envelope::Envelope;
 use serde::{Deserialize, Serialize};

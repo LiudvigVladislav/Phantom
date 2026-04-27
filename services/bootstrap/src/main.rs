@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
 /// PHANTOM Bootstrap — minimal network entry.
 ///
 /// Provides: relay node addresses, transport config hints, version compatibility.

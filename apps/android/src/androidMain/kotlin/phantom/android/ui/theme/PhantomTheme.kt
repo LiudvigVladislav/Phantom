@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
 package phantom.android.ui.theme
 
 import androidx.compose.material3.MaterialTheme

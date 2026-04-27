@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
 /// PHANTOM Directory — username lookup service.
 ///
 /// Alpha-0 scope (ADR-005): username → public identity bundle only.

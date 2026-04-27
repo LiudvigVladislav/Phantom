@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
 use crate::{envelope::*, error::RelayError, state::{AppState, AbuseReport, RateEntry, append_report_to_disk, append_block_to_disk}};
 use subtle::ConstantTimeEq;
 use axum::{
