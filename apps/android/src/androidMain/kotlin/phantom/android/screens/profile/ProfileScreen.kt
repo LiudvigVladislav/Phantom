@@ -430,7 +430,7 @@ private fun ProfileTopBar(onBack: () -> Unit) {
             Spacer(modifier = Modifier.size(32.dp))
         }
 
-        HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
     }
 }
 
@@ -822,7 +822,7 @@ private fun ConnectionCard(identity: IdentityRecord) {
                     letterSpacing = 2.5.sp,
                 )
             }
-            HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
+            HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
 
             ConnectionRow(label = "Algorithm", value = "Ed25519 / X25519")
             HorizontalDivider(

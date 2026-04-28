@@ -135,7 +135,7 @@ fun SettingsScreen(
                                 }
                             }
                         }
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconDevice(color = CyanAccent, size = 16.dp) },
                             label = "Linked Devices",
@@ -155,7 +155,7 @@ fun SettingsScreen(
                             value = "English",
                             onClick = { showComingSoon() },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconSun(color = CyanAccent, size = 16.dp) },
                             label = "Theme",
@@ -240,49 +240,49 @@ fun SettingsScreen(
                             value = BuildConfig.VERSION_NAME,
                             onClick = { /* no-op: read-only */ },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconMessage(color = CyanAccent, size = 16.dp) },
                             label = "Send feedback",
                             value = "support@phntm.pro",
                             onClick = { context.openMailto("support@phntm.pro", subject = "PHANTOM feedback") },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
                             label = "Report abuse",
                             value = "abuse@phntm.pro",
                             onClick = { context.openMailto("abuse@phntm.pro", subject = "PHANTOM abuse report") },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconLock(color = CyanAccent, size = 16.dp) },
                             label = "Security disclosure",
                             value = "security@phntm.pro",
                             onClick = { context.openMailto("security@phntm.pro", subject = "PHANTOM security report") },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconShieldCheck(color = CyanAccent, size = 16.dp) },
                             label = "Privacy & data",
                             value = "privacy@phntm.pro",
                             onClick = { context.openMailto("privacy@phntm.pro", subject = "PHANTOM privacy request") },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconBookmark(color = CyanAccent, size = 16.dp) },
                             label = "Legal",
                             value = "legal@phntm.pro",
                             onClick = { context.openMailto("legal@phntm.pro", subject = "PHANTOM legal inquiry") },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconMegaphone(color = CyanAccent, size = 16.dp) },
                             label = "Press",
                             value = "press@phntm.pro",
                             onClick = { context.openMailto("press@phntm.pro", subject = "PHANTOM press inquiry") },
                         )
-                        HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconShare(color = CyanAccent, size = 14.dp) },
                             label = "Source code on GitHub",

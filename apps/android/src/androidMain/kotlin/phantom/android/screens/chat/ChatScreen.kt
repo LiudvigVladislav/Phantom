@@ -377,7 +377,7 @@ fun ChatScreen(
                         Spacer(Modifier.width(12.dp))
                         Text("Notes", color = TextPrimary, fontSize = 15.sp)
                     }
-                    HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
 
                     if (conversations.isEmpty()) {
                         Text("No other conversations", color = TextDim, fontSize = 14.sp, modifier = Modifier.padding(8.dp))
@@ -821,7 +821,7 @@ fun ChatScreen(
                             }
                         }
                     }
-                    HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                 }
             }
 
@@ -1608,7 +1608,7 @@ private fun MessageBubble(
                                     )
                                 }
                             }
-                            HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
+                            HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                             // ── Action list (bottom, expanded) ───────────────
                             ActionRow(icon = 0x21A9, label = "Reply") {
                                 showActionPanel = false; onReply()
@@ -1649,7 +1649,7 @@ private fun MessageBubble(
                                     )
                                 }
                             }
-                            HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
+                            HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                             ActionRow(icon = 0x1F5D1, label = "Delete", danger = true) {
                                 showActionPanel = false; showDeleteDialog = true
                             }

@@ -209,7 +209,7 @@ fun ContactProfileScreen(
                         }
                     }
                 }
-                HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+                HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
             }
         },
     ) { padding ->
@@ -864,7 +864,7 @@ private fun CKeyRow(
 ) {
     Column {
         if (showTopDivider) {
-            HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+            HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
         }
         Row(
             modifier = Modifier

@@ -493,7 +493,7 @@ private fun SavedMessageBubble(
                         onClick = { showActions = false; onEdit(bodyText) },
                     )
                 }
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
+                HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                 DropdownMenuItem(
                     leadingIcon = { NoteMenuIcon(0x1F5D1) },
                     text = { Text("Delete", color = Danger, fontSize = 14.sp) },
