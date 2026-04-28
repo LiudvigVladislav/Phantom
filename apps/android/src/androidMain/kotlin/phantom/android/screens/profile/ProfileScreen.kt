@@ -566,54 +566,53 @@ private fun ProfileCard(
                 )
             }
 
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(24.dp))
 
-            // Edit fields grid
-            Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                // Row 1: First name + Last name
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    ProfileEditField(
-                        label = "First name",
-                        value = firstName,
-                        modifier = Modifier.weight(1f),
-                        onTap = { onEditField("First name", firstName) },
-                    )
-                    ProfileEditField(
-                        label = "Last name",
-                        value = lastName,
-                        modifier = Modifier.weight(1f),
-                        onTap = { onEditField("Last name", lastName) },
-                    )
-                }
-
-                // Row 2: Date of birth + City
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    ProfileEditField(
-                        label = "Date of birth",
-                        value = dateOfBirth,
-                        modifier = Modifier.weight(1f),
-                        onTap = { onEditField("Date of birth", dateOfBirth) },
-                    )
-                    ProfileEditField(
-                        label = "City",
-                        value = city,
-                        modifier = Modifier.weight(1f),
-                        onTap = { onEditField("City", city) },
-                    )
-                }
-
-                // Row 3: Country (full width)
+            // Phase 2 mockup AccountRow pattern: single-column card on
+            // SurfaceElevated, each row 50dp tall, label on the left
+            // (Inter 14sp tertiary, fixed 112dp width) and value on the
+            // right (Inter 14sp primary, flex). Rows separated by 1dp
+            // BorderSubtle hairlines, no hairline after the last.
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(PhantomTokens.Radius.md))
+                    .background(PhantomTokens.Colors.SurfaceElevated)
+                    .border(
+                        1.dp,
+                        PhantomTokens.Colors.BorderSubtle,
+                        RoundedCornerShape(PhantomTokens.Radius.md),
+                    ),
+            ) {
+                ProfileEditField(
+                    label = "First name",
+                    value = firstName,
+                    onTap = { onEditField("First name", firstName) },
+                )
+                ProfileFieldDivider()
+                ProfileEditField(
+                    label = "Last name",
+                    value = lastName,
+                    onTap = { onEditField("Last name", lastName) },
+                )
+                ProfileFieldDivider()
+                ProfileEditField(
+                    label = "Date of birth",
+                    value = dateOfBirth,
+                    onTap = { onEditField("Date of birth", dateOfBirth) },
+                )
+                ProfileFieldDivider()
+                ProfileEditField(
+                    label = "City",
+                    value = city,
+                    onTap = { onEditField("City", city) },
+                )
+                ProfileFieldDivider()
                 ProfileEditField(
                     label = "Country",
                     value = country,
-                    modifier = Modifier.fillMaxWidth(),
                     onTap = { onEditField("Country", country) },
+                    isLast = true,
                 )
             }
         }
@@ -624,33 +623,43 @@ private fun ProfileCard(
 private fun ProfileEditField(
     label: String,
     value: String,
-    modifier: Modifier = Modifier,
     onTap: () -> Unit,
+    isLast: Boolean = false,
 ) {
-    Box(
-        modifier = modifier
-            .clip(RoundedCornerShape(10.dp))
-            .background(Surface2)
-            .border(0.5.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
-            .clickable { onTap() }
-            .padding(horizontal = 12.dp, vertical = 9.dp),
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(50.dp)
+            .clickable(onClick = onTap)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column {
-            Text(
-                text = label.uppercase(),
-                color = TextDim,
-                fontSize = 9.sp,
-                fontFamily = PhantomFontMono,
-                letterSpacing = 2.2.sp,
-            )
-            Spacer(Modifier.height(3.dp))
-            Text(
-                text = value.ifEmpty { "—" },
-                color = TextPrimary,
-                fontSize = 13.sp,
-            )
-        }
+        Text(
+            text = label,
+            color = PhantomTokens.Colors.TextTertiary,
+            fontSize = 14.sp,
+            modifier = Modifier.width(112.dp),
+        )
+        Text(
+            text = value.ifEmpty { "—" },
+            color = if (value.isEmpty()) PhantomTokens.Colors.TextDisabled else PhantomTokens.Colors.TextPrimary,
+            fontSize = 14.sp,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+        )
     }
+}
+
+@Composable
+private fun ProfileFieldDivider() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp)
+            .height(1.dp)
+            .background(PhantomTokens.Colors.BorderSubtle),
+    )
 }
 
 // ── QR key card ───────────────────────────────────────────────────────────────
