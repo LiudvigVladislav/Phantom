@@ -176,31 +176,24 @@ fun SavedMessagesScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp)
-                    .padding(horizontal = 12.dp),
+                    .padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Surface2)
-                        .clickable(onClick = onBack),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    PhIconBack(color = TextPrimary, size = 18.dp)
+                IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                    PhIconBack(color = TextPrimary, size = 20.dp)
                 }
                 Text(
-                    text = "NOTES",
+                    text = "SAVED MESSAGES",
                     modifier = Modifier.weight(1f),
                     textAlign = TextAlign.Center,
                     color = TextDim,
-                    fontSize = 10.sp,
+                    fontSize = 11.sp,
                     fontFamily = PhantomFontMono,
-                    letterSpacing = 3.sp,
+                    letterSpacing = 0.88.sp,
                 )
-                Spacer(Modifier.size(36.dp))
+                Spacer(Modifier.size(32.dp))
             }
-            HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+            HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
         }
 
         // Bottom bar

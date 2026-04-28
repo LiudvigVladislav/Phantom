@@ -34,15 +34,23 @@ fun AddContactDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Surface,
-        title = { Text("Add contact", color = TextPrimary) },
+        containerColor = PhantomTokens.Colors.SurfaceElevated,
+        title = {
+            Text(
+                "Add contact",
+                color = TextPrimary,
+                fontSize = 17.sp,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                letterSpacing = (-0.17).sp,
+            )
+        },
         text = {
             Column {
                 Text(
                     "Paste their key (from Profile → Share my key)",
                     color = TextDim,
-                    fontSize = 12.sp,
-                    lineHeight = 16.sp,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
                 )
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
