@@ -118,7 +118,7 @@ For the most sensitive use cases, PHANTOM should be combined with operating syst
 ### Clone
 
 ```bash
-git clone https://github.com/WladislaWLE/Phantom.git
+git clone https://github.com/LiudvigVladislav/Phantom.git
 cd Phantom
 # Alpha 1 lives on master once the release is tagged:
 git checkout v0.1.0-alpha.1
@@ -164,7 +164,7 @@ PHANTOM relays are intentionally simple and designed to be self-hostable. The re
 
 ```bash
 # On your VPS
-git clone https://github.com/WladislaWLE/Phantom.git
+git clone https://github.com/LiudvigVladislav/Phantom.git
 cd Phantom/deploy
 # Edit Caddyfile to set your domain
 docker compose up --build -d
@@ -224,7 +224,7 @@ A commercial dual-licensing option is available for white-label or B2B deploymen
 
 ## Contact
 
-- **GitHub Issues:** https://github.com/WladislaWLE/Phantom/issues
+- **GitHub Issues:** https://github.com/LiudvigVladislav/Phantom/issues
 - **Author:** WladislaW
 - **Company:** Willen LLC (Delaware, USA)
 

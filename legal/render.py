@@ -446,7 +446,7 @@ TEMPLATE = """<!DOCTYPE html>
     <nav aria-label="Footer navigation">
       <a href="{nav_terms_url}">{footer_terms_label}</a>
       <a href="{nav_privacy_url}">{footer_privacy_label}</a>
-      <a href="https://github.com/WladislaWLE/Phantom">{footer_github_label}</a>
+      <a href="https://github.com/LiudvigVladislav/Phantom">{footer_github_label}</a>
     </nav>
     <div class="legal">{footer_legal}</div>
   </div>

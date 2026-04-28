@@ -191,6 +191,6 @@ These are documented for transparency about what we resolved during the developm
 ## Tracking
 
 This list is maintained as a living document. Issues are tracked in GitHub Issues at:
-https://github.com/WladislaWLE/Phantom/issues
+https://github.com/LiudvigVladislav/Phantom/issues
 
 For NLnet review and Beta planning, this snapshot represents the state at the end of Alpha 1 development sprint (2026-04-25).

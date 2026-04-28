@@ -71,7 +71,7 @@ PHANTOM сейчас в **Alpha**. Сервис предоставляется "
 
 ## 8. Интеллектуальная собственность
 
-Клиентские приложения PHANTOM являются open source под лицензией, указанной в нашем публичном репозитории по адресу [github.com/WladislaWLE/Phantom](https://github.com/WladislaWLE/Phantom). Название "PHANTOM" и логотип являются товарными знаками Willen LLC.
+Клиентские приложения PHANTOM являются open source под лицензией, указанной в нашем публичном репозитории по адресу [github.com/LiudvigVladislav/Phantom](https://github.com/LiudvigVladislav/Phantom). Название "PHANTOM" и логотип являются товарными знаками Willen LLC.
 
 ## 9. Отказ от гарантий и ограничение ответственности
 

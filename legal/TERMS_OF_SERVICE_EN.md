@@ -71,7 +71,7 @@ We may terminate or restrict your access to the Service if we have reasonable gr
 
 ## 8. Intellectual Property
 
-PHANTOM client applications are open source under the license specified in our public repository at [github.com/WladislaWLE/Phantom](https://github.com/WladislaWLE/Phantom). The "PHANTOM" name and logo are trademarks of Willen LLC.
+PHANTOM client applications are open source under the license specified in our public repository at [github.com/LiudvigVladislav/Phantom](https://github.com/LiudvigVladislav/Phantom). The "PHANTOM" name and logo are trademarks of Willen LLC.
 
 ## 9. Disclaimers and Limitation of Liability
 

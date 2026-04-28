@@ -1,7 +1,7 @@
 # GitHub Issues — Drafts for Alpha 2 Backlog
 
 Each section below is a self-contained issue body. Open
-<https://github.com/WladislaWLE/Phantom/issues/new>, paste the title
+<https://github.com/LiudvigVladislav/Phantom/issues/new>, paste the title
 into the title field, paste the body verbatim, set the suggested
 labels, and click "Submit new issue".
 
@@ -205,7 +205,7 @@ stored verbatim). This is wrong on three counts:
 ## Suggested label setup
 
 If the labels above don't exist in the repo yet, create them once via
-`https://github.com/WladislaWLE/Phantom/labels`:
+`https://github.com/LiudvigVladislav/Phantom/labels`:
 
 | Label             | Colour    | Purpose                                       |
 |-------------------|-----------|-----------------------------------------------|

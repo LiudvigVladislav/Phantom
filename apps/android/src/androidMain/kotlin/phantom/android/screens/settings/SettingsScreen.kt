@@ -259,8 +259,8 @@ fun SettingsScreen(
                         SettingsRowItem(
                             icon = { PhIconShare(color = CyanAccent, size = 14.dp) },
                             label = "Source code on GitHub",
-                            value = "WladislaWLE/Phantom",
-                            onClick = { context.openUrl("https://github.com/WladislaWLE/Phantom") },
+                            value = "LiudvigVladislav/Phantom",
+                            onClick = { context.openUrl("https://github.com/LiudvigVladislav/Phantom") },
                         )
                     }
                 }

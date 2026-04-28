@@ -194,6 +194,6 @@ In rough order of importance:
 
 ## Contact
 
-- GitHub: https://github.com/WladislaWLE/Phantom
+- GitHub: https://github.com/LiudvigVladislav/Phantom
 - Author: WladislaW (Willen LLC, Delaware)
 - Project status: Active development, Alpha stage, NLnet grant application in preparation (deadline 2026-06-01)
