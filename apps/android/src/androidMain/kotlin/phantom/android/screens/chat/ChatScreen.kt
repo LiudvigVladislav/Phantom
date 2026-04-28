@@ -82,6 +82,7 @@ import androidx.compose.ui.window.PopupProperties
 import phantom.android.di.AppContainer
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.messaging.OutgoingMessage
 import phantom.core.messaging.SafetyReportCategory
 import phantom.core.storage.MessageEntity
@@ -772,7 +773,7 @@ fun ChatScreen(
                                 text = pinnerLabel,
                                 color = CyanAccent,
                                 fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
+                                fontFamily = PhantomFontMono,
                             )
                             Text(
                                 text = msg.plaintextCache?.take(60) ?: "•••",
@@ -973,7 +974,7 @@ private fun E2EENoteRow(theirUsername: String) {
                 text = "End-to-end encrypted · ED25519 · @$theirUsername",
                 color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f),
                 fontSize = 10.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 0.4.sp,
             )
         }
@@ -1008,7 +1009,7 @@ private fun ChatDateSep(millis: Long) {
             text = label,
             color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.45f),
             fontSize = 9.sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             letterSpacing = 0.54.sp,  // 0.06em × 9sp
         )
         Box(
@@ -1484,7 +1485,7 @@ private fun MessageBubble(
                                 text = preview.url.take(50),
                                 color = if (isSent) Color.White.copy(alpha = 0.6f) else CyanAccent.copy(alpha = 0.7f),
                                 fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
+                                fontFamily = PhantomFontMono,
                                 maxLines = 1,
                                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                             )
@@ -2462,7 +2463,7 @@ private fun ChatTopBar(
                         text = "typing…",
                         color = PhantomTokens.Colors.Cyan.copy(alpha = 0.8f),
                         fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                     )
                 } else {
                     Row(
@@ -2480,7 +2481,7 @@ private fun ChatTopBar(
                             text = if (isConnected) "online" else "offline",
                             color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
                             fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = PhantomFontMono,
                         )
                     }
                 }

@@ -45,6 +45,7 @@ import phantom.android.navigation.Screen
 import phantom.android.screens.group.GroupInitialsAvatar
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.GroupEntity
 
@@ -470,7 +471,7 @@ private fun SectionLabel(text: String, showPin: Boolean = false) {
         }
         Text(
             text = text.uppercase(),
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             fontSize = 10.sp,
             letterSpacing = 2.8.sp,
             color = TextDim,
@@ -653,7 +654,7 @@ private fun ChatRow(
                 Text(
                     text = timeStr,
                     color = if (isUnread) CyanAccent else TextDim,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     fontSize = 11.sp,
                     fontWeight = if (isUnread) FontWeight.Medium else FontWeight.Normal,
                 )
@@ -695,7 +696,7 @@ private fun ChatRow(
                         Text(
                             text = if (conv.unreadCount > 99) "99+" else conv.unreadCount.toString(),
                             color = BgDeep,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = PhantomFontMono,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Medium,
                         )

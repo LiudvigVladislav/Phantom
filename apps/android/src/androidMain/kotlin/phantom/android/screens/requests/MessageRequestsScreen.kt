@@ -24,6 +24,7 @@ import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.ConversationEntity
 
 @Composable
@@ -76,7 +77,7 @@ fun MessageRequestsScreen(
                     textAlign = TextAlign.Center,
                     color = TextDim,
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 3.sp,
                 )
                 Spacer(Modifier.size(36.dp))

@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import phantom.android.R
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 @Composable
 fun PhantomSplashScreen() {
@@ -46,7 +47,7 @@ fun PhantomSplashScreen() {
                 color = CyanAccent,
                 fontSize = 11.sp,
                 letterSpacing = 4.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
             )
 
             Spacer(Modifier.height(14.dp))

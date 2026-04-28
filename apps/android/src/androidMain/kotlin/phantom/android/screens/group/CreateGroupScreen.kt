@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.ConversationEntity
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -256,7 +257,7 @@ private fun ContactSelectRow(
                 text = contact.theirPublicKeyHex.take(8) + "…",
                 color = TextDim,
                 fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
             )
         }
         if (isSelected) {
@@ -280,7 +281,7 @@ private fun SectionLabel(text: String) {
         text = text.uppercase(),
         color = TextDim,
         fontSize = 10.sp,
-        fontFamily = FontFamily.Monospace,
+        fontFamily = PhantomFontMono,
         letterSpacing = 2.sp,
         modifier = Modifier.padding(horizontal = 20.dp),
     )

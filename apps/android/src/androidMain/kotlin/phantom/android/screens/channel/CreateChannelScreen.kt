@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -196,7 +197,7 @@ fun CreateChannelScreen(
                 text = "CHANNEL NAME",
                 color = TextDim,
                 fontSize = 10.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 2.sp,
             )
             Spacer(Modifier.height(8.dp))

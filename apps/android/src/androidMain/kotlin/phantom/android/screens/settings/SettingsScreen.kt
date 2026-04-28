@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -28,6 +29,7 @@ import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -126,7 +128,7 @@ fun SettingsScreen(
                                             color = if (active) BgDeep else TextDim,
                                             fontSize = 9.sp,
                                             fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                            fontFamily = FontFamily.Monospace,
+                                            fontFamily = PhantomFontMono,
                                             letterSpacing = 1.8.sp,
                                         )
                                     }
@@ -185,6 +187,11 @@ fun SettingsScreen(
                     var appLockEnabled by remember {
                         mutableStateOf(prefs.getBoolean("app_lock_enabled", false))
                     }
+                    var lockTimeoutMs by remember {
+                        mutableStateOf(prefs.getLong("app_lock_timeout_ms", 60_000L))
+                    }
+                    var showTimeoutDialog by remember { mutableStateOf(false) }
+
                     SettingsGroupCard {
                         SettingsRowItem(
                             icon = { PhIconLock(color = CyanAccent, size = 16.dp) },
@@ -195,6 +202,26 @@ fun SettingsScreen(
                                 appLockEnabled = newVal
                                 prefs.edit().putBoolean("app_lock_enabled", newVal).apply()
                             },
+                        )
+                        if (appLockEnabled) {
+                            SettingsRowItem(
+                                icon = { PhIconTimer(color = CyanAccent, size = 16.dp) },
+                                label = "Auto-lock",
+                                value = lockTimeoutLabel(lockTimeoutMs),
+                                onClick = { showTimeoutDialog = true },
+                            )
+                        }
+                    }
+
+                    if (showTimeoutDialog) {
+                        AppLockTimeoutDialog(
+                            current = lockTimeoutMs,
+                            onPick = { ms ->
+                                lockTimeoutMs = ms
+                                prefs.edit().putLong("app_lock_timeout_ms", ms).apply()
+                                showTimeoutDialog = false
+                            },
+                            onDismiss = { showTimeoutDialog = false },
                         )
                     }
                 }
@@ -303,4 +330,62 @@ private fun android.content.Context.openUrl(url: String) {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     runCatching { startActivity(intent) }
+}
+
+// ── App Lock timeout ────────────────────────────────────────────────────────
+
+private val LOCK_TIMEOUT_OPTIONS: List<Pair<Long, String>> = listOf(
+    0L            to "Immediately",
+    60_000L       to "After 1 minute",
+    5 * 60_000L   to "After 5 minutes",
+    60 * 60_000L  to "After 1 hour",
+)
+
+private fun lockTimeoutLabel(ms: Long): String =
+    LOCK_TIMEOUT_OPTIONS.firstOrNull { it.first == ms }?.second
+        ?: "After ${ms / 60_000} minutes"
+
+@Composable
+private fun AppLockTimeoutDialog(
+    current: Long,
+    onPick: (Long) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Surface,
+        title = { Text("Auto-lock", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) },
+        text = {
+            Column {
+                LOCK_TIMEOUT_OPTIONS.forEach { (ms, label) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onPick(ms) }
+                            .padding(horizontal = 4.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // Selected indicator: cyan dot for the active option.
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(if (ms == current) CyanAccent else TextDim.copy(alpha = 0.25f)),
+                        )
+                        Text(
+                            text = label,
+                            color = TextPrimary,
+                            fontSize = 14.sp,
+                            modifier = Modifier.padding(start = 12.dp),
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Done", color = CyanAccent, fontSize = 14.sp)
+            }
+        },
+    )
 }

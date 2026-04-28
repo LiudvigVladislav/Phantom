@@ -33,6 +33,7 @@ import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.ConversationEntity
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -87,7 +88,7 @@ fun ArchiveScreen(
                     textAlign = TextAlign.Center,
                     color = TextDim,
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 3.sp,
                 )
                 Spacer(Modifier.size(36.dp))
@@ -124,7 +125,7 @@ fun ArchiveScreen(
                         "Long-press a chat to archive it",
                         color = TextDim.copy(alpha = 0.5f),
                         fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                     )
                 }
             }

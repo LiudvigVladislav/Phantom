@@ -23,6 +23,7 @@ import kotlinx.coroutines.delay
 import phantom.android.calls.ActiveCall
 import phantom.android.calls.CallState
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 private fun formatCallDuration(seconds: Long): String {
     val h = seconds / 3600
@@ -123,7 +124,7 @@ fun ActiveCallScreen(
                 text = statusText,
                 color = if (call.state == CallState.IN_CALL) CyanAccent else TextDim,
                 fontSize = 15.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 0.4.sp,
             )
 
@@ -155,7 +156,7 @@ fun ActiveCallScreen(
                         text = if (call.isMuted) "Muted" else "Mute",
                         color = if (call.isMuted) CyanAccent else TextDim,
                         fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                     )
                 }
 
@@ -179,7 +180,7 @@ fun ActiveCallScreen(
                         text = if (call.isSpeakerOn) "Speaker" else "Speaker",
                         color = if (call.isSpeakerOn) CyanAccent else TextDim,
                         fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                     )
                 }
             }
@@ -204,7 +205,7 @@ fun ActiveCallScreen(
                     text = "End Call",
                     color = Danger.copy(alpha = 0.8f),
                     fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                 )
             }
 

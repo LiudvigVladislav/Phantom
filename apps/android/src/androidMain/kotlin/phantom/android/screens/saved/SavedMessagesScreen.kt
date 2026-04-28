@@ -41,6 +41,7 @@ import com.benasher44.uuid.uuid4
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.messaging.OutgoingMessage
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.MessageEntity
@@ -194,7 +195,7 @@ fun SavedMessagesScreen(
                     textAlign = TextAlign.Center,
                     color = TextDim,
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 3.sp,
                 )
                 Spacer(Modifier.size(36.dp))

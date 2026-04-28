@@ -53,6 +53,7 @@ import phantom.android.qr.QrCodeImage
 import phantom.android.qr.generateQrBitmap
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.identity.IdentityRecord
 import java.io.File
 
@@ -418,7 +419,7 @@ private fun ProfileTopBar(onBack: () -> Unit) {
                 text = "PROFILE",
                 color = TextDim,
                 fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 fontWeight = FontWeight.Normal,
                 letterSpacing = 0.88.sp,  // 0.08em × 11sp
                 textAlign = TextAlign.Center,
@@ -561,7 +562,7 @@ private fun ProfileCard(
                     text = "online",
                     color = TextDim.copy(alpha = 0.6f),
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                 )
             }
 
@@ -639,7 +640,7 @@ private fun ProfileEditField(
                 text = label.uppercase(),
                 color = TextDim,
                 fontSize = 9.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 2.2.sp,
             )
             Spacer(Modifier.height(3.dp))
@@ -680,7 +681,7 @@ private fun QrKeyCard(
                     text = "QR CODE & KEY",
                     color = TextDim,
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 2.5.sp,
                 )
                 Spacer(Modifier.width(8.dp))
@@ -786,7 +787,7 @@ private fun ConnectionCard(identity: IdentityRecord) {
                     text = "CONNECTION DATA",
                     color = TextDim,
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 2.5.sp,
                 )
             }
@@ -817,7 +818,7 @@ private fun ConnectionRow(label: String, value: String) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, color = TextDim, fontSize = 12.sp)
-        Text(value, color = TextPrimary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+        Text(value, color = TextPrimary, fontSize = 12.sp, fontFamily = PhantomFontMono)
     }
 }
 

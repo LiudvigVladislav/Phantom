@@ -32,6 +32,7 @@ import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -179,7 +180,7 @@ fun ContactProfileScreen(
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         color = TextDim,
                         fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                         letterSpacing = 0.88.sp,
                         fontWeight = FontWeight.Normal,
                     )
@@ -279,7 +280,7 @@ fun ContactProfileScreen(
                     text = "Last seen recently",
                     color = TextDim,
                     fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 0.4.sp,
                 )
 
@@ -398,7 +399,7 @@ fun ContactProfileScreen(
                                 "ed25519",
                                 color = CyanAccent,
                                 fontSize = 9.sp,
-                                fontFamily = FontFamily.Monospace,
+                                fontFamily = PhantomFontMono,
                                 letterSpacing = 2.sp,
                                 fontWeight = FontWeight.SemiBold,
                             )
@@ -406,7 +407,7 @@ fun ContactProfileScreen(
                                 "verified · ${java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(java.util.Date())}",
                                 color = TextDim,
                                 fontSize = 9.sp,
-                                fontFamily = FontFamily.Monospace,
+                                fontFamily = PhantomFontMono,
                                 letterSpacing = 1.6.sp,
                             )
                         }
@@ -420,7 +421,7 @@ fun ContactProfileScreen(
                             text = keyPreview,
                             color = TextPrimary,
                             fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = PhantomFontMono,
                             letterSpacing = 0.6.sp,
                             lineHeight = 18.sp,
                         )
@@ -444,7 +445,7 @@ fun ContactProfileScreen(
                             text = if (keyCopied) "Copied" else "Copy",
                             color = if (keyCopied) Success else CyanAccent,
                             fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = PhantomFontMono,
                             letterSpacing = 1.8.sp,
                         )
                     },
@@ -554,7 +555,7 @@ fun ContactProfileScreen(
                         "Encrypted · stored locally only",
                         color = TextDim,
                         fontSize = 9.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                         letterSpacing = 1.8.sp,
                     )
                 }
@@ -700,7 +701,7 @@ fun ContactProfileScreen(
                     "SAFETY NUMBER",
                     color = TextDim,
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 2.sp,
                 )
 
@@ -715,7 +716,7 @@ fun ContactProfileScreen(
                         text = fingerprint,
                         color = TextPrimary,
                         fontSize = 18.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                         letterSpacing = 3.sp,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                     )
@@ -766,7 +767,7 @@ fun ContactProfileScreen(
                     text = "DISAPPEARING MESSAGES",
                     color = TextDim,
                     fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 2.sp,
                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
                 )
@@ -846,7 +847,7 @@ private fun CContactSectionHeader(label: String, icon: @Composable () -> Unit) {
             text = label.uppercase(),
             color = TextDim,
             fontSize = 10.sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             letterSpacing = 2.4.sp,
         )
     }
@@ -888,7 +889,7 @@ private fun CKeyRow(
                         text = value,
                         color = TextDim,
                         fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                         letterSpacing = 0.2.sp,
                         modifier = Modifier.padding(top = 2.dp),
                     )

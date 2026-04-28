@@ -24,6 +24,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 enum class NavTab { CALLS, CHATS, SETTINGS }
 
@@ -192,7 +193,7 @@ fun SoonBadge() {
     ) {
         Text(
             text = "SOON",
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             fontSize = 8.5.sp,
             letterSpacing = 1.5.sp,
             color = CyanAccent,
@@ -294,14 +295,14 @@ fun ComingSoonOverlay(kicker: String = "COMING SOON") {
         ) {
             Text(
                 text = kicker,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 fontSize = 10.sp,
                 letterSpacing = 3.6.sp,
                 color = TextDim,
             )
             Text(
                 text = "COMING SOON",
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 fontSize = 30.sp,
                 fontWeight = FontWeight.Light,
                 letterSpacing = 6.sp,
@@ -337,7 +338,7 @@ fun SettingsGroupHeader(title: String) {
     // tertiary tone — quieter than the body but architectural in feel.
     Text(
         text = title.uppercase(),
-        fontFamily = FontFamily.Monospace,
+        fontFamily = PhantomFontMono,
         fontSize = 11.sp,
         letterSpacing = 0.88.sp,  // 0.08em × 11sp
         color = TextDim,
@@ -401,7 +402,7 @@ fun SettingsRowItem(
                 text = value,
                 color = TextDim,
                 fontSize = 13.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
             )
         }
         PhIconChevron(color = TextDim, size = 14.dp)
@@ -458,7 +459,7 @@ fun ModePill(label: String, active: Boolean) {
     ) {
         Text(
             text = label.uppercase(),
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             fontSize = 9.sp,
             letterSpacing = 1.5.sp,
             color = if (active) BgDeep else TextDim,

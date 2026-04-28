@@ -41,6 +41,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
 
@@ -224,7 +225,7 @@ fun GroupChatScreen(
                         text = "Read-only channel",
                         color = TextDim,
                         fontSize = 13.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                         letterSpacing = 1.sp,
                     )
                 }
@@ -351,7 +352,7 @@ private fun GroupE2EENoteRow(isChannel: Boolean) {
                 text = if (isChannel) "channel — messages broadcast by admins" else "group · end-to-end encrypted",
                 color = TextDim,
                 fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 0.5.sp,
             )
         }
@@ -372,7 +373,7 @@ private fun GroupDateSep(millis: Long) {
             text = label.uppercase(),
             color = TextDim,
             fontSize = 10.sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             letterSpacing = 2.sp,
         )
     }
@@ -462,6 +463,9 @@ private fun GroupAudioBubble(
     var progress by remember { mutableStateOf(0f) }
     var mediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
     var durationSec by remember { mutableStateOf(0) }
+    val speedSteps = remember { listOf(1.0f, 1.5f, 2.0f, 0.5f) }
+    var speedIdx by remember { mutableIntStateOf(0) }
+    val currentSpeed = speedSteps[speedIdx]
 
     DisposableEffect(Unit) {
         onDispose {
@@ -476,7 +480,7 @@ private fun GroupAudioBubble(
     }
 
     Row(
-        modifier = Modifier.width(200.dp),
+        modifier = Modifier.width(220.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -493,8 +497,16 @@ private fun GroupAudioBubble(
                         } ?: return@IconButton
                         mediaPlayer = player
                         durationSec = player.duration
+                        runCatching {
+                            player.playbackParams = player.playbackParams.setSpeed(currentSpeed)
+                        }
                     } else {
-                        mediaPlayer?.start()
+                        mediaPlayer?.let { mp ->
+                            runCatching {
+                                mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed)
+                            }
+                            mp.start()
+                        }
                     }
                     isPlaying = true
                     scope.launch {
@@ -524,12 +536,39 @@ private fun GroupAudioBubble(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = if (durationSec > 0) formatDuration(durationSec) else "0:00",
-                    color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
-                    fontSize = 10.sp,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = if (durationSec > 0) formatDuration(durationSec) else "0:00",
+                        color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
+                        fontSize = 10.sp,
+                    )
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (isSent) BgDeep.copy(alpha = 0.2f) else Surface2)
+                            .clickable {
+                                speedIdx = (speedIdx + 1) % speedSteps.size
+                                mediaPlayer?.let { mp ->
+                                    runCatching {
+                                        mp.playbackParams = mp.playbackParams.setSpeed(speedSteps[speedIdx])
+                                    }
+                                }
+                            }
+                            .padding(horizontal = 6.dp, vertical = 1.dp),
+                    ) {
+                        Text(
+                            text = formatGroupSpeed(currentSpeed),
+                            fontSize = 9.5.sp,
+                            color = if (isSent) BgDeep.copy(alpha = 0.7f) else CyanAccent,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
                 Text(
                     text = timeStr,
                     color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
@@ -538,6 +577,13 @@ private fun GroupAudioBubble(
             }
         }
     }
+}
+
+private fun formatGroupSpeed(speed: Float): String = when (speed) {
+    1.0f -> "1×"
+    2.0f -> "2×"
+    0.5f -> "0.5×"
+    else -> "${"%.1f".format(speed)}×"
 }
 
 private fun playGroupAudio(
@@ -614,7 +660,7 @@ private fun GroupTopBar(
                     text = if (isChannel) "Channel" else "$memberCount members",
                     color = TextDim,
                     fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                 )
             }
 

@@ -87,8 +87,12 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         val prefs = getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
         if (prefs.getBoolean("app_lock_enabled", false)) {
+            // User-configurable threshold — see Settings → App Lock → Auto-lock.
+            // 0L means "lock immediately whenever the app is backgrounded";
+            // any positive value is a grace window in milliseconds.
+            val timeoutMs = prefs.getLong("app_lock_timeout_ms", 60_000L)
             val elapsed = System.currentTimeMillis() - backgroundedAt
-            if (backgroundedAt > 0 && elapsed > 60_000) {
+            if (backgroundedAt > 0 && (timeoutMs == 0L || elapsed > timeoutMs)) {
                 isLockedState.value = true
             }
         }

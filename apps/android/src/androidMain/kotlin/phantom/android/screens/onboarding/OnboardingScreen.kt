@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 @Composable
 fun OnboardingScreen(
@@ -92,7 +93,7 @@ private fun TermsScreen(onAccept: () -> Unit) {
             color = CyanAccent.copy(alpha = 0.55f),
             fontSize = 10.sp,
             letterSpacing = 5.sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             fontWeight = FontWeight.Normal,
         )
 
@@ -193,7 +194,7 @@ private fun TermsScreen(onAccept: () -> Unit) {
                     color = CyanAccent,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     modifier = Modifier.clickable {
                         linkContext.startActivity(
                             android.content.Intent(
@@ -208,7 +209,7 @@ private fun TermsScreen(onAccept: () -> Unit) {
                     color = CyanAccent,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     modifier = Modifier.clickable {
                         linkContext.startActivity(
                             android.content.Intent(
@@ -225,7 +226,7 @@ private fun TermsScreen(onAccept: () -> Unit) {
                 color = TextDim.copy(alpha = 0.6f),
                 fontSize = 11.sp,
                 lineHeight = 17.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
             )
         }
 
@@ -242,7 +243,7 @@ private fun TermsScreen(onAccept: () -> Unit) {
                     color = TextDim.copy(alpha = 0.5f),
                     fontSize = 10.sp,
                     letterSpacing = 1.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                 )
                 Spacer(Modifier.height(6.dp))
                 // Drawn chevron-down arrow — no material icon
@@ -287,7 +288,7 @@ private fun TermsScreen(onAccept: () -> Unit) {
                 fontSize = 10.sp,
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 2.5.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
             )
         }
 
@@ -303,7 +304,7 @@ private fun TosSection(title: String, body: String, isLast: Boolean = false) {
         fontSize = 11.sp,
         fontWeight = FontWeight.Medium,
         letterSpacing = 1.sp,
-        fontFamily = FontFamily.Monospace,
+        fontFamily = PhantomFontMono,
     )
     Spacer(Modifier.height(7.dp))
     Text(
@@ -369,7 +370,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
             fontSize = 10.sp,
             fontWeight = FontWeight.Normal,
             letterSpacing = 5.sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
         )
 
         Spacer(Modifier.height(40.dp))
@@ -405,7 +406,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
             fontSize = 12.sp,
             fontWeight = FontWeight.Normal,
             letterSpacing = 0.5.sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
         )
 
         Spacer(Modifier.height(14.dp))
@@ -439,7 +440,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                 color = CyanAccent,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Light,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
             )
             Spacer(Modifier.width(10.dp))
             BasicTextField(
@@ -454,7 +455,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                     color = TextPrimary,
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Light,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                 ),
                 cursorBrush = SolidColor(CyanAccent),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
@@ -473,7 +474,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                             color = TextDim.copy(alpha = 0.5f),
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Light,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = PhantomFontMono,
                         )
                     }
                     inner()
@@ -487,7 +488,7 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                 text = error!!,
                 color = Danger,
                 fontSize = 12.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
             )
         }
 
@@ -561,7 +562,7 @@ private fun FeaturePill(label: String) {
             color = CyanAccent.copy(alpha = 0.55f),
             fontSize = 8.sp,
             letterSpacing = 1.sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = PhantomFontMono,
             fontWeight = FontWeight.Medium,
         )
     }

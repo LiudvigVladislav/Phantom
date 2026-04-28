@@ -32,9 +32,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import phantom.android.ui.theme.BgDeep
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.android.ui.theme.Danger
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.android.ui.theme.Success
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.android.ui.theme.TextDim
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.transport.TransportState
 
 /**
@@ -128,7 +132,7 @@ fun ConnectionBanner(
                 color = TextDim,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 0.5.sp,
                 modifier = Modifier.padding(start = 10.dp),
             )

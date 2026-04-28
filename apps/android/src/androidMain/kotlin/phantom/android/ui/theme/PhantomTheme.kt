@@ -3,9 +3,11 @@
 
 package phantom.android.ui.theme
 
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 
 // ── BACKWARD-COMPAT TOP-LEVEL ALIASES ───────────────────────────────────────
 // Every existing reference (~400+ across screens/) reads names like
@@ -72,9 +74,18 @@ private val PhantomColorScheme = darkColorScheme(
 
 @Composable
 fun PhantomTheme(content: @Composable () -> Unit) {
+    // Default body text style is the Inter-based PhantomType.body. Bare Text()
+    // calls (no fontFamily / fontSize override) inherit this and pick up Inter
+    // automatically — without this CompositionLocal the default would still be
+    // the platform's system sans-serif on every screen.
     MaterialTheme(
         colorScheme = PhantomColorScheme,
         typography  = PhantomMaterial3Typography,
-        content     = content,
-    )
+    ) {
+        CompositionLocalProvider(
+            LocalTextStyle provides PhantomType.body,
+        ) {
+            content()
+        }
+    }
 }

@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 @Composable
 fun IncomingCallScreen(
@@ -110,7 +111,7 @@ fun IncomingCallScreen(
                 text = "Incoming call...",
                 color = TextDim,
                 fontSize = 14.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 0.6.sp,
             )
 
@@ -143,7 +144,7 @@ fun IncomingCallScreen(
                         text = "Decline",
                         color = TextDim,
                         fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                     )
                 }
 
@@ -165,7 +166,7 @@ fun IncomingCallScreen(
                         text = "Accept",
                         color = TextDim,
                         fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = PhantomFontMono,
                     )
                 }
             }

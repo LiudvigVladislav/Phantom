@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 
 @Composable
 fun AppLockScreen(onUnlocked: () -> Unit) {
@@ -54,7 +55,7 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
                 text = "PHANTOM",
                 color = CyanAccent,
                 fontSize = 28.sp,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = PhantomFontMono,
                 letterSpacing = 8.sp,
             )
 
@@ -96,7 +97,7 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
                     text = errorMsg,
                     color = Danger,
                     fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                 )
             }
 
@@ -120,7 +121,7 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
                     text = "UNLOCK",
                     color = CyanAccent,
                     fontSize = 14.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = PhantomFontMono,
                     letterSpacing = 2.sp,
                 )
             }

@@ -30,6 +30,7 @@ import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
+import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.ConversationEntity
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -164,7 +165,7 @@ private fun SectionHeader(text: String) {
             .fillMaxWidth()
             .padding(horizontal = 20.dp)
             .padding(top = 16.dp, bottom = 6.dp),
-        fontFamily = FontFamily.Monospace,
+        fontFamily = PhantomFontMono,
         fontSize = 10.sp,
         letterSpacing = 2.8.sp,
         color = TextDim,
