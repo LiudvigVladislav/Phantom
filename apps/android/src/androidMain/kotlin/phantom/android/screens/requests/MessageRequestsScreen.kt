@@ -4,6 +4,7 @@
 package phantom.android.screens.requests
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -58,31 +59,24 @@ fun MessageRequestsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp)
-                    .padding(horizontal = 12.dp),
+                    .padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Surface2)
-                        .clickable(onClick = onBack),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    PhIconBack(color = TextPrimary, size = 18.dp)
+                IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                    PhIconBack(color = TextPrimary, size = 20.dp)
                 }
                 Text(
                     text = "REQUESTS",
                     modifier = Modifier.weight(1f),
                     textAlign = TextAlign.Center,
                     color = TextDim,
-                    fontSize = 10.sp,
+                    fontSize = 11.sp,
                     fontFamily = PhantomFontMono,
-                    letterSpacing = 3.sp,
+                    letterSpacing = 0.88.sp,
                 )
-                Spacer(Modifier.size(36.dp))
+                Spacer(Modifier.size(32.dp))
             }
-            HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+            HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
         }
 
         if (requests.isEmpty()) {
@@ -127,53 +121,65 @@ private fun RequestCard(
     onAccept: () -> Unit,
     onBlock: () -> Unit,
 ) {
+    // Card surface — SurfaceElevated with BorderSubtle outline, radius 12dp.
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Surface)
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(PhantomTokens.Colors.SurfaceElevated)
             .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            GradientAvatar(name = entity.theirUsername, size = 44.dp)
+            GradientAvatar(name = entity.theirUsername, size = 48.dp)
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(entity.theirUsername, color = TextPrimary, fontSize = 15.sp)
+                Text(
+                    text = entity.theirUsername,
+                    color = TextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                )
                 entity.lastMessagePreview?.let { preview ->
-                    Spacer(Modifier.height(2.dp))
+                    Spacer(Modifier.height(3.dp))
                     Text(
                         preview,
                         color = TextDim,
-                        fontSize = 12.sp,
+                        fontSize = 13.sp,
                         maxLines = 2,
                     )
                 }
             }
         }
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(14.dp))
 
+        // Action row — pill buttons. Block: ghost danger. Accept: filled cyan.
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .height(36.dp)
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(Danger.copy(alpha = 0.12f))
+                    .height(40.dp)
+                    .clip(RoundedCornerShape(9999.dp))
+                    .background(Color.Transparent)
+                    .border(1.dp, Danger.copy(alpha = 0.4f), RoundedCornerShape(9999.dp))
                     .clickable(onClick = onBlock),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("Block", color = Danger, fontSize = 13.sp)
+                Text("Block", color = Danger, fontSize = 14.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
             }
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .height(36.dp)
-                    .clip(RoundedCornerShape(18.dp))
+                    .height(40.dp)
+                    .clip(RoundedCornerShape(9999.dp))
                     .background(CyanAccent)
                     .clickable(onClick = onAccept),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("Accept", color = BgDeep, fontSize = 13.sp)
+                Text("Accept", color = BgDeep, fontSize = 14.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
             }
         }
     }

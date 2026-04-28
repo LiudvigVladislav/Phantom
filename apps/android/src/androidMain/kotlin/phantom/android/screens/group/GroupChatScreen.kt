@@ -12,6 +12,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -405,18 +406,33 @@ private fun GroupMessageBubble(entity: MessageEntity, context: android.content.C
                 )
             }
 
+            // Phase 2 mockup parity: 12 12 12 2 incoming / 12 12 2 12 outgoing,
+            // outgoing is flat Cyan, incoming is SurfaceElevated with a 1dp
+            // BorderSubtle outline so it does not blend into the chat surface.
             val bubbleShape = RoundedCornerShape(
-                topStart = 16.dp, topEnd = 16.dp,
-                bottomStart = if (isSent) 16.dp else 4.dp,
-                bottomEnd = if (isSent) 4.dp else 16.dp,
+                topStart = PhantomTokens.Radius.md,
+                topEnd = PhantomTokens.Radius.md,
+                bottomStart = if (isSent) PhantomTokens.Radius.md else 2.dp,
+                bottomEnd = if (isSent) 2.dp else PhantomTokens.Radius.md,
             )
 
             Box(
                 modifier = Modifier
                     .widthIn(min = 80.dp, max = 260.dp)
-                    .background(
-                        color = if (isSent) CyanAccent else Surface2,
-                        shape = bubbleShape,
+                    .then(
+                        if (isSent) Modifier.background(
+                            color = PhantomTokens.Colors.Cyan,
+                            shape = bubbleShape,
+                        ) else Modifier
+                            .background(
+                                color = PhantomTokens.Colors.SurfaceElevated,
+                                shape = bubbleShape,
+                            )
+                            .border(
+                                width = 1.dp,
+                                color = PhantomTokens.Colors.BorderSubtle,
+                                shape = bubbleShape,
+                            )
                     )
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
@@ -616,6 +632,8 @@ private fun GroupTopBar(
     onAddMember: () -> Unit,
     onLeaveGroup: () -> Unit,
 ) {
+    // Phase 2 mockup parity with ChatTopBar — flat back arrow, group avatar
+    // (36dp), name + member count, BorderSubtle hairline at the bottom.
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -626,23 +644,14 @@ private fun GroupTopBar(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(Surface2)
-                    .clickable(onClick = onBack),
-                contentAlignment = Alignment.Center,
-            ) {
-                PhIconBack(color = TextPrimary, size = 18.dp)
+            IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
             }
+            Spacer(Modifier.width(8.dp))
 
-            Spacer(Modifier.width(10.dp))
-
-            // Group avatar — initials in circle
             GroupInitialsAvatar(name = groupName, size = 36.dp)
 
             Spacer(Modifier.width(10.dp))
@@ -650,23 +659,24 @@ private fun GroupTopBar(
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = groupName,
-                    color = TextPrimary,
+                    color = PhantomTokens.Colors.TextPrimary,
                     fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = (-0.15).sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
                     text = if (isChannel) "Channel" else "$memberCount members",
-                    color = TextDim,
-                    fontSize = 11.sp,
+                    color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
+                    fontSize = 10.sp,
                     fontFamily = PhantomFontMono,
                 )
             }
 
             Box {
-                IconButton(onClick = onMoreMenu, modifier = Modifier.size(32.dp)) {
-                    PhIconMoreVert(color = TextDim, size = 18.dp)
+                IconButton(onClick = onMoreMenu, modifier = Modifier.size(36.dp)) {
+                    PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
                 }
                 DropdownMenu(
                     expanded = showMenu,
@@ -686,7 +696,7 @@ private fun GroupTopBar(
                 }
             }
         }
-        HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+        HorizontalDivider(color = PhantomTokens.Colors.BorderSubtle, thickness = 1.dp)
     }
 }
 
@@ -724,16 +734,18 @@ private fun GroupInputBar(
     onMicClick: () -> Unit,
 ) {
     val recordingSeconds = recordingDurationMs / 1000
+    // Phase 2 mockup parity with ChatScreen InputBar — composer sits on
+    // SurfaceElevated with a BorderSubtle hairline.
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Surface),
+            .background(PhantomTokens.Colors.SurfaceElevated),
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(1.dp)
-                .background(Color.White.copy(alpha = 0.05f)),
+                .background(PhantomTokens.Colors.BorderSubtle),
         )
         Row(
             modifier = Modifier
