@@ -64,29 +64,23 @@ fun CreateGroupScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(56.dp)
-                        .padding(horizontal = 12.dp),
+                        .padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(Surface2)
-                            .clickable(onClick = onBack),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        PhIconBack(color = TextPrimary, size = 18.dp)
+                    IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                        PhIconBack(color = TextPrimary, size = 20.dp)
                     }
-                    Spacer(Modifier.width(12.dp))
+                    Spacer(Modifier.width(8.dp))
                     Text(
                         text = "New Group",
                         color = TextPrimary,
                         fontSize = 17.sp,
-                        fontWeight = FontWeight.SemiBold,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = (-0.17).sp,
                         modifier = Modifier.weight(1f),
                     )
                 }
-                HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+                HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
             }
         },
         bottomBar = {

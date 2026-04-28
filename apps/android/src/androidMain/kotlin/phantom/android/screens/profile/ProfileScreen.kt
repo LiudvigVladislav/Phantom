@@ -662,55 +662,72 @@ private fun QrKeyCard(
     onShare: () -> Unit,
     onCopy: () -> Unit,
 ) {
-    Surface(
+    // Phase 2 mockup IdentityKeyBlock — SurfaceDeep card with BorderSubtle
+    // outline, 12dp radius. Header row: Shield icon (cyan 70%) + "IDENTITY KEY"
+    // mono overline + right "ED25519" mono 10sp tertiary. Below: QR + key text.
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(14.dp),
-        color = Surface,
-        shape = RoundedCornerShape(16.dp),
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
+            .background(PhantomTokens.Colors.SurfaceDeep)
+            .border(1.dp, PhantomTokens.Colors.BorderSubtle, RoundedCornerShape(PhantomTokens.Radius.md)),
     ) {
+        // Header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Shield glyph — Canvas-drawn cyan @ 70% alpha.
+            Canvas(modifier = Modifier.size(13.dp)) {
+                val w = size.width
+                val h = size.height
+                val sw = 1.5.dp.toPx()
+                val color = PhantomTokens.Colors.Cyan.copy(alpha = 0.7f)
+                val path = androidx.compose.ui.graphics.Path().apply {
+                    moveTo(w * 0.5f, h * 0.05f)
+                    lineTo(w * 0.92f, h * 0.22f)
+                    cubicTo(
+                        w * 0.92f, h * 0.6f,
+                        w * 0.7f, h * 0.92f,
+                        w * 0.5f, h * 0.95f,
+                    )
+                    cubicTo(
+                        w * 0.3f, h * 0.92f,
+                        w * 0.08f, h * 0.6f,
+                        w * 0.08f, h * 0.22f,
+                    )
+                    close()
+                }
+                drawPath(path, color = color, style = Stroke(sw))
+            }
+            Spacer(Modifier.width(7.dp))
+            Text(
+                text = "IDENTITY KEY",
+                color = PhantomTokens.Colors.TextSecondary,
+                fontSize = 10.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 0.6.sp,
+            )
+            Spacer(Modifier.weight(1f))
+            Text(
+                text = "ED25519",
+                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
+                fontSize = 10.sp,
+                fontFamily = PhantomFontMono,
+            )
+        }
+        HorizontalDivider(color = PhantomTokens.Colors.BorderSubtle, thickness = 1.dp)
+
+        // QR + body
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(24.dp),
+                .padding(horizontal = 16.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // Header
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "QR CODE & KEY",
-                    color = TextDim,
-                    fontSize = 10.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 2.5.sp,
-                )
-                Spacer(Modifier.width(8.dp))
-                // Lock icon using Canvas
-                Canvas(modifier = Modifier.size(12.dp)) {
-                    val w = size.width
-                    val h = size.height
-                    // shackle
-                    drawArc(
-                        color = Success,
-                        startAngle = 180f,
-                        sweepAngle = 180f,
-                        useCenter = false,
-                        topLeft = androidx.compose.ui.geometry.Offset(w * 0.2f, 0f),
-                        size = androidx.compose.ui.geometry.Size(w * 0.6f, h * 0.55f),
-                        style = Stroke(1.5.dp.toPx()),
-                    )
-                    // body
-                    drawRoundRect(
-                        color = Success,
-                        topLeft = androidx.compose.ui.geometry.Offset(0f, h * 0.45f),
-                        size = androidx.compose.ui.geometry.Size(w, h * 0.55f),
-                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.5.dp.toPx()),
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(16.dp))
-
             QrCodeImage(content = identityString, size = 172.dp)
 
             Spacer(Modifier.height(12.dp))
@@ -725,12 +742,12 @@ private fun QrKeyCard(
 
             Spacer(Modifier.height(16.dp))
 
-            // Share button (filled)
+            // Share button — pill-shape primary cyan with restrained glow.
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(46.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(9999.dp))
                     .background(CyanAccent)
                     .clickable { onShare() },
                 contentAlignment = Alignment.Center,
@@ -745,20 +762,25 @@ private fun QrKeyCard(
 
             Spacer(Modifier.height(8.dp))
 
-            // Copy button (outline)
+            // Copy — ghost pill with cyan outline.
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(44.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .border(1.dp, CyanAccent.copy(alpha = if (copied) 1f else 0.5f), RoundedCornerShape(10.dp))
+                    .height(40.dp)
+                    .clip(RoundedCornerShape(9999.dp))
+                    .border(
+                        1.dp,
+                        CyanAccent.copy(alpha = if (copied) 1f else 0.4f),
+                        RoundedCornerShape(9999.dp),
+                    )
                     .clickable { onCopy() },
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
                     text = if (copied) "Copied" else "Copy key",
                     color = CyanAccent,
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
                 )
             }
         }

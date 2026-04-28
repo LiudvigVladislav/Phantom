@@ -63,10 +63,18 @@ fun QrScanScreen(
         containerColor = BgDeep,
         topBar = {
             TopAppBar(
-                title = { Text("Scan QR Code", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Normal) },
+                title = {
+                    Text(
+                        text = "Scan QR code",
+                        color = TextPrimary,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = (-0.17).sp,
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        PhIconBack(color = TextDim, size = 22.dp)
+                        PhIconBack(color = TextPrimary, size = 20.dp)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Surface),
