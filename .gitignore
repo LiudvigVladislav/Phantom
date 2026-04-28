@@ -1,5 +1,9 @@
 # Claude Code
 .claude/settings.local.json
+# Local Claude Code skills / plugins (per-user dev tooling — not part of the
+# project source). Tracked variants (project-level skills/agents/commands)
+# live elsewhere under .claude/ and are added explicitly when needed.
+.claude/skills/
 
 # Gradle / KMP
 .gradle/
