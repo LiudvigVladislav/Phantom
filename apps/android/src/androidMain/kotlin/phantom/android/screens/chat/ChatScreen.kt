@@ -76,6 +76,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.produceState
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import phantom.android.di.AppContainer
@@ -724,7 +725,7 @@ fun ChatScreen(
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            item(key = "__e2ee__") { E2EENoteRow() }
+            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
 
             // Pinned message banner — shown when at least one message is pinned
             if (pinnedMessages.isNotEmpty()) {
@@ -930,26 +931,50 @@ private sealed class ChatItem {
 }
 
 @Composable
-private fun E2EENoteRow() {
-    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+private fun E2EENoteRow(theirUsername: String) {
+    // Phase 2 mockup: a 32dp full-width strip on SurfaceDeep, BorderSubtle
+    // bottom hairline, centered "End-to-end encrypted · ED25519 · @username"
+    // in mono 10sp tertiary 70%. Architectural truth, not a banner.
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(32.dp)
+            .background(PhantomTokens.Colors.SurfaceDeep),
+        contentAlignment = Alignment.Center,
+    ) {
         Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(999.dp))
-                .background(Color.White.copy(alpha = 0.03f))
-                .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(999.dp))
-                .padding(horizontal = 12.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
         ) {
+            // Lock glyph — small, tertiary 70%.
             Canvas(modifier = Modifier.size(10.dp)) {
-                val r = size.minDimension / 2f
-                drawCircle(color = Success, radius = r, style = Stroke(1.2.dp.toPx()))
-                drawCircle(color = Success, radius = r * 0.38f)
+                val w = size.width
+                val h = size.height
+                val sw = 1.4.dp.toPx()
+                val color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f)
+                // Lock body
+                drawRoundRect(
+                    color = color,
+                    topLeft = Offset(w * 0.18f, h * 0.45f),
+                    size = androidx.compose.ui.geometry.Size(w * 0.64f, h * 0.45f),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.dp.toPx()),
+                    style = Stroke(sw),
+                )
+                // Shackle
+                drawArc(
+                    color = color,
+                    startAngle = 180f, sweepAngle = 180f, useCenter = false,
+                    topLeft = Offset(w * 0.30f, h * 0.18f),
+                    size = androidx.compose.ui.geometry.Size(w * 0.40f, h * 0.50f),
+                    style = Stroke(sw),
+                )
             }
             Text(
-                "messages are end-to-end encrypted",
-                color = TextDim, fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace, letterSpacing = 0.5.sp,
+                text = "End-to-end encrypted · ED25519 · @$theirUsername",
+                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f),
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                letterSpacing = 0.4.sp,
             )
         }
     }
@@ -957,13 +982,41 @@ private fun E2EENoteRow() {
 
 @Composable
 private fun ChatDateSep(millis: Long) {
+    // Phase 2 mockup: centered "Today · April 28" in mono 9sp tertiary 45%,
+    // flanked by 1px BorderSubtle hairlines. The full date format ("Today
+    // · April 28") gives readers a stronger time anchor than a bare label.
     val label = when {
-        isToday(millis) -> "Today"
-        isYesterday(millis) -> "Yesterday"
-        else -> java.text.SimpleDateFormat("dd MMM yyyy", java.util.Locale.US).format(java.util.Date(millis))
+        isToday(millis) -> "Today · ${java.text.SimpleDateFormat("MMMM d", java.util.Locale.US).format(java.util.Date(millis))}"
+        isYesterday(millis) -> "Yesterday · ${java.text.SimpleDateFormat("MMMM d", java.util.Locale.US).format(java.util.Date(millis))}"
+        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(millis))
     }
-    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
-        Text(label.uppercase(), color = TextDim, fontSize = 10.sp, fontFamily = FontFamily.Monospace, letterSpacing = 2.sp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(top = 14.dp, bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(PhantomTokens.Colors.BorderSubtle),
+        )
+        Text(
+            text = label,
+            color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.45f),
+            fontSize = 9.sp,
+            fontFamily = FontFamily.Monospace,
+            letterSpacing = 0.54.sp,  // 0.06em × 9sp
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(1.dp)
+                .background(PhantomTokens.Colors.BorderSubtle),
+        )
     }
 }
 
@@ -2321,62 +2374,109 @@ private fun ChatTopBar(
     onReport: () -> Unit,
     onBlock: () -> Unit,
 ) {
+    // Phase 2 mockup layout:
+    //   [back] [avatar+online] [name+lock | presenceDot+state] [phone] [video] [more]
+    // 56dp height, BorderSubtle bottom hairline.
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Surface)
+            .background(PhantomTokens.Colors.Surface)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = PhantomTokens.Spacing.comfortable),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Back button — 36dp Surface2 circle
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(Surface2)
-                    .clickable(onClick = onBack),
-                contentAlignment = Alignment.Center,
-            ) {
-                PhIconBack(color = TextPrimary, size = 18.dp)
+            // Back arrow — flat icon, no surface chip.
+            IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
             }
+            Spacer(Modifier.width(PhantomTokens.Spacing.baseUnit))
 
-            Spacer(Modifier.width(10.dp))
+            // Avatar (tap → contact profile). Online dot is rendered inside
+            // GradientAvatar via the `online` flag.
+            Box(modifier = Modifier.clickable(onClick = onContactProfile)) {
+                GradientAvatar(
+                    name = theirUsername,
+                    size = 36.dp,
+                    online = if (isConnected) true else null,
+                )
+            }
+            Spacer(Modifier.width(PhantomTokens.Spacing.baseUnit + 2.dp))
 
-            // Center — name + E2EE status pill / typing indicator
+            // Name + lock chip stacked over presence/typing line.
             Column(
                 modifier = Modifier.weight(1f),
-                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text(
-                    text = theirUsername,
-                    color = TextPrimary,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = theirUsername,
+                        color = PhantomTokens.Colors.TextPrimary,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = (-0.15).sp,  // -0.01em × 15sp
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    // Lock chip — 14dp SurfaceDeep circle with cyan padlock.
+                    Box(
+                        modifier = Modifier
+                            .size(14.dp)
+                            .clip(CircleShape)
+                            .background(PhantomTokens.Colors.SurfaceDeep)
+                            .border(1.dp, PhantomTokens.Colors.BorderSubtle, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Canvas(modifier = Modifier.size(7.dp)) {
+                            val w = size.width
+                            val h = size.height
+                            val sw = 1.5.dp.toPx()
+                            val c = PhantomTokens.Colors.Cyan
+                            drawRoundRect(
+                                color = c,
+                                topLeft = Offset(w * 0.18f, h * 0.42f),
+                                size = androidx.compose.ui.geometry.Size(w * 0.64f, h * 0.50f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(0.6.dp.toPx()),
+                                style = Stroke(sw),
+                            )
+                            drawArc(
+                                color = c,
+                                startAngle = 180f, sweepAngle = 180f, useCenter = false,
+                                topLeft = Offset(w * 0.28f, h * 0.10f),
+                                size = androidx.compose.ui.geometry.Size(w * 0.44f, h * 0.55f),
+                                style = Stroke(sw),
+                            )
+                        }
+                    }
+                }
                 if (isTyping) {
                     Text(
-                        text = "typing...",
-                        color = CyanAccent.copy(alpha = 0.8f),
-                        fontSize = 11.sp,
+                        text = "typing…",
+                        color = PhantomTokens.Colors.Cyan.copy(alpha = 0.8f),
+                        fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace,
                     )
                 } else {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier.padding(top = 2.dp),
                     ) {
-                        Canvas(modifier = Modifier.size(7.dp)) {
-                            drawCircle(color = if (isConnected) Success else TextDim)
+                        Canvas(modifier = Modifier.size(5.dp)) {
+                            drawCircle(
+                                color = if (isConnected) PhantomTokens.Colors.Success
+                                else PhantomTokens.Colors.TextDisabled,
+                            )
                         }
                         Text(
-                            text = "Ed25519 · Encrypted",
-                            color = TextDim,
+                            text = if (isConnected) "online" else "offline",
+                            color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace,
                         )
@@ -2384,20 +2484,21 @@ private fun ChatTopBar(
                 }
             }
 
-            Spacer(Modifier.width(10.dp))
-
-            PhIconPhone(color = TextDim, modifier = Modifier.clickable { }, size = 20.dp)
-
-            Spacer(Modifier.width(12.dp))
-
-            // Avatar (tap → contact profile) + MoreVert dropdown
-            Box(modifier = Modifier.clickable(onClick = onContactProfile)) {
-                GradientAvatar(name = theirUsername, size = 36.dp)
+            // Action icons — Phone, Video, More. Each ~32dp tap target with
+            // 18-20dp glyph.
+            IconButton(onClick = { /* TODO: voice call */ }, modifier = Modifier.size(36.dp)) {
+                PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
+            }
+            // Video icon — placeholder for now (no PhIconVideo); reuse Phone
+            // glyph at smaller size to keep visual rhythm. Will swap for a
+            // Camera/Video glyph in PhantomIcons in the next polish round.
+            IconButton(onClick = { /* TODO: video call */ }, modifier = Modifier.size(36.dp)) {
+                PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
             }
 
             Box {
-                IconButton(onClick = onMoreMenu, modifier = Modifier.size(32.dp)) {
-                    PhIconMoreVert(color = TextDim, size = 18.dp)
+                IconButton(onClick = onMoreMenu, modifier = Modifier.size(36.dp)) {
+                    PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
                 }
                 DropdownMenu(
                     expanded = showMenu,
@@ -2415,6 +2516,6 @@ private fun ChatTopBar(
                 }
             }
         }
-        HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+        HorizontalDivider(color = PhantomTokens.Colors.BorderSubtle, thickness = 1.dp)
     }
 }
