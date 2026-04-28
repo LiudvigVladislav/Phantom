@@ -333,31 +333,39 @@ fun ComingSoonOverlay(kicker: String = "COMING SOON") {
 
 @Composable
 fun SettingsGroupHeader(title: String) {
+    // Phase 2 mockup: section overlines are mono 11sp, 0.08em tracked,
+    // tertiary tone — quieter than the body but architectural in feel.
     Text(
         text = title.uppercase(),
         fontFamily = FontFamily.Monospace,
-        fontSize = 10.sp,
-        letterSpacing = 2.8.sp,
+        fontSize = 11.sp,
+        letterSpacing = 0.88.sp,  // 0.08em × 11sp
         color = TextDim,
         modifier = Modifier
-            .padding(horizontal = 20.dp)
-            .padding(top = 10.dp, bottom = 8.dp),
+            .padding(horizontal = 16.dp)
+            .padding(top = 16.dp, bottom = 8.dp),
     )
 }
 
 @Composable
 fun SettingsGroupCard(content: @Composable ColumnScope.() -> Unit) {
+    // Card surface: SurfaceElevated with BorderSubtle outline, radius 12dp.
+    // Replaces the inline rgba(white, 4%) border and 14dp radius.
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(Surface)
-            .border(1.dp, Color.White.copy(alpha = 0.04f), RoundedCornerShape(14.dp)),
+            .clip(RoundedCornerShape(12.dp))
+            .background(phantom.android.ui.theme.PhantomTokens.Colors.SurfaceElevated)
+            .border(
+                1.dp,
+                phantom.android.ui.theme.BorderSubtle,
+                RoundedCornerShape(12.dp),
+            ),
     ) {
         content()
     }
-    Spacer(Modifier.height(16.dp))
+    Spacer(Modifier.height(12.dp))
 }
 
 @Composable
@@ -371,15 +379,13 @@ fun SettingsRowItem(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 13.dp),
+            .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        // Icon container — flat (no Surface2 chip), tertiary glyph.
         Box(
-            modifier = Modifier
-                .size(30.dp)
-                .clip(CircleShape)
-                .background(Surface2),
+            modifier = Modifier.size(20.dp),
             contentAlignment = Alignment.Center,
         ) {
             icon()
@@ -387,11 +393,16 @@ fun SettingsRowItem(
         Text(
             text = label,
             color = TextPrimary,
-            fontSize = 14.5.sp,
+            fontSize = 15.sp,
             modifier = Modifier.weight(1f),
         )
         if (value != null) {
-            Text(text = value, color = TextDim, fontSize = 13.sp)
+            Text(
+                text = value,
+                color = TextDim,
+                fontSize = 13.sp,
+                fontFamily = FontFamily.Monospace,
+            )
         }
         PhIconChevron(color = TextDim, size = 14.dp)
     }

@@ -164,44 +164,33 @@ fun ContactProfileScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(56.dp)
-                        .padding(horizontal = 12.dp),
+                        .padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // Back
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(Surface2)
-                            .clickable(onClick = onBack),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        PhIconBack(color = TextPrimary, size = 18.dp)
+                    // Back — flat icon (mockup spec, no Surface2 chip).
+                    IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                        PhIconBack(color = TextPrimary, size = 20.dp)
                     }
 
-                    // Title
+                    // Title — overline mono 11sp 0.08em tracked.
                     Text(
-                        text = "Contact",
+                        text = "CONTACT",
                         modifier = Modifier.weight(1f),
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         color = TextDim,
-                        fontSize = 10.sp,
+                        fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
-                        letterSpacing = 3.sp,
+                        letterSpacing = 0.88.sp,
                         fontWeight = FontWeight.Normal,
                     )
 
-                    // More menu
+                    // More menu — flat icon, matching back button.
                     Box {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(RoundedCornerShape(18.dp))
-                                .background(Surface2)
-                                .clickable { showMoreMenu = true },
-                            contentAlignment = Alignment.Center,
+                        IconButton(
+                            onClick = { showMoreMenu = true },
+                            modifier = Modifier.size(32.dp),
                         ) {
-                            PhIconMoreVert(color = TextPrimary, size = 18.dp)
+                            PhIconMoreVert(color = TextPrimary, size = 20.dp)
                         }
                         DropdownMenu(
                             expanded = showMoreMenu,
