@@ -40,32 +40,40 @@ fun PhantomSplashScreen() {
         ) {
             LogoWithSonar()
 
-            Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.height(32.dp))
 
+            // Brand wordmark — Geist 17sp medium with -0.01em tracking,
+            // matching the design system's PhantomTopBar treatment.
             Text(
                 text = "PHANTOM",
-                color = CyanAccent,
-                fontSize = 11.sp,
-                letterSpacing = 4.sp,
-                fontFamily = PhantomFontMono,
+                color = TextPrimary,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.17).sp,
             )
 
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(16.dp))
 
+            // Tagline — display Geist medium with negative tracking.
+            // Inherits PhantomFontGeist via LocalTextStyle since no
+            // fontFamily is set here.
             Text(
                 text = "Your presence,\nknown to no one.",
-                color = TextPrimary,
-                fontSize = 21.sp,
-                fontWeight = FontWeight.Light,
+                color = TextSecondary,
+                fontSize = 20.sp,
+                lineHeight = 28.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.20).sp,
                 textAlign = TextAlign.Center,
-                lineHeight = 30.sp,
             )
         }
 
         Text(
-            text = "Alpha 0.1",
-            color = TextDim,
-            fontSize = 11.sp,
+            text = "Alpha 1",
+            color = TextDim.copy(alpha = 0.55f),
+            fontSize = 10.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 0.8.sp,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = 42.dp),

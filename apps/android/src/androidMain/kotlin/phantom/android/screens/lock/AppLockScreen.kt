@@ -23,6 +23,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -50,13 +51,14 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(24.dp),
         ) {
-            // PHANTOM wordmark
+            // PHANTOM wordmark — Geist 24sp medium, negative tracking.
+            // Matches the brand-mark treatment used everywhere else.
             Text(
                 text = "PHANTOM",
-                color = CyanAccent,
-                fontSize = 28.sp,
-                fontFamily = PhantomFontMono,
-                letterSpacing = 8.sp,
+                color = TextPrimary,
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.24).sp,
             )
 
             // Canvas-drawn padlock icon
@@ -101,12 +103,12 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
                 )
             }
 
-            // Manual unlock button — shown so the user can retry if the auto-prompt was dismissed
+            // Manual unlock — primary cyan pill matching the design's
+            // primary CTA pattern (radius 9999, 44dp, restrained glow).
             Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Surface2)
-                    .border(1.dp, CyanAccent.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+                    .clip(RoundedCornerShape(9999.dp))
+                    .background(CyanAccent)
                     .clickable {
                         showBiometricPrompt(
                             context,
@@ -114,15 +116,14 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
                             onError = { errorMsg = it },
                         )
                     }
-                    .padding(horizontal = 32.dp, vertical = 14.dp),
+                    .padding(horizontal = 32.dp, vertical = 12.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = "UNLOCK",
-                    color = CyanAccent,
+                    text = "Unlock",
+                    color = BgDeep,
                     fontSize = 14.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 2.sp,
+                    fontWeight = FontWeight.Medium,
                 )
             }
         }

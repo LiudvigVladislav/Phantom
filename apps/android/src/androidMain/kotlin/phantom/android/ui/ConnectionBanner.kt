@@ -32,13 +32,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import phantom.android.ui.theme.BgDeep
-import phantom.android.ui.theme.PhantomFontMono
+import phantom.android.ui.theme.BorderSubtle
 import phantom.android.ui.theme.Danger
 import phantom.android.ui.theme.PhantomFontMono
 import phantom.android.ui.theme.Success
-import phantom.android.ui.theme.PhantomFontMono
 import phantom.android.ui.theme.TextDim
-import phantom.android.ui.theme.PhantomFontMono
+import phantom.android.ui.theme.Warning
 import phantom.core.transport.TransportState
 
 /**
@@ -95,7 +94,7 @@ fun ConnectionBanner(
         }
         is TransportState.Connecting -> {
             label = "Connecting…"
-            dotColor = Color(0xFFF4B740) // amber
+            dotColor = Warning  // canonical amber from the design palette
         }
         is TransportState.Disconnected -> {
             label = "Offline — messages queued"
