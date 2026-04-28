@@ -9,7 +9,7 @@
 > date, goal, what shipped, what was rejected and why. Keep entries
 > reverse-chronological so the freshest context is at the top.
 >
-> User-facing release artefacts live in [`Releases/`](../Releases/);
+> User-facing release artefacts (`README.md`, `RELEASE_NOTES.md`, `KNOWN_ISSUES.md`) live at the repo root;
 > formal architectural decisions live in [`docs/adr/`](adr/); this log is
 > the in-between layer that ties them together with the human story of
 > "why are we doing what we're doing right now".
@@ -42,7 +42,7 @@ patch on 2026-04-27).
 
 ### Known limitations (documented)
 
-See [`Releases/KNOWN_ISSUES.md`](../Releases/KNOWN_ISSUES.md) for the full
+See [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) for the full
 register. Headline items:
 
 - ⚠️ **ISSUE-001** Tecno HiOS / aggressive-OEM Android skins reconnect every ~60 s due to OS-level Wi-Fi radio parking. **Mitigated** to 1–3 s message-delivery latency through WakeLock, OkHttp `pingInterval(8s)`, `forceCancelAllEngineCalls`, `cancelAndJoin`. **Real fix** scheduled for Alpha 2 via Unified Push (FOSS, no Google).
@@ -57,7 +57,7 @@ register. Headline items:
 ## Active backlog
 
 The four GitHub Issues drafted in
-[`Releases/GITHUB_ISSUES_DRAFT.md`](../Releases/GITHUB_ISSUES_DRAFT.md)
+[`docs/alpha2-backlog.md`](alpha2-backlog.md)
 are the Alpha 2 priority queue:
 
 1. **Onboarding ToS review** — final wording approval after lawyer / GDPR review.
@@ -178,6 +178,17 @@ every received PING.
 Code + VS Code Pack" guide that the founder uses to bootstrap their
 local agent setup. Replacing it with the product README would break the
 founder's tooling. `Releases/` keeps both worlds clean.
+
+> **Superseded 2026-04-28.** The `Releases/` folder was retired. Public
+> artefacts moved to repo-root standard locations (`README.md`,
+> `RELEASE_NOTES.md`, `KNOWN_ISSUES.md`); the GitHub Release-body
+> template and the issues-draft moved into `docs/release-drafts/` and
+> `docs/alpha2-backlog.md` respectively. The Claude Code + VS Code Pack
+> guide that used to occupy the root `README.md` was deleted (no longer
+> needed in the public repo — it described the founder's local agent
+> tooling, not the product). `Releases/` was also stripped from git
+> history via `git-filter-repo` so the public repo presents a clean
+> tree.
 
 ---
 
@@ -432,10 +443,11 @@ produced Alpha 1.
 
 ## Quick links
 
-- Public README → [`Releases/README.md`](../Releases/README.md)
-- Release notes → [`Releases/RELEASE_NOTES.md`](../Releases/RELEASE_NOTES.md)
-- Known issues → [`Releases/KNOWN_ISSUES.md`](../Releases/KNOWN_ISSUES.md)
-- Alpha 2 backlog → [`Releases/GITHUB_ISSUES_DRAFT.md`](../Releases/GITHUB_ISSUES_DRAFT.md)
+- Public README → [`README.md`](../README.md)
+- Release notes → [`RELEASE_NOTES.md`](../RELEASE_NOTES.md)
+- Known issues → [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md)
+- Alpha 2 backlog → [`docs/alpha2-backlog.md`](alpha2-backlog.md)
+- Release-body drafts → [`docs/release-drafts/`](release-drafts/)
 - Threat model → [`docs/threat-model/Threat_Model_v0.md`](threat-model/Threat_Model_v0.md)
 - Architectural decisions → [`docs/adr/`](adr/)
 - Crypto details → [`docs/CRYPTO.md`](CRYPTO.md)

@@ -166,7 +166,7 @@ java.lang.NullPointerException: Cannot invoke "java.net.URL.getFile()" because "
 1. **Unified Push** integration ([ROADMAP.md](../ROADMAP.md)) — server-side push wakes the device when an envelope is queued, opening a fresh radio window each time so the next outbound flush starts immediately. Already on the Alpha 2 plan as the long-term ISSUE-001 fix.
 2. **Attachment server** — voice and other large media move to HTTPS POST against a separate endpoint (S3-compatible storage); the WS envelope only carries a URL + decryption key (~few hundred bytes). Voice no longer needs a multi-second uplink burst over WebSocket. This is the right place to land voice messages structurally; inlining base64 over the WS was always a stop-gap.
 
-**Not in scope of Alpha 1.** Documented as a known limitation in [Releases/KNOWN_ISSUES.md](../Releases/KNOWN_ISSUES.md) ISSUE-001 ("Voice messages on Tecno-class OEMs: NOT delivered").
+**Not in scope of Alpha 1.** Documented as a known limitation in [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) ISSUE-001 ("Voice messages on Tecno-class OEMs: NOT delivered").
 
 ---
 
