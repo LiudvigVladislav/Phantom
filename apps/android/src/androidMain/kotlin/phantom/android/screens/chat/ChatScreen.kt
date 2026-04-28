@@ -1233,24 +1233,35 @@ private fun MessageBubble(
             val timeReserve = if (isSent) 56.dp else 36.dp
             // Outer column: bubble + reaction pills stacked vertically
             Column {
-            // Column wraps quote block + text+time — no overlapping content
+            // Bubble shape per design system Phase 2:
+            //   incoming  → 12 12 12 2  (tail bottom-left)
+            //   outgoing  → 12 12 2 12  (tail bottom-right)
+            // Outgoing is flat Cyan — the design brief explicitly removed the
+            // gradient ("Gradient felt decorative; flat is more PHANTOM:
+            // architectural, not branded.").
             val bubbleShape = RoundedCornerShape(
-                topStart = 16.dp, topEnd = 16.dp,
-                bottomStart = if (isSent) 16.dp else 4.dp,
-                bottomEnd = if (isSent) 4.dp else 16.dp,
+                topStart = PhantomTokens.Radius.md,
+                topEnd = PhantomTokens.Radius.md,
+                bottomStart = if (isSent) PhantomTokens.Radius.md else 2.dp,
+                bottomEnd = if (isSent) 2.dp else PhantomTokens.Radius.md,
             )
             Column(
                 modifier = Modifier
                     .widthIn(min = 80.dp, max = 260.dp)
                     .then(
                         if (isSent) Modifier.background(
-                            brush = Brush.linearGradient(
-                                colors = listOf(CyanAccent, Color(0xFF0099CC)),
-                                start = Offset(0f, 0f),
-                                end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY),
-                            ),
+                            color = PhantomTokens.Colors.Cyan,
                             shape = bubbleShape,
-                        ) else Modifier.background(color = Surface, shape = bubbleShape)
+                        ) else Modifier
+                            .background(
+                                color = PhantomTokens.Colors.SurfaceElevated,
+                                shape = bubbleShape,
+                            )
+                            .border(
+                                width = 1.dp,
+                                color = PhantomTokens.Colors.BorderSubtle,
+                                shape = bubbleShape,
+                            )
                     )
                     .onGloballyPositioned { coords ->
                         bubbleBoundsPx = coords.boundsInWindow()
@@ -1755,6 +1766,11 @@ private fun AudioBubble(
     var progress by remember { mutableStateOf(0f) }
     var mediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
     var durationMs by remember { mutableStateOf(0) }
+    // Playback speed cycle: 1× → 1.5× → 2× → 0.5× → 1×. State persists across
+    // pause/resume so the user keeps their chosen speed for this bubble.
+    val speedSteps = remember { listOf(1.0f, 1.5f, 2.0f, 0.5f) }
+    var speedIdx by remember { mutableIntStateOf(0) }
+    val currentSpeed = speedSteps[speedIdx]
 
     DisposableEffect(Unit) {
         onDispose {
@@ -1769,7 +1785,7 @@ private fun AudioBubble(
     }
 
     Row(
-        modifier = Modifier.width(200.dp),
+        modifier = Modifier.width(220.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -1802,10 +1818,18 @@ private fun AudioBubble(
                                 }
                                 mediaPlayer = mp
                                 durationMs = mp.duration
+                                runCatching {
+                                    mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed)
+                                }
                                 mp.start()
                             } catch (_: Exception) {}
                         } else {
-                            mediaPlayer?.start()
+                            mediaPlayer?.let { mp ->
+                                runCatching {
+                                    mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed)
+                                }
+                                mp.start()
+                            }
                         }
                         isPlaying = true
                         scope.launch {
@@ -1856,11 +1880,43 @@ private fun AudioBubble(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = formatDur(durationMs),
-                    color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
-                    fontSize = 10.sp,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = formatDur(durationMs),
+                        color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
+                        fontSize = 10.sp,
+                    )
+                    // Playback speed cycle button. Compact pill — tap to bump
+                    // through 1× → 1.5× → 2× → 0.5× → 1×. Applied to live
+                    // MediaPlayer immediately if one exists; otherwise stored
+                    // and applied on next play.
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(
+                                if (isSent) BgDeep.copy(alpha = 0.2f) else Surface2,
+                            )
+                            .clickable {
+                                speedIdx = (speedIdx + 1) % speedSteps.size
+                                mediaPlayer?.let { mp ->
+                                    runCatching {
+                                        mp.playbackParams = mp.playbackParams.setSpeed(speedSteps[speedIdx])
+                                    }
+                                }
+                            }
+                            .padding(horizontal = 6.dp, vertical = 1.dp),
+                    ) {
+                        Text(
+                            text = formatSpeed(currentSpeed),
+                            fontSize = 9.5.sp,
+                            color = if (isSent) BgDeep.copy(alpha = 0.7f) else CyanAccent,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(3.dp),
@@ -1875,6 +1931,13 @@ private fun AudioBubble(
             }
         }
     }
+}
+
+private fun formatSpeed(speed: Float): String = when (speed) {
+    1.0f -> "1×"
+    2.0f -> "2×"
+    0.5f -> "0.5×"
+    else -> "${"%.1f".format(speed)}×"
 }
 
 // ── Input bar ─────────────────────────────────────────────────────────────────
@@ -1894,16 +1957,19 @@ private fun InputBar(
 ) {
     val haptic = LocalHapticFeedback.current
     val recordingSeconds = recordingDurationMs / 1000
+    // Phase 2 mockup: composer sits on SurfaceElevated, BorderSubtle 1px top.
+    // Slightly more "premium" than the surrounding chat surface, signalling
+    // the input zone without a heavy bar.
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Surface),
+            .background(PhantomTokens.Colors.SurfaceElevated),
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(1.dp)
-                .background(Color.White.copy(alpha = 0.05f)),
+                .background(PhantomTokens.Colors.BorderSubtle),
         )
         Row(
             modifier = Modifier

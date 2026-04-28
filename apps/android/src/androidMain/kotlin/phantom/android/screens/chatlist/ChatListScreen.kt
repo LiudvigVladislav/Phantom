@@ -625,11 +625,13 @@ private fun ChatRow(
                 onClick = onClick,
                 onLongClick = { showContextMenu = true },
             )
-            .padding(horizontal = 20.dp, vertical = 11.dp),
+            // Phase 2 mockup: 16dp horizontal padding, 12dp gap between avatar
+            // and content, 72dp row height (≈12dp vertical with 48dp avatar).
+            .padding(horizontal = PhantomTokens.Spacing.comfortable, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        GradientAvatar(name = conv.theirUsername, size = 46.dp)
-        Spacer(Modifier.width(14.dp))
+        GradientAvatar(name = conv.theirUsername, size = 48.dp)
+        Spacer(Modifier.width(PhantomTokens.Spacing.tight))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -643,9 +645,15 @@ private fun ChatRow(
                 )
                 Spacer(Modifier.width(8.dp))
                 val timeStr = conv.lastMessageAt?.let { formatChatTime(it) } ?: ""
+                // Phase 2 mockup: timestamps are mono, tertiary 65%. Cyan
+                // accent on unread is a PHANTOM-specific affordance kept on
+                // top of the design token (the mockup uses muted tertiary, but
+                // our local convention surfaces unread state via the cyan
+                // accent here too).
                 Text(
                     text = timeStr,
                     color = if (isUnread) CyanAccent else TextDim,
+                    fontFamily = FontFamily.Monospace,
                     fontSize = 11.sp,
                     fontWeight = if (isUnread) FontWeight.Medium else FontWeight.Normal,
                 )
@@ -667,25 +675,29 @@ private fun ChatRow(
                         if (p.startsWith("[AUDIO:")) "🎤 Voice message" else p
                     },
                     color = TextDim,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
                 if (isUnread) {
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(PhantomTokens.Spacing.baseUnit))
+                    // Unread badge — Phase 2 spec: 20dp pill, mono 11sp
+                    // surfaceDeep text on cyan.
                     Box(
                         modifier = Modifier
+                            .heightIn(min = 20.dp)
                             .clip(CircleShape)
                             .background(CyanAccent)
-                            .padding(horizontal = 7.dp, vertical = 3.dp),
+                            .padding(horizontal = 6.dp, vertical = 1.dp),
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
                             text = if (conv.unreadCount > 99) "99+" else conv.unreadCount.toString(),
                             color = BgDeep,
+                            fontFamily = FontFamily.Monospace,
                             fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
+                            fontWeight = FontWeight.Medium,
                         )
                     }
                 }
