@@ -29,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Size
@@ -492,6 +493,9 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
 
         Spacer(Modifier.weight(1f))
 
+        // Phase 2 mockup: primary CTA is a pill (radius 9999), 48dp tall,
+        // Cyan with restrained shadow (0 2px 12px rgba(0,212,255,0.12)),
+        // label Inter 15sp 500 SurfaceDeep — not a tech overline.
         Button(
             onClick = {
                 if (valid && !loading) {
@@ -504,14 +508,21 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
             enabled = valid && !loading,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(54.dp),
+                .height(48.dp)
+                .shadow(
+                    elevation = 8.dp,
+                    shape = RoundedCornerShape(9999.dp),
+                    clip = false,
+                    spotColor = CyanAccent.copy(alpha = 0.20f),
+                    ambientColor = CyanAccent.copy(alpha = 0.10f),
+                ),
             colors = ButtonDefaults.buttonColors(
                 containerColor = CyanAccent,
                 contentColor = BgDeep,
                 disabledContainerColor = CyanAccent.copy(alpha = 0.15f),
                 disabledContentColor = TextDim.copy(alpha = 0.5f),
             ),
-            shape = RoundedCornerShape(12.dp),
+            shape = RoundedCornerShape(9999.dp),
         ) {
             if (loading) {
                 CircularProgressIndicator(
@@ -521,11 +532,9 @@ private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
                 )
             } else {
                 Text(
-                    text = "BEGIN",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    letterSpacing = 3.sp,
-                    fontFamily = FontFamily.Monospace,
+                    text = "Begin",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
                 )
             }
         }

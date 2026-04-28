@@ -402,35 +402,31 @@ private fun ProfileTopBar(onBack: () -> Unit) {
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Back button
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(Surface2)
-                    .clickable { onBack() },
-                contentAlignment = Alignment.Center,
+            // Back button — flat icon (mockup spec, no Surface2 chip).
+            IconButton(
+                onClick = onBack,
+                modifier = Modifier.size(32.dp),
             ) {
-                PhIconBack(color = TextPrimary, size = 18.dp)
+                PhIconBack(color = TextPrimary, size = 20.dp)
             }
 
-            // Title
+            // Title — overline mono 11sp tracked uppercase.
             Text(
                 text = "PROFILE",
                 color = TextDim,
-                fontSize = 10.sp,
+                fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Normal,
-                letterSpacing = 3.sp,
+                letterSpacing = 0.88.sp,  // 0.08em × 11sp
                 textAlign = TextAlign.Center,
                 modifier = Modifier.weight(1f),
             )
 
             // Spacer mirror of back button to keep title centered
-            Spacer(modifier = Modifier.size(36.dp))
+            Spacer(modifier = Modifier.size(32.dp))
         }
 
         HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
@@ -541,32 +537,35 @@ private fun ProfileCard(
 
             Spacer(Modifier.height(14.dp))
 
-            // @username
+            // Identity headline — Phase 2 mockup: Geist 22sp 500 -0.01em.
             Text(
                 text = if (username.isNotEmpty()) "@$username" else "Loading…",
                 color = TextPrimary,
                 fontSize = 22.sp,
                 fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.22).sp,  // -0.01em × 22sp
             )
 
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(8.dp))
 
-            // Status row
+            // Online status — minimal mockup style (5dp Success dot + mono 10sp
+            // tertiary "online"). Replaces the heavy "DEVICE TRUSTED · ONLINE"
+            // overline; trust state is surfaced via the QR / fingerprint card
+            // below, not a header tagline.
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Canvas(modifier = Modifier.size(8.dp)) {
+                Canvas(modifier = Modifier.size(5.dp)) {
                     drawCircle(color = Success, radius = size.minDimension / 2f)
                 }
-                Spacer(Modifier.width(6.dp))
+                Spacer(Modifier.width(5.dp))
                 Text(
-                    text = "DEVICE TRUSTED · ONLINE",
-                    color = TextDim,
+                    text = "online",
+                    color = TextDim.copy(alpha = 0.6f),
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
-                    letterSpacing = 2.sp,
                 )
             }
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(20.dp))
 
             // Edit fields grid
             Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
