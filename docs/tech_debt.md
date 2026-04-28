@@ -152,6 +152,40 @@ java.lang.NullPointerException: Cannot invoke "java.net.URL.getFile()" because "
 
 ---
 
+### Bug J — Asymmetric outbound packet loss on Tecno-class OEMs [PROTOCOL/INFRA GAP]
+
+**Symptom:** Tecno Spark 2023 (HiOS) running PHANTOM with the foreground service active, both `WIFI_MODE_FULL_HIGH_PERF` and `PARTIAL` wake locks held, and Battery → Unrestricted set, still loses its outbound channel to the relay within ~30–70 s of each reconnect. Inbound continues to work — incoming text envelopes from the relay arrive normally — but outbound `RelayMessage.Ping` frames stop reaching the relay (no `Pong` round-trips) and any envelope dispatched in that window (notably voice messages, ~70 KB) never gets an ack.
+
+**Diagnosis (2026-04-28):** End-to-end log capture on Tecno-Spark ↔ relay ↔ Pixel-emulator. Same code path on emulator-to-emulator delivers a 75 KB voice envelope in ~1 s; same code path on Tecno never gets a 70 KB envelope through. Both client-side timeout bumps (`OkHttp pingInterval(0)`, `PONG_TIMEOUT_MS = 60 s`, `ACK_TIMEOUT_MS = 60 s`) confirm this is **not** the previous transport-ping bug — extending the timeout window does not help, because the radio is genuinely silent for ≥ 60 s.
+
+**Root cause:** OEM Wi-Fi/cellular power management on Tecno HiOS parks the upstream radio asymmetrically — downstream packets continue to drain into the device but the device's outbound queue does not flush. No client-side configuration can override this: the foreground service, wake locks, and unrestricted-battery whitelist are already in place. This generalises ISSUE-001 from "WS reconnects every 60 s, no message loss" to "WS reconnects every 60 s, **and** large/voice payloads are silently lost" once the affected payload size exceeds what fits in the brief radio-wake window after each reconnect.
+
+**Why text still works:** Text envelopes (~1 KB) flush in milliseconds inside the brief radio-alive window after each reconnect. Voice envelopes (50–100 KB) cannot be uploaded in that window before the radio re-parks.
+
+**Fix path (Alpha 2):**
+1. **Unified Push** integration ([ROADMAP.md](../ROADMAP.md)) — server-side push wakes the device when an envelope is queued, opening a fresh radio window each time so the next outbound flush starts immediately. Already on the Alpha 2 plan as the long-term ISSUE-001 fix.
+2. **Attachment server** — voice and other large media move to HTTPS POST against a separate endpoint (S3-compatible storage); the WS envelope only carries a URL + decryption key (~few hundred bytes). Voice no longer needs a multi-second uplink burst over WebSocket. This is the right place to land voice messages structurally; inlining base64 over the WS was always a stop-gap.
+
+**Not in scope of Alpha 1.** Documented as a known limitation in [Releases/KNOWN_ISSUES.md](../Releases/KNOWN_ISSUES.md) ISSUE-001 ("Voice messages on Tecno-class OEMs: NOT delivered").
+
+---
+
+### Bug I — Avatar not transmitted to peer (no ProfileSync envelope) [FEATURE GAP]
+
+**Symptom:** When a user sets a profile photo, it appears on their own device (top-bar, profile screen) but their peer always sees the gradient + initial fallback. There is no protocol message that carries avatars across the wire.
+
+**Scope:** Not a bug in current code — the protocol simply has no `ProfileSync` envelope. Adding it requires:
+- New message type (e.g. `MessagePayload.TYPE_PROFILE_SYNC`) carrying compressed avatar bytes (target ≤ 64 KB after JPEG compression at quality 70 and 256×256 resize) plus display name and a monotonically-increasing version counter.
+- Send on first 1:1 message after a contact is added, and again whenever the local user changes their photo.
+- Receiver stores in a new `contact_profile` SQLite table (avatar bytes + version + last-updated-at), separate from `conversation` (which is identity-keyed routing data).
+- Top-bar and contact-row avatars on the recipient side observe the new repo via StateFlow, same pattern as the self-avatar fix in [ProfileScreen.kt:106](apps/android/src/androidMain/kotlin/phantom/android/screens/profile/ProfileScreen.kt#L106).
+
+**When to do it:** Alpha 2 — bundle with the related Alpha 2 backlog items (per-message status indicators, encrypted profile sync). Not before NLnet (2026-06-01) submission; this is product polish, not a security or correctness blocker.
+
+**Risk note for the security review:** Avatar bytes flow through the existing Double Ratchet, so confidentiality and authenticity are already covered. The metadata exposure is the same as for any other message (relay sees envelope size; peer sees content). No additional trust assumptions.
+
+---
+
 ### Bug H-follow-up — `Alpha0IntegrationTest` also uses libsodium on JVM
 
 **File:** `shared/core/messaging/src/commonTest/kotlin/phantom/core/messaging/Alpha0IntegrationTest.kt`
