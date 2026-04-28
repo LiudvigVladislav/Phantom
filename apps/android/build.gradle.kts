@@ -55,6 +55,7 @@ kotlin {
             implementation(libs.ktor.client.okhttp)
             implementation(libs.ktor.client.websockets)
             implementation(libs.androidx.activity.compose)
+            implementation(libs.androidx.compose.ui.google.fonts)
             implementation(libs.zxing.core)
             implementation(libs.camerax.camera2)
             implementation(libs.camerax.lifecycle)

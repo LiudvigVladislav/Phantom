@@ -6,22 +6,26 @@ package phantom.android.ui.theme
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.googlefonts.Font as GoogleFontFont
+import androidx.compose.ui.text.googlefonts.GoogleFont
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 
 /**
  * PHANTOM type system — mirrors `Design/Primary/src/app/tokens.ts` `TS` object.
  *
- * Three font families: Geist (display/brand), Inter (UI text), JetBrains Mono
- * (technical / overlines). Today they fall back to system equivalents because
- * the .ttf files have not been dropped into `res/font/`. To activate the real
- * faces:
+ * Three font families:
+ *   - **Geist** (display / brand) — open-source variable font from Vercel.
+ *   - **Inter** (UI text) — open-source variable font.
+ *   - **JetBrains Mono** (technical / overlines) — open-source variable font.
  *
- *   1. Drop the variable .ttf files into
- *      `apps/android/src/androidMain/res/font/`
- *      (see `docs/font-setup/README.md` for filenames and download links).
- *   2. Replace the [PhantomFontGeist] / [PhantomFontInter] / [PhantomFontMono]
- *      values below with `FontFamily(Font(R.font.geist_variable, …))` etc.
+ * Fonts load via Google's Downloadable Fonts mechanism through Google Play
+ * Services. The first time the app needs Geist (or Inter, or JetBrains Mono),
+ * Play Services downloads and caches it system-wide; subsequent launches and
+ * other apps share that cache. No .ttf binaries are bundled with the apk, so
+ * the binary stays small and the licence does not have to travel with us.
  *
  * Production mapping (tokens.ts comment):
  *   Geist          → PP Neue Montreal (display / brand)
@@ -29,10 +33,46 @@ import androidx.compose.ui.unit.sp
  *   JetBrains Mono → Berkeley Mono (Pro tier — premium mono contexts)
  */
 
+// ── GOOGLE FONTS PROVIDER ───────────────────────────────────────────────────
+private val PhantomFontProvider = GoogleFont.Provider(
+    providerAuthority = "com.google.android.gms.fonts",
+    providerPackage   = "com.google.android.gms",
+    certificates      = R.array.com_google_android_gms_fonts_certs,
+)
+
+private fun phantomGoogleFont(
+    name: String,
+    weight: FontWeight,
+    style: FontStyle = FontStyle.Normal,
+) = GoogleFontFont(
+    googleFont   = GoogleFont(name),
+    fontProvider = PhantomFontProvider,
+    weight       = weight,
+    style        = style,
+)
+
 // ── FONT FAMILIES ───────────────────────────────────────────────────────────
-val PhantomFontGeist: FontFamily = FontFamily.Default      // TODO: swap to R.font.geist
-val PhantomFontInter: FontFamily = FontFamily.Default      // TODO: swap to R.font.inter
-val PhantomFontMono: FontFamily  = FontFamily.Monospace    // TODO: swap to R.font.jetbrains_mono
+val PhantomFontGeist: FontFamily = FontFamily(
+    phantomGoogleFont("Geist", FontWeight.Normal),
+    phantomGoogleFont("Geist", FontWeight.Medium),
+    phantomGoogleFont("Geist", FontWeight.SemiBold),
+    phantomGoogleFont("Geist", FontWeight.Bold),
+)
+
+val PhantomFontInter: FontFamily = FontFamily(
+    phantomGoogleFont("Inter", FontWeight.Normal),
+    phantomGoogleFont("Inter", FontWeight.Medium),
+    phantomGoogleFont("Inter", FontWeight.SemiBold),
+    phantomGoogleFont("Inter", FontWeight.Bold),
+    phantomGoogleFont("Inter", FontWeight.Normal, FontStyle.Italic),
+)
+
+val PhantomFontMono: FontFamily = FontFamily(
+    phantomGoogleFont("JetBrains Mono", FontWeight.Normal),
+    phantomGoogleFont("JetBrains Mono", FontWeight.Medium),
+    phantomGoogleFont("JetBrains Mono", FontWeight.SemiBold),
+    phantomGoogleFont("JetBrains Mono", FontWeight.Normal, FontStyle.Italic),
+)
 
 // ── TYPE SCALE ──────────────────────────────────────────────────────────────
 // Letter-spacing in TS is given in em (e.g. -0.01em). Compose accepts sp:

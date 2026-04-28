@@ -1,50 +1,73 @@
-# PHANTOM Fonts
+# PHANTOM Fonts — activated via Google Downloadable Fonts
 
-This directory holds the typeface binaries for the app. Today PhantomTypography
-falls back to Android's stock sans-serif and monospace because the .ttf files
-have not been committed yet — see the TODO comments in
-`apps/android/src/androidMain/kotlin/phantom/android/ui/theme/PhantomTypography.kt`.
+**Status (2026-04-29):** Geist, Inter, and JetBrains Mono are now active in
+the Android app via Google's Downloadable Fonts mechanism through Google Play
+Services. No .ttf binaries are bundled with the apk.
 
-## How to activate the design-system fonts
+## How it works
 
-1. **Download the variable .ttf files** from the upstream sources (open-source,
-   no license headers required for binaries shipped with an AGPL-3.0 client):
+`apps/android/src/androidMain/kotlin/phantom/android/ui/theme/PhantomTypography.kt`
+declares each family with `androidx.compose.ui.text.googlefonts.GoogleFont`.
+The font provider points at `com.google.android.gms.fonts` (Google Play
+Services Font Provider).
 
-   | Family | Source | Filename to drop here |
-   |---|---|---|
-   | Geist | https://github.com/vercel/geist-font/releases | `geist_variable.ttf` |
-   | Inter | https://github.com/rsms/inter/releases | `inter_variable.ttf` |
-   | JetBrains Mono | https://github.com/JetBrains/JetBrainsMono/releases | `jetbrains_mono_variable.ttf` |
+On first request, Play Services downloads the variable .ttf in the
+background and caches it system-wide. Subsequent launches and other apps that
+need the same family share that cache. The first text after a cold launch
+may render in a system fallback for a frame, then reflow once the variable
+font is cached — this is acceptable for our use case.
 
-   File names must be **lowercase, snake_case, only `[a-z0-9_]`** — Android's
-   resource compiler rejects camelCase and dashes.
+The certificate array required by the Compose `GoogleFont.Provider` API
+lives in `apps/android/src/androidMain/res/values/font_certs.xml`. Those
+values are public (Google publishes them) and match the
+`com.google.android.gms.fonts` content-provider authority.
 
-2. **Update `PhantomTypography.kt`** — replace each `FontFamily.Default` /
-   `FontFamily.Monospace` with the real family:
+## Why downloadable instead of bundled .ttf
+
+- **APK stays small.** A bundled variable Geist + Inter + JetBrains Mono
+  triplet is 1.5–2 MB; downloadable adds ~0 KB to the apk.
+- **No licence files travel with us.** The fonts are still SIL OFL 1.1, but
+  the licence text travels with Google's font cache, not our build.
+- **System-wide cache.** Other Compose apps that use the same families share
+  the same cached binary, so users only pay the download cost once.
+
+## Falling back to bundled .ttf (if you ever want offline-first)
+
+If a future build needs full offline-first font availability (e.g. a
+sandboxed device with no Google Play Services), you can revert to bundled
+fonts:
+
+1. Drop the variable .ttf files into
+   `apps/android/src/androidMain/res/font/` with these exact lowercase
+   `[a-z0-9_]` filenames:
+   - `geist_variable.ttf`
+   - `inter_variable.ttf`
+   - `jetbrains_mono_variable.ttf`
+
+   Sources (open-source, SIL OFL 1.1):
+   - https://github.com/vercel/geist-font/releases
+   - https://github.com/rsms/inter/releases
+   - https://github.com/JetBrains/JetBrainsMono/releases
+
+2. In `PhantomTypography.kt`, replace the GoogleFont-based families with
+   bundled-font definitions:
 
    ```kotlin
    import androidx.compose.ui.text.font.Font
-   import androidx.compose.ui.text.font.FontFamily
+   import phantom.android.R
 
    val PhantomFontGeist: FontFamily = FontFamily(
-       Font(R.font.geist_variable),
+       Font(R.font.geist_variable, FontWeight.Normal),
+       Font(R.font.geist_variable, FontWeight.Medium),
+       Font(R.font.geist_variable, FontWeight.SemiBold),
+       Font(R.font.geist_variable, FontWeight.Bold),
    )
-   val PhantomFontInter: FontFamily = FontFamily(
-       Font(R.font.inter_variable),
-   )
-   val PhantomFontMono: FontFamily = FontFamily(
-       Font(R.font.jetbrains_mono_variable),
-   )
+   // … same pattern for Inter and JetBrainsMono
    ```
 
-3. **Add the `R` import** at the top of `PhantomTypography.kt`:
-
-   ```kotlin
-   import phantom.android.R
-   ```
-
-4. **Rebuild.** Android Studio sometimes caches the resource table; if Compose
-   previews don't pick up the new fonts, re-sync gradle and clean-rebuild.
+3. Remove the `androidx-compose-ui-google-fonts` dependency from
+   `gradle/libs.versions.toml` and `apps/android/build.gradle.kts` if you
+   want to stop fetching via Play Services entirely.
 
 ## Production swap (later)
 
@@ -55,12 +78,7 @@ The design system maps prototype fonts to production fonts:
 - JetBrains Mono → **Berkeley Mono** (Pro tier — premium mono contexts) —
   paid licence required.
 
-When the licence is acquired, drop the new .ttf with the same filename pattern
-(`pp_neue_montreal_variable.ttf`, `berkeley_mono_variable.ttf`) and swap the
-font family in `PhantomTypography.kt`. No other code changes needed.
-
-## Why .ttf and not .otf
-
-Android's `R.font.*` resource compiler only accepts TrueType (.ttf) and XML
-font sets. Variable fonts shipped as TTF cover all 100–900 weights via axes,
-so we don't need separate Bold / Regular / Italic files.
+When the licence is acquired, the swap is local to `PhantomTypography.kt`:
+either point GoogleFont names at the new families (if Google adds them — PP
+Neue Montreal is not on Google Fonts), or swap to bundled .ttf per the
+fallback section above.

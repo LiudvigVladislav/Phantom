@@ -14,8 +14,7 @@ Material3 ColorScheme wired. Component reskin (Phase B) and animations
 | Code mirror | `apps/android/src/androidMain/kotlin/phantom/android/ui/theme/PhantomTokens.kt` | Kotlin port of `tokens.ts`. Mirror in lock-step. |
 | Code mirror | `apps/android/src/androidMain/kotlin/phantom/android/ui/theme/PhantomTypography.kt` | Type scale + font families |
 | Code mirror | `apps/android/src/androidMain/kotlin/phantom/android/ui/theme/PhantomTheme.kt` | Material3 wiring + back-compat aliases |
-| Fonts (instructions) | `docs/font-setup/README.md` | How to drop .ttf files in to activate Geist / Inter / JetBrains Mono |
-| Fonts (binaries — TBD) | `apps/android/src/androidMain/res/font/` | Place .ttf files here once downloaded (directory is created on demand) |
+| Fonts (active) | `apps/android/src/androidMain/kotlin/phantom/android/ui/theme/PhantomTypography.kt` | Geist / Inter / JetBrains Mono via Google Downloadable Fonts (Play Services). No .ttf bundling. See `docs/font-setup/README.md` for details and the offline-first fallback path. |
 
 When the designer ships a new revision of `tokens.ts`, the **only** change in
 client code is to update `PhantomTokens.kt` to match. All screens read tokens
