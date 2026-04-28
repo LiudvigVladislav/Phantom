@@ -5,73 +5,85 @@ package phantom.android.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.googlefonts.Font as GoogleFontFont
-import androidx.compose.ui.text.googlefonts.GoogleFont
 import androidx.compose.ui.unit.sp
 import phantom.android.R
 
 /**
  * PHANTOM type system — mirrors `Design/Primary/src/app/tokens.ts` `TS` object.
  *
- * Three font families:
- *   - **Geist** (display / brand) — open-source variable font from Vercel.
- *   - **Inter** (UI text) — open-source variable font.
- *   - **JetBrains Mono** (technical / overlines) — open-source variable font.
+ * Three font families, all bundled as variable .ttf binaries in
+ * `apps/android/src/androidMain/res/font/`:
  *
- * Fonts load via Google's Downloadable Fonts mechanism through Google Play
- * Services. The first time the app needs Geist (or Inter, or JetBrains Mono),
- * Play Services downloads and caches it system-wide; subsequent launches and
- * other apps share that cache. No .ttf binaries are bundled with the apk, so
- * the binary stays small and the licence does not have to travel with us.
+ *   - **Geist** (display / brand) — variable weight 100–900 in
+ *     `geist_variable.ttf`.
+ *   - **Inter** (UI text) — variable weight 100–900 in `inter_variable.ttf`.
+ *   - **JetBrains Mono** (technical / overlines) — variable weight 100–800
+ *     in `jetbrains_mono_variable.ttf`.
+ *
+ * Each `Font(...)` declaration pins the wght axis with [FontVariation.weight]
+ * so Compose's text engine pulls the right outline from the variable file
+ * instead of synthesising bold/medium from a single weight cut.
  *
  * Production mapping (tokens.ts comment):
- *   Geist          → PP Neue Montreal (display / brand)
- *   Inter          → Inter (unchanged for UI text)
- *   JetBrains Mono → Berkeley Mono (Pro tier — premium mono contexts)
+ *   Geist          → PP Neue Montreal (display / brand) — paid licence,
+ *                    bundled separately when activated.
+ *   Inter          → unchanged.
+ *   JetBrains Mono → Berkeley Mono (Pro tier — premium mono contexts).
  */
 
-// ── GOOGLE FONTS PROVIDER ───────────────────────────────────────────────────
-private val PhantomFontProvider = GoogleFont.Provider(
-    providerAuthority = "com.google.android.gms.fonts",
-    providerPackage   = "com.google.android.gms",
-    certificates      = R.array.com_google_android_gms_fonts_certs,
-)
-
-private fun phantomGoogleFont(
-    name: String,
-    weight: FontWeight,
-    style: FontStyle = FontStyle.Normal,
-) = GoogleFontFont(
-    googleFont   = GoogleFont(name),
-    fontProvider = PhantomFontProvider,
-    weight       = weight,
-    style        = style,
-)
-
 // ── FONT FAMILIES ───────────────────────────────────────────────────────────
+
+@OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
+private fun geistFont(weight: FontWeight) = Font(
+    R.font.geist_variable,
+    weight = weight,
+    style = FontStyle.Normal,
+    variationSettings = FontVariation.Settings(FontVariation.weight(weight.weight)),
+)
+
+@OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
+private fun interFont(weight: FontWeight, italic: Boolean = false) = Font(
+    R.font.inter_variable,
+    weight = weight,
+    style = if (italic) FontStyle.Italic else FontStyle.Normal,
+    variationSettings = FontVariation.Settings(FontVariation.weight(weight.weight)),
+)
+
+@OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
+private fun jetbrainsMonoFont(weight: FontWeight) = Font(
+    R.font.jetbrains_mono_variable,
+    weight = weight,
+    style = FontStyle.Normal,
+    variationSettings = FontVariation.Settings(FontVariation.weight(weight.weight)),
+)
+
 val PhantomFontGeist: FontFamily = FontFamily(
-    phantomGoogleFont("Geist", FontWeight.Normal),
-    phantomGoogleFont("Geist", FontWeight.Medium),
-    phantomGoogleFont("Geist", FontWeight.SemiBold),
-    phantomGoogleFont("Geist", FontWeight.Bold),
+    geistFont(FontWeight.Light),
+    geistFont(FontWeight.Normal),
+    geistFont(FontWeight.Medium),
+    geistFont(FontWeight.SemiBold),
+    geistFont(FontWeight.Bold),
 )
 
 val PhantomFontInter: FontFamily = FontFamily(
-    phantomGoogleFont("Inter", FontWeight.Normal),
-    phantomGoogleFont("Inter", FontWeight.Medium),
-    phantomGoogleFont("Inter", FontWeight.SemiBold),
-    phantomGoogleFont("Inter", FontWeight.Bold),
-    phantomGoogleFont("Inter", FontWeight.Normal, FontStyle.Italic),
+    interFont(FontWeight.Normal),
+    interFont(FontWeight.Medium),
+    interFont(FontWeight.SemiBold),
+    interFont(FontWeight.Bold),
+    interFont(FontWeight.Normal, italic = true),
+    interFont(FontWeight.Medium, italic = true),
 )
 
 val PhantomFontMono: FontFamily = FontFamily(
-    phantomGoogleFont("JetBrains Mono", FontWeight.Normal),
-    phantomGoogleFont("JetBrains Mono", FontWeight.Medium),
-    phantomGoogleFont("JetBrains Mono", FontWeight.SemiBold),
-    phantomGoogleFont("JetBrains Mono", FontWeight.Normal, FontStyle.Italic),
+    jetbrainsMonoFont(FontWeight.Normal),
+    jetbrainsMonoFont(FontWeight.Medium),
+    jetbrainsMonoFont(FontWeight.SemiBold),
+    jetbrainsMonoFont(FontWeight.Bold),
 )
 
 // ── TYPE SCALE ──────────────────────────────────────────────────────────────

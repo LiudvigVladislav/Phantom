@@ -257,10 +257,14 @@ private fun NavPillItem(
     onClick: () -> Unit,
 ) {
     val color = if (active) CyanAccent else TextDim
+    // Clip the tap target to the same RoundedCornerShape as the surrounding
+    // pill so the ripple stays inside a rounded rectangle instead of a
+    // square halo around the icon.
     Column(
         modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 4.dp, vertical = 6.dp),
+            .padding(horizontal = 12.dp, vertical = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {

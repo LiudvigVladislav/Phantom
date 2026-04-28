@@ -1,84 +1,74 @@
-# PHANTOM Fonts — activated via Google Downloadable Fonts
+# PHANTOM Fonts — bundled variable .ttf
 
-**Status (2026-04-29):** Geist, Inter, and JetBrains Mono are now active in
-the Android app via Google's Downloadable Fonts mechanism through Google Play
-Services. No .ttf binaries are bundled with the apk.
+**Status (2026-04-29):** Geist, Inter, and JetBrains Mono are bundled in
+the apk as variable .ttf binaries. No download, no Google Play Services
+dependency, no first-frame fallback.
 
-## How it works
+## Active fonts
 
+The variable .ttf files live under
+`apps/android/src/androidMain/res/font/`:
+
+| Family | File | Source |
+|---|---|---|
+| Geist | `geist_variable.ttf` | https://github.com/vercel/geist-font (SIL OFL 1.1) |
+| Inter | `inter_variable.ttf` | https://github.com/rsms/inter (SIL OFL 1.1) |
+| JetBrains Mono | `jetbrains_mono_variable.ttf` | https://github.com/JetBrains/JetBrainsMono (SIL OFL 1.1) |
+
+Each `Font(...)` declaration in
 `apps/android/src/androidMain/kotlin/phantom/android/ui/theme/PhantomTypography.kt`
-declares each family with `androidx.compose.ui.text.googlefonts.GoogleFont`.
-The font provider points at `com.google.android.gms.fonts` (Google Play
-Services Font Provider).
+pins the `wght` axis with `FontVariation.weight(weight.weight)` so Compose
+pulls the right outline from the variable file instead of synthesising
+bold/medium from a single regular cut.
 
-On first request, Play Services downloads the variable .ttf in the
-background and caches it system-wide. Subsequent launches and other apps that
-need the same family share that cache. The first text after a cold launch
-may render in a system fallback for a frame, then reflow once the variable
-font is cached — this is acceptable for our use case.
+## Apk size impact
 
-The certificate array required by the Compose `GoogleFont.Provider` API
-lives in `apps/android/src/androidMain/res/values/font_certs.xml`. Those
-values are public (Google publishes them) and match the
-`com.google.android.gms.fonts` content-provider authority.
+The three variable .ttf files together add ~1.2 MiB to the apk (Geist
+~130 KiB, Inter ~800 KiB, JetBrains Mono ~300 KiB). This is acceptable for
+a privacy-first app where we want zero network round-trips for the type
+system.
 
-## Why downloadable instead of bundled .ttf
-
-- **APK stays small.** A bundled variable Geist + Inter + JetBrains Mono
-  triplet is 1.5–2 MB; downloadable adds ~0 KB to the apk.
-- **No licence files travel with us.** The fonts are still SIL OFL 1.1, but
-  the licence text travels with Google's font cache, not our build.
-- **System-wide cache.** Other Compose apps that use the same families share
-  the same cached binary, so users only pay the download cost once.
-
-## Falling back to bundled .ttf (if you ever want offline-first)
-
-If a future build needs full offline-first font availability (e.g. a
-sandboxed device with no Google Play Services), you can revert to bundled
-fonts:
-
-1. Drop the variable .ttf files into
-   `apps/android/src/androidMain/res/font/` with these exact lowercase
-   `[a-z0-9_]` filenames:
-   - `geist_variable.ttf`
-   - `inter_variable.ttf`
-   - `jetbrains_mono_variable.ttf`
-
-   Sources (open-source, SIL OFL 1.1):
-   - https://github.com/vercel/geist-font/releases
-   - https://github.com/rsms/inter/releases
-   - https://github.com/JetBrains/JetBrainsMono/releases
-
-2. In `PhantomTypography.kt`, replace the GoogleFont-based families with
-   bundled-font definitions:
-
-   ```kotlin
-   import androidx.compose.ui.text.font.Font
-   import phantom.android.R
-
-   val PhantomFontGeist: FontFamily = FontFamily(
-       Font(R.font.geist_variable, FontWeight.Normal),
-       Font(R.font.geist_variable, FontWeight.Medium),
-       Font(R.font.geist_variable, FontWeight.SemiBold),
-       Font(R.font.geist_variable, FontWeight.Bold),
-   )
-   // … same pattern for Inter and JetBrainsMono
-   ```
-
-3. Remove the `androidx-compose-ui-google-fonts` dependency from
-   `gradle/libs.versions.toml` and `apps/android/build.gradle.kts` if you
-   want to stop fetching via Play Services entirely.
-
-## Production swap (later)
+## Production swap
 
 The design system maps prototype fonts to production fonts:
 
-- Geist → **PP Neue Montreal** (display / brand) — paid licence required.
-- Inter → unchanged.
-- JetBrains Mono → **Berkeley Mono** (Pro tier — premium mono contexts) —
-  paid licence required.
+- **Geist → PP Neue Montreal** (display / brand) — paid licence required.
+  When the licence is acquired, drop the licensed .otf cuts (or a single
+  variable .ttf if Pangram Pangram ships one) into `res/font/` as
+  `pp_neue_montreal_*.otf` (or `pp_neue_montreal_variable.ttf`) and swap
+  the `geistFont(...)` helper in `PhantomTypography.kt` to point at the
+  new resource. No call-site changes needed.
+- **Inter → unchanged.**
+- **JetBrains Mono → Berkeley Mono** (Pro tier — premium mono contexts) —
+  paid licence required. Same pattern: drop the licensed .otf into
+  `res/font/`, swap `jetbrainsMonoFont(...)` helper. The free JetBrains
+  Mono build can stay for free-tier users; gating is a runtime decision
+  based on subscription state.
 
-When the licence is acquired, the swap is local to `PhantomTypography.kt`:
-either point GoogleFont names at the new families (if Google adds them — PP
-Neue Montreal is not on Google Fonts), or swap to bundled .ttf per the
-fallback section above.
+## Filename rules
+
+Android's resource compiler is strict about font resource filenames:
+
+- **lowercase** only — `Geist-Variable.ttf` is rejected, `geist_variable.ttf`
+  works.
+- **`[a-z0-9_]` only** — no dashes, no dots beyond the extension, no
+  uppercase, no spaces.
+
+If you ever rename a font file, also update the `R.font.X` reference in
+`PhantomTypography.kt`.
+
+## Why bundled (not Google Downloadable Fonts)
+
+We previously routed the same families through Google's Downloadable
+Fonts mechanism via Google Play Services. That worked but had two
+costs:
+
+- A Google Play Services dependency on every device that wants the
+  designed look — not a fit for our "no Google services" privacy
+  posture.
+- A first-frame fallback to system sans-serif while the .ttf cached.
+
+Bundling the same .ttf files (also SIL OFL 1.1) cures both at the cost
+of ~1.2 MiB apk size. PP Neue Montreal is also not on Google Fonts, so
+when we move to production fonts the bundled path is what we'd need
+anyway — no point keeping two paths.
