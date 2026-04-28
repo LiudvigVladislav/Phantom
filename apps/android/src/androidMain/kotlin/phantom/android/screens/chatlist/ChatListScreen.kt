@@ -25,6 +25,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -80,11 +81,10 @@ fun ChatListScreen(
     var requestCount by remember { mutableStateOf(0) }
     var showAddDialog by remember { mutableStateOf(false) }
     var prefillContactString by remember { mutableStateOf("") }
-    var userName by remember { mutableStateOf("") }
-
-    LaunchedEffect(Unit) {
-        userName = container.identityRepo.loadIdentity()?.username ?: ""
-    }
+    val identity by container.identityState.collectAsState()
+    val userName = identity?.username ?: ""
+    val selfAvatarBitmap by container.selfAvatar.collectAsState()
+    val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
 
     LaunchedEffect(scannedQr) {
         if (scannedQr != null) {
@@ -131,6 +131,7 @@ fun ChatListScreen(
                 onProfile = onProfile,
                 onAddContact = { showAddDialog = true },
                 onScanQr = onScanQr,
+                avatarBitmap = selfAvatarImage,
             )
         },
     ) { padding ->

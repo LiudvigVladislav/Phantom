@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -34,8 +35,13 @@ import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -79,7 +85,7 @@ fun ProfileScreen(
     val context = LocalContext.current
     val prefs = remember { prefsOf(context) }
 
-    var identity by remember { mutableStateOf<IdentityRecord?>(null) }
+    val identity by container.identityState.collectAsState()
     var avatarBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
 
     // Profile field state
@@ -113,11 +119,12 @@ fun ProfileScreen(
             withContext(Dispatchers.Main) {
                 avatarBitmap = bmp?.asImageBitmap()
             }
+            // Notify other screens (top-bar avatar, etc.) that the file changed.
+            container.refreshSelfAvatar()
         }
     }
 
     LaunchedEffect(Unit) {
-        identity = container.identityRepo.loadIdentity()
         withContext(Dispatchers.IO) {
             firstName = prefs.getString("profile_first_name", "") ?: ""
             lastName = prefs.getString("profile_last_name", "") ?: ""
@@ -922,7 +929,14 @@ private fun FieldEditDialog(
     onSave: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var text by remember { mutableStateOf(initialValue) }
+    val isDateField = label == "Date of birth"
+
+    // For the date field we store digits only; the formatted "mm.dd.yyyy" view
+    // is produced by DateMmDdYyyyVisualTransformation, and dots are added back
+    // on save via formatDob().
+    var text by remember {
+        mutableStateOf(if (isDateField) initialValue.filter { it.isDigit() }.take(8) else initialValue)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -931,8 +945,23 @@ private fun FieldEditDialog(
         text = {
             OutlinedTextField(
                 value = text,
-                onValueChange = { text = it },
+                onValueChange = { newValue ->
+                    text = if (isDateField) newValue.filter { it.isDigit() }.take(8) else newValue
+                },
                 singleLine = true,
+                keyboardOptions = if (isDateField) {
+                    KeyboardOptions(keyboardType = KeyboardType.Number)
+                } else {
+                    KeyboardOptions.Default
+                },
+                visualTransformation = if (isDateField) {
+                    DateMmDdYyyyVisualTransformation
+                } else {
+                    VisualTransformation.None
+                },
+                placeholder = if (isDateField) {
+                    { Text("MM.DD.YYYY", color = TextDim.copy(alpha = 0.5f)) }
+                } else null,
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = TextPrimary,
                     unfocusedTextColor = TextPrimary,
@@ -944,7 +973,10 @@ private fun FieldEditDialog(
             )
         },
         confirmButton = {
-            TextButton(onClick = { onSave(text.trim()) }) {
+            TextButton(onClick = {
+                val saved = if (isDateField) formatDob(text) else text.trim()
+                onSave(saved)
+            }) {
                 Text("Save", color = CyanAccent)
             }
         },
@@ -954,6 +986,40 @@ private fun FieldEditDialog(
             }
         },
     )
+}
+
+// Display digits as "mm.dd.yyyy" (or partial: "mm", "mm.dd", "mm.dd.yy") while
+// the user types only digits. Caret offsets account for the inserted dots.
+private val DateMmDdYyyyVisualTransformation = VisualTransformation { input ->
+    val digits = input.text.filter { it.isDigit() }.take(8)
+    val formatted = buildString {
+        digits.forEachIndexed { i, c ->
+            if (i == 2 || i == 4) append('.')
+            append(c)
+        }
+    }
+    val mapping = object : OffsetMapping {
+        override fun originalToTransformed(offset: Int): Int {
+            val dotsBefore = (if (offset > 2) 1 else 0) + (if (offset > 4) 1 else 0)
+            return (offset + dotsBefore).coerceIn(0, formatted.length)
+        }
+        override fun transformedToOriginal(offset: Int): Int {
+            val dotsBefore = (if (offset > 2) 1 else 0) + (if (offset > 5) 1 else 0)
+            return (offset - dotsBefore).coerceIn(0, digits.length)
+        }
+    }
+    TransformedText(AnnotatedString(formatted), mapping)
+}
+
+// Persisted form: digits get dots inserted. Short inputs are saved as-is so the
+// user can type just "1225" → "12.25" (mm.dd) or "122526" → "12.25.26" (mm.dd.yy).
+private fun formatDob(rawDigits: String): String {
+    val d = rawDigits.filter { it.isDigit() }.take(8)
+    return when (d.length) {
+        in 0..2 -> d
+        in 3..4 -> d.substring(0, 2) + "." + d.substring(2)
+        else    -> d.substring(0, 2) + "." + d.substring(2, 4) + "." + d.substring(4)
+    }
 }
 
 // ── Delete account dialog ─────────────────────────────────────────────────────

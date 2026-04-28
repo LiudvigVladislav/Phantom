@@ -16,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -32,6 +33,7 @@ fun PhantomTopBar(
     onProfile: () -> Unit = {},
     onAddContact: () -> Unit = {},
     onScanQr: () -> Unit = {},
+    avatarBitmap: ImageBitmap? = null,
 ) {
     var showAvatarMenu by remember { mutableStateOf(false) }
     var showComposeMenu by remember { mutableStateOf(false) }
@@ -68,8 +70,17 @@ fun PhantomTopBar(
         ) {
             // Avatar + dropdown
             Box {
-                Box(modifier = Modifier.clickable { showAvatarMenu = !showAvatarMenu }) {
-                    GradientAvatar(name = userName.ifEmpty { "?" }, size = 36.dp, brushOverride = gradientBrush)
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { showAvatarMenu = !showAvatarMenu },
+                ) {
+                    GradientAvatar(
+                        name = userName.ifEmpty { "?" },
+                        size = 36.dp,
+                        brushOverride = gradientBrush,
+                        imageBitmap = avatarBitmap,
+                    )
                 }
                 DropdownMenu(
                     expanded = showAvatarMenu,

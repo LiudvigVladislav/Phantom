@@ -17,6 +17,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -39,11 +40,13 @@ fun CallsScreen(
     onProfile: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
-    var userName by remember { mutableStateOf("") }
+    val identity by container.identityState.collectAsState()
+    val userName = identity?.username ?: ""
+    val selfAvatarBitmap by container.selfAvatar.collectAsState()
+    val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
     var contacts by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
 
     LaunchedEffect(Unit) {
-        userName = container.identityRepo.loadIdentity()?.username ?: ""
         contacts = runCatching { container.conversationRepo.getActiveConversations() }.getOrElse { emptyList() }
     }
 
@@ -65,6 +68,7 @@ fun CallsScreen(
                 onProfile = onProfile,
                 onAddContact = { onNavigate(Screen.ChatList) },
                 onScanQr = { onNavigate(Screen.QrScan) },
+                avatarBitmap = selfAvatarImage,
             )
         },
     ) { padding ->

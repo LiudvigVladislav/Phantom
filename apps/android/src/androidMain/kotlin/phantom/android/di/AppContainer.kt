@@ -4,11 +4,17 @@
 package phantom.android.di
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import java.io.File
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import phantom.android.calls.CallManager
@@ -78,6 +84,37 @@ class AppContainer(private val context: Context) {
         repository = identityRepo,
     )
 
+    // In-memory cache of the current identity. Populated eagerly at startup and
+    // by initMessaging*; readers (ProfileScreen, top-bar avatar, etc.) collect
+    // this StateFlow instead of calling identityRepo.loadIdentity() per screen,
+    // which avoids the Keystore-decrypt round-trip on every navigation.
+    private val _identityState = MutableStateFlow<IdentityRecord?>(null)
+    val identityState: StateFlow<IdentityRecord?> = _identityState.asStateFlow()
+
+    // Self-avatar shared across screens (top-bar, chat list, settings, profile).
+    // Single source of truth; ProfileScreen calls refreshSelfAvatar() after the
+    // user picks a new photo, and any screen that observes selfAvatar updates.
+    private val avatarFile: File = File(context.filesDir, "profile_avatar.jpg")
+    private val _selfAvatar = MutableStateFlow<Bitmap?>(null)
+    val selfAvatar: StateFlow<Bitmap?> = _selfAvatar.asStateFlow()
+
+    fun refreshSelfAvatar() {
+        appScope.launch(Dispatchers.IO) {
+            _selfAvatar.value = if (avatarFile.exists()) {
+                BitmapFactory.decodeFile(avatarFile.absolutePath)
+            } else null
+        }
+    }
+
+    init {
+        appScope.launch {
+            if (_identityState.value == null) {
+                _identityState.value = identityRepo.loadIdentity()
+            }
+        }
+        refreshSelfAvatar()
+    }
+
     // ── Transport ─────────────────────────────────────────────────────────────
     val transport = KtorRelayTransport(createHttpClient())
 
@@ -111,6 +148,7 @@ class AppContainer(private val context: Context) {
         identity: phantom.core.identity.IdentityRecord,
         localKeyPair: phantom.core.crypto.DhKeyPair,
     ) {
+        _identityState.value = identity
         val sessionManager = SessionManager(x3dh, ratchetRepo, json)
         val service = DefaultMessagingService(
             identity = identity,
@@ -184,7 +222,9 @@ class AppContainer(private val context: Context) {
      */
     suspend fun initMessagingFromStorage() {
         if (messagingService != null) return
-        val record = identityRepo.loadIdentity() ?: return
+        val record = _identityState.value
+            ?: identityRepo.loadIdentity()?.also { _identityState.value = it }
+            ?: return
         val dhKeyPair = phantom.core.crypto.DhKeyPair(
             phantom.core.crypto.DhPublicKey(record.publicKeyHex.hexToByteArray()),
             phantom.core.crypto.DhPrivateKey(record.dhPrivateKeyHex.hexToByteArray()),

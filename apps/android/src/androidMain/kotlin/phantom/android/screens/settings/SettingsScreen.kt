@@ -16,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -38,11 +39,13 @@ fun SettingsScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
-    var userName by remember { mutableStateOf("") }
+    val identity by container.identityState.collectAsState()
+    val userName = identity?.username ?: ""
+    val selfAvatarBitmap by container.selfAvatar.collectAsState()
+    val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
     var privacyMode by remember { mutableStateOf("Standard") }
 
     LaunchedEffect(Unit) {
-        userName = container.identityRepo.loadIdentity()?.username ?: ""
         val prefs = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
         privacyMode = prefs.getString("privacy_mode", "Standard") ?: "Standard"
     }
@@ -79,6 +82,7 @@ fun SettingsScreen(
                 onProfile = onProfile,
                 onAddContact = { onNavigate(Screen.ChatList) },
                 onScanQr = { onNavigate(Screen.QrScan) },
+                avatarBitmap = selfAvatarImage,
             )
         },
     ) { padding ->
