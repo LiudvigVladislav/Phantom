@@ -11,18 +11,21 @@ object RelayTransportConfig {
     const val PING_INTERVAL_MS = 10_000L
 
     // If the relay has not emitted a Pong for this long, declare the connection
-    // dead and force a reconnect. ~2.5 × PING_INTERVAL_MS so a single dropped
-    // ping does not thrash the reconnect state machine; first detection happens
-    // on the next ping iteration after the timeout elapses.
-    const val PONG_TIMEOUT_MS = 25_000L
+    // dead and force a reconnect. Bumped from 25 s to 60 s so a slow uplink
+    // saturated by a large envelope (e.g. an 80 KB voice note over cellular on
+    // an aggressive-OEM device that parks the radio) does not get torn down
+    // mid-upload. App-level Ping frames are still sent every 10 s; this only
+    // controls how long we tolerate silence before force-reconnecting.
+    const val PONG_TIMEOUT_MS = 60_000L
 
     // How long a sent envelope may sit unacknowledged before it is treated as
-    // lost in transit. The frame may have been written into a half-dead socket
-    // that does not surface an exception; without this watchdog the envelope
-    // would never reach the relay and never be retried. On expiry the socket
-    // is closed (force-reconnect) and the envelope is re-enqueued at the head
-    // of pendingOutbox so it lands first on the next session.
-    const val ACK_TIMEOUT_MS = 15_000L
+    // lost in transit. Bumped from 15 s to 60 s for the same reason as
+    // PONG_TIMEOUT_MS — uploading a large payload on a slow link plus the
+    // relay's own queueing/persistence can easily exceed 15 s before the ack
+    // round-trips back to the client. On expiry the socket is closed
+    // (force-reconnect) and the envelope is re-enqueued at the head of
+    // pendingOutbox so it lands first on the next session.
+    const val ACK_TIMEOUT_MS = 60_000L
 
     // How often the watchdog scans pendingAcks for envelopes that have aged
     // past ACK_TIMEOUT_MS.
