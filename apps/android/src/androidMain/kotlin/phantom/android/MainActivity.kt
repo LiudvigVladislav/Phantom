@@ -105,6 +105,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.d("PHANTOM_INIT", "MainActivity onCreate")
+        // Block screenshots, screen recording, and the recents-thumbnail preview.
+        // FLAG_SECURE on the only Activity in the app is sufficient — there are
+        // no other Activity classes (one ComponentActivity, all screens are
+        // Compose). Windows that don't belong to MainActivity (system dialogs,
+        // BiometricPrompt, IME, OS notifications) are governed by the OS, not us.
+        window.setFlags(
+            android.view.WindowManager.LayoutParams.FLAG_SECURE,
+            android.view.WindowManager.LayoutParams.FLAG_SECURE,
+        )
         // Start the foreground service that owns the WebSocket connection lifetime.
         // The service awaits app.ready internally, so it is safe to launch before init completes.
         startForegroundService(Intent(this, PhantomMessagingService::class.java))
