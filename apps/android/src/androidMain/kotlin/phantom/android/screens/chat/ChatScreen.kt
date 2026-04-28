@@ -2100,20 +2100,22 @@ private fun InputBar(
 
             Spacer(Modifier.width(8.dp))
 
-            // Right: send button (text/edit) or mic button (empty/recording)
+            // Right: send button (text/edit) or mic button (empty/recording).
+            // Phase 2 mockup: 38dp circular Cyan with restrained glow
+            // (0 2px 10px rgba(0,212,255,0.10)) — present but never decorative.
             if ((text.isNotBlank() || isEditing) && !isRecording) {
                 Box(
                     modifier = Modifier
-                        .size(44.dp)
+                        .size(38.dp)
                         .shadow(
-                            elevation = 12.dp,
+                            elevation = 6.dp,
                             shape = CircleShape,
                             clip = false,
-                            spotColor = CyanAccent.copy(alpha = 0.5f),
-                            ambientColor = CyanAccent.copy(alpha = 0.2f),
+                            spotColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.18f),
+                            ambientColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.08f),
                         )
                         .clip(CircleShape)
-                        .background(CyanAccent)
+                        .background(PhantomTokens.Colors.Cyan)
                         .clickable(onClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             onSend()

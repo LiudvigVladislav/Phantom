@@ -75,9 +75,10 @@ fun PhantomTopBar(
                         .clip(CircleShape)
                         .clickable { showAvatarMenu = !showAvatarMenu },
                 ) {
+                    // Phase 2 mockup: 32dp avatar in the chats header.
                     GradientAvatar(
                         name = userName.ifEmpty { "?" },
-                        size = 36.dp,
+                        size = 32.dp,
                         brushOverride = gradientBrush,
                         imageBitmap = avatarBitmap,
                     )
@@ -112,14 +113,14 @@ fun PhantomTopBar(
                 }
             }
 
-            // PHANTOM wordmark centered
+            // PHANTOM wordmark centered. Phase 2 mockup: Geist 17sp 500
+            // with -0.01em tracking — clean brand mark, not a tech overline.
             Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
                 Text(
                     text = "PHANTOM",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Light,
-                    letterSpacing = 5.sp,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = (-0.17).sp,  // -0.01em × 17sp
                     color = TextPrimary,
                 )
             }
@@ -170,12 +171,12 @@ fun PhantomTopBar(
             }
         }
 
-        // Hairline divider
+        // Hairline divider — BorderSubtle from design system.
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(1.dp)
-                .background(Color.White.copy(alpha = 0.05f)),
+                .background(BorderSubtle),
         )
     }
 }
@@ -205,32 +206,40 @@ fun BottomNavPill(
     onTabSelected: (NavTab) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // Phase 2 mockup: 64dp tall, 16dp from bottom and sides, RoundedCornerShape
+    // 20dp (NOT a fully-rounded pill), Surface bg with BorderSubtle 1px outline.
+    // Active tab: Cyan icon + label visible. Inactive: icon TextTertiary, no
+    // label rendered (mockup leaves a 14dp empty slot to keep vertical rhythm).
     Box(
-        modifier = modifier.padding(bottom = 28.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
         contentAlignment = Alignment.TopCenter,
     ) {
         Row(
             modifier = Modifier
-                .clip(RoundedCornerShape(999.dp))
-                .background(Color(0xFF0F1318).copy(alpha = 0.94f))
-                .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(999.dp))
-                .padding(6.dp),
+                .fillMaxWidth()
+                .height(64.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(phantom.android.ui.theme.Surface)
+                .border(1.dp, phantom.android.ui.theme.BorderSubtle, RoundedCornerShape(20.dp)),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceAround,
         ) {
             NavPillItem(
-                icon = { color -> PhIconPhone(color = color, size = 18.dp) },
+                icon = { color -> PhIconPhone(color = color, size = 22.dp) },
                 label = "Calls",
                 active = activeTab == NavTab.CALLS,
                 onClick = { onTabSelected(NavTab.CALLS) },
             )
             NavPillItem(
-                icon = { color -> PhIconMessage(color = color, size = 18.dp) },
+                icon = { color -> PhIconMessage(color = color, size = 22.dp) },
                 label = "Chats",
                 active = activeTab == NavTab.CHATS,
                 onClick = { onTabSelected(NavTab.CHATS) },
             )
             NavPillItem(
-                icon = { color -> PhIconGear(color = color, size = 18.dp) },
+                icon = { color -> PhIconGear(color = color, size = 22.dp) },
                 label = "Settings",
                 active = activeTab == NavTab.SETTINGS,
                 onClick = { onTabSelected(NavTab.SETTINGS) },
@@ -247,23 +256,27 @@ private fun NavPillItem(
     onClick: () -> Unit,
 ) {
     val color = if (active) CyanAccent else TextDim
-    Row(
+    Column(
         modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(if (active) CyanAccent.copy(alpha = 0.12f) else Color.Transparent)
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(7.dp),
+            .padding(horizontal = 4.dp, vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
         icon(color)
-        Text(
-            text = label,
-            color = color,
-            fontSize = 12.sp,
-            fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
-            letterSpacing = 0.2.sp,
-        )
+        // Mockup: active shows label, inactive renders an empty 14dp slot so
+        // every tab keeps the same vertical rhythm.
+        if (active) {
+            Text(
+                text = label,
+                color = TextPrimary,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.2.sp,
+            )
+        } else {
+            Spacer(Modifier.height(14.dp))
+        }
     }
 }
 
