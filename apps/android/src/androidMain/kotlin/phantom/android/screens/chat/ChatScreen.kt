@@ -62,6 +62,8 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpOffset
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,7 +75,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.produceState
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import phantom.android.di.AppContainer
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
@@ -180,8 +184,14 @@ fun ChatScreen(
     // Pinned messages banner state — loaded once and refreshed after pin/unpin actions
     var pinnedMessages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
 
+    // Pinned messages — polled every 2 s instead of one-shot. TYPE_PIN
+    // arriving from the peer updates the local DB silently; without polling
+    // the banner would not refresh on the receiver's side.
     LaunchedEffect(conversationId) {
-        pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+        while (true) {
+            pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+            kotlinx.coroutines.delay(2_000)
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -720,11 +730,25 @@ fun ChatScreen(
             if (pinnedMessages.isNotEmpty()) {
                 item(key = "pinned_banner") {
                     val msg = pinnedMessages.last() // most recently pinned
+                    val pinnedIndex = remember(msg.id, chatItems) {
+                        chatItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == msg.id }
+                    }
+                    val selfPubKey = container.identityState.value?.publicKeyHex
+                    val pinnerLabel = when (msg.pinnedByPubkey) {
+                        null -> "Pinned"
+                        selfPubKey -> "Pinned by you"
+                        theirPublicKeyHex -> "Pinned by $theirUsername"
+                        else -> "Pinned"
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(Surface2)
-                            .clickable { /* TODO: scroll to pinned message */ }
+                            .background(Surface2.copy(alpha = 0.78f))
+                            .clickable {
+                                if (pinnedIndex >= 0) {
+                                    scope.launch { listState.animateScrollToItem(pinnedIndex) }
+                                }
+                            }
                             .padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -744,7 +768,7 @@ fun ChatScreen(
                         Spacer(Modifier.width(10.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Pinned message",
+                                text = pinnerLabel,
                                 color = CyanAccent,
                                 fontSize = 10.sp,
                                 fontFamily = FontFamily.Monospace,
@@ -756,6 +780,43 @@ fun ChatScreen(
                                 maxLines = 1,
                                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                             )
+                        }
+                        // Quick-unpin (local-only). Tapping the X removes the
+                        // banner without notifying the peer; for an unpin that
+                        // syncs both sides, use the message's long-press menu.
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .clickable {
+                                    scope.launch {
+                                        container.messageRepo.pinMessage(
+                                            messageId = msg.id,
+                                            pinned = false,
+                                            pinnedByPubkey = null,
+                                        )
+                                        pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+                                    }
+                                }
+                                .padding(8.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Canvas(modifier = Modifier.size(12.dp)) {
+                                val sw = 1.5.dp.toPx()
+                                drawLine(
+                                    color = TextDim,
+                                    start = Offset(0f, 0f),
+                                    end = Offset(size.width, size.height),
+                                    strokeWidth = sw,
+                                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                                )
+                                drawLine(
+                                    color = TextDim,
+                                    start = Offset(size.width, 0f),
+                                    end = Offset(0f, size.height),
+                                    strokeWidth = sw,
+                                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                                )
+                            }
                         }
                     }
                     HorizontalDivider(color = Color.White.copy(alpha = 0.04f))
@@ -831,6 +892,24 @@ fun ChatScreen(
                                         conversationId = conversationId,
                                         recipientPublicKeyHex = theirPublicKeyHex,
                                         pinned = !msg.pinned,
+                                    )
+                                    pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+                                }
+                            },
+                            onPinLocal = {
+                                // Local-only pin: write directly to the message
+                                // table without sending TYPE_PIN over the wire,
+                                // so the peer never learns this message was
+                                // pinned. Useful for personal bookmarks the
+                                // user does not want surfaced on the other
+                                // side.
+                                scope.launch {
+                                    val newPinned = !msg.pinned
+                                    val selfPubKey = container.identityState.value?.publicKeyHex
+                                    container.messageRepo.pinMessage(
+                                        messageId = msg.id,
+                                        pinned = newPinned,
+                                        pinnedByPubkey = if (newPinned) selfPubKey else null,
                                     )
                                     pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
                                 }
@@ -1018,15 +1097,24 @@ private fun MessageBubble(
     onCopy: (String) -> Unit,
     onForward: (cleanText: String, senderLabel: String) -> Unit,
     onPin: () -> Unit,
+    onPinLocal: () -> Unit,
 ) {
     val context = LocalContext.current
     val bubbleCoroutineScope = rememberCoroutineScope()
     val isSent = entity.sent
     val rawText = entity.plaintextCache ?: "•••"
     val timeStr = formatMessageTime(entity.createdAt)
-    var showActions by remember { mutableStateOf(false) }
+    // Single combined long-press panel — emoji row at top, action list
+    // already expanded below it. Replaces the previous two-step UX where the
+    // user had to tap "•••" inside the emoji popup to open a separate
+    // DropdownMenu.
+    var showActionPanel by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
-    var showReactionPicker by remember { mutableStateOf(false) }
+    var showPinChoice by remember { mutableStateOf(false) }
+    // Bubble bounds in window-pixel coordinates — used to position the
+    // long-press panel directly next to the tapped message instead of the
+    // screen centre.
+    var bubbleBoundsPx by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
 
     // Load reactions; polls every 2 s so real-time reactions appear without a full DB Flow.
     val reactions by produceState(initialValue = emptyList<ReactionEntry>(), key1 = entity.id) {
@@ -1164,9 +1252,12 @@ private fun MessageBubble(
                             shape = bubbleShape,
                         ) else Modifier.background(color = Surface, shape = bubbleShape)
                     )
+                    .onGloballyPositioned { coords ->
+                        bubbleBoundsPx = coords.boundsInWindow()
+                    }
                     .combinedClickable(
                         onClick = {},
-                        onLongClick = { showReactionPicker = true },
+                        onLongClick = { showActionPanel = true },
                     )
                     .padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp),
             ) {
@@ -1358,131 +1449,196 @@ private fun MessageBubble(
             }
             } // end outer Column (bubble + pills)
 
-            // Reaction emoji picker popup — shown on long-press
-            if (showReactionPicker) {
-                Popup(onDismissRequest = { showReactionPicker = false }) {
-                    Row(
+            // Combined long-press panel — emoji row at the top, compact
+            // action list expanded directly below. Rendered as a Dialog so we
+            // get a dimmed scrim and the panel does not eat the whole screen.
+            if (showActionPanel) {
+                val within24h = (System.currentTimeMillis() - entity.createdAt) < 24 * 60 * 60 * 1000L
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+                val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
+                val screenWidthPx  = with(density) { configuration.screenWidthDp.dp.toPx() }
+                val panelMaxWidthPx = with(density) { 280.dp.toPx() }
+                val panelEstimatedHeightPx = with(density) { 380.dp.toPx() }
+                val gapPx = with(density) { 8.dp.toPx() }
+                val sideMarginPx = with(density) { 16.dp.toPx() }
+                val topMarginPx = with(density) { 40.dp.toPx() }
+                androidx.compose.ui.window.Dialog(
+                    onDismissRequest = { showActionPanel = false },
+                    properties = androidx.compose.ui.window.DialogProperties(
+                        usePlatformDefaultWidth = false,
+                        dismissOnClickOutside = true,
+                    ),
+                ) {
+                    Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(24.dp))
-                            .background(Surface2)
-                            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(24.dp))
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.32f))
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                            ) { showActionPanel = false },
                     ) {
-                        REACTION_EMOJIS.forEach { emoji ->
-                            Text(
-                                text = emoji,
-                                fontSize = 22.sp,
-                                modifier = Modifier
-                                    .clip(CircleShape)
-                                    .clickable {
-                                        showReactionPicker = false
-                                        if (theirPublicKeyHex.isNotEmpty()) {
-                                            bubbleCoroutineScope.launch {
-                                                container.messagingService?.sendReaction(
-                                                    messageId = entity.id,
-                                                    conversationId = conversationId,
-                                                    recipientPublicKeyHex = theirPublicKeyHex,
-                                                    emoji = emoji,
-                                                )
-                                            }
-                                        }
-                                    }
-                                    .padding(6.dp),
-                            )
+                        // Compute panel offset relative to the long-pressed
+                        // bubble. Prefer placing the panel above the bubble;
+                        // fall back below if there is not enough room above.
+                        val bounds = bubbleBoundsPx
+                        val placeAbove = bounds != null && bounds.top > panelEstimatedHeightPx + gapPx + topMarginPx
+                        val panelXPx = (bounds?.left ?: (screenWidthPx / 2f - panelMaxWidthPx / 2f))
+                            .coerceIn(sideMarginPx, screenWidthPx - panelMaxWidthPx - sideMarginPx)
+                        val panelYPx = when {
+                            bounds == null ->
+                                // Fallback to vertical centre when bounds are unknown.
+                                (screenHeightPx / 2f - panelEstimatedHeightPx / 2f).coerceAtLeast(topMarginPx)
+                            placeAbove ->
+                                bounds.top - panelEstimatedHeightPx - gapPx
+                            else ->
+                                (bounds.bottom + gapPx)
+                                    .coerceAtMost(screenHeightPx - panelEstimatedHeightPx - sideMarginPx)
                         }
-                        // More actions — opens the full context menu
-                        Text(
-                            text = "•••",
-                            fontSize = 14.sp,
-                            color = TextDim,
+                        Column(
                             modifier = Modifier
-                                .clip(CircleShape)
-                                .clickable {
-                                    showReactionPicker = false
-                                    showActions = true
+                                .offset {
+                                    androidx.compose.ui.unit.IntOffset(
+                                        x = panelXPx.toInt(),
+                                        y = panelYPx.toInt(),
+                                    )
                                 }
-                                .padding(6.dp),
-                        )
+                                .widthIn(max = 280.dp)
+                                .wrapContentHeight()
+                                .clip(RoundedCornerShape(20.dp))
+                                .background(Surface.copy(alpha = 0.96f))
+                                .border(1.dp, Color.White.copy(alpha = 0.07f), RoundedCornerShape(20.dp))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                ) {}, // swallow taps so panel doesn't dismiss itself
+                        ) {
+                            // ── Emoji row (top) ──────────────────────────────
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceEvenly,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                REACTION_EMOJIS.forEach { emoji ->
+                                    Text(
+                                        text = emoji,
+                                        fontSize = 22.sp,
+                                        modifier = Modifier
+                                            .clip(CircleShape)
+                                            .clickable {
+                                                showActionPanel = false
+                                                if (theirPublicKeyHex.isNotEmpty()) {
+                                                    bubbleCoroutineScope.launch {
+                                                        container.messagingService?.sendReaction(
+                                                            messageId = entity.id,
+                                                            conversationId = conversationId,
+                                                            recipientPublicKeyHex = theirPublicKeyHex,
+                                                            emoji = emoji,
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            .padding(6.dp),
+                                    )
+                                }
+                            }
+                            HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
+                            // ── Action list (bottom, expanded) ───────────────
+                            ActionRow(icon = 0x21A9, label = "Reply") {
+                                showActionPanel = false; onReply()
+                            }
+                            if (isSent && within24h) {
+                                ActionRow(icon = 0x270F, label = "Edit") {
+                                    showActionPanel = false; onEdit()
+                                }
+                            }
+                            ActionRow(icon = 0x1F4CB, label = "Copy text") {
+                                showActionPanel = false; onCopy(rawText)
+                            }
+                            ActionRow(
+                                icon = 0x1F4CC,
+                                label = if (entity.pinned) "Unpin" else "Pin",
+                            ) {
+                                showActionPanel = false; showPinChoice = true
+                            }
+                            ActionRow(icon = 0x27A1, label = "Forward") {
+                                showActionPanel = false
+                                val senderLabel = if (entity.sent) "You" else theirUsername
+                                onForward(text, senderLabel)
+                            }
+                            ActionRow(icon = 0x1F516, label = "Save") {
+                                showActionPanel = false
+                                bubbleCoroutineScope.launch {
+                                    val savedConvId = "saved_messages_local"
+                                    container.messageRepo.insertMessage(
+                                        phantom.core.storage.MessageEntity(
+                                            id = com.benasher44.uuid.uuid4().toString(),
+                                            conversationId = savedConvId,
+                                            ciphertext = ByteArray(0),
+                                            plaintextCache = "↩ from @${if (entity.sent) "You" else theirUsername}\n$text",
+                                            sent = true,
+                                            status = phantom.core.storage.MessageStatus.DELIVERED,
+                                            createdAt = System.currentTimeMillis(),
+                                        )
+                                    )
+                                }
+                            }
+                            HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
+                            ActionRow(icon = 0x1F5D1, label = "Delete", danger = true) {
+                                showActionPanel = false; showDeleteDialog = true
+                            }
+                        }
                     }
                 }
             }
 
-            // Long-press context menu
-            val within24h = (System.currentTimeMillis() - entity.createdAt) < 24 * 60 * 60 * 1000L
-            DropdownMenu(
-                expanded = showActions,
-                onDismissRequest = { showActions = false },
-                containerColor = Surface2,
-                offset = DpOffset(0.dp, 4.dp),
-            ) {
-                DropdownMenuItem(
-                    leadingIcon = { MenuIcon(0x21A9) }, // ↩
-                    text = { Text("Reply", color = TextPrimary, fontSize = 14.sp) },
-                    onClick = { showActions = false; onReply() },
-                )
-                if (isSent && within24h) {
-                    DropdownMenuItem(
-                        leadingIcon = { MenuIcon(0x270F) }, // ✏
-                        text = { Text("Edit", color = TextPrimary, fontSize = 14.sp) },
-                        onClick = { showActions = false; onEdit() },
-                    )
-                }
-                DropdownMenuItem(
-                    leadingIcon = { MenuIcon(0x1F4CB) }, // 📋
-                    text = { Text("Copy text", color = TextPrimary, fontSize = 14.sp) },
-                    onClick = { showActions = false; onCopy(rawText) },
-                )
-                DropdownMenuItem(
-                    leadingIcon = { MenuIcon(0x1F4CC) }, // 📌
-                    text = {
+            // Pin sub-choice dialog — opened from the action panel's "Pin" row.
+            if (showPinChoice) {
+                AlertDialog(
+                    onDismissRequest = { showPinChoice = false },
+                    containerColor = Surface,
+                    title = {
                         Text(
-                            text = if (entity.pinned) "Unpin" else "Pin message",
+                            text = if (entity.pinned) "Unpin message" else "Pin message",
                             color = TextPrimary,
-                            fontSize = 14.sp,
+                            fontSize = 16.sp,
                         )
                     },
-                    onClick = {
-                        showActions = false
-                        onPin()
+                    text = {
+                        Text(
+                            text = if (entity.pinned) {
+                                "Choose where to unpin."
+                            } else {
+                                "Pin for everyone shows this message at the top of the chat for both of you. Pin for me keeps it private to your device."
+                            },
+                            color = TextDim,
+                            fontSize = 13.sp,
+                        )
                     },
-                )
-                DropdownMenuItem(
-                    leadingIcon = { MenuIcon(0x27A1) }, // ➡
-                    text = { Text("Forward", color = TextPrimary, fontSize = 14.sp) },
-                    onClick = {
-                        showActions = false
-                        val senderLabel = if (entity.sent) "You" else theirUsername
-                        onForward(text, senderLabel)
-                    },
-                )
-                DropdownMenuItem(
-                    leadingIcon = { MenuIcon(0x1F516) }, // 🔖
-                    text = { Text("Save", color = TextPrimary, fontSize = 14.sp) },
-                    onClick = {
-                        showActions = false
-                        bubbleCoroutineScope.launch {
-                            val savedConvId = "saved_messages_local"
-                            container.messageRepo.insertMessage(
-                                phantom.core.storage.MessageEntity(
-                                    id = com.benasher44.uuid.uuid4().toString(),
-                                    conversationId = savedConvId,
-                                    ciphertext = ByteArray(0),
-                                    plaintextCache = "↩ from @${if (entity.sent) "You" else theirUsername}\n$text",
-                                    sent = true,
-                                    status = phantom.core.storage.MessageStatus.DELIVERED,
-                                    createdAt = System.currentTimeMillis(),
-                                )
+                    confirmButton = {
+                        TextButton(onClick = { showPinChoice = false; onPin() }) {
+                            Text(
+                                text = if (entity.pinned) "Unpin for everyone" else "Pin for everyone",
+                                color = CyanAccent,
+                                fontSize = 14.sp,
                             )
                         }
                     },
-                )
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
-                DropdownMenuItem(
-                    leadingIcon = { MenuIcon(0x1F5D1) }, // 🗑
-                    text = { Text("Delete", color = Danger, fontSize = 14.sp) },
-                    onClick = { showActions = false; showDeleteDialog = true },
+                    dismissButton = {
+                        Row {
+                            TextButton(onClick = { showPinChoice = false; onPinLocal() }) {
+                                Text(
+                                    text = if (entity.pinned) "Unpin for me" else "Pin for me",
+                                    color = TextPrimary,
+                                    fontSize = 14.sp,
+                                )
+                            }
+                            TextButton(onClick = { showPinChoice = false }) {
+                                Text("Cancel", color = TextDim, fontSize = 14.sp)
+                            }
+                        }
+                    },
                 )
             }
         }
@@ -1497,6 +1653,30 @@ private fun MenuIcon(codePoint: Int) {
         fontSize = 16.sp,
         modifier = Modifier.size(20.dp),
     )
+}
+
+@Composable
+private fun ActionRow(
+    icon: Int,
+    label: String,
+    danger: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        MenuIcon(icon)
+        Text(
+            text = label,
+            color = if (danger) Danger else TextPrimary,
+            fontSize = 14.sp,
+        )
+    }
 }
 
 private fun formatMessageTime(millis: Long): String {

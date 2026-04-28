@@ -76,13 +76,17 @@ class SqlDelightMessageRepository(
             db.messageQueries.deleteExpiredMessages(nowMs)
         }
 
-    override suspend fun pinMessage(messageId: String, pinned: Boolean): Unit =
-        withContext(Dispatchers.IO) {
-            db.messageQueries.pinMessage(
-                pinned = if (pinned) 1L else 0L,
-                id = messageId,
-            )
-        }
+    override suspend fun pinMessage(
+        messageId: String,
+        pinned: Boolean,
+        pinnedByPubkey: String?,
+    ): Unit = withContext(Dispatchers.IO) {
+        db.messageQueries.pinMessage(
+            pinned = if (pinned) 1L else 0L,
+            pinnedByPubkey = pinnedByPubkey,
+            id = messageId,
+        )
+    }
 
     override suspend fun getPinnedMessages(conversationId: String): List<MessageEntity> =
         withContext(Dispatchers.IO) {
@@ -119,6 +123,7 @@ class SqlDelightMessageRepository(
         expiresAtMs = expires_at_ms,
         pinned = pinned != 0L,
         saved = saved != 0L,
+        pinnedByPubkey = pinned_by_pubkey,
     )
 
     private fun statusFromString(raw: String): MessageStatus =

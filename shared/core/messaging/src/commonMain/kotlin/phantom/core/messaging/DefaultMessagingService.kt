@@ -386,7 +386,16 @@ class DefaultMessagingService(
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_PIN && payload.targetMessageId.isNotEmpty()) {
-                messageRepository.pinMessage(payload.targetMessageId, payload.pinned ?: false)
+                // Whoever sent the wire message is the pinner. Store their
+                // pubkey so the banner can render "Pinned by <username>".
+                // On unpin (pinned=false) we clear the column to null so the
+                // next pin gets a fresh attribution.
+                val pinnedFlag = payload.pinned ?: false
+                messageRepository.pinMessage(
+                    messageId = payload.targetMessageId,
+                    pinned = pinnedFlag,
+                    pinnedByPubkey = if (pinnedFlag) senderPubKeyHex else null,
+                )
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_KEY_ROTATION) {
@@ -734,15 +743,33 @@ class DefaultMessagingService(
                 messageId = uuid4().toString(),
             )
         )
-        // Apply locally so the sender sees the pin state immediately
-        messageRepository.pinMessage(messageId, pinned)
+        // Apply locally so the sender sees the pin state immediately. We
+        // are the pinner — record our own pubkey so the banner reads
+        // "Pinned by you" on this side.
+        messageRepository.pinMessage(
+            messageId = messageId,
+            pinned = pinned,
+            pinnedByPubkey = if (pinned) identity.publicKeyHex else null,
+        )
     }
 
-    /** Strip reply prefix "> quote\n" so chat list shows the actual message. */
+    /** Strip reply prefix "> quote\n" and substitute media markers with
+     *  human-readable labels so chat list and notifications never leak the
+     *  raw `[AUDIO:base64...]` envelope. */
     private fun previewText(text: String): String {
-        if (!text.startsWith("> ")) return text.take(60)
-        val nl = text.indexOf('\n')
-        return if (nl in 1 until text.length) text.substring(nl + 1).take(60) else text.take(60)
+        // Body to inspect: drop reply quote first.
+        val body = if (text.startsWith("> ")) {
+            val nl = text.indexOf('\n')
+            if (nl in 1 until text.length) text.substring(nl + 1) else text
+        } else {
+            text
+        }
+        return when {
+            body.startsWith("[AUDIO:") -> "🎤 Voice message"
+            body.startsWith("[IMAGE:") -> "🖼️ Photo"
+            body.startsWith("[FILE:")  -> "📎 File"
+            else                       -> body.take(60)
+        }
     }
 }
 

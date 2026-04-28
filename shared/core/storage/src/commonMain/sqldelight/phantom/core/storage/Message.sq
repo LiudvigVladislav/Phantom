@@ -9,6 +9,7 @@ CREATE TABLE message (
     expires_at_ms INTEGER,
     pinned INTEGER NOT NULL DEFAULT 0,
     saved INTEGER NOT NULL DEFAULT 0,
+    pinned_by_pubkey TEXT,
     FOREIGN KEY(conversation_id) REFERENCES conversation(id) ON DELETE CASCADE
 );
 
@@ -53,7 +54,7 @@ getNextExpiry:
 SELECT MIN(expires_at_ms) AS next_expiry FROM message WHERE expires_at_ms IS NOT NULL AND expires_at_ms > :nowMs;
 
 pinMessage:
-UPDATE message SET pinned = :pinned WHERE id = :id;
+UPDATE message SET pinned = :pinned, pinned_by_pubkey = :pinnedByPubkey WHERE id = :id;
 
 getPinnedMessages:
 SELECT * FROM message WHERE conversation_id = :conversationId AND pinned = 1 ORDER BY created_at ASC;
