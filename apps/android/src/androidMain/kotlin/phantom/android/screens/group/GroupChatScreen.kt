@@ -291,12 +291,27 @@ fun GroupChatScreen(
 // ── Helper: start recording ────────────────────────────────────────────────────
 
 private fun startGroupRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder>? = runCatching {
-    val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.3gp")
+    // See startChatRecording() for the codec-selection rationale (Opus on
+    // API 29+, AAC fallback on API 26-28, mono 32 kbps Opus / 64 kbps AAC).
+    val useOpus = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
+    val ext = if (useOpus) "ogg" else "m4a"
+    val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.$ext")
     @Suppress("DEPRECATION")
     val recorder = android.media.MediaRecorder().apply {
         setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-        setOutputFormat(android.media.MediaRecorder.OutputFormat.THREE_GPP)
-        setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AMR_NB)
+        if (useOpus) {
+            setOutputFormat(android.media.MediaRecorder.OutputFormat.OGG)
+            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.OPUS)
+            setAudioSamplingRate(48_000)
+            setAudioChannels(1)
+            setAudioEncodingBitRate(48_000)
+        } else {
+            setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
+            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
+            setAudioSamplingRate(44_100)
+            setAudioChannels(1)
+            setAudioEncodingBitRate(64_000)
+        }
         setOutputFile(file.absolutePath)
         prepare()
         start()

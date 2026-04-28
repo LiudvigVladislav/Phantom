@@ -1897,12 +1897,36 @@ private fun InputBar(
 // ── Recording helper ──────────────────────────────────────────────────────────
 
 private fun startChatRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder> {
-    val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.3gp")
+    // Codec selection by API level. Voice notes inline as base64 in the chat
+    // payload, so smaller is better. Mono is intentional — at the same bitrate
+    // it sounds cleaner than stereo for speech and halves payload size, which
+    // matters on slow uplinks (Bug J / ISSUE-001 Tecno radio parking). A
+    // stereo voice-notes mode is reserved for the future Plus tier.
+    val useOpus = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
+    val ext = if (useOpus) "ogg" else "m4a"
+    val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.$ext")
     @Suppress("DEPRECATION")
     val recorder = android.media.MediaRecorder().apply {
         setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-        setOutputFormat(android.media.MediaRecorder.OutputFormat.THREE_GPP)
-        setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AMR_NB)
+        if (useOpus) {
+            // OGG + Opus, 48 kHz mono, 48 kbps — comfortably above the
+            // transparent-voice threshold (~24-32 kbps). Extra headroom helps
+            // on cheap OEM mics (Tecno-class) where the captured signal has
+            // more noise that needs more bits to encode without artefacts.
+            setOutputFormat(android.media.MediaRecorder.OutputFormat.OGG)
+            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.OPUS)
+            setAudioSamplingRate(48_000)
+            setAudioChannels(1)
+            setAudioEncodingBitRate(48_000)
+        } else {
+            // Pre-API-29 fallback: AAC in MPEG-4 container. Still vastly better
+            // than the legacy AMR_NB this code used before.
+            setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
+            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
+            setAudioSamplingRate(44_100)
+            setAudioChannels(1)
+            setAudioEncodingBitRate(64_000)
+        }
         setOutputFile(file.absolutePath)
         prepare()
         start()
