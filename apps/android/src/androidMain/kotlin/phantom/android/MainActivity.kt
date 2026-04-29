@@ -337,6 +337,9 @@ private fun PhantomApp(
             container = container,
             onBack = { currentScreen = Screen.ChatList },
             onContactProfile = { currentScreen = Screen.ContactProfile(screen.conversationId, screen.theirUsername) },
+            onStartVoiceCall = {
+                currentScreen = Screen.ActiveCall(screen.conversationId, screen.theirUsername)
+            },
         )
         is Screen.ContactProfile -> ContactProfileScreen(
             conversationId = screen.conversationId,
