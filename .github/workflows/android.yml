@@ -72,19 +72,25 @@ jobs:
         run: chmod +x ./gradlew
 
       # Common tests run on JVM target — fast, no Android SDK required.
-      # These cover the actual cryptographic and protocol logic
-      # (LibsodiumIdentityCryptoTest, IdentityManagerTest, FakeRelayTransportTest,
-      # RelayMessageSerializationTest, InMemoryRepositoryTest,
-      # DefaultMessagingServiceTest, Alpha0IntegrationTest).
-      - name: Run shared/core JVM tests
-        run: |
-          ./gradlew \
-            :shared:core:identity:jvmTest \
-            :shared:core:crypto:jvmTest \
-            :shared:core:storage:jvmTest \
-            :shared:core:transport:jvmTest \
-            :shared:core:messaging:jvmTest \
-            --stacktrace
+      # Modules split across separate steps so a failure pinpoints exactly
+      # which module's tests broke without grep-archeology in the combined
+      # log. Each step uses --info for verbose output the first time
+      # through; tighten back down once CI is green and we trust the
+      # baseline.
+      - name: Test :shared:core:identity (jvm)
+        run: ./gradlew :shared:core:identity:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:crypto (jvm)
+        run: ./gradlew :shared:core:crypto:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:storage (jvm)
+        run: ./gradlew :shared:core:storage:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:transport (jvm)
+        run: ./gradlew :shared:core:transport:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:messaging (jvm)
+        run: ./gradlew :shared:core:messaging:jvmTest --stacktrace --info
 
       # Android debug build — exercises full assembly pipeline including
       # SQLDelight code-gen, Compose compiler, AGP 9.1.1.
