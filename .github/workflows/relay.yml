@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Relay CI — split into a hard `build-test` gate and an advisory `lint` job.
+#   build-test: cargo build (release) + cargo test on the workspace. Must pass.
+#               Mirrors the command sequence used by services/relay/Dockerfile.
+#   lint:       cargo fmt --check + cargo clippy with -D warnings.
+#               continue-on-error so style drift surfaces in PR review without
+#               blocking merge while the team agrees on a baseline. Tighten by
+#               dropping continue-on-error once the lint debt is paid down.
+
+name: Relay CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'services/**'
+      - '.github/workflows/relay.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'services/**'
+      - '.github/workflows/relay.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: relay-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: services
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services
+
+      - name: Build release
+        run: cargo build --workspace --release
+
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Upload relay binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantom-relay-binary
+          path: services/target/release/phantom-relay
+          retention-days: 7
+          if-no-files-found: error
+
+  lint:
+    # Advisory only — does not block PR merge yet. See header for rationale.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: services
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain (with clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services
+          # Read-only — don't poison the build-test cache with lint-only deps.
+          save-if: 'false'
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: Clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true

@@ -148,9 +148,9 @@ private class FakeMessageRepository : MessageRepository {
         store.removeAll { msg -> msg.expiresAtMs?.let { it <= now } == true }
     }
 
-    override suspend fun pinMessage(messageId: String, pinned: Boolean) {
+    override suspend fun pinMessage(messageId: String, pinned: Boolean, pinnedByPubkey: String?) {
         val index = store.indexOfFirst { it.id == messageId }
-        if (index != -1) store[index] = store[index].copy(pinned = pinned)
+        if (index != -1) store[index] = store[index].copy(pinned = pinned, pinnedByPubkey = pinnedByPubkey)
     }
 
     override suspend fun getPinnedMessages(conversationId: String): List<MessageEntity> =

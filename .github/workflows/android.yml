@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Android CI — assembleDebug + jvmTest across all shared/core modules.
+# androidInstrumentedTest is intentionally NOT run here (requires emulator;
+# slow + flaky on free runners). Add a separate gated workflow if needed.
+
+name: Android CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # ubuntu-latest GitHub-hosted runners ALREADY ship a complete Android
+      # SDK at /usr/local/lib/android/sdk with platform-tools, multiple
+      # build-tools versions, and android-35 platform. ANDROID_HOME and
+      # ANDROID_SDK_ROOT are exported by the runner image itself.
+      #
+      # The previous attempt to use android-actions/setup-android@v3 hit
+      # an interactive license prompt that auto-accept could not handle
+      # ("6 of 7 SDK package licenses not accepted. Review licenses ...
+      # (y/N)?" — sdkmanager waited for input despite the action's
+      # accept-android-sdk-licenses flag).
+      #
+      # `yes | sdkmanager --licenses` reliably accepts every outstanding
+      # licence by piping "y" into the prompt. `|| true` keeps the step
+      # green even on partial-accept paths.
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Set up Gradle (caches dependencies, daemons, configuration cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      # NOTE: `gradle/actions/wrapper-validation` is intentionally NOT used yet.
+      # The action validates gradle-wrapper.jar against a hard-coded trusted
+      # checksum set, and Gradle 9.3.1 (released 2025) is too new for the
+      # action's published trust list as of this commit — the validation
+      # fails before the build even starts. Re-enable once the action's
+      # checksum DB catches up to Gradle 9.x.
+
+      # The repository is developed primarily on Windows, where file system
+      # permissions are not preserved in git. Linux runners check out
+      # `gradlew` without the execute bit set (`./gradlew: Permission
+      # denied`, exit code 126). Restore it here so the wrapper invocations
+      # below succeed. The persistent fix is one git operation
+      # (`git update-index --chmod=+x gradlew && git commit`) but until
+      # someone on a Unix host runs that, this CI step keeps the workflow
+      # green.
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # Common tests run on JVM target — fast, no Android SDK required.
+      # Modules split across separate steps so a failure pinpoints exactly
+      # which module's tests broke without grep-archeology in the combined
+      # log. Each step uses --info for verbose output the first time
+      # through; tighten back down once CI is green and we trust the
+      # baseline.
+      - name: Test :shared:core:identity (jvm)
+        run: ./gradlew :shared:core:identity:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:crypto (jvm)
+        run: ./gradlew :shared:core:crypto:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:storage (jvm)
+        run: ./gradlew :shared:core:storage:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:transport (jvm)
+        run: ./gradlew :shared:core:transport:jvmTest --stacktrace --info
+
+      - name: Test :shared:core:messaging (jvm)
+        run: ./gradlew :shared:core:messaging:jvmTest --stacktrace --info
+
+      # Android debug build — exercises full assembly pipeline including
+      # SQLDelight code-gen, Compose compiler, AGP 9.1.1.
+      - name: Build Android debug APK
+        run: ./gradlew :apps:android:assembleDebug --stacktrace
+
+      - name: Upload debug APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantom-debug-apk
+          path: apps/android/build/outputs/apk/debug/*.apk
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            shared/core/*/build/reports/tests/
+            shared/core/*/build/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Capture every Kotlin compile / KSP / SQLDelight code-gen log on
+      # failure so we don't need to grep through the GitHub Actions log
+      # viewer manually. This bundle is the fastest way to diagnose
+      # compile errors on Linux runners that don't reproduce locally on
+      # Windows (case-sensitivity, file-path issues, native lib loaders,
+      # etc).
+      - name: Upload Gradle build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-logs
+          path: |
+            shared/core/*/build/kotlin/
+            shared/core/*/build/reports/
+            shared/core/*/build/tmp/
+            ~/.gradle/daemon/*/daemon-*.out.log
+          retention-days: 7
+          if-no-files-found: ignore

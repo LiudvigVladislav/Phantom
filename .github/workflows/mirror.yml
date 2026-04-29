@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Codeberg mirror — pushes master to codeberg.org/LiudvigVladislav/Phantom
+# on every successful push to master. Manual fallback also available via
+# workflow_dispatch.
+#
+# Setup (one-time, before this workflow can succeed):
+#   1. Generate ed25519 SSH keypair locally:
+#        ssh-keygen -t ed25519 -f phantom-codeberg -C "github-actions-mirror"
+#   2. Add the PUBLIC key as a deploy key on Codeberg
+#      (Settings → Deploy Keys → Add, "Allow write access" enabled)
+#   3. Add the PRIVATE key as a GitHub repository secret named
+#        CODEBERG_DEPLOY_KEY
+#   4. Set CODEBERG_REPO_URL repository variable to the SSH clone URL,
+#      e.g. git@codeberg.org:LiudvigVladislav/Phantom.git
+#
+# Until the secret + variable are in place this workflow will fail
+# fast with a clear error message — that is intentional, not a bug.
+
+name: Mirror to Codeberg
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-codeberg
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  push-mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Verify mirror configuration
+        run: |
+          if [ -z "${{ secrets.CODEBERG_DEPLOY_KEY }}" ]; then
+            echo "::error::CODEBERG_DEPLOY_KEY secret is not set. See .github/workflows/mirror.yml header for setup."
+            exit 1
+          fi
+          if [ -z "${{ vars.CODEBERG_REPO_URL }}" ]; then
+            echo "::error::CODEBERG_REPO_URL repository variable is not set. See .github/workflows/mirror.yml header for setup."
+            exit 1
+          fi
+
+      # Full clone with all branches + tags so the mirror is complete,
+      # not just a single-commit shallow snapshot.
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up SSH for Codeberg
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.CODEBERG_DEPLOY_KEY }}" > ~/.ssh/codeberg
+          chmod 600 ~/.ssh/codeberg
+          ssh-keyscan -H codeberg.org >> ~/.ssh/known_hosts 2>/dev/null
+          cat <<EOF >> ~/.ssh/config
+          Host codeberg.org
+            IdentityFile ~/.ssh/codeberg
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Push to Codeberg mirror
+        run: |
+          git remote add codeberg "${{ vars.CODEBERG_REPO_URL }}"
+          # --mirror sends every ref (branches, tags) and removes anything
+          # on the destination that no longer exists locally. This keeps
+          # Codeberg byte-for-byte identical to GitHub.
+          git push --mirror codeberg

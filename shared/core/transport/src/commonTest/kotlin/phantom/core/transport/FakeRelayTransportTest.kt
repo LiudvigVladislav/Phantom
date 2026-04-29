@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -120,15 +121,25 @@ class FakeRelayTransportTest {
         transport.connect("ws://relay", "pubkey")
 
         val collected = mutableListOf<String>()
-        val job = kotlinx.coroutines.launch {
+        // `launch` is a CoroutineScope extension; inside runTest the
+        // lambda receiver is the TestScope so the unqualified call
+        // resolves correctly.
+        val job = launch {
             transport.typingEvents.collect { collected.add(it) }
         }
 
+        // CRITICAL ordering: pump the scheduler once BEFORE emitting so
+        // the collector actually subscribes to the SharedFlow. If we emit
+        // first, MutableSharedFlow(replay = 0) drops the values because
+        // it has no subscribers yet — that's how the assertion came up
+        // with `expected:<2> but was:<0>`.
+        testScheduler.runCurrent()
+
         transport.sendTyping("alice-key")
         transport.sendTyping("alice-key")
 
-        // Allow emissions to propagate
-        kotlinx.coroutines.yield()
+        // Drain the now-pending emissions to the live collector.
+        testScheduler.runCurrent()
         job.cancel()
 
         assertEquals(2, collected.size)

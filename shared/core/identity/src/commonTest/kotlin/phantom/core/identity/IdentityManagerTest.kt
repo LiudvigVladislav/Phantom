@@ -3,12 +3,19 @@
 
 package phantom.core.identity
 
+import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 
+/**
+ * See `LibsodiumIdentityCryptoTest` header comment for why every test
+ * here begins with `LibsodiumInitializer.initialize()`. The JVM target
+ * uses JNA and the lateinit `sodiumJna` property must be populated
+ * before any `Box.keypair()` call.
+ */
 class IdentityManagerTest {
 
     private fun makeManager(repo: FakeIdentityRepository = FakeIdentityRepository()): Pair<IdentityManager, FakeIdentityRepository> {
@@ -19,6 +26,7 @@ class IdentityManagerTest {
 
     @Test
     fun createOrLoad_createsNewIdentityWhenNoneExists() = runTest {
+        LibsodiumInitializer.initialize()
         val (manager, repo) = makeManager()
         assertNull(repo.loadIdentity())
 
@@ -33,6 +41,7 @@ class IdentityManagerTest {
 
     @Test
     fun createOrLoad_returnsExistingIdentityWhenAlreadyCreated() = runTest {
+        LibsodiumInitializer.initialize()
         val (manager, _) = makeManager()
         val (firstRecord, _) = manager.createOrLoad("alice")
 
@@ -44,12 +53,14 @@ class IdentityManagerTest {
 
     @Test
     fun getIdentity_returnsNullBeforeCreation() = runTest {
+        LibsodiumInitializer.initialize()
         val (manager, _) = makeManager()
         assertNull(manager.getIdentity())
     }
 
     @Test
     fun getIdentity_returnsRecordAfterCreation() = runTest {
+        LibsodiumInitializer.initialize()
         val (manager, _) = makeManager()
         manager.createOrLoad("bob")
         val identity = manager.getIdentity()
