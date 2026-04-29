@@ -304,6 +304,11 @@ private fun PhantomApp(
         is Screen.Premium -> phantom.android.screens.premium.PremiumScreen(
             onBack = { currentScreen = Screen.Settings },
         )
+        is Screen.AddContact -> phantom.android.screens.addcontact.AddContactScreen(
+            container = container,
+            onNavigate = { currentScreen = it },
+            onBack = { currentScreen = Screen.ChatList },
+        )
         is Screen.Settings -> SettingsScreen(
             container = container,
             onNavigate = { currentScreen = it },

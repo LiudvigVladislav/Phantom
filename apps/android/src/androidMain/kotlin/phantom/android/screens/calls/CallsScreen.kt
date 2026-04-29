@@ -78,12 +78,16 @@ fun CallsScreen(
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 180.dp),
-            ) {
-                // ── Contact list with "Call" button ─────────────────────
-                if (contacts.isNotEmpty()) {
+            if (contacts.isEmpty()) {
+                // No contacts → show the canonical EmptyCalls state behind the
+                // bottom-nav pill. Keeps the Calls tab feeling architectural
+                // even before any call history exists.
+                EmptyCalls()
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(bottom = 180.dp),
+                ) {
                     item {
                         SectionHeader(text = "Contacts")
                     }
@@ -98,14 +102,9 @@ fun CallsScreen(
                             },
                         )
                     }
-                }
 
-                // ── Recent call history — coming soon ──────────────────
-                item {
-                    SectionHeader(text = "Recent")
-                }
-                item {
-                    ComingSoonBanner()
+                    item { SectionHeader(text = "Recent") }
+                    item { ComingSoonBanner() }
                 }
             }
 

@@ -46,6 +46,7 @@ fun SettingsScreen(
     val selfAvatarBitmap by container.selfAvatar.collectAsState()
     val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
     var privacyMode by remember { mutableStateOf("Standard") }
+    var showBackupSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         val prefs = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
@@ -376,6 +377,71 @@ fun SettingsScreen(
                     }
                 }
 
+                // Advanced — Data export + Clear cache (FULL_COMPOSE §06).
+                // "Export data" opens the BackupExport bottom-sheet (§14).
+                // Real export wiring lands with the BackupExport milestone;
+                // the sheet exists now so the IA matches the canonical doc.
+                item { SettingsGroupHeader("Advanced") }
+                item {
+                    SettingsGroupCard {
+                        SettingsRowItem(
+                            icon = { PhIconDownload(color = CyanAccent, size = 16.dp) },
+                            label = "Export data",
+                            value = "Encrypted",
+                            onClick = { showBackupSheet = true },
+                        )
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                        SettingsRowItem(
+                            icon = { PhIconTrash(color = CyanAccent, size = 16.dp) },
+                            label = "Clear cache",
+                            value = null,
+                            onClick = { showComingSoon() },
+                        )
+                    }
+                }
+
+                // Danger zone — destructive actions, danger-tinted, isolated
+                // from the rest of the list.
+                item { SettingsGroupHeader("Danger zone") }
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(PhantomTokens.Colors.SurfaceElevated)
+                            .border(
+                                1.dp,
+                                Danger.copy(alpha = 0.30f),
+                                RoundedCornerShape(12.dp),
+                            ),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onNavigate(Screen.Profile) }
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier.size(20.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                PhIconTrash(color = Danger, size = 16.dp)
+                            }
+                            Text(
+                                text = "Delete account",
+                                color = Danger,
+                                fontSize = 15.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                            PhIconChevron(color = Danger.copy(alpha = 0.6f), size = 14.dp)
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
+
                 // About — version + categorised contact addresses (per
                 // SECURITY.md / Releases/README.md routing table). Each entry
                 // launches an ACTION_SENDTO intent so the user picks their own
@@ -456,6 +522,23 @@ fun SettingsScreen(
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
         }
+    }
+
+    if (showBackupSheet) {
+        val identity by container.identityState.collectAsState()
+        val pubKey = identity?.publicKeyHex.orEmpty()
+        val fingerprint = remember(pubKey) {
+            if (pubKey.length >= 32) pubKey.substring(0, 32).uppercase().chunked(4).joinToString("  ")
+            else ""
+        }
+        BackupExportSheet(
+            fingerprint = fingerprint,
+            onExport = {
+                showBackupSheet = false
+                showComingSoon()
+            },
+            onDismiss = { showBackupSheet = false },
+        )
     }
 }
 

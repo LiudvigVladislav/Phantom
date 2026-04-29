@@ -326,23 +326,16 @@ private fun ChatsTab(
             }
         }
 
-        if (conversations.isEmpty() && requestCount == 0 && searchQuery.isBlank()) {
+        if (conversations.isEmpty() && requestCount == 0 && searchQuery.isBlank() && groups.isEmpty()) {
             item {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(32.dp),
-                    contentAlignment = Alignment.Center,
+                        .height(420.dp),
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("No conversations yet", color = TextDim, fontSize = 15.sp)
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = "Tap the compose button to add a contact",
-                            color = TextDim.copy(alpha = 0.6f),
-                            fontSize = 13.sp,
-                        )
-                    }
+                    EmptyChats(
+                        onAddContact = { onNavigate(Screen.AddContact) },
+                    )
                 }
             }
         }

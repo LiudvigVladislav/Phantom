@@ -82,12 +82,95 @@ fun ActiveCallScreen(
                 .padding(horizontal = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.weight(0.7f))
 
-            // Static avatar (no animation during active call)
+            // PHANTOM_FULL_COMPOSE §08 State B — name Geist 28px, "Connected"
+            // success-green status pill, timer JetBrains Mono 56px (the
+            // typographic centerpiece), avatar 80dp.
+            Text(
+                text = call.remoteUsername,
+                color = TextPrimary,
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.28).sp,
+            )
+
+            Spacer(Modifier.height(10.dp))
+
+            when (call.state) {
+                CallState.IN_CALL -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(Success),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "Connected",
+                            color = Success,
+                            fontSize = 11.sp,
+                            fontFamily = PhantomFontMono,
+                            letterSpacing = 1.6.sp,
+                        )
+                    }
+                }
+                CallState.CALLING -> Text(
+                    text = "CALLING…",
+                    color = TextDim,
+                    fontSize = 11.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 1.6.sp,
+                )
+                CallState.RINGING -> Text(
+                    text = "CONNECTING…",
+                    color = TextDim,
+                    fontSize = 11.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 1.6.sp,
+                )
+                CallState.ENDED -> Text(
+                    text = "CALL ENDED",
+                    color = TextDim,
+                    fontSize = 11.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 1.6.sp,
+                )
+                CallState.REJECTED -> Text(
+                    text = "CALL DECLINED",
+                    color = Danger,
+                    fontSize = 11.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 1.6.sp,
+                )
+                else -> {}
+            }
+
+            Spacer(Modifier.height(28.dp))
+
+            // The timer — Mono 56px, the typographic centerpiece per the
+            // canonical doc. Renders only during an active call; other
+            // states show a small placeholder so the column doesn't jump.
+            if (call.state == CallState.IN_CALL) {
+                Text(
+                    text = formatCallDuration(elapsedSeconds),
+                    color = TextPrimary,
+                    fontSize = 56.sp,
+                    fontFamily = PhantomFontMono,
+                    fontWeight = FontWeight.Light,
+                    letterSpacing = (-0.5).sp,
+                )
+            } else {
+                Spacer(Modifier.height(56.dp))
+            }
+
+            Spacer(Modifier.height(36.dp))
+
+            // Avatar 80dp centered.
             Box(
                 modifier = Modifier
-                    .size(104.dp)
+                    .size(80.dp)
                     .clip(CircleShape)
                     .background(Color(0xFF1A2535)),
                 contentAlignment = Alignment.Center,
@@ -95,38 +178,10 @@ fun ActiveCallScreen(
                 Text(
                     text = call.remoteUsername.take(1).uppercase(),
                     color = CyanAccent,
-                    fontSize = 40.sp,
-                    fontWeight = FontWeight.Bold,
+                    fontSize = 32.sp,
+                    fontWeight = FontWeight.Medium,
                 )
             }
-
-            Spacer(Modifier.height(24.dp))
-
-            Text(
-                text = call.remoteUsername,
-                color = TextPrimary,
-                fontSize = 24.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-
-            Spacer(Modifier.height(8.dp))
-
-            // Timer or status text depending on call state
-            val statusText = when (call.state) {
-                CallState.CALLING  -> "Calling..."
-                CallState.RINGING  -> "Connecting..."
-                CallState.IN_CALL  -> formatCallDuration(elapsedSeconds)
-                CallState.ENDED    -> "Call ended"
-                CallState.REJECTED -> "Call declined"
-                else               -> ""
-            }
-            Text(
-                text = statusText,
-                color = if (call.state == CallState.IN_CALL) CyanAccent else TextDim,
-                fontSize = 15.sp,
-                fontFamily = PhantomFontMono,
-                letterSpacing = 0.4.sp,
-            )
 
             Spacer(Modifier.weight(1f))
 

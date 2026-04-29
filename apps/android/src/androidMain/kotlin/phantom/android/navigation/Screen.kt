@@ -12,6 +12,7 @@ sealed class Screen {
     object Settings : Screen()
     object MessageRequests : Screen()
     object Profile : Screen()
+    object AddContact : Screen()
     object QrScan : Screen()
     object SavedMessages : Screen()
     object Archive : Screen()
