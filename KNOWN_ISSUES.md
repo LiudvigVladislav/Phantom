@@ -1,7 +1,7 @@
 # PHANTOM Alpha 1 — Known Issues
 
-**Last updated:** 2026-04-27
-**Build:** branch `fix/bug-h-libsodium-jni`, latest commit `b2447dde`
+**Last updated:** 2026-04-29
+**Build:** branch `master`, latest commit `697103d2` (`v0.1.0-alpha.1`)
 **Tested platforms:** Android (Tecno Spark 2022 / Android 12, plus Pixel 8 Pro emulator API 35), Hetzner VPS relay (`relay.phntm.pro`)
 
 ---
@@ -12,15 +12,22 @@ PHANTOM Alpha 1 is a functional privacy-focused E2E messenger with verified end-
 
 This document is intentionally exhaustive. Transparency about limitations is essential for a privacy tool — users deserve to know exactly what works and what doesn't.
 
-## Severity Legend
+## Document structure
 
-- **P1 (High):** Causes user-visible problems. Should fix before Beta.
+This file separates two kinds of items:
+
+1. **Bugs and limitations** — defects against the intended behaviour, scored P1 / P2 / P3. These get fixed.
+2. **Architectural choices** — intentional design decisions with documented trade-offs. These do not get "fixed"; they get re-evaluated at planned points (audit, milestone, etc).
+
+## Severity Legend (for bugs)
+
+- **P1 (Critical / High):** Causes user-visible problems or has security relevance. Fix before Beta.
 - **P2 (Medium):** Polish issues. Acceptable in Alpha, fix in Beta.
 - **P3 (Low):** Cosmetic or edge-case. Track for future iterations.
 
 ---
 
-## P1 — High Severity
+## Critical Security Issues (P1)
 
 ### ISSUE-001: WebSocket reconnects every ~60 s on aggressive-OEM Android skins
 
@@ -76,7 +83,7 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 
 ---
 
-## P2 — Medium Severity
+## High Severity (P2)
 
 ### ISSUE-004: First envelope after reconnect+flush occasionally fails MAC verification
 
@@ -136,7 +143,7 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 
 ---
 
-## P3 — Low Severity
+## Low Severity (P3)
 
 ### ISSUE-008: Debug build URL hardcoded to local development IP (now fixed)
 
@@ -159,6 +166,34 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 **Status:** TypeScript web prototype exists in repository but is not wired to the production relay. Web client not part of Alpha 1.
 
 **Planned for:** Beta release. Compose Multiplatform supports web target via WASM.
+
+---
+
+## Architectural Choices
+
+This section documents intentional design decisions with known trade-offs. These are not bugs; they are choices made with explicit trigger conditions for re-evaluation. Users, contributors, and reviewers should know what we chose and why.
+
+### ISSUE-011: Cryptography library status — self-rolled Signal protocol over libsodium
+
+**Status:** Documented architectural choice, hardening in progress.
+
+**Background.** PHANTOM Alpha 2 implements the Signal protocol (X3DH handshake + Double Ratchet) on top of libsodium primitives, rather than using Signal Foundation's `libsignal-client` directly. The original ADR-006 (2026-04-15) accepted libsignal-client; the implementation shipped a libsodium-based equivalent. ADR-006 has been revised (2026-04-29) to reconcile this — see `docs/adr/ADR-006-Crypto-Library-Decision.md`.
+
+**Current limitations** (all tracked for Phase 1 closure or as known P3 items):
+
+| ID  | Limitation                                                                            | Plan                                |
+|-----|---------------------------------------------------------------------------------------|-------------------------------------|
+| F12 | X3DH handshake exists but is bypassed; SessionManager calls only raw shared-secret    | Phase 1 Week 4 (ADR-009)            |
+| F15 | Initial ratchet bootstrap reuses identity DH key as ratchet seed                      | Phase 1 Week 4 (ADR-009)            |
+| F3  | SenderKey KDF uses raw SHA-256 rather than HKDF                                       | Phase 1 Week 5–6                    |
+| F13 | SenderKey signing keys generated but never used                                       | Phase 1 Week 4 (ADR-017: remove)    |
+| —   | No header encryption in Double Ratchet                                                | P3, post-Beta                       |
+| —   | Limited skipped-message-key cache                                                     | P2, Alpha 2 expansion (see ISSUE-004) |
+| —   | No one-time prekeys (OPKs)                                                            | Phase 1 Week 4 (ADR-009)            |
+
+**Why not libsignal-client immediately?** Implementation simplicity (zero JNI bridging, smaller dependency surface, AGPL-3.0 + "external use unsupported" friction). Re-evaluation trigger: post-Phase 6 audit response.
+
+**Audit transparency.** All findings above were identified by internal security review on 2026-04-29 and are tracked publicly in this issue, in `docs/adr/ADR-006-Crypto-Library-Decision.md` (Decision (revised) section), and in `docs/adr/ADR-009-identity-prekey-separation.md` (Phase 1, in draft).
 
 ---
 
