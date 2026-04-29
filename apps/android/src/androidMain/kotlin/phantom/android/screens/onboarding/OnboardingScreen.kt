@@ -247,6 +247,9 @@ private fun IdentityKeyStep(
     val focusRequester = remember { FocusRequester() }
     val valid = username.length >= 3
     val sampleFingerprint = "A4B2  C8D1  E3F7  2A9B  4C6D  8E1F  3A5B  7C2D"
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snack = remember { SnackbarHostState() }
 
     Column(
         modifier = Modifier
@@ -329,7 +332,46 @@ private fun IdentityKeyStep(
                 fontSize = 12.sp,
                 lineHeight = 18.sp,
             )
+            Spacer(Modifier.height(14.dp))
+            // Copy fingerprint to clipboard — useful for verifying via another
+            // channel. Sample fingerprint is shown as illustration; the real
+            // key is generated only when "Enter PHANTOM" is tapped.
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .border(
+                        1.dp,
+                        CyanAccent.copy(alpha = 0.30f),
+                        RoundedCornerShape(8.dp),
+                    )
+                    .clickable {
+                        val clip = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        clip.setPrimaryClip(
+                            android.content.ClipData.newPlainText(
+                                "PHANTOM identity key",
+                                sampleFingerprint.replace("  ", " "),
+                            ),
+                        )
+                        scope.launch { snack.showSnackbar("Key copied to clipboard") }
+                    }
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    phantom.android.ui.PhIconCopy(color = CyanAccent, size = 12.dp)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "COPY KEY",
+                        color = CyanAccent,
+                        fontSize = 10.sp,
+                        fontFamily = PhantomFontMono,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 1.6.sp,
+                    )
+                }
+            }
         }
+        SnackbarHost(snack)
 
         Spacer(Modifier.height(24.dp))
 

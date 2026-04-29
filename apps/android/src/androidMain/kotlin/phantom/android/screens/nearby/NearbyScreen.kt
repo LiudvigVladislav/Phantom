@@ -7,10 +7,8 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -22,9 +20,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -93,26 +89,34 @@ fun NearbyScreen(
             ) {
                 item { RadarPanel() }
 
+                // BLE / WiFi-Direct discovery isn't wired into the transport
+                // layer yet, so we surface an honest empty state instead of
+                // mocking peers. Replace with the real peer feed once the
+                // mesh transport milestone lands.
                 item {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = "DETECTED  ·  ${SAMPLE_PEERS.size}",
-                        color = PhantomTokens.Colors.TextTertiary,
-                        style = PhantomType.overline,
-                        modifier = Modifier.padding(
-                            horizontal = PhantomTokens.Spacing.comfortable,
-                            vertical = PhantomTokens.Spacing.tight,
-                        ),
-                    )
-                }
-
-                items(SAMPLE_PEERS, key = { it.fingerprint }) { peer ->
-                    NearbyPeerRow(peer = peer, onTap = { /* TODO: handshake */ })
-                    HorizontalDivider(
-                        color = BorderSubtle,
-                        thickness = 1.dp,
-                        modifier = Modifier.padding(start = 72.dp),
-                    )
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                horizontal = PhantomTokens.Spacing.comfortable,
+                                vertical = PhantomTokens.Spacing.gap,
+                            ),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "LOOKING FOR PEERS",
+                            color = PhantomTokens.Colors.TextTertiary,
+                            style = PhantomType.overline,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = "Mesh discovery (BLE / WiFi-Direct) is coming in a future build. Stay close to your contact and we'll find them when ready.",
+                            color = PhantomTokens.Colors.TextSecondary,
+                            style = PhantomType.caption,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                        )
+                    }
                 }
             }
 
@@ -207,102 +211,6 @@ private fun RadarPanel() {
             )
         }
 
-        // Sample peer pings — tiny dots floating at fixed positions on the
-        // radar. Real implementation will project signal strength → radius.
-        Canvas(modifier = Modifier.size(220.dp)) {
-            val cx = size.width / 2f
-            val cy = size.height / 2f
-            val maxR = minOf(cx, cy) - 4f
-            SAMPLE_PEERS.forEachIndexed { idx, _ ->
-                val angle = (idx * 67f) % 360f
-                val r = maxR * (0.45f + (idx % 3) * 0.18f)
-                val rad = Math.toRadians(angle.toDouble())
-                val x = cx + r * Math.cos(rad).toFloat()
-                val y = cy + r * Math.sin(rad).toFloat()
-                drawCircle(
-                    color = PhantomTokens.Colors.Cyan,
-                    radius = 3.5f,
-                    center = Offset(x, y),
-                )
-                drawCircle(
-                    color = PhantomTokens.Colors.Cyan.copy(alpha = 0.25f),
-                    radius = 8f,
-                    center = Offset(x, y),
-                )
-            }
-        }
     }
 }
 
-private data class NearbyPeer(
-    val handle: String,
-    val fingerprint: String,
-    val transport: String,
-    val signalDbm: Int,
-    val trusted: Boolean,
-)
-
-private val SAMPLE_PEERS = listOf(
-    NearbyPeer("@river", "A1F3·E92B", "BLE", -42, trusted = true),
-    NearbyPeer("@forge", "5C0B·D7A1", "WiFi", -56, trusted = false),
-    NearbyPeer("@aurora", "9AE2·44C8", "BLE", -71, trusted = false),
-)
-
-@Composable
-private fun NearbyPeerRow(peer: NearbyPeer, onTap: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onTap)
-            .padding(
-                horizontal = PhantomTokens.Spacing.comfortable,
-                vertical = PhantomTokens.Spacing.tight,
-            ),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        GradientAvatar(name = peer.handle, size = 40.dp)
-        Spacer(Modifier.width(PhantomTokens.Spacing.tight))
-        Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = peer.handle,
-                    color = TextPrimary,
-                    style = PhantomType.title,
-                )
-                if (peer.trusted) {
-                    Spacer(Modifier.width(6.dp))
-                    PhIconShieldCheck(color = PhantomTokens.Colors.Cyan, size = 14.dp)
-                }
-            }
-            Spacer(Modifier.height(2.dp))
-            Text(
-                text = "${peer.transport} · ${peer.signalDbm} dBm · ${peer.fingerprint}",
-                color = PhantomTokens.Colors.TextTertiary,
-                style = PhantomType.monoSm,
-            )
-        }
-        // Trust chip — Cyan if already trusted, neutral otherwise.
-        Box(
-            modifier = Modifier
-                .clip(RoundedCornerShape(PhantomTokens.Radius.pill))
-                .background(
-                    if (peer.trusted) PhantomTokens.Colors.Cyan.copy(alpha = 0.10f)
-                    else PhantomTokens.Colors.SurfaceHover,
-                )
-                .border(
-                    1.dp,
-                    if (peer.trusted) PhantomTokens.Colors.Cyan.copy(alpha = 0.45f)
-                    else PhantomTokens.Colors.BorderSubtle,
-                    RoundedCornerShape(PhantomTokens.Radius.pill),
-                )
-                .padding(horizontal = 10.dp, vertical = 4.dp),
-        ) {
-            Text(
-                text = if (peer.trusted) "TRUSTED" else "HANDSHAKE",
-                color = if (peer.trusted) PhantomTokens.Colors.Cyan else TextPrimary,
-                style = PhantomType.overline,
-                fontWeight = FontWeight.Medium,
-            )
-        }
-    }
-}

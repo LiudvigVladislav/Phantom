@@ -455,20 +455,7 @@ private fun SectionLabel(text: String, showPin: Boolean = false) {
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         if (showPin) {
-            Canvas(modifier = Modifier.size(10.dp)) {
-                val w = size.width; val h = size.height
-                val path = Path().apply {
-                    moveTo(w * 0.67f, 0f)
-                    lineTo(w, h * 0.42f)
-                    lineTo(w * 0.60f, h * 0.42f)
-                    lineTo(w * 0.55f, h)
-                    lineTo(w * 0.45f, h)
-                    lineTo(w * 0.40f, h * 0.42f)
-                    lineTo(0f, h * 0.42f)
-                    close()
-                }
-                drawPath(path, color = TextDim)
-            }
+            PhIconPin(color = TextDim, size = 12.dp)
         }
         Text(
             text = text.uppercase(),

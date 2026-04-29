@@ -271,24 +271,21 @@ private fun NavPillItem(
         modifier = Modifier
             .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            .padding(horizontal = 10.dp, vertical = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         icon(color)
-        // Mockup: active shows label, inactive renders an empty 14dp slot so
-        // every tab keeps the same vertical rhythm.
-        if (active) {
-            Text(
-                text = label,
-                color = TextPrimary,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 0.2.sp,
-            )
-        } else {
-            Spacer(Modifier.height(14.dp))
-        }
+        // All four tabs always show their label so the user can read the
+        // navigation at a glance — active tab gets primary text + cyan icon,
+        // inactive stays in tertiary tone.
+        Text(
+            text = label,
+            color = if (active) TextPrimary else TextDim,
+            fontSize = 10.sp,
+            fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+            letterSpacing = 0.2.sp,
+        )
     }
 }
 
