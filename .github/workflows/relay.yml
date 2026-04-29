@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Relay CI — cargo build (release), cargo test, cargo clippy on the
+# services workspace (relay + bootstrap + directory). Mirrors the
+# command sequence used by services/relay/Dockerfile.
+
+name: Relay CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'services/**'
+      - '.github/workflows/relay.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'services/**'
+      - '.github/workflows/relay.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: relay-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: services
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build release
+        run: cargo build --workspace --release
+
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Upload relay binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantom-relay-binary
+          path: services/target/release/phantom-relay
+          retention-days: 7
+          if-no-files-found: error
