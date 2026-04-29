@@ -494,22 +494,7 @@ private fun NotesRow(onClick: () -> Unit) {
         }
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                Text("Notes", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                Canvas(modifier = Modifier.size(9.dp)) {
-                    val path = Path().apply {
-                        moveTo(size.width * 0.67f, 0f)
-                        lineTo(size.width, size.height * 0.42f)
-                        lineTo(size.width * 0.60f, size.height * 0.42f)
-                        lineTo(size.width * 0.55f, size.height)
-                        lineTo(size.width * 0.45f, size.height)
-                        lineTo(size.width * 0.40f, size.height * 0.42f)
-                        lineTo(0f, size.height * 0.42f)
-                        close()
-                    }
-                    drawPath(path, color = CyanAccent)
-                }
-            }
+            Text("Notes", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(3.dp))
             Text("Personal notes & saved", color = TextDim, fontSize = 13.sp)
         }

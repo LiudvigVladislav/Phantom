@@ -41,6 +41,7 @@ fun EmptyState(
     secondaryText: String,
     ctaLabel: String? = null,
     onCta: () -> Unit = {},
+    showMotif: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -49,7 +50,7 @@ fun EmptyState(
             .background(PhantomTokens.Colors.SurfaceDeep),
         contentAlignment = Alignment.Center,
     ) {
-        AmbientCircleMotif()
+        if (showMotif) AmbientCircleMotif()
 
         Column(
             modifier = Modifier.padding(horizontal = 32.dp),

@@ -31,13 +31,86 @@ enum class NavTab { CALLS, CHATS, NEARBY, SETTINGS }
 @Composable
 fun PhantomTopBar(
     userName: String = "",
+    title: String = "Messages",
     onProfile: () -> Unit = {},
     onAddContact: () -> Unit = {},
     onScanQr: () -> Unit = {},
     avatarBitmap: ImageBitmap? = null,
+    avatarMenuContent: @Composable (close: () -> Unit) -> Unit = { close ->
+        // Default: chat-list flavour menu.
+        DropdownMenuItem(
+            leadingIcon = { PhIconFunnel(color = TextDim, size = 15.dp) },
+            text = { Text("Filter unread", fontSize = 14.sp) },
+            onClick = { close() },
+        )
+        DropdownMenuItem(
+            leadingIcon = { PhIconCheck3(color = TextDim, size = 15.dp) },
+            text = { Text("Select chats", fontSize = 14.sp) },
+            onClick = { close() },
+        )
+        HorizontalDivider()
+        DropdownMenuItem(
+            leadingIcon = { PhIconPerson(color = CyanAccent, size = 15.dp) },
+            text = {
+                Text(
+                    "Profile",
+                    color = CyanAccent,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            },
+            onClick = { close(); onProfile() },
+        )
+    },
+    trailing: @Composable () -> Unit = {
+        // Default: compose pencil with dropdown for new chat / group / QR.
+        var showComposeMenu by remember { mutableStateOf(false) }
+        Box {
+            IconButton(onClick = { showComposeMenu = !showComposeMenu }) {
+                PhIconPencilCompose(color = CyanAccent, size = 22.dp)
+            }
+            DropdownMenu(
+                expanded = showComposeMenu,
+                onDismissRequest = { showComposeMenu = false },
+            ) {
+                DropdownMenuItem(
+                    text = {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text("Create group", fontSize = 14.sp)
+                            SoonBadge()
+                        }
+                    },
+                    onClick = { showComposeMenu = false },
+                )
+                DropdownMenuItem(
+                    text = {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text("Create channel", fontSize = 14.sp)
+                            SoonBadge()
+                        }
+                    },
+                    onClick = { showComposeMenu = false },
+                )
+                HorizontalDivider()
+                DropdownMenuItem(
+                    text = { Text("Scan QR code", fontSize = 14.sp) },
+                    onClick = { showComposeMenu = false; onScanQr() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Add by key", fontSize = 14.sp) },
+                    onClick = { showComposeMenu = false; onAddContact() },
+                )
+            }
+        }
+    },
 ) {
     var showAvatarMenu by remember { mutableStateOf(false) }
-    var showComposeMenu by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val gradientBrush = remember(userName) {
         val prefs = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
@@ -88,38 +161,15 @@ fun PhantomTopBar(
                     expanded = showAvatarMenu,
                     onDismissRequest = { showAvatarMenu = false },
                 ) {
-                    DropdownMenuItem(
-                        leadingIcon = { PhIconFunnel(color = TextDim, size = 15.dp) },
-                        text = { Text("Filter unread", fontSize = 14.sp) },
-                        onClick = { showAvatarMenu = false },
-                    )
-                    DropdownMenuItem(
-                        leadingIcon = { PhIconCheck3(color = TextDim, size = 15.dp) },
-                        text = { Text("Select chats", fontSize = 14.sp) },
-                        onClick = { showAvatarMenu = false },
-                    )
-                    HorizontalDivider()
-                    DropdownMenuItem(
-                        leadingIcon = { PhIconPerson(color = CyanAccent, size = 15.dp) },
-                        text = {
-                            Text(
-                                "Profile",
-                                color = CyanAccent,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium,
-                            )
-                        },
-                        onClick = { showAvatarMenu = false; onProfile() },
-                    )
+                    avatarMenuContent { showAvatarMenu = false }
                 }
             }
 
-            // PHANTOM_FULL_COMPOSE §03: "Messages" Geist 20px (left-aligned
-            // after the avatar, not a centered wordmark — this is the chat
-            // list header, not the brand splash).
+            // Title is parametrised so each tab can supply its own header
+            // ("Messages" / "Calls" / "Settings" / "Nearby"). PHANTOM_FULL_COMPOSE §03.
             Box(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
                 Text(
-                    text = "Messages",
+                    text = title,
                     fontSize = 20.sp,
                     fontWeight = FontWeight.Medium,
                     letterSpacing = (-0.20).sp,
@@ -127,50 +177,7 @@ fun PhantomTopBar(
                 )
             }
 
-            // Compose button + dropdown
-            Box {
-                IconButton(onClick = { showComposeMenu = !showComposeMenu }) {
-                    PhIconPencilCompose(color = CyanAccent, size = 22.dp)
-                }
-                DropdownMenu(
-                    expanded = showComposeMenu,
-                    onDismissRequest = { showComposeMenu = false },
-                ) {
-                    DropdownMenuItem(
-                        text = {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text("Create group", fontSize = 14.sp)
-                                SoonBadge()
-                            }
-                        },
-                        onClick = { showComposeMenu = false },
-                    )
-                    DropdownMenuItem(
-                        text = {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text("Create channel", fontSize = 14.sp)
-                                SoonBadge()
-                            }
-                        },
-                        onClick = { showComposeMenu = false },
-                    )
-                    HorizontalDivider()
-                    DropdownMenuItem(
-                        text = { Text("Scan QR code", fontSize = 14.sp) },
-                        onClick = { showComposeMenu = false; onScanQr() },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Add by key", fontSize = 14.sp) },
-                        onClick = { showComposeMenu = false; onAddContact() },
-                    )
-                }
-            }
+            trailing()
         }
 
         // Hairline divider — BorderSubtle from design system.
@@ -208,26 +215,44 @@ fun BottomNavPill(
     onTabSelected: (NavTab) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // Phase 2 mockup: 64dp tall, 16dp from bottom and sides, RoundedCornerShape
-    // 20dp (NOT a fully-rounded pill), Surface bg with BorderSubtle 1px outline.
-    // Active tab: Cyan icon + label visible. Inactive: icon TextTertiary, no
-    // label rendered (mockup leaves a 14dp empty slot to keep vertical rhythm).
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
-        contentAlignment = Alignment.TopCenter,
+    // 64dp pill, 16dp side / bottom inset, 20dp radius, Surface bg with
+    // BorderSubtle outline. A vertical fade (Transparent → BgDeep) sits
+    // behind the pill so list content scrolling underneath softly dissolves
+    // into the navigation area instead of cutting against an opaque edge.
+    Column(
+        modifier = modifier.fillMaxWidth(),
     ) {
-        Row(
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(64.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(phantom.android.ui.theme.Surface)
-                .border(1.dp, phantom.android.ui.theme.BorderSubtle, RoundedCornerShape(20.dp)),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceAround,
+                .height(40.dp)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.Transparent,
+                            phantom.android.ui.theme.BgDeep.copy(alpha = 0.85f),
+                            phantom.android.ui.theme.BgDeep,
+                        ),
+                    ),
+                ),
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(phantom.android.ui.theme.BgDeep)
+                .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+            contentAlignment = Alignment.TopCenter,
         ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(64.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(phantom.android.ui.theme.Surface)
+                    .border(1.dp, phantom.android.ui.theme.BorderSubtle, RoundedCornerShape(20.dp)),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceAround,
+            ) {
             NavPillItem(
                 icon = { color -> PhIconPhone(color = color, size = 22.dp) },
                 label = "Calls",
@@ -252,6 +277,7 @@ fun BottomNavPill(
                 active = activeTab == NavTab.SETTINGS,
                 onClick = { onTabSelected(NavTab.SETTINGS) },
             )
+            }
         }
     }
 }

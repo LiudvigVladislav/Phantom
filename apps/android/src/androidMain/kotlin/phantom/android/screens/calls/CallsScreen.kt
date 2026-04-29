@@ -66,10 +66,43 @@ fun CallsScreen(
         topBar = {
             PhantomTopBar(
                 userName = userName,
+                title = "Calls",
                 onProfile = onProfile,
                 onAddContact = { onNavigate(Screen.ChatList) },
                 onScanQr = { onNavigate(Screen.QrScan) },
                 avatarBitmap = selfAvatarImage,
+                avatarMenuContent = { close ->
+                    DropdownMenuItem(
+                        leadingIcon = { PhIconPhone(color = TextDim, size = 15.dp) },
+                        text = { Text("Missed only", fontSize = 14.sp) },
+                        onClick = { close() },
+                    )
+                    DropdownMenuItem(
+                        leadingIcon = { PhIconCheck3(color = TextDim, size = 15.dp) },
+                        text = { Text("Select calls", fontSize = 14.sp) },
+                        onClick = { close() },
+                    )
+                    HorizontalDivider()
+                    DropdownMenuItem(
+                        leadingIcon = { PhIconPerson(color = CyanAccent, size = 15.dp) },
+                        text = {
+                            Text(
+                                "Profile",
+                                color = CyanAccent,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        },
+                        onClick = { close(); onProfile() },
+                    )
+                },
+                trailing = {
+                    // Calls trailing → "new call" pencil that jumps to chat
+                    // list so user picks a contact, no SOON-gated dropdown.
+                    IconButton(onClick = { onNavigate(Screen.ChatList) }) {
+                        PhIconPhone(color = CyanAccent, size = 22.dp)
+                    }
+                },
             )
         },
     ) { padding ->

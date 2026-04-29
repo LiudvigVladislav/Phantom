@@ -1596,29 +1596,44 @@ private fun MessageBubble(
                             }
                             HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                             // ── Action list (bottom, expanded) ───────────────
-                            ActionRow(icon = 0x21A9, label = "Reply") {
+                            ActionRow(
+                                icon = { c -> PhIconReply(color = c, size = 16.dp) },
+                                label = "Reply",
+                            ) {
                                 showActionPanel = false; onReply()
                             }
                             if (isSent && within24h) {
-                                ActionRow(icon = 0x270F, label = "Edit") {
+                                ActionRow(
+                                    icon = { c -> PhIconEdit(color = c, size = 16.dp) },
+                                    label = "Edit",
+                                ) {
                                     showActionPanel = false; onEdit()
                                 }
                             }
-                            ActionRow(icon = 0x1F4CB, label = "Copy text") {
+                            ActionRow(
+                                icon = { c -> PhIconCopy(color = c, size = 14.dp) },
+                                label = "Copy text",
+                            ) {
                                 showActionPanel = false; onCopy(rawText)
                             }
                             ActionRow(
-                                icon = 0x1F4CC,
+                                icon = { c -> PhIconPinAction(color = c, size = 16.dp) },
                                 label = if (entity.pinned) "Unpin" else "Pin",
                             ) {
                                 showActionPanel = false; showPinChoice = true
                             }
-                            ActionRow(icon = 0x27A1, label = "Forward") {
+                            ActionRow(
+                                icon = { c -> PhIconForward(color = c, size = 16.dp) },
+                                label = "Forward",
+                            ) {
                                 showActionPanel = false
                                 val senderLabel = if (entity.sent) "You" else theirUsername
                                 onForward(text, senderLabel)
                             }
-                            ActionRow(icon = 0x1F516, label = "Save") {
+                            ActionRow(
+                                icon = { c -> PhIconBookmark(color = c, size = 16.dp) },
+                                label = "Save",
+                            ) {
                                 showActionPanel = false
                                 bubbleCoroutineScope.launch {
                                     val savedConvId = "saved_messages_local"
@@ -1636,7 +1651,11 @@ private fun MessageBubble(
                                 }
                             }
                             HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                            ActionRow(icon = 0x1F5D1, label = "Delete", danger = true) {
+                            ActionRow(
+                                icon = { c -> PhIconTrash(color = c, size = 15.dp) },
+                                label = "Delete",
+                                danger = true,
+                            ) {
                                 showActionPanel = false; showDeleteDialog = true
                             }
                         }
@@ -1698,30 +1717,25 @@ private fun MessageBubble(
 }
 
 @Composable
-private fun MenuIcon(codePoint: Int) {
-    Text(
-        text = String(Character.toChars(codePoint)),
-        fontSize = 16.sp,
-        modifier = Modifier.size(20.dp),
-    )
-}
-
-@Composable
 private fun ActionRow(
-    icon: Int,
+    icon: @Composable (color: Color) -> Unit,
     label: String,
     danger: Boolean = false,
     onClick: () -> Unit,
 ) {
+    val tint = if (danger) Danger else PhantomTokens.Colors.TextSecondary
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        MenuIcon(icon)
+        Box(
+            modifier = Modifier.size(20.dp),
+            contentAlignment = Alignment.Center,
+        ) { icon(tint) }
         Text(
             text = label,
             color = if (danger) Danger else TextPrimary,
