@@ -533,3 +533,27 @@ fun PhIconMoreVert(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp
         drawCircle(color, r, Offset(cx, 19f * s))
     }
 }
+
+// radar — concentric rings + sweep line + center dot.
+// Used for the Nearby (mesh) bottom-nav tab. Architectural truth, not a wifi
+// glyph: PHANTOM finds peers via BLE/WiFi-Direct, not internet APs.
+@Composable
+fun PhIconRadar(color: Color, modifier: Modifier = Modifier, size: Dp = 22.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val cx = 12f * s
+        val cy = 12f * s
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Outer + middle rings
+        drawCircle(color, 9f * s, Offset(cx, cy), style = st)
+        drawCircle(color, 5.5f * s, Offset(cx, cy), style = st)
+        // Sweep arm pointing up-right
+        drawPath(
+            parsePath("M12 12L20 5", s),
+            color,
+            style = st,
+        )
+        // Center dot
+        drawCircle(color, 1.5f * s, Offset(cx, cy))
+    }
+}

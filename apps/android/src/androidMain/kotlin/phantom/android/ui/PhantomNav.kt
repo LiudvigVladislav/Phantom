@@ -26,7 +26,7 @@ import androidx.compose.ui.unit.sp
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 
-enum class NavTab { CALLS, CHATS, SETTINGS }
+enum class NavTab { CALLS, CHATS, NEARBY, SETTINGS }
 
 @Composable
 fun PhantomTopBar(
@@ -240,6 +240,12 @@ fun BottomNavPill(
                 onClick = { onTabSelected(NavTab.CHATS) },
             )
             NavPillItem(
+                icon = { color -> PhIconRadar(color = color, size = 22.dp) },
+                label = "Nearby",
+                active = activeTab == NavTab.NEARBY,
+                onClick = { onTabSelected(NavTab.NEARBY) },
+            )
+            NavPillItem(
                 icon = { color -> PhIconGear(color = color, size = 22.dp) },
                 label = "Settings",
                 active = activeTab == NavTab.SETTINGS,
@@ -402,11 +408,12 @@ fun SettingsRowItem(
             modifier = Modifier.weight(1f),
         )
         if (value != null) {
+            // Design Brief v3 §11.5: trailing meta in Inter 13pt secondary —
+            // calmer than mono, reads as detail rather than tech readout.
             Text(
                 text = value,
-                color = TextDim,
+                color = phantom.android.ui.theme.PhantomTokens.Colors.TextSecondary,
                 fontSize = 13.sp,
-                fontFamily = PhantomFontMono,
             )
         }
         PhIconChevron(color = TextDim, size = 14.dp)

@@ -296,6 +296,11 @@ private fun PhantomApp(
             onNavigate = { currentScreen = it },
             onProfile = { currentScreen = Screen.Profile },
         )
+        is Screen.Nearby -> phantom.android.screens.nearby.NearbyScreen(
+            container = container,
+            onNavigate = { currentScreen = it },
+            onProfile = { currentScreen = Screen.Profile },
+        )
         is Screen.Settings -> SettingsScreen(
             container = container,
             onNavigate = { currentScreen = it },

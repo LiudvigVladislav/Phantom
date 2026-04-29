@@ -79,13 +79,29 @@ fun SettingsScreen(
             }
         },
         topBar = {
-            PhantomTopBar(
-                userName = userName,
-                onProfile = onProfile,
-                onAddContact = { onNavigate(Screen.ChatList) },
-                onScanQr = { onNavigate(Screen.QrScan) },
-                avatarBitmap = selfAvatarImage,
-            )
+            // Design Brief v3 §11.4: Settings has its own minimal header — no
+            // PHANTOM wordmark, just "Settings" set in Geist Medium 20pt.
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Surface)
+                    .windowInsetsPadding(WindowInsets.statusBars),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(64.dp)
+                        .padding(horizontal = PhantomTokens.Spacing.comfortable),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    Text(
+                        text = "Settings",
+                        color = TextPrimary,
+                        style = PhantomType.headline,
+                    )
+                }
+                HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+            }
         },
     ) { padding ->
         Box(
@@ -97,6 +113,58 @@ fun SettingsScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(top = 6.dp, bottom = 110.dp),
             ) {
+                // Profile card — Design Brief v3 §11.4: avatar 64×64 + name +
+                // @username (mono) + "DEVICE TRUSTED · ONLINE" overline +
+                // chevron. Tap → full Profile.
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                start = PhantomTokens.Spacing.comfortable,
+                                end = PhantomTokens.Spacing.comfortable,
+                                top = PhantomTokens.Spacing.tight,
+                                bottom = PhantomTokens.Spacing.baseUnit,
+                            )
+                            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
+                            .background(PhantomTokens.Colors.SurfaceElevated)
+                            .border(
+                                1.dp,
+                                BorderSubtle,
+                                RoundedCornerShape(PhantomTokens.Radius.md),
+                            )
+                            .clickable(onClick = onProfile)
+                            .padding(
+                                horizontal = PhantomTokens.Spacing.comfortable,
+                                vertical = PhantomTokens.Spacing.tight,
+                            ),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        GradientAvatar(
+                            name = userName.ifEmpty { "?" },
+                            size = 64.dp,
+                            imageBitmap = selfAvatarImage,
+                        )
+                        Spacer(Modifier.width(PhantomTokens.Spacing.comfortable))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (userName.isNotEmpty()) "@$userName" else "Loading…",
+                                color = TextPrimary,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Medium,
+                                fontFamily = PhantomFontMono,
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "DEVICE TRUSTED · ONLINE",
+                                color = PhantomTokens.Colors.TextTertiary,
+                                style = PhantomType.overline,
+                            )
+                        }
+                        PhIconChevron(color = TextDim, size = 14.dp)
+                    }
+                }
+
                 // Account
                 item { SettingsGroupHeader("Account") }
                 item {
@@ -299,6 +367,7 @@ fun SettingsScreen(
                     when (tab) {
                         NavTab.CALLS -> onNavigate(Screen.Calls)
                         NavTab.CHATS -> onNavigate(Screen.ChatList)
+                        NavTab.NEARBY -> onNavigate(Screen.Nearby)
                         NavTab.SETTINGS -> {}
                     }
                 },

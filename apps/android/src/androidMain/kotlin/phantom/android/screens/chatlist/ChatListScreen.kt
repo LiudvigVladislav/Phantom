@@ -166,6 +166,7 @@ fun ChatListScreen(
                 onTabSelected = { tab ->
                     when (tab) {
                         NavTab.CALLS -> onNavigate(Screen.Calls)
+                        NavTab.NEARBY -> onNavigate(Screen.Nearby)
                         NavTab.SETTINGS -> onNavigate(Screen.Settings)
                         NavTab.CHATS -> {}
                     }

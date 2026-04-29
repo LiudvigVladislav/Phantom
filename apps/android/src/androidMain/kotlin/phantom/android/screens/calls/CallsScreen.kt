@@ -115,6 +115,7 @@ fun CallsScreen(
                 onTabSelected = { tab ->
                     when (tab) {
                         NavTab.CHATS    -> onNavigate(Screen.ChatList)
+                        NavTab.NEARBY   -> onNavigate(Screen.Nearby)
                         NavTab.SETTINGS -> onNavigate(Screen.Settings)
                         NavTab.CALLS    -> {}
                     }

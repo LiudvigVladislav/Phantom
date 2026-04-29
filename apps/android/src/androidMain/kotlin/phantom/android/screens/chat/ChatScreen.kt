@@ -726,8 +726,6 @@ fun ChatScreen(
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
-
             // Pinned message banner — shown when at least one message is pinned
             if (pinnedMessages.isNotEmpty()) {
                 item(key = "pinned_banner") {
@@ -932,91 +930,23 @@ private sealed class ChatItem {
 }
 
 @Composable
-private fun E2EENoteRow(theirUsername: String) {
-    // Phase 2 mockup: a 32dp full-width strip on SurfaceDeep, BorderSubtle
-    // bottom hairline, centered "End-to-end encrypted · ED25519 · @username"
-    // in mono 10sp tertiary 70%. Architectural truth, not a banner.
+private fun ChatDateSep(millis: Long) {
+    // Design Brief v3 §9.5: just centered uppercase mono label, no hairlines.
+    val label = when {
+        isToday(millis) -> "TODAY"
+        isYesterday(millis) -> "YESTERDAY"
+        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(millis)).uppercase(java.util.Locale.US)
+    }
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(32.dp)
-            .background(PhantomTokens.Colors.SurfaceDeep),
+            .padding(top = 16.dp, bottom = 12.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(7.dp),
-        ) {
-            // Lock glyph — small, tertiary 70%.
-            Canvas(modifier = Modifier.size(10.dp)) {
-                val w = size.width
-                val h = size.height
-                val sw = 1.4.dp.toPx()
-                val color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f)
-                // Lock body
-                drawRoundRect(
-                    color = color,
-                    topLeft = Offset(w * 0.18f, h * 0.45f),
-                    size = androidx.compose.ui.geometry.Size(w * 0.64f, h * 0.45f),
-                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.dp.toPx()),
-                    style = Stroke(sw),
-                )
-                // Shackle
-                drawArc(
-                    color = color,
-                    startAngle = 180f, sweepAngle = 180f, useCenter = false,
-                    topLeft = Offset(w * 0.30f, h * 0.18f),
-                    size = androidx.compose.ui.geometry.Size(w * 0.40f, h * 0.50f),
-                    style = Stroke(sw),
-                )
-            }
-            Text(
-                text = "End-to-end encrypted · ED25519 · @$theirUsername",
-                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f),
-                fontSize = 10.sp,
-                fontFamily = PhantomFontMono,
-                letterSpacing = 0.4.sp,
-            )
-        }
-    }
-}
-
-@Composable
-private fun ChatDateSep(millis: Long) {
-    // Phase 2 mockup: centered "Today · April 28" in mono 9sp tertiary 45%,
-    // flanked by 1px BorderSubtle hairlines. The full date format ("Today
-    // · April 28") gives readers a stronger time anchor than a bare label.
-    val label = when {
-        isToday(millis) -> "Today · ${java.text.SimpleDateFormat("MMMM d", java.util.Locale.US).format(java.util.Date(millis))}"
-        isYesterday(millis) -> "Yesterday · ${java.text.SimpleDateFormat("MMMM d", java.util.Locale.US).format(java.util.Date(millis))}"
-        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(millis))
-    }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp)
-            .padding(top = 14.dp, bottom = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .height(1.dp)
-                .background(PhantomTokens.Colors.BorderSubtle),
-        )
         Text(
             text = label,
-            color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.45f),
-            fontSize = 9.sp,
-            fontFamily = PhantomFontMono,
-            letterSpacing = 0.54.sp,  // 0.06em × 9sp
-        )
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .height(1.dp)
-                .background(PhantomTokens.Colors.BorderSubtle),
+            color = PhantomTokens.Colors.TextTertiary,
+            style = PhantomType.overline,
         )
     }
 }
@@ -1287,12 +1217,10 @@ private fun MessageBubble(
             val timeReserve = if (isSent) 56.dp else 36.dp
             // Outer column: bubble + reaction pills stacked vertically
             Column {
-            // Bubble shape per design system Phase 2:
-            //   incoming  → 12 12 12 2  (tail bottom-left)
-            //   outgoing  → 12 12 2 12  (tail bottom-right)
-            // Outgoing is flat Cyan — the design brief explicitly removed the
-            // gradient ("Gradient felt decorative; flat is more PHANTOM:
-            // architectural, not branded.").
+            // Bubble shape per Design Brief v3 §9.6:
+            //   incoming  → 12 12 12 2   (tail bottom-left)
+            //   outgoing  → 12 12 2 12   (tail bottom-right)
+            // Outgoing fill: linear gradient #00D4FF → #0099CC at 135°.
             val bubbleShape = RoundedCornerShape(
                 topStart = PhantomTokens.Radius.md,
                 topEnd = PhantomTokens.Radius.md,
@@ -1304,7 +1232,14 @@ private fun MessageBubble(
                     .widthIn(min = 80.dp, max = 260.dp)
                     .then(
                         if (isSent) Modifier.background(
-                            color = PhantomTokens.Colors.Cyan,
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    PhantomTokens.Colors.Cyan,
+                                    PhantomTokens.Colors.CyanDark,
+                                ),
+                                start = Offset(0f, 0f),
+                                end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY),
+                            ),
                             shape = bubbleShape,
                         ) else Modifier
                             .background(
@@ -2377,145 +2312,107 @@ private fun ChatTopBar(
     onReport: () -> Unit,
     onBlock: () -> Unit,
 ) {
-    // Phase 2 mockup layout:
-    //   [back] [avatar+online] [name+lock | presenceDot+state] [phone] [video] [more]
-    // 56dp height, BorderSubtle bottom hairline.
+    // Design Brief v3 §9.1 layout:
+    //   [back]   [name + ED25519 indicator centered]   [avatar right]   [more]
+    // 64dp content height, BorderSubtle bottom hairline.
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(PhantomTokens.Colors.Surface)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
-        Row(
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp)
+                .height(64.dp)
                 .padding(horizontal = PhantomTokens.Spacing.comfortable),
-            verticalAlignment = Alignment.CenterVertically,
+            contentAlignment = Alignment.Center,
         ) {
-            // Back arrow — flat icon, no surface chip.
-            IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
-                PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
-            }
-            Spacer(Modifier.width(PhantomTokens.Spacing.baseUnit))
-
-            // Avatar (tap → contact profile). Online dot is rendered inside
-            // GradientAvatar via the `online` flag.
-            Box(modifier = Modifier.clickable(onClick = onContactProfile)) {
-                GradientAvatar(
-                    name = theirUsername,
-                    size = 36.dp,
-                    online = if (isConnected) true else null,
-                )
-            }
-            Spacer(Modifier.width(PhantomTokens.Spacing.baseUnit + 2.dp))
-
-            // Name + lock chip stacked over presence/typing line.
+            // Centered name + ED25519 line.
             Column(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.fillMaxWidth(0.55f),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Text(
-                        text = theirUsername,
-                        color = PhantomTokens.Colors.TextPrimary,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium,
-                        letterSpacing = (-0.15).sp,  // -0.01em × 15sp
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    // Lock chip — 14dp SurfaceDeep circle with cyan padlock.
-                    Box(
-                        modifier = Modifier
-                            .size(14.dp)
-                            .clip(CircleShape)
-                            .background(PhantomTokens.Colors.SurfaceDeep)
-                            .border(1.dp, PhantomTokens.Colors.BorderSubtle, CircleShape),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Canvas(modifier = Modifier.size(7.dp)) {
-                            val w = size.width
-                            val h = size.height
-                            val sw = 1.5.dp.toPx()
-                            val c = PhantomTokens.Colors.Cyan
-                            drawRoundRect(
-                                color = c,
-                                topLeft = Offset(w * 0.18f, h * 0.42f),
-                                size = androidx.compose.ui.geometry.Size(w * 0.64f, h * 0.50f),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(0.6.dp.toPx()),
-                                style = Stroke(sw),
-                            )
-                            drawArc(
-                                color = c,
-                                startAngle = 180f, sweepAngle = 180f, useCenter = false,
-                                topLeft = Offset(w * 0.28f, h * 0.10f),
-                                size = androidx.compose.ui.geometry.Size(w * 0.44f, h * 0.55f),
-                                style = Stroke(sw),
-                            )
-                        }
-                    }
-                }
+                Text(
+                    text = theirUsername,
+                    color = PhantomTokens.Colors.TextPrimary,
+                    style = PhantomType.title,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 if (isTyping) {
                     Text(
                         text = "typing…",
-                        color = PhantomTokens.Colors.Cyan.copy(alpha = 0.8f),
-                        fontSize = 10.sp,
-                        fontFamily = PhantomFontMono,
+                        color = PhantomTokens.Colors.Cyan.copy(alpha = 0.85f),
+                        style = PhantomType.monoSm,
                     )
                 } else {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                         modifier = Modifier.padding(top = 2.dp),
                     ) {
                         Canvas(modifier = Modifier.size(5.dp)) {
                             drawCircle(
-                                color = if (isConnected) PhantomTokens.Colors.Success
+                                color = if (isConnected) PhantomTokens.Colors.Cyan
                                 else PhantomTokens.Colors.TextDisabled,
                             )
                         }
                         Text(
-                            text = if (isConnected) "online" else "offline",
-                            color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
-                            fontSize = 10.sp,
-                            fontFamily = PhantomFontMono,
+                            text = "ED25519",
+                            color = PhantomTokens.Colors.TextTertiary,
+                            style = PhantomType.monoSm,
+                            letterSpacing = 0.5.sp,
                         )
                     }
                 }
             }
 
-            // Action icons — Phone, Video, More. Each ~32dp tap target with
-            // 18-20dp glyph.
-            IconButton(onClick = { /* TODO: voice call */ }, modifier = Modifier.size(36.dp)) {
-                PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
-            }
-            // Video icon — placeholder for now (no PhIconVideo); reuse Phone
-            // glyph at smaller size to keep visual rhythm. Will swap for a
-            // Camera/Video glyph in PhantomIcons in the next polish round.
-            IconButton(onClick = { /* TODO: video call */ }, modifier = Modifier.size(36.dp)) {
-                PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
+            // Left edge: back arrow.
+            Row(
+                modifier = Modifier.align(Alignment.CenterStart),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
+                    PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
+                }
             }
 
-            Box {
-                IconButton(onClick = onMoreMenu, modifier = Modifier.size(36.dp)) {
-                    PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
-                }
-                DropdownMenu(
-                    expanded = showMenu,
-                    onDismissRequest = onDismissMenu,
-                    containerColor = Surface2,
+            // Right edge: avatar (tap → contact profile) + more menu.
+            Row(
+                modifier = Modifier.align(Alignment.CenterEnd),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable(onClick = onContactProfile),
                 ) {
-                    DropdownMenuItem(
-                        text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
-                        onClick = onReport,
+                    GradientAvatar(
+                        name = theirUsername,
+                        size = 36.dp,
+                        online = if (isConnected) true else null,
                     )
-                    DropdownMenuItem(
-                        text = { Text("Block", color = Danger, fontSize = 14.sp) },
-                        onClick = onBlock,
-                    )
+                }
+                Box {
+                    IconButton(onClick = onMoreMenu, modifier = Modifier.size(36.dp)) {
+                        PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = onDismissMenu,
+                        containerColor = Surface2,
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
+                            onClick = onReport,
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Block", color = Danger, fontSize = 14.sp) },
+                            onClick = onBlock,
+                        )
+                    }
                 }
             }
         }

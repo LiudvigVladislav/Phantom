@@ -538,31 +538,31 @@ private fun ProfileCard(
 
             Spacer(Modifier.height(14.dp))
 
-            // Identity headline — Phase 2 mockup: Geist 22sp 500 -0.01em.
+            // Design Brief v3 §11.3: identity is the @username in JetBrains
+            // Mono Medium 20pt — architectural truth, not a soft display name.
             Text(
                 text = if (username.isNotEmpty()) "@$username" else "Loading…",
                 color = TextPrimary,
-                fontSize = 22.sp,
+                fontSize = 20.sp,
                 fontWeight = FontWeight.Medium,
-                letterSpacing = (-0.22).sp,  // -0.01em × 22sp
+                fontFamily = PhantomFontMono,
+                letterSpacing = 0.2.sp,
             )
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(10.dp))
 
-            // Online status — minimal mockup style (5dp Success dot + mono 10sp
-            // tertiary "online"). Replaces the heavy "DEVICE TRUSTED · ONLINE"
-            // overline; trust state is surfaced via the QR / fingerprint card
-            // below, not a header tagline.
+            // Trust + presence overline: "DEVICE TRUSTED · ONLINE" uppercased
+            // mono 11pt, tertiary, separated by middle dot. Cyan dot signals
+            // active connection.
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Canvas(modifier = Modifier.size(5.dp)) {
-                    drawCircle(color = Success, radius = size.minDimension / 2f)
+                    drawCircle(color = PhantomTokens.Colors.Cyan, radius = size.minDimension / 2f)
                 }
-                Spacer(Modifier.width(5.dp))
+                Spacer(Modifier.width(7.dp))
                 Text(
-                    text = "online",
-                    color = TextDim.copy(alpha = 0.6f),
-                    fontSize = 10.sp,
-                    fontFamily = PhantomFontMono,
+                    text = "DEVICE TRUSTED · ONLINE",
+                    color = PhantomTokens.Colors.TextTertiary,
+                    style = PhantomType.overline,
                 )
             }
 
