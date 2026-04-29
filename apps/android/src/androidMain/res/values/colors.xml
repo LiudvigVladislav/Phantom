@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#0B0D12</color>
+    <!-- Match the deep purple-black corners of phantom_logo.png so the
+         adaptive-icon mask shows no contrast ring around the PNG. -->
+    <color name="ic_launcher_background">#000000</color>
 </resources>

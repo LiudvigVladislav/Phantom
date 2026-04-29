@@ -3,11 +3,12 @@
 
 package phantom.android.screens.premium
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -15,11 +16,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -28,18 +25,20 @@ import phantom.android.ui.*
 import phantom.android.ui.theme.*
 
 /**
- * PremiumScreen — Design Brief v3 §14: PHANTOM PRO upgrade.
+ * PremiumScreen — PHANTOM_FULL_COMPOSE §11.
  *
- * Tone: never marketing-loud. PRO unlocks operator-grade features (custom
- * relays, Berkeley Mono, advanced sealed-sender variants) for users whose
- * threat model demands them. Free tier is fully functional E2E messaging —
- * PRO is for journalists, dissidents, security teams.
+ * 3 tiers: Free / Plus / Pro.
+ *  - Mobile: segmented tab selector shows one plan card at a time.
+ *  - Plan card: tier name (Geist 20px), price (Geist 32px /mo), feature list
+ *    with cyan check ticks, CTA pill 48dp.
+ *  - Pro card carries an inline "Recommended" mono kicker and a Ghost Mode
+ *    inset block (surfaceDeep · borderSubtle · radius 10dp).
  */
 @Composable
 fun PremiumScreen(
     onBack: () -> Unit,
 ) {
-    val scroll = rememberScrollState()
+    var selected by remember { mutableStateOf(Tier.Pro) }
 
     Scaffold(
         containerColor = PhantomTokens.Colors.SurfaceDeep,
@@ -53,18 +52,20 @@ fun PremiumScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(64.dp)
-                        .padding(horizontal = PhantomTokens.Spacing.tight),
+                        .height(56.dp)
+                        .padding(horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
                         PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
                     }
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(4.dp))
                     Text(
-                        text = "PHANTOM PRO",
+                        text = "Upgrade",
                         color = TextPrimary,
-                        style = PhantomType.headline,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = (-0.20).sp,
                     )
                 }
                 HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
@@ -75,172 +76,325 @@ fun PremiumScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .verticalScroll(scroll)
-                .padding(horizontal = PhantomTokens.Spacing.comfortable)
-                .padding(bottom = 32.dp),
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Spacer(Modifier.height(PhantomTokens.Spacing.gap))
-
-            // Hero glyph — concentric vault rings with cyan core.
-            Canvas(modifier = Modifier.size(96.dp)) {
-                val cx = size.width / 2f
-                val cy = size.height / 2f
-                val maxR = size.width / 2f - 4f
-                for (i in 1..3) {
-                    drawCircle(
-                        color = PhantomTokens.Colors.Cyan.copy(alpha = 0.20f - (i - 1) * 0.05f),
-                        radius = maxR * (i / 3f),
-                        center = Offset(cx, cy),
-                        style = Stroke(width = 1.2f),
-                    )
-                }
-                drawCircle(
-                    color = PhantomTokens.Colors.Cyan,
-                    radius = maxR * 0.18f,
-                    center = Offset(cx, cy),
-                )
-                drawCircle(
-                    color = PhantomTokens.Colors.Cyan.copy(alpha = 0.2f),
-                    radius = maxR * 0.36f,
-                    center = Offset(cx, cy),
-                )
-            }
-
-            Spacer(Modifier.height(PhantomTokens.Spacing.gap))
-
+            // Section overline
             Text(
-                text = "Operator-grade privacy",
+                text = "PHANTOM PRO",
+                color = CyanAccent,
+                fontSize = 10.sp,
+                fontFamily = PhantomFontMono,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 2.4.sp,
+            )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                text = "Choose your plan",
                 color = TextPrimary,
-                fontSize = 26.sp,
+                fontSize = 24.sp,
                 fontWeight = FontWeight.Light,
-                lineHeight = 32.sp,
+                lineHeight = 30.sp,
                 textAlign = TextAlign.Center,
                 letterSpacing = (-0.5).sp,
             )
-
-            Spacer(Modifier.height(12.dp))
-
+            Spacer(Modifier.height(8.dp))
             Text(
-                text = "PHANTOM is free and fully encrypted. PRO unlocks the controls a journalist, dissident, or security team needs.",
+                text = "PHANTOM is free and fully encrypted. Plus and Pro unlock advanced controls.",
                 color = TextDim,
-                fontSize = 14.sp,
-                lineHeight = 22.sp,
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
                 textAlign = TextAlign.Center,
             )
 
-            Spacer(Modifier.height(PhantomTokens.Spacing.gap))
+            Spacer(Modifier.height(24.dp))
 
-            PremiumFeatureCard(
-                kicker = "RELAY CONTROL",
-                title = "Bring your own relay",
-                body = "Route through a self-hosted onion or LAN relay. Default to phntm.pro only when you choose to.",
-            )
-            Spacer(Modifier.height(12.dp))
-            PremiumFeatureCard(
-                kicker = "BERKELEY MONO",
-                title = "Premium typeface",
-                body = "Tabular figures, ligatures, and a cut tuned for cryptographic readouts. Used in fingerprints, key prefixes, hashes.",
-            )
-            Spacer(Modifier.height(12.dp))
-            PremiumFeatureCard(
-                kicker = "STEALTH ROUTING",
-                title = "Advanced sealed sender",
-                body = "Per-conversation tag rotation, decoy traffic shaping, and Tor-bridge fallback when relays are unreachable.",
-            )
-            Spacer(Modifier.height(12.dp))
-            PremiumFeatureCard(
-                kicker = "EXTENDED LIFETIME",
-                title = "Disappearing windows up to 1 year",
-                body = "Free is capped at 30 days. PRO lets you set retention from one minute to one year per conversation.",
-            )
+            // Mobile segmented selector — Free / Plus / Pro.
+            TierSelector(selected = selected, onSelect = { selected = it })
 
-            Spacer(Modifier.height(PhantomTokens.Spacing.sectionGap))
+            Spacer(Modifier.height(20.dp))
 
-            Button(
-                onClick = { /* TODO: launch billing flow */ },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(54.dp)
-                    .shadow(
-                        elevation = 12.dp,
-                        shape = RoundedCornerShape(9999.dp),
-                        clip = false,
-                        spotColor = CyanAccent.copy(alpha = 0.30f),
-                        ambientColor = CyanAccent.copy(alpha = 0.10f),
-                    ),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = CyanAccent,
-                    contentColor = BgDeep,
-                ),
-                shape = RoundedCornerShape(9999.dp),
-            ) {
-                Text(
-                    text = "Upgrade — $4.99 / month",
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Medium,
-                )
+            when (selected) {
+                Tier.Free -> FreePlanCard()
+                Tier.Plus -> PlusPlanCard()
+                Tier.Pro -> ProPlanCard()
             }
 
-            Spacer(Modifier.height(PhantomTokens.Spacing.tight))
+            Spacer(Modifier.height(20.dp))
 
             Text(
-                text = "Cancel any time. PRO never weakens encryption — Free is fully E2E.",
+                text = "Cancel any time. Subscription never weakens encryption — Free is fully E2E.",
                 color = PhantomTokens.Colors.TextTertiary,
-                style = PhantomType.caption,
+                fontSize = 12.sp,
+                lineHeight = 18.sp,
                 textAlign = TextAlign.Center,
             )
+
+            Spacer(Modifier.height(32.dp))
         }
     }
 }
 
+private enum class Tier { Free, Plus, Pro }
+
 @Composable
-private fun PremiumFeatureCard(kicker: String, title: String, body: String) {
+private fun TierSelector(selected: Tier, onSelect: (Tier) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(Surface)
+            .border(1.dp, BorderSubtle, RoundedCornerShape(10.dp))
+            .padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Tier.entries.forEach { tier ->
+            val active = tier == selected
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (active) Surface2 else Color.Transparent)
+                    .border(
+                        1.dp,
+                        if (active) CyanAccent.copy(alpha = 0.30f) else Color.Transparent,
+                        RoundedCornerShape(8.dp),
+                    )
+                    .clickable { onSelect(tier) }
+                    .padding(vertical = 10.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = tier.name.uppercase(),
+                    color = if (active) CyanAccent else TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = PhantomFontMono,
+                    fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+                    letterSpacing = 1.8.sp,
+                )
+            }
+        }
+    }
+}
+
+// ── Tier cards ──────────────────────────────────────────────────────────────
+
+@Composable
+private fun FreePlanCard() {
+    PlanCardShell(
+        recommended = false,
+        kicker = "FREE",
+        price = "$0",
+        cadence = "/mo",
+        features = listOf(
+            "1:1 end-to-end encrypted messages",
+            "Group chats up to 8",
+            "Voice & video calls",
+            "Disappearing messages up to 30 days",
+            "Phntm.pro relay",
+        ),
+        ctaLabel = "Current plan",
+        ctaEnabled = false,
+        ghostInset = false,
+    )
+}
+
+@Composable
+private fun PlusPlanCard() {
+    PlanCardShell(
+        recommended = false,
+        kicker = "PLUS",
+        price = "$4.99",
+        cadence = "/mo",
+        features = listOf(
+            "Everything in Free",
+            "Larger groups up to 64 members",
+            "Disappearing messages up to 1 year",
+            "Custom relay support",
+            "Priority message routing",
+            "Premium typeface (PP Neue Montreal)",
+        ),
+        ctaLabel = "Upgrade to Plus",
+        ctaEnabled = true,
+        ghostInset = false,
+    )
+}
+
+@Composable
+private fun ProPlanCard() {
+    PlanCardShell(
+        recommended = true,
+        kicker = "PRO",
+        price = "$9.99",
+        cadence = "/mo",
+        features = listOf(
+            "Everything in Plus",
+            "Berkeley Mono for fingerprints & keys",
+            "Stealth routing & decoy traffic",
+            "Tor-bridge fallback",
+            "Self-hosted relay support",
+            "Advanced sealed sender",
+        ),
+        ctaLabel = "Upgrade to Pro",
+        ctaEnabled = true,
+        ghostInset = true,
+    )
+}
+
+@Composable
+private fun PlanCardShell(
+    recommended: Boolean,
+    kicker: String,
+    price: String,
+    cadence: String,
+    features: List<String>,
+    ctaLabel: String,
+    ctaEnabled: Boolean,
+    ghostInset: Boolean,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
-            .background(
-                Brush.linearGradient(
-                    colors = listOf(
-                        PhantomTokens.Colors.SurfaceElevated,
-                        PhantomTokens.Colors.SurfaceElevated.copy(alpha = 0.85f),
-                    ),
-                ),
-            )
+            .clip(RoundedCornerShape(12.dp))
+            .background(PhantomTokens.Colors.SurfaceElevated)
             .border(
                 1.dp,
-                PhantomTokens.Colors.Cyan.copy(alpha = 0.10f),
-                RoundedCornerShape(PhantomTokens.Radius.md),
+                if (recommended) CyanAccent.copy(alpha = 0.35f) else BorderSubtle,
+                RoundedCornerShape(12.dp),
             )
-            .padding(horizontal = PhantomTokens.Spacing.comfortable, vertical = PhantomTokens.Spacing.tight),
+            .padding(horizontal = 20.dp, vertical = 22.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        if (recommended) {
             Box(
                 modifier = Modifier
-                    .size(6.dp)
-                    .clip(androidx.compose.foundation.shape.CircleShape)
-                    .background(PhantomTokens.Colors.Cyan),
-            )
-            Spacer(Modifier.width(8.dp))
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(CyanAccent.copy(alpha = 0.08f))
+                    .border(
+                        1.dp,
+                        CyanAccent.copy(alpha = 0.30f),
+                        RoundedCornerShape(4.dp),
+                    )
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(
+                    text = "RECOMMENDED",
+                    color = CyanAccent,
+                    fontSize = 9.sp,
+                    fontFamily = PhantomFontMono,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = 1.6.sp,
+                )
+            }
+            Spacer(Modifier.height(14.dp))
+        }
+        Text(
+            text = kicker,
+            color = TextDim,
+            fontSize = 9.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 1.8.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.Bottom) {
             Text(
-                text = kicker,
-                color = PhantomTokens.Colors.Cyan,
-                style = PhantomType.overline,
+                text = price,
+                color = TextPrimary,
+                fontSize = 32.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.32).sp,
+            )
+            Text(
+                text = cadence,
+                color = TextDim,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(start = 4.dp, bottom = 6.dp),
+            )
+        }
+        Spacer(Modifier.height(20.dp))
+
+        features.forEach { feature ->
+            Row(
+                modifier = Modifier.padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(16.dp)
+                        .clip(CircleShape)
+                        .background(CyanAccent.copy(alpha = 0.10f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "✓",
+                        color = CyanAccent,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = feature,
+                    color = PhantomTokens.Colors.TextSecondary,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+            }
+        }
+
+        if (ghostInset) {
+            Spacer(Modifier.height(16.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(PhantomTokens.Colors.SurfaceDeep)
+                    .border(1.dp, BorderSubtle, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    PhIconEye(color = PhantomTokens.Colors.TextTertiary, size = 14.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Ghost Mode",
+                        color = TextPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Become completely invisible on PHANTOM. Receive-only mode disables read receipts, presence, and discovery.",
+                    color = PhantomTokens.Colors.TextTertiary,
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp,
+                )
+            }
+        }
+
+        Spacer(Modifier.height(20.dp))
+
+        Button(
+            onClick = { /* TODO: launch billing flow */ },
+            enabled = ctaEnabled,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (ctaEnabled) CyanAccent else Color.Transparent,
+                contentColor = if (ctaEnabled) BgDeep else TextDim,
+                disabledContainerColor = Color.Transparent,
+                disabledContentColor = TextDim,
+            ),
+            border = if (!ctaEnabled) androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle) else null,
+            shape = RoundedCornerShape(8.dp),
+        ) {
+            Text(
+                text = ctaLabel,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
             )
         }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = title,
-            color = TextPrimary,
-            style = PhantomType.title,
-        )
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = body,
-            color = PhantomTokens.Colors.TextSecondary,
-            style = PhantomType.body,
-        )
     }
 }

@@ -538,31 +538,47 @@ private fun ProfileCard(
 
             Spacer(Modifier.height(14.dp))
 
-            // Design Brief v3 §11.3: identity is the @username in JetBrains
-            // Mono Medium 20pt — architectural truth, not a soft display name.
+            // PHANTOM_FULL_COMPOSE §07 Zone A — display name in Geist 24px
+            // textPrimary, then @handle in Mono 12px textTertiary opacity 0.55.
             Text(
-                text = if (username.isNotEmpty()) "@$username" else "Loading…",
+                text = if (firstName.isNotEmpty()) firstName else (if (username.isNotEmpty()) username else "Loading…"),
                 color = TextPrimary,
-                fontSize = 20.sp,
+                fontSize = 24.sp,
                 fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.24).sp,
+            )
+
+            Spacer(Modifier.height(6.dp))
+
+            Text(
+                text = if (username.isNotEmpty()) "@$username" else "—",
+                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
+                fontSize = 12.sp,
                 fontFamily = PhantomFontMono,
-                letterSpacing = 0.2.sp,
+                letterSpacing = 0.4.sp,
             )
 
             Spacer(Modifier.height(10.dp))
 
-            // Trust + presence overline: "DEVICE TRUSTED · ONLINE" uppercased
-            // mono 11pt, tertiary, separated by middle dot. Cyan dot signals
-            // active connection.
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Canvas(modifier = Modifier.size(5.dp)) {
-                    drawCircle(color = PhantomTokens.Colors.Cyan, radius = size.minDimension / 2f)
-                }
-                Spacer(Modifier.width(7.dp))
+            // Tier badge — mono 9px, rounded 4dp. FREE while billing isn't wired.
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color.White.copy(alpha = 0.04f))
+                    .border(
+                        1.dp,
+                        Color.White.copy(alpha = 0.08f),
+                        RoundedCornerShape(4.dp),
+                    )
+                    .padding(horizontal = 7.dp, vertical = 3.dp),
+            ) {
                 Text(
-                    text = "DEVICE TRUSTED · ONLINE",
-                    color = PhantomTokens.Colors.TextTertiary,
-                    style = PhantomType.overline,
+                    text = "FREE",
+                    color = TextDim,
+                    fontSize = 9.sp,
+                    fontFamily = PhantomFontMono,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = 1.5.sp,
                 )
             }
 

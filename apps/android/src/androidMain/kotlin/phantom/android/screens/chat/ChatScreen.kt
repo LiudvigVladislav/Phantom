@@ -726,6 +726,8 @@ fun ChatScreen(
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
+            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
+
             // Pinned message banner — shown when at least one message is pinned
             if (pinnedMessages.isNotEmpty()) {
                 item(key = "pinned_banner") {
@@ -927,6 +929,60 @@ fun ChatScreen(
 private sealed class ChatItem {
     data class DateSep(val dateKey: String, val millis: Long) : ChatItem()
     data class Msg(val entity: MessageEntity) : ChatItem()
+}
+
+/**
+ * PHANTOM_FULL_COMPOSE §05 — Encryption strip is THE WOW MOMENT.
+ *
+ *   32dp, surfaceDeep bg, borderSubtle bottom hairline.
+ *   Lock 10dp + "End-to-end encrypted · ED25519 · @username"
+ *   JetBrains Mono 10sp · textTertiary · opacity 0.7
+ */
+@Composable
+private fun E2EENoteRow(theirUsername: String) {
+    Column {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(32.dp)
+                .background(PhantomTokens.Colors.SurfaceDeep),
+            contentAlignment = Alignment.Center,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Canvas(modifier = Modifier.size(10.dp)) {
+                    val w = this.size.width
+                    val h = this.size.height
+                    val sw = 1.4.dp.toPx()
+                    val color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f)
+                    drawRoundRect(
+                        color = color,
+                        topLeft = Offset(w * 0.18f, h * 0.45f),
+                        size = androidx.compose.ui.geometry.Size(w * 0.64f, h * 0.45f),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.dp.toPx()),
+                        style = Stroke(sw),
+                    )
+                    drawArc(
+                        color = color,
+                        startAngle = 180f, sweepAngle = 180f, useCenter = false,
+                        topLeft = Offset(w * 0.30f, h * 0.18f),
+                        size = androidx.compose.ui.geometry.Size(w * 0.40f, h * 0.50f),
+                        style = Stroke(sw),
+                    )
+                }
+                Text(
+                    text = "End-to-end encrypted · ED25519 · @$theirUsername",
+                    color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f),
+                    fontSize = 10.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 0.4.sp,
+                )
+            }
+        }
+        HorizontalDivider(color = PhantomTokens.Colors.BorderSubtle, thickness = 1.dp)
+    }
 }
 
 @Composable
@@ -1217,10 +1273,12 @@ private fun MessageBubble(
             val timeReserve = if (isSent) 56.dp else 36.dp
             // Outer column: bubble + reaction pills stacked vertically
             Column {
-            // Bubble shape per Design Brief v3 §9.6:
+            // Bubble shape per PHANTOM_FULL_COMPOSE §05:
             //   incoming  → 12 12 12 2   (tail bottom-left)
             //   outgoing  → 12 12 2 12   (tail bottom-right)
-            // Outgoing fill: linear gradient #00D4FF → #0099CC at 135°.
+            // OutBubble is FLAT cyan — gradient explicitly LOCKED OFF in the
+            // Phase-2 polish pass (see §15 "What was normalized": "OutBubble:
+            // gradient removed → flat C.cyan").
             val bubbleShape = RoundedCornerShape(
                 topStart = PhantomTokens.Radius.md,
                 topEnd = PhantomTokens.Radius.md,
@@ -1232,14 +1290,7 @@ private fun MessageBubble(
                     .widthIn(min = 80.dp, max = 260.dp)
                     .then(
                         if (isSent) Modifier.background(
-                            brush = Brush.linearGradient(
-                                colors = listOf(
-                                    PhantomTokens.Colors.Cyan,
-                                    PhantomTokens.Colors.CyanDark,
-                                ),
-                                start = Offset(0f, 0f),
-                                end = Offset(Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY),
-                            ),
+                            color = PhantomTokens.Colors.Cyan,
                             shape = bubbleShape,
                         ) else Modifier
                             .background(
@@ -2312,31 +2363,49 @@ private fun ChatTopBar(
     onReport: () -> Unit,
     onBlock: () -> Unit,
 ) {
-    // Design Brief v3 §9.1 layout:
-    //   [back]   [name + ED25519 indicator centered]   [avatar right]   [more]
-    // 64dp content height, BorderSubtle bottom hairline.
+    // PHANTOM_FULL_COMPOSE §05 layout:
+    //   [← back] [Avatar 36dp] [name + @username] [Phone] [Video] [MoreHoriz]
+    // 56dp height, BorderSubtle bottom hairline.
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(PhantomTokens.Colors.Surface)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
-        Box(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(64.dp)
-                .padding(horizontal = PhantomTokens.Spacing.comfortable),
-            contentAlignment = Alignment.Center,
+                .height(56.dp)
+                .padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Centered name + ED25519 line.
+            IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
+                PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
+            }
+            Spacer(Modifier.width(4.dp))
+            Box(
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .clickable(onClick = onContactProfile),
+            ) {
+                GradientAvatar(
+                    name = theirUsername,
+                    size = 36.dp,
+                    online = if (isConnected) true else null,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
             Column(
-                modifier = Modifier.fillMaxWidth(0.55f),
-                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClick = onContactProfile),
             ) {
                 Text(
                     text = theirUsername,
                     color = PhantomTokens.Colors.TextPrimary,
-                    style = PhantomType.title,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = (-0.15).sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -2344,75 +2413,44 @@ private fun ChatTopBar(
                     Text(
                         text = "typing…",
                         color = PhantomTokens.Colors.Cyan.copy(alpha = 0.85f),
-                        style = PhantomType.monoSm,
+                        fontSize = 11.sp,
+                        fontFamily = PhantomFontMono,
                     )
                 } else {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier.padding(top = 2.dp),
-                    ) {
-                        Canvas(modifier = Modifier.size(5.dp)) {
-                            drawCircle(
-                                color = if (isConnected) PhantomTokens.Colors.Cyan
-                                else PhantomTokens.Colors.TextDisabled,
-                            )
-                        }
-                        Text(
-                            text = "ED25519",
-                            color = PhantomTokens.Colors.TextTertiary,
-                            style = PhantomType.monoSm,
-                            letterSpacing = 0.5.sp,
-                        )
-                    }
-                }
-            }
-
-            // Left edge: back arrow.
-            Row(
-                modifier = Modifier.align(Alignment.CenterStart),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
-                    PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
-                }
-            }
-
-            // Right edge: avatar (tap → contact profile) + more menu.
-            Row(
-                modifier = Modifier.align(Alignment.CenterEnd),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .clip(CircleShape)
-                        .clickable(onClick = onContactProfile),
-                ) {
-                    GradientAvatar(
-                        name = theirUsername,
-                        size = 36.dp,
-                        online = if (isConnected) true else null,
+                    Text(
+                        text = "@$theirUsername",
+                        color = PhantomTokens.Colors.TextTertiary,
+                        fontSize = 11.sp,
+                        fontFamily = PhantomFontMono,
+                        letterSpacing = 0.4.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
-                Box {
-                    IconButton(onClick = onMoreMenu, modifier = Modifier.size(36.dp)) {
-                        PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = onDismissMenu,
-                        containerColor = Surface2,
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
-                            onClick = onReport,
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Block", color = Danger, fontSize = 14.sp) },
-                            onClick = onBlock,
-                        )
-                    }
+            }
+            IconButton(onClick = { /* TODO: voice call */ }, modifier = Modifier.size(40.dp)) {
+                PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
+            }
+            IconButton(onClick = { /* TODO: video call */ }, modifier = Modifier.size(40.dp)) {
+                PhIconVideo(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
+            }
+            Box {
+                IconButton(onClick = onMoreMenu, modifier = Modifier.size(40.dp)) {
+                    PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
+                }
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = onDismissMenu,
+                    containerColor = Surface2,
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
+                        onClick = onReport,
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Block", color = Danger, fontSize = 14.sp) },
+                        onClick = onBlock,
+                    )
                 }
             }
         }

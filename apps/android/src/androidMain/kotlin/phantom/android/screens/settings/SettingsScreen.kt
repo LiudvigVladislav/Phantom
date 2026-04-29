@@ -113,9 +113,9 @@ fun SettingsScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(top = 6.dp, bottom = 110.dp),
             ) {
-                // Profile card — Design Brief v3 §11.4: avatar 64×64 + name +
-                // @username (mono) + "DEVICE TRUSTED · ONLINE" overline +
-                // chevron. Tap → full Profile.
+                // Profile card — PHANTOM_FULL_COMPOSE §06: avatar 56dp +
+                // display name Geist 17px + @handle mono 12px tertiary +
+                // inline FREE/PLUS/PRO tier badge. Tap → full Profile.
                 item {
                     Row(
                         modifier = Modifier
@@ -142,23 +142,48 @@ fun SettingsScreen(
                     ) {
                         GradientAvatar(
                             name = userName.ifEmpty { "?" },
-                            size = 64.dp,
+                            size = 56.dp,
                             imageBitmap = selfAvatarImage,
                         )
                         Spacer(Modifier.width(PhantomTokens.Spacing.comfortable))
                         Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = if (userName.isNotEmpty()) userName else "Loading…",
+                                    color = TextPrimary,
+                                    fontSize = 17.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    letterSpacing = (-0.17).sp,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Color.White.copy(alpha = 0.04f))
+                                        .border(
+                                            1.dp,
+                                            Color.White.copy(alpha = 0.08f),
+                                            RoundedCornerShape(4.dp),
+                                        )
+                                        .padding(horizontal = 5.dp, vertical = 2.dp),
+                                ) {
+                                    Text(
+                                        text = "FREE",
+                                        color = TextDim,
+                                        fontSize = 8.sp,
+                                        fontFamily = PhantomFontMono,
+                                        fontWeight = FontWeight.Medium,
+                                        letterSpacing = 1.4.sp,
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(4.dp))
                             Text(
-                                text = if (userName.isNotEmpty()) "@$userName" else "Loading…",
-                                color = TextPrimary,
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.Medium,
+                                text = if (userName.isNotEmpty()) "@$userName" else "—",
+                                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
+                                fontSize = 12.sp,
                                 fontFamily = PhantomFontMono,
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                text = "DEVICE TRUSTED · ONLINE",
-                                color = PhantomTokens.Colors.TextTertiary,
-                                style = PhantomType.overline,
+                                letterSpacing = 0.4.sp,
                             )
                         }
                         PhIconChevron(color = TextDim, size = 14.dp)

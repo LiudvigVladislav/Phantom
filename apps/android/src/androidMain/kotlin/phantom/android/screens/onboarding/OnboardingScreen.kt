@@ -10,10 +10,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
@@ -35,13 +35,15 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -49,19 +51,29 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 
+/**
+ * OnboardingScreen — Design/PHANTOM_FULL_COMPOSE.md §09 (3 steps).
+ *
+ * Phase 0: TermsScreen — legal gate. Once accepted, never shown again.
+ * Phase 1: 3-page intro pager.
+ *   Step 1 — Welcome: phantom_logo + "PHANTOM" wordmark + "Private by design."
+ *   Step 2 — Identity Key: ED25519 fingerprint card + username input
+ *   Step 3 — Privacy Mode: Standard / Private / Ghost (Ghost = PRO locked)
+ *
+ * All steps share an ambient concentric-circle motif in the background and a
+ * 3-segment step indicator at the bottom. Swipe is free in both directions
+ * so the user can preview steps before committing to a username.
+ */
 @Composable
 fun OnboardingScreen(
     container: AppContainer,
     onComplete: () -> Unit,
 ) {
-    // Two phases:
-    //   Phase 0 — legal gate: ToS scroll + accept (TermsScreen)
-    //   Phase 1 — 4-page intro pager (Welcome → Privacy → Network → Identity)
-    // Per Design Brief v3 §5: progressive trust narrative, identity choice last.
     var tosAccepted by remember { mutableStateOf(false) }
 
     if (!tosAccepted) {
@@ -74,8 +86,28 @@ fun OnboardingScreen(
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
-    val pagerState = rememberPagerState(pageCount = { 4 })
+    val pagerState = rememberPagerState(pageCount = { 3 })
     val scope = rememberCoroutineScope()
+
+    // Identity & privacy state lives at the pager level so the user can swipe
+    // back to Step 2 without losing their typed username.
+    var username by remember { mutableStateOf("") }
+    var privacyMode by remember { mutableStateOf(PrivacyMode.Standard) }
+    var loading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    val ctx = LocalContext.current
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ -> onComplete() }
+
+    val finalize: () -> Unit = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            onComplete()
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -83,43 +115,61 @@ private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
             .background(BgDeep)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
+        // Ambient motif — 5 concentric circles, 0.028 opacity per FULL_COMPOSE.
+        AmbientMotif()
+
         HorizontalPager(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
-            // Identity page owns the IME — disable swipe so the keyboard does
-            // not slide pages while the user types.
-            userScrollEnabled = pagerState.currentPage != 3,
         ) { page ->
             when (page) {
-                0 -> WelcomePage(onContinue = {
+                0 -> WelcomeStep(onContinue = {
                     scope.launch { pagerState.animateScrollToPage(1) }
                 })
-                1 -> PrivacyPage(onContinue = {
-                    scope.launch { pagerState.animateScrollToPage(2) }
-                })
-                2 -> NetworkPage(onContinue = {
-                    scope.launch { pagerState.animateScrollToPage(3) }
-                })
-                3 -> IdentityScreen(container = container, onComplete = onComplete)
+                1 -> IdentityKeyStep(
+                    username = username,
+                    onUsernameChange = { username = it; error = null },
+                    onContinue = {
+                        scope.launch { pagerState.animateScrollToPage(2) }
+                    },
+                )
+                2 -> PrivacyModeStep(
+                    selected = privacyMode,
+                    onSelect = { privacyMode = it },
+                    isLoading = loading,
+                    canEnter = username.length >= 3,
+                    error = error,
+                    onEnter = {
+                        if (!loading) {
+                            scope.launch {
+                                loading = true
+                                runOnboarding(container, username, finalize) {
+                                    error = it; loading = false
+                                }
+                            }
+                        }
+                    },
+                )
             }
         }
 
-        // Page indicator — 4 dots, bottom centered.
+        // Step indicator — 3 segments. Active = cyan, inactive = border.
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 24.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                .padding(bottom = 28.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            repeat(4) { i ->
+            repeat(3) { i ->
                 val active = pagerState.currentPage == i
                 Box(
                     modifier = Modifier
-                        .size(if (active) 7.dp else 6.dp)
-                        .clip(CircleShape)
+                        .height(3.dp)
+                        .width(if (active) 28.dp else 16.dp)
+                        .clip(RoundedCornerShape(2.dp))
                         .background(
                             if (active) CyanAccent
-                            else TextDim.copy(alpha = 0.25f),
+                            else BorderSubtle,
                         ),
                 )
             }
@@ -127,7 +177,494 @@ private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
     }
 }
 
-// ── Step 1: Terms of Service ──────────────────────────────────────────────────
+// ── Step 1 · Welcome ────────────────────────────────────────────────────────
+
+@Composable
+private fun WelcomeStep(onContinue: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.weight(0.55f))
+
+        // PHANTOM logo — phantom_logo.png used AS-IS, height 60dp, no clip.
+        Image(
+            painter = painterResource(R.drawable.phantom_logo),
+            contentDescription = "PHANTOM",
+            modifier = Modifier.height(72.dp),
+        )
+
+        Spacer(Modifier.height(20.dp))
+
+        // Wordmark — Geist 32px Medium, tight tracking.
+        Text(
+            text = "PHANTOM",
+            color = TextPrimary,
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = (-0.32).sp,
+        )
+
+        Spacer(Modifier.height(14.dp))
+
+        // Tagline — Inter 15px secondary.
+        Text(
+            text = "Private by design.",
+            color = TextDim,
+            fontSize = 15.sp,
+            textAlign = TextAlign.Center,
+        )
+
+        Spacer(Modifier.height(20.dp))
+
+        // Body value-prop.
+        Text(
+            text = "End-to-end encrypted. No phone number, no email, no metadata. Your conversations belong to you.",
+            color = PhantomTokens.Colors.TextTertiary,
+            fontSize = 14.sp,
+            lineHeight = 22.sp,
+            textAlign = TextAlign.Center,
+        )
+
+        Spacer(Modifier.weight(1f))
+
+        IntroCta(label = "Get started", onClick = onContinue)
+
+        Spacer(Modifier.height(80.dp))
+    }
+}
+
+// ── Step 2 · Identity Key ───────────────────────────────────────────────────
+
+@Composable
+private fun IdentityKeyStep(
+    username: String,
+    onUsernameChange: (String) -> Unit,
+    onContinue: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    val valid = username.length >= 3
+    val sampleFingerprint = "A4B2  C8D1  E3F7  2A9B  4C6D  8E1F  3A5B  7C2D"
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.height(72.dp))
+
+        Text(
+            text = "02 · YOUR IDENTITY KEY",
+            color = CyanAccent,
+            fontSize = 10.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 2.4.sp,
+        )
+
+        Spacer(Modifier.height(18.dp))
+
+        Text(
+            text = "You are your key.",
+            color = TextPrimary,
+            fontSize = 28.sp,
+            fontWeight = FontWeight.Light,
+            lineHeight = 34.sp,
+            textAlign = TextAlign.Center,
+            letterSpacing = (-0.6).sp,
+        )
+
+        Spacer(Modifier.height(14.dp))
+
+        Text(
+            text = "Your account is a cryptographic key generated on this device. There is no password to leak.",
+            color = TextDim,
+            fontSize = 14.sp,
+            lineHeight = 22.sp,
+            textAlign = TextAlign.Center,
+        )
+
+        Spacer(Modifier.height(28.dp))
+
+        // ED25519 fingerprint card — surfaceDeep bg, cyan-tinted border.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(PhantomTokens.Colors.SurfaceDeep)
+                .border(
+                    1.dp,
+                    CyanAccent.copy(alpha = 0.22f),
+                    RoundedCornerShape(12.dp),
+                )
+                .padding(horizontal = 20.dp, vertical = 18.dp),
+            horizontalAlignment = Alignment.Start,
+        ) {
+            Text(
+                text = "ED25519 · GENERATED ON DEVICE · NEVER TRANSMITTED",
+                color = CyanAccent.copy(alpha = 0.85f),
+                fontSize = 9.sp,
+                fontFamily = PhantomFontMono,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 1.5.sp,
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = sampleFingerprint,
+                color = TextPrimary,
+                fontSize = 13.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 0.65.sp,
+                lineHeight = 22.sp,
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = "Generated on your device. Never stored, never transmitted.",
+                color = PhantomTokens.Colors.TextTertiary,
+                fontSize = 12.sp,
+                lineHeight = 18.sp,
+            )
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        // Username input — single field with @ prefix, mono.
+        Text(
+            text = "Choose your handle",
+            color = TextDim,
+            fontSize = 12.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 1.sp,
+        )
+        Spacer(Modifier.height(10.dp))
+        val fieldInteraction = remember { MutableInteractionSource() }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(Surface2)
+                .border(
+                    1.dp,
+                    if (valid) CyanAccent.copy(alpha = 0.30f) else BorderSubtle,
+                    RoundedCornerShape(10.dp),
+                )
+                .clickable(
+                    interactionSource = fieldInteraction,
+                    indication = null,
+                ) { focusRequester.requestFocus() }
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "@",
+                color = CyanAccent,
+                fontSize = 17.sp,
+                fontFamily = PhantomFontMono,
+            )
+            Spacer(Modifier.width(8.dp))
+            BasicTextField(
+                value = username,
+                onValueChange = {
+                    onUsernameChange(it.lowercase().filter { c -> c.isLetterOrDigit() || c == '_' })
+                },
+                modifier = Modifier.weight(1f).focusRequester(focusRequester),
+                singleLine = true,
+                textStyle = LocalTextStyle.current.copy(
+                    color = TextPrimary,
+                    fontSize = 17.sp,
+                    fontFamily = PhantomFontMono,
+                ),
+                cursorBrush = SolidColor(CyanAccent),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                keyboardActions = KeyboardActions(onNext = { if (valid) onContinue() }),
+                decorationBox = { inner ->
+                    if (username.isEmpty()) {
+                        Text(
+                            text = "yourname",
+                            color = TextDim.copy(alpha = 0.5f),
+                            fontSize = 17.sp,
+                            fontFamily = PhantomFontMono,
+                        )
+                    }
+                    inner()
+                },
+            )
+        }
+
+        Spacer(Modifier.height(28.dp))
+
+        IntroCta(
+            label = "Continue",
+            onClick = onContinue,
+            enabled = valid,
+        )
+
+        Spacer(Modifier.height(80.dp))
+    }
+}
+
+// ── Step 3 · Privacy Mode ───────────────────────────────────────────────────
+
+private enum class PrivacyMode { Standard, Private, Ghost }
+
+@Composable
+private fun PrivacyModeStep(
+    selected: PrivacyMode,
+    onSelect: (PrivacyMode) -> Unit,
+    isLoading: Boolean,
+    canEnter: Boolean,
+    error: String?,
+    onEnter: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.height(72.dp))
+
+        Text(
+            text = "03 · PRIVACY MODE",
+            color = CyanAccent,
+            fontSize = 10.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 2.4.sp,
+        )
+
+        Spacer(Modifier.height(18.dp))
+
+        Text(
+            text = "Choose your privacy mode",
+            color = TextPrimary,
+            fontSize = 26.sp,
+            fontWeight = FontWeight.Light,
+            lineHeight = 32.sp,
+            textAlign = TextAlign.Center,
+            letterSpacing = (-0.5).sp,
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        Text(
+            text = "Control how visible you are to others on PHANTOM.",
+            color = TextDim,
+            fontSize = 14.sp,
+            textAlign = TextAlign.Center,
+        )
+
+        Spacer(Modifier.height(28.dp))
+
+        PrivacyModeCard(
+            title = "Standard",
+            body = "Visible to contacts, searchable by username.",
+            active = selected == PrivacyMode.Standard,
+            locked = false,
+            onClick = { onSelect(PrivacyMode.Standard) },
+        )
+        Spacer(Modifier.height(12.dp))
+        PrivacyModeCard(
+            title = "Private",
+            body = "Visible only to confirmed contacts.",
+            active = selected == PrivacyMode.Private,
+            locked = false,
+            onClick = { onSelect(PrivacyMode.Private) },
+        )
+        Spacer(Modifier.height(12.dp))
+        PrivacyModeCard(
+            title = "Ghost Mode",
+            body = "Invisible to all. Receive-only.",
+            active = selected == PrivacyMode.Ghost,
+            locked = true,
+            onClick = { /* PRO-locked, informative not blocking */ },
+        )
+
+        if (error != null) {
+            Spacer(Modifier.height(14.dp))
+            Text(
+                text = error,
+                color = Danger,
+                fontSize = 12.sp,
+                fontFamily = PhantomFontMono,
+                textAlign = TextAlign.Center,
+            )
+        }
+
+        Spacer(Modifier.height(28.dp))
+
+        IntroCta(
+            label = if (isLoading) "Entering…" else "Enter PHANTOM",
+            onClick = onEnter,
+            enabled = canEnter && !isLoading,
+            showLoader = isLoading,
+        )
+
+        Spacer(Modifier.height(80.dp))
+    }
+}
+
+@Composable
+private fun PrivacyModeCard(
+    title: String,
+    body: String,
+    active: Boolean,
+    locked: Boolean,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .alpha(if (locked) 0.5f else 1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (active) Surface2 else Surface)
+            .border(
+                width = 1.dp,
+                color = if (active) CyanAccent.copy(alpha = 0.35f) else BorderSubtle,
+                shape = RoundedCornerShape(12.dp),
+            )
+            .then(
+                if (active) Modifier.drawWithContent {
+                    drawContent()
+                    drawRect(
+                        color = CyanAccent,
+                        size = Size(3.dp.toPx(), size.height),
+                    )
+                } else Modifier,
+            )
+            .clickable(enabled = !locked, onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.Top) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = title,
+                        color = TextPrimary,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    if (locked) {
+                        Spacer(Modifier.width(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(CyanAccent.copy(alpha = 0.10f))
+                                .border(
+                                    1.dp,
+                                    CyanAccent.copy(alpha = 0.30f),
+                                    RoundedCornerShape(4.dp),
+                                )
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                        ) {
+                            Text(
+                                text = "PRO",
+                                color = CyanAccent,
+                                fontSize = 9.sp,
+                                fontFamily = PhantomFontMono,
+                                letterSpacing = 1.5.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = body,
+                    color = PhantomTokens.Colors.TextSecondary,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                )
+            }
+            if (active) {
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(CyanAccent.copy(alpha = 0.12f))
+                        .border(1.dp, CyanAccent.copy(alpha = 0.35f), CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "✓",
+                        color = CyanAccent,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ── Ambient motif (concentric circles) ──────────────────────────────────────
+
+@Composable
+private fun AmbientMotif() {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val cx = size.width / 2f
+        val cy = size.height / 2.2f
+        val maxR = minOf(size.width, size.height) * 0.45f
+        val ringColor = TextPrimary
+        for (i in 1..5) {
+            drawCircle(
+                color = ringColor,
+                radius = maxR * (i / 5f),
+                center = Offset(cx, cy),
+                style = Stroke(width = 0.75.dp.toPx()),
+                alpha = 0.028f,
+            )
+        }
+    }
+}
+
+// ── Shared CTA ──────────────────────────────────────────────────────────────
+
+@Composable
+private fun IntroCta(
+    label: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    showLoader: Boolean = false,
+) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = CyanAccent,
+            contentColor = BgDeep,
+            disabledContainerColor = CyanAccent.copy(alpha = 0.18f),
+            disabledContentColor = TextDim.copy(alpha = 0.5f),
+        ),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        if (showLoader) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                color = BgDeep,
+                strokeWidth = 2.dp,
+            )
+        } else {
+            Text(
+                text = label,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+// ── Step 0 · Terms of Service (legal gate) ──────────────────────────────────
 
 @Composable
 private fun TermsScreen(onAccept: () -> Unit) {
@@ -150,7 +687,6 @@ private fun TermsScreen(onAccept: () -> Unit) {
     ) {
         Spacer(Modifier.height(40.dp))
 
-        // Wordmark
         Text(
             text = "PHANTOM",
             color = CyanAccent.copy(alpha = 0.55f),
@@ -181,7 +717,6 @@ private fun TermsScreen(onAccept: () -> Unit) {
 
         Spacer(Modifier.height(24.dp))
 
-        // Scrollable ToS card
         Column(
             modifier = Modifier
                 .weight(1f)
@@ -195,7 +730,6 @@ private fun TermsScreen(onAccept: () -> Unit) {
                 .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp, vertical = 22.dp),
         ) {
-            // Welcome line — sets the casual tone of the new TOS_SUMMARY drafts.
             Text(
                 text = "Welcome to PHANTOM",
                 color = TextPrimary,
@@ -245,8 +779,6 @@ private fun TermsScreen(onAccept: () -> Unit) {
             )
             Spacer(Modifier.height(20.dp))
 
-            // Tappable links to full ToS / Privacy Policy hosted at phntm.pro.
-            // These open in the user's browser — see Caddyfile for the routes.
             val linkContext = LocalContext.current
             Row(
                 horizontalArrangement = Arrangement.spacedBy(20.dp),
@@ -295,7 +827,6 @@ private fun TermsScreen(onAccept: () -> Unit) {
 
         Spacer(Modifier.height(12.dp))
 
-        // Scroll hint with drawn arrow
         if (!readEnough) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -309,7 +840,6 @@ private fun TermsScreen(onAccept: () -> Unit) {
                     fontFamily = PhantomFontMono,
                 )
                 Spacer(Modifier.height(6.dp))
-                // Drawn chevron-down arrow — no material icon
                 Canvas(modifier = Modifier.size(16.dp, 8.dp)) {
                     val w = size.width
                     val h = size.height
@@ -386,517 +916,7 @@ private fun TosSection(title: String, body: String, isLast: Boolean = false) {
     }
 }
 
-// ── Step 2: Identity creation ─────────────────────────────────────────────────
-
-@Composable
-private fun IdentityScreen(container: AppContainer, onComplete: () -> Unit) {
-    val scope = rememberCoroutineScope()
-    var username by remember { mutableStateOf("") }
-    var loading by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    val focusRequester = remember { FocusRequester() }
-
-    LaunchedEffect(Unit) {
-        kotlinx.coroutines.delay(300)
-        runCatching { focusRequester.requestFocus() }
-    }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { _ -> onComplete() }
-
-    val proceed: () -> Unit = {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            onComplete()
-        }
-    }
-
-    val valid = username.length >= 3
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(BgDeep)
-            .windowInsetsPadding(WindowInsets.statusBars)
-            .imePadding()
-            .padding(horizontal = 32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Spacer(Modifier.height(52.dp))
-
-        // Wordmark
-        Text(
-            text = "PHANTOM",
-            color = CyanAccent.copy(alpha = 0.55f),
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Normal,
-            letterSpacing = 5.sp,
-            fontFamily = PhantomFontMono,
-        )
-
-        Spacer(Modifier.height(40.dp))
-
-        // Hero tagline
-        Text(
-            text = "Your presence,\nknown to no one.",
-            color = TextPrimary,
-            fontSize = 32.sp,
-            fontWeight = FontWeight.Light,
-            lineHeight = 42.sp,
-            textAlign = TextAlign.Center,
-            letterSpacing = (-0.8).sp,
-        )
-
-        Spacer(Modifier.height(28.dp))
-
-        // Trust badge pills
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.wrapContentWidth(),
-        ) {
-            FeaturePill("E2E ENCRYPTED")
-            FeaturePill("NO PHONE")
-            FeaturePill("ZERO METADATA")
-        }
-
-        Spacer(Modifier.height(52.dp))
-
-        Text(
-            text = "Choose your identity",
-            color = TextDim,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Normal,
-            letterSpacing = 0.5.sp,
-            fontFamily = PhantomFontMono,
-        )
-
-        Spacer(Modifier.height(14.dp))
-
-        // Username input field — Surface2 box with CyanAccent left border
-        val fieldInteraction = remember { MutableInteractionSource() }
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(topEnd = 10.dp, bottomEnd = 10.dp))
-                .background(Surface2)
-                .border(
-                    width = 1.dp,
-                    color = if (valid) CyanAccent.copy(alpha = 0.25f) else Color.White.copy(alpha = 0.06f),
-                    shape = RoundedCornerShape(topEnd = 10.dp, bottomEnd = 10.dp),
-                )
-                // 2dp CyanAccent left border via inner padding trick with a drawn line
-                .drawLeftBorder(color = CyanAccent.copy(alpha = if (valid) 0.9f else 0.35f), width = 2.dp)
-                // Entire pill area forwards taps to the text field — avoids the problem
-                // where the tight BasicTextField hit box misses taps on the "@" prefix
-                // or on the padding zone around it.
-                .clickable(
-                    interactionSource = fieldInteraction,
-                    indication = null,
-                ) { focusRequester.requestFocus() }
-                .padding(horizontal = 16.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "@",
-                color = CyanAccent,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Light,
-                fontFamily = PhantomFontMono,
-            )
-            Spacer(Modifier.width(10.dp))
-            BasicTextField(
-                value = username,
-                onValueChange = {
-                    username = it.lowercase().filter { c -> c.isLetterOrDigit() || c == '_' }
-                    error = null
-                },
-                modifier = Modifier.weight(1f).focusRequester(focusRequester),
-                singleLine = true,
-                textStyle = LocalTextStyle.current.copy(
-                    color = TextPrimary,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Light,
-                    fontFamily = PhantomFontMono,
-                ),
-                cursorBrush = SolidColor(CyanAccent),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = {
-                    if (valid && !loading) {
-                        scope.launch {
-                            loading = true
-                            runOnboarding(container, username, proceed) { error = it; loading = false }
-                        }
-                    }
-                }),
-                decorationBox = { inner ->
-                    if (username.isEmpty()) {
-                        Text(
-                            text = "username",
-                            color = TextDim.copy(alpha = 0.5f),
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Light,
-                            fontFamily = PhantomFontMono,
-                        )
-                    }
-                    inner()
-                },
-            )
-        }
-
-        if (error != null) {
-            Spacer(Modifier.height(10.dp))
-            Text(
-                text = error!!,
-                color = Danger,
-                fontSize = 12.sp,
-                fontFamily = PhantomFontMono,
-            )
-        }
-
-        Spacer(Modifier.weight(1f))
-
-        // Phase 2 mockup: primary CTA is a pill (radius 9999), 48dp tall,
-        // Cyan with restrained shadow (0 2px 12px rgba(0,212,255,0.12)),
-        // label Inter 15sp 500 SurfaceDeep — not a tech overline.
-        Button(
-            onClick = {
-                if (valid && !loading) {
-                    scope.launch {
-                        loading = true
-                        runOnboarding(container, username, proceed) { error = it; loading = false }
-                    }
-                }
-            },
-            enabled = valid && !loading,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-                .shadow(
-                    elevation = 8.dp,
-                    shape = RoundedCornerShape(9999.dp),
-                    clip = false,
-                    spotColor = CyanAccent.copy(alpha = 0.20f),
-                    ambientColor = CyanAccent.copy(alpha = 0.10f),
-                ),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = CyanAccent,
-                contentColor = BgDeep,
-                disabledContainerColor = CyanAccent.copy(alpha = 0.15f),
-                disabledContentColor = TextDim.copy(alpha = 0.5f),
-            ),
-            shape = RoundedCornerShape(9999.dp),
-        ) {
-            if (loading) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(18.dp),
-                    color = BgDeep,
-                    strokeWidth = 2.dp,
-                )
-            } else {
-                Text(
-                    text = "Begin",
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-            }
-        }
-
-        Spacer(Modifier.height(32.dp))
-    }
-}
-
-// ── Reusable sub-components ───────────────────────────────────────────────────
-
-@Composable
-private fun FeaturePill(label: String) {
-    Box(
-        modifier = Modifier
-            .border(
-                width = 1.dp,
-                color = CyanAccent.copy(alpha = 0.25f),
-                shape = RoundedCornerShape(4.dp),
-            )
-            .padding(horizontal = 8.dp, vertical = 5.dp),
-    ) {
-        Text(
-            text = label,
-            color = CyanAccent.copy(alpha = 0.55f),
-            fontSize = 8.sp,
-            letterSpacing = 1.sp,
-            fontFamily = PhantomFontMono,
-            fontWeight = FontWeight.Medium,
-        )
-    }
-}
-
-/**
- * Draws a solid left border stripe directly on the Modifier draw layer,
- * avoiding the need for a nested Box or extra composable.
- */
-private fun Modifier.drawLeftBorder(color: Color, width: Dp): Modifier =
-    this.drawWithContent {
-        drawContent()
-        drawRect(
-            color = color,
-            size = Size(width.toPx(), size.height),
-        )
-    }
-
-// ── Intro pager pages (Welcome / Privacy / Network) ──────────────────────────
-
-@Composable
-private fun WelcomePage(onContinue: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Spacer(Modifier.weight(0.4f))
-
-        // Wordmark
-        Text(
-            text = "PHANTOM",
-            color = CyanAccent.copy(alpha = 0.7f),
-            fontSize = 11.sp,
-            letterSpacing = 6.sp,
-            fontFamily = PhantomFontMono,
-            fontWeight = FontWeight.Medium,
-        )
-
-        Spacer(Modifier.height(28.dp))
-
-        // Hero — Geist display 32, light, tight tracking.
-        Text(
-            text = "Privacy you can\nactually verify.",
-            color = TextPrimary,
-            fontSize = 32.sp,
-            fontWeight = FontWeight.Light,
-            lineHeight = 42.sp,
-            textAlign = TextAlign.Center,
-            letterSpacing = (-0.8).sp,
-        )
-
-        Spacer(Modifier.height(20.dp))
-
-        Text(
-            text = "PHANTOM is end-to-end encrypted and built so we cannot read, log, or hand over what is not on our servers.",
-            color = TextDim,
-            fontSize = 14.sp,
-            lineHeight = 22.sp,
-            textAlign = TextAlign.Center,
-        )
-
-        Spacer(Modifier.weight(1f))
-
-        IntroCta(label = "Get started", onClick = onContinue)
-
-        Spacer(Modifier.height(72.dp))
-    }
-}
-
-@Composable
-private fun PrivacyPage(onContinue: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Spacer(Modifier.height(72.dp))
-
-        Text(
-            text = "HOW WE PROTECT YOU",
-            color = CyanAccent.copy(alpha = 0.7f),
-            fontSize = 10.sp,
-            letterSpacing = 3.sp,
-            fontFamily = PhantomFontMono,
-            fontWeight = FontWeight.Medium,
-        )
-
-        Spacer(Modifier.height(20.dp))
-
-        Text(
-            text = "Three architectural truths.",
-            color = TextPrimary,
-            fontSize = 26.sp,
-            fontWeight = FontWeight.Light,
-            lineHeight = 32.sp,
-            textAlign = TextAlign.Center,
-            letterSpacing = (-0.5).sp,
-        )
-
-        Spacer(Modifier.height(36.dp))
-
-        IntroCard(
-            kicker = "01",
-            title = "End-to-end encryption",
-            body = "Your messages are encrypted on your device with libsodium. Keys live only on the endpoints — never the relay.",
-        )
-        Spacer(Modifier.height(16.dp))
-        IntroCard(
-            kicker = "02",
-            title = "No phone, no email",
-            body = "Your identity is a cryptographic key, not a phone number. Nothing links your account to a SIM card or address book.",
-        )
-        Spacer(Modifier.height(16.dp))
-        IntroCard(
-            kicker = "03",
-            title = "Zero metadata",
-            body = "Sealed sender hides the route. Our relay sees ciphertext only — no who-talked-to-whom log to seize.",
-        )
-
-        Spacer(Modifier.weight(1f))
-        Spacer(Modifier.height(40.dp))
-
-        IntroCta(label = "Continue", onClick = onContinue)
-
-        Spacer(Modifier.height(72.dp))
-    }
-}
-
-@Composable
-private fun NetworkPage(onContinue: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Spacer(Modifier.height(72.dp))
-
-        Text(
-            text = "HOW MESSAGES TRAVEL",
-            color = CyanAccent.copy(alpha = 0.7f),
-            fontSize = 10.sp,
-            letterSpacing = 3.sp,
-            fontFamily = PhantomFontMono,
-            fontWeight = FontWeight.Medium,
-        )
-
-        Spacer(Modifier.height(20.dp))
-
-        Text(
-            text = "Direct first.\nMesh next. Relay last.",
-            color = TextPrimary,
-            fontSize = 26.sp,
-            fontWeight = FontWeight.Light,
-            lineHeight = 32.sp,
-            textAlign = TextAlign.Center,
-            letterSpacing = (-0.5).sp,
-        )
-
-        Spacer(Modifier.height(28.dp))
-
-        Text(
-            text = "PHANTOM picks the most private route available, every time:",
-            color = TextDim,
-            fontSize = 14.sp,
-            lineHeight = 22.sp,
-            textAlign = TextAlign.Center,
-        )
-
-        Spacer(Modifier.height(28.dp))
-
-        IntroCard(
-            kicker = "BLE / WIFI-DIRECT",
-            title = "Nearby — fully off-grid",
-            body = "Within range we hop peer-to-peer. No internet, no infrastructure, no observers.",
-        )
-        Spacer(Modifier.height(14.dp))
-        IntroCard(
-            kicker = "MESH",
-            title = "Friend-of-a-friend relay",
-            body = "Messages can travel through trusted contacts when the network is hostile.",
-        )
-        Spacer(Modifier.height(14.dp))
-        IntroCard(
-            kicker = "RELAY",
-            title = "Encrypted store-and-forward",
-            body = "When peers are offline, a stateless relay holds ciphertext for up to 30 days. It cannot read it.",
-        )
-
-        Spacer(Modifier.weight(1f))
-        Spacer(Modifier.height(40.dp))
-
-        IntroCta(label = "Choose your handle", onClick = onContinue)
-
-        Spacer(Modifier.height(72.dp))
-    }
-}
-
-@Composable
-private fun IntroCard(kicker: String, title: String, body: String) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(Surface)
-            .border(
-                1.dp,
-                Color.White.copy(alpha = 0.05f),
-                RoundedCornerShape(14.dp),
-            )
-            .padding(horizontal = 18.dp, vertical = 16.dp),
-    ) {
-        Text(
-            text = kicker,
-            color = CyanAccent.copy(alpha = 0.75f),
-            fontSize = 9.sp,
-            letterSpacing = 2.sp,
-            fontFamily = PhantomFontMono,
-            fontWeight = FontWeight.Medium,
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = title,
-            color = TextPrimary,
-            fontSize = 16.sp,
-            fontWeight = FontWeight.Medium,
-        )
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = body,
-            color = TextDim,
-            fontSize = 13.sp,
-            lineHeight = 20.sp,
-        )
-    }
-}
-
-@Composable
-private fun IntroCta(label: String, onClick: () -> Unit) {
-    Button(
-        onClick = onClick,
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(48.dp)
-            .shadow(
-                elevation = 8.dp,
-                shape = RoundedCornerShape(9999.dp),
-                clip = false,
-                spotColor = CyanAccent.copy(alpha = 0.20f),
-                ambientColor = CyanAccent.copy(alpha = 0.10f),
-            ),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = CyanAccent,
-            contentColor = BgDeep,
-        ),
-        shape = RoundedCornerShape(9999.dp),
-    ) {
-        Text(
-            text = label,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Medium,
-        )
-    }
-}
-
-// ── Business logic (unchanged) ────────────────────────────────────────────────
+// ── Business logic ──────────────────────────────────────────────────────────
 
 private suspend fun runOnboarding(
     container: AppContainer,

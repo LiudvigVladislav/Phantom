@@ -669,20 +669,14 @@ fun ContactProfileScreen(
     }
 
     // ── Safety-number verification sheet ─────────────────────────────────────
+    // PHANTOM_FULL_COMPOSE §12: two FingerprintBlocks stacked (yours + theirs)
+    // with an axis bridge between them. Each block shows 8 groups of 4 hex
+    // chars — the first 32 hex chars of the ED25519 public key.
     if (showVerifySheet) {
         val theirPublicKeyHex = conversation.theirPublicKeyHex
 
-        // Load own public key once when the sheet opens.
         val myPubKeyHex by produceState(initialValue = "") {
             value = container.identityRepo.loadIdentity()?.publicKeyHex ?: ""
-        }
-
-        val fingerprint = remember(myPubKeyHex, theirPublicKeyHex) {
-            if (myPubKeyHex.isNotEmpty() && theirPublicKeyHex.isNotEmpty()) {
-                phantom.core.crypto.SafetyNumber.compute(myPubKeyHex, theirPublicKeyHex)
-            } else {
-                "loading…"
-            }
         }
 
         ModalBottomSheet(
@@ -695,10 +689,10 @@ fun ContactProfileScreen(
                     .padding(horizontal = 24.dp)
                     .padding(bottom = 32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Text(
-                    "SAFETY NUMBER",
+                    "VERIFY @${conversation.theirUsername.uppercase()}",
                     color = TextDim,
                     fontSize = 10.sp,
                     fontFamily = PhantomFontMono,
@@ -706,99 +700,108 @@ fun ContactProfileScreen(
                 )
 
                 Text(
-                    text = "Compare these numbers with @${conversation.theirUsername} in person or over a trusted channel.",
+                    text = "Match all 8 groups with @${conversation.theirUsername} in person or on a trusted call.",
                     color = TextDim,
                     fontSize = 13.sp,
                     lineHeight = 19.sp,
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 )
 
-                // Design Brief v3 §10: 60-digit grid in 12 groups of 5 — four
-                // rows × three columns, each cell a SurfaceElevated chip with
-                // monospace digits. Easier to read aloud than a single block.
-                val raw = remember(fingerprint) { fingerprint.filter { it.isDigit() } }
-                if (raw.length == 60) {
-                    val groups = remember(raw) { raw.chunked(5) }
-                    Column(
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        for (row in 0 until 4) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                for (col in 0 until 3) {
-                                    val idx = row * 3 + col
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .clip(RoundedCornerShape(10.dp))
-                                            .background(Surface2)
-                                            .border(
-                                                1.dp,
-                                                Color.White.copy(alpha = 0.05f),
-                                                RoundedCornerShape(10.dp),
-                                            )
-                                            .padding(vertical = 12.dp),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text(
-                                            text = groups[idx],
-                                            color = TextPrimary,
-                                            fontSize = 17.sp,
-                                            fontFamily = PhantomFontMono,
-                                            letterSpacing = 1.5.sp,
-                                            fontWeight = FontWeight.Medium,
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Fallback while the fingerprint loads.
+                Spacer(Modifier.height(4.dp))
+
+                FingerprintBlock(
+                    ownerLabel = "Your key",
+                    name = "You",
+                    publicKeyHex = myPubKeyHex,
+                )
+
+                // Axis bridge — two textTertiary lines flanking a "Compare ↕"
+                // label. Restrained, no glow.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Surface2, RoundedCornerShape(12.dp))
-                            .padding(20.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = fingerprint,
-                            color = TextDim,
-                            fontSize = 14.sp,
-                            fontFamily = PhantomFontMono,
-                        )
-                    }
+                            .weight(1f)
+                            .height(1.dp)
+                            .background(TextDim.copy(alpha = 0.15f)),
+                    )
+                    Text(
+                        text = "Compare ↕",
+                        color = TextDim,
+                        fontSize = 9.sp,
+                        fontFamily = PhantomFontMono,
+                        letterSpacing = 1.5.sp,
+                    )
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(1.dp)
+                            .background(TextDim.copy(alpha = 0.15f)),
+                    )
                 }
 
-                Button(
-                    onClick = {
-                        scope.launch {
-                            container.conversationRepo.setVerified(conversationId, true)
-                            container.conversationRepo.clearIdentityKeyChangedAt(conversationId)
-                            isVerified = true
-                            keyChangedAt = null
-                            conversation = conversation.copy(identityKeyChangedAt = null)
-                            showVerifySheet = false
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isVerified) Success else CyanAccent,
-                        contentColor = BgDeep,
-                    ),
-                    shape = RoundedCornerShape(9999.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
+                FingerprintBlock(
+                    ownerLabel = "@${conversation.theirUsername}'s key",
+                    name = conversation.theirUsername,
+                    publicKeyHex = theirPublicKeyHex,
+                )
+
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Text(
-                        text = if (isVerified) "Verified" else "Mark as Verified",
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
+                    Button(
+                        onClick = { showVerifySheet = false },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color.Transparent,
+                            contentColor = Danger,
+                        ),
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            Danger.copy(alpha = 0.40f),
+                        ),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(46.dp),
+                    ) {
+                        Text(
+                            text = "Mismatch",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                container.conversationRepo.setVerified(conversationId, true)
+                                container.conversationRepo.clearIdentityKeyChangedAt(conversationId)
+                                isVerified = true
+                                keyChangedAt = null
+                                conversation = conversation.copy(identityKeyChangedAt = null)
+                                showVerifySheet = false
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isVerified) Success else CyanAccent,
+                            contentColor = BgDeep,
+                        ),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .weight(1.4f)
+                            .height(46.dp),
+                    ) {
+                        Text(
+                            text = if (isVerified) "Verified ✓" else "It's a match",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
                 }
             }
         }
@@ -959,5 +962,57 @@ private fun ChevronIcon() {
         val sw = 1.4.dp.toPx()
         drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), sw, StrokeCap.Round)
         drawLine(TextDim, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
+    }
+}
+
+/**
+ * PHANTOM_FULL_COMPOSE §12 FingerprintBlock — owner label + name + 8 groups
+ * of 4 hex chars (first 32 hex of the ED25519 public key) on surfaceDeep,
+ * radius 12dp, cyan-tinted edge handled by the calling axis bridge.
+ */
+@Composable
+private fun FingerprintBlock(
+    ownerLabel: String,
+    name: String,
+    publicKeyHex: String,
+) {
+    val fingerprint = remember(publicKeyHex) {
+        if (publicKeyHex.length >= 32) {
+            publicKeyHex.substring(0, 32).uppercase().chunked(4).joinToString("  ")
+        } else {
+            "loading…"
+        }
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(BgDeep)
+            .padding(horizontal = 20.dp, vertical = 18.dp),
+    ) {
+        Text(
+            text = ownerLabel,
+            color = TextDim.copy(alpha = 0.45f),
+            fontSize = 10.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 1.5.sp,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = name,
+            color = TextPrimary,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = (-0.16).sp,
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = fingerprint,
+            color = TextPrimary,
+            fontSize = 13.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 0.65.sp,
+            lineHeight = 22.sp,
+        )
     }
 }
