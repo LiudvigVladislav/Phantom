@@ -70,8 +70,24 @@ jobs:
           chmod 600 ~/.ssh/config
 
       - name: Push to Codeberg mirror
+        env:
+          # Raw value as captured by GitHub Variables UI. The paste flow
+          # there can include trailing whitespace (\n / \r); if the URL is
+          # then interpolated literally into `git remote add`, the resulting
+          # remote URL contains the newline and Codeberg's Forgejo daemon
+          # answers "Invalid repo name" over SSH (observed 2026-04-30, run
+          # #N on master).
+          # Trim defensively before use so the variable can contain
+          # accidental whitespace without breaking the push.
+          CODEBERG_REPO_URL_RAW: ${{ vars.CODEBERG_REPO_URL }}
         run: |
-          git remote add codeberg "${{ vars.CODEBERG_REPO_URL }}"
+          REPO_URL=$(printf %s "$CODEBERG_REPO_URL_RAW" | tr -d '[:space:]')
+          if [ -z "$REPO_URL" ]; then
+            echo "::error::CODEBERG_REPO_URL is empty after whitespace trim."
+            exit 1
+          fi
+          echo "Mirroring to: $REPO_URL"
+          git remote add codeberg "$REPO_URL"
           # --mirror sends every ref (branches, tags) and removes anything
           # on the destination that no longer exists locally. This keeps
           # Codeberg byte-for-byte identical to GitHub.
