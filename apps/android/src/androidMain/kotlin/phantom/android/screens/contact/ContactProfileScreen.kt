@@ -67,6 +67,7 @@ fun ContactProfileScreen(
     var showMoreMenu by remember { mutableStateOf(false) }
     var keyCopied by remember { mutableStateOf(false) }
     var showVerifySheet by remember { mutableStateOf(false) }
+    var showReportSheet by remember { mutableStateOf(false) }
     var isVerified by remember { mutableStateOf(false) }
     var keyChangedAt by remember { mutableStateOf<Long?>(null) }
     var showTimerSheet by remember { mutableStateOf(false) }
@@ -150,6 +151,89 @@ fun ContactProfileScreen(
         )
     }
 
+    // Report dialog — pick a category, then POST /report on relay (Level A
+    // per ADR-019 placeholder; full admin review pipeline is Phase 2-3).
+    if (showReportSheet) {
+        var selectedCategory by remember { mutableStateOf<String?>(null) }
+        val categories = listOf(
+            "spam" to "Spam or unwanted messages",
+            "harassment" to "Harassment or threats",
+            "inappropriate" to "Inappropriate content",
+            "csam" to "Child safety concern",
+            "other" to "Other",
+        )
+        AlertDialog(
+            onDismissRequest = { showReportSheet = false },
+            containerColor = Surface,
+            title = { Text("Report @$theirUsername", color = TextPrimary) },
+            text = {
+                Column {
+                    Text(
+                        "Select the reason. Reports are reviewed by Willen LLC; PHANTOM does not share the report content with the reported user.",
+                        color = TextDim,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    categories.forEach { (key, label) ->
+                        val active = selectedCategory == key
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedCategory = key }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(
+                                selected = active,
+                                onClick = { selectedCategory = key },
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = CyanAccent,
+                                    unselectedColor = TextDim,
+                                ),
+                            )
+                            Text(label, color = if (active) TextPrimary else TextDim, fontSize = 14.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = selectedCategory != null,
+                    onClick = {
+                        val category = selectedCategory ?: return@TextButton
+                        showReportSheet = false
+                        scope.launch {
+                            val myKey = container.identityRepo.loadIdentity()?.publicKeyHex.orEmpty()
+                            val theirKey = conversation.theirPublicKeyHex
+                            val ok = submitAbuseReport(
+                                reporterKey = myKey,
+                                reportedKey = theirKey,
+                                category = category,
+                            )
+                            android.widget.Toast.makeText(
+                                context,
+                                if (ok) "Report submitted — thanks for helping keep PHANTOM safe."
+                                else "Could not send report. Try again when online.",
+                                android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    },
+                ) {
+                    Text(
+                        "Submit",
+                        color = if (selectedCategory != null) Danger else TextDim,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showReportSheet = false }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
+    }
+
     // ── Screen ───────────────────────────────────────────────────────────────
 
     Scaffold(
@@ -201,7 +285,7 @@ fun ContactProfileScreen(
                         ) {
                             DropdownMenuItem(
                                 text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
-                                onClick = { showMoreMenu = false },
+                                onClick = { showMoreMenu = false; showReportSheet = true },
                             )
                             DropdownMenuItem(
                                 text = { Text("Block", color = Danger, fontSize = 14.sp) },
@@ -893,7 +977,10 @@ fun ContactProfileScreen(
                             Text("Go back", fontSize = 13.sp, fontWeight = FontWeight.Medium)
                         }
                         Button(
-                            onClick = { /* TODO: report endpoint */ showVerifySheet = false },
+                            onClick = {
+                                showVerifySheet = false
+                                showReportSheet = true
+                            },
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = Color.Transparent,
                                 contentColor = Danger.copy(alpha = 0.55f),
@@ -1141,4 +1228,56 @@ private fun FingerprintBlock(
             lineHeight = 22.sp,
         )
     }
+}
+
+/**
+ * Submit an abuse report to the relay's POST /report endpoint.
+ *
+ * Schema (matches services/relay/src/routes.rs ReportRequest):
+ *   { "reporter_key": <hex>, "reported_key": <hex>, "category": <string> }
+ *
+ * The relay persists each report to /var/phantom/reports.jsonl on the VPS
+ * and surfaces them via the /admin/reports endpoint. Level A scope: client
+ * submits, relay stores, no admin review UI yet (Phase 2-3 deliverable).
+ *
+ * Uses HttpURLConnection rather than the existing Ktor client because
+ * KtorRelayTransport is WebSocket-shaped — adding a one-off HTTP call
+ * through it would mean either bolting on a generic HTTP method or
+ * creating a separate Ktor HttpClient just for this endpoint. The JDK
+ * HttpURLConnection has zero new dependencies and runs cleanly off the
+ * Dispatchers.IO context the caller already provides.
+ *
+ * Returns true on 2xx, false on any failure (network, timeout, 4xx, 5xx).
+ * Caller surfaces the result via Toast — no retry logic; user can resubmit.
+ */
+private suspend fun submitAbuseReport(
+    reporterKey: String,
+    reportedKey: String,
+    category: String,
+): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    if (reporterKey.isEmpty() || reportedKey.isEmpty()) return@withContext false
+    runCatching {
+        // BuildConfig.RELAY_URL is the WebSocket URL (wss://relay.phntm.pro/ws).
+        // Convert to the HTTP base used by /report.
+        val httpBase = phantom.android.BuildConfig.RELAY_URL
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .removeSuffix("/ws")
+        val url = java.net.URL("$httpBase/report")
+        val conn = url.openConnection() as java.net.HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 10_000
+        conn.doOutput = true
+        // JSON literal — keys come from local sources (own pubkey + the
+        // peer's stored pubkey); category is one of the predefined enum
+        // strings from the dialog. No interpolated user-provided strings
+        // are written into JSON, so a hand-built body is safe here.
+        val payload = """{"reporter_key":"$reporterKey","reported_key":"$reportedKey","category":"$category"}"""
+        conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+        val code = conn.responseCode
+        conn.disconnect()
+        code in 200..299
+    }.getOrDefault(false)
 }
