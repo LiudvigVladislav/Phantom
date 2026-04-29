@@ -15,8 +15,20 @@ interface MessagingService {
     // Start listening for relay messages (call after transport is connected)
     suspend fun startReceiving()
 
-    // Notify sender that their messages in this conversation were read
-    suspend fun markConversationRead(conversationId: String, theirPublicKeyHex: String)
+    /**
+     * Mark all unread messages in a conversation as READ locally.
+     *
+     * @param sendReceipt when true (default) also broadcasts a ReadReceipt
+     *   envelope to the sender so their UI can display the blue tick. Pass
+     *   false from privacy modes that suppress outgoing receipt metadata
+     *   (Settings → Privacy Mode → Private / Ghost). Local read state is
+     *   updated either way; only the wire signal is gated.
+     */
+    suspend fun markConversationRead(
+        conversationId: String,
+        theirPublicKeyHex: String,
+        sendReceipt: Boolean = true,
+    )
 
     // Send encrypted delete-control message and delete locally
     suspend fun deleteMessageForBoth(messageId: String, conversationId: String, recipientPublicKeyHex: String): Result<Unit>

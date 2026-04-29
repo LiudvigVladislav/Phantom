@@ -533,17 +533,23 @@ class DefaultMessagingService(
         }
     }
 
-    override suspend fun markConversationRead(conversationId: String, theirPublicKeyHex: String) {
+    override suspend fun markConversationRead(
+        conversationId: String,
+        theirPublicKeyHex: String,
+        sendReceipt: Boolean,
+    ) {
         val unreadMessages = messageRepository.getMessages(conversationId)
             .filter { !it.sent && it.status != MessageStatus.READ }
         unreadMessages.forEach { msg ->
-            transport.sendReadReceipt(
-                phantom.core.transport.RelayMessage.ReadReceipt(
-                    to = theirPublicKeyHex,
-                    from = identity.publicKeyHex,
-                    messageId = msg.id,
+            if (sendReceipt) {
+                transport.sendReadReceipt(
+                    phantom.core.transport.RelayMessage.ReadReceipt(
+                        to = theirPublicKeyHex,
+                        from = identity.publicKeyHex,
+                        messageId = msg.id,
+                    )
                 )
-            )
+            }
             messageRepository.updateStatus(msg.id, MessageStatus.READ)
         }
         conversationRepository.resetUnread(conversationId)
