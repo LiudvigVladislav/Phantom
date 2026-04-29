@@ -382,14 +382,6 @@ fun SavedMessagesScreen(
     }
 }
 
-@Composable
-private fun NoteMenuIcon(codePoint: Int) {
-    Text(
-        text = String(Character.toChars(codePoint)),
-        fontSize = 16.sp,
-        modifier = Modifier.size(20.dp),
-    )
-}
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -472,30 +464,55 @@ private fun SavedMessageBubble(
                 offset = DpOffset(0.dp, 4.dp),
             ) {
                 DropdownMenuItem(
-                    leadingIcon = { NoteMenuIcon(0x27A1) },
+                    leadingIcon = {
+                        phantom.android.ui.PhIconForward(
+                            color = phantom.android.ui.theme.PhantomTokens.Colors.TextSecondary,
+                            size = 16.dp,
+                        )
+                    },
                     text = { Text("Forward", color = TextPrimary, fontSize = 14.sp) },
                     onClick = { showActions = false; onForward(bodyText) },
                 )
                 DropdownMenuItem(
-                    leadingIcon = { NoteMenuIcon(0x1F4CC) },
+                    leadingIcon = {
+                        phantom.android.ui.PhIconPinAction(
+                            color = phantom.android.ui.theme.PhantomTokens.Colors.TextSecondary,
+                            size = 16.dp,
+                        )
+                    },
                     text = { Text("Pin", color = TextPrimary, fontSize = 14.sp) },
                     onClick = { showActions = false; onPin() },
                 )
                 DropdownMenuItem(
-                    leadingIcon = { NoteMenuIcon(0x1F4CB) },
+                    leadingIcon = {
+                        phantom.android.ui.PhIconCopy(
+                            color = phantom.android.ui.theme.PhantomTokens.Colors.TextSecondary,
+                            size = 14.dp,
+                        )
+                    },
                     text = { Text("Copy", color = TextPrimary, fontSize = 14.sp) },
                     onClick = { showActions = false; onCopy(bodyText) },
                 )
                 if (within24h) {
                     DropdownMenuItem(
-                        leadingIcon = { NoteMenuIcon(0x270F) },
+                        leadingIcon = {
+                            phantom.android.ui.PhIconEdit(
+                                color = phantom.android.ui.theme.PhantomTokens.Colors.TextSecondary,
+                                size = 16.dp,
+                            )
+                        },
                         text = { Text("Edit", color = TextPrimary, fontSize = 14.sp) },
                         onClick = { showActions = false; onEdit(bodyText) },
                     )
                 }
                 HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                 DropdownMenuItem(
-                    leadingIcon = { NoteMenuIcon(0x1F5D1) },
+                    leadingIcon = {
+                        phantom.android.ui.PhIconTrash(
+                            color = Danger,
+                            size = 15.dp,
+                        )
+                    },
                     text = { Text("Delete", color = Danger, fontSize = 14.sp) },
                     onClick = { showActions = false; onDelete() },
                 )

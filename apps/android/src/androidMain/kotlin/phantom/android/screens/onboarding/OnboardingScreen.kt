@@ -211,7 +211,7 @@ private fun WelcomeStep(onContinue: () -> Unit) {
 
         // Tagline — Inter 15px secondary.
         Text(
-            text = "Private by design.",
+            text = "Private communication, built to last.",
             color = TextDim,
             fontSize = 15.sp,
             textAlign = TextAlign.Center,
@@ -221,7 +221,7 @@ private fun WelcomeStep(onContinue: () -> Unit) {
 
         // Body value-prop.
         Text(
-            text = "End-to-end encrypted. No phone number, no email, no metadata. Your conversations belong to you.",
+            text = "Your identity is created on this device. No phone number required to get started.",
             color = PhantomTokens.Colors.TextTertiary,
             fontSize = 14.sp,
             lineHeight = 22.sp,
