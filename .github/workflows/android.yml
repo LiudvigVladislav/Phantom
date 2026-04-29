@@ -33,24 +33,22 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # ubuntu-latest GitHub-hosted runners do not ship with Android SDK
-      # bundled. AGP's project-isolation needs ANDROID_HOME at Gradle config
-      # time — without this step Gradle init dies with "SDK location not
-      # found", which is what produced the 16-second pre-build failure
-      # observed on the first iteration of this workflow.
-      # android-actions/setup-android installs cmdline-tools, accepts
-      # licenses, and exports ANDROID_HOME / ANDROID_SDK_ROOT.
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # Match the Gradle config — pinning these saves ~30s vs letting AGP
-          # auto-download whatever it picks. compile/target SDK come from
-          # gradle/libs.versions.toml; bump in lockstep.
-          cmdline-tools-version: 11076708
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
+      # ubuntu-latest GitHub-hosted runners ALREADY ship a complete Android
+      # SDK at /usr/local/lib/android/sdk with platform-tools, multiple
+      # build-tools versions, and android-35 platform. ANDROID_HOME and
+      # ANDROID_SDK_ROOT are exported by the runner image itself.
+      #
+      # The previous attempt to use android-actions/setup-android@v3 hit
+      # an interactive license prompt that auto-accept could not handle
+      # ("6 of 7 SDK package licenses not accepted. Review licenses ...
+      # (y/N)?" — sdkmanager waited for input despite the action's
+      # accept-android-sdk-licenses flag).
+      #
+      # `yes | sdkmanager --licenses` reliably accepts every outstanding
+      # licence by piping "y" into the prompt. `|| true` keeps the step
+      # green even on partial-accept paths.
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
 
       - name: Set up Gradle (caches dependencies, daemons, configuration cache)
         uses: gradle/actions/setup-gradle@v4
