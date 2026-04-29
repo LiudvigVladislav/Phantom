@@ -66,13 +66,11 @@ fun NearbyScreen(
                         style = PhantomType.headline,
                         modifier = Modifier.weight(1f),
                     )
-                    // §04 Filter icon — opens future filter sheet (e.g. trusted-only).
-                    IconButton(
-                        onClick = { /* TODO: filter sheet */ },
-                        modifier = Modifier.size(40.dp),
-                    ) {
-                        PhIconFunnel(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
-                    }
+                    // Filter icon hidden in Alpha 2: there is no filter sheet
+                    // and no trusted-vs-untrusted partitioning to filter on
+                    // until BLE / WiFi-Direct nearby discovery actually ships
+                    // (Phase 7+). Re-add the IconButton(PhIconFunnel) here when
+                    // the filter sheet exists.
                 }
                 HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
             }

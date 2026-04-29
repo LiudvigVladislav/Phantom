@@ -150,7 +150,16 @@ private fun SearchState(
     ownHandle: String,
     ownPubKey: String,
 ) {
-    // Search input
+    // Search-by-username is hidden in Alpha 2: there is no directory
+    // service to query against. The username namespace and lookup
+    // endpoint land with Phase 2 / ADR-007 (planned July 2026). Until
+    // then users add contacts via QR scan or by accepting an invite
+    // link — the two flows still surfaced below.
+    //
+    // Replacing the BasicTextField with a small informational card so
+    // users understand WHY there's no search box, rather than silently
+    // dropping the input. Once ADR-007 lands, restore the original
+    // search Row in this position.
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -162,27 +171,19 @@ private fun SearchState(
     ) {
         PhIconSearch(color = TextDim, size = 16.dp)
         Spacer(Modifier.width(10.dp))
-        BasicTextField(
-            value = query,
-            onValueChange = onQueryChange,
-            modifier = Modifier.weight(1f),
-            singleLine = true,
-            textStyle = LocalTextStyle.current.copy(
-                color = TextPrimary,
-                fontSize = 15.sp,
-            ),
-            cursorBrush = SolidColor(CyanAccent),
-            decorationBox = { inner ->
-                if (query.isEmpty()) {
-                    Text(
-                        text = "Search by username…",
-                        color = TextDim.copy(alpha = 0.6f),
-                        fontSize = 15.sp,
-                    )
-                }
-                inner()
-            },
-        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "Search by username — coming Jul 2026",
+                color = TextDim,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "Username directory ships in Phase 2",
+                color = TextDim.copy(alpha = 0.6f),
+                fontSize = 11.sp,
+            )
+        }
     }
 
     Spacer(Modifier.height(12.dp))
