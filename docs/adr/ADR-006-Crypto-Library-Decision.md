@@ -1,66 +1,110 @@
 # ADR-006: Crypto Library Decision
 
-Статус: **ACCEPTED**  
-Дата: 2026-04-15
+Статус: **REVISED** (originally ACCEPTED 2026-04-15, revised 2026-04-29)
+Дата ревизии: 2026-04-29
 
-## Context
+## Update history
 
-PHANTOM должен использовать только аудированные криптографические библиотеки (Product Doctrine 2.4).
-Для реализации Signal Protocol (E2EE, Double Ratchet, prekeys) есть два основных кандидата:
+- 2026-04-15: ACCEPTED — libsignal-client (AGPL-3.0) + libsodium (ISC)
+- 2026-04-29: REVISED — libsignal-client deferred to Beta+; Alpha 2 ships
+  libsodium-based Signal-protocol-compatible implementation
 
-### Кандидат A: signalapp/libsignal
-- Официальная реализация Signal Protocol от Signal Foundation
-- Ядро на Rust, обёртки для Java/Swift/TypeScript
-- Лицензия: **AGPL-3.0** ⚠️
+## Why this revision
 
-### Кандидат B: libsodium + ручная реализация Double Ratchet
-- libsodium — ISC лицензия (безопасна для коммерческого использования)
-- Базовые примитивы: X25519, XSalsa20-Poly1305, Ed25519
-- Требует написания Double Ratchet поверх примитивов
+The 2026-04-15 decision intended to use libsignal-client as the primary
+crypto library. In implementation (commits up to `697103d2`) the team
+shipped a libsodium-based Signal-protocol-compatible stack (Double
+Ratchet over X25519 + XSalsa20-Poly1305 + Ed25519) without integrating
+libsignal-client. This ADR reconciles documentation with code reality.
 
-### Кандидат C: BouncyCastle / Tink
-- Google Tink — Apache-2.0, аудированная библиотека
-- Не реализует Signal Protocol напрямую
-- Может быть использован как слой примитивов
+Drivers of the de-facto path:
+- libsodium has lower API surface and zero JNI complexity vs libsignal's
+  Rust + JNI bridge
+- AGPL-3.0 plus Signal Foundation's "use outside Signal not supported"
+  posture creates non-trivial integration risk
+- Test vectors and examples for self-rolled Double Ratchet over libsodium
+  primitives are well-documented (Signal whitepapers + reference
+  implementations)
 
-## Проблема с Кандидатом A (libsignal AGPL-3.0)
+## Current state (Alpha 2)
 
-AGPL-3.0 — сильная копилефт-лицензия:
-- Любая модификация libsignal должна быть открыта
-- Линковка с AGPL-кодом в проприетарном приложении — юридически спорно
-- Signal Foundation явно пишет: «использование вне Signal не поддерживается»
-- API/bridge-слои могут меняться без предупреждения
+PHANTOM uses **libsodium-bindings** (KMP wrapper, ISC license) for all
+cryptographic primitives:
 
-**Требуется консультация юриста до интеграции.**
+- X25519 — key exchange
+- XSalsa20-Poly1305 — authenticated encryption
+- Ed25519 — signatures (currently unused, see ADR-017)
+- HKDF-SHA256 — key derivation (planned for ADR-009 / SenderKey rotation)
+- BLAKE2b — Safety Number derivation
 
-## Decision
+The Signal protocol layer (X3DH + Double Ratchet) is implemented in
+`shared/core/crypto/`:
 
-✅ **ПРИНЯТО (2026-04-15) основателем:**
+- `LibsodiumX3DH.kt` — X3DH handshake (initiator/recipient)
+- `LibsodiumDoubleRatchet.kt` — Double Ratchet encrypt/decrypt
+- `SealedSender.kt` — sealed sender envelope wrap/unwrap
 
-**PHANTOM будет open source (AGPL-3.0 совместим с проектом).**
+## Known limitations of current implementation
 
-- Использовать **libsignal-client** (signalapp/libsignal, AGPL-3.0)
-- PHANTOM выпускается под open source лицензией (AGPL-3.0 или аналог)
-- Монетизация: Premium-подписка, гранты (EFF, Mozilla, NLnet), Kickstarter, B2B — не продажа кода
-- Открытый код = доверие пользователей = конкурентное преимущество для privacy-продукта
+The self-rolled Double Ratchet implementation has documented gaps vs the
+libsignal reference. All are tracked for closure in Phase 1 or as
+explicit P3 items:
 
-**Почему open source правильно для PHANTOM:**
-- Signal, Telegram (клиент), Briar — все open source. Это норма для privacy мессенджеров
-- Kickstarter и гранты (EFF/Mozilla/NLnet) охотнее дают open source проектам
-- Пользователи, которые платят за приватность, доверяют коду, который можно проверить
-- AGPL перестаёт быть проблемой, когда проект сам AGPL
+1. **No header encryption.** Ratchet header is not encrypted; the relay
+   sees ratchet metadata (counter values, ratchet pubkey). Severity: P3.
+   Mitigation: sealed sender hides identity even if metadata leaks.
 
-**Libsodium** (ISC) используется параллельно как дополнительные примитивы там, где libsignal не покрывает.
+2. **Limited skipped-message-key cache.** Small window; out-of-order
+   delivery beyond the window fails MAC validation. See ISSUE-004 in
+   `KNOWN_ISSUES.md`. Mitigation: sender retry; planned widening in
+   Alpha 2.
+
+3. **X3DH not yet wired.** `SessionManager.getOrCreateSession` calls
+   only `computeSharedSecret(...)`, bypassing `initiatorHandshake` and
+   `recipientHandshake`. See finding F12 in 2026-04-29 security audit.
+   **Fix:** ADR-009 (Phase 1 Week 4).
+
+4. **No prekey infrastructure.** No signed prekey, no one-time prekeys.
+   **Fix:** ADR-009 (Phase 1 Week 4).
+
+5. **SenderKey signing keys generated but never used.** See ADR-017.
+
+## Decision (revised)
+
+For **Alpha 2 (Phase 1, May–Jun 2026):**
+
+- Continue with libsodium-based implementation
+- Land ADR-009 (identity / signed prekey / one-time prekey separation)
+  in Phase 1 Week 4
+- Ship test vectors for X3DH and Double Ratchet against the Signal
+  protocol specification
+- Document all known limitations explicitly (this ADR + KNOWN_ISSUES.md)
+
+For **Beta and beyond:**
+
+- **Re-evaluate libsignal-client** integration once:
+  - Phase 1 security blockers are closed (F12, F15, F8, F1, F3, F4)
+  - Independent crypto audit performed (Phase 6, NLnet milestone)
+  - AGPL-3.0 license compatibility re-confirmed for our distribution
+- If audit recommends libsignal — migrate; otherwise stay on libsodium
+  with full security hardening landed in Phase 1
 
 ## Consequences
 
-- `core:crypto` реализуется через libsignal-client + libsodium
-- Репозиторий будет публичным на GitHub под open source лицензией
-- Лицензионный файл добавить при создании публичного репо
-- Ни один агент не должен добавлять закрытые/проприетарные зависимости
+- ADR-006 originally said "use libsignal" — that intent is **deferred**,
+  not abandoned
+- `gradle/libs.versions.toml` libsignal entry remains commented out
+- All security findings tied to self-rolled crypto (F12, F15, F3) are
+  closed via Phase 1 work, not via library swap
+- Project repo remains AGPL-3.0 (decision unchanged)
+- Re-evaluation trigger: post-Phase 6 audit response, or any new finding
+  indicating self-rolled crypto cannot meet the threat model
 
 ## References
 
 - [signalapp/libsignal](https://github.com/signalapp/libsignal) — AGPL-3.0
 - [libsodium](https://libsodium.org) — ISC License
-- [Google Tink](https://github.com/google/tink) — Apache-2.0
+- ADR-009 — identity / prekey separation (Phase 1)
+- ADR-017 — SenderKey signing key removal (Phase 1)
+- `KNOWN_ISSUES.md` — current state visible to users and reviewers
+- Security audit 2026-04-29 — findings F12, F15, F3, F13
