@@ -114,14 +114,15 @@ fun PhantomTopBar(
                 }
             }
 
-            // PHANTOM wordmark centered. Phase 2 mockup: Geist 17sp 500
-            // with -0.01em tracking — clean brand mark, not a tech overline.
-            Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
+            // PHANTOM_FULL_COMPOSE §03: "Messages" Geist 20px (left-aligned
+            // after the avatar, not a centered wordmark — this is the chat
+            // list header, not the brand splash).
+            Box(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
                 Text(
-                    text = "PHANTOM",
-                    fontSize = 17.sp,
+                    text = "Messages",
+                    fontSize = 20.sp,
                     fontWeight = FontWeight.Medium,
-                    letterSpacing = (-0.17).sp,  // -0.01em × 17sp
+                    letterSpacing = (-0.20).sp,
                     color = TextPrimary,
                 )
             }
