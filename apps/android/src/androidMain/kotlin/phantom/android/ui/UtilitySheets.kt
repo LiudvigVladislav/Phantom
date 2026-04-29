@@ -124,9 +124,16 @@ fun BackupExportSheet(
                 )
             }
             Spacer(Modifier.height(20.dp))
-            SheetPrimaryCta(label = "Export key", onClick = onExport)
+            // Encrypted backup export ships with recovery phrase in Phase 3
+            // (Sep 2026) per ADR-012. The sheet describes the future feature
+            // honestly; the CTA stays disabled until then.
+            SheetPrimaryCta(
+                label = "Available Sep 2026",
+                onClick = onExport,
+                enabled = false,
+            )
             Spacer(Modifier.height(8.dp))
-            SheetGhostCta(label = "Skip for now", onClick = onDismiss)
+            SheetGhostCta(label = "Close", onClick = onDismiss)
         }
     }
 }
@@ -274,16 +281,21 @@ private fun SheetBodyText(text: String) {
 }
 
 @Composable
-private fun SheetPrimaryCta(label: String, onClick: () -> Unit) {
+private fun SheetPrimaryCta(label: String, onClick: () -> Unit, enabled: Boolean = true) {
     Button(
         onClick = onClick,
+        enabled = enabled,
         modifier = Modifier
             .fillMaxWidth()
             .height(48.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = PhantomTokens.Colors.Cyan,
             contentColor = BgDeep,
+            disabledContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+            disabledContentColor = TextDim,
         ),
+        border = if (!enabled)
+            androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle) else null,
         shape = RoundedCornerShape(8.dp),
     ) {
         Text(

@@ -215,8 +215,8 @@ private fun PlusPlanCard() {
             "Priority message routing",
             "Premium typeface (PP Neue Montreal)",
         ),
-        ctaLabel = "Upgrade to Plus",
-        ctaEnabled = true,
+        ctaLabel = "Available Sep 2026",
+        ctaEnabled = false,
         ghostInset = false,
     )
 }
@@ -236,8 +236,8 @@ private fun ProPlanCard() {
             "Self-hosted relay support",
             "Advanced sealed sender",
         ),
-        ctaLabel = "Upgrade to Pro",
-        ctaEnabled = true,
+        ctaLabel = "Available Sep 2026",
+        ctaEnabled = false,
         ghostInset = true,
     )
 }
@@ -376,7 +376,9 @@ private fun PlanCardShell(
         Spacer(Modifier.height(20.dp))
 
         Button(
-            onClick = { /* TODO: launch billing flow */ },
+            // Billing flow lands in Phase 3 (Sep 2026) per ADR-011.
+            // Until then both Plus and Pro CTAs are disabled.
+            onClick = {},
             enabled = ctaEnabled,
             modifier = Modifier
                 .fillMaxWidth()

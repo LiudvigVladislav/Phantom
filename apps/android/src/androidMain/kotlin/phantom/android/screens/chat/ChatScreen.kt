@@ -178,9 +178,13 @@ fun ChatScreen(
     var conversations by remember { mutableStateOf<List<phantom.core.storage.ConversationEntity>>(emptyList()) }
     var theirPublicKeyHex by remember { mutableStateOf("") }
 
-    // Typing indicator state — true while the remote party is actively typing
+    // Typing indicator: hidden in Alpha 2.
+    // Re-enabled in Phase 5 alongside sealed-sender extension to control
+    // messages — until then `transport.sendTyping(...)` exposes the sender's
+    // full pubkey at the relay (audit finding F18). Plumbing is preserved so
+    // re-enable is a one-line flip.
+    val typingIndicatorEnabled = false
     var isContactTyping by remember { mutableStateOf(false) }
-    // Job reference for debouncing outgoing typing events
     var typingJob by remember { mutableStateOf<Job?>(null) }
 
     // Pinned messages banner state — loaded once and refreshed after pin/unpin actions
@@ -256,7 +260,8 @@ fun ChatScreen(
 
     // Collect incoming typing events from the contact in this conversation.
     // The indicator auto-clears after 3 s with no new event (matches standard messenger UX).
-    LaunchedEffect(conversationId, theirPublicKeyHex) {
+    LaunchedEffect(conversationId, theirPublicKeyHex, typingIndicatorEnabled) {
+        if (!typingIndicatorEnabled) return@LaunchedEffect
         if (theirPublicKeyHex.isEmpty()) return@LaunchedEffect
         container.transport.typingEvents.collect { senderKey ->
             if (senderKey == theirPublicKeyHex) {
@@ -565,7 +570,10 @@ fun ChatScreen(
                         if (showEmojiPanel) showEmojiPanel = false
                         // Debounced typing event: cancel any pending send and schedule a new one.
                         // One event per keystroke burst is enough — the relay drops if offline.
-                        if (newText.isNotEmpty() && theirPublicKeyHex.isNotEmpty()) {
+                        if (typingIndicatorEnabled &&
+                            newText.isNotEmpty() &&
+                            theirPublicKeyHex.isNotEmpty()
+                        ) {
                             typingJob?.cancel()
                             typingJob = scope.launch {
                                 container.transport.sendTyping(theirPublicKeyHex)
