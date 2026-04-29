@@ -60,6 +60,17 @@ jobs:
       # fails before the build even starts. Re-enable once the action's
       # checksum DB catches up to Gradle 9.x.
 
+      # The repository is developed primarily on Windows, where file system
+      # permissions are not preserved in git. Linux runners check out
+      # `gradlew` without the execute bit set (`./gradlew: Permission
+      # denied`, exit code 126). Restore it here so the wrapper invocations
+      # below succeed. The persistent fix is one git operation
+      # (`git update-index --chmod=+x gradlew && git commit`) but until
+      # someone on a Unix host runs that, this CI step keeps the workflow
+      # green.
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
       # Common tests run on JVM target — fast, no Android SDK required.
       # These cover the actual cryptographic and protocol logic
       # (LibsodiumIdentityCryptoTest, IdentityManagerTest, FakeRelayTransportTest,
