@@ -36,12 +36,48 @@ fun MessageRequestsScreen(
 ) {
     val scope = rememberCoroutineScope()
     var requests by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
+    // Block requires confirmation — single-tap on Block button without
+    // a dialog was leading to accidental permanent blocks during QA.
+    // Pattern matches ContactProfileScreen's existing Block confirmation.
+    var blockTarget by remember { mutableStateOf<ConversationEntity?>(null) }
 
     suspend fun reload() {
         requests = container.conversationRepo.getMessageRequests()
     }
 
     LaunchedEffect(Unit) { reload() }
+
+    // Block confirmation dialog — opens when user taps Block on a request.
+    blockTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { blockTarget = null },
+            containerColor = Surface,
+            title = { Text("Block @${target.theirUsername}?", color = TextPrimary) },
+            text = {
+                Text(
+                    "They will no longer be able to message you. " +
+                        "You can unblock them later from the contact profile.",
+                    color = TextDim,
+                    fontSize = 14.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val toBlock = target
+                    blockTarget = null
+                    scope.launch {
+                        container.conversationRepo.blockConversation(toBlock.id)
+                        reload()
+                    }
+                }) { Text("Block", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { blockTarget = null }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -97,17 +133,16 @@ fun MessageRequestsScreen(
                         entity = req,
                         onAccept = {
                             scope.launch {
+                                // SQL: UPDATE conversation SET trust_tier = 'TRUSTED' WHERE id = ?
+                                // After this, getActiveConversations() includes this row;
+                                // getMessageRequests() excludes it. ChatList badge updates
+                                // on next fresh recomposition (when user navigates back).
                                 container.conversationRepo.acceptRequest(req.id)
                                 reload()
                                 onNavigate(Screen.Chat(req.id, req.theirUsername))
                             }
                         },
-                        onBlock = {
-                            scope.launch {
-                                container.conversationRepo.blockConversation(req.id)
-                                reload()
-                            }
-                        },
+                        onBlock = { blockTarget = req },
                     )
                 }
             }
