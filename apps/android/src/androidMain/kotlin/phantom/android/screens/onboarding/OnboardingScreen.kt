@@ -16,7 +16,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -55,12 +58,72 @@ fun OnboardingScreen(
     container: AppContainer,
     onComplete: () -> Unit,
 ) {
+    // Two phases:
+    //   Phase 0 — legal gate: ToS scroll + accept (TermsScreen)
+    //   Phase 1 — 4-page intro pager (Welcome → Privacy → Network → Identity)
+    // Per Design Brief v3 §5: progressive trust narrative, identity choice last.
     var tosAccepted by remember { mutableStateOf(false) }
 
     if (!tosAccepted) {
         TermsScreen(onAccept = { tosAccepted = true })
     } else {
-        IdentityScreen(container = container, onComplete = onComplete)
+        IntroPager(container = container, onComplete = onComplete)
+    }
+}
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
+    val pagerState = rememberPagerState(pageCount = { 4 })
+    val scope = rememberCoroutineScope()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgDeep)
+            .windowInsetsPadding(WindowInsets.statusBars),
+    ) {
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize(),
+            // Identity page owns the IME — disable swipe so the keyboard does
+            // not slide pages while the user types.
+            userScrollEnabled = pagerState.currentPage != 3,
+        ) { page ->
+            when (page) {
+                0 -> WelcomePage(onContinue = {
+                    scope.launch { pagerState.animateScrollToPage(1) }
+                })
+                1 -> PrivacyPage(onContinue = {
+                    scope.launch { pagerState.animateScrollToPage(2) }
+                })
+                2 -> NetworkPage(onContinue = {
+                    scope.launch { pagerState.animateScrollToPage(3) }
+                })
+                3 -> IdentityScreen(container = container, onComplete = onComplete)
+            }
+        }
+
+        // Page indicator — 4 dots, bottom centered.
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 24.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            repeat(4) { i ->
+                val active = pagerState.currentPage == i
+                Box(
+                    modifier = Modifier
+                        .size(if (active) 7.dp else 6.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (active) CyanAccent
+                            else TextDim.copy(alpha = 0.25f),
+                        ),
+                )
+            }
+        }
     }
 }
 
@@ -580,6 +643,258 @@ private fun Modifier.drawLeftBorder(color: Color, width: Dp): Modifier =
             size = Size(width.toPx(), size.height),
         )
     }
+
+// ── Intro pager pages (Welcome / Privacy / Network) ──────────────────────────
+
+@Composable
+private fun WelcomePage(onContinue: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.weight(0.4f))
+
+        // Wordmark
+        Text(
+            text = "PHANTOM",
+            color = CyanAccent.copy(alpha = 0.7f),
+            fontSize = 11.sp,
+            letterSpacing = 6.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.Medium,
+        )
+
+        Spacer(Modifier.height(28.dp))
+
+        // Hero — Geist display 32, light, tight tracking.
+        Text(
+            text = "Privacy you can\nactually verify.",
+            color = TextPrimary,
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Light,
+            lineHeight = 42.sp,
+            textAlign = TextAlign.Center,
+            letterSpacing = (-0.8).sp,
+        )
+
+        Spacer(Modifier.height(20.dp))
+
+        Text(
+            text = "PHANTOM is end-to-end encrypted and built so we cannot read, log, or hand over what is not on our servers.",
+            color = TextDim,
+            fontSize = 14.sp,
+            lineHeight = 22.sp,
+            textAlign = TextAlign.Center,
+        )
+
+        Spacer(Modifier.weight(1f))
+
+        IntroCta(label = "Get started", onClick = onContinue)
+
+        Spacer(Modifier.height(72.dp))
+    }
+}
+
+@Composable
+private fun PrivacyPage(onContinue: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.height(72.dp))
+
+        Text(
+            text = "HOW WE PROTECT YOU",
+            color = CyanAccent.copy(alpha = 0.7f),
+            fontSize = 10.sp,
+            letterSpacing = 3.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.Medium,
+        )
+
+        Spacer(Modifier.height(20.dp))
+
+        Text(
+            text = "Three architectural truths.",
+            color = TextPrimary,
+            fontSize = 26.sp,
+            fontWeight = FontWeight.Light,
+            lineHeight = 32.sp,
+            textAlign = TextAlign.Center,
+            letterSpacing = (-0.5).sp,
+        )
+
+        Spacer(Modifier.height(36.dp))
+
+        IntroCard(
+            kicker = "01",
+            title = "End-to-end encryption",
+            body = "Your messages are encrypted on your device with libsodium. Keys live only on the endpoints — never the relay.",
+        )
+        Spacer(Modifier.height(16.dp))
+        IntroCard(
+            kicker = "02",
+            title = "No phone, no email",
+            body = "Your identity is a cryptographic key, not a phone number. Nothing links your account to a SIM card or address book.",
+        )
+        Spacer(Modifier.height(16.dp))
+        IntroCard(
+            kicker = "03",
+            title = "Zero metadata",
+            body = "Sealed sender hides the route. Our relay sees ciphertext only — no who-talked-to-whom log to seize.",
+        )
+
+        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(40.dp))
+
+        IntroCta(label = "Continue", onClick = onContinue)
+
+        Spacer(Modifier.height(72.dp))
+    }
+}
+
+@Composable
+private fun NetworkPage(onContinue: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.height(72.dp))
+
+        Text(
+            text = "HOW MESSAGES TRAVEL",
+            color = CyanAccent.copy(alpha = 0.7f),
+            fontSize = 10.sp,
+            letterSpacing = 3.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.Medium,
+        )
+
+        Spacer(Modifier.height(20.dp))
+
+        Text(
+            text = "Direct first.\nMesh next. Relay last.",
+            color = TextPrimary,
+            fontSize = 26.sp,
+            fontWeight = FontWeight.Light,
+            lineHeight = 32.sp,
+            textAlign = TextAlign.Center,
+            letterSpacing = (-0.5).sp,
+        )
+
+        Spacer(Modifier.height(28.dp))
+
+        Text(
+            text = "PHANTOM picks the most private route available, every time:",
+            color = TextDim,
+            fontSize = 14.sp,
+            lineHeight = 22.sp,
+            textAlign = TextAlign.Center,
+        )
+
+        Spacer(Modifier.height(28.dp))
+
+        IntroCard(
+            kicker = "BLE / WIFI-DIRECT",
+            title = "Nearby — fully off-grid",
+            body = "Within range we hop peer-to-peer. No internet, no infrastructure, no observers.",
+        )
+        Spacer(Modifier.height(14.dp))
+        IntroCard(
+            kicker = "MESH",
+            title = "Friend-of-a-friend relay",
+            body = "Messages can travel through trusted contacts when the network is hostile.",
+        )
+        Spacer(Modifier.height(14.dp))
+        IntroCard(
+            kicker = "RELAY",
+            title = "Encrypted store-and-forward",
+            body = "When peers are offline, a stateless relay holds ciphertext for up to 30 days. It cannot read it.",
+        )
+
+        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(40.dp))
+
+        IntroCta(label = "Choose your handle", onClick = onContinue)
+
+        Spacer(Modifier.height(72.dp))
+    }
+}
+
+@Composable
+private fun IntroCard(kicker: String, title: String, body: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Surface)
+            .border(
+                1.dp,
+                Color.White.copy(alpha = 0.05f),
+                RoundedCornerShape(14.dp),
+            )
+            .padding(horizontal = 18.dp, vertical = 16.dp),
+    ) {
+        Text(
+            text = kicker,
+            color = CyanAccent.copy(alpha = 0.75f),
+            fontSize = 9.sp,
+            letterSpacing = 2.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.Medium,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = title,
+            color = TextPrimary,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = body,
+            color = TextDim,
+            fontSize = 13.sp,
+            lineHeight = 20.sp,
+        )
+    }
+}
+
+@Composable
+private fun IntroCta(label: String, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .shadow(
+                elevation = 8.dp,
+                shape = RoundedCornerShape(9999.dp),
+                clip = false,
+                spotColor = CyanAccent.copy(alpha = 0.20f),
+                ambientColor = CyanAccent.copy(alpha = 0.10f),
+            ),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = CyanAccent,
+            contentColor = BgDeep,
+        ),
+        shape = RoundedCornerShape(9999.dp),
+    ) {
+        Text(
+            text = label,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
 
 // ── Business logic (unchanged) ────────────────────────────────────────────────
 

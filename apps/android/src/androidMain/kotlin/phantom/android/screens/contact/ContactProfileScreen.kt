@@ -695,7 +695,7 @@ fun ContactProfileScreen(
                     .padding(horizontal = 24.dp)
                     .padding(bottom = 32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(20.dp),
             ) {
                 Text(
                     "SAFETY NUMBER",
@@ -705,29 +705,74 @@ fun ContactProfileScreen(
                     letterSpacing = 2.sp,
                 )
 
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Surface2, RoundedCornerShape(12.dp))
-                        .padding(20.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = fingerprint,
-                        color = TextPrimary,
-                        fontSize = 18.sp,
-                        fontFamily = PhantomFontMono,
-                        letterSpacing = 3.sp,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                    )
-                }
-
                 Text(
-                    text = "Compare this number with your contact in person or via another channel.",
+                    text = "Compare these numbers with @${conversation.theirUsername} in person or over a trusted channel.",
                     color = TextDim,
-                    fontSize = 12.sp,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 )
+
+                // Design Brief v3 §10: 60-digit grid in 12 groups of 5 — four
+                // rows × three columns, each cell a SurfaceElevated chip with
+                // monospace digits. Easier to read aloud than a single block.
+                val raw = remember(fingerprint) { fingerprint.filter { it.isDigit() } }
+                if (raw.length == 60) {
+                    val groups = remember(raw) { raw.chunked(5) }
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        for (row in 0 until 4) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                for (col in 0 until 3) {
+                                    val idx = row * 3 + col
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(Surface2)
+                                            .border(
+                                                1.dp,
+                                                Color.White.copy(alpha = 0.05f),
+                                                RoundedCornerShape(10.dp),
+                                            )
+                                            .padding(vertical = 12.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = groups[idx],
+                                            color = TextPrimary,
+                                            fontSize = 17.sp,
+                                            fontFamily = PhantomFontMono,
+                                            letterSpacing = 1.5.sp,
+                                            fontWeight = FontWeight.Medium,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback while the fingerprint loads.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Surface2, RoundedCornerShape(12.dp))
+                            .padding(20.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = fingerprint,
+                            color = TextDim,
+                            fontSize = 14.sp,
+                            fontFamily = PhantomFontMono,
+                        )
+                    }
+                }
 
                 Button(
                     onClick = {
@@ -740,12 +785,19 @@ fun ContactProfileScreen(
                             showVerifySheet = false
                         }
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Success),
-                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isVerified) Success else CyanAccent,
+                        contentColor = BgDeep,
+                    ),
+                    shape = RoundedCornerShape(9999.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp),
                 ) {
                     Text(
                         text = if (isVerified) "Verified" else "Mark as Verified",
-                        color = Color.Black,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium,
                     )
                 }
             }

@@ -165,6 +165,63 @@ fun SettingsScreen(
                     }
                 }
 
+                // PHANTOM PRO upsell — restrained card with cyan accent.
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                horizontal = PhantomTokens.Spacing.comfortable,
+                                vertical = PhantomTokens.Spacing.baseUnit,
+                            )
+                            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
+                            .background(PhantomTokens.Colors.SurfaceElevated)
+                            .border(
+                                1.dp,
+                                PhantomTokens.Colors.Cyan.copy(alpha = 0.20f),
+                                RoundedCornerShape(PhantomTokens.Radius.md),
+                            )
+                            .clickable { onNavigate(Screen.Premium) }
+                            .padding(
+                                horizontal = PhantomTokens.Spacing.comfortable,
+                                vertical = PhantomTokens.Spacing.tight,
+                            ),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(PhantomTokens.Colors.Cyan.copy(alpha = 0.10f))
+                                .border(
+                                    1.dp,
+                                    PhantomTokens.Colors.Cyan.copy(alpha = 0.30f),
+                                    RoundedCornerShape(10.dp),
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            PhIconShieldCheck(color = PhantomTokens.Colors.Cyan, size = 18.dp)
+                        }
+                        Spacer(Modifier.width(PhantomTokens.Spacing.tight))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "PHANTOM PRO",
+                                color = PhantomTokens.Colors.Cyan,
+                                style = PhantomType.overline,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = "Operator-grade privacy",
+                                color = TextPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                        PhIconChevron(color = TextDim, size = 14.dp)
+                    }
+                }
+
                 // Account
                 item { SettingsGroupHeader("Account") }
                 item {

@@ -301,6 +301,9 @@ private fun PhantomApp(
             onNavigate = { currentScreen = it },
             onProfile = { currentScreen = Screen.Profile },
         )
+        is Screen.Premium -> phantom.android.screens.premium.PremiumScreen(
+            onBack = { currentScreen = Screen.Settings },
+        )
         is Screen.Settings -> SettingsScreen(
             container = container,
             onNavigate = { currentScreen = it },

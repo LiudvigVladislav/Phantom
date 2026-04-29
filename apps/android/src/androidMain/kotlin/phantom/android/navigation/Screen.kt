@@ -8,6 +8,7 @@ sealed class Screen {
     object ChatList : Screen()
     object Calls : Screen()
     object Nearby : Screen()
+    object Premium : Screen()
     object Settings : Screen()
     object MessageRequests : Screen()
     object Profile : Screen()
