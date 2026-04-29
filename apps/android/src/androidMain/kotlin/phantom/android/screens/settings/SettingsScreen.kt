@@ -252,13 +252,24 @@ fun SettingsScreen(
                 item { SettingsGroupHeader("Account") }
                 item {
                     SettingsGroupCard {
-                        // Privacy mode — интерактивный
+                        // Privacy mode — three pills (Standard / Private / Ghost) that
+                        // change real client behavior. Persisted in SharedPreferences
+                        // under key "privacy_mode"; consulted by ChatScreen before
+                        // calling markConversationRead so Private/Ghost suppress
+                        // outgoing read receipts at the wire level.
                         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Privacy Mode", color = TextPrimary, fontSize = 14.sp)
-                                Spacer(Modifier.width(8.dp))
-                                SoonBadge()
-                            }
+                            Text("Privacy Mode", color = TextPrimary, fontSize = 14.sp)
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                text = when (privacyMode) {
+                                    "Private" -> "Private — read receipts not sent. Local read state still updates."
+                                    "Ghost" -> "Ghost — read receipts not sent. (Future Phase 5: notification preview hidden, sealed sender extended.)"
+                                    else -> "Standard — full delivery + read receipts visible to your contacts."
+                                },
+                                color = TextDim,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp,
+                            )
                             Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 listOf("Standard", "Private", "Ghost").forEach { mode ->
@@ -272,6 +283,14 @@ fun SettingsScreen(
                                                 if (active) Color.Transparent else Color.White.copy(alpha = 0.12f),
                                                 RoundedCornerShape(20.dp),
                                             )
+                                            .clickable {
+                                                privacyMode = mode
+                                                val prefs = context.getSharedPreferences(
+                                                    "phantom_prefs",
+                                                    android.content.Context.MODE_PRIVATE,
+                                                )
+                                                prefs.edit().putString("privacy_mode", mode).apply()
+                                            }
                                             .padding(horizontal = 10.dp, vertical = 4.dp),
                                     ) {
                                         Text(

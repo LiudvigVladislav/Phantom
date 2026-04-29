@@ -220,7 +220,13 @@ fun ChatScreen(
         reloadMessages()
         val conv = container.conversationRepo.getConversation(conversationId)
         if (conv != null) {
-            container.messagingService?.markConversationRead(conversationId, conv.theirPublicKeyHex)
+            // Privacy Mode: Standard sends read receipts; Private/Ghost suppress
+            // them at the wire level (local state still flips to READ).
+            val privacyPrefs = context.getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
+            val sendReceipts = privacyPrefs.getString("privacy_mode", "Standard") == "Standard"
+            container.messagingService?.markConversationRead(
+                conversationId, conv.theirPublicKeyHex, sendReceipts,
+            )
         }
 
         // Send profile card once per conversation if own profile has at least one name field
@@ -312,7 +318,12 @@ fun ChatScreen(
                 reloadMessages()
                 val conv = container.conversationRepo.getConversation(conversationId)
                 if (conv != null) {
-                    container.messagingService?.markConversationRead(conversationId, conv.theirPublicKeyHex)
+                    // Honor Privacy Mode (see top of LaunchedEffect above for explanation).
+                    val privacyPrefs = context.getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
+                    val sendReceipts = privacyPrefs.getString("privacy_mode", "Standard") == "Standard"
+                    container.messagingService?.markConversationRead(
+                        conversationId, conv.theirPublicKeyHex, sendReceipts,
+                    )
                 }
                 listState.animateScrollToItem(messages.lastIndex.coerceAtLeast(0))
             }
