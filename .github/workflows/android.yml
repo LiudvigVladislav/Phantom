@@ -33,6 +33,25 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # ubuntu-latest GitHub-hosted runners do not ship with Android SDK
+      # bundled. AGP's project-isolation needs ANDROID_HOME at Gradle config
+      # time — without this step Gradle init dies with "SDK location not
+      # found", which is what produced the 16-second pre-build failure
+      # observed on the first iteration of this workflow.
+      # android-actions/setup-android installs cmdline-tools, accepts
+      # licenses, and exports ANDROID_HOME / ANDROID_SDK_ROOT.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # Match the Gradle config — pinning these saves ~30s vs letting AGP
+          # auto-download whatever it picks. compile/target SDK come from
+          # gradle/libs.versions.toml; bump in lockstep.
+          cmdline-tools-version: 11076708
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+
       - name: Set up Gradle (caches dependencies, daemons, configuration cache)
         uses: gradle/actions/setup-gradle@v4
 
