@@ -27,6 +27,18 @@ interface ConversationRepository {
     suspend fun getArchivedConversations(): List<ConversationEntity>
     suspend fun setIdentityKeyChangedAt(conversationId: String, ts: Long)
     suspend fun clearIdentityKeyChangedAt(conversationId: String)
+
+    /**
+     * Set or clear the per-conversation mute timestamp.
+     *
+     * @param until epoch ms after which mute auto-expires; pass null to
+     *   unmute, or [Long.MAX_VALUE] for "muted forever". Alpha 2 surfaces
+     *   only the binary toggle; timed-mute UI lands in Phase 5.
+     */
+    suspend fun setMutedUntil(conversationId: String, until: Long?)
+
+    /** Toggle conversation pin state — pinned chats sort first. */
+    suspend fun setPinned(conversationId: String, pinned: Boolean)
 }
 
 data class ConversationEntity(
@@ -43,4 +55,6 @@ data class ConversationEntity(
     val disappearingTimerSecs: Long = 0L,
     val archived: Boolean = false,
     val identityKeyChangedAt: Long? = null,
+    val mutedUntil: Long? = null,
+    val pinned: Boolean = false,
 )

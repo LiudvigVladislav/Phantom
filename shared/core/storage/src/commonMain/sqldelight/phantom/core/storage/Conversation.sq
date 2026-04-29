@@ -11,16 +11,18 @@ CREATE TABLE conversation (
     is_verified INTEGER NOT NULL DEFAULT 0,
     disappearing_timer_secs INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
-    identity_key_changed_at INTEGER
+    identity_key_changed_at INTEGER,
+    muted_until INTEGER,
+    pinned INTEGER NOT NULL DEFAULT 0
 );
 
 getAllConversations:
-SELECT * FROM conversation ORDER BY last_message_at DESC;
+SELECT * FROM conversation ORDER BY pinned DESC, last_message_at DESC;
 
 getActiveConversations:
 SELECT * FROM conversation
 WHERE blocked = 0 AND trust_tier = 'TRUSTED' AND their_public_key_hex != '' AND archived = 0
-ORDER BY last_message_at DESC;
+ORDER BY pinned DESC, last_message_at DESC;
 
 getMessageRequests:
 SELECT * FROM conversation
@@ -36,8 +38,8 @@ INSERT OR REPLACE INTO conversation(
     last_message_preview, last_message_at, unread_count,
     trust_tier, blocked, notes,
     is_verified, disappearing_timer_secs, archived,
-    identity_key_changed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    identity_key_changed_at, muted_until, pinned
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 updateNotes:
 UPDATE conversation SET notes = ? WHERE id = ?;
@@ -86,3 +88,9 @@ UPDATE conversation SET identity_key_changed_at = :ts, is_verified = 0 WHERE id 
 
 clearIdentityKeyChangedAt:
 UPDATE conversation SET identity_key_changed_at = NULL WHERE id = :id;
+
+setMutedUntil:
+UPDATE conversation SET muted_until = :until WHERE id = :id;
+
+setPinned:
+UPDATE conversation SET pinned = :pinned WHERE id = :id;

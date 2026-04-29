@@ -47,6 +47,8 @@ class SqlDelightConversationRepository(
                 disappearing_timer_secs = entity.disappearingTimerSecs,
                 archived = if (entity.archived) 1L else 0L,
                 identity_key_changed_at = entity.identityKeyChangedAt,
+                muted_until = entity.mutedUntil,
+                pinned = if (entity.pinned) 1L else 0L,
             )
         }
 
@@ -135,6 +137,19 @@ class SqlDelightConversationRepository(
             db.conversationQueries.clearIdentityKeyChangedAt(id = conversationId)
         }
 
+    override suspend fun setMutedUntil(conversationId: String, until: Long?): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.setMutedUntil(until = until, id = conversationId)
+        }
+
+    override suspend fun setPinned(conversationId: String, pinned: Boolean): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.setPinned(
+                pinned = if (pinned) 1L else 0L,
+                id = conversationId,
+            )
+        }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------
@@ -153,5 +168,7 @@ class SqlDelightConversationRepository(
         disappearingTimerSecs = disappearing_timer_secs,
         archived = archived != 0L,
         identityKeyChangedAt = identity_key_changed_at,
+        mutedUntil = muted_until,
+        pinned = pinned != 0L,
     )
 }

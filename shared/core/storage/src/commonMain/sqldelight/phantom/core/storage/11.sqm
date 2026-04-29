@@ -1,0 +1,10 @@
+-- 11.sqm — per-conversation mute + pin (Phase 1 quick wins #1 + #6)
+-- muted_until: epoch ms after which mute auto-expires; NULL means not muted.
+--   Alpha 2 surfaces only "muted forever" (Long.MAX_VALUE) and "not muted",
+--   but the schema is already wide enough for timed-mute (8h / 1d / 1w)
+--   without another migration when Phase 5 lands timed-mute UI.
+-- pinned: 0 = normal, 1 = pinned. Pinned chats sort first in
+--   getActiveConversations regardless of last_message_at.
+
+ALTER TABLE conversation ADD COLUMN muted_until INTEGER;
+ALTER TABLE conversation ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;

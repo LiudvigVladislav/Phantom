@@ -310,6 +310,25 @@ private fun ChatsTab(
                         onReload()
                     }
                 },
+                onTogglePin = {
+                    scope.launch {
+                        container.conversationRepo.setPinned(conv.id, !conv.pinned)
+                        onReload()
+                    }
+                },
+                onToggleMute = {
+                    scope.launch {
+                        val isCurrentlyMuted =
+                            conv.mutedUntil != null && conv.mutedUntil!! > System.currentTimeMillis()
+                        // Alpha 2: binary toggle. Long.MAX_VALUE = "muted forever".
+                        // Phase 5 expands to timed-mute UI (8h / 1d / 1w).
+                        container.conversationRepo.setMutedUntil(
+                            conv.id,
+                            if (isCurrentlyMuted) null else Long.MAX_VALUE,
+                        )
+                        onReload()
+                    }
+                },
             )
         }
 
@@ -557,8 +576,12 @@ private fun ChatRow(
     conv: ConversationEntity,
     onClick: () -> Unit,
     onArchive: () -> Unit = {},
+    onTogglePin: () -> Unit = {},
+    onToggleMute: () -> Unit = {},
 ) {
     val isUnread = conv.unreadCount > 0
+    val isMuted = conv.mutedUntil != null && conv.mutedUntil!! > System.currentTimeMillis()
+    val isPinned = conv.pinned
     val context = LocalContext.current
     var showContextMenu by remember { mutableStateOf(false) }
 
@@ -611,15 +634,33 @@ private fun ChatRow(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(Modifier.width(8.dp))
+                // Pinned + muted glyphs sit immediately before the timestamp.
+                // Mono so they line up with the time column visually.
+                if (isPinned) {
+                    Text(
+                        text = "📌",
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(end = 4.dp),
+                    )
+                }
+                if (isMuted) {
+                    Text(
+                        text = "🔕",
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(end = 4.dp),
+                    )
+                }
                 val timeStr = conv.lastMessageAt?.let { formatChatTime(it) } ?: ""
                 // Phase 2 mockup: timestamps are mono, tertiary 65%. Cyan
                 // accent on unread is a PHANTOM-specific affordance kept on
                 // top of the design token (the mockup uses muted tertiary, but
                 // our local convention surfaces unread state via the cyan
-                // accent here too).
+                // accent here too). Muted conversations keep TextDim even
+                // when there is unread content — the mute glyph above carries
+                // the visual signal.
                 Text(
                     text = timeStr,
-                    color = if (isUnread) CyanAccent else TextDim,
+                    color = if (isUnread && !isMuted) CyanAccent else TextDim,
                     fontFamily = PhantomFontMono,
                     fontSize = 11.sp,
                     fontWeight = if (isUnread) FontWeight.Medium else FontWeight.Normal,
@@ -678,6 +719,33 @@ private fun ChatRow(
         containerColor = Surface2,
         offset = DpOffset(20.dp, 0.dp),
     ) {
+        DropdownMenuItem(
+            text = {
+                Text(
+                    text = if (isPinned) "Unpin" else "Pin to top",
+                    color = TextPrimary,
+                    fontSize = 14.sp,
+                )
+            },
+            onClick = {
+                showContextMenu = false
+                onTogglePin()
+            },
+        )
+        DropdownMenuItem(
+            text = {
+                Text(
+                    text = if (isMuted) "Unmute" else "Mute notifications",
+                    color = TextPrimary,
+                    fontSize = 14.sp,
+                )
+            },
+            onClick = {
+                showContextMenu = false
+                onToggleMute()
+            },
+        )
+        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
         DropdownMenuItem(
             text = { Text("Archive", color = TextPrimary, fontSize = 14.sp) },
             onClick = {

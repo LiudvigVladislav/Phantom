@@ -141,6 +141,12 @@ private class FakeConversationRepository : ConversationRepository {
     override suspend fun clearIdentityKeyChangedAt(conversationId: String) {
         store[conversationId]?.let { store[conversationId] = it.copy(identityKeyChangedAt = null) }
     }
+    override suspend fun setMutedUntil(conversationId: String, until: Long?) {
+        store[conversationId]?.let { store[conversationId] = it.copy(mutedUntil = until) }
+    }
+    override suspend fun setPinned(conversationId: String, pinned: Boolean) {
+        store[conversationId]?.let { store[conversationId] = it.copy(pinned = pinned) }
+    }
 }
 
 private class FakeReactionRepository : ReactionRepository {
