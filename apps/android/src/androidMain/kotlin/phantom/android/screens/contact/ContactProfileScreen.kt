@@ -790,6 +790,42 @@ fun ContactProfileScreen(
 
                 Spacer(Modifier.height(8.dp))
 
+                // Combined safety number — identical on both devices, designed
+                // to be read aloud. Complements the visual hex blocks above:
+                //   - Visual: compare 8×4 hex side by side (in person)
+                //   - Verbal: compare these 60 digits (over a trusted call)
+                // Computed via phantom.core.crypto.SafetyNumber.compute().
+                if (myPubKeyHex.isNotEmpty() && theirPublicKeyHex.isNotEmpty()) {
+                    val safetyNumber = remember(myPubKeyHex, theirPublicKeyHex) {
+                        phantom.core.crypto.SafetyNumber.compute(myPubKeyHex, theirPublicKeyHex)
+                    }
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Surface2)
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                    ) {
+                        Text(
+                            text = "OR READ ALOUD · 60 DIGITS",
+                            color = TextDim,
+                            fontSize = 9.sp,
+                            fontFamily = PhantomFontMono,
+                            letterSpacing = 1.6.sp,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = safetyNumber,
+                            color = TextPrimary,
+                            fontSize = 13.sp,
+                            fontFamily = PhantomFontMono,
+                            lineHeight = 18.sp,
+                            letterSpacing = 0.3.sp,
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
+
                 // CTA row varies by state.
                 when (verifyState) {
                     VerifyState.Compare -> Row(
