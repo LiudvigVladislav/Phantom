@@ -90,7 +90,7 @@ Signed PreKey (medium-term, X25519)
     - Generated client-side at onboarding
     - Signed by identity Ed25519 key:
         signature = Ed25519.sign(IK_priv, "phantom-spk-v1" || SPK_pub || timestamp)
-    - Uploaded to relay via PUT /prekeys/signed
+    - Uploaded to relay via RelayMessage::UploadSignedPreKey (WS)
     - Rotated by client every 7 days
     - Relay retains previous SPK for 14 days after rotation to
       tolerate in-flight handshakes
@@ -104,7 +104,7 @@ One-Time PreKey (single-use, X25519)
       for the very first message before any ratchet step)
   Lifecycle:
     - Generated client-side in batches of 100
-    - Public keys uploaded to relay via PUT /prekeys/onetime
+    - Public keys uploaded to relay via RelayMessage::UploadOneTimePreKeys (WS)
     - Each public key consumed at most once during peer X3DH bundle fetch
     - Relay deletes consumed OPK from its store
     - Client refills batch when remaining < 20 (relay signals via
@@ -133,13 +133,15 @@ Ephemeral Ratchet Keys (per-message-step, X25519)
 Initiator (Alice) wants to message Recipient (Bob), Bob's identity
 public key known via QR / invite link / username directory.
 
-1.  Initiator GET /prekeys/bundle/:bob_identity_pubkey
-    Response: {
-      identity_pubkey: bytes32,
-      signed_prekey: bytes32,
+1.  Initiator sends RelayMessage::FetchPreKeyBundle { for_identity: bob_pub }
+    over the existing authenticated WebSocket session.
+    Reply: RelayMessage::PreKeyBundleResponse {
+      for_identity:            bytes32,
+      signed_prekey:           bytes32,
       signed_prekey_signature: bytes64,
-      one_time_prekey: optional bytes32,    // present if pool nonempty
-      one_time_prekey_id: optional bytes16, // for relay book-keeping
+      one_time_prekey:         optional bytes32,
+      one_time_prekey_id:      optional bytes16,
+      remaining_opk_pool:      u32
     }
 
 2.  Initiator verifies signed_prekey_signature with bob_identity_ed25519
@@ -153,23 +155,25 @@ public key known via QR / invite link / username directory.
     DH2 = X25519(EK_a_priv, IK_b_x25519_pub)        // ephemeral ↔ identity
     DH3 = X25519(EK_a_priv, SPK_b_pub)              // ephemeral ↔ signed prekey
     DH4 = X25519(EK_a_priv, OPK_b_pub) if OPK_b_pub // ephemeral ↔ one-time
-    master_secret = HKDF(
+    rootKey = HKDF(
       ikm  = DH1 || DH2 || DH3 || DH4,
       salt = SHA256("phantom-x3dh-v2"),
       info = "phantom-x3dh-rootkey-v1",
-      L    = 64,
+      L    = 32,
     )
-    rootKey      = master_secret[0..32]
-    chainKeySeed = master_secret[32..64]
 
 5.  Initiator initializes RatchetState with:
-      rootKey                  = rootKey
+      rootKey                  = rootKey   (32-byte HKDF output)
       sendingRatchetKeyPair    = freshly generated DH keypair (NEW)
-      sendingRatchetPrivateKey = NEW.priv         // Q1 fix: NOT IK_priv
+      sendingRatchetPrivateKey = NEW.priv          // Q1 fix: NOT IK_priv
       sendingRatchetPublicKey  = NEW.pub
-      receivingChainKey        = chainKeySeed
       sendingChainKey          = null until first send
-      receivingRatchetPublicKey= SPK_b_pub        // for first DH ratchet
+      receivingChainKey        = null until first receive
+      receivingRatchetPublicKey= SPK_b_pub         // for first DH ratchet step
+
+    The Double Ratchet itself derives both chain keys on the first DH
+    ratchet step from rootKey + DH(NEW.priv, SPK_b_pub) per spec —
+    matching libsignal behavior, not splitting the X3DH output ourselves.
 
 6.  Initiator sends first encrypted message; the message header carries:
       ek_pub               (initiator's ephemeral public key)
@@ -193,68 +197,119 @@ Recipient (Bob) on first inbound message from Alice:
     OPK_priv from local storage.
 ```
 
-### Relay endpoints (Rust additions to `services/relay/`)
+### Relay endpoints — WebSocket-message based (Q2 confirmed: per-identity authenticated)
+
+All prekey operations travel as authenticated `RelayMessage` types over
+the existing WebSocket session. The session itself authenticates the
+sender via the connection identity (already known to the relay from
+the `?id=` parameter and, post Phase 1 P2 batch, from the signed
+challenge of ADR-018). This means **rate limits apply to authenticated
+requesting identities, not source IPs** — VPN rotation cannot bypass
+them. There is no anonymous HTTP endpoint that an unauthenticated
+attacker can hit to drain a target's OPK pool.
 
 ```
-PUT /prekeys/signed
-  Auth: WebSocket signed-challenge identity (per ADR-018, Phase 1 P2 batch)
-        — until then, RELAY_SECRET_TOKEN gate
-  Body (JSON):
-    {
-      identity_pubkey: hex32,
-      signed_prekey: hex32,
-      signature: hex64,
-      timestamp: i64
-    }
-  Action:
-    - Verify Ed25519 signature with identity_pubkey
+RelayMessage::UploadSignedPreKey
+  // Sent: client → relay
+  fields:
+    spk_pubkey: hex32
+    signature:  hex64        // Ed25519(IK_priv,
+                             //   "phantom-spk-v1" || spk_pubkey || timestamp)
+    timestamp:  i64
+
+  Relay action:
+    - identity_pubkey is taken from the authenticated connection
+      (NOT supplied by the client to prevent spoofing)
+    - Verify Ed25519 signature with identity Ed25519 pubkey
     - Reject if timestamp older than 24h or in future > 60s
-    - UPSERT into signed_prekey table for this identity
-    - Mark previous SPK as expiring in 14 days
-  Returns: 204 No Content
+    - If a current SPK exists, demote it to "previous" with
+      expires_at = now + 14 days
+    - INSERT new SPK as "current"
+  Reply: RelayMessage::Ack { ok: true } or RelayMessage::Ack { ok: false, reason }
 
-PUT /prekeys/onetime
-  Body (JSON):
-    {
-      identity_pubkey: hex32,
-      one_time_prekeys: [
-        { id: hex16, pubkey: hex32 }
-      ] // batch size 1..100
-    }
-  Action:
-    - INSERT each onto onetime_prekey table for this identity
-    - Reject duplicates (id collision is a client bug)
-  Returns: 204 No Content
+RelayMessage::UploadOneTimePreKeys
+  // Sent: client → relay
+  fields:
+    one_time_prekeys: [ { id: hex16, pubkey: hex32 } ]   // 1..100
 
-GET /prekeys/bundle/:identity_pubkey
-  Action:
-    - Read current SPK + signature
-    - Atomically POP one OPK if pool nonempty (transaction)
-    - Increment X-PreKey-Remaining header
-  Returns: 200 OK
-    {
-      identity_pubkey: hex32,
-      signed_prekey: hex32,
-      signed_prekey_signature: hex64,
-      one_time_prekey: hex32 | null,
-      one_time_prekey_id: hex16 | null
-    }
-  Rate limit: 10 / minute / requesting identity
-                100 / hour / requesting identity
-                (prevents OPK pool drain attack)
+  Relay action:
+    - identity_pubkey from authenticated connection
+    - INSERT each onto onetime_prekey for this identity
+    - Reject duplicate ids (client bug)
+  Reply: RelayMessage::Ack { ok: true, remaining: u32 }
 
-GET /prekeys/status (self)
-  Returns: 200 OK
-    {
-      signed_prekey_age_secs: i64,
-      one_time_prekey_remaining: u32,
-      next_signed_prekey_due_secs: i64
-    }
-  Used by client to decide when to refill / rotate.
+RelayMessage::FetchPreKeyBundle
+  // Sent: client → relay
+  fields:
+    for_identity: hex32        // who I want to handshake with
 
-DELETE /prekeys (self, on account deletion only)
-  Removes SPK and all OPKs.
+  Relay action:
+    - requesting_identity from authenticated connection (used for
+      rate-limit accounting)
+    - Rate-limit per requesting_identity:
+        10 / minute, 100 / hour
+      Exceeded → reply Ack { ok: false, reason: "rate_limited" }
+    - If for_identity has no current SPK, reply Ack { ok: false,
+      reason: "no_prekeys" }
+    - Read current SPK + signature for for_identity
+    - Atomically POP one OPK if pool nonempty (single transaction
+      with PreKeyBundleResponse send to ensure exactly-once consume)
+  Reply: RelayMessage::PreKeyBundleResponse {
+    for_identity:            hex32,
+    signed_prekey:           hex32,
+    signed_prekey_signature: hex64,
+    one_time_prekey:         hex32 | null,
+    one_time_prekey_id:      hex16 | null,
+    remaining_opk_pool:      u32          // hint for the target user
+  }
+
+RelayMessage::PreKeyStatus
+  // Sent: client → relay
+  // No fields. Asks for own prekey state.
+
+  Relay action:
+    - identity_pubkey from authenticated connection
+    - Read SPK age, OPK pool size for THIS identity
+  Reply: RelayMessage::PreKeyStatusResponse {
+    signed_prekey_age_secs:   i64,
+    one_time_prekey_remaining: u32,
+    next_signed_prekey_due_secs: i64,
+  }
+
+RelayMessage::DeletePreKeys
+  // Sent: client → relay (on account deletion only)
+  Relay action: delete SPK and all OPKs for authenticated identity
+  Reply: Ack
 ```
+
+### SignedPreKey retention policy (Q3 offline >14d edge case)
+
+The 14-day expiry applies **only to the PREVIOUS SPK** after rotation
+(i.e. the SPK that has been replaced by a newer one). The **current
+SPK is never expired by the relay** — it persists until the user
+uploads a replacement.
+
+This means:
+
+- A client offline for >14 days remains reachable. The relay still
+  has their current SPK (uploaded long ago, not replaced). Peers
+  fetching the bundle receive that SPK; X3DH succeeds with the
+  not-recently-rotated key.
+- When the offline client reconnects, the client checks
+  `RelayMessage::PreKeyStatus`. If `signed_prekey_age_secs > 7 days`,
+  client immediately rotates: generates a new SPK, signs it, sends
+  `RelayMessage::UploadSignedPreKey`. The previous (old) SPK is
+  demoted with 14-day grace; in-flight handshakes initiated against
+  it during the demotion window still succeed.
+- Trade-off accepted: SPK can be older than 7 days for offline users.
+  This is a confidentiality-vs-availability trade-off matching Signal's
+  behavior: the alternative (auto-expire current SPK without
+  replacement) would render the user unreachable.
+
+Future improvement (Beta+): if SPK age > 30 days at handshake time,
+relay can include a hint in `PreKeyBundleResponse` so the initiator's
+UI shows "this contact's keys are unrotated; consider verifying via
+QR / safety number before sending sensitive content."
 
 Schema (SQLite via `services/relay/src/state.rs`, in-memory + journal):
 
@@ -378,9 +433,10 @@ install when old ratchet states are detected. Copy:
 > Protocol architecture. Existing conversations need to be
 > re-established with proper key exchange.
 >
-> **Your identity stays the same** — your @username, your QR code, and
-> your existing contacts will recognize you. Only the per-conversation
-> encryption keys are being refreshed.
+> **Your identity stays the same** — your QR code and your existing
+> contacts will recognize you. Once Phase 2 brings unique @usernames
+> (planned July 2026), your identity will support that as well. Only
+> the per-conversation encryption keys are being refreshed.
 >
 > Tap **Continue** to refresh local conversation state. Past messages
 > are preserved as read-only history; the next message you send will
@@ -432,10 +488,13 @@ preferences.edit { putBoolean("phantom.alpha2.bootstrap_done", true) }
   to re-establish (auto-handled by client, but visible as "new
   session" in logs and possibly a UI hint)
 - New attack surface: prekey exhaustion attack (relay drains a target's
-  OPK pool with bogus `GET /prekeys/bundle/:target` calls).
-  Mitigated by per-requester rate limit (10/min, 100/hour) and
-  client refill at `< 20 remaining`. Pool degrades gracefully to
-  3-DH variant when empty.
+  OPK pool with bogus `RelayMessage::FetchPreKeyBundle` requests).
+  Mitigated by per-requesting-identity rate limit (10/min, 100/hour)
+  enforced over the authenticated WebSocket connection — VPN/IP
+  rotation does not bypass it because rate limits key off the
+  authenticated identity, not source IP. Client refill at
+  `< 20 remaining`. Pool degrades gracefully to 3-DH variant when
+  empty.
 
 ### Neutral
 
