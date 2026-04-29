@@ -101,6 +101,7 @@ fun ChatScreen(
     container: AppContainer,
     onBack: () -> Unit,
     onContactProfile: () -> Unit = {},
+    onStartVoiceCall: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -473,6 +474,14 @@ fun ChatScreen(
                 isTyping = isContactTyping,
                 onBack = onBack,
                 onContactProfile = onContactProfile,
+                onVoiceCall = {
+                    if (theirPublicKeyHex.isNotEmpty()) {
+                        scope.launch {
+                            container.callManager?.startCall(theirPublicKeyHex, theirUsername)
+                        }
+                        onStartVoiceCall()
+                    }
+                },
                 onMoreMenu = { showMenu = true },
                 showMenu = showMenu,
                 onDismissMenu = { showMenu = false },
@@ -2371,6 +2380,7 @@ private fun ChatTopBar(
     isTyping: Boolean = false,
     onBack: () -> Unit,
     onContactProfile: () -> Unit,
+    onVoiceCall: () -> Unit,
     onMoreMenu: () -> Unit,
     showMenu: Boolean,
     onDismissMenu: () -> Unit,
@@ -2378,8 +2388,12 @@ private fun ChatTopBar(
     onBlock: () -> Unit,
 ) {
     // PHANTOM_FULL_COMPOSE §05 layout:
-    //   [← back] [Avatar 36dp] [name + @username] [Phone] [Video] [MoreHoriz]
+    //   [← back] [Avatar 36dp] [name + @username] [Phone] [MoreHoriz]
     // 56dp height, BorderSubtle bottom hairline.
+    // Video button removed: CallManager is audio-only (no VideoTrack /
+    // VideoCapturer / VideoSource integration). Video calls land with a
+    // future ADR after Phase 4 iOS parity. Phone button now wired to
+    // CallManager.startCall.
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -2442,11 +2456,8 @@ private fun ChatTopBar(
                     )
                 }
             }
-            IconButton(onClick = { /* TODO: voice call */ }, modifier = Modifier.size(40.dp)) {
+            IconButton(onClick = onVoiceCall, modifier = Modifier.size(40.dp)) {
                 PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
-            }
-            IconButton(onClick = { /* TODO: video call */ }, modifier = Modifier.size(40.dp)) {
-                PhIconVideo(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
             }
             Box {
                 IconButton(onClick = onMoreMenu, modifier = Modifier.size(40.dp)) {
