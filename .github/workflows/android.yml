@@ -114,3 +114,23 @@ jobs:
             shared/core/*/build/reports/tests/
             shared/core/*/build/test-results/
           retention-days: 7
+          if-no-files-found: ignore
+
+      # Capture every Kotlin compile / KSP / SQLDelight code-gen log on
+      # failure so we don't need to grep through the GitHub Actions log
+      # viewer manually. This bundle is the fastest way to diagnose
+      # compile errors on Linux runners that don't reproduce locally on
+      # Windows (case-sensitivity, file-path issues, native lib loaders,
+      # etc).
+      - name: Upload Gradle build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-logs
+          path: |
+            shared/core/*/build/kotlin/
+            shared/core/*/build/reports/
+            shared/core/*/build/tmp/
+            ~/.gradle/daemon/*/daemon-*.out.log
+          retention-days: 7
+          if-no-files-found: ignore
