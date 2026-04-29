@@ -41,6 +41,9 @@ fun EmptyState(
     secondaryText: String,
     ctaLabel: String? = null,
     onCta: () -> Unit = {},
+    // FULL_COMPOSE §13 prescribes the ambient motif always on, but the user
+    // explicitly asked for a clean empty state on the chat list. Default off,
+    // opt-in for hero/onboarding-style empty states.
     showMotif: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
@@ -130,7 +133,7 @@ private fun AmbientCircleMotif() {
 @Composable
 fun EmptyChats(onAddContact: () -> Unit, modifier: Modifier = Modifier) {
     EmptyState(
-        icon = { PhIconMessage(color = PhantomTokens.Colors.TextTertiary, size = 40.dp) },
+        icon = { PhIconMessage(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
         primaryText = "No conversations yet",
         secondaryText = "Add a contact to start a private, encrypted conversation.",
         ctaLabel = "Add contact",
@@ -142,7 +145,7 @@ fun EmptyChats(onAddContact: () -> Unit, modifier: Modifier = Modifier) {
 @Composable
 fun EmptyCalls(modifier: Modifier = Modifier) {
     EmptyState(
-        icon = { PhIconPhone(color = PhantomTokens.Colors.TextTertiary, size = 40.dp) },
+        icon = { PhIconPhone(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
         primaryText = "No call history",
         secondaryText = "All calls are end-to-end encrypted. No record is stored.",
         modifier = modifier,
@@ -152,7 +155,7 @@ fun EmptyCalls(modifier: Modifier = Modifier) {
 @Composable
 fun EmptyContacts(onFindPeople: () -> Unit, modifier: Modifier = Modifier) {
     EmptyState(
-        icon = { PhIconPerson(color = PhantomTokens.Colors.TextTertiary, size = 40.dp) },
+        icon = { PhIconPerson(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
         primaryText = "No contacts yet",
         secondaryText = "Search for a username or scan a QR code to connect.",
         ctaLabel = "Find people",
@@ -164,7 +167,7 @@ fun EmptyContacts(onFindPeople: () -> Unit, modifier: Modifier = Modifier) {
 @Composable
 fun EmptySearch(modifier: Modifier = Modifier) {
     EmptyState(
-        icon = { PhIconSearch(color = PhantomTokens.Colors.TextTertiary, size = 40.dp) },
+        icon = { PhIconSearch(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
         primaryText = "No results",
         secondaryText = "Try a different username or check your spelling.",
         modifier = modifier,

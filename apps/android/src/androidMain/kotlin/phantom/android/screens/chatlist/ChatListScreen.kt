@@ -592,12 +592,12 @@ private fun ChatRow(
                 onClick = onClick,
                 onLongClick = { showContextMenu = true },
             )
-            // Phase 2 mockup: 16dp horizontal padding, 12dp gap between avatar
-            // and content, 72dp row height (≈12dp vertical with 48dp avatar).
-            .padding(horizontal = PhantomTokens.Spacing.comfortable, vertical = 12.dp),
+            // PHANTOM_FULL_COMPOSE §03: avatar 40dp, total row 72dp height
+            // (16dp vertical padding × 2 + 40dp avatar = 72dp).
+            .padding(horizontal = PhantomTokens.Spacing.comfortable, vertical = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        GradientAvatar(name = conv.theirUsername, size = 48.dp)
+        GradientAvatar(name = conv.theirUsername, size = 40.dp)
         Spacer(Modifier.width(PhantomTokens.Spacing.tight))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {

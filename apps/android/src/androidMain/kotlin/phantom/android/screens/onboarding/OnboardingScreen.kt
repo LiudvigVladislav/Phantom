@@ -487,7 +487,7 @@ private fun PrivacyModeStep(
             text = "Choose your privacy mode",
             color = TextPrimary,
             fontSize = 26.sp,
-            fontWeight = FontWeight.Light,
+            fontWeight = FontWeight.Medium,
             lineHeight = 32.sp,
             textAlign = TextAlign.Center,
             letterSpacing = (-0.5).sp,
@@ -626,9 +626,10 @@ private fun PrivacyModeCard(
             }
             if (active) {
                 Spacer(Modifier.width(8.dp))
+                // FULL_COMPOSE §09 Step 3: 15×15dp check badge top-right.
                 Box(
                     modifier = Modifier
-                        .size(20.dp)
+                        .size(15.dp)
                         .clip(CircleShape)
                         .background(CyanAccent.copy(alpha = 0.12f))
                         .border(1.dp, CyanAccent.copy(alpha = 0.35f), CircleShape),

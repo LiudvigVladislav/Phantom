@@ -53,25 +53,25 @@ fun NearbyScreen(
                     .background(Surface)
                     .windowInsetsPadding(WindowInsets.statusBars),
             ) {
-                Box(
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(64.dp)
+                        .height(56.dp)
                         .padding(horizontal = PhantomTokens.Spacing.comfortable),
-                    contentAlignment = Alignment.CenterStart,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column {
-                        Text(
-                            text = "Nearby",
-                            color = TextPrimary,
-                            style = PhantomType.headline,
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            text = "MESH PEER DISCOVERY",
-                            color = PhantomTokens.Colors.TextTertiary,
-                            style = PhantomType.overline,
-                        )
+                    Text(
+                        text = "Nearby",
+                        color = TextPrimary,
+                        style = PhantomType.headline,
+                        modifier = Modifier.weight(1f),
+                    )
+                    // §04 Filter icon — opens future filter sheet (e.g. trusted-only).
+                    IconButton(
+                        onClick = { /* TODO: filter sheet */ },
+                        modifier = Modifier.size(40.dp),
+                    ) {
+                        PhIconFunnel(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
                     }
                 }
                 HorizontalDivider(color = BorderSubtle, thickness = 1.dp)

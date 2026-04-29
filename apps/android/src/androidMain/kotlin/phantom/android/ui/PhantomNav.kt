@@ -246,10 +246,10 @@ fun BottomNavPill(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(64.dp)
-                    .clip(RoundedCornerShape(20.dp))
+                    .height(56.dp)
+                    .clip(RoundedCornerShape(18.dp))
                     .background(phantom.android.ui.theme.Surface)
-                    .border(1.dp, phantom.android.ui.theme.BorderSubtle, RoundedCornerShape(20.dp)),
+                    .border(1.dp, phantom.android.ui.theme.BorderSubtle, RoundedCornerShape(18.dp)),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceAround,
             ) {

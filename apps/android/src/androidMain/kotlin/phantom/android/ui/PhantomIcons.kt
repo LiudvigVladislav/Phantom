@@ -557,3 +557,219 @@ fun PhIconRadar(color: Color, modifier: Modifier = Modifier, size: Dp = 22.dp) {
         drawCircle(color, 1.5f * s, Offset(cx, cy))
     }
 }
+
+// ── Additional icons — FULL_COMPOSE §02B catalogue (cat 02 / 03 / 06 / 12 / 13)
+// All Lucide-aligned at stroke 1.6, cap/join Round, on a 24×24 viewBox.
+
+// alert-circle — circle + bang
+@Composable
+fun PhIconAlertCircle(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 9f * s, Offset(12f * s, 12f * s), style = st)
+        drawPath(parsePath("M12 8v4M12 16h.01", s), color, style = st)
+    }
+}
+
+// eye-off — eye with diagonal slash
+@Composable
+fun PhIconEyeOff(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M3 3l18 18M9.88 5.12A11.85 11.85 0 0112 5c5 0 9.27 3.11 11 7-.6 1.34-1.46 2.55-2.51 3.55M6.61 6.61C4.61 8 3.18 9.84 2.46 12c1.73 3.89 6 7 11 7 1.37 0 2.69-.23 3.93-.65M9.88 9.88a3 3 0 104.24 4.24",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// qr-code — three corner brackets + center pixel cluster
+@Composable
+fun PhIconQrCode(color: Color, modifier: Modifier = Modifier, size: Dp = 22.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Three corner squares
+        drawPath(parsePath("M3 3h6v6H3zM15 3h6v6h-6zM3 15h6v6H3z", s), color, style = st)
+        // Inner solid centers
+        drawPath(parsePath("M5 5h2v2H5zM17 5h2v2h-2zM5 17h2v2H5z", s), color)
+        // Bottom-right cluster
+        drawPath(parsePath("M13 13h3v3h-3zM18 13h3M13 18v3M18 18h3v3h-3z", s), color, style = st)
+    }
+}
+
+// plus
+@Composable
+fun PhIconPlus(color: Color, modifier: Modifier = Modifier, size: Dp = 20.dp) {
+    PhStrokePath("M12 5v14M5 12h14", color, modifier.then(Modifier.size(size)))
+}
+
+// x — close
+@Composable
+fun PhIconX(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath("M18 6L6 18M6 6l12 12", color, modifier.then(Modifier.size(size)))
+}
+
+// chevron-left
+@Composable
+fun PhIconChevronLeft(color: Color, modifier: Modifier = Modifier, size: Dp = 14.dp) {
+    PhStrokePath("M15 18l-6-6 6-6", color, modifier.then(Modifier.size(size)))
+}
+
+// chevron-down
+@Composable
+fun PhIconChevronDown(color: Color, modifier: Modifier = Modifier, size: Dp = 14.dp) {
+    PhStrokePath("M6 9l6 6 6-6", color, modifier.then(Modifier.size(size)))
+}
+
+// star — outline
+@Composable
+fun PhIconStar(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
+    PhStrokePath(
+        "M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// flag — moderation report
+@Composable
+fun PhIconFlag(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
+    PhStrokePath(
+        "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22V15",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ban — block, prohibition
+@Composable
+fun PhIconBan(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 9f * s, Offset(12f * s, 12f * s), style = st)
+        drawPath(parsePath("M5.64 5.64l12.72 12.72", s), color, style = st)
+    }
+}
+
+// smile-plus — emoji reaction trigger
+@Composable
+fun PhIconSmilePlus(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Smile arc + eyes
+        drawPath(
+            parsePath("M21 12c0 5-4 9-9 9s-9-4-9-9 4-9 9-9M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01", s),
+            color, style = st,
+        )
+        // Plus
+        drawPath(parsePath("M19 3v4M17 5h4", s), color, style = st)
+    }
+}
+
+// bell-ring — bell with subtle radiating dots
+@Composable
+fun PhIconBellRing(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M6 8a6 6 0 0112 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 003.4 0M4 2C2.8 3.7 2 5.7 2 8M22 8c0-2.3-.8-4.3-2-6",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// bell-off — muted bell
+@Composable
+fun PhIconBellOff(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M8.7 3a6 6 0 019.3 5v2.5M17 17H3s3-2 3-9M3 3l18 18M10.3 21a1.94 1.94 0 003.4 0",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ellipsis-vertical (alias for MoreVert; bigger 22dp default for context menu triggers)
+@Composable
+fun PhIconEllipsisVertical(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) =
+    PhIconMoreVert(color, modifier, size)
+
+// pin-off — slashed pin
+@Composable
+fun PhIconPinOff(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
+    PhStrokePath(
+        "M12 17v5M9 10.76V6a2 2 0 012-2h2a2 2 0 012 2v4.76l-1 .76M3 3l18 18",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// reply-all — chevron-back-back glyph
+@Composable
+fun PhIconReplyAll(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
+    PhStrokePath(
+        "M7 17l-5-5 5-5M12 17l-5-5 5-5M22 18v-2a4 4 0 00-4-4H7",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// message-circle — speech bubble
+@Composable
+fun PhIconMessageCircle(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// award — premium tier
+@Composable
+fun PhIconAward(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 4f * s, Offset(12f * s, 8f * s), style = st)
+        drawPath(
+            parsePath("M8.21 13.89L7 23l5-3 5 3-1.21-9.12", s),
+            color, style = st,
+        )
+    }
+}
+
+// gift — wrapped box with bow
+@Composable
+fun PhIconGift(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M20 12v10H4V12M2 7h20v5H2zM12 22V7M12 7H7.5a2.5 2.5 0 010-5C11 2 12 7 12 7zM12 7h4.5a2.5 2.5 0 000-5C13 2 12 7 12 7z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// zap — lightning
+@Composable
+fun PhIconZap(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M13 2L3 14h9l-1 8 10-12h-9l1-8z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// dollar-sign — billing / pricing
+@Composable
+fun PhIconDollarSign(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M12 1v22M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// hash — channel sigil
+@Composable
+fun PhIconHash(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M4 9h16M4 15h16M10 3L8 21M16 3l-2 18",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// archive — box with lid
+@Composable
+fun PhIconArchive(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M21 8v13H3V8M1 3h22v5H1zM10 12h4",
+        color, modifier.then(Modifier.size(size)),
+    )
+}

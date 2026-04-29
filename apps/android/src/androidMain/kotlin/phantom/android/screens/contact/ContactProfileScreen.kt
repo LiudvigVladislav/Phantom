@@ -18,6 +18,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -679,8 +680,12 @@ fun ContactProfileScreen(
             value = container.identityRepo.loadIdentity()?.publicKeyHex ?: ""
         }
 
+        // Tri-state machine per FULL_COMPOSE §12: Compare (neutral) →
+        // Verified (success-tinted) | Mismatch (danger-tinted, opacity 0.70).
+        var verifyState by remember { mutableStateOf(if (isVerified) VerifyState.Verified else VerifyState.Compare) }
+
         ModalBottomSheet(
-            onDismissRequest = { showVerifySheet = false },
+            onDismissRequest = { showVerifySheet = false; verifyState = VerifyState.Compare },
             containerColor = Surface,
         ) {
             Column(
@@ -691,16 +696,36 @@ fun ContactProfileScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                Text(
-                    "VERIFY @${conversation.theirUsername.uppercase()}",
-                    color = TextDim,
-                    fontSize = 10.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 2.sp,
-                )
+                // Header — varies by state.
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    when (verifyState) {
+                        VerifyState.Compare -> PhIconShield(color = TextDim, size = 14.dp)
+                        VerifyState.Verified -> PhIconShieldCheck(color = Success, size = 14.dp)
+                        VerifyState.Mismatch -> Text("!", color = Danger, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        text = when (verifyState) {
+                            VerifyState.Compare -> "VERIFY @${conversation.theirUsername.uppercase()}"
+                            VerifyState.Verified -> "VERIFIED · @${conversation.theirUsername.uppercase()}"
+                            VerifyState.Mismatch -> "MISMATCH · @${conversation.theirUsername.uppercase()}"
+                        },
+                        color = when (verifyState) {
+                            VerifyState.Verified -> Success
+                            VerifyState.Mismatch -> Danger
+                            else -> TextDim
+                        },
+                        fontSize = 10.sp,
+                        fontFamily = PhantomFontMono,
+                        letterSpacing = 2.sp,
+                    )
+                }
 
                 Text(
-                    text = "Match all 8 groups with @${conversation.theirUsername} in person or on a trusted call.",
+                    text = when (verifyState) {
+                        VerifyState.Compare -> "Match all 8 groups with @${conversation.theirUsername} in person or on a trusted call."
+                        VerifyState.Verified -> "Identity confirmed. Future messages will arrive on this key only — you'll be warned if it changes."
+                        VerifyState.Mismatch -> "These keys do not match. Do not trust this conversation until you re-verify in person."
+                    },
                     color = TextDim,
                     fontSize = 13.sp,
                     lineHeight = 19.sp,
@@ -713,10 +738,15 @@ fun ContactProfileScreen(
                     ownerLabel = "Your key",
                     name = "You",
                     publicKeyHex = myPubKeyHex,
+                    accent = VerifyState.Compare,
                 )
 
-                // Axis bridge — two textTertiary lines flanking a "Compare ↕"
-                // label. Restrained, no glow.
+                // Axis bridge — neutral lines or success/danger tint per state.
+                val bridgeColor = when (verifyState) {
+                    VerifyState.Verified -> Success.copy(alpha = 0.45f)
+                    VerifyState.Mismatch -> Danger.copy(alpha = 0.30f)
+                    else -> TextDim.copy(alpha = 0.15f)
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -726,11 +756,19 @@ fun ContactProfileScreen(
                         modifier = Modifier
                             .weight(1f)
                             .height(1.dp)
-                            .background(TextDim.copy(alpha = 0.15f)),
+                            .background(bridgeColor),
                     )
                     Text(
-                        text = "Compare ↕",
-                        color = TextDim,
+                        text = when (verifyState) {
+                            VerifyState.Compare -> "Compare ↕"
+                            VerifyState.Verified -> "Verified ✓"
+                            VerifyState.Mismatch -> "Mismatch ×"
+                        },
+                        color = when (verifyState) {
+                            VerifyState.Verified -> Success
+                            VerifyState.Mismatch -> Danger
+                            else -> TextDim
+                        },
                         fontSize = 9.sp,
                         fontFamily = PhantomFontMono,
                         letterSpacing = 1.5.sp,
@@ -739,7 +777,7 @@ fun ContactProfileScreen(
                         modifier = Modifier
                             .weight(1f)
                             .height(1.dp)
-                            .background(TextDim.copy(alpha = 0.15f)),
+                            .background(bridgeColor),
                     )
                 }
 
@@ -747,60 +785,89 @@ fun ContactProfileScreen(
                     ownerLabel = "@${conversation.theirUsername}'s key",
                     name = conversation.theirUsername,
                     publicKeyHex = theirPublicKeyHex,
+                    accent = verifyState,
                 )
 
                 Spacer(Modifier.height(8.dp))
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Button(
+                // CTA row varies by state.
+                when (verifyState) {
+                    VerifyState.Compare -> Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Button(
+                            onClick = { verifyState = VerifyState.Mismatch },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.Transparent,
+                                contentColor = Danger,
+                            ),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Danger.copy(alpha = 0.40f)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f).height(46.dp),
+                        ) {
+                            Text("Mismatch", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        }
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    container.conversationRepo.setVerified(conversationId, true)
+                                    container.conversationRepo.clearIdentityKeyChangedAt(conversationId)
+                                    isVerified = true
+                                    keyChangedAt = null
+                                    conversation = conversation.copy(identityKeyChangedAt = null)
+                                    verifyState = VerifyState.Verified
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = CyanAccent,
+                                contentColor = BgDeep,
+                            ),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1.4f).height(46.dp),
+                        ) {
+                            Text("It's a match", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        }
+                    }
+                    VerifyState.Verified -> Button(
                         onClick = { showVerifySheet = false },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = Color.Transparent,
-                            contentColor = Danger,
-                        ),
-                        border = androidx.compose.foundation.BorderStroke(
-                            1.dp,
-                            Danger.copy(alpha = 0.40f),
-                        ),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(46.dp),
-                    ) {
-                        Text(
-                            text = "Mismatch",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium,
-                        )
-                    }
-                    Button(
-                        onClick = {
-                            scope.launch {
-                                container.conversationRepo.setVerified(conversationId, true)
-                                container.conversationRepo.clearIdentityKeyChangedAt(conversationId)
-                                isVerified = true
-                                keyChangedAt = null
-                                conversation = conversation.copy(identityKeyChangedAt = null)
-                                showVerifySheet = false
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isVerified) Success else CyanAccent,
+                            containerColor = CyanAccent,
                             contentColor = BgDeep,
                         ),
                         shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier
-                            .weight(1.4f)
-                            .height(46.dp),
+                        modifier = Modifier.fillMaxWidth().height(48.dp),
                     ) {
-                        Text(
-                            text = if (isVerified) "Verified ✓" else "It's a match",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium,
-                        )
+                        Text("Back to chat", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    }
+                    VerifyState.Mismatch -> Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Button(
+                            onClick = { verifyState = VerifyState.Compare },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.Transparent,
+                                contentColor = TextPrimary,
+                            ),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f).height(46.dp),
+                        ) {
+                            Text("Go back", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        }
+                        Button(
+                            onClick = { /* TODO: report endpoint */ showVerifySheet = false },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.Transparent,
+                                contentColor = Danger.copy(alpha = 0.55f),
+                            ),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Danger.copy(alpha = 0.30f)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f).height(46.dp),
+                        ) {
+                            Text("Report", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        }
                     }
                 }
             }
@@ -966,15 +1033,26 @@ private fun ChevronIcon() {
 }
 
 /**
+ * Tri-state verification flow per FULL_COMPOSE §12.
+ *   Compare  — neutral surfaceDeep block, no tinted border
+ *   Verified — success-tinted border 0.25
+ *   Mismatch — danger-tinted border 0.25, danger-tinted hex 0.70 alpha,
+ *              block opacity 0.70 (calm precision, NOT panic)
+ */
+private enum class VerifyState { Compare, Verified, Mismatch }
+
+/**
  * PHANTOM_FULL_COMPOSE §12 FingerprintBlock — owner label + name + 8 groups
  * of 4 hex chars (first 32 hex of the ED25519 public key) on surfaceDeep,
- * radius 12dp, cyan-tinted edge handled by the calling axis bridge.
+ * radius 12dp. Border tint and overall opacity respond to the parent
+ * verify state.
  */
 @Composable
 private fun FingerprintBlock(
     ownerLabel: String,
     name: String,
     publicKeyHex: String,
+    accent: VerifyState = VerifyState.Compare,
 ) {
     val fingerprint = remember(publicKeyHex) {
         if (publicKeyHex.length >= 32) {
@@ -983,11 +1061,23 @@ private fun FingerprintBlock(
             "loading…"
         }
     }
+    val borderColor = when (accent) {
+        VerifyState.Verified -> Success.copy(alpha = 0.25f)
+        VerifyState.Mismatch -> Danger.copy(alpha = 0.25f)
+        VerifyState.Compare -> Color.Transparent
+    }
+    val hexColor = when (accent) {
+        VerifyState.Mismatch -> Danger.copy(alpha = 0.70f)
+        else -> TextPrimary
+    }
+    val blockAlpha = if (accent == VerifyState.Mismatch) 0.70f else 1f
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .alpha(blockAlpha)
             .clip(RoundedCornerShape(12.dp))
             .background(BgDeep)
+            .border(1.dp, borderColor, RoundedCornerShape(12.dp))
             .padding(horizontal = 20.dp, vertical = 18.dp),
     ) {
         Text(
@@ -1008,7 +1098,7 @@ private fun FingerprintBlock(
         Spacer(Modifier.height(12.dp))
         Text(
             text = fingerprint,
-            color = TextPrimary,
+            color = hexColor,
             fontSize = 13.sp,
             fontFamily = PhantomFontMono,
             letterSpacing = 0.65.sp,

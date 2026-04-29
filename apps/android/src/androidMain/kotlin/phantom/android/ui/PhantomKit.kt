@@ -46,16 +46,32 @@ fun hslToColor(h: Float, s: Float, l: Float): Color {
     return Color(r1 + m, g1 + m, b1 + m)
 }
 
-// Deterministic gradient per username — matches design's gradientForName()
+// PHANTOM_FULL_COMPOSE §02 "restrained hue palette" — 8 muted persona
+// colours, deterministically picked by username hash. Same name always
+// gets the same avatar across devices without sync. Anchors include the
+// LOCKED quad from the brief (Maya / David / Anna / Tom).
+private val RESTRAINED_PALETTE = listOf(
+    Color(0xFF4853C2),  // muted indigo (Maya)
+    Color(0xFFB87336),  // muted amber (David)
+    Color(0xFF33897A),  // muted teal (Anna)
+    Color(0xFF525C6C),  // slate (Tom)
+    Color(0xFF6B4FB8),  // muted purple
+    Color(0xFFB85E5E),  // muted brick
+    Color(0xFF4A8B5E),  // muted forest
+    Color(0xFF8B7B4F),  // muted olive
+)
+
+// Picks a flat avatar fill from the restrained palette by hashing the
+// username. Kept as a `Brush` return type so existing call-sites compile
+// unchanged — under the hood the brush is a SolidColor, no gradient.
 fun gradientBrushForName(name: String): Brush {
     var h = 0L
     for (c in name) h = (h * 31L + c.code) and 0xFFFFFFFFL
-    val h1 = (h % 360).toFloat()
-    val h2 = (h1 + 40f + (h % 60)) % 360f
+    val idx = (h % RESTRAINED_PALETTE.size).toInt()
     return Brush.linearGradient(
         colors = listOf(
-            hslToColor(h1, 0.70f, 0.55f),
-            hslToColor(h2, 0.75f, 0.40f),
+            RESTRAINED_PALETTE[idx],
+            RESTRAINED_PALETTE[idx],
         ),
     )
 }
