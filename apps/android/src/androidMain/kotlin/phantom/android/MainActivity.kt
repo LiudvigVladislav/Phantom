@@ -38,6 +38,7 @@ import phantom.android.screens.chat.ChatScreen
 import phantom.android.screens.chatlist.ChatListScreen
 import phantom.android.screens.contact.ContactProfileScreen
 import phantom.android.screens.lock.AppLockScreen
+import phantom.android.screens.migration.MigrationScreen
 import phantom.android.screens.onboarding.OnboardingScreen
 import phantom.android.screens.profile.ProfileScreen
 import phantom.android.screens.requests.MessageRequestsScreen
@@ -227,7 +228,25 @@ private fun PhantomApp(
 
     LaunchedEffect(Unit) {
         val identity = container.identityRepo.loadIdentity()
-        startScreen = if (identity == null) Screen.Onboarding else Screen.ChatList
+        startScreen = when {
+            identity == null -> Screen.Onboarding
+            // PR C-followup-2: Alpha 1 → Alpha 2 migration trigger.
+            // Records that predate the PR C commit-6 schema migration
+            // have null signingPublicKeyHex; needsMigration() returns
+            // true and the user lands on MigrationScreen instead of
+            // ChatList. After they tap Continue the screen invokes
+            // [onMigrationComplete] which advances to ChatList.
+            // We must initMessaging FIRST so container.migrationManager
+            // is set; without it the field is null and we'd fall
+            // through to ChatList, where the broken-Alpha-1 send path
+            // would throw on every outgoing message.
+            else -> {
+                runCatching { container.initMessagingFromStorage() }
+                val mgr = container.migrationManager
+                if (mgr != null && mgr.needsMigration()) Screen.Migration
+                else Screen.ChatList
+            }
+        }
     }
 
     var currentScreen by remember { mutableStateOf<Screen>(Screen.Onboarding) }
@@ -246,7 +265,13 @@ private fun PhantomApp(
 
     LaunchedEffect(startScreen) {
         startScreen?.let { screen ->
-            if (screen is Screen.ChatList) {
+            // initMessagingFromStorage was called inside the prior
+            // LaunchedEffect for the Migration / ChatList branches;
+            // calling it again here would be redundant. Onboarding
+            // path doesn't initialise messaging until onComplete fires.
+            if (screen is Screen.ChatList && container.migrationManager == null) {
+                // Defence-in-depth: cover any cold-path where the
+                // outer LaunchedEffect bailed before initMessaging.
                 runCatching { container.initMessagingFromStorage() }
             }
             // If launched from a notification tap, navigate directly to the relevant chat.
@@ -283,6 +308,53 @@ private fun PhantomApp(
                 currentScreen = Screen.ChatList
             },
         )
+        is Screen.Migration -> {
+            // PR C-followup-2: Alpha 1 → Alpha 2 migration UI. The
+            // manager was wired by initMessagingFromStorage in the
+            // launch LaunchedEffect, so it's non-null here. On a
+            // success the runMigration call has already updated the
+            // local state; we kick the foreground service so the new
+            // bundle gets published over a fresh WS connection
+            // (background ticker would otherwise wait 24h) and route
+            // the user onto ChatList.
+            val mgr = container.migrationManager
+            if (mgr != null) {
+                MigrationScreen(
+                    migrationManager = mgr,
+                    onMigrationComplete = {
+                        // Trigger initial bundle publish via lifecycle
+                        // service immediately — without it the user
+                        // can't receive first messages until the 24-h
+                        // ticker fires.
+                        scope.launch {
+                            runCatching {
+                                container.preKeyLifecycle?.bootstrapForNewIdentity()
+                            }
+                        }
+                        context.startForegroundService(
+                            Intent(context, PhantomMessagingService::class.java),
+                        )
+                        currentScreen = Screen.ChatList
+                    },
+                    onQuit = {
+                        // Activity finish() drops the user back to launcher.
+                        // The next launch will see needsMigration() == true
+                        // again — there is no "skip migration" path.
+                        (context as? android.app.Activity)?.finishAndRemoveTask()
+                    },
+                )
+            } else {
+                // Edge case: container.migrationManager is null because
+                // initMessaging never ran (e.g. some race). Fall back
+                // to ChatList; the user will hit a hard send error
+                // until they restart the app.
+                Log.w(
+                    "PHANTOM_MIGRATION",
+                    "Screen.Migration with null migrationManager; falling back to ChatList",
+                )
+                currentScreen = Screen.ChatList
+            }
+        }
         is Screen.ChatList -> ChatListScreen(
             container = container,
             onNavigate = { currentScreen = it },

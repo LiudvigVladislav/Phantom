@@ -5,6 +5,14 @@ package phantom.android.navigation
 
 sealed class Screen {
     object Onboarding : Screen()
+    /**
+     * Alpha 1 → Alpha 2 cryptographic protocol upgrade. Shown on launch
+     * when MigrationManager.needsMigration() returns true (i.e. the
+     * IdentityRecord lacks the Ed25519 signing keypair). After the user
+     * taps Continue and migration succeeds, the app navigates onto
+     * [ChatList]. C-followup-2.
+     */
+    object Migration : Screen()
     object ChatList : Screen()
     object Calls : Screen()
     object Nearby : Screen()
