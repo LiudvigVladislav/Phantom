@@ -4,11 +4,10 @@
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod config;
-mod envelope;
-mod error;
-mod routes;
-mod state;
+// All implementation lives in lib.rs so that integration tests in
+// `tests/` and any future tooling can drive the same router this binary
+// serves. main.rs is just the runtime entry point.
+use phantom_relay::{config, routes, state};
 
 #[tokio::main]
 async fn main() {
@@ -40,17 +39,26 @@ async fn main() {
     // Background task: purge expired envelopes every 5 minutes.
     // Recipients that never connect would otherwise accumulate stale envelopes
     // indefinitely; this ensures the in-memory store is bounded in practice.
+    // Also purges previous-SPK records past their retention window so the
+    // ADR-009 14-day grace period gets enforced even on a long-running relay.
     let cleanup_state = Arc::clone(&app_state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
-            let mut store = cleanup_state.store.write().await;
-            store.retain(|_, queue| {
-                queue.retain(|e| !e.is_expired());
-                !queue.is_empty()
-            });
-            tracing::debug!("Cleanup: purged expired envelopes");
+            {
+                let mut store = cleanup_state.store.write().await;
+                store.retain(|_, queue| {
+                    queue.retain(|e| !e.is_expired());
+                    !queue.is_empty()
+                });
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            cleanup_state.prekeys.purge_expired_previous_spks(now_ms).await;
+            tracing::debug!("Cleanup: purged expired envelopes + previous SPKs");
         }
     });
 

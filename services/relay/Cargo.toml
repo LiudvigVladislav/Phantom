@@ -16,7 +16,11 @@ tracing-subscriber = { workspace = true }
 time = { workspace = true }
 futures-util = { workspace = true }
 subtle = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }

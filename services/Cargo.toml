@@ -30,5 +30,17 @@ time = { version = "0.3", features = ["serde"] }
 futures-util = "0.3"
 subtle = "2"
 
+# Crypto — Ed25519 detached-signature verification for prekey bundles.
+# Pure-Rust impl, no native deps, MIT/Apache-2.0 dual-licensed.
+# Used by the prekey-publish endpoint to verify the SPK signature before
+# accepting a bundle. The relay never signs, only verifies.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
+# Random bytes for OPK keyId generation (16 bytes from OS RNG).
+rand = "0.8"
+
+# Hex encoding for public keys / keyIds in URL paths.
+hex = "0.4"
+
 # Testing
 tokio-test = "0.4"
