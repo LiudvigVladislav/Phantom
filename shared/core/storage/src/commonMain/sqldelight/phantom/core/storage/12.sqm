@@ -1,0 +1,28 @@
+-- 12.sqm — identity Ed25519 signing keypair (ADR-009 supplement, PR C).
+--
+-- Adds two columns to the identity table to persist the Ed25519 signing
+-- keypair that lives on IdentityRecord alongside the X25519 routing
+-- keypair. Both columns default to empty string so an Alpha 1 row that
+-- predates this migration deserialises cleanly with `null` semantics on
+-- the Kotlin side (`IdentityRecord.needsSigningKeyBackfill` keys off
+-- isNullOrEmpty), which is exactly what the migration UX needs to
+-- detect "this user hasn't been backfilled yet."
+--
+-- Why two columns and not a derived key:
+--   X25519 (Curve25519 DH) and Ed25519 (Edwards-curve sig) are different
+--   cryptographic objects and libsodium does not provide a deterministic
+--   X25519 → Ed25519 conversion. Storing Ed25519 separately is the only
+--   option that preserves the existing X25519 publicKeyHex value
+--   byte-for-byte (the migration UX promise: "your identity stays the
+--   same"). See ADR-009 supplement "Signing key distribution".
+--
+-- Why default '' instead of NULL:
+--   SQLDelight's generated Kotlin handles NOT NULL DEFAULT '' more
+--   ergonomically than nullable columns. The empty-string sentinel is
+--   converted to Kotlin `null` in the repository layer, which is then
+--   what the IdentityRecord model exposes. Same pattern as
+--   dh_private_key_hex (added in an earlier migration with the same
+--   '' default).
+
+ALTER TABLE identity ADD COLUMN signing_public_key_hex TEXT NOT NULL DEFAULT '';
+ALTER TABLE identity ADD COLUMN signing_private_key_hex TEXT NOT NULL DEFAULT '';

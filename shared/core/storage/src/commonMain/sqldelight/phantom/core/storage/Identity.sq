@@ -3,15 +3,28 @@ CREATE TABLE identity (
     username TEXT NOT NULL,
     public_key_hex TEXT NOT NULL,
     dh_private_key_hex TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- Ed25519 signing keypair added in 12.sqm (ADR-009 supplement, PR C).
+    -- Both columns default to '' so Alpha 1 rows survive the migration
+    -- and `IdentityRecord.needsSigningKeyBackfill` returns true for them.
+    signing_public_key_hex TEXT NOT NULL DEFAULT '',
+    signing_private_key_hex TEXT NOT NULL DEFAULT ''
 );
 
 getIdentity:
 SELECT * FROM identity LIMIT 1;
 
 insertIdentity:
-INSERT OR REPLACE INTO identity(id, username, public_key_hex, dh_private_key_hex, created_at)
-VALUES (?, ?, ?, ?, ?);
+INSERT OR REPLACE INTO identity(
+    id,
+    username,
+    public_key_hex,
+    dh_private_key_hex,
+    created_at,
+    signing_public_key_hex,
+    signing_private_key_hex
+)
+VALUES (?, ?, ?, ?, ?, ?, ?);
 
 deleteIdentity:
 DELETE FROM identity;
