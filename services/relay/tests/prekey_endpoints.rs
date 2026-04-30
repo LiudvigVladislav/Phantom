@@ -43,18 +43,32 @@ fn sign_spk_payload(
     sig.to_bytes()
 }
 
+/// Per ADR-009 the X25519 routing identity is independent from the Ed25519
+/// signing identity. Tests use a synthetic 32-byte hex for the X25519 slot
+/// (relay only checks shape) and the actual Ed25519 verifying key for the
+/// signing slot.
+fn synthetic_identity_hex(seed: u8) -> String {
+    let mut buf = [0u8; 32];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = seed.wrapping_add(i as u8);
+    }
+    hex::encode(buf)
+}
+
 #[tokio::test]
 async fn publish_then_fetch_round_trip_via_http() {
     let app = build_app();
 
-    let identity_kp = SigningKey::generate(&mut OsRng);
-    let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+    let identity_hex = synthetic_identity_hex(20);
     let spk_pub = [0xAAu8; 32];
     let created_at_ms: i64 = 1_700_000_000_000;
-    let sig = sign_spk_payload(&identity_kp, &spk_pub, created_at_ms);
+    let sig = sign_spk_payload(&signing_kp, &spk_pub, created_at_ms);
 
     let publish_body = json!({
         "identity_pubkey_hex": identity_hex,
+        "signing_pubkey_hex": signing_hex,
         "signed_pre_key": {
             "key_id": 1,
             "public_key_hex": hex::encode(spk_pub),
@@ -90,7 +104,8 @@ async fn publish_then_fetch_round_trip_via_http() {
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["stored_opks"], 2);
 
-    // Fetch the bundle — must include the SPK and one of the OPKs.
+    // Fetch the bundle — must include the SPK, the signing pubkey, and
+    // one of the OPKs.
     let res = app
         .clone()
         .oneshot(
@@ -105,6 +120,8 @@ async fn publish_then_fetch_round_trip_via_http() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
     let bundle: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(bundle["identity_pubkey_hex"], identity_hex);
+    assert_eq!(bundle["signing_pubkey_hex"], signing_hex);
     assert_eq!(bundle["signed_pre_key"]["key_id"], 1);
     assert!(bundle["one_time_pre_key"].is_object());
 
@@ -127,14 +144,16 @@ async fn publish_then_fetch_round_trip_via_http() {
 #[tokio::test]
 async fn bad_signature_returns_400() {
     let app = build_app();
-    let identity_kp = SigningKey::generate(&mut OsRng);
-    let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+    let identity_hex = synthetic_identity_hex(21);
     let spk_pub = [0x33u8; 32];
-    let mut sig = sign_spk_payload(&identity_kp, &spk_pub, 1_000);
+    let mut sig = sign_spk_payload(&signing_kp, &spk_pub, 1_000);
     sig[0] ^= 0x01; // flip a bit
 
     let body = json!({
         "identity_pubkey_hex": identity_hex,
+        "signing_pubkey_hex": signing_hex,
         "signed_pre_key": {
             "key_id": 1,
             "public_key_hex": hex::encode(spk_pub),
@@ -160,12 +179,14 @@ async fn bad_signature_returns_400() {
 #[tokio::test]
 async fn empty_pool_bundle_omits_opk() {
     let app = build_app();
-    let identity_kp = SigningKey::generate(&mut OsRng);
-    let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+    let identity_hex = synthetic_identity_hex(22);
     let spk_pub = [0x44u8; 32];
-    let sig = sign_spk_payload(&identity_kp, &spk_pub, 5_000);
+    let sig = sign_spk_payload(&signing_kp, &spk_pub, 5_000);
     let body = json!({
         "identity_pubkey_hex": identity_hex,
+        "signing_pubkey_hex": signing_hex,
         "signed_pre_key": {
             "key_id": 1,
             "public_key_hex": hex::encode(spk_pub),
@@ -207,8 +228,9 @@ async fn empty_pool_bundle_omits_opk() {
 #[tokio::test]
 async fn publish_rate_limit_returns_429_after_quota() {
     let app = build_app();
-    let identity_kp = SigningKey::generate(&mut OsRng);
-    let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+    let identity_hex = synthetic_identity_hex(23);
 
     // 10 successful publishes, then the 11th must be 429.
     for n in 0..11 {
@@ -218,9 +240,10 @@ async fn publish_rate_limit_returns_429_after_quota() {
             p
         };
         let created_at_ms: i64 = 10_000 + (n as i64);
-        let sig = sign_spk_payload(&identity_kp, &spk_pub, created_at_ms);
+        let sig = sign_spk_payload(&signing_kp, &spk_pub, created_at_ms);
         let body = json!({
             "identity_pubkey_hex": identity_hex,
+            "signing_pubkey_hex": signing_hex,
             "signed_pre_key": {
                 "key_id": (n as i64) + 1,
                 "public_key_hex": hex::encode(spk_pub),
@@ -257,8 +280,7 @@ async fn publish_rate_limit_returns_429_after_quota() {
 #[tokio::test]
 async fn fetch_unpublished_identity_returns_404() {
     let app = build_app();
-    let kp = SigningKey::generate(&mut OsRng);
-    let identity_hex = hex::encode(kp.verifying_key().to_bytes());
+    let identity_hex = synthetic_identity_hex(24);
     let res = app
         .oneshot(
             Request::builder()
@@ -270,4 +292,72 @@ async fn fetch_unpublished_identity_returns_404() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn signing_key_rotation_returns_409_conflict() {
+    // Once an X25519 identity registers an Ed25519 signing key, a subsequent
+    // publish for the same X25519 with a DIFFERENT Ed25519 must be rejected
+    // with 409 Conflict (relay enforces 1:1 binding).
+    let app = build_app();
+    let identity_hex = synthetic_identity_hex(25);
+
+    let kp_a = SigningKey::generate(&mut OsRng);
+    let kp_b = SigningKey::generate(&mut OsRng);
+    let signing_a = hex::encode(kp_a.verifying_key().to_bytes());
+    let signing_b = hex::encode(kp_b.verifying_key().to_bytes());
+
+    let spk_pub = [0x55u8; 32];
+    let sig_a = sign_spk_payload(&kp_a, &spk_pub, 100);
+    let body_a = json!({
+        "identity_pubkey_hex": identity_hex,
+        "signing_pubkey_hex": signing_a,
+        "signed_pre_key": {
+            "key_id": 1,
+            "public_key_hex": hex::encode(spk_pub),
+            "created_at_ms": 100,
+            "signature_hex": hex::encode(sig_a),
+        },
+        "one_time_pre_keys": [],
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/prekeys/publish")
+                .header("content-type", "application/json")
+                .body(Body::from(body_a.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // Now try publishing with a DIFFERENT signing key for the same identity.
+    let spk_pub_b = [0x66u8; 32];
+    let sig_b = sign_spk_payload(&kp_b, &spk_pub_b, 200);
+    let body_b = json!({
+        "identity_pubkey_hex": identity_hex,
+        "signing_pubkey_hex": signing_b,
+        "signed_pre_key": {
+            "key_id": 2,
+            "public_key_hex": hex::encode(spk_pub_b),
+            "created_at_ms": 200,
+            "signature_hex": hex::encode(sig_b),
+        },
+        "one_time_pre_keys": [],
+    });
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/prekeys/publish")
+                .header("content-type", "application/json")
+                .body(Body::from(body_b.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
 }

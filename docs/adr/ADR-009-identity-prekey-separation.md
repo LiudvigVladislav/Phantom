@@ -466,6 +466,212 @@ After successful prekey upload + ratchet wipe:
 preferences.edit { putBoolean("phantom.alpha2.bootstrap_done", true) }
 ```
 
+### Signing key distribution (added 2026-04-30 during PR C implementation)
+
+This subsection clarifies a gap in the original ADR-009 draft that
+surfaced during PR C: the ADR named the identity hierarchy as
+"X25519 + Ed25519" (line 70) but did not say HOW these two keypairs
+relate, where Alpha-1 identities pick up the missing Ed25519 part, or
+how peers learn each other's Ed25519 verifying key. Decided 2026-04-30
+in concert with Vladislav.
+
+#### The two keypairs are stored independently — no derivation
+
+`IdentityRecord` carries two keypairs side by side. They are
+**generated together, used independently, and never derived from each
+other**:
+
+```kotlin
+data class IdentityRecord(
+    val id: String,
+    val username: String,
+    val publicKeyHex: String,           // X25519 — primary identity
+    val dhPrivateKeyHex: String,        // X25519 private
+    val signingPublicKeyHex: String?,   // Ed25519 — added in Alpha 2
+    val signingPrivateKeyHex: String?,  // Ed25519 secret (64 bytes)
+    val createdAt: Long,
+)
+```
+
+Why no derivation? Two reasons:
+
+1. **libsodium provides Ed25519 → X25519 conversion only in one
+   direction** (`Signature.ed25519PkToCurve25519`,
+   `Signature.ed25519SkToCurve25519`). X25519 → Ed25519 is not a
+   well-defined operation — multiple Ed25519 keypairs map to the same
+   X25519 keypair under that conversion, and there is no standard
+   inverse. We cannot convert existing Alpha-1 X25519 identities into
+   Ed25519.
+
+2. **Alternative C considered and rejected.** A scheme where Ed25519
+   IS the identity and X25519 is derived per use is what Signal does,
+   but it would force every existing Alpha-1 user to take on a new
+   `publicKeyHex` value (the Ed25519 hex). That breaks the QR codes
+   tested users have already shared and the
+   "your identity stays the same" promise of the migration UX. We
+   chose to preserve the Alpha-1 X25519 identity verbatim and bind a
+   fresh Ed25519 to it, accepting the storage cost (32 + 32 bytes
+   per identity) in exchange for migration UX continuity.
+
+The two keypairs are bound at the application layer through
+co-presence in `IdentityRecord` and through the
+`signing_pubkey_hex` field on the published prekey bundle (relay
+enforces 1:1 mapping per X25519 identity). There is no cryptographic
+binding between the two keys at the libsodium level. A future ADR
+could revisit this when the Alpha-1 cohort is small enough to absorb
+an identity rotation.
+
+#### Wire format — distributing the signing pubkey to peers
+
+The relay stores both keys per identity (PR C extends PR B's
+`PublishRequest` with a `signing_pubkey_hex` field, see "Relay
+backport" below). So when Alice fetches Bob's prekey bundle, she
+receives Bob's `signing_pubkey_hex` and can verify the SignedPreKey
+signature server-side-blind.
+
+But Bob also needs to learn Alice's signing pubkey before he can verify
+**her** future SignedPreKey rotations against the bundle she'll
+publish under his contact's name. He learns it by piggyback: the first
+message Alice sends in the new session carries her signing pubkey in
+the cleartext header alongside the existing `x3dhInit` subobject.
+
+```kotlin
+// MessagePayload extension (additive — old fields untouched)
+data class MessagePayload(
+    /* ...existing fields... */
+
+    // Set on the FIRST message of a freshly-bootstrapped session.
+    // Carries the X3DH ephemeral pubkey + which OPK was consumed.
+    val x3dhInit: X3DHInitData? = null,
+
+    // Set on the FIRST message of a freshly-bootstrapped session.
+    // Lets the recipient cache the sender's Ed25519 signing pubkey
+    // so future SPK-rotation signatures can be verified.
+    val signingPublicKey: ByteArray? = null,
+)
+```
+
+`signingPublicKey` is `null` on every message after the first — once
+the recipient has cached it, retransmission is wasted bytes. Callers
+that need to *re-bootstrap* a session (e.g. after a contact reset) put
+it back in.
+
+Caching strategy: `ContactRecord` (or whatever the existing peer-cache
+shape is, TBD when wiring) stores `signingPublicKeyHex` keyed on
+peer's `publicKeyHex` (X25519). On every fresh-session first message
+the cache is updated; on every subsequent SPK rotation the cached key
+is the verifier.
+
+#### Trust model for the signing key
+
+When Alice scans Bob's QR code, she gets his X25519 `publicKeyHex`.
+She does NOT yet know his Ed25519 `signingPublicKeyHex`. The first
+time she fetches his bundle from the relay, the bundle carries
+`signing_pubkey_hex` — Alice has to trust that the relay returned a
+bundle Bob actually published, not one an attacker substituted.
+
+This is the same trust assumption that already applies to Alice's
+session bootstrap with Bob in Alpha 1 (the relay could have substituted
+Bob's identity X25519 too). The relay sees both keys; the relay does
+not validate either. The user vouches for the channel by which they
+got the X25519 (QR code), and the Ed25519 signing key is bound to that
+X25519 only as strongly as the relay is honest.
+
+Hardening (out of scope for ADR-009, tracked for a future ADR):
+
+- **Phase 2 username directory** (ADR-007 draft) gives a second
+  channel for the X25519 ↔ Ed25519 binding — the directory cache
+  signs both keys together, so an attacker would have to compromise
+  both the relay AND the directory to substitute a key.
+- **Verification certificates** (ADR-008 draft) attest a binding
+  between username + X25519 + Ed25519 with a third-party signature.
+  Out-of-band SafetyNumber verification (already wired in the chat
+  UI) compares both keys when both ends are on Alpha 2.
+- **In-app "Verify safety number"** is extended in PR C-or-later to
+  display the SafetyNumber computed over BOTH keys
+  (`SHA256(IK_a_x25519 || IK_a_ed25519 || IK_b_x25519 || IK_b_ed25519)`),
+  so a key swap on either side surfaces visibly to manual verifiers.
+
+#### Alpha-1 backfill — how existing identities get their Ed25519 key
+
+Alpha-1's `IdentityRecord` has no signing keypair. The migration
+detector checks for this:
+
+```kotlin
+val migrationNeeded =
+    identity.signingPublicKeyHex.isNullOrEmpty() ||
+    identity.signingPrivateKeyHex.isNullOrEmpty()
+```
+
+When `migrationNeeded == true`, the MigrationScreen is shown. On
+"Continue":
+
+1. `LibsodiumIdentityCrypto.generateSigningKeyPair()` mints a fresh
+   Ed25519 keypair (libsodium's `Signature.keypair()`).
+2. The keypair is written into the existing `IdentityRecord` row —
+   X25519 fields are unchanged, the two new Ed25519 fields are
+   populated atomically with `IdentityRepository.update(...)`.
+3. The first prekey bundle publish to the relay carries the new
+   Ed25519 as `signing_pubkey_hex`.
+4. Existing peers learn the new Ed25519 via the
+   `MessagePayload.signingPublicKey` field on each first
+   re-handshake message.
+
+Backfill is one-shot per device. Once the signing keypair is present,
+`migrationNeeded` returns false and the screen is never shown again.
+
+#### Relationship to F13 (ADR-017)
+
+The 2026-04-29 audit flagged F13: "SenderKey signing keys generated
+but never used, and the wrong primitive (X25519) for a signing role."
+Those are SenderKey-scoped keys, distinct from the per-identity
+Ed25519 keypair this section describes.
+
+PR D (ADR-017 implementation) **removes** the broken SenderKey X25519
+signing keys; PR C (this ADR's implementation) **adds** the
+per-identity Ed25519 signing keypair. The two changes do not collide:
+- F13 fix touches `shared/core/crypto/SenderKey.kt` and removes its
+  `signing_*` fields.
+- ADR-009 implementation touches `IdentityRecord` and adds Ed25519
+  fields with a different name (`signingPublicKeyHex` /
+  `signingPrivateKeyHex`).
+
+The naming is intentionally distinct so that no migration code path
+can confuse "drop the broken SenderKey signing column" with "add the
+new identity signing keypair."
+
+#### Relay backport — `signing_pubkey_hex` field
+
+PR B's `/prekeys/publish` and `/prekeys/bundle/{identity}` endpoints
+implicitly assumed `identity_pubkey_hex` was an Ed25519 verifying key
+(see `verify_spk_signature` in `services/relay/src/prekeys.rs`). With
+the two-keypair `IdentityRecord` confirmed, that assumption is
+incorrect — `identity_pubkey_hex` is X25519 (the routing identity),
+and the SPK signature is verified against a separate Ed25519
+`signing_pubkey_hex`.
+
+PR C therefore backports the relay endpoints:
+
+```rust
+// PublishRequest (extended, +1 field)
+struct PublishRequest {
+    identity_pubkey_hex: String,    // X25519 — primary lookup, unchanged
+    signing_pubkey_hex:  String,    // Ed25519 — NEW, used for SPK verify
+    signed_pre_key:      SignedPreKeyPublicBundle,
+    one_time_pre_keys:   Vec<OneTimePreKeyPublicBundle>,
+}
+
+// StoredPreKeyState (extended, +1 field)
+// PreKeyBundle response (extended, +1 field returned to fetcher)
+// verify_spk_signature() now takes signing_pubkey_hex instead of
+// identity_pubkey_hex.
+```
+
+This is a backward-incompatible additive change to the wire format,
+landing in PR C alongside the client-side wiring. No production
+client published bundles to the relay before PR C, so there is no
+in-flight compatibility burden.
+
 ## Consequences
 
 ### Positive

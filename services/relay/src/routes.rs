@@ -709,7 +709,16 @@ const DELETE_RATE_WINDOW_SECS: u64 = 60;
 
 #[derive(serde::Deserialize)]
 struct PublishRequest {
+    /// X25519 — primary routing identity. Unchanged from Alpha 1; matches
+    /// the publicKeyHex visible in QR codes / contacts list / send paths.
     identity_pubkey_hex: String,
+    /// Ed25519 — signing identity used to sign `signed_pre_key`. Per
+    /// ADR-009 (revised 2026-04-30) this is a SEPARATE keypair from the
+    /// X25519 identity, stored alongside on `IdentityRecord`. The relay
+    /// enforces a 1:1 binding: once an X25519 identity has registered an
+    /// Ed25519 signing key, subsequent publishes must use the same one
+    /// or the request is rejected with `SigningKeyMismatch`.
+    signing_pubkey_hex: String,
     signed_pre_key: SignedPreKeyPublicBundle,
     /// Up to MAX_OPKS_PER_PUBLISH (100). The bundle replaces the previous
     /// OPK pool wholesale on each publish.
@@ -743,6 +752,7 @@ async fn publish_prekeys(
         .prekeys
         .publish(
             &req.identity_pubkey_hex,
+            &req.signing_pubkey_hex,
             req.signed_pre_key,
             req.one_time_pre_keys,
             now_ms,
@@ -769,11 +779,19 @@ async fn publish_prekeys(
 fn publish_error_response(e: PublishError) -> axum::response::Response {
     let (status, msg) = match e {
         PublishError::BadIdentity(m) => (StatusCode::BAD_REQUEST, m.to_string()),
+        PublishError::BadSigningKey(m) => (StatusCode::BAD_REQUEST, m.to_string()),
         PublishError::BadSignature(m) => (StatusCode::BAD_REQUEST, m.to_string()),
         PublishError::BadOpk(m) => (StatusCode::BAD_REQUEST, m.to_string()),
         PublishError::TooManyOpks(n) => (
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("too many OPKs: {} (max 100)", n),
+        ),
+        // 409 Conflict: a different signing key was previously registered
+        // for this X25519 identity. Client should treat as a hard failure
+        // (not a retryable transport error).
+        PublishError::SigningKeyMismatch => (
+            StatusCode::CONFLICT,
+            "signing_pubkey_hex does not match the one registered for this identity_pubkey_hex".to_string(),
         ),
     };
     (status, Json(serde_json::json!({ "error": msg }))).into_response()

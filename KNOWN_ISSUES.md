@@ -183,17 +183,37 @@ This section documents intentional design decisions with known trade-offs. These
 
 | ID  | Limitation                                                                            | Plan                                |
 |-----|---------------------------------------------------------------------------------------|-------------------------------------|
-| F12 | X3DH handshake exists but is bypassed; SessionManager calls only raw shared-secret    | Phase 1 Week 4 (ADR-009)            |
-| F15 | Initial ratchet bootstrap reuses identity DH key as ratchet seed                      | Phase 1 Week 4 (ADR-009)            |
+| F12 | X3DH handshake exists but is bypassed; SessionManager calls only raw shared-secret    | ✅ Fixed — Phase 1 Week 4 PR C       |
+| F15 | Initial ratchet bootstrap reuses identity DH key as ratchet seed                      | ✅ Fixed — Phase 1 Week 4 PR C       |
 | F3  | SenderKey KDF uses raw SHA-256 rather than HKDF                                       | Phase 1 Week 5–6                    |
 | F13 | SenderKey signing keys generated but never used                                       | Phase 1 Week 4 (ADR-017: remove)    |
 | —   | No header encryption in Double Ratchet                                                | P3, post-Beta                       |
 | —   | Limited skipped-message-key cache                                                     | P2, Alpha 2 expansion (see ISSUE-004) |
-| —   | No one-time prekeys (OPKs)                                                            | Phase 1 Week 4 (ADR-009)            |
+| —   | No one-time prekeys (OPKs)                                                            | ✅ Fixed — Phase 1 Week 4 PRs A/B/C  |
 
 **Why not libsignal-client immediately?** Implementation simplicity (zero JNI bridging, smaller dependency surface, AGPL-3.0 + "external use unsupported" friction). Re-evaluation trigger: post-Phase 6 audit response.
 
 **Audit transparency.** All findings above were identified by internal security review on 2026-04-29 and are tracked publicly in this issue, in `docs/adr/ADR-006-Crypto-Library-Decision.md` (Decision (revised) section), and in `docs/adr/ADR-009-identity-prekey-separation.md` (Phase 1, in draft).
+
+---
+
+### ISSUE-012: Relay PreKeyStore — in-memory + JSONL persistence
+
+**Status:** Documented architectural choice, sufficient for Alpha 2 — Beta 1.
+
+**Background:** PreKey storage on relay uses `RwLock<HashMap>` + JSONL append (consistent with existing patterns for envelopes, reports, blocklist). SQL backend deferred — see future ADR-018 for SQL migration plan when:
+- Multi-instance relay deployment needed
+- Memory volume becomes bottleneck
+- ACID compliance required
+
+For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recovery + automatic client re-publish flow handles all expected operational scenarios (relay restart, deploy update, brief outages). Replay is best-effort and idempotent: on startup the relay reads `prekeys.jsonl` line-by-line; the most recent line per identity wins, which is consistent with the publish endpoint's "replace OPK pool wholesale" semantics. A relay restart that drops the file entirely is recoverable — clients re-publish on next online session via the existing background lifecycle task.
+
+**Trigger conditions for ADR-018 (SQL migration):**
+- Relay handles >50k identities and JSONL replay exceeds 5 s on cold start
+- Operational need for transactional OPK consumption guarantees across multi-instance HA
+- Audit requirement for ACID-compliant prekey storage
+
+**Why this isn't a P3 bug:** the Signal protocol's prekey contract makes the storage replaceable — clients tolerate (and recover from) a server that "forgot" their prekeys by re-publishing. Loss of prekey state degrades to a 3-DH handshake (no OPK round) for at most one window, then fully restores after replenish. This is by design.
 
 ---
 
@@ -220,6 +240,8 @@ These are documented for transparency about what we resolved during the developm
 | BUG-PINGJOB-LEAK | Stale `pingJob` from previous generation force-cancelled the new session | Fixed | `846d6bed` (`cancelAndJoin`) |
 | BUG-RELAY-NO-PONG | Relay's `socket.split()` deferred WS PONG flushing past idle windows | Fixed | `dbd9393c` (single-task `tokio::select!` with explicit `Message::Pong`) |
 | BUG-OEM-RADIO-PARK | Tecno HiOS parked Wi-Fi radio mid-session despite foreground service | Mitigated | `74e6af0a` (WifiLock+WakeLock), see ISSUE-001 |
+| F12 | X3DH handshake bypassed — SessionManager called only `computeSharedSecret(identity_priv, identity_pub)` | Fixed in Phase 1 Week 4 | PR A (`8fa020ae`) + PR B (`d53011f5`) + PR C (this branch) |
+| F15 | Initial ratchet seeded with identity DH keypair — compromise of identity meant compromise of every session | Fixed in Phase 1 Week 4 | PR A introduced fresh-ephemeral invariant; PR C wires the production path |
 
 ---
 

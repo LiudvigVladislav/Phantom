@@ -67,7 +67,129 @@ class IdentityManagerTest {
         assertNotNull(identity)
         assertEquals("bob", identity.username)
     }
+
+    // ── ADR-009 supplement: Ed25519 signing keypair ─────────────────────────
+
+    @Test
+    fun newIdentity_hasSigningKeyPair_populated() = runTest {
+        LibsodiumInitializer.initialize()
+        val (manager, _) = makeManager()
+        val (record, _) = manager.createOrLoad("carol")
+
+        // New (Alpha 2+) identities ship with both keypairs populated atomically.
+        assertNotNull(record.signingPublicKeyHex)
+        assertNotNull(record.signingPrivateKeyHex)
+        assertEquals(false, record.needsSigningKeyBackfill)
+
+        // 32-byte Ed25519 verifying key → 64 hex chars; 64-byte secret → 128 hex.
+        assertEquals(64, record.signingPublicKeyHex!!.length)
+        assertEquals(128, record.signingPrivateKeyHex!!.length)
+    }
+
+    @Test
+    fun loadSigningKeyPair_returnsKeypairForNewIdentity() = runTest {
+        LibsodiumInitializer.initialize()
+        val (manager, _) = makeManager()
+        manager.createOrLoad("dave")
+
+        val signing = manager.loadSigningKeyPair()
+        assertNotNull(signing)
+        assertEquals(32, signing.publicKey.bytes.size)
+        assertEquals(64, signing.privateKey.bytes.size)
+    }
+
+    @Test
+    fun loadSigningKeyPair_returnsNullForAlpha1Record() = runTest {
+        LibsodiumInitializer.initialize()
+        val repo = FakeIdentityRepository()
+        // Seed the repo with an Alpha-1-shaped record (no signing fields).
+        repo.saveIdentity(
+            IdentityRecord(
+                id = "alpha1-id",
+                username = "old-user",
+                publicKeyHex = "00".repeat(32),
+                dhPrivateKeyHex = "11".repeat(32),
+                createdAt = 0L,
+                signingPublicKeyHex = null,
+                signingPrivateKeyHex = null,
+            )
+        )
+        val (manager, _) = makeManager(repo)
+
+        // Migration trigger: loadSigningKeyPair returns null, telling the
+        // launch path to route through MigrationScreen.
+        val signing = manager.loadSigningKeyPair()
+        assertNull(signing)
+        val record = manager.getIdentity()!!
+        assertTrue(record.needsSigningKeyBackfill)
+    }
+
+    @Test
+    fun backfillSigningKeyPair_populatesFieldsAtomically() = runTest {
+        LibsodiumInitializer.initialize()
+        val repo = FakeIdentityRepository()
+        repo.saveIdentity(
+            IdentityRecord(
+                id = "alpha1-id",
+                username = "old-user",
+                publicKeyHex = "aa".repeat(32),
+                dhPrivateKeyHex = "bb".repeat(32),
+                createdAt = 100L,
+                signingPublicKeyHex = null,
+                signingPrivateKeyHex = null,
+            )
+        )
+        val (manager, _) = makeManager(repo)
+
+        val signing = manager.backfillSigningKeyPair()
+        assertEquals(32, signing.publicKey.bytes.size)
+        assertEquals(64, signing.privateKey.bytes.size)
+
+        // Persisted record now has both signing fields and X25519 fields
+        // are byte-for-byte unchanged (the Alpha-1 identity is preserved).
+        val updated = manager.getIdentity()!!
+        assertEquals(false, updated.needsSigningKeyBackfill)
+        assertEquals("aa".repeat(32), updated.publicKeyHex)
+        assertEquals("bb".repeat(32), updated.dhPrivateKeyHex)
+        assertEquals(100L, updated.createdAt)
+        assertEquals("old-user", updated.username)
+    }
+
+    @Test
+    fun backfillSigningKeyPair_isIdempotent() = runTest {
+        LibsodiumInitializer.initialize()
+        val (manager, _) = makeManager()
+        manager.createOrLoad("eve")  // ships with signing keys already
+
+        // Calling backfill on a record that already has signing keys
+        // returns the EXACT keypair without rotating it. Otherwise a
+        // crash-and-retry mid-migration would burn through fresh
+        // randomness on every wake.
+        val first = manager.backfillSigningKeyPair()
+        val second = manager.backfillSigningKeyPair()
+        assertContentEquals(first.publicKey.bytes, second.publicKey.bytes)
+        assertContentEquals(first.privateKey.bytes, second.privateKey.bytes)
+    }
+
+    @Test
+    fun signWithIdentity_thenVerifyWithIdentity_succeeds() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = LibsodiumIdentityCrypto()
+        val signing = crypto.generateSigningKeyPair()
+
+        val message = "phantom-x3dh-test-payload".encodeToByteArray()
+        val sig = crypto.signWithIdentity(message, signing.privateKey)
+        assertEquals(64, sig.size)
+        assertTrue(crypto.verifyWithIdentity(message, sig, signing.publicKey))
+
+        // Tampered message must fail verification.
+        val tampered = message.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() }
+        kotlin.test.assertFalse(crypto.verifyWithIdentity(tampered, sig, signing.publicKey))
+    }
 }
+
+private fun assertContentEquals(a: ByteArray, b: ByteArray) =
+    kotlin.test.assertContentEquals(a, b)
 
 private fun assertTrue(value: Boolean) = kotlin.test.assertTrue(value)
 

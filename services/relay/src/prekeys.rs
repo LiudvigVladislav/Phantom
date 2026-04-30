@@ -122,9 +122,17 @@ pub struct OneTimePreKeyPublicBundle {
 /// What `GET /prekeys/bundle/:identity` returns. The OPK slot is `None`
 /// when the identity's OPK pool is empty — clients then fall back to 3-DH
 /// (still under the new HKDF salt, see ADR-009).
+///
+/// `signing_pubkey_hex` (Ed25519) is what the fetcher uses to verify the
+/// SPK signature client-side. `identity_pubkey_hex` (X25519) is the
+/// routing identity used by the rest of the relay surface (matches the
+/// identity in QR codes and `/send`/`/fetch` endpoints). The two keypairs
+/// are stored independently per ADR-009 — the relay enforces only the
+/// 1:1 binding (one signing pubkey per X25519 identity).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreKeyBundle {
     pub identity_pubkey_hex: String,
+    pub signing_pubkey_hex: String,
     pub signed_pre_key: SignedPreKeyPublicBundle,
     pub one_time_pre_key: Option<OneTimePreKeyPublicBundle>,
 }
@@ -143,9 +151,19 @@ pub struct PreKeyStatus {
 
 /// In-memory record of an identity's published prekey state. Mirrors what a
 /// SQL row pair (signed_prekeys + one_time_prekeys) would hold in ADR-018.
+///
+/// `signing_pubkey_hex` is the Ed25519 verifying key that signed the SPK.
+/// Stored alongside the X25519 `identity_pubkey_hex` per ADR-009's
+/// two-keypair IdentityRecord model. `signing_pubkey_hex` defaults to
+/// empty when an Alpha-1 client publishes without it (rejected in the
+/// publish path; persisted-then-replayed records that predate this
+/// field on disk default to empty and force a re-publish on next
+/// publish call).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredPreKeyState {
     pub identity_pubkey_hex: String,
+    #[serde(default)]
+    pub signing_pubkey_hex: String,
     pub current_spk: SignedPreKeyPublicBundle,
     /// Set when an SPK has just been rotated; cleaned up after
     /// `SPK_PREVIOUS_RETENTION_DAYS`. The relay does not currently serve
@@ -207,12 +225,14 @@ impl PreKeyStore {
     pub async fn publish(
         &self,
         identity_pubkey_hex: &str,
+        signing_pubkey_hex: &str,
         spk: SignedPreKeyPublicBundle,
         opks: Vec<OneTimePreKeyPublicBundle>,
         now_ms: i64,
     ) -> Result<usize, PublishError> {
         validate_identity_hex(identity_pubkey_hex).map_err(PublishError::BadIdentity)?;
-        verify_spk_signature(identity_pubkey_hex, &spk).map_err(PublishError::BadSignature)?;
+        validate_signing_hex(signing_pubkey_hex).map_err(PublishError::BadSigningKey)?;
+        verify_spk_signature(signing_pubkey_hex, &spk).map_err(PublishError::BadSignature)?;
         if opks.len() > MAX_OPKS_PER_PUBLISH {
             return Err(PublishError::TooManyOpks(opks.len()));
         }
@@ -221,6 +241,18 @@ impl PreKeyStore {
         }
 
         let mut map = self.inner.write().await;
+        // Bound the X25519 identity to a single Ed25519 signing key. Once a
+        // signing key is registered, only its rotation is allowed via the
+        // explicit "rotate signing key" path (TBD post-Alpha 2). Rejecting
+        // mismatched signing keys protects against an attacker who steals
+        // the X25519 identity but lacks the matching Ed25519 secret.
+        if let Some(prev) = map.get(identity_pubkey_hex) {
+            if !prev.signing_pubkey_hex.is_empty()
+                && prev.signing_pubkey_hex != signing_pubkey_hex
+            {
+                return Err(PublishError::SigningKeyMismatch);
+            }
+        }
         let entry = map.get(identity_pubkey_hex).cloned();
         let stored = match entry {
             Some(mut prev) => {
@@ -230,6 +262,7 @@ impl PreKeyStore {
                     prev.previous_spk = Some(prev.current_spk.clone());
                     prev.previous_retired_at_ms = Some(now_ms);
                 }
+                prev.signing_pubkey_hex = signing_pubkey_hex.to_string();
                 prev.current_spk = spk;
                 // OPK pool is REPLACED on each publish, not merged: the
                 // client owns its OPK lifecycle and a publish is the
@@ -239,6 +272,7 @@ impl PreKeyStore {
             }
             None => StoredPreKeyState {
                 identity_pubkey_hex: identity_pubkey_hex.to_string(),
+                signing_pubkey_hex: signing_pubkey_hex.to_string(),
                 current_spk: spk,
                 previous_spk: None,
                 previous_retired_at_ms: None,
@@ -267,6 +301,7 @@ impl PreKeyStore {
         let one_time = entry.one_time_prekeys.pop();
         let bundle = PreKeyBundle {
             identity_pubkey_hex: entry.identity_pubkey_hex.clone(),
+            signing_pubkey_hex: entry.signing_pubkey_hex.clone(),
             signed_pre_key: entry.current_spk.clone(),
             one_time_pre_key: one_time.clone(),
         };
@@ -312,7 +347,22 @@ impl PreKeyStore {
         if (now_ms - signed_timestamp_ms).abs() > DELETE_TIMESTAMP_TOLERANCE_MS {
             return Err(DeleteError::TimestampOutOfWindow);
         }
+
+        // Look up the registered Ed25519 signing key for this X25519
+        // identity FIRST — DELETE signatures are verified against the
+        // signing key, not against the X25519 identity key (the latter
+        // doesn't even support Ed25519 signatures). The bound 1:1 mapping
+        // was established at publish time.
+        let signing_pubkey_hex = {
+            let map = self.inner.read().await;
+            match map.get(identity_pubkey_hex) {
+                Some(s) if !s.signing_pubkey_hex.is_empty() => s.signing_pubkey_hex.clone(),
+                _ => return Err(DeleteError::NotFound),
+            }
+        };
+
         verify_opk_delete_signature(
+            &signing_pubkey_hex,
             identity_pubkey_hex,
             key_id_hex,
             signed_timestamp_ms,
@@ -380,9 +430,14 @@ impl PreKeyStore {
 #[derive(Debug)]
 pub enum PublishError {
     BadIdentity(&'static str),
+    BadSigningKey(&'static str),
     BadSignature(&'static str),
     BadOpk(&'static str),
     TooManyOpks(usize),
+    /// A bundle was published claiming the same X25519 identity as a
+    /// prior publish but with a DIFFERENT Ed25519 signing key. The
+    /// 1:1 X25519↔Ed25519 binding per identity is enforced server-side.
+    SigningKeyMismatch,
 }
 
 #[derive(Debug)]
@@ -407,6 +462,18 @@ fn validate_identity_hex(s: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Same shape check as identity but with distinct error messages so a
+/// malformed bundle is debuggable on the client side.
+fn validate_signing_hex(s: &str) -> Result<(), &'static str> {
+    if s.len() != 64 {
+        return Err("signing_pubkey_hex must be 64 hex chars");
+    }
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("signing_pubkey_hex contains non-hex characters");
+    }
+    Ok(())
+}
+
 fn validate_opk_shape(opk: &OneTimePreKeyPublicBundle) -> Result<(), &'static str> {
     if opk.key_id_hex.len() != 32 || !opk.key_id_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("opk key_id_hex must be 32 hex chars (16 bytes)");
@@ -420,20 +487,26 @@ fn validate_opk_shape(opk: &OneTimePreKeyPublicBundle) -> Result<(), &'static st
 }
 
 /// Recompute the canonical signing payload and verify the Ed25519 signature
-/// against the claimed identity public key. The verifier reconstructs the
-/// payload itself — never trust a wire-supplied "message" buffer.
+/// against the publisher's Ed25519 signing public key. The verifier
+/// reconstructs the payload itself — never trust a wire-supplied "message"
+/// buffer.
+///
+/// `signing_pubkey_hex` is the Ed25519 verifying key (NOT the X25519
+/// `identity_pubkey_hex`). Per ADR-009 the two keypairs are stored
+/// independently on `IdentityRecord` and shipped together in
+/// `PublishRequest`.
 fn verify_spk_signature(
-    identity_pubkey_hex: &str,
+    signing_pubkey_hex: &str,
     spk: &SignedPreKeyPublicBundle,
 ) -> Result<(), &'static str> {
-    let identity_bytes =
-        hex::decode(identity_pubkey_hex).map_err(|_| "identity_pubkey_hex hex-decode failed")?;
-    let identity_arr: [u8; 32] = identity_bytes
+    let signing_bytes =
+        hex::decode(signing_pubkey_hex).map_err(|_| "signing_pubkey_hex hex-decode failed")?;
+    let signing_arr: [u8; 32] = signing_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| "identity_pubkey_hex must decode to 32 bytes")?;
+        .map_err(|_| "signing_pubkey_hex must decode to 32 bytes")?;
     let verifying_key =
-        VerifyingKey::from_bytes(&identity_arr).map_err(|_| "identity_pubkey_hex not a valid Ed25519 pubkey")?;
+        VerifyingKey::from_bytes(&signing_arr).map_err(|_| "signing_pubkey_hex not a valid Ed25519 pubkey")?;
 
     let spk_pub_bytes =
         hex::decode(&spk.public_key_hex).map_err(|_| "spk public_key_hex hex-decode failed")?;
@@ -461,20 +534,41 @@ fn verify_spk_signature(
         .map_err(|_| "Ed25519 signature verify failed")
 }
 
+/// Verify a DELETE-OPK request signature.
+///
+/// The Ed25519 verifying key (`signing_pubkey_hex`) is the one registered
+/// at publish time for this X25519 identity. Payload is bound to BOTH
+/// the X25519 identity (so a stolen signature can't be replayed against
+/// a different identity that happens to share an Ed25519 signing key)
+/// AND the Ed25519 signing key (defence in depth — distinct from the
+/// X25519 routing identity). Specifically:
+///
+///   payload = OPK_DELETE_DOMAIN_LABEL
+///          || identity_pubkey (X25519, 32 bytes raw)
+///          || signing_pubkey  (Ed25519, 32 bytes raw)
+///          || keyId (16 bytes raw)
+///          || timestamp_ms (8 bytes big-endian)
 fn verify_opk_delete_signature(
+    signing_pubkey_hex: &str,
     identity_pubkey_hex: &str,
     key_id_hex: &str,
     signed_timestamp_ms: i64,
     signature_hex: &str,
 ) -> Result<(), &'static str> {
+    let signing_bytes =
+        hex::decode(signing_pubkey_hex).map_err(|_| "signing_pubkey hex-decode")?;
+    let signing_arr: [u8; 32] = signing_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "signing_pubkey must be 32 bytes")?;
+    let verifying_key = VerifyingKey::from_bytes(&signing_arr)
+        .map_err(|_| "signing_pubkey not Ed25519 pubkey")?;
     let identity_bytes =
         hex::decode(identity_pubkey_hex).map_err(|_| "identity hex-decode")?;
     let identity_arr: [u8; 32] = identity_bytes
         .as_slice()
         .try_into()
         .map_err(|_| "identity must be 32 bytes")?;
-    let verifying_key = VerifyingKey::from_bytes(&identity_arr)
-        .map_err(|_| "identity not Ed25519 pubkey")?;
     let sig_bytes = hex::decode(signature_hex).map_err(|_| "signature hex-decode")?;
     if sig_bytes.len() != 64 {
         return Err("signature must be 64 bytes");
@@ -484,10 +578,11 @@ fn verify_opk_delete_signature(
         return Err("keyId must be 16 bytes");
     }
     let mut payload = Vec::with_capacity(
-        OPK_DELETE_DOMAIN_LABEL.len() + 32 + 16 + 8,
+        OPK_DELETE_DOMAIN_LABEL.len() + 32 + 32 + 16 + 8,
     );
     payload.extend_from_slice(OPK_DELETE_DOMAIN_LABEL.as_bytes());
     payload.extend_from_slice(&identity_arr);
+    payload.extend_from_slice(&signing_arr);
     payload.extend_from_slice(&key_id_bytes);
     payload.extend_from_slice(&signed_timestamp_ms.to_be_bytes());
 
@@ -600,18 +695,37 @@ mod tests {
         }
     }
 
+    /// Per ADR-009 the X25519 routing identity is independent from the
+    /// Ed25519 signing identity. The relay only checks shape on
+    /// `identity_pubkey_hex` (must be 32 bytes hex) so we can use any
+    /// well-formed value in tests — what matters is that
+    /// `signing_pubkey_hex` matches the keypair that signed the SPK.
+    fn synthetic_identity_hex(seed: u8) -> String {
+        let mut buf = [0u8; 32];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = seed.wrapping_add(i as u8);
+        }
+        hex::encode(buf)
+    }
+
     #[tokio::test]
     async fn publish_and_consume_round_trip() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_pub = identity_kp.verifying_key().to_bytes();
-        let identity_hex = hex::encode(identity_pub);
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(1);
 
-        let spk = build_signed_spk(&identity_kp, 1, [42u8; 32], 1_700_000_000_000);
+        let spk = build_signed_spk(&signing_kp, 1, [42u8; 32], 1_700_000_000_000);
         let opks = vec![make_opk(1), make_opk(2), make_opk(3)];
 
         let store = PreKeyStore::empty();
         let count = store
-            .publish(&identity_hex, spk.clone(), opks.clone(), 1_700_000_000_000)
+            .publish(
+                &identity_hex,
+                &signing_hex,
+                spk.clone(),
+                opks.clone(),
+                1_700_000_000_000,
+            )
             .await
             .expect("publish should succeed");
         assert_eq!(count, 3);
@@ -620,6 +734,8 @@ mod tests {
             .consume_bundle(&identity_hex)
             .await
             .expect("bundle should exist");
+        assert_eq!(bundle.identity_pubkey_hex, identity_hex);
+        assert_eq!(bundle.signing_pubkey_hex, signing_hex);
         assert_eq!(bundle.signed_pre_key.key_id, spk.key_id);
         assert_eq!(bundle.signed_pre_key.public_key_hex, spk.public_key_hex);
         assert!(bundle.one_time_pre_key.is_some());
@@ -630,15 +746,19 @@ mod tests {
 
     #[tokio::test]
     async fn opk_consume_is_atomic_under_concurrent_fetches() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
-        let spk = build_signed_spk(&identity_kp, 1, [1u8; 32], 0);
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(2);
+        let spk = build_signed_spk(&signing_kp, 1, [1u8; 32], 0);
         // Single OPK in the pool — exactly one of the two concurrent fetches
         // must receive it; the other must see one_time_pre_key = None.
         let opks = vec![make_opk(7)];
 
         let store = std::sync::Arc::new(PreKeyStore::empty());
-        store.publish(&identity_hex, spk, opks, 0).await.unwrap();
+        store
+            .publish(&identity_hex, &signing_hex, spk, opks, 0)
+            .await
+            .unwrap();
 
         let s1 = std::sync::Arc::clone(&store);
         let s2 = std::sync::Arc::clone(&store);
@@ -664,15 +784,22 @@ mod tests {
 
     #[tokio::test]
     async fn publishing_new_spk_rotates_previous() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(3);
 
-        let spk_a = build_signed_spk(&identity_kp, 1, [10u8; 32], 1_000);
-        let spk_b = build_signed_spk(&identity_kp, 2, [11u8; 32], 2_000);
+        let spk_a = build_signed_spk(&signing_kp, 1, [10u8; 32], 1_000);
+        let spk_b = build_signed_spk(&signing_kp, 2, [11u8; 32], 2_000);
 
         let store = PreKeyStore::empty();
-        store.publish(&identity_hex, spk_a.clone(), vec![], 1_000).await.unwrap();
-        store.publish(&identity_hex, spk_b.clone(), vec![], 2_000).await.unwrap();
+        store
+            .publish(&identity_hex, &signing_hex, spk_a.clone(), vec![], 1_000)
+            .await
+            .unwrap();
+        store
+            .publish(&identity_hex, &signing_hex, spk_b.clone(), vec![], 2_000)
+            .await
+            .unwrap();
 
         let map = store.inner.read().await;
         let s = map.get(&identity_hex).unwrap();
@@ -684,14 +811,21 @@ mod tests {
 
     #[tokio::test]
     async fn previous_spk_is_purged_after_retention_window() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(4);
 
-        let spk_a = build_signed_spk(&identity_kp, 1, [10u8; 32], 1_000);
-        let spk_b = build_signed_spk(&identity_kp, 2, [11u8; 32], 2_000);
+        let spk_a = build_signed_spk(&signing_kp, 1, [10u8; 32], 1_000);
+        let spk_b = build_signed_spk(&signing_kp, 2, [11u8; 32], 2_000);
         let store = PreKeyStore::empty();
-        store.publish(&identity_hex, spk_a, vec![], 1_000).await.unwrap();
-        store.publish(&identity_hex, spk_b, vec![], 2_000).await.unwrap();
+        store
+            .publish(&identity_hex, &signing_hex, spk_a, vec![], 1_000)
+            .await
+            .unwrap();
+        store
+            .publish(&identity_hex, &signing_hex, spk_b, vec![], 2_000)
+            .await
+            .unwrap();
 
         // Advance "now" past the retention window.
         let one_day_ms: i64 = 24 * 3600 * 1000;
@@ -706,17 +840,20 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_signature_rejected() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(5);
 
         // Sign a payload, then flip a bit in the signature: must reject.
-        let mut spk = build_signed_spk(&identity_kp, 1, [42u8; 32], 1_000);
+        let mut spk = build_signed_spk(&signing_kp, 1, [42u8; 32], 1_000);
         let mut sig_bytes = hex::decode(&spk.signature_hex).unwrap();
         sig_bytes[0] ^= 0x01;
         spk.signature_hex = hex::encode(sig_bytes);
 
         let store = PreKeyStore::empty();
-        let r = store.publish(&identity_hex, spk, vec![], 1_000).await;
+        let r = store
+            .publish(&identity_hex, &signing_hex, spk, vec![], 1_000)
+            .await;
         match r {
             Err(PublishError::BadSignature(_)) => {}
             other => panic!("expected BadSignature, got {:?}", other),
@@ -724,29 +861,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signature_under_wrong_identity_rejected() {
+    async fn signature_under_wrong_signing_key_rejected() {
+        // Honest publisher's signing key, attacker's signing key.
         let owner_kp = SigningKey::generate(&mut OsRng);
+        let owner_signing_hex = hex::encode(owner_kp.verifying_key().to_bytes());
         let attacker_kp = SigningKey::generate(&mut OsRng);
-        // Sign with attacker, claim ownership by owner — must reject.
-        let spk = build_signed_spk(&attacker_kp, 1, [42u8; 32], 1_000);
-        let owner_hex = hex::encode(owner_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(6);
 
+        // Bundle SIGNED by attacker but PUBLISHED claiming owner's signing
+        // key. The signature was produced for one Ed25519 key but verified
+        // against another — must fail.
+        let spk = build_signed_spk(&attacker_kp, 1, [42u8; 32], 1_000);
         let store = PreKeyStore::empty();
-        let r = store.publish(&owner_hex, spk, vec![], 1_000).await;
+        let r = store
+            .publish(&identity_hex, &owner_signing_hex, spk, vec![], 1_000)
+            .await;
         match r {
             Err(PublishError::BadSignature(_)) => {}
             other => panic!("expected BadSignature, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn signing_key_rotation_rejected_for_existing_identity() {
+        // First publish binds an Ed25519 signing key to an X25519 identity.
+        // A second publish for the same X25519 identity but a DIFFERENT
+        // signing key must be rejected — the 1:1 binding is server-enforced
+        // until an explicit rotation path lands (post-Alpha 2).
+        let kp_a = SigningKey::generate(&mut OsRng);
+        let kp_b = SigningKey::generate(&mut OsRng);
+        let signing_a = hex::encode(kp_a.verifying_key().to_bytes());
+        let signing_b = hex::encode(kp_b.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(7);
+
+        let store = PreKeyStore::empty();
+        let spk_a = build_signed_spk(&kp_a, 1, [1u8; 32], 100);
+        store
+            .publish(&identity_hex, &signing_a, spk_a, vec![], 100)
+            .await
+            .expect("first publish should succeed");
+
+        let spk_b = build_signed_spk(&kp_b, 2, [2u8; 32], 200);
+        let r = store
+            .publish(&identity_hex, &signing_b, spk_b, vec![], 200)
+            .await;
+        match r {
+            Err(PublishError::SigningKeyMismatch) => {}
+            other => panic!("expected SigningKeyMismatch, got {:?}", other),
         }
     }
 
     #[tokio::test]
     async fn empty_opk_pool_returns_only_spk() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
-        let spk = build_signed_spk(&identity_kp, 1, [1u8; 32], 0);
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(8);
+        let spk = build_signed_spk(&signing_kp, 1, [1u8; 32], 0);
 
         let store = PreKeyStore::empty();
-        store.publish(&identity_hex, spk.clone(), vec![], 0).await.unwrap();
+        store
+            .publish(&identity_hex, &signing_hex, spk.clone(), vec![], 0)
+            .await
+            .unwrap();
 
         let bundle = store.consume_bundle(&identity_hex).await.unwrap();
         assert!(bundle.one_time_pre_key.is_none());
@@ -764,35 +940,64 @@ mod tests {
         assert!(!store.allow_call(key, 3, 60).await);
     }
 
+    /// Build the canonical DELETE-OPK signing payload for a test. Mirrors
+    /// `verify_opk_delete_signature`'s reconstruction order.
+    fn build_delete_opk_signature(
+        signing_kp: &SigningKey,
+        identity_hex: &str,
+        signing_hex: &str,
+        key_id_hex: &str,
+        signed_ts_ms: i64,
+    ) -> String {
+        let identity_bytes = hex::decode(identity_hex).unwrap();
+        let signing_bytes = hex::decode(signing_hex).unwrap();
+        let key_id_bytes = hex::decode(key_id_hex).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(OPK_DELETE_DOMAIN_LABEL.as_bytes());
+        payload.extend_from_slice(&identity_bytes);
+        payload.extend_from_slice(&signing_bytes);
+        payload.extend_from_slice(&key_id_bytes);
+        payload.extend_from_slice(&signed_ts_ms.to_be_bytes());
+        let sig: Signature = signing_kp.sign(&payload);
+        hex::encode(sig.to_bytes())
+    }
+
     #[tokio::test]
     async fn delete_opk_with_valid_signature_removes_from_pool() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
-        let spk = build_signed_spk(&identity_kp, 1, [9u8; 32], 0);
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(9);
+        let spk = build_signed_spk(&signing_kp, 1, [9u8; 32], 0);
         let target = make_opk(42);
         let other = make_opk(7);
 
         let store = PreKeyStore::empty();
         store
-            .publish(&identity_hex, spk, vec![target.clone(), other.clone()], 0)
+            .publish(
+                &identity_hex,
+                &signing_hex,
+                spk,
+                vec![target.clone(), other.clone()],
+                0,
+            )
             .await
             .unwrap();
 
         let now_ms: i64 = 1_700_000_000_000;
-        let key_id_bytes = hex::decode(&target.key_id_hex).unwrap();
-        let mut payload = Vec::new();
-        payload.extend_from_slice(OPK_DELETE_DOMAIN_LABEL.as_bytes());
-        payload.extend_from_slice(&identity_kp.verifying_key().to_bytes());
-        payload.extend_from_slice(&key_id_bytes);
-        payload.extend_from_slice(&now_ms.to_be_bytes());
-        let sig: Signature = identity_kp.sign(&payload);
+        let sig_hex = build_delete_opk_signature(
+            &signing_kp,
+            &identity_hex,
+            &signing_hex,
+            &target.key_id_hex,
+            now_ms,
+        );
 
         store
             .delete_opk(
                 &identity_hex,
                 &target.key_id_hex,
                 now_ms,
-                &hex::encode(sig.to_bytes()),
+                &sig_hex,
                 now_ms,
             )
             .await
@@ -804,13 +1009,20 @@ mod tests {
 
     #[tokio::test]
     async fn delete_opk_with_stale_timestamp_rejected() {
-        let identity_kp = SigningKey::generate(&mut OsRng);
-        let identity_hex = hex::encode(identity_kp.verifying_key().to_bytes());
-        let spk = build_signed_spk(&identity_kp, 1, [9u8; 32], 0);
+        let signing_kp = SigningKey::generate(&mut OsRng);
+        let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+        let identity_hex = synthetic_identity_hex(10);
+        let spk = build_signed_spk(&signing_kp, 1, [9u8; 32], 0);
         let target = make_opk(42);
         let store = PreKeyStore::empty();
         store
-            .publish(&identity_hex, spk, vec![target.clone()], 0)
+            .publish(
+                &identity_hex,
+                &signing_hex,
+                spk,
+                vec![target.clone()],
+                0,
+            )
             .await
             .unwrap();
 
@@ -818,20 +1030,20 @@ mod tests {
         // 5-minute tolerance window.
         let signed_ts: i64 = 1_700_000_000_000;
         let now_ms: i64 = signed_ts + 60 * 60 * 1000;
-        let key_id_bytes = hex::decode(&target.key_id_hex).unwrap();
-        let mut payload = Vec::new();
-        payload.extend_from_slice(OPK_DELETE_DOMAIN_LABEL.as_bytes());
-        payload.extend_from_slice(&identity_kp.verifying_key().to_bytes());
-        payload.extend_from_slice(&key_id_bytes);
-        payload.extend_from_slice(&signed_ts.to_be_bytes());
-        let sig: Signature = identity_kp.sign(&payload);
+        let sig_hex = build_delete_opk_signature(
+            &signing_kp,
+            &identity_hex,
+            &signing_hex,
+            &target.key_id_hex,
+            signed_ts,
+        );
 
         let r = store
             .delete_opk(
                 &identity_hex,
                 &target.key_id_hex,
                 signed_ts,
-                &hex::encode(sig.to_bytes()),
+                &sig_hex,
                 now_ms,
             )
             .await;
