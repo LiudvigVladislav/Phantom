@@ -228,6 +228,21 @@ private class PassthroughX3DH : X3DHProtocol {
         initiatorIdentityPublicKey: DhPublicKey,
         initiatorEphemeralPublicKey: DhPublicKey,
     ) = initiatorHandshake(recipientIdentityKeyPair, initiatorIdentityPublicKey, initiatorEphemeralPublicKey)
+    // 4-DH stubs added for PR A so the interface compiles. SessionManager
+    // does not yet call into them — that's PR C work.
+    override fun initiatorHandshake4DH(
+        initiatorIdentityKeyPair: DhKeyPair,
+        recipientIdentityPublicKey: DhPublicKey,
+        recipientSignedPreKey: DhPublicKey,
+        recipientOPK: DhPublicKey?,
+    ) = initiatorHandshake(initiatorIdentityKeyPair, recipientIdentityPublicKey, recipientSignedPreKey)
+    override fun recipientHandshake4DH(
+        recipientIdentityKeyPair: DhKeyPair,
+        recipientSignedPreKeyPair: DhKeyPair,
+        recipientOPKPair: DhKeyPair?,
+        initiatorIdentityPublicKey: DhPublicKey,
+        initiatorEphemeralPublicKey: DhPublicKey,
+    ) = initiatorHandshake(recipientIdentityKeyPair, initiatorIdentityPublicKey, initiatorEphemeralPublicKey)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
