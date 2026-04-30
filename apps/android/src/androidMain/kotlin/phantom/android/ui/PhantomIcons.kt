@@ -651,6 +651,22 @@ fun PhIconBan(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
 
 // smile-plus — emoji reaction trigger
 @Composable
+fun PhIconSmile(color: Color, modifier: Modifier = Modifier, size: Dp = 22.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Round smile face: outer circle + smile arc + two eye dots.
+        drawPath(
+            parsePath(
+                "M21 12c0 5-4 9-9 9s-9-4-9-9 4-9 9-9 9 4 9 9M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01",
+                s,
+            ),
+            color, style = st,
+        )
+    }
+}
+
+@Composable
 fun PhIconSmilePlus(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
     Canvas(modifier = modifier.then(Modifier.size(size))) {
         val s = this.size.width / 24f
