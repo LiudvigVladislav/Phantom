@@ -6,6 +6,14 @@
 #               continue-on-error so style drift surfaces in PR review without
 #               blocking merge while the team agrees on a baseline. Tighten by
 #               dropping continue-on-error once the lint debt is paid down.
+#
+# IMPORTANT: paths filter is intentionally NOT applied to `pull_request`
+# triggers. GitHub branch protection rulesets that mark `Relay CI / build-test`
+# as a required status check will deadlock on PRs that don't touch services/
+# (workflow never runs → check stays in "Expected — Waiting" forever). Instead
+# the job always fires on PRs and short-circuits internally when the diff
+# touches no relay files. The `push` trigger keeps the paths filter so master
+# pushes that don't touch the relay don't waste CI minutes on a no-op build.
 
 name: Relay CI
 
@@ -17,9 +25,6 @@ on:
       - '.github/workflows/relay.yml'
   pull_request:
     branches: [master]
-    paths:
-      - 'services/**'
-      - '.github/workflows/relay.yml'
   workflow_dispatch:
 
 concurrency:
@@ -36,28 +41,58 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    defaults:
-      run:
-        working-directory: services
 
     steps:
+      # Full history needed for the diff-based change detection below — a
+      # shallow clone has no merge base to diff against.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Detect whether this run touches anything the relay actually cares
+      # about. On pull_request the workflow always fires (so the required
+      # status check always reports), but if the PR doesn't touch services/
+      # there's nothing to build — short-circuit to a green success.
+      # On push (master) the paths filter already gated us, so always run.
+      # On workflow_dispatch the operator asked for a build — always run.
+      - name: Detect relay changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$base" "$head" -- 'services/**' '.github/workflows/relay.yml' | grep -q .; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No services/ or relay workflow changes in this PR — skipping cargo build/test."
+            fi
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install stable Rust toolchain
+        if: steps.changes.outputs.relevant == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry + target dir
+        if: steps.changes.outputs.relevant == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: services
 
       - name: Build release
+        if: steps.changes.outputs.relevant == 'true'
+        working-directory: services
         run: cargo build --workspace --release
 
       - name: Run tests
+        if: steps.changes.outputs.relevant == 'true'
+        working-directory: services
         run: cargo test --workspace --no-fail-fast
 
       - name: Upload relay binary as artifact
+        if: steps.changes.outputs.relevant == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: phantom-relay-binary
@@ -70,19 +105,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
-    defaults:
-      run:
-        working-directory: services
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect relay changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$base" "$head" -- 'services/**' '.github/workflows/relay.yml' | grep -q .; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install stable Rust toolchain (with clippy + rustfmt)
+        if: steps.changes.outputs.relevant == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + target dir
+        if: steps.changes.outputs.relevant == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: services
@@ -90,9 +141,13 @@ jobs:
           save-if: 'false'
 
       - name: Format check
+        if: steps.changes.outputs.relevant == 'true'
+        working-directory: services
         run: cargo fmt --all -- --check
         continue-on-error: true
 
       - name: Clippy (workspace, all targets)
+        if: steps.changes.outputs.relevant == 'true'
+        working-directory: services
         run: cargo clippy --workspace --all-targets -- -D warnings
         continue-on-error: true
