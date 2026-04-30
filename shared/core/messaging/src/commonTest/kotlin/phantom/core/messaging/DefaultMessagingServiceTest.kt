@@ -3,6 +3,7 @@
 
 package phantom.core.messaging
 
+import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -182,6 +183,103 @@ private class FakeRatchetStateRepository : RatchetStateRepository {
     override suspend fun deleteRatchetState(conversationId: String) { store.remove(conversationId) }
 }
 
+/**
+ * PR C commit 10: SessionManager.getOrCreateSession is gone. The send/
+ * receive wire-flow tests still want to exercise a real DMS, so they
+ * pre-seed this repo with a constant Alpha-2-shaped RatchetState for
+ * each conversation they exercise.
+ *
+ * The seed value is the same shape PassthroughX3DH produces from its
+ * stub initiatorHandshake4DH — all-zero-byte fields. PassthroughDoubleRatchet
+ * doesn't care about state contents, so any well-formed JSON works.
+ */
+private class PreSeededRatchetStateRepository(
+    seedFor: List<String>,
+) : RatchetStateRepository {
+    private val seedJson: String = run {
+        val state = phantom.core.crypto.RatchetState(
+            rootKey = ByteArray(32),
+            sendingChainKey = ByteArray(32),
+            receivingChainKey = ByteArray(32),
+            sendingRatchetPublicKey = ByteArray(32),
+            sendingRatchetPrivateKey = ByteArray(32),
+            receivingRatchetPublicKey = ByteArray(32),
+        )
+        kotlinx.serialization.json.Json.encodeToString(
+            phantom.core.crypto.RatchetState.serializer(),
+            state,
+        )
+    }
+    private val store = mutableMapOf<String, String>().also { m ->
+        seedFor.forEach { m[it] = seedJson }
+    }
+    override suspend fun getRatchetState(conversationId: String) = store[conversationId]
+    override suspend fun upsertRatchetState(conversationId: String, stateBlob: String) {
+        store[conversationId] = stateBlob
+    }
+    override suspend fun deleteRatchetState(conversationId: String) { store.remove(conversationId) }
+}
+
+/**
+ * No-op stub — tests don't drive the SessionManager bootstrap path
+ * directly (they pre-seed RatchetState instead), so signedPreKeyRepository
+ * and oneTimePreKeyRepository are never consulted. Provide minimal
+ * implementations so SessionManager construction succeeds.
+ */
+private class FakeLocalSignedPreKeyRepository :
+    phantom.core.storage.LocalSignedPreKeyRepository {
+    override suspend fun get(): phantom.core.storage.LocalSignedPreKeyEntity? = null
+    override suspend fun upsert(entity: phantom.core.storage.LocalSignedPreKeyEntity) {}
+    override suspend fun clear() {}
+}
+
+private class FakeLocalOneTimePreKeyRepository :
+    phantom.core.storage.LocalOneTimePreKeyRepository {
+    override suspend fun get(keyIdHex: String): phantom.core.storage.LocalOneTimePreKeyEntity? = null
+    override suspend fun getAll(): List<phantom.core.storage.LocalOneTimePreKeyEntity> = emptyList()
+    override suspend fun count(): Int = 0
+    override suspend fun insert(entity: phantom.core.storage.LocalOneTimePreKeyEntity) {}
+    override suspend fun insertAll(entities: List<phantom.core.storage.LocalOneTimePreKeyEntity>) {}
+    override suspend fun deleteByKeyId(keyIdHex: String) {}
+    override suspend fun clear() {}
+}
+
+/**
+ * IdentityCrypto stub — SessionManager only invokes `verifyWithIdentity`
+ * on the bootstrap path, which the wire-flow tests don't exercise.
+ */
+private class FakeIdentityCrypto : phantom.core.identity.IdentityCrypto {
+    override fun generateKeyPair(): phantom.core.identity.IdentityKeyPair =
+        phantom.core.identity.IdentityKeyPair(
+            phantom.core.identity.PublicKey(ByteArray(32)),
+            phantom.core.identity.PrivateKey(ByteArray(32)),
+        )
+    override fun generateSigningKeyPair(): phantom.core.identity.IdentitySigningKeyPair =
+        phantom.core.identity.IdentitySigningKeyPair(
+            phantom.core.identity.SigningPublicKey(ByteArray(32)),
+            phantom.core.identity.SigningPrivateKey(ByteArray(64)),
+        )
+    override fun sign(message: ByteArray, privateKey: phantom.core.identity.PrivateKey): ByteArray =
+        error("sign not used in tests")
+    override fun verify(message: ByteArray, signature: ByteArray, publicKey: phantom.core.identity.PublicKey): Boolean =
+        error("verify not used in tests")
+    override fun signWithIdentity(message: ByteArray, privateKey: phantom.core.identity.SigningPrivateKey): ByteArray =
+        ByteArray(64)
+    override fun verifyWithIdentity(
+        message: ByteArray,
+        signature: ByteArray,
+        publicKey: phantom.core.identity.SigningPublicKey,
+    ): Boolean = true
+    override fun publicKeyToHex(key: phantom.core.identity.PublicKey): String =
+        key.bytes.joinToString("") { "%02x".format(it.toInt().and(0xFF)) }
+    override fun hexToPublicKey(hex: String): phantom.core.identity.PublicKey =
+        phantom.core.identity.PublicKey(ByteArray(0))
+    override fun signingPublicKeyToHex(key: phantom.core.identity.SigningPublicKey): String =
+        key.bytes.joinToString("") { "%02x".format(it.toInt().and(0xFF)) }
+    override fun hexToSigningPublicKey(hex: String): phantom.core.identity.SigningPublicKey =
+        phantom.core.identity.SigningPublicKey(ByteArray(0))
+}
+
 private class FakeRelayTransport : RelayTransport {
     private val _state = MutableStateFlow<TransportState>(TransportState.Connected)
     override val state: StateFlow<TransportState> = _state
@@ -253,6 +351,13 @@ private class PassthroughX3DH : X3DHProtocol {
         initiatorIdentityPublicKey: DhPublicKey,
         initiatorEphemeralPublicKey: DhPublicKey,
     ) = initiatorHandshake(recipientIdentityKeyPair, initiatorIdentityPublicKey, initiatorEphemeralPublicKey)
+    override fun initiatorHandshake4DHWithEphemeral(
+        initiatorIdentityKeyPair: DhKeyPair,
+        recipientIdentityPublicKey: DhPublicKey,
+        recipientSignedPreKey: DhPublicKey,
+        recipientOPK: DhPublicKey?,
+        ephemeralKeyPair: DhKeyPair,
+    ) = initiatorHandshake(initiatorIdentityKeyPair, recipientIdentityPublicKey, recipientSignedPreKey)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -272,15 +377,49 @@ class DefaultMessagingServiceTest {
         DhPrivateKey(ByteArray(32) { 0xBB.toByte() }),
     )
 
-    private fun buildService(
+    private suspend fun buildService(
         testScope: TestScope,
         msgRepo: FakeMessageRepository = FakeMessageRepository(),
         convRepo: FakeConversationRepository = FakeConversationRepository(),
         transport: FakeRelayTransport = FakeRelayTransport(),
         reactionRepo: FakeReactionRepository? = null,
     ): DefaultMessagingService {
-        val ratchetRepo = FakeRatchetStateRepository()
-        val sessionManager = SessionManager(PassthroughX3DH(), ratchetRepo, json)
+        // sendMessage paths reach SealedSender.seal which uses libsodium.
+        // On JVM the lib is loaded via JNA; calling Box.keypair() before
+        // LibsodiumInitializer.initialize() throws lateinit-property-not-
+        // initialized. Tests previously relied on Alpha0IntegrationTest
+        // running first to initialise the lib for the JVM process, which
+        // is order-dependent. Initialise unconditionally here — idempotent
+        // after the first call.
+        LibsodiumInitializer.initialize()
+        // PR C commit 10: SessionManager dropped getOrCreateSession (F12
+        // closure). DefaultMessagingService now expects a session to
+        // already exist on encrypt/decrypt — the bundle-fetch + bootstrap
+        // path lands in commit 11. To keep the existing send/receive
+        // wire-flow tests meaningful, we pre-seed `ratchetRepo` with a
+        // constant state for the conversation each test exercises.
+        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = listOf(
+            // Tests pass conversationId values directly to OutgoingMessage
+            // (sendMessage uses message.conversationId verbatim, not the
+            // derived id) and use deriveConversationId on the receive path
+            // (sorts identity.publicKeyHex + senderPubKeyHex). Pre-seed
+            // every shape currently exercised so tryLoadSession returns
+            // non-null on every test path.
+            "conv-1",
+            "conv-2",
+            "aabb_ccdd",
+            "ccdd_aabb",
+            "aabb_eeff",
+            "eeff_aabb",
+        ))
+        val sessionManager = SessionManager(
+            x3dh = PassthroughX3DH(),
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = FakeIdentityCrypto(),
+            json = json,
+        )
         return DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,

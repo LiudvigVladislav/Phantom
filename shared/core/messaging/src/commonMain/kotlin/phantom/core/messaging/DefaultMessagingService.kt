@@ -88,15 +88,25 @@ class DefaultMessagingService(
      */
     private suspend fun encryptUnderLock(
         conversationId: String,
-        recipientPublicKeyHex: String,
+        @Suppress("UNUSED_PARAMETER") recipientPublicKeyHex: String,
         plaintext: ByteArray,
     ): phantom.core.crypto.EncryptedMessage =
         mutexFor(conversationId).withLock {
-            val state = sessionManager.getOrCreateSession(
-                conversationId = conversationId,
-                localIdentityKeyPair = localKeyPair,
-                remoteIdentityPublicKeyHex = recipientPublicKeyHex,
-            )
+            // PR C commit 10: SessionManager.getOrCreateSession is gone
+            // (F12 closure — Alpha 1 path that derived root key from raw
+            // identity scalarmult is removed). For now, encrypt only when
+            // a session already exists — fresh-session bootstrap arrives
+            // in commit 11 along with the bundle-fetch + WireFrame
+            // wrapping wiring. Existing tests pre-seed the ratchet store
+            // so this branch always succeeds.
+            val state = sessionManager.tryLoadSession(conversationId)
+                ?: error(
+                    "encryptUnderLock: no session for conversationId=" +
+                        "${conversationId.take(16)}…. PR C commit 11 wires " +
+                        "first-message bootstrap via PreKeyApiClient + " +
+                        "SessionManager.initiatorBootstrap; until then, " +
+                        "callers must not invoke send on a fresh conversation.",
+                )
             val (newState, encrypted) = ratchet.encrypt(state, plaintext)
             sessionManager.saveSession(conversationId, newState)
             encrypted
@@ -297,11 +307,20 @@ class DefaultMessagingService(
             // conversation could still observe a half-saved state.
             val mutex = mutexFor(conversationId)
             val plainBytes = mutex.withLock {
-                val state = sessionManager.getOrCreateSession(
-                    conversationId = conversationId,
-                    localIdentityKeyPair = localKeyPair,
-                    remoteIdentityPublicKeyHex = senderPubKeyHex,
-                )
+                // PR C commit 10: SessionManager.getOrCreateSession is gone
+                // (F12 closure). Receive path now requires either an
+                // existing session OR an x3dhInit header on the wire frame.
+                // Commit 11 parses the WireFrame wrapping and routes to
+                // SessionManager.recipientBootstrap when needed; until
+                // then this path requires the session to already exist.
+                val state = sessionManager.tryLoadSession(conversationId)
+                    ?: error(
+                        "handleDeliver: no session for conversationId=" +
+                            "${conversationId.take(16)}… and incoming WireFrame " +
+                            "parsing isn't wired yet. PR C commit 11 adds the " +
+                            "recipient bootstrap path; until then, decrypts on " +
+                            "fresh conversations fail loudly.",
+                    )
                 messagingLog(
                     MessagingLogLevel.INFO,
                     "Session loaded: conv=${conversationId.take(24)}… decrypting…",

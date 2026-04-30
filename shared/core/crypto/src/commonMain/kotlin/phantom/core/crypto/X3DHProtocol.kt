@@ -94,6 +94,26 @@ interface X3DHProtocol {
     ): RatchetState
 
     /**
+     * Same as [initiatorHandshake4DH] but the caller supplies the X3DH
+     * ephemeral keypair (`EK_a` in the spec) explicitly. SessionManager
+     * uses this so it can carry `EK_a.publicKey` in the cleartext
+     * [phantom.core.messaging.X3dhInitHeader] alongside the first
+     * message — without it the recipient cannot recompute DH2/DH3/DH4.
+     *
+     * The `ephemeralKeyPair` parameter is the X3DH ephemeral (EK_a),
+     * NOT the Double Ratchet sending-ratchet seed. The ratchet seed is
+     * still generated fresh inside the implementation per F15 — it
+     * never equals the identity keypair NOR the X3DH ephemeral.
+     */
+    fun initiatorHandshake4DHWithEphemeral(
+        initiatorIdentityKeyPair: DhKeyPair,
+        recipientIdentityPublicKey: DhPublicKey,
+        recipientSignedPreKey: DhPublicKey,
+        recipientOPK: DhPublicKey?,
+        ephemeralKeyPair: DhKeyPair,
+    ): RatchetState
+
+    /**
      * 4-DH recipient handshake.
      *
      * Mirrors [initiatorHandshake4DH] from Bob's side. Same IKM, same HKDF

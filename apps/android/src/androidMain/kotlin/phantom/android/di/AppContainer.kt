@@ -149,7 +149,23 @@ class AppContainer(private val context: Context) {
         localKeyPair: phantom.core.crypto.DhKeyPair,
     ) {
         _identityState.value = identity
-        val sessionManager = SessionManager(x3dh, ratchetRepo, json)
+        // PR C commit 10: SessionManager rewrite — see ADR-009 supplement
+        // and Alpha2_Migration.md. Constructor expanded to accept the
+        // local SignedPreKey + OneTimePreKey repositories (recipient
+        // bootstrap path looks up own keypairs by id) and IdentityCrypto
+        // (verifies peer's published SPK signature). The full bundle-
+        // fetch + first-message bootstrap wiring lands in commit 11.
+        val signedPreKeyRepo = phantom.core.storage.SqlDelightLocalSignedPreKeyRepository(dbHolder.database)
+        val oneTimePreKeyRepo = phantom.core.storage.SqlDelightLocalOneTimePreKeyRepository(dbHolder.database)
+        val sessionManagerIdentityCrypto = phantom.core.identity.LibsodiumIdentityCrypto()
+        val sessionManager = SessionManager(
+            x3dh = x3dh,
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = signedPreKeyRepo,
+            oneTimePreKeyRepository = oneTimePreKeyRepo,
+            identityCrypto = sessionManagerIdentityCrypto,
+            json = json,
+        )
         val service = DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,

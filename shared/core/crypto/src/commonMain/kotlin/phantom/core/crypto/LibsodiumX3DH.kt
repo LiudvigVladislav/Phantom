@@ -112,10 +112,12 @@ class LibsodiumX3DH : X3DHProtocol {
     )
 
     /**
-     * Test driver — lets vectors pin a specific ephemeral keypair and check
-     * the masterSecret deterministically against the recipient side.
+     * Caller-supplied EK_a path. Used by SessionManager to carry EK_a's
+     * public key on the wire, AND by tests to pin the ephemeral for
+     * deterministic vector verification. The ratchet seed remains
+     * generated-fresh per F15 inside this method.
      */
-    fun initiatorHandshake4DHWithEphemeral(
+    override fun initiatorHandshake4DHWithEphemeral(
         initiatorIdentityKeyPair: DhKeyPair,
         recipientIdentityPublicKey: DhPublicKey,
         recipientSignedPreKey: DhPublicKey,
