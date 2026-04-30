@@ -1812,6 +1812,28 @@ private fun StatusIcon(status: MessageStatus) {
                 drawCheckmark(color = CyanAccent, offsetX = size.width * 0.3f)
             }
         }
+        MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE -> {
+            // Hourglass-style amber dot — recipient hasn't published
+            // a prekey bundle yet, retry sweep will pick this up.
+            // PR C-followup-3.
+            Canvas(modifier = Modifier.size(14.dp)) {
+                drawCircle(
+                    color = Color(0xFFF59E0B), // amber/warning
+                    radius = 3.dp.toPx(),
+                )
+            }
+        }
+        MessageStatus.FAILED -> {
+            // Red dot — non-retryable encryption failure. Tap-to-retry
+            // hook is a future polish item; for now the indicator just
+            // tells the user the message didn't ship.
+            Canvas(modifier = Modifier.size(14.dp)) {
+                drawCircle(
+                    color = Color(0xFFEF4444), // red/danger
+                    radius = 3.dp.toPx(),
+                )
+            }
+        }
     }
 }
 
