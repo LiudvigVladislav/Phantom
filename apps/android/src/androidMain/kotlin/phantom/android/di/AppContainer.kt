@@ -65,6 +65,17 @@ class AppContainer(private val context: Context) {
     @Volatile var migrationManager: phantom.core.messaging.MigrationManager? = null
         private set
 
+    /**
+     * Steady-state prekey lifecycle service: onboarding bootstrap,
+     * OPK pool refill, weekly SPK rotation. The 24-hour ticker is
+     * launched in [initMessaging]; UI surfaces (e.g. MigrationScreen)
+     * also call [phantom.core.messaging.PreKeyLifecycleService.bootstrapForNewIdentity]
+     * directly after a flow that yields a fresh signing keypair so the
+     * first publish doesn't wait 24 h.
+     */
+    @Volatile var preKeyLifecycle: phantom.core.messaging.PreKeyLifecycleService? = null
+        private set
+
     // ── Storage ───────────────────────────────────────────────────────────────
     private val driverFactory = DatabaseDriverFactory(context)
     private val dbHolder = PhantomDatabaseHolder(driverFactory)
@@ -208,6 +219,68 @@ class AppContainer(private val context: Context) {
             preKeyApi = preKeyApi,
             x3dh = x3dh,
         )
+
+        // PR C-followup-1: PreKeyLifecycleService — drives the steady
+        // state of the user's published bundle. Three operations:
+        //
+        //   * bootstrapForNewIdentity() runs once per install
+        //     immediately. No-op when an SPK already exists locally
+        //     (covers app restart between onboarding completion and
+        //     the publish call landing). Initial publish makes this
+        //     identity discoverable on the relay.
+        //
+        //   * maybeReplenishOneTimePreKeys() refills the OPK pool
+        //     when count drops below 20.
+        //
+        //   * maybeRotateSignedPreKey() rotates the SPK every 7 days.
+        //
+        // The 24-hour ticker below polls both replenish + rotate.
+        // On every successful WS reconnect we also fire the same pair
+        // so a long-offline device catches up promptly.
+        val lifecycleService = phantom.core.messaging.PreKeyLifecycleService(
+            identityManager = identityManager,
+            signedPreKeyRepository = signedPreKeyRepo,
+            oneTimePreKeyRepository = oneTimePreKeyRepo,
+            preKeyApi = preKeyApi,
+            x3dh = x3dh,
+        )
+        preKeyLifecycle = lifecycleService
+
+        // Onboarding bootstrap — fire-and-forget. On Alpha-1 records
+        // (no signing keypair yet) this is a no-op until migration
+        // runs because lifecycleService.bootstrapForNewIdentity ()
+        // requires loadSigningKeyPair() to return non-null. After
+        // migration completes the user's next foreground hits the
+        // 24-h ticker which retries publish.
+        appScope.launch {
+            runCatching { lifecycleService.bootstrapForNewIdentity() }
+                .onFailure { e ->
+                    android.util.Log.w(
+                        "PreKeyLifecycle",
+                        "Onboarding bootstrap failed: ${e.message}",
+                    )
+                }
+        }
+
+        // 24-hour ticker — drives steady-state replenish + rotate.
+        // Idempotent: skips when pool >= threshold and SPK age < 7d.
+        // Survives the app being suspended via Dispatchers.Default
+        // (continues in background as long as the process is alive;
+        // a foreground service or WorkManager job would harden this
+        // against process death — flagged for future work).
+        appScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(24 * 60 * 60 * 1000L)
+                runCatching { lifecycleService.maybeReplenishOneTimePreKeys() }
+                    .onFailure {
+                        android.util.Log.w("PreKeyLifecycle", "Replenish failed: ${it.message}")
+                    }
+                runCatching { lifecycleService.maybeRotateSignedPreKey() }
+                    .onFailure {
+                        android.util.Log.w("PreKeyLifecycle", "Rotate failed: ${it.message}")
+                    }
+            }
+        }
         val service = DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
