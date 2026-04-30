@@ -56,6 +56,28 @@ unify around Ed25519 with a derived X25519 (Signal's approach) but only
 at the cost of changing every existing user's public key value, which we
 explicitly chose not to do.
 
+> **Don't confuse the signing key with the SignedPreKey.** They sound
+> similar and both relate to ADR-009, but they live at different
+> lifecycle layers:
+>
+> - **Identity Ed25519 signing keypair** (this section): long-term, one
+>   per user, generated once and never rotated. Used to sign every
+>   SignedPreKey the user ever publishes. Compromise of this key means
+>   any future bundle from the user can be forged — same impact tier as
+>   identity X25519 compromise. Stored in `IdentityRecord`.
+>
+> - **SignedPreKey** (a.k.a. SPK, X25519): medium-term, rotated weekly,
+>   used as a DH input in the X3DH handshake. Each new SPK is signed by
+>   the identity Ed25519 key above. Compromise of an SPK only impacts
+>   sessions started against that specific SPK during its 14-day
+>   retention window — not the long-term identity. Stored in
+>   `signed_pre_keys` table.
+>
+> If a debugger ever shows you "two Ed25519-shaped 32-byte values" near
+> the prekey code path, the one bound to `IdentityRecord` is the
+> signing key and the one in `SignedPreKey` is the SPK *being signed*.
+> They never overlap.
+
 ---
 
 ## Migration trigger — what users see
@@ -306,12 +328,58 @@ CI must pass all of these on JVM target before PR C is mergeable.
   user installs Phantom on a new phone they get a new identity and re-add
   contacts. Multi-device is a separate roadmap item (post-Phase 2).
 - **Bundle authentication for first contact.** Currently when Alice
-  fetches Bob's bundle, she trusts the SPK signature because she
-  recognizes Bob's Ed25519 key from the QR code she scanned. Until QR
-  codes carry Ed25519 (Phase 2), Alice cannot verify the bundle's
-  Ed25519 belongs to Bob. This is the same trust assumption as Alpha 1's
-  X25519 QR code: the user vouches for the channel by which they got
-  the key. Documented as a known limitation, not a regression.
+  fetches Bob's bundle, she has no out-of-band way to verify that the
+  Ed25519 `signing_pubkey_hex` returned by the relay actually belongs
+  to Bob — until QR codes are updated to carry Ed25519 (Phase 2 work),
+  the bundle's signing key arrives only through the relay. This is the
+  same TOFU (trust-on-first-use) assumption as Alpha 1's QR-only X25519
+  distribution, just transplanted to the new key.
+  
+  **Security implication for Alpha 2.** A relay-side adversary that
+  controls the bundle endpoint could substitute their own Ed25519
+  verifying key in Bob's bundle, then sign a malicious SPK and serve
+  it to Alice. Alice would complete the X3DH handshake with the
+  attacker, not Bob — a man-in-the-middle on the very first message.
+  
+  **Threat model.** The PHANTOM relay is treated as semi-trusted
+  (ADR-004): operator-malicious is in scope for the long-term threat
+  model but not for Alpha 2's day-one defenses. A determined
+  relay operator can already substitute X25519 identity keys in Alpha 1
+  via the same `/send`/`/fetch` routing surface; the Ed25519 signing
+  key inherits that trust posture rather than weakening it. The threat
+  is thus equivalent to Alpha 1 — adding the Ed25519 key surface area
+  doesn't change the worst-case outcome.
+  
+  **Mitigations available in Alpha 2 today.**
+  
+  - **SafetyNumber verification** (already wired into the chat UI from
+    Alpha 1) lets two users compare a 60-digit fingerprint over their
+    identity keys out of band. PR C extends this fingerprint to cover
+    BOTH keys: `SHA256(IK_a_x25519 || IK_a_ed25519 || IK_b_x25519 ||
+    IK_b_ed25519)`. A relay-substituted Ed25519 key surfaces as a
+    SafetyNumber mismatch the moment either party manually verifies.
+  - **High-stakes contacts policy.** Onboarding copy and the
+    Verify-safety-number screen recommend that users compare safety
+    numbers before sending sensitive content. Alpha 2 ships this copy.
+  - **No silent key rotation.** The relay enforces a 1:1 binding
+    between an X25519 identity and its registered Ed25519 signing key
+    (`SigningKeyMismatch` error on conflicting publishes). An attacker
+    who registered a substitute key would have to do so before Bob's
+    own client publishes — observable as Bob's first publish failing
+    with 409 Conflict, which surfaces in Bob's client logs.
+  
+  **Closure path (Phase 2).** QR codes will be extended to carry the
+  Ed25519 signing key alongside the X25519 identity. This collapses the
+  TOFU window to zero: scanning Bob's QR code gives Alice both keys
+  out-of-band, and any relay-substituted Ed25519 in a later bundle
+  fetch is rejected by Alice's client before any session starts.
+  Tracked as part of the Phase 2 directory + verification certificate
+  work (ADR-008 draft).
+  
+  **Audit framing.** This is a documented, threat-modeled, mitigated
+  TOFU surface — not a regression from Alpha 1, not an open security
+  hole. Alpha 2 ships with the full mitigation set above; the closure
+  in Phase 2 reduces residual risk to Signal-protocol parity.
 
 ---
 
