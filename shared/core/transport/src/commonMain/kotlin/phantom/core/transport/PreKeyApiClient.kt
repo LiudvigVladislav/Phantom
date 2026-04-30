@@ -41,6 +41,27 @@ import kotlinx.serialization.json.Json
  * ws(s):// and lives on the same Caddy/host pair, so callers typically
  * derive one from the other in the AppContainer wiring.
  */
+/**
+ * Surface that the prekey REST client exposes to its consumers
+ * (lifecycle service, SessionManager bootstrap path via DMS). Extracted
+ * as an interface in PR C commit 11 so DMS tests can swap in an
+ * in-memory fake without spinning up an HttpClient + MockEngine.
+ *
+ * The HTTP-backed implementation is [PreKeyApiClient]; production code
+ * wires a single instance via AppContainer.
+ */
+interface PreKeyApi {
+    suspend fun publishBundle(request: PublishRequest): PublishResult
+    suspend fun fetchBundle(
+        identityPubkeyHex: String,
+        requesterPubkeyHex: String? = null,
+    ): PreKeyBundle?
+    suspend fun fetchStatus(
+        identityPubkeyHex: String,
+        requesterPubkeyHex: String? = null,
+    ): PreKeyStatus
+}
+
 class PreKeyApiClient(
     private val httpClient: HttpClient,
     private val relayBaseUrl: String,
@@ -48,7 +69,7 @@ class PreKeyApiClient(
         ignoreUnknownKeys = true
         encodeDefaults = true
     },
-) {
+) : PreKeyApi {
 
     /**
      * Publish (or refresh) the local SignedPreKey + a batch of OneTimePreKeys.
@@ -63,7 +84,7 @@ class PreKeyApiClient(
      *         retained (after dedup + cap), or [PublishResult.Failure]
      *         describing why the relay rejected the bundle.
      */
-    suspend fun publishBundle(request: PublishRequest): PublishResult {
+    override suspend fun publishBundle(request: PublishRequest): PublishResult {
         val body = json.encodeToString(PublishRequest.serializer(), request)
         val response: HttpResponse = httpClient.post("$relayBaseUrl/prekeys/publish") {
             contentType(ContentType.Application.Json)
@@ -108,9 +129,9 @@ class PreKeyApiClient(
      * Other non-2xx codes propagate as a [BundleFetchException] so callers
      * can distinguish "transient relay error" from "peer not on Alpha 2."
      */
-    suspend fun fetchBundle(
+    override suspend fun fetchBundle(
         identityPubkeyHex: String,
-        requesterPubkeyHex: String? = null,
+        requesterPubkeyHex: String?,
     ): PreKeyBundle? {
         val url = buildString {
             append(relayBaseUrl)
@@ -142,9 +163,9 @@ class PreKeyApiClient(
      * to decide replenish (count < 20) and SPK rotation (age >= 7 days)
      * without uploading anything.
      */
-    suspend fun fetchStatus(
+    override suspend fun fetchStatus(
         identityPubkeyHex: String,
-        requesterPubkeyHex: String? = null,
+        requesterPubkeyHex: String?,
     ): PreKeyStatus {
         val url = buildString {
             append(relayBaseUrl)

@@ -166,6 +166,21 @@ class AppContainer(private val context: Context) {
             identityCrypto = sessionManagerIdentityCrypto,
             json = json,
         )
+        // PR C commit 11: DMS gains the prekey REST client (for the
+        // first-message bundle-fetch path) plus a signing-key provider
+        // that resolves the local Ed25519 keypair on demand. The HTTP
+        // base URL is derived from BuildConfig.RELAY_URL (which is
+        // wss:// or ws://) — same pattern as the report-endpoint flow
+        // in ContactProfileScreen.
+        val relayHttpBase = phantom.android.BuildConfig.RELAY_URL
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .removeSuffix("/ws")
+            .removeSuffix("/")
+        val preKeyApi = phantom.core.transport.PreKeyApiClient(
+            httpClient = phantom.core.transport.createHttpClient(),
+            relayBaseUrl = relayHttpBase,
+        )
         val service = DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
@@ -177,6 +192,12 @@ class AppContainer(private val context: Context) {
             scope = appScope,
             json = json,
             reactionRepository = reactionRepo,
+            preKeyApi = preKeyApi,
+            // Signing-key provider — looks up the Ed25519 keypair from
+            // the IdentityManager. Returns null on Alpha 1 records that
+            // haven't yet been backfilled by the migration flow
+            // (PR C commit 12). DMS surfaces null as a hard send error.
+            signingKeyProvider = { identityManager.loadSigningKeyPair() },
         )
         // Wire local notification callback — Android-only side-effect, not part of the KMP interface.
         service.onNewMessageNotification = { convId, sender, preview, senderPubKeyHex ->
