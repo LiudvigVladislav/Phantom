@@ -2077,7 +2077,11 @@ private fun InputBar(
                         drawLine(Danger, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
                     }
                 } else {
-                    PhIconPaperclip(color = TextDim, size = 22.dp)
+                    // PR C-followup-3 / bug 3 fix: this button toggles
+                    // the emoji panel — emoji icon, not the paperclip
+                    // (which would mean attachment-picker, a separate
+                    // future button).
+                    PhIconSmile(color = TextDim, size = 22.dp)
                 }
             }
             if (!isRecording) Spacer(Modifier.width(6.dp))
