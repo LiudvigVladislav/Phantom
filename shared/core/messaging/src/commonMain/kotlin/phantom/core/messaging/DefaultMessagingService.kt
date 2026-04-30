@@ -24,6 +24,7 @@ import phantom.core.crypto.DhKeyPair
 import phantom.core.crypto.MessagePadding
 import phantom.core.crypto.SealedSender
 import phantom.core.identity.IdentityRecord
+import phantom.core.identity.IdentitySigningKeyPair
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.ConversationRepository
 import phantom.core.storage.MessageEntity
@@ -31,6 +32,7 @@ import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.ReactionRepository
 import phantom.core.storage.TrustTier
+import phantom.core.transport.PreKeyApi
 import phantom.core.transport.RelayMessage
 import phantom.core.transport.RelayTransport
 
@@ -45,6 +47,24 @@ class DefaultMessagingService(
     private val scope: CoroutineScope,
     private val json: Json = Json { ignoreUnknownKeys = true },
     private val reactionRepository: ReactionRepository? = null,
+    /**
+     * REST client for the relay's prekey endpoints. Used by the send
+     * path to fetch a peer's [phantom.core.transport.PreKeyBundle] when
+     * no session exists yet for a conversation. PR C commit 11.
+     */
+    private val preKeyApi: PreKeyApi,
+    /**
+     * Resolves the local user's Ed25519 signing keypair on demand.
+     * The send path calls this on the FIRST message of a fresh session
+     * to attach `senderSigningPublicKeyHex` to the [WireFrame] so the
+     * recipient can cache the key for verifying future SPK rotations.
+     *
+     * Returns `null` when the identity hasn't been backfilled yet
+     * (Alpha 1 → Alpha 2 migration not run). The caller surfaces that
+     * as a hard send failure with a clear error — by the time DMS is
+     * receiving send calls, migration must have completed.
+     */
+    private val signingKeyProvider: suspend () -> IdentitySigningKeyPair?,
 ) : MessagingService {
 
     private val _incomingMessages = MutableSharedFlow<IncomingMessage>(
@@ -79,27 +99,76 @@ class DefaultMessagingService(
         }
 
     /**
-     * Loads the ratchet state for the conversation, encrypts [plaintext] with the
-     * Double Ratchet, and persists the advanced state — all under the per-
-     * conversation mutex so concurrent callers cannot derive the same chain key.
-     * Returns the wire-ready EncryptedMessage. The DH keypair argument is
-     * threaded through so this helper stays usable from outgoing call sites
-     * that already have it on the stack.
+     * Loads (or bootstraps) the ratchet state for the conversation,
+     * encrypts [plaintext] with the Double Ratchet, persists the
+     * advanced state, and returns a wire-ready [WireFrame] — all under
+     * the per-conversation mutex so concurrent callers cannot derive
+     * the same chain key.
+     *
+     * On the FIRST message of a fresh conversation the session does
+     * not yet exist. We:
+     *   1. Fetch the peer's PreKeyBundle from the relay
+     *   2. Run [SessionManager.initiatorBootstrap] (verifies SPK signature,
+     *      runs X3DH 4-DH, persists fresh RatchetState, asserts F15)
+     *   3. Encrypt under the freshly-bootstrapped state
+     *   4. Wrap result in a [WireFrame] WITH `x3dhInit` + the local
+     *      signing pubkey so the recipient can mirror the bootstrap
+     *
+     * On every subsequent message the session is loaded as-is and the
+     * resulting WireFrame has `x3dhInit = null` and
+     * `senderSigningPublicKeyHex = null` — wasted bytes once the
+     * recipient cached them.
      */
     private suspend fun encryptUnderLock(
         conversationId: String,
         recipientPublicKeyHex: String,
         plaintext: ByteArray,
-    ): phantom.core.crypto.EncryptedMessage =
+    ): WireFrame =
         mutexFor(conversationId).withLock {
-            val state = sessionManager.getOrCreateSession(
-                conversationId = conversationId,
-                localIdentityKeyPair = localKeyPair,
-                remoteIdentityPublicKeyHex = recipientPublicKeyHex,
-            )
-            val (newState, encrypted) = ratchet.encrypt(state, plaintext)
-            sessionManager.saveSession(conversationId, newState)
-            encrypted
+            val existingState = sessionManager.tryLoadSession(conversationId)
+            if (existingState != null) {
+                val (newState, encrypted) = ratchet.encrypt(existingState, plaintext)
+                sessionManager.saveSession(conversationId, newState)
+                WireFrame(encryptedMessage = encrypted)
+            } else {
+                // Bootstrap path: peer has no session here yet.
+                // Fetch their bundle, run 4-DH, ship the bootstrap
+                // header with the first message.
+                val wireBundle = preKeyApi.fetchBundle(
+                    identityPubkeyHex = recipientPublicKeyHex,
+                    requesterPubkeyHex = identity.publicKeyHex,
+                ) ?: error(
+                    "encryptUnderLock: peer ${recipientPublicKeyHex.take(16)}… " +
+                        "has no published prekey bundle. They have not migrated " +
+                        "to Alpha 2 yet; the message stays in the outbox until " +
+                        "they come online and publish.",
+                )
+                val pkBundle = PreKeyBundle.fromWire(wireBundle)
+                val bootstrap = sessionManager.initiatorBootstrap(
+                    conversationId = conversationId,
+                    localIdentityKeyPair = localKeyPair,
+                    bundle = pkBundle,
+                )
+                val (newState, encrypted) = ratchet.encrypt(bootstrap.ratchetState, plaintext)
+                sessionManager.saveSession(conversationId, newState)
+
+                // Attach our Ed25519 signing pubkey so the recipient can
+                // cache it under our X25519 identity for verifying our
+                // future SPK rotations.
+                val ourSigning = signingKeyProvider() ?: error(
+                    "encryptUnderLock: local Ed25519 signing keypair is missing. " +
+                        "Either onboarding (commit 13) or migration (commit 12) " +
+                        "must run before any first-send happens.",
+                )
+                val ourSigningHex = ourSigning.publicKey.bytes
+                    .joinToString("") { "%02x".format(it.toInt().and(0xFF)) }
+
+                WireFrame(
+                    encryptedMessage = encrypted,
+                    x3dhInit = bootstrap.x3dhInit,
+                    senderSigningPublicKeyHex = ourSigningHex,
+                )
+            }
         }
 
     /**
@@ -285,9 +354,13 @@ class DefaultMessagingService(
 
             // Unpad ISO 7816-4 padding applied by the sender to hide message length.
             val ciphertext = MessagePadding.unpad(deliver.payload.decodeBase64Bytes())
-            val encrypted = json.decodeFromString<phantom.core.crypto.EncryptedMessage>(
-                ciphertext.decodeToString()
-            )
+            // PR C commit 11: parse the WireFrame wrapper. Alpha 2 wraps
+            // every outbound message in WireFrame; Alpha 1 sent a bare
+            // EncryptedMessage. Migration wipes every session so there is
+            // no Alpha-1 → Alpha-2 cross traffic — anything arriving here
+            // is well-formed WireFrame.
+            val wireFrame = json.decodeFromString<WireFrame>(ciphertext.decodeToString())
+            val encrypted = wireFrame.encryptedMessage
 
             val conversationId = deriveConversationId(senderPubKeyHex)
             // The same per-conversation mutex protects the receive path so that an
@@ -297,23 +370,63 @@ class DefaultMessagingService(
             // conversation could still observe a half-saved state.
             val mutex = mutexFor(conversationId)
             val plainBytes = mutex.withLock {
-                val state = sessionManager.getOrCreateSession(
-                    conversationId = conversationId,
-                    localIdentityKeyPair = localKeyPair,
-                    remoteIdentityPublicKeyHex = senderPubKeyHex,
-                )
-                messagingLog(
-                    MessagingLogLevel.INFO,
-                    "Session loaded: conv=${conversationId.take(24)}… decrypting…",
-                )
+                val state = sessionManager.tryLoadSession(conversationId)
+                if (state != null) {
+                    // Existing session — decrypt directly. Any x3dhInit /
+                    // signing pubkey that came with this frame are
+                    // re-bootstraps; ignored when we already hold a
+                    // session, the peer simply pays a few wasted bytes.
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "Session loaded: conv=${conversationId.take(24)}… decrypting…",
+                    )
+                    val (newState, decrypted) = ratchet.decrypt(state, encrypted)
+                    sessionManager.saveSession(conversationId, newState)
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "Decrypt OK: plaintextBytes=${decrypted.size}",
+                    )
+                    decrypted
+                } else {
+                    // Fresh session — require x3dhInit on the wire. The
+                    // initiator side (their encryptUnderLock) is contract-
+                    // bound to attach it on the first message of a new
+                    // session.
+                    val x3dhInit = wireFrame.x3dhInit
+                        ?: error(
+                            "handleDeliver: no session for conversationId=" +
+                                "${conversationId.take(16)}… and incoming WireFrame " +
+                                "lacks x3dhInit header. Either the peer is on Alpha 1 " +
+                                "(impossible — migration wipes sessions) or the wire " +
+                                "frame is malformed.",
+                        )
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "Bootstrapping recipient session: conv=${conversationId.take(24)}…",
+                    )
+                    val freshState = sessionManager.recipientBootstrap(
+                        conversationId = conversationId,
+                        localIdentityKeyPair = localKeyPair,
+                        senderIdentityPublicKeyHex = senderPubKeyHex,
+                        x3dhInit = x3dhInit,
+                    )
+                    val (advancedState, decrypted) = ratchet.decrypt(freshState, encrypted)
+                    sessionManager.saveSession(conversationId, advancedState)
 
-                val (newState, decrypted) = ratchet.decrypt(state, encrypted)
-                sessionManager.saveSession(conversationId, newState)
-                messagingLog(
-                    MessagingLogLevel.INFO,
-                    "Decrypt OK: plaintextBytes=${decrypted.size}",
-                )
-                decrypted
+                    // TODO PR C commit 12 (or follow-up): persist
+                    // wireFrame.senderSigningPublicKeyHex on the
+                    // ConversationEntity (or a new PeerSigningKey table)
+                    // so future SPK rotations from this peer can be
+                    // verified against it. For Alpha 2 we trust the
+                    // bundle's signing key on each fetch; the cache
+                    // hardens the rotation path which lands in Phase 5.
+
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "Decrypt OK after bootstrap: plaintextBytes=${decrypted.size}",
+                    )
+                    decrypted
+                }
             }
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())

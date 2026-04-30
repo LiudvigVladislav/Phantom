@@ -13,7 +13,14 @@ CREATE TABLE conversation (
     archived INTEGER NOT NULL DEFAULT 0,
     identity_key_changed_at INTEGER,
     muted_until INTEGER,
-    pinned INTEGER NOT NULL DEFAULT 0
+    pinned INTEGER NOT NULL DEFAULT 0,
+    -- Set by the Alpha 1 → Alpha 2 migration (PR C, ADR-009): every
+    -- existing conversation whose Alpha 1 ratchet state was wiped during
+    -- the cryptographic protocol upgrade gets this flag = 1. The chat
+    -- list shows a "needs re-handshake" indicator and the next outbound
+    -- message in such a conversation forces the X3DH 4-DH bootstrap
+    -- path. Cleared after a successful new session is established.
+    needs_rehandshake INTEGER NOT NULL DEFAULT 0
 );
 
 getAllConversations:
@@ -38,8 +45,15 @@ INSERT OR REPLACE INTO conversation(
     last_message_preview, last_message_at, unread_count,
     trust_tier, blocked, notes,
     is_verified, disappearing_timer_secs, archived,
-    identity_key_changed_at, muted_until, pinned
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    identity_key_changed_at, muted_until, pinned,
+    needs_rehandshake
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+setNeedsRehandshake:
+UPDATE conversation SET needs_rehandshake = :flag WHERE id = :id;
+
+markAllNeedsRehandshake:
+UPDATE conversation SET needs_rehandshake = 1;
 
 updateNotes:
 UPDATE conversation SET notes = ? WHERE id = ?;

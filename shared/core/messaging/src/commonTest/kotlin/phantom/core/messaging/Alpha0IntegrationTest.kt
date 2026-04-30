@@ -37,6 +37,7 @@ private class InMemoryRatchetStateRepository : RatchetStateRepository {
         store[conversationId] = stateBlob
     }
     override suspend fun deleteRatchetState(conversationId: String) { store.remove(conversationId) }
+    override suspend fun deleteAll() { store.clear() }
 }
 
 /**

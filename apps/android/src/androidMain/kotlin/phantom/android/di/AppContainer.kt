@@ -55,6 +55,16 @@ class AppContainer(private val context: Context) {
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Alpha 1 → Alpha 2 migration manager. Set by [initMessaging] so
+     * the launch path can route to MigrationScreen when
+     * [phantom.core.messaging.MigrationManager.needsMigration] returns
+     * true. Null until initMessaging runs (i.e. before the user has an
+     * IdentityRecord, which is the no-op path for migration anyway).
+     */
+    @Volatile var migrationManager: phantom.core.messaging.MigrationManager? = null
+        private set
+
     // ── Storage ───────────────────────────────────────────────────────────────
     private val driverFactory = DatabaseDriverFactory(context)
     private val dbHolder = PhantomDatabaseHolder(driverFactory)
@@ -149,7 +159,55 @@ class AppContainer(private val context: Context) {
         localKeyPair: phantom.core.crypto.DhKeyPair,
     ) {
         _identityState.value = identity
-        val sessionManager = SessionManager(x3dh, ratchetRepo, json)
+        // PR C commit 10: SessionManager rewrite — see ADR-009 supplement
+        // and Alpha2_Migration.md. Constructor expanded to accept the
+        // local SignedPreKey + OneTimePreKey repositories (recipient
+        // bootstrap path looks up own keypairs by id) and IdentityCrypto
+        // (verifies peer's published SPK signature). The full bundle-
+        // fetch + first-message bootstrap wiring lands in commit 11.
+        val signedPreKeyRepo = phantom.core.storage.SqlDelightLocalSignedPreKeyRepository(dbHolder.database)
+        val oneTimePreKeyRepo = phantom.core.storage.SqlDelightLocalOneTimePreKeyRepository(dbHolder.database)
+        val sessionManagerIdentityCrypto = phantom.core.identity.LibsodiumIdentityCrypto()
+        val sessionManager = SessionManager(
+            x3dh = x3dh,
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = signedPreKeyRepo,
+            oneTimePreKeyRepository = oneTimePreKeyRepo,
+            identityCrypto = sessionManagerIdentityCrypto,
+            json = json,
+        )
+        // PR C commit 11: DMS gains the prekey REST client (for the
+        // first-message bundle-fetch path) plus a signing-key provider
+        // that resolves the local Ed25519 keypair on demand. The HTTP
+        // base URL is derived from BuildConfig.RELAY_URL (which is
+        // wss:// or ws://) — same pattern as the report-endpoint flow
+        // in ContactProfileScreen.
+        val relayHttpBase = phantom.android.BuildConfig.RELAY_URL
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .removeSuffix("/ws")
+            .removeSuffix("/")
+        val preKeyApi = phantom.core.transport.PreKeyApiClient(
+            httpClient = phantom.core.transport.createHttpClient(),
+            relayBaseUrl = relayHttpBase,
+        )
+
+        // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2
+        // upgrade. Inspected by the launch path (`needsMigration()`);
+        // executed when the user taps Continue on MigrationScreen.
+        // Lives on AppContainer alongside DMS so the Activity can
+        // reach it before normal messaging starts.
+        migrationManager = phantom.core.messaging.MigrationManager(
+            identityManager = identityManager,
+            identityCrypto = sessionManagerIdentityCrypto,
+            signedPreKeyRepository = signedPreKeyRepo,
+            oneTimePreKeyRepository = oneTimePreKeyRepo,
+            ratchetStateRepository = ratchetRepo,
+            senderKeyRepository = senderKeyRepo,
+            conversationRepository = conversationRepo,
+            preKeyApi = preKeyApi,
+            x3dh = x3dh,
+        )
         val service = DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
@@ -161,6 +219,12 @@ class AppContainer(private val context: Context) {
             scope = appScope,
             json = json,
             reactionRepository = reactionRepo,
+            preKeyApi = preKeyApi,
+            // Signing-key provider — looks up the Ed25519 keypair from
+            // the IdentityManager. Returns null on Alpha 1 records that
+            // haven't yet been backfilled by the migration flow
+            // (PR C commit 12). DMS surfaces null as a hard send error.
+            signingKeyProvider = { identityManager.loadSigningKeyPair() },
         )
         // Wire local notification callback — Android-only side-effect, not part of the KMP interface.
         service.onNewMessageNotification = { convId, sender, preview, senderPubKeyHex ->

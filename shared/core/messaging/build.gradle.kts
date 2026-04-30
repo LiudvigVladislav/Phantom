@@ -15,6 +15,11 @@ kotlin {
             implementation(libs.kotlinx.serialization.json)
             implementation(libs.kotlinx.datetime)
             implementation(libs.uuid)
+            // libsodium — needed for LibsodiumRandom in MigrationManager's
+            // OPK key-id generation (16 random bytes per OPK). Already a
+            // transitive dep via :shared:core:crypto and :shared:core:identity;
+            // hoisted here so commonMain can reference the API directly.
+            implementation(libs.libsodium.bindings)
             implementation(project(":shared:core:identity"))
             implementation(project(":shared:core:crypto"))
             implementation(project(":shared:core:storage"))

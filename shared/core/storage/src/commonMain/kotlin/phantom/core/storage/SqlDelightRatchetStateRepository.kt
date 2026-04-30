@@ -28,4 +28,8 @@ class SqlDelightRatchetStateRepository(
         withContext(Dispatchers.IO) {
             db.ratchetStateQueries.deleteRatchetState(conversationId)
         }
+
+    override suspend fun deleteAll(): Unit = withContext(Dispatchers.IO) {
+        db.ratchetStateQueries.deleteAllRatchetStates()
+    }
 }

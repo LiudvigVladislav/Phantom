@@ -12,3 +12,6 @@ VALUES (?, ?);
 
 deleteRatchetState:
 DELETE FROM ratchet_state WHERE conversation_id = ?;
+
+deleteAllRatchetStates:
+DELETE FROM ratchet_state;

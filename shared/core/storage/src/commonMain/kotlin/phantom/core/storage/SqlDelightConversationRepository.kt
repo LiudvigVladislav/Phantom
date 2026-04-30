@@ -49,6 +49,7 @@ class SqlDelightConversationRepository(
                 identity_key_changed_at = entity.identityKeyChangedAt,
                 muted_until = entity.mutedUntil,
                 pinned = if (entity.pinned) 1L else 0L,
+                needs_rehandshake = if (entity.needsRehandshake) 1L else 0L,
             )
         }
 
@@ -150,6 +151,19 @@ class SqlDelightConversationRepository(
             )
         }
 
+    override suspend fun setNeedsRehandshake(conversationId: String, needs: Boolean): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.setNeedsRehandshake(
+                flag = if (needs) 1L else 0L,
+                id = conversationId,
+            )
+        }
+
+    override suspend fun markAllNeedsRehandshake(): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.markAllNeedsRehandshake()
+        }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------
@@ -170,5 +184,6 @@ class SqlDelightConversationRepository(
         identityKeyChangedAt = identity_key_changed_at,
         mutedUntil = muted_until,
         pinned = pinned != 0L,
+        needsRehandshake = needs_rehandshake != 0L,
     )
 }

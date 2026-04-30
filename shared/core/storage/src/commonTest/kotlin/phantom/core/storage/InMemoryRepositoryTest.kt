@@ -101,6 +101,18 @@ private class FakeConversationRepository : ConversationRepository {
     override suspend fun setPinned(conversationId: String, pinned: Boolean) {
         store[conversationId]?.let { store[conversationId] = it.copy(pinned = pinned) }
     }
+
+    override suspend fun setNeedsRehandshake(conversationId: String, needs: Boolean) {
+        store[conversationId]?.let {
+            store[conversationId] = it.copy(needsRehandshake = needs)
+        }
+    }
+
+    override suspend fun markAllNeedsRehandshake() {
+        store.keys.toList().forEach { id ->
+            store[id]?.let { store[id] = it.copy(needsRehandshake = true) }
+        }
+    }
 }
 
 private class FakeMessageRepository : MessageRepository {
@@ -181,6 +193,8 @@ private class FakeRatchetStateRepository : RatchetStateRepository {
     override suspend fun deleteRatchetState(conversationId: String) {
         store.remove(conversationId)
     }
+
+    override suspend fun deleteAll() { store.clear() }
 }
 
 // ---------------------------------------------------------------------------

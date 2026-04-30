@@ -532,29 +532,46 @@ signature server-side-blind.
 But Bob also needs to learn Alice's signing pubkey before he can verify
 **her** future SignedPreKey rotations against the bundle she'll
 publish under his contact's name. He learns it by piggyback: the first
-message Alice sends in the new session carries her signing pubkey in
-the cleartext header alongside the existing `x3dhInit` subobject.
+message Alice sends in the new session carries her signing pubkey in a
+cleartext header alongside an `x3dhInit` subobject.
+
+The header lives in a NEW outer wire layer (`WireFrame`) wrapping the
+existing `EncryptedMessage`, NOT inside the encrypted `MessagePayload`.
+The recipient cannot decrypt without an established session, and the
+session itself is what `x3dhInit` is here to bootstrap — so the
+bootstrap inputs must travel in cleartext alongside the ciphertext, not
+inside it.
 
 ```kotlin
-// MessagePayload extension (additive — old fields untouched)
-data class MessagePayload(
-    /* ...existing fields... */
-
+// shared/core/messaging/WireFrame.kt — wraps EncryptedMessage, lives
+// inside the relay's existing opaque `payload` field. Relay sees only
+// base64(JSON(WireFrame)); it does not parse or interpret either layer.
+data class WireFrame(
+    val encryptedMessage: EncryptedMessage,
     // Set on the FIRST message of a freshly-bootstrapped session.
-    // Carries the X3DH ephemeral pubkey + which OPK was consumed.
-    val x3dhInit: X3DHInitData? = null,
+    val x3dhInit: X3dhInitHeader? = null,
+    // Set on the FIRST message — recipient caches it under peer's
+    // X25519 identity for verifying future SPK rotations.
+    val senderSigningPublicKeyHex: String? = null,
+)
 
-    // Set on the FIRST message of a freshly-bootstrapped session.
-    // Lets the recipient cache the sender's Ed25519 signing pubkey
-    // so future SPK-rotation signatures can be verified.
-    val signingPublicKey: ByteArray? = null,
+data class X3dhInitHeader(
+    val ephemeralPubKeyHex: String,   // initiator's EK_a (X25519, 32 bytes hex)
+    val spkKeyId: Long,                // recipient's targeted SPK
+    val opkKeyIdHex: String? = null,   // recipient's consumed OPK, null if pool empty
 )
 ```
 
-`signingPublicKey` is `null` on every message after the first — once
-the recipient has cached it, retransmission is wasted bytes. Callers
-that need to *re-bootstrap* a session (e.g. after a contact reset) put
-it back in.
+`senderSigningPublicKeyHex` and `x3dhInit` are `null` on every message
+after the first — once the recipient has cached them and the session
+is established, retransmission wastes bytes. Callers that need to
+*re-bootstrap* a session (e.g. after a contact reset or the Alpha 1 →
+Alpha 2 migration) populate them again on the first message of the new
+session.
+
+The `MessagePayload` plaintext is unchanged — its existing fields
+(text, type, sentAt, etc.) continue to carry user-visible message
+content and are encrypted as today.
 
 Caching strategy: `ContactRecord` (or whatever the existing peer-cache
 shape is, TBD when wiring) stores `signingPublicKeyHex` keyed on

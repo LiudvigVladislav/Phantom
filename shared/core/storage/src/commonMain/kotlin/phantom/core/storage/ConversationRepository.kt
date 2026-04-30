@@ -39,6 +39,15 @@ interface ConversationRepository {
 
     /** Toggle conversation pin state — pinned chats sort first. */
     suspend fun setPinned(conversationId: String, pinned: Boolean)
+
+    /** Set or clear the per-conversation needs-rehandshake flag (PR C). */
+    suspend fun setNeedsRehandshake(conversationId: String, needs: Boolean)
+
+    /**
+     * Mark every conversation as needing a re-handshake. Called once by
+     * the Alpha 1 → Alpha 2 migration after wiping ratchet states.
+     */
+    suspend fun markAllNeedsRehandshake()
 }
 
 data class ConversationEntity(
@@ -57,4 +66,14 @@ data class ConversationEntity(
     val identityKeyChangedAt: Long? = null,
     val mutedUntil: Long? = null,
     val pinned: Boolean = false,
+    /**
+     * Set by the Alpha 1 → Alpha 2 migration (PR C). Indicates that the
+     * existing ratchet state for this conversation was wiped during the
+     * cryptographic protocol upgrade and a fresh X3DH 4-DH handshake
+     * must run before the next outbound message ships. Cleared after the
+     * new session is established. Default `false` covers both new
+     * conversations and post-migration ones whose handshake has already
+     * completed.
+     */
+    val needsRehandshake: Boolean = false,
 )
