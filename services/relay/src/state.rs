@@ -3,6 +3,7 @@
 
 use crate::config::RelayConfig;
 use crate::envelope::Envelope;
+use crate::prekeys::PreKeyStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -42,6 +43,11 @@ pub struct AppState {
     pub reports: RwLock<Vec<AbuseReport>>,
     /// Blocked public key prefixes — relay silently drops their messages.
     pub blocklist: RwLock<std::collections::HashSet<String>>,
+    /// X3DH 4-DH prekey bundle storage (ADR-009). Hosts published SPKs +
+    /// OPK pools and serves consume-bundle / status queries. Lives outside
+    /// `store` because the persistence shape and access patterns differ
+    /// (per-identity record, atomic OPK pop, separate jsonl file).
+    pub prekeys: PreKeyStore,
 }
 
 impl AppState {
@@ -58,6 +64,7 @@ impl AppState {
             rate_limiter: RwLock::new(HashMap::new()),
             reports: RwLock::new(persisted),
             blocklist: RwLock::new(blocked),
+            prekeys: PreKeyStore::new(),
         }
     }
 }

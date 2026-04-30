@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Willen LLC
 
-use crate::{envelope::*, error::RelayError, state::{AppState, AbuseReport, RateEntry, append_report_to_disk, append_block_to_disk}};
+use crate::{
+    envelope::*,
+    error::RelayError,
+    prekeys::{
+        DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
+        SignedPreKeyPublicBundle,
+    },
+    state::{
+        append_block_to_disk, append_report_to_disk, AbuseReport, AppState, RateEntry,
+    },
+};
 use subtle::ConstantTimeEq;
 use axum::{
     extract::{
@@ -40,6 +50,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/reports",      get(admin_list_reports))
         .route("/admin/block",        post(admin_block_key))
         .route("/admin/blocklist",    get(admin_list_blocklist))
+        // ── X3DH prekey bundle endpoints (ADR-009) ─────────────────────
+        // No admin token: prekey bundles are public material by design,
+        // but per-identity rate limits inside each handler defeat OPK
+        // drain attacks and abusive publish loops.
+        .route("/prekeys/publish",                post(publish_prekeys))
+        .route("/prekeys/bundle/{identity}",      get(fetch_bundle))
+        .route("/prekeys/status/{identity}",      get(prekey_status))
+        .route("/prekeys/{identity}/opk/{key_id}", delete(delete_opk))
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
@@ -661,4 +679,242 @@ async fn admin_list_blocklist(
     }
     let list: Vec<String> = state.blocklist.read().await.iter().cloned().collect();
     (StatusCode::OK, Json(serde_json::json!({ "count": list.len(), "keys": list }))).into_response()
+}
+
+// ── X3DH prekey endpoints (ADR-009) ──────────────────────────────────────────
+
+/// Per-endpoint rate limit windows.
+///
+/// publish: 10 calls per hour per identity. Tight because publish rotates
+/// SPK + replaces the OPK pool, both relatively heavy storage operations.
+/// A normal client publishes once per pool-replenish (≈ once per ~50 first
+/// contacts), so 10/hour leaves headroom for retries but caps abuse.
+const PUBLISH_RATE_LIMIT: u32 = 10;
+const PUBLISH_RATE_WINDOW_SECS: u64 = 3600;
+
+/// bundle: 60 calls per minute per requester key. Looking up someone's
+/// bundle is the read path that drains OPKs; an attacker spamming the
+/// endpoint can exhaust a victim's pool. The limit is bucketed on the
+/// `?requester=<hex>` query param, falling back to the path identity
+/// when no requester is supplied (best-effort — the relay does not yet
+/// authenticate bundle fetchers; ADR-019 will add a session token).
+const BUNDLE_RATE_LIMIT: u32 = 60;
+const BUNDLE_RATE_WINDOW_SECS: u64 = 60;
+
+const STATUS_RATE_LIMIT: u32 = 60;
+const STATUS_RATE_WINDOW_SECS: u64 = 60;
+
+const DELETE_RATE_LIMIT: u32 = 30;
+const DELETE_RATE_WINDOW_SECS: u64 = 60;
+
+#[derive(serde::Deserialize)]
+struct PublishRequest {
+    identity_pubkey_hex: String,
+    signed_pre_key: SignedPreKeyPublicBundle,
+    /// Up to MAX_OPKS_PER_PUBLISH (100). The bundle replaces the previous
+    /// OPK pool wholesale on each publish.
+    one_time_pre_keys: Vec<OneTimePreKeyPublicBundle>,
+}
+
+async fn publish_prekeys(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PublishRequest>,
+) -> impl IntoResponse {
+    // Rate limit BEFORE signature verify so that a spammer hammering with
+    // garbage payloads still gets bucketed and isn't burning CPU on Ed25519
+    // verifies for free.
+    if !state
+        .prekeys
+        .allow_call(
+            &format!("publish:{}", req.identity_pubkey_hex),
+            PUBLISH_RATE_LIMIT,
+            PUBLISH_RATE_WINDOW_SECS,
+        )
+        .await
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "publish rate limit exceeded" })),
+        )
+            .into_response();
+    }
+    let now_ms = now_millis();
+    match state
+        .prekeys
+        .publish(
+            &req.identity_pubkey_hex,
+            req.signed_pre_key,
+            req.one_time_pre_keys,
+            now_ms,
+        )
+        .await
+    {
+        Ok(stored_count) => {
+            tracing::info!(
+                event = "prekey_publish",
+                identity = %&req.identity_pubkey_hex[..req.identity_pubkey_hex.len().min(16)],
+                opk_count = stored_count,
+                "metadata"
+            );
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "stored_opks": stored_count })),
+            )
+                .into_response()
+        }
+        Err(e) => publish_error_response(e),
+    }
+}
+
+fn publish_error_response(e: PublishError) -> axum::response::Response {
+    let (status, msg) = match e {
+        PublishError::BadIdentity(m) => (StatusCode::BAD_REQUEST, m.to_string()),
+        PublishError::BadSignature(m) => (StatusCode::BAD_REQUEST, m.to_string()),
+        PublishError::BadOpk(m) => (StatusCode::BAD_REQUEST, m.to_string()),
+        PublishError::TooManyOpks(n) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("too many OPKs: {} (max 100)", n),
+        ),
+    };
+    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+async fn fetch_bundle(
+    Path(identity): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Rate-limit on requester key when supplied (Alpha-2 best-effort), else
+    // on the target identity. The latter is intentionally permissive: a
+    // single attacker behind a varying requester header would still be
+    // throttled by `target:<identity>` once OPK drain becomes detectable
+    // through pool depletion. Hardening to a session token: ADR-019.
+    let bucket = match params.get("requester") {
+        Some(r) if !r.is_empty() => format!("bundle-req:{}", r),
+        _ => format!("bundle-tgt:{}", identity),
+    };
+    if !state
+        .prekeys
+        .allow_call(&bucket, BUNDLE_RATE_LIMIT, BUNDLE_RATE_WINDOW_SECS)
+        .await
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "bundle rate limit exceeded" })),
+        )
+            .into_response();
+    }
+    match state.prekeys.consume_bundle(&identity).await {
+        Some(bundle) => {
+            tracing::info!(
+                event = "prekey_consume",
+                identity = %&identity[..identity.len().min(16)],
+                had_opk = bundle.one_time_pre_key.is_some(),
+                "metadata"
+            );
+            (StatusCode::OK, Json::<PreKeyBundle>(bundle)).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no published prekeys for this identity" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn prekey_status(
+    Path(identity): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let bucket = match params.get("requester") {
+        Some(r) if !r.is_empty() => format!("status-req:{}", r),
+        _ => format!("status-tgt:{}", identity),
+    };
+    if !state
+        .prekeys
+        .allow_call(&bucket, STATUS_RATE_LIMIT, STATUS_RATE_WINDOW_SECS)
+        .await
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "status rate limit exceeded" })),
+        )
+            .into_response();
+    }
+    let now_ms = now_millis();
+    let s: PreKeyStatus = state.prekeys.status(&identity, now_ms).await;
+    (StatusCode::OK, Json(s)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteOpkRequest {
+    /// Wall-clock millisecond timestamp the client signed. Verified inside
+    /// a 5-minute window to blunt off-the-wire replay; see prekeys.rs.
+    timestamp_ms: i64,
+    /// 64-byte Ed25519 detached signature, hex-encoded.
+    signature_hex: String,
+}
+
+async fn delete_opk(
+    Path((identity, key_id)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeleteOpkRequest>,
+) -> impl IntoResponse {
+    if !state
+        .prekeys
+        .allow_call(
+            &format!("delete:{}", identity),
+            DELETE_RATE_LIMIT,
+            DELETE_RATE_WINDOW_SECS,
+        )
+        .await
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "delete rate limit exceeded" })),
+        )
+            .into_response();
+    }
+    let now_ms = now_millis();
+    match state
+        .prekeys
+        .delete_opk(&identity, &key_id, req.timestamp_ms, &req.signature_hex, now_ms)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                event = "prekey_delete_opk",
+                identity = %&identity[..identity.len().min(16)],
+                "metadata"
+            );
+            (StatusCode::NO_CONTENT, ()).into_response()
+        }
+        Err(e) => match e {
+            DeleteError::BadIdentity(m) | DeleteError::BadSignature(m) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": m })),
+            )
+                .into_response(),
+            DeleteError::TimestampOutOfWindow => (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "timestamp outside 5-minute tolerance window" }),
+                ),
+            )
+                .into_response(),
+            DeleteError::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "opk not found" })),
+            )
+                .into_response(),
+        },
+    }
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

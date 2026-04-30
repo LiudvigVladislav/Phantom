@@ -30,6 +30,23 @@ pub struct RelayConfig {
 }
 
 impl RelayConfig {
+    /// Deterministic config for integration tests. Mirrors `from_env`
+    /// but ignores the surrounding shell environment so tests don't pick
+    /// up stray `RELAY_*` vars set by a developer's terminal session.
+    pub fn from_env_for_test() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 0,
+            max_payload_bytes: 65_536,
+            envelope_ttl_secs: 7 * 24 * 3600,
+            max_envelopes_per_recipient: 500,
+            secret_token: None,
+            fcm_server_key: None,
+            rate_limit_per_window: 60,
+            rate_limit_window_secs: 60,
+        }
+    }
+
     pub fn from_env() -> Self {
         Self {
             host: std::env::var("RELAY_HOST").unwrap_or_else(|_| "0.0.0.0".into()),

@@ -55,6 +55,13 @@ Thumbs.db
 services/target/
 target/
 
+# Relay runtime persistence (jsonl append-only state — regenerated from
+# wire on next publish). Same family as reports.jsonl / blocklist.txt
+# already kept out of git.
+services/relay/prekeys.jsonl
+services/relay/reports.jsonl
+services/relay/blocklist.txt
+
 # Logs
 *.log
 npm-debug.log*
