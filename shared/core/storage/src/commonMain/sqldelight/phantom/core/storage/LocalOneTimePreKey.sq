@@ -1,0 +1,30 @@
+CREATE TABLE local_one_time_pre_key (
+    key_id_hex TEXT NOT NULL PRIMARY KEY,
+    public_key_hex TEXT NOT NULL,
+    private_key_hex TEXT NOT NULL,
+    uploaded_at_ms INTEGER NOT NULL
+);
+
+getByKeyId:
+SELECT * FROM local_one_time_pre_key WHERE key_id_hex = ?;
+
+getAll:
+SELECT * FROM local_one_time_pre_key ORDER BY uploaded_at_ms ASC;
+
+countAll:
+SELECT COUNT(*) FROM local_one_time_pre_key;
+
+insert:
+INSERT INTO local_one_time_pre_key(
+    key_id_hex,
+    public_key_hex,
+    private_key_hex,
+    uploaded_at_ms
+)
+VALUES (?, ?, ?, ?);
+
+deleteByKeyId:
+DELETE FROM local_one_time_pre_key WHERE key_id_hex = ?;
+
+clearAll:
+DELETE FROM local_one_time_pre_key;

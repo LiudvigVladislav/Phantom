@@ -1,0 +1,64 @@
+-- 13.sqm — local prekey storage + needs_rehandshake flag (PR C, ADR-009).
+--
+-- Three additions:
+--
+-- 1. local_signed_pre_key: the user's own current Signed PreKey + private
+--    half + an optional "previous" generation kept for the 14-day rotation
+--    retention window (matches the relay's StoredPreKeyState shape). One
+--    row per device — a singleton keyed on `id = 1`, mirroring the
+--    identity table pattern (one local identity per install in Alpha 2).
+--
+-- 2. local_one_time_pre_key: the user's own pool of OPK keypairs.
+--    The relay assigned key_id_hex (16 bytes random) at publish time;
+--    that ID round-trips back inside the recipient's MessagePayload.
+--    x3dhInit subobject so we can find the matching private half.
+--
+-- 3. conversation.needs_rehandshake: set by the migration flow to flag
+--    every existing conversation whose Alpha 1 ratchet state was wiped.
+--    The chat list shows a "needs re-handshake" indicator; the next
+--    outbound message in such a conversation triggers the X3DH 4-DH
+--    bootstrap path even if a (pre-migration) ratchet state somehow
+--    still exists.
+--
+-- Why store private halves as hex on disk:
+--   This is the same encoding choice as identity.dh_private_key_hex —
+--   SQLDelight is set up for TEXT columns, SQLCipher already provides
+--   at-rest encryption on Android, and Keystore-wrap sits in PR E (F8).
+--   Keeping consistency with identity makes the future Keystore migration
+--   uniform.
+
+CREATE TABLE local_signed_pre_key (
+    -- Singleton row marker: always 1. Forward-compat for multi-identity
+    -- (Beta+) is handled by extending this column to identity_pubkey_hex.
+    id INTEGER NOT NULL PRIMARY KEY,
+    key_id INTEGER NOT NULL,
+    public_key_hex TEXT NOT NULL,
+    private_key_hex TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    -- Ed25519 detached signature, hex-encoded. 64 bytes raw, 128 hex chars.
+    signature_hex TEXT NOT NULL,
+    -- Previous-generation SPK kept for the 14-day rotation retention
+    -- window. Inflight handshakes initiated against the just-rotated
+    -- SPK still complete.
+    previous_key_id INTEGER,
+    previous_public_key_hex TEXT,
+    previous_private_key_hex TEXT,
+    previous_signature_hex TEXT,
+    previous_created_at_ms INTEGER,
+    previous_retired_at_ms INTEGER
+);
+
+CREATE TABLE local_one_time_pre_key (
+    -- 16-byte server-assigned ID, hex-encoded (32 chars). PRIMARY KEY so
+    -- the recipient bootstrap path can look up the matching private half
+    -- in O(1).
+    key_id_hex TEXT NOT NULL PRIMARY KEY,
+    public_key_hex TEXT NOT NULL,
+    private_key_hex TEXT NOT NULL,
+    -- Wall-clock when this OPK was successfully published to the relay.
+    -- Lifecycle service uses it to age out OPKs the relay forgot
+    -- (rare; relay restarts re-publish).
+    uploaded_at_ms INTEGER NOT NULL
+);
+
+ALTER TABLE conversation ADD COLUMN needs_rehandshake INTEGER NOT NULL DEFAULT 0;

@@ -1,0 +1,37 @@
+CREATE TABLE local_signed_pre_key (
+    id INTEGER NOT NULL PRIMARY KEY,
+    key_id INTEGER NOT NULL,
+    public_key_hex TEXT NOT NULL,
+    private_key_hex TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    signature_hex TEXT NOT NULL,
+    previous_key_id INTEGER,
+    previous_public_key_hex TEXT,
+    previous_private_key_hex TEXT,
+    previous_signature_hex TEXT,
+    previous_created_at_ms INTEGER,
+    previous_retired_at_ms INTEGER
+);
+
+getCurrent:
+SELECT * FROM local_signed_pre_key WHERE id = 1;
+
+upsertCurrent:
+INSERT OR REPLACE INTO local_signed_pre_key(
+    id,
+    key_id,
+    public_key_hex,
+    private_key_hex,
+    created_at_ms,
+    signature_hex,
+    previous_key_id,
+    previous_public_key_hex,
+    previous_private_key_hex,
+    previous_signature_hex,
+    previous_created_at_ms,
+    previous_retired_at_ms
+)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+clearAll:
+DELETE FROM local_signed_pre_key;
