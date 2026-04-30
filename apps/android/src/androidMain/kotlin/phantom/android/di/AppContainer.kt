@@ -281,6 +281,7 @@ class AppContainer(private val context: Context) {
                     }
             }
         }
+
         val service = DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
@@ -325,6 +326,43 @@ class AppContainer(private val context: Context) {
         )
         service.groupMessagingService = groupService
         groupMessagingService = groupService
+
+        // PR C-followup-3: pending-bundle retry sweep. Messages that
+        // tried to send while the peer had no published bundle on the
+        // relay sit in `WAITING_FOR_RECIPIENT_BUNDLE` until either a
+        // WS reconnect (peer just came online and published) or a
+        // ticker tick (peer published but we haven't reconnected).
+        //
+        // The sweep is a no-op when the WAITING set is empty, so a
+        // 60-second cadence is fine even on quiet conversations.
+        appScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(60 * 1000L)
+                runCatching { service.retryWaitingMessages() }
+                    .onFailure {
+                        android.util.Log.w(
+                            "PendingBundleRetry",
+                            "retryWaitingMessages failed: ${it.message}",
+                        )
+                    }
+            }
+        }
+        // Same retry on every WS reconnect — peer who came online
+        // and published their bundle gets their backlog flushed
+        // before the user even notices the message was queued.
+        appScope.launch {
+            transport.state.collect { st ->
+                if (st is phantom.core.transport.TransportState.Connected) {
+                    runCatching { service.retryWaitingMessages() }
+                        .onFailure {
+                            android.util.Log.w(
+                                "PendingBundleRetry",
+                                "retryWaitingMessages on reconnect failed: ${it.message}",
+                            )
+                        }
+                }
+            }
+        }
 
         // Initialise CallManager and wire call-signalling routing.
         val cm = CallManager(
