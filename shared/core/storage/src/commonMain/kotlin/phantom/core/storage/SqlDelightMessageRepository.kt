@@ -132,6 +132,8 @@ class SqlDelightMessageRepository(
             "RELAYED" -> MessageStatus.RELAYED
             "DELIVERED" -> MessageStatus.DELIVERED
             "READ" -> MessageStatus.READ
+            "WAITING_FOR_RECIPIENT_BUNDLE" -> MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE
+            "FAILED" -> MessageStatus.FAILED
             else -> MessageStatus.QUEUED
         }
 }

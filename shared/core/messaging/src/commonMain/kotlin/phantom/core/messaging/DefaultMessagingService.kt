@@ -137,12 +137,7 @@ class DefaultMessagingService(
                 val wireBundle = preKeyApi.fetchBundle(
                     identityPubkeyHex = recipientPublicKeyHex,
                     requesterPubkeyHex = identity.publicKeyHex,
-                ) ?: error(
-                    "encryptUnderLock: peer ${recipientPublicKeyHex.take(16)}… " +
-                        "has no published prekey bundle. They have not migrated " +
-                        "to Alpha 2 yet; the message stays in the outbox until " +
-                        "they come online and publish.",
-                )
+                ) ?: throw PeerBundleMissingException(recipientPublicKeyHex)
                 val pkBundle = PreKeyBundle.fromWire(wireBundle)
                 val bootstrap = sessionManager.initiatorBootstrap(
                     conversationId = conversationId,
@@ -207,17 +202,57 @@ class DefaultMessagingService(
             )
         ).encodeToByteArray()
 
-        val encrypted = encryptUnderLock(
-            conversationId = message.conversationId,
-            recipientPublicKeyHex = message.recipientPublicKeyHex,
-            plaintext = payload,
-        )
-
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-
         val insertedAtMs = Clock.System.now().toEpochMilliseconds()
         val outgoingTimerSecs = conversationRepository.getDisappearingTimer(message.conversationId)
         val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) insertedAtMs + outgoingTimerSecs * 1_000L else null
+
+        // PR C-followup-3: encrypt FIRST (under per-conversation mutex)
+        // and only insert the message into the local store on the
+        // successful path. The pending-bundle case below inserts a
+        // placeholder row so the UI shows the message and the retry
+        // ticker can pick it up later — without that row the user's
+        // message vanishes into a runCatching-swallowed exception.
+        val encrypted = try {
+            encryptUnderLock(
+                conversationId = message.conversationId,
+                recipientPublicKeyHex = message.recipientPublicKeyHex,
+                plaintext = payload,
+            )
+        } catch (e: PeerBundleMissingException) {
+            // Peer has no published prekey bundle yet — either they
+            // haven't installed Alpha 2 + migrated, or their device
+            // hasn't been online to publish, or the relay is missing
+            // the prekey endpoints entirely (server-side deployment
+            // lag). Insert a placeholder row with WAITING status so:
+            //   * UI shows the message immediately (no silent /dev/null)
+            //   * Retry hook in retryWaitingMessages() can pick it up
+            //     later, on WS reconnect or a periodic ticker.
+            messageRepository.insertMessage(
+                MessageEntity(
+                    id = message.id,
+                    conversationId = message.conversationId,
+                    // Empty placeholder ciphertext — never sent over
+                    // the wire from this row. retryWaitingMessages()
+                    // will re-encrypt with a fresh bundle and update
+                    // the row to QUEUED → SENT.
+                    ciphertext = ByteArray(0),
+                    plaintextCache = message.text,
+                    sent = true,
+                    status = MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE,
+                    createdAt = insertedAtMs,
+                    expiresAtMs = outgoingExpiresAtMs,
+                ),
+            )
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "send DEFERRED: peer ${e.recipientPubKeyHex.take(16)}… has no bundle " +
+                    "(404 from /prekeys/bundle). Message saved with WAITING status; " +
+                    "retryWaitingMessages() will retry on next reconnect / ticker tick.",
+            )
+            return@runCatching Unit
+        }
+
+        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
 
         messageRepository.insertMessage(
             MessageEntity(
@@ -673,6 +708,52 @@ class DefaultMessagingService(
         return "${keys[0]}_${keys[1]}"
     }
 
+    /**
+     * Re-attempt every message currently in [MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE].
+     * Called by AppContainer on every WS reconnect and on a periodic
+     * ticker (60-second cadence) so a peer who comes online and
+     * publishes their bundle gets their backlog flushed automatically.
+     *
+     * Each retry calls [sendMessage] again with the original message
+     * id + plaintext. On success the WAITING row is replaced (insertOrIgnore
+     * by id) — to swap the placeholder ciphertext for the real one we
+     * delete-then-reinsert. PR C-followup-3.
+     *
+     * Idempotent: messages that succeed transition out of WAITING; the
+     * next sweep finds nothing to do. Messages that still fail (peer
+     * still has no bundle) stay in WAITING for the next sweep.
+     */
+    override suspend fun retryWaitingMessages(): Result<Int> = runCatching {
+        // Snapshot the WAITING set first so a successful retry that
+        // mutates state doesn't shift the iteration cursor underneath us.
+        val convIds = conversationRepository.getAllConversations()
+            .map { it.id }
+        var attempts = 0
+        for (convId in convIds) {
+            val msgs = messageRepository.getMessages(convId)
+                .filter { it.status == MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE }
+            if (msgs.isEmpty()) continue
+
+            val conv = conversationRepository.getConversation(convId) ?: continue
+            for (m in msgs) {
+                attempts++
+                // Drop the placeholder row first — sendMessage will
+                // re-insert with real ciphertext on success, or
+                // re-insert another WAITING row on continued failure.
+                messageRepository.deleteMessage(m.id)
+                sendMessage(
+                    OutgoingMessage(
+                        id = m.id,
+                        conversationId = conv.id,
+                        recipientPublicKeyHex = conv.theirPublicKeyHex,
+                        text = m.plaintextCache.orEmpty(),
+                    ),
+                )
+            }
+        }
+        attempts
+    }
+
     override suspend fun deleteMessageForBoth(
         messageId: String,
         conversationId: String,
@@ -900,3 +981,19 @@ private fun String.decodeBase64Bytes(): ByteArray = Base64.decode(this)
 
 private fun hexToBytes(hex: String): ByteArray =
     ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+/**
+ * Thrown by [DefaultMessagingService.encryptUnderLock] when the peer
+ * has no published prekey bundle on the relay (404 from
+ * [phantom.core.transport.PreKeyApi.fetchBundle]). The send path catches
+ * this distinctly and stores the message with [phantom.core.storage.MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE]
+ * for later retry. Other encrypt failures (signature verify, malformed
+ * bundle, signing-key mismatch) bubble through as the original
+ * SessionBootstrapException variants. PR C-followup-3.
+ */
+class PeerBundleMissingException(
+    val recipientPubKeyHex: String,
+) : Exception(
+    "peer ${recipientPubKeyHex.take(16)}… has no published prekey bundle " +
+        "(404 from /prekeys/bundle). Message will retry on reconnect.",
+)

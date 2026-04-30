@@ -23,10 +23,26 @@ interface MessageRepository {
 
 enum class MessageStatus {
     QUEUED,
+    /**
+     * Encryption attempted but the recipient has no published prekey
+     * bundle on the relay yet (404 from PreKeyApi.fetchBundle). The
+     * message stays in the outbox; the foreground retry hook re-tries
+     * `sendMessage` periodically. The chat UI surfaces this as a
+     * "Waiting for {contact} to update PHANTOM" indicator.
+     *
+     * PR C-followup-3.
+     */
+    WAITING_FOR_RECIPIENT_BUNDLE,
     SENT,
     RELAYED,
     DELIVERED,
     READ,
+    /**
+     * Send permanently failed for a non-retryable reason (encrypt
+     * threw on something other than missing peer bundle). Surfaced
+     * in the chat UI with a retry-by-tap indicator. PR C-followup-3.
+     */
+    FAILED,
 }
 
 data class MessageEntity(
