@@ -36,6 +36,10 @@ class SqlDelightSenderKeyRepository(
             db.senderKeyStoreQueries.deleteSenderKeysForGroup(groupId)
         }
 
+    override suspend fun deleteAll(): Unit = withContext(Dispatchers.IO) {
+        db.senderKeyStoreQueries.deleteAllSenderKeys()
+    }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------

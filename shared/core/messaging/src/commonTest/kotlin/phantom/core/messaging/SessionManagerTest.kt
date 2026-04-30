@@ -83,6 +83,7 @@ class SessionManagerTest {
         override suspend fun deleteRatchetState(conversationId: String) {
             store.remove(conversationId)
         }
+        override suspend fun deleteAll() { store.clear() }
         fun isPersisted(conversationId: String): Boolean = store.containsKey(conversationId)
     }
 

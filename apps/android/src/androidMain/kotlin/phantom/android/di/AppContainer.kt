@@ -55,6 +55,16 @@ class AppContainer(private val context: Context) {
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Alpha 1 → Alpha 2 migration manager. Set by [initMessaging] so
+     * the launch path can route to MigrationScreen when
+     * [phantom.core.messaging.MigrationManager.needsMigration] returns
+     * true. Null until initMessaging runs (i.e. before the user has an
+     * IdentityRecord, which is the no-op path for migration anyway).
+     */
+    @Volatile var migrationManager: phantom.core.messaging.MigrationManager? = null
+        private set
+
     // ── Storage ───────────────────────────────────────────────────────────────
     private val driverFactory = DatabaseDriverFactory(context)
     private val dbHolder = PhantomDatabaseHolder(driverFactory)
@@ -180,6 +190,23 @@ class AppContainer(private val context: Context) {
         val preKeyApi = phantom.core.transport.PreKeyApiClient(
             httpClient = phantom.core.transport.createHttpClient(),
             relayBaseUrl = relayHttpBase,
+        )
+
+        // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2
+        // upgrade. Inspected by the launch path (`needsMigration()`);
+        // executed when the user taps Continue on MigrationScreen.
+        // Lives on AppContainer alongside DMS so the Activity can
+        // reach it before normal messaging starts.
+        migrationManager = phantom.core.messaging.MigrationManager(
+            identityManager = identityManager,
+            identityCrypto = sessionManagerIdentityCrypto,
+            signedPreKeyRepository = signedPreKeyRepo,
+            oneTimePreKeyRepository = oneTimePreKeyRepo,
+            ratchetStateRepository = ratchetRepo,
+            senderKeyRepository = senderKeyRepo,
+            conversationRepository = conversationRepo,
+            preKeyApi = preKeyApi,
+            x3dh = x3dh,
         )
         val service = DefaultMessagingService(
             identity = identity,

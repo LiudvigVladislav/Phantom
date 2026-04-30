@@ -182,6 +182,7 @@ private class FakeRatchetStateRepository : RatchetStateRepository {
     override suspend fun getRatchetState(conversationId: String) = store[conversationId]
     override suspend fun upsertRatchetState(conversationId: String, stateBlob: String) { store[conversationId] = stateBlob }
     override suspend fun deleteRatchetState(conversationId: String) { store.remove(conversationId) }
+    override suspend fun deleteAll() { store.clear() }
 }
 
 /**
@@ -219,6 +220,7 @@ private class PreSeededRatchetStateRepository(
         store[conversationId] = stateBlob
     }
     override suspend fun deleteRatchetState(conversationId: String) { store.remove(conversationId) }
+    override suspend fun deleteAll() { store.clear() }
 }
 
 /**

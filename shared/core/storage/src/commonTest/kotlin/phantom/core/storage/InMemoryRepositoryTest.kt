@@ -193,6 +193,8 @@ private class FakeRatchetStateRepository : RatchetStateRepository {
     override suspend fun deleteRatchetState(conversationId: String) {
         store.remove(conversationId)
     }
+
+    override suspend fun deleteAll() { store.clear() }
 }
 
 // ---------------------------------------------------------------------------
