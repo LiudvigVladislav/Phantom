@@ -35,34 +35,35 @@ private val sharedOkHttpClient: OkHttpClient = OkHttpClient.Builder()
     // detection still triggers forceCancelAllEngineCalls() on pong timeout —
     // see KtorRelayTransport.startPing().
     .pingInterval(0, TimeUnit.SECONDS)
-    // readTimeout is the OS-level backstop: if the kernel socket is silent
-    // for this long, OkHttp throws SocketTimeoutException, webSocket{}
-    // block exits, and runReconnectLoop opens a fresh session.
-    //
-    // History:
-    //   60 s — too lax: when Tecno HiOS parked the Wi-Fi radio,
-    //          dispatcher.cancelAll() did NOT unblock the native read,
-    //          so the kernel sat in recv() for the full minute. User
-    //          saw "messages don't send until I restart the app".
-    //   12 s — too aggressive: ping/pong RTT on real mobile networks is
-    //          frequently >2 s; a 10 s ping interval + 2 s jitter ate
-    //          the 12 s window and the socket was killed every cycle.
-    //          User saw a permanent reconnect storm.
-    //   25 s — compromise. Tolerates ~2 ping intervals' worth of jitter
-    //          (10 + 10 + jitter) so a healthy socket survives, but
-    //          dead-socket recovery is still well under the 60 s prior.
-    //          Combined with the existing 25 s app-level Pong timeout
-    //          this gives roughly co-equal detection paths.
-    //
-    // Voice messages (~270 KB envelopes today) need their write to
-    // complete inside this window; if a slow uplink can't push the
-    // payload in 25 s the send will be re-queued by ackWatchdog. Long
-    // term: chunk voice messages so each fragment fits comfortably.
-    .readTimeout(25, TimeUnit.SECONDS)
+    // readTimeout is the OS-level backstop only. After ADR-010 the
+    // primary recovery path on pong timeout is connectionPool.evictAll()
+    // (see forceCancelAllEngineCalls below) which closes the underlying
+    // TCP socket and unblocks the kernel recv() within milliseconds.
+    // readTimeout is the last-resort fallback for the unlikely case
+    // where evictAll() does not propagate; 60 s is generous enough that
+    // it does NOT chop healthy connections during Wi-Fi-to-cellular
+    // handovers or large in-flight envelopes.
+    .readTimeout(60, TimeUnit.SECONDS)
     .build()
 
 actual fun forceCancelAllEngineCalls() {
-    runCatching { sharedOkHttpClient.dispatcher.cancelAll() }
+    // ADR-010: dispatcher.cancelAll() is a no-op once a WebSocket has
+    // been upgraded — OkHttp removes the Call from its dispatcher right
+    // after the 101 handshake, so the running-calls list is empty and
+    // there is nothing to cancel. The actual reader thread is parked
+    // in a kernel recv() on the underlying TCP socket and only unblocks
+    // when that socket's file descriptor is closed.
+    //
+    // connectionPool.evictAll() walks the pool and closes every
+    // connection's socket directly, which causes recv() to return
+    // immediately, the reader to exit, the Ktor incoming channel to
+    // close, the suspended webSocket{} block to return, and
+    // runReconnectLoop to enter its next iteration within milliseconds.
+    //
+    // The pool object itself is not destroyed — the next webSocket()
+    // call allocates a fresh connection into it normally. This makes
+    // the singleton sharedOkHttpClient safe across reconnect cycles.
+    runCatching { sharedOkHttpClient.connectionPool.evictAll() }
 }
 
 actual fun createHttpClient(): HttpClient = HttpClient(OkHttp) {
