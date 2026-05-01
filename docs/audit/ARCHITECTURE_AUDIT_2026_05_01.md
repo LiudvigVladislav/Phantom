@@ -467,8 +467,252 @@ new state) not `enabled` (the old state). Currently accidentally correct.
 | F-13 | Medium   | Messaging          | Rare: two delivery pipelines if race on startReceiving |
 | F-14 | Low      | PreKey             | SPK keypair not persisted before network publish      |
 | F-15 | Low      | Calls              | toggleMute logic accidentally correct but semantically wrong |
+| F-16 | Critical | Messaging/Crypto   | Zombie pre-migration envelope loops forever; MAC always fails |
+| F-17 | High     | Messaging/Relay    | Relay redelivers permanently undecryptable envelope every reconnect |
 
 ---
 
-*End of audit. No production code was written. All findings are based on static analysis
-of the committed source as of 2026-05-01.*
+*End of original audit. Supplemental section appended below.*
+
+---
+
+## Supplemental: QA Incident 2026-05-01 — Envelope id=0e8780fb-175
+
+Added: 2026-05-01. Source: QA logs from Caddy-fix session (phone → emulator).
+
+### Plain-language summary
+
+A message sent at 09:22 from the phone is being delivered by the relay to the emulator
+on every reconnect, all the way to 14:53 and beyond. Every delivery attempt fails with
+the same error: "MAC verification error." The emulator cannot decrypt it. The relay never
+gets the confirmation it needs to delete the envelope, so it keeps delivering it in an
+infinite loop. After 5 hours of testing that envelope was still looping.
+
+There are two separate problems: why the emulator cannot decrypt it (Issue A), and why
+the relay keeps trying to deliver it forever (Issue B).
+
+---
+
+### Issue A — Root cause diagnosis: why the emulator cannot decrypt envelope 0e8780fb-175
+
+**Five hypotheses evaluated against the code:**
+
+**Hypothesis 5 — PR C / Alpha-2 migration aftermath (MOST LIKELY, confidence: high)**
+
+PR C wiped every session on both devices and bootstrapped fresh Alpha-2 sessions. The
+phone generated envelope 0e8780fb-175 at 09:22:08. The relay stored it. The emulator
+received it later — but by then the emulator's ratchet state had been bootstrapped from
+a *different* first message (one that carried an `x3dhInit` header). The emulator's
+receiving chain is now positioned AFTER the key position that was used to encrypt
+0e8780fb-175. The Double Ratchet in this codebase has no skipped-message-key cache
+(confirmed: `RatchetState.kt` lines 11-12 explicitly notes this limitation). There is
+no way to recover a key from a position the chain has already advanced past.
+
+Evidence: (a) the emulator log shows "Session loaded" — a fresh Alpha-2 session exists;
+(b) the envelope was sent at 09:22 but first appeared in the emulator log at 14:53,
+meaning 5+ hours passed during which other traffic established the ratchet state;
+(c) every retry fails with the exact same error, which rules out a transient state
+problem — the key is permanently gone.
+
+**Hypothesis 1 — Double-send with advanced ratchet (SECOND MOST LIKELY, confidence: medium)**
+
+`sendMessage` calls `encryptUnderLock`, which calls `ratchet.encrypt(state, plaintext)`
+and then `saveSession(conversationId, newState)`. The chain key advances on every call.
+The transport layer's `pendingOutbox` re-tries the already-encrypted wire bytes
+(`sendRaw`) — it does NOT call `encryptUnderLock` again. So transport retries are safe.
+
+However: if the Caddy reconnect dropped the connection between `sendRaw` attempts, and
+the phone also triggered `retryWaitingMessages()` (which calls `sendMessage()` again with
+the same message id), a SECOND encryption would be produced from a further-advanced chain
+key. The DB guards against duplicate `insertMessage` by id, but `encryptUnderLock` itself
+has no idempotency guard by `messageId` — calling it twice for the same id produces two
+different ciphertexts from different chain positions.
+
+The emulator would advance past the first key (if it received any other message in between),
+leaving the second ciphertext undecryptable.
+
+This scenario requires the message to have been in `WAITING_FOR_RECIPIENT_BUNDLE` status
+to trigger `retryWaitingMessages`. The evidence does not confirm this, so Hypothesis 5
+is ranked higher — but both can be simultaneously true.
+
+**Hypothesis 2 — Session bootstrap mismatch (LOW LIKELIHOOD)**
+
+Both sides use `deriveConversationId` = `sorted(myPubKey, theirPubKey).joinToString("_")`.
+The SessionManager's `initiatorBootstrap` and `recipientBootstrap` both take
+`localIdentityKeyPair` and peer identity as inputs to `X3DHProtocol`. Roles (initiator
+vs recipient) are determined by which side calls which method, not by key ordering alone.
+The QR scan flow determines who calls `initiatorBootstrap`. This is a structural concern
+but the logs confirm a session was loaded and the same key position fails every time,
+which is inconsistent with a pure bootstrap mismatch (that would fail on the first
+message, not 5 hours later with a chain that has advanced).
+
+**Hypothesis 3 — Ratchet state save race (LOW LIKELIHOOD)**
+
+The per-conversation `Mutex` in `DefaultMessagingService` (lines 94-100) correctly
+serialises all `loadSession → encrypt/decrypt → saveSession` sequences. A race is
+not structurally possible given the mutex is held for the entire load-decrypt-save
+sequence.
+
+**Hypothesis 4 — Storage corruption (LOW LIKELIHOOD)**
+
+`saveSession` calls `ratchetStateRepository.upsertRatchetState()` — a single SQL upsert.
+SQLDelight + SQLCipher provide atomic writes at the row level. A torn write would corrupt
+the entire row (JSON blob), which would surface as a `SerializationException` on next
+load, not a MAC error on decrypt.
+
+---
+
+**Immediate action required for Issue A**
+
+The root cause is structural: there is no skipped-message-key cache. This was a known
+Alpha-0 constraint (noted in `RatchetState.kt`). The migration between Alpha-1 and Alpha-2
+left zombie envelopes in the relay store that were encrypted under a now-unreachable chain
+key position. These envelopes can never be decrypted. They cannot be "fixed" without
+re-encryption from the sender.
+
+The fix has two parts:
+
+1. **Relay-side (urgent):** After PR C deployed, the relay should have flushed all
+   envelopes older than the migration timestamp. It did not. A one-time relay-side command
+   to purge all envelopes with a `created_at` earlier than the Alpha-2 deploy time (approx
+   2026-04-28 per commit history) would clear the zombie queue for all affected users.
+   This is a relay operations task, not a code change.
+
+2. **Code-side (Phase 2):** Implement a skipped-message-key cache in `RatchetState` (add a
+   `skippedMessageKeys: Map<Pair<ByteArrayKey, Int>, ByteArray>` field with a bounded size,
+   typically max 1000 entries per the Signal spec). This enables out-of-order delivery and
+   eliminates this class of failure for future migrations or reorder events.
+
+---
+
+### Issue B — Why the relay keeps redelivering a permanently failed envelope
+
+**How the loop works:**
+
+`handleDeliver` calls `ratchet.decrypt()`. That throws `IllegalArgumentException` (MAC
+error). The exception is caught by the `.onFailure` block at line 785 of
+`DefaultMessagingService.kt`. Logging happens. The function returns. `sendDeliveryAck`
+is never called. The relay does not know delivery failed. On the next reconnect the relay
+re-emits the stored envelope from its in-memory store. `handleDeliver` runs again. Same
+result. Infinite loop.
+
+The existing idempotency guard (`getMessageById(deliver.messageId) != null`) only fires
+if the message was *successfully* stored. A message that failed decrypt is never stored,
+so the guard never trips.
+
+**Why the code deliberately avoids acking on unknown failures (see comments at lines
+466-474):** an earlier version silently acked on any parse failure and was found to eat
+legitimate user data. The current design is conservative: do not ack unless you know
+what you are looking at. This is the right policy in general but it has no carve-out for
+the one case where acking is safe: a hard cryptographic failure with no possible recovery.
+
+**Recommended fix for Issue B:**
+
+Add a `dead_letter_envelopes` table to the local database with columns:
+`envelope_id TEXT PRIMARY KEY, conversation_id TEXT, failure_reason TEXT, failed_at INTEGER, payload_preview TEXT`.
+
+In `handleDeliver`, add a new catch branch specifically for `IllegalArgumentException`
+where `message` contains "MAC verification error". The branch should:
+1. Insert a row into `dead_letter_envelopes` with the envelope id and truncated payload
+   preview (first 80 bytes of the raw payload, for diagnostics).
+2. Call `transport.sendDeliveryAck(deliver.messageId)` to break the redeliver loop.
+3. Log at ERROR level: "Permanently undecryptable envelope ack'd to dead-letter:
+   id=... Relay will no longer redeliver. Row written to dead_letter_envelopes."
+
+Safety considerations:
+- This is explicit data loss. The message is gone. The `dead_letter_envelopes` row is
+  the audit trail. A future "Help & Feedback" screen can surface dead-letter entries to
+  the user ("1 message could not be decrypted — it may be from before an update").
+- Only trigger on MAC failure (which is a hard cryptographic verdict from libsodium, not
+  a transient condition). Do not trigger on parse errors (`SerializationException`) or
+  network errors — those are potentially recoverable.
+- The `dead_letter_envelopes` table must be included in the SQLCipher database (same
+  encryption boundary as messages). Do not write dead-letter rows to a plaintext log.
+- Do not show a per-message error banner in the chat UI. One aggregate notice in Settings
+  is enough.
+
+**Layer affected:** `shared/core/messaging` (feature layer) and
+`shared/core/storage` (core layer — new table migration required).
+
+---
+
+### Sprint reprioritisation
+
+The in-flight PR sprints are:
+- **Track A (1-5 Reliability sprint):** F-01 (QUEUED retry), F-04 (crash window),
+  F-09 (drain on disconnect), F-11 (relay persistence), F-08 (bootstrap gate).
+- **Track B (Security sprint):** P1 security blockers from the 2026-04-27 audit.
+
+**F-16 and F-17 (this incident) do not block Track B.** The security findings are
+independent of the ratchet-state-position problem.
+
+**F-16 and F-17 partially overlap with Track A:**
+- The relay-side zombie flush (Issue A fix 1) should be inserted as an urgent ops task
+  before the next QA session. It requires no code change — just a relay admin command.
+  Estimated effort: 15 minutes on the relay host.
+- The `dead_letter_envelopes` fix (Issue B) is a small, bounded feature: one new SQL
+  table migration, one new catch branch in `handleDeliver`, no interface changes. It can
+  be added to the Track A sprint as item A-6 without affecting the other items.
+- The skipped-message-key cache (Issue A fix 2) is Phase 2 scope. It is not a Kickstarter
+  blocker because the zombie-flush ops task clears the immediate symptom and no
+  Alpha-2 user should be generating cross-migration envelopes after the relay is flushed.
+
+**Recommended priority order for next session:**
+1. Relay ops: flush pre-migration envelopes (no code, 15 min).
+2. Track B security sprint (unblocked).
+3. Track A item A-6: dead-letter table + ack-on-MAC-failure (small, safe, kills the loop).
+4. Track A items A-1 through A-5 in original order.
+
+---
+
+### F-16 — CRITICAL: Zombie pre-migration envelope permanently undecryptable; ratchet has no key cache
+
+**Files:**
+`shared/core/crypto/src/commonMain/kotlin/phantom/core/crypto/RatchetState.kt` (lines 11-12, no skipped-key cache)
+`shared/core/crypto/src/commonMain/kotlin/phantom/core/crypto/LibsodiumDoubleRatchet.kt` (decrypt, no skipped-key lookup)
+
+**Failure scenario:** PR C migration wiped all local ratchet sessions. The relay's
+in-memory store was not flushed. Envelopes encrypted under the old (Alpha-1) chain key
+position remained in the relay store. After migration the receiver bootstrapped a fresh
+session from a subsequent first-message exchange. The old envelope was then delivered to
+a chain key position that no longer exists locally. MAC verification fails permanently.
+The Double Ratchet implementation has no skipped-message-key cache (explicit design note
+in `RatchetState.kt`), so there is no recovery path.
+
+**Root cause:** Intentional Alpha-0 simplification (no skipped-key cache) combined with
+relay not flushing pre-migration envelopes on deploy.
+
+**Recommended fix:**
+- Immediate (ops): flush relay envelope store of all envelopes with `created_at` before
+  the Alpha-2 migration deployment date.
+- Future (code): implement Signal-spec skipped-message-key cache in `RatchetState` and
+  `LibsodiumDoubleRatchet.decrypt`. Bounded to 1000 entries per session. Phase 2 scope.
+
+---
+
+### F-17 — HIGH: Relay redelivers permanently undecryptable envelope every reconnect; no dead-letter path
+
+**Files:**
+`shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt`
+(handleDeliver, lines 785-795 — onFailure block does not ack)
+`shared/core/storage` — no dead_letter_envelopes table exists
+
+**Failure scenario:** Any envelope that causes `ratchet.decrypt()` to throw (MAC error,
+corrupt state) is logged but never ack'd. The relay receives no ack-deliver, keeps the
+envelope in its store, and redelivers it on every reconnect. The emulator received and
+failed to decrypt envelope 0e8780fb-175 at least seven times across a 5-hour window.
+Each attempt advances no ratchet state (the exception fires before `saveSession`) but
+consumes a network round trip and burns log space.
+
+**Root cause:** The `onFailure` handler in `handleDeliver` has no carve-out for hard
+cryptographic failures that are permanently unrecoverable. The conservative no-ack-on-unknown
+policy (correct in general) has no exception for MAC failures.
+
+**Recommended fix:** Add `dead_letter_envelopes` table (schema above). In the `onFailure`
+block, detect `IllegalArgumentException` with message containing "MAC verification error"
+and ack-deliver the envelope after writing to `dead_letter_envelopes`. No code change to
+the relay is needed.
+
+---
+
+*Supplemental section added 2026-05-01. No production code was written.*
