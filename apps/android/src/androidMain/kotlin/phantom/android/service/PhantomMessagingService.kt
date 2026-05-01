@@ -132,6 +132,16 @@ class PhantomMessagingService : Service() {
                     "tokenSet=${BuildConfig.RELAY_TOKEN != null} " +
                     "myPubKey=${myPubKey.take(16)}…",
             )
+            // ADR-011: schedule the AlarmManager wakeup BEFORE entering
+            // the suspending connect loop. connect() doesn't return until
+            // disconnect() is called — if we scheduled after, the alarm
+            // would never be set up. Idempotent: re-schedules replace.
+            val exactGranted = PhantomWakeupReceiver.schedule(applicationContext)
+            Log.d(
+                TAG,
+                "AlarmManager keepalive scheduled (exact=$exactGranted, interval=${PhantomWakeupReceiver.WAKEUP_INTERVAL_MS}ms)",
+            )
+
             runCatching {
                 container.transport.connect(
                     relayUrl = BuildConfig.RELAY_URL,
@@ -149,6 +159,9 @@ class PhantomMessagingService : Service() {
     override fun onDestroy() {
         Log.d(TAG, "onDestroy — disconnecting transport")
         super.onDestroy()
+        // ADR-011: cancel the AlarmManager wakeup so we don't keep waking
+        // the device after the user has explicitly stopped the service.
+        runCatching { PhantomWakeupReceiver.cancel(applicationContext) }
         releaseKeepAliveLocks()
         serviceScope.launch {
             runCatching { (application as PhantomApplication).container.transport.disconnect() }

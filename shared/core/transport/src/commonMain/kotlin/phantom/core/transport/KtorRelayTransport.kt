@@ -566,4 +566,34 @@ class KtorRelayTransport(
     }
 
     override fun isConnected(): Boolean = _state.value is TransportState.Connected
+
+    // ADR-011: AlarmManager wakeup uses this to decide whether to force a
+    // reconnect. lastPongMark starts at the construction-time markNow() so
+    // the very first alarm after cold start (~30-60 s in) will see a
+    // staleness > 25 s if no pong has arrived yet, triggering a reconnect.
+    // That is the desired behaviour — an idle process that never received
+    // a pong should be treated as needing a reconnect, not as healthy.
+    override val lastPongElapsedMs: Long
+        get() = lastPongMark.elapsedNow().inWholeMilliseconds
+
+    override suspend fun forceReconnect() {
+        relayLog(
+            RelayLogLevel.INFO,
+            "forceReconnect() called — cancelling current generation scope so runReconnectLoop opens a fresh socket",
+        )
+        // Do NOT toggle disconnectRequested. We want the reconnect loop to
+        // carry on, just with a new generation. Cancelling scope causes the
+        // current webSocket{} block to exit via cancellation; the finally
+        // block closes the generation client; the outer while loop then
+        // immediately enters its next iteration and calls the factory.
+        scope?.cancel()
+        // Belt-and-suspenders: also call forceShutdownActiveEngine() in
+        // case the scope cancellation does not propagate through the
+        // kernel-blocked reader thread (the original problem ADR-010 ran
+        // into). With AlarmManager's wakeup the radio is already awake, so
+        // the close should propagate cleanly — but the engine kill is
+        // cheap insurance.
+        forceShutdownActiveEngine()
+        runCatching { currentGenerationClient?.close() }
+    }
 }

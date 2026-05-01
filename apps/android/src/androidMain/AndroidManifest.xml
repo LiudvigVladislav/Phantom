@@ -21,6 +21,25 @@
     -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!--
+        ADR-011: AlarmManager-driven periodic wakeup to recover the
+        WebSocket from OEM Wi-Fi-radio parking (Tecno HiOS et al.). Both
+        permissions are declared so we cover the full API range:
+
+        SCHEDULE_EXACT_ALARM is required by Android 12 (API 31) for
+        setExactAndAllowWhileIdle(). Granted automatically at install.
+
+        USE_EXACT_ALARM is required by Android 13+ (API 33+) for the same
+        API. Messenger apps (which PHANTOM is) qualify under Play Console
+        policy and the permission is granted without a user prompt — but
+        users can still revoke it in Settings, in which case
+        AlarmManager.canScheduleExactAlarms() returns false and the
+        scheduling code falls back to setAndAllowWhileIdle (Doze-aware
+        inexact alarm; ~5-15 min latency instead of 30-60 s).
+    -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
     <application
         android:name=".PhantomApplication"
         android:label="PHANTOM"
@@ -74,6 +93,17 @@
 
         <receiver
             android:name=".notifications.QuickReplyReceiver"
+            android:exported="false" />
+
+        <!--
+            ADR-011: AlarmManager wakeup target. Fires every ~30-60 s to
+            check whether the WebSocket pong is still fresh; forces a
+            reconnect via PhantomWakeupReceiver.handleWake() if not.
+            Not exported — only our own AlarmManager schedule path can
+            invoke it.
+        -->
+        <receiver
+            android:name=".service.PhantomWakeupReceiver"
             android:exported="false" />
 
         <provider

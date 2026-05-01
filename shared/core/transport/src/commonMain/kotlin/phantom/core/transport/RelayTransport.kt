@@ -39,4 +39,29 @@ interface RelayTransport {
     suspend fun sendTyping(toPubKeyHex: String): Boolean
 
     fun isConnected(): Boolean
+
+    /**
+     * Milliseconds elapsed since the last Pong frame was received from the
+     * relay. ADR-011 — used by the AlarmManager-driven wakeup receiver to
+     * detect a parked-radio dead WebSocket. A fresh value (< ~25 s) means
+     * the connection is healthy; a stale value means the OS has parked the
+     * Wi-Fi radio and the receiver should call [forceReconnect].
+     *
+     * Initial value (before the first connect) is conventionally large
+     * (effectively "infinitely stale") so the first scheduled alarm fire
+     * after cold start triggers a reconnect attempt.
+     */
+    val lastPongElapsedMs: Long
+
+    /**
+     * Force the current reconnect generation to tear down and start over.
+     * ADR-011 — invoked by [phantom.android.service.PhantomWakeupReceiver]
+     * (Android only) when AlarmManager fires and detects a stale pong.
+     *
+     * Idempotent: cancelling an already-cancelled per-generation scope is
+     * a no-op in coroutines, so concurrent calls (e.g. ack watchdog and
+     * alarm receiver firing within the same second) collapse safely into
+     * a single reconnect.
+     */
+    suspend fun forceReconnect()
 }
