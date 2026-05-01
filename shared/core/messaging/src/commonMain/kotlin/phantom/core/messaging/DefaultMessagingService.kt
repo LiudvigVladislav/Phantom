@@ -388,8 +388,47 @@ class DefaultMessagingService(
                 return@runCatching
             }
 
+            val rawPayloadBytes = deliver.payload.decodeBase64Bytes()
+
+            // Plaintext call-signalling fast-path.
+            //
+            // CallManager (apps/android/.../CallManager.kt) currently sends
+            // call_offer / call_answer / call_ice / call_hangup / call_reject
+            // as a plaintext JSON MessagePayload, base64-encoded with no
+            // padding and no Double Ratchet wrap. Without this branch the
+            // recipient runs the bytes through MessagePadding.unpad and
+            // tries to parse them as a WireFrame — which fails — and the
+            // call never rings on the callee. See user logs 2026-05-01:
+            // the only thing arriving on the callee was a sealed=false
+            // envelope whose preview started with `{"type":"call_offer"`.
+            //
+            // SECURITY DEBT — call signalling SHOULD ride the same E2EE
+            // pipeline as regular messages. SDP currently leaks ICE
+            // candidates / local IPs to the relay in cleartext. Track in a
+            // follow-up PR: CallManager should call sendMessage() and let
+            // DefaultMessagingService wrap it in WireFrame, exactly as
+            // group control messages already do.
+            if (deliver.sealedSender.isEmpty()) {
+                val rawText = rawPayloadBytes.decodeToString()
+                val maybeCall = try {
+                    json.decodeFromString<MessagePayload>(rawText)
+                } catch (_: SerializationException) {
+                    null
+                }
+                if (maybeCall != null && maybeCall.type in MessagePayload.CALL_TYPES) {
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "Plaintext call-signalling envelope: type=${maybeCall.type} " +
+                            "from=${senderPubKeyHex.take(16)}… id=${deliver.messageId.take(12)}…",
+                    )
+                    onCallMessage?.invoke(maybeCall, senderPubKeyHex)
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@runCatching
+                }
+            }
+
             // Unpad ISO 7816-4 padding applied by the sender to hide message length.
-            val ciphertext = MessagePadding.unpad(deliver.payload.decodeBase64Bytes())
+            val ciphertext = MessagePadding.unpad(rawPayloadBytes)
             // PR C commit 11: parse the WireFrame wrapper. Alpha 2 wraps
             // every outbound message in WireFrame; Alpha 1 sent a bare
             // EncryptedMessage. Migration wipes every session so there is
