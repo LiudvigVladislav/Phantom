@@ -16,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.datetime.Clock
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -387,14 +388,91 @@ class DefaultMessagingService(
                 return@runCatching
             }
 
+            val rawPayloadBytes = deliver.payload.decodeBase64Bytes()
+
+            // Plaintext call-signalling fast-path.
+            //
+            // CallManager (apps/android/.../CallManager.kt) currently sends
+            // call_offer / call_answer / call_ice / call_hangup / call_reject
+            // as a plaintext JSON MessagePayload, base64-encoded with no
+            // padding and no Double Ratchet wrap. Without this branch the
+            // recipient runs the bytes through MessagePadding.unpad and
+            // tries to parse them as a WireFrame — which fails — and the
+            // call never rings on the callee. See user logs 2026-05-01:
+            // the only thing arriving on the callee was a sealed=false
+            // envelope whose preview started with `{"type":"call_offer"`.
+            //
+            // SECURITY DEBT — call signalling SHOULD ride the same E2EE
+            // pipeline as regular messages. SDP currently leaks ICE
+            // candidates / local IPs to the relay in cleartext. Track in a
+            // follow-up PR: CallManager should call sendMessage() and let
+            // DefaultMessagingService wrap it in WireFrame, exactly as
+            // group control messages already do.
+            if (deliver.sealedSender.isEmpty()) {
+                val rawText = rawPayloadBytes.decodeToString()
+                val maybeCall = try {
+                    json.decodeFromString<MessagePayload>(rawText)
+                } catch (_: SerializationException) {
+                    null
+                }
+                if (maybeCall != null && maybeCall.type in MessagePayload.CALL_TYPES) {
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "Plaintext call-signalling envelope: type=${maybeCall.type} " +
+                            "from=${senderPubKeyHex.take(16)}… id=${deliver.messageId.take(12)}…",
+                    )
+                    onCallMessage?.invoke(maybeCall, senderPubKeyHex)
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@runCatching
+                }
+            }
+
             // Unpad ISO 7816-4 padding applied by the sender to hide message length.
-            val ciphertext = MessagePadding.unpad(deliver.payload.decodeBase64Bytes())
+            val ciphertext = MessagePadding.unpad(rawPayloadBytes)
             // PR C commit 11: parse the WireFrame wrapper. Alpha 2 wraps
             // every outbound message in WireFrame; Alpha 1 sent a bare
             // EncryptedMessage. Migration wipes every session so there is
             // no Alpha-1 → Alpha-2 cross traffic — anything arriving here
-            // is well-formed WireFrame.
-            val wireFrame = json.decodeFromString<WireFrame>(ciphertext.decodeToString())
+            // SHOULD be well-formed WireFrame.
+            //
+            // Tolerant fallback: if WireFrame parse fails, retry as a bare
+            // EncryptedMessage and wrap. This rescues legacy envelopes
+            // that sat in the relay store across the migration.
+            //
+            // CRITICAL — DO NOT ack on parse failure. Earlier revision
+            // ack'd to break a perceived redeliver loop, but logs from
+            // 2026-05-01 testing showed the "unparseable" envelopes were
+            // actually fresh sealed=false payloads from the peer (delivery
+            // receipts / voice / control msgs) — silent ack ate real
+            // user data. Log a payload preview so we can identify the
+            // unknown format, and let the relay redeliver while we work
+            // out what kind of envelope it is.
+            val ciphertextText = ciphertext.decodeToString()
+            val wireFrame = try {
+                json.decodeFromString<WireFrame>(ciphertextText)
+            } catch (firstErr: SerializationException) {
+                try {
+                    val legacy = json.decodeFromString<phantom.core.crypto.EncryptedMessage>(ciphertextText)
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "Legacy bare EncryptedMessage payload — wrapping into WireFrame: id=${deliver.messageId.take(12)}…",
+                    )
+                    WireFrame(encryptedMessage = legacy)
+                } catch (secondErr: SerializationException) {
+                    val previewLen = minOf(ciphertextText.length, 240)
+                    val preview = ciphertextText.substring(0, previewLen)
+                    messagingLog(
+                        MessagingLogLevel.ERROR,
+                        "Unparseable wire payload (neither WireFrame nor EncryptedMessage) — " +
+                            "NOT ack'ing (relay will redeliver). " +
+                            "id=${deliver.messageId.take(12)}… sealed=${deliver.sealedSender.isNotEmpty()} " +
+                            "totalBytes=${ciphertextText.length} previewBytes=$previewLen " +
+                            "preview=<<<$preview>>> " +
+                            "wireFrameErr=${firstErr.message} legacyErr=${secondErr.message}",
+                    )
+                    return@runCatching
+                }
+            }
             val encrypted = wireFrame.encryptedMessage
 
             val conversationId = deriveConversationId(senderPubKeyHex)
@@ -404,7 +482,7 @@ class DefaultMessagingService(
             // transport.incoming.onEach, but a parallel sendMessage on the same
             // conversation could still observe a half-saved state.
             val mutex = mutexFor(conversationId)
-            val plainBytes = mutex.withLock {
+            val plainBytes: ByteArray? = mutex.withLock {
                 val state = sessionManager.tryLoadSession(conversationId)
                 if (state != null) {
                     // Existing session — decrypt directly. Any x3dhInit /
@@ -428,13 +506,22 @@ class DefaultMessagingService(
                     // bound to attach it on the first message of a new
                     // session.
                     val x3dhInit = wireFrame.x3dhInit
-                        ?: error(
-                            "handleDeliver: no session for conversationId=" +
-                                "${conversationId.take(16)}… and incoming WireFrame " +
-                                "lacks x3dhInit header. Either the peer is on Alpha 1 " +
-                                "(impossible — migration wipes sessions) or the wire " +
-                                "frame is malformed.",
+                    if (x3dhInit == null) {
+                        // Legacy Alpha 1 bare-EncryptedMessage envelope that
+                        // survived the migration in the relay store. We
+                        // cannot decrypt it (session was wiped, no x3dhInit
+                        // means no way to bootstrap). Ack so the relay
+                        // drops it instead of redelivering on every
+                        // reconnect.
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "Legacy envelope: no session for conv=${conversationId.take(16)}… " +
+                                "and no x3dhInit header — ack-deliver'ing to clear relay store: " +
+                                "id=${deliver.messageId.take(12)}…",
                         )
+                        transport.sendDeliveryAck(deliver.messageId)
+                        return@withLock null
+                    }
                     messagingLog(
                         MessagingLogLevel.INFO,
                         "Bootstrapping recipient session: conv=${conversationId.take(24)}…",
@@ -463,6 +550,10 @@ class DefaultMessagingService(
                     decrypted
                 }
             }
+
+            // Legacy/garbage envelope was already ack'd inside withLock —
+            // skip downstream payload processing.
+            if (plainBytes == null) return@runCatching
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
             messagingLog(

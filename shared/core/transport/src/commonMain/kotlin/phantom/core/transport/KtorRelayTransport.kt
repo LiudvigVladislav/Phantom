@@ -27,6 +27,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlin.math.min
@@ -201,7 +202,28 @@ class KtorRelayTransport(
                 // to actually complete before the next iteration creates new
                 // ones. cancel() alone is asynchronous and lets stale pingJobs
                 // race the new connection.
-                generationScope?.coroutineContext?.get(Job)?.cancelAndJoin()
+                //
+                // BUT — cancelAndJoin can hang indefinitely if a child job is
+                // stuck inside an uncooperative suspension (observed on Tecno
+                // HiOS after Wi-Fi radio parking: the OkHttp dispatcher
+                // already cancelled the call, but the per-generation scope's
+                // outgoing actor is still parked waiting for the OS socket to
+                // notice. cancelAndJoin then never returns and the entire
+                // reconnect loop deadlocks for tens of seconds — this is what
+                // shipped as "сообщение не отправляется пока не перезапустишь
+                // приложение" in 2026-05-01 testing). Bound the wait so we
+                // always proceed to the next reconnect attempt.
+                val joined = withTimeoutOrNull(5_000) {
+                    generationScope?.coroutineContext?.get(Job)?.cancelAndJoin()
+                    Unit
+                }
+                if (joined == null) {
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "Generation scope cancelAndJoin timed out (>5s) — proceeding to next reconnect anyway. " +
+                            "Stale jobs may briefly overlap; pingJob captures its own session reference so it will not race the new generation.",
+                    )
+                }
             }
         }
         relayLog(RelayLogLevel.INFO, "Reconnect loop exited (disconnect requested)")
@@ -224,16 +246,18 @@ class KtorRelayTransport(
                         RelayLogLevel.WARN,
                         "Pong timeout (${sinceLastPong}ms without Pong) — forcing reconnect",
                     )
-                    // session.cancel() alone is NOT enough on the OkHttp engine: Ktor's
-                    // OkHttpWebsocketSession.outgoing is an actor whose finally block calls
-                    // websocket.close() (graceful), which blocks on OkHttp's hardcoded
-                    // 60-second CANCEL_AFTER_CLOSE_MILLIS waiting for the server's CLOSE.
-                    // forceCancelAllEngineCalls() goes around the actor by cancelling the
-                    // OkHttp dispatcher's calls directly — this fires onFailure on the
-                    // listener and the actor's finally then sees a failed websocket and
-                    // returns instantly. scope.cancel() stops ackWatchdogJob.
+                    // forceCancelAllEngineCalls() goes around Ktor's outgoing actor by
+                    // cancelling OkHttp dispatcher calls directly — this fires onFailure
+                    // on the listener and the actor's finally then sees a failed
+                    // websocket and returns instantly. We deliberately do NOT call
+                    // mySession.cancel() afterwards: that path goes through Ktor's
+                    // graceful close which can wait for the server's CLOSE frame
+                    // (OkHttp's hardcoded CANCEL_AFTER_CLOSE_MILLIS = 60s) and on
+                    // a half-dead Wi-Fi (Tecno HiOS post-radio-parking) it deadlocks
+                    // the reconnect loop for the full 60s — caused 2026-05-01 issue
+                    // "сообщение не уходит до перезапуска". scope.cancel() stops
+                    // ackWatchdogJob; the OkHttp cancellation tears down the session.
                     forceCancelAllEngineCalls()
-                    mySession?.cancel()
                     scope.cancel()
                     break
                 }
@@ -267,11 +291,10 @@ class KtorRelayTransport(
                     expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
                 }
                 // Force the session closed so the reconnect loop opens a
-                // fresh WebSocket and flushPendingOutbox re-sends them. See the
-                // comment in startPing() above for why forceCancelAllEngineCalls()
-                // is required in addition to session.cancel().
+                // fresh WebSocket and flushPendingOutbox re-sends them. See
+                // the comment in startPing() for why we skip the
+                // mySession.cancel() graceful-close path on Tecno HiOS.
                 forceCancelAllEngineCalls()
-                mySession?.cancel()
                 scope.cancel()
                 break
             }
