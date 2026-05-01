@@ -39,23 +39,26 @@ private val sharedOkHttpClient: OkHttpClient = OkHttpClient.Builder()
     // for this long, OkHttp throws SocketTimeoutException, webSocket{}
     // block exits, and runReconnectLoop opens a fresh session.
     //
-    // Sized at 12 s deliberately, NOT 60 s. Field testing on Tecno Spark Go
-    // (HiOS / Android 12) showed that when the OS parks the Wi-Fi radio for
-    // battery reasons, dispatcher.cancelAll() does NOT propagate into the
-    // native socket reader — it stays blocked on the kernel read until OS
-    // readTimeout fires. With readTimeout=60 the user saw 60–80 s gaps
-    // between "Pong timeout" and reconnect; in the meantime any messages
-    // queued on the dead socket could not be sent and the user had to
-    // restart the app. With readTimeout=12 the dead socket recovers in
-    // ~12 s, ack timeout (60 s) re-queues unacked envelopes onto the
-    // fresh session, and the user sees normal delivery.
+    // History:
+    //   60 s — too lax: when Tecno HiOS parked the Wi-Fi radio,
+    //          dispatcher.cancelAll() did NOT unblock the native read,
+    //          so the kernel sat in recv() for the full minute. User
+    //          saw "messages don't send until I restart the app".
+    //   12 s — too aggressive: ping/pong RTT on real mobile networks is
+    //          frequently >2 s; a 10 s ping interval + 2 s jitter ate
+    //          the 12 s window and the socket was killed every cycle.
+    //          User saw a permanent reconnect storm.
+    //   25 s — compromise. Tolerates ~2 ping intervals' worth of jitter
+    //          (10 + 10 + jitter) so a healthy socket survives, but
+    //          dead-socket recovery is still well under the 60 s prior.
+    //          Combined with the existing 25 s app-level Pong timeout
+    //          this gives roughly co-equal detection paths.
     //
-    // 12 s is safe because the application-level Ping flows every 10 s
-    // and the server immediately responds with a Pong frame, so a healthy
-    // socket sees an incoming frame at least every ~10 s. 12 s is the
-    // tightest setting that still tolerates one missed ping cycle from
-    // brief jitter.
-    .readTimeout(12, TimeUnit.SECONDS)
+    // Voice messages (~270 KB envelopes today) need their write to
+    // complete inside this window; if a slow uplink can't push the
+    // payload in 25 s the send will be re-queued by ackWatchdog. Long
+    // term: chunk voice messages so each fragment fits comfortably.
+    .readTimeout(25, TimeUnit.SECONDS)
     .build()
 
 actual fun forceCancelAllEngineCalls() {
