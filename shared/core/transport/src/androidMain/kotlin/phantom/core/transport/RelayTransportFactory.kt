@@ -8,6 +8,7 @@ import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.websocket.WebSockets
 import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 
 // Singleton OkHttpClient — exposed so KtorRelayTransport can call
 // dispatcher.cancelAll() to forcibly tear down a hung WebSocket on
@@ -44,6 +45,25 @@ private val sharedOkHttpClient: OkHttpClient = OkHttpClient.Builder()
     // it does NOT chop healthy connections during Wi-Fi-to-cellular
     // handovers or large in-flight envelopes.
     .readTimeout(60, TimeUnit.SECONDS)
+    // Force HTTP/1.1 only for the WebSocket upgrade.
+    //
+    // Why: ADR-010 (2026-05-01) fix relied on connectionPool.evictAll()
+    // closing the TCP socket and unblocking the kernel recv(). That
+    // assumes one TCP connection per WebSocket — which is true for
+    // HTTP/1.1. With HTTP/2 (RFC 8441 WS-over-H2) one TCP connection
+    // multiplexes many streams, the pool entry is a long-lived h2
+    // connection, and evictAll() does not have the same effect on the
+    // already-upgraded WS stream. Real-device QA on Tecno HiOS
+    // (2026-05-01) confirmed the original ADR-010 fix did not help —
+    // analysis traced this to the relay (`relay.phntm.pro`) advertising
+    // h2 + h3 via ALPN; OkHttp's default protocol list is `[h2,
+    // http/1.1]` so we were upgrading via h2.
+    //
+    // Locking ALPN to HTTP/1.1 here keeps the pool semantics clean and
+    // makes the evictAll() reset path actually work. Cost: marginal —
+    // we open one TCP per WS session, but we have one persistent WS per
+    // app anyway.
+    .protocols(listOf(Protocol.HTTP_1_1))
     .build()
 
 actual fun forceCancelAllEngineCalls() {
@@ -63,7 +83,29 @@ actual fun forceCancelAllEngineCalls() {
     // The pool object itself is not destroyed — the next webSocket()
     // call allocates a fresh connection into it normally. This makes
     // the singleton sharedOkHttpClient safe across reconnect cycles.
-    runCatching { sharedOkHttpClient.connectionPool.evictAll() }
+    //
+    // Observability: log connection counts before/after so QA logs make
+    // it obvious whether evictAll() actually closed anything. After APK
+    // 11 we still saw multi-minute hangs — the count log will tell us
+    // whether the hang is upstream (we never called evictAll) or
+    // downstream (we called it but the OS socket did not unblock).
+    runCatching {
+        val before = sharedOkHttpClient.connectionPool.connectionCount()
+        val idleBefore = sharedOkHttpClient.connectionPool.idleConnectionCount()
+        sharedOkHttpClient.connectionPool.evictAll()
+        val after = sharedOkHttpClient.connectionPool.connectionCount()
+        android.util.Log.w(
+            "PhantomRelay",
+            "forceCancelAllEngineCalls: pool connections before=$before " +
+                "(idle=$idleBefore) → after=$after — evictAll() invoked"
+        )
+    }.onFailure {
+        android.util.Log.e(
+            "PhantomRelay",
+            "forceCancelAllEngineCalls FAILED: ${it::class.simpleName}: ${it.message}",
+            it,
+        )
+    }
 }
 
 actual fun createHttpClient(): HttpClient = HttpClient(OkHttp) {

@@ -200,19 +200,12 @@ class KtorRelayTransport(
             } finally {
                 // Cancel the previous generation's coroutines and WAIT for them
                 // to actually complete before the next iteration creates new
-                // ones. cancel() alone is asynchronous and lets stale pingJobs
-                // race the new connection.
-                //
-                // BUT — cancelAndJoin can hang indefinitely if a child job is
-                // stuck inside an uncooperative suspension (observed on Tecno
-                // HiOS after Wi-Fi radio parking: the OkHttp dispatcher
-                // already cancelled the call, but the per-generation scope's
-                // outgoing actor is still parked waiting for the OS socket to
-                // notice. cancelAndJoin then never returns and the entire
-                // reconnect loop deadlocks for tens of seconds — this is what
-                // shipped as "сообщение не отправляется пока не перезапустишь
-                // приложение" in 2026-05-01 testing). Bound the wait so we
-                // always proceed to the next reconnect attempt.
+                // ones. Bounded by withTimeoutOrNull so a non-cooperative
+                // suspension does not deadlock the reconnect loop.
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "webSocket{} block exited — entering finally block, cancelling generation scope",
+                )
                 val joined = withTimeoutOrNull(5_000) {
                     generationScope?.coroutineContext?.get(Job)?.cancelAndJoin()
                     Unit
@@ -222,6 +215,11 @@ class KtorRelayTransport(
                         RelayLogLevel.WARN,
                         "Generation scope cancelAndJoin timed out (>5s) — proceeding to next reconnect anyway. " +
                             "Stale jobs may briefly overlap; pingJob captures its own session reference so it will not race the new generation.",
+                    )
+                } else {
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "Generation scope cancelled — looping for next reconnect attempt",
                     )
                 }
             }
