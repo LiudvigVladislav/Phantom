@@ -141,3 +141,68 @@ If `sendRaw` fails on any item during the post-reconnect flush, that item is log
 3. **Is `WIFI_MODE_FULL_HIGH_PERF` actually being granted on Tecno HiOS / Android 12?** The `WifiLock.acquire()` call is wrapped in `runCatching` and logs a warning on failure but does not stop the service. On HiOS, `WIFI_MODE_FULL_HIGH_PERF` may be silently downgraded or ignored. If radio parking still occurs after this ADR's fix is applied, the WifiLock should be investigated. Confirm with `adb shell dumpsys wifi | grep -i phantom`.
 
 4. **`sendRaw` called on a dead session returns `true`.** During the stall window (pong timeout fired, socket is dead, reconnect has not completed), `sendRaw` calls `session?.send(Frame.Text(...))`, which calls OkHttp's `RealWebSocket.send()`. On a half-dead socket this enqueues into OkHttp's outgoing buffer and returns `true` without throwing. The ACK watchdog correctly handles this case (requeues on timeout), but the false `true` return from `sendRaw` causes `send()` to NOT re-enqueue the message in the outbox. The message is then only in `pendingAcks` and will be recovered by the ack watchdog at `ACK_TIMEOUT_MS` (60 s). This is the correct recovery path, but it means the user sees a "sending" indicator for up to 60 s even after the fix. If that is unacceptable, `sendRaw` should also return `false` when `_state.value !is TransportState.Connected` — but that change must be coordinated with the ACK watchdog to avoid double-tracking. Flag for Alpha-2.
+
+---
+
+## Addendum — Updated 2026-05-01: Original Recommendation Was Wrong; Option (A) Adopted
+
+Status: superseded-in-place. The recommended fix above (`connectionPool.evictAll()`) was implemented in APK 12 and **did not fix the hang**. Real-device QA on Tecno HiOS produced this log entry:
+
+```
+forceCancelAllEngineCalls: pool connections before=2 (idle=1) → after=1 — evictAll() invoked
+[3+ minutes of silence, no reconnect]
+```
+
+The `before=2, idle=1` observation is the key. `evictAll()` only closes **idle** connections — connections that are not currently leased to any caller. The WebSocket connection is an active, leased connection: OkHttp holds it open for the duration of the reader thread's lifetime. `evictAll()` therefore closes the one idle HTTP connection (likely a keep-alive from a previous prekey REST call) and leaves the live WebSocket connection completely untouched. The reconnect loop deadlock continues exactly as before.
+
+### Why `connection.cancel()` is still not enough
+
+OkHttp does expose `RealConnection.cancel()` through its internal API, and this does close the socket at the file-descriptor level on an active connection. However, it is not reachable from a stable public API surface. The only public path that closes an active, upgraded WebSocket connection's socket is to destroy the `OkHttpClient` that owns the connection pool the connection lives in. Calling `client.dispatcher.cancelAll()` was wrong (open question 1 above confirmed: nothing to cancel after 101 upgrade). Calling `client.connectionPool.evictAll()` was wrong (confirmed: skips non-idle connections). The correct primitive is `client.close()` (or equivalently: creating a new client per reconnect and letting the old one be garbage collected after `close()` is called on it, which tears down the dispatcher thread pool and the connection pool together).
+
+### Why per-reconnect OkHttpClient recreation is correct
+
+`OkHttpClient.close()` shuts down:
+- The dispatcher's `ExecutorService` (no more threads are born from it)
+- The `ConnectionPool`'s background cleanup thread
+- Every connection in the pool, including active ones, by closing their sockets
+
+This is the only public OkHttp API that unconditionally closes an active WebSocket connection's underlying socket. Creating a new `OkHttpClient` on each reconnect attempt and calling `close()` on the previous one is therefore the only approach that provides the bounded-time socket teardown guarantee that `forceCancelAllEngineCalls()` is supposed to offer.
+
+The HTTP/1.1 ALPN lock added in APK 12 is correct and should be kept — it prevents OkHttp from negotiating h2 for the WebSocket upgrade (h2 multiplexed streams have different pool semantics). It is orthogonal to the fix described here.
+
+### New contract: Option (A)
+
+**`KtorRelayTransport` takes `httpClientFactory: () -> HttpClient` instead of `httpClient: HttpClient`.**
+
+On each reconnect loop iteration a fresh `OkHttpClient` (wrapped in a fresh Ktor `HttpClient`) is created at the top of the `try` block. After the `webSocket{}` block exits (for any reason — clean close, exception, or cancellation), `httpClient.close()` is called in the `finally` block. This tears down the OkHttp connection pool and dispatcher for that generation, which closes the socket, which unblocks the kernel `recv()`, which lets the `webSocket{}` block return within milliseconds.
+
+`forceCancelAllEngineCalls()` as a top-level `expect fun` is **removed**. The pong watchdog and ack watchdog no longer call it. Instead they call `generationClient.close()` directly on the per-generation client reference, which they receive via the generation scope's structured hierarchy. The bounded-teardown guarantee is now provided by the client lifecycle rather than a best-effort dispatcher/pool call.
+
+#### Singleton fate
+
+The `sharedOkHttpClient` singleton in `androidMain/RelayTransportFactory.kt` is **split into two**:
+
+- **WS client**: no singleton. Created per reconnect attempt by the factory lambda. Closed in the `finally` block.
+- **REST client** (used by `PreKeyApiClient`): retains a singleton-style instance. `PreKeyApiClient` is instantiated once in `AppContainer.initMessaging()` and holds its own `HttpClient` for the lifetime of the app. This client does not need the forced-teardown behaviour — REST calls are short-lived and not subject to the reader-thread park problem. It keeps the same `OkHttpClient.Builder` configuration (HTTP/1.1 ALPN, no ping, 60 s readTimeout) but is constructed independently, not shared with the WS factory.
+
+#### Summary of changes required
+
+| File | Change |
+|---|---|
+| `commonMain/RelayTransportFactory.kt` | Replace `expect fun createHttpClient(): HttpClient` with `expect fun createHttpClientFactory(): () -> HttpClient`. Remove `expect fun forceCancelAllEngineCalls()`. |
+| `androidMain/RelayTransportFactory.kt` | Remove `sharedOkHttpClient` singleton. Implement `createHttpClientFactory()` returning a lambda that builds a fresh `OkHttpClient` + Ktor `HttpClient` on each call. Remove `actual fun forceCancelAllEngineCalls()`. Keep HTTP/1.1 ALPN and 60 s readTimeout in the builder. |
+| `iosMain/RelayTransportFactory.kt` | Rename `createHttpClient()` to factory, remove `forceCancelAllEngineCalls()` stub. |
+| `jvmMain/RelayTransportFactory.kt` | Same rename, remove stub. |
+| `KtorRelayTransport.kt` | Constructor changes from `httpClient: HttpClient` to `httpClientFactory: () -> HttpClient`. `runReconnectLoop` creates `var generationClient: HttpClient? = null` at the top of each iteration. `finally` block calls `generationClient?.close()` before proceeding. Remove calls to `forceCancelAllEngineCalls()` in `startPing` and `startAckWatchdog`. Those functions call `generationClient.close()` instead (reference passed in or captured). |
+| `AppContainer.kt` | Wire `transport = KtorRelayTransport(createHttpClientFactory())`. The `PreKeyApiClient` instantiation keeps its own `createHttpClient()` call (or a new `createRestHttpClient()` alias). |
+
+#### Open questions resolved by this addendum
+
+- Open question 1 (evictAll timing): **closed — evictAll does not close active connections**.
+- Open question 2 (HTTP/1.1 vs HTTP/2 pool semantics): **closed — HTTP/1.1 lock is confirmed correct and kept; but the real fix is client recreation, not pool management**.
+
+#### New open questions for QA after the fix
+
+1. Does `HttpClient.close()` on the per-generation Ktor client block the calling coroutine for any meaningful duration on HiOS? If it parks the coroutine for longer than ~200 ms while the dispatcher shutdown completes, the `finally` block may need to run close on a dedicated IO dispatcher context rather than the reconnect coroutine's thread. Confirm with a timestamp log around the `close()` call.
+2. Does creating one `OkHttpClient` per reconnect cycle on HiOS cause any GC pressure or memory churn visible in Profiler? Each client allocates a thread pool; on aggressive-OEM devices with constrained heap, this could be visible. Measure in APK 13 with Android Profiler during a rapid reconnect storm (simulate by toggling airplane mode 5 times in 30 s).
+3. The REST client (`PreKeyApiClient`) now owns a completely independent `OkHttpClient`. Both clients will hold separate connection pools and separate dispatcher thread pools. Confirm total thread count does not exceed system limits on HiOS. Expected: 2 dispatcher threads (one per client) + 2 pool cleanup threads = 4 additional threads total. Should be fine but worth a `adb shell ps -T` check.

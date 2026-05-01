@@ -1,0 +1,474 @@
+# PHANTOM Android — Architecture Audit 2026-05-01
+
+Auditor: PHANTOM Project Architect (Claude Sonnet 4.6)
+Scope: reliability, lifecycle, delivery correctness
+Status: pre-Kickstarter Alpha-1 build; ADR-010 (evictAll fix) already merged
+
+---
+
+## Plain-Language Summary (for the founder)
+
+Five things most likely to break next, ordered by how often a user will notice:
+
+1. **Voice messages never arrive on the other device.** A voice note is one giant base64
+   blob (~300 KB after encoding). The relay enforces `max_payload_bytes` and the relay
+   store also has a per-recipient cap of `max_envelopes_per_recipient`. If the voice note
+   exceeds either limit it is silently dropped with no error shown to the sender.
+   There is no chunking anywhere in the stack.
+
+2. **"Calling…" stays forever on the caller's screen.** When the callee picks up, the
+   `call_answer` signal goes through the Double Ratchet E2EE pipeline (because
+   `sealedSender` is empty but it IS a real envelope). The relay stores it and live-
+   delivers it — but back on the caller side, `handleAnswer` calls
+   `peerConnection.setRemoteDescription()` whose success callback runs on a WebRTC
+   thread and updates `_activeCall.value`. That update is correct, BUT: if the answer
+   arrives while the caller's `peerConnection` is null (race between WebRTC offer
+   creation and the answer arriving quickly), the state machine stalls in `CALLING`
+   with no recovery path. The callee also has no timeout to un-ring.
+
+3. **First message to a new contact disappears silently.** When the send path calls
+   `encryptUnderLock`, it fetches the peer's bundle and calls
+   `sessionManager.initiatorBootstrap()` which calls `saveSession()` — persisting ratchet
+   state — and THEN the outer function encrypts and inserts the message row. If the
+   device loses power between `saveSession` and `insertMessage`, the ratchet state on
+   disk is one step ahead of any stored message. On restart the next message will decrypt
+   fine, but the original message is gone from local storage and the peer receives it
+   without a corresponding row on the sender's side.
+
+4. **Messages stuck in QUEUED after a reconnect.** The `flushPendingOutbox` loop in
+   KtorRelayTransport reads the in-memory `pendingOutbox`. If `sendRaw` fails for any
+   entry, that entry is logged and discarded — the loop does not re-enqueue it. Messages
+   whose DB row is already `QUEUED` (from a previous run or a transport failure) are
+   never re-submitted by any background job; only messages in
+   `WAITING_FOR_RECIPIENT_BUNDLE` get retried. A message stuck in `QUEUED` across a
+   process restart is stranded forever.
+
+5. **SQLCipher passphrase breaks permanently after a biometric-change or factory reset
+   of the secure element.** The passphrase is encrypted by a Keystore key created with
+   `setUnlockedDeviceRequired(true)`. Enrolling a new fingerprint, removing the lock
+   screen, or performing a partial factory reset can invalidate the key without deleting
+   the SharedPreferences entry. The next app launch calls `getOrCreatePassphrase`, which
+   tries to decrypt the stored bytes, gets a `KeyPermanentlyInvalidatedException`, and
+   crashes the database open. There is no recovery path — the user loses all message
+   history silently with no error shown.
+
+---
+
+## Findings
+
+---
+
+### F-01 — CRITICAL: flushPendingOutbox silently drops items on sendRaw failure; QUEUED messages are never retried after process restart
+
+**File:** `shared/core/transport/src/commonMain/kotlin/phantom/core/transport/KtorRelayTransport.kt`
+Lines 487–522 (`flushPendingOutbox`), lines 390–425 (`send`)
+
+**Failure scenario:** User sends a message while the socket is briefly transitioning.
+The envelope enters `pendingOutbox`. On reconnect, `flushPendingOutbox` drains the list
+but `sendRaw` returns false for one item (session just died again mid-flush). The item
+is logged and the loop continues with the next item — the failed item is gone.
+Separately, if the process is killed while an envelope is in the in-memory `pendingOutbox`
+(common: Android kills background service), the envelope disappears entirely.
+The DB row stays `QUEUED` but nothing in the codebase ever re-submits `QUEUED` rows.
+`retryWaitingMessages` only touches `WAITING_FOR_RECIPIENT_BUNDLE`.
+
+**Root cause:** `flushPendingOutbox` does not re-enqueue failed items (line 514–520).
+`pendingOutbox` is not persisted. There is no background job that reads `QUEUED` rows
+from the DB and calls `transport.send()` again.
+
+**Recommended fix:** On `sendRaw` failure inside `flushPendingOutbox`, push the item
+back to the front of `pendingOutbox` and break out of the flush (the session is dead;
+next reconnect will retry). Separately, add a startup sweep in `initMessagingFromStorage`
+that reads all `QUEUED` messages from the DB and re-submits them via `transport.send()`.
+
+---
+
+### F-02 — CRITICAL: SQLCipher passphrase permanently lost on Keystore key invalidation; no recovery path
+
+**File:** `shared/core/storage/src/androidMain/kotlin/phantom/core/storage/DatabasePassphraseManager.kt`
+Lines 33–48 (`getOrCreatePassphrase`), line 65 (`setUnlockedDeviceRequired(true)`)
+
+**Failure scenario:** User enrols a new fingerprint, removes and re-adds a PIN, or
+triggers a partial factory reset that wipes the secure element. Android invalidates the
+`phantom_db_passphrase_key` Keystore key. On next launch, `getOrCreatePassphrase` calls
+`decrypt(storedBytes)`, which throws `KeyPermanentlyInvalidatedException` (or on older
+APIs, `javax.crypto.BadPaddingException`). The exception propagates into
+`DatabaseDriverFactory.createDriver()`, crashing the database open. All message history
+and session state become inaccessible. There is no migration, wipe-and-restart, or
+user-visible error message.
+
+**Root cause:** The Keystore key carries `setUnlockedDeviceRequired(true)`, which ties
+it to the current biometric enrollment. No error handling exists around `decrypt()` in
+`getOrCreatePassphrase` for the case where decryption fails due to key invalidation.
+
+**Recommended fix:** Wrap `decrypt()` in a try/catch that catches
+`KeyPermanentlyInvalidatedException` and `BadPaddingException`. On invalidation, generate
+a new passphrase and a new Keystore key, delete the old encrypted entry, and show the
+user a one-time warning that history was lost due to security key change. This is
+unavoidable — the old ciphertext is unrecoverable — but the app must not crash silently.
+
+---
+
+### F-03 — CRITICAL: Caller stuck in CALLING forever — call_answer race when peerConnection is null
+
+**File:** `apps/android/src/androidMain/kotlin/phantom/android/calls/CallManager.kt`
+Lines 213–229 (`handleAnswer`)
+
+**Failure scenario:** User reports "caller still shows Calling after callee picks up."
+The `call_answer` signal arrives on the caller's side via `handleDeliver` fast-path
+(plaintext, `sealedSender.isEmpty()`). `handleAnswer` is called. It reads
+`_activeCall.value` (non-null, state = CALLING) and then calls
+`peerConnection?.setRemoteDescription(...)`. `peerConnection` can be null if `startCall`
+was interrupted between creating the `ActiveCall` state (line 97) and calling
+`createPeerConnection` (line 99) — for example, if `createPeerConnection` threw because
+`peerConnectionFactory` was null (race with `initialize()` not yet complete). In that
+case `setRemoteDescription` is a no-op, the success callback never fires, and
+`_activeCall` stays in `CALLING` until the caller manually hangs up.
+
+There is also no ring timeout on the caller side — if the callee never answers (device
+offline, dismissed notification), the caller's UI stays in `CALLING` indefinitely.
+
+**Root cause:** No null-guard before `peerConnection?.setRemoteDescription`; no
+call-ring timeout coroutine.
+
+**Recommended fix:** In `handleAnswer`, if `peerConnection == null`, log and transition
+to `ENDED`. Add a ring-timeout coroutine in `startCall` (e.g. 60 seconds) that calls
+`cleanupCall(CallState.ENDED)` if still in `CALLING` state.
+
+---
+
+### F-04 — HIGH: Ratchet state persisted before message row — crash window causes ghost session advance
+
+**File:** `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt`
+Lines 143–149, then lines 258–269 (`sendMessage`)
+`shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/SessionManager.kt`
+Line 171 (`saveSession` inside `initiatorBootstrap`)
+
+**Failure scenario:** Alice sends the first message to Bob. Inside `encryptUnderLock`,
+`initiatorBootstrap` is called, which calls `saveSession()` (line 171 of SessionManager),
+persisting the ratchet state to the DB. Control returns to `encryptUnderLock`. Then
+`sendMessage` calls `messageRepository.insertMessage()`. If the process dies in the
+window between these two DB writes, the ratchet state on disk shows "first message sent"
+but there is no message row. On restart the next send uses the already-advanced chain
+key, producing correct ciphertext from the ratchet's perspective, but Alice's local
+history shows no record of the first message ever being attempted.
+Separately on Bob's side: he receives the first message and bootstraps his session
+successfully. But if the relay redelivers the same envelope (no ack was sent because
+Alice's app died), Bob's duplicate guard (`getMessageById`) catches it and skips it —
+correct. However, Alice's ratchet is now ahead of the relay's envelope store by one
+step. The second message Alice sends decrypts fine on Bob's side.
+This is not a decryption failure, but it is a silent message loss from the sender's
+conversation history.
+
+**Root cause:** `saveSession` is called inside `initiatorBootstrap` (before the envelope
+is inserted). There is no transactional guarantee linking the ratchet state write and the
+message row write.
+
+**Recommended fix:** In `encryptUnderLock`, do not persist the bootstrapped state
+immediately inside `initiatorBootstrap`. Instead, return the `RatchetState` without
+writing it, then write both the message row and the ratchet state in a single SQLDelight
+transaction. This requires exposing a transactional path in `SessionManager` and
+`MessageRepository`. Medium refactor but eliminates the crash window.
+
+---
+
+### F-05 — HIGH: Voice messages silently dropped at relay payload or store cap
+
+**File:** `services/relay/src/routes.rs` lines 355–364 (store capacity check)
+`apps/android/src/androidMain/kotlin/phantom/android/calls/CallManager.kt` — no
+audio-message handling; voice goes through DefaultMessagingService as inline text.
+`shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt`
+lines 198–204 (`sendMessage` — no chunking)
+
+**Failure scenario:** A voice note is base64-inlined into the `MessagePayload.text`
+field and sent as a single WireFrame envelope. A 10-second voice note at 16 kHz / 16-bit
+mono / Opus (typical mobile codec) is ~20–40 KB compressed, but the codebase stores raw
+PCM or AAC and base64-encodes it, making the final payload 3–4x larger.
+The relay's `max_payload_bytes` is a configurable value. If the encoded envelope exceeds
+it, `RequestBodyLimitLayer` (line 77 of routes.rs) returns 413 BEFORE the send handler
+runs. The client gets an HTTP-level error in the WS frame write path, `sendRaw` returns
+false (exception caught silently), the item is re-enqueued, and retries indefinitely
+without ever succeeding. The user sees the message stuck in a sending state forever.
+
+Even if the payload fits within `max_payload_bytes`, if the recipient's store is at
+`max_envelopes_per_recipient`, the envelope is dropped at line 364 with a server-side
+warning log and no client-side notification.
+
+**Root cause:** No chunking. No size validation before send. No client-side cap check.
+No user-visible error when the relay rejects with 413.
+
+**Recommended fix (structural):** Voice messages must not be inlined in the text field.
+Define a maximum inline attachment size (suggested: 64 KB post-padding). Anything larger
+must either be chunked across multiple envelopes or moved to an out-of-band upload flow
+(Phase 2 scope). For Alpha-1, add a pre-send size check in `sendMessage` that fails fast
+with a user-visible error rather than queuing an unsendable envelope.
+
+---
+
+### F-06 — HIGH: sessionMutexes map leaks one Mutex per peer forever
+
+**File:** `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt`
+Lines 95–99 (`mutexFor`)
+
+**Failure scenario:** Every conversation the user has ever opened adds one `Mutex` to
+`sessionMutexes`. The map is never cleaned. On a device used for months with hundreds of
+conversations, this is a trivial memory leak in absolute terms (~40 bytes per entry).
+However, the structural concern is that `sessionMutexes` is keyed by `conversationId`
+(a deterministic string derived from two public keys), and the map is a
+`mutableMapOf<String, Mutex>` held in process memory. If a contact is deleted and their
+conversation is wiped from the DB, the orphan mutex remains in the map. This is currently
+harmless but will cause confusion if a future path tries to infer "is this conversation
+active" from the mutex map.
+
+**Root cause:** `getOrPut` pattern with no eviction. No lifecycle hook removes entries
+when a conversation is deleted.
+
+**Recommended fix:** Add a `removeConversationMutex(conversationId: String)` method
+called from the conversation-delete path. Since this is a non-urgent memory issue, a
+weekly sweep that removes keys absent from the DB is also acceptable.
+
+---
+
+### F-07 — HIGH: Incoming call screen shows pubkey prefix instead of username (confirmed)
+
+**File:** `apps/android/src/androidMain/kotlin/phantom/android/di/AppContainer.kt`
+Lines 378–379 (`fromUsername = conversationRepo.getConversation(fromPubKeyHex)?.theirUsername ?: fromPubKeyHex.take(8)`)
+
+**Failure scenario:** User reported: incoming call screen shows first 8 hex characters
+of the caller's pubkey instead of their username. This is confirmed by the code.
+`getConversation(fromPubKeyHex)` uses `fromPubKeyHex` as the conversation `id` lookup,
+but the conversation `id` is the deterministic sorted-concat of BOTH keys
+(`deriveConversationId` in DMS), not the peer's pubkey alone. The lookup therefore always
+returns null for callers, falling back to `fromPubKeyHex.take(8)`.
+
+**Root cause:** AppContainer uses the peer pubkey as the lookup key, but
+`SqlDelightConversationRepository.getConversation` queries `WHERE id = ?` and `id` is
+the two-pubkey derivation, not the peer pubkey alone.
+
+**Recommended fix:** Change the lookup in `onCallMessage` wiring to
+`conversationRepo.getConversation(deriveConversationId(myPubKeyHex, fromPubKeyHex))`.
+Since `deriveConversationId` is private to `DefaultMessagingService`, either expose a
+utility function in a shared module or add a `getConversationByPeerKey(peerPubHex)` query
+to `SqlDelightConversationRepository` that queries `WHERE their_public_key_hex = ?`.
+
+---
+
+### F-08 — HIGH: PreKeyLifecycleService bootstrap window — user can send/receive before prekeys are published
+
+**File:** `apps/android/src/androidMain/kotlin/phantom/android/di/AppContainer.kt`
+Lines 255–263 (`bootstrapForNewIdentity` launched as fire-and-forget)
+
+**Failure scenario:** On first launch after onboarding, `initMessaging` is called and
+`bootstrapForNewIdentity` is launched in `appScope` as a fire-and-forget coroutine.
+`messagingService` is set immediately after (line 390), before the bootstrap coroutine
+has completed. If the user switches back to a chat and sends a message in the same
+instant, `encryptUnderLock` runs while `bootstrapForNewIdentity` is still in-flight,
+possibly competing over `signedPreKeyRepository.upsert()`. More concretely, the incoming
+side: if Alice sends a message and Bob's device receives it before `bootstrapForNewIdentity`
+has published Bob's bundle, Alice's `encryptUnderLock` gets a 404 and puts the message in
+`WAITING_FOR_RECIPIENT_BUNDLE`. This is handled correctly. However if the bootstrap is
+slow (relay latency, cold start), and a peer has cached Bob's old bundle (from Alpha-1),
+the 4-DH handshake will fail because the old bundle no longer has valid local keypairs
+(migration wiped them). The error bubbles as a `SessionBootstrapException.SpkNotFound`
+and the peer's message is permanently undeliverable — it is logged, not ack'd, so the
+relay redelivers it on every reconnect until TTL.
+
+**Root cause:** `bootstrapForNewIdentity` is async and not awaited before
+`messagingService` is exposed to callers. No serialization between bootstrap completion
+and the first allow-send.
+
+**Recommended fix:** In `initMessaging`, await `bootstrapForNewIdentity()` before setting
+`messagingService`. Gate the UI's ability to send a first message behind a
+`preKeyLifecycle.bootstrapForNewIdentity()` completion signal (can be a
+`MutableStateFlow<Boolean>` on AppContainer).
+
+---
+
+### F-09 — HIGH: disconnect() does not drain in-flight envelopes; in-memory outbox lost on service stop
+
+**File:** `shared/core/transport/src/commonMain/kotlin/phantom/core/transport/KtorRelayTransport.kt`
+Lines 538–547 (`disconnect`)
+
+**Failure scenario:** User force-swipes the app or Android kills the foreground service
+for battery reasons. `onDestroy` calls `disconnect()`. `disconnect()` sets
+`disconnectRequested = true`, cancels jobs, cancels the scope, and calls `session.close()`.
+Any envelopes in `pendingOutbox` (e.g., message typed during a brief connection hiccup)
+are discarded. The DB rows remain `QUEUED` but (per F-01) are never retried on next start.
+
+**Root cause:** `disconnect()` does not drain `pendingOutbox` before closing. There is no
+flush-before-disconnect path.
+
+**Recommended fix:** Before cancelling the scope in `disconnect()`, attempt a best-effort
+`flushPendingOutbox()` with a short timeout (e.g. 3 seconds). This pairs with the F-01
+fix — once QUEUED rows are retried on startup, this becomes less critical.
+
+---
+
+### F-10 — MEDIUM: ICE candidates may arrive before offer is processed and be silently queued against the wrong peerConnection
+
+**File:** `apps/android/src/androidMain/kotlin/phantom/android/calls/CallManager.kt`
+Lines 231–241 (`handleIce`)
+
+**Failure scenario:** Because call signals are plaintext and go through the same relay
+queue, the relay may deliver `call_ice` frames before `call_offer` if the offer was
+queued from a previous session and ICE arrives live. `handleIce` checks
+`peerConnection?.remoteDescription != null`; if false, it buffers in `pendingIceCandidates`.
+But `pendingIceCandidates` is a plain `mutableListOf` with no size bound and no
+expiration. If an ICE frame arrives before `handleOffer` is called (because the offer
+is still in the relay store from a prior disconnected attempt), `pendingIceCandidates`
+accumulates stale candidates that will be applied to the wrong `PeerConnection` instance
+when the next call starts.
+
+**Root cause:** `pendingIceCandidates` is not cleared when no active call exists.
+`handleOffer` does not clear the list before setting up the new session.
+
+**Recommended fix:** In `handleOffer` (line 151), clear `pendingIceCandidates` before
+setting `_activeCall.value`. Add a `callId` check in `handleIce` so candidates from a
+prior call session (different `callId`) are discarded rather than queued.
+
+---
+
+### F-11 — MEDIUM: Relay store is in-memory only; all queued envelopes lost on relay process restart
+
+**File:** `services/relay/src/routes.rs` lines 155–175 (in-memory store flush on connect)
+Referenced in `state.rs` (not read, but store is an in-memory HashMap per the Arc<AppState> pattern)
+
+**Failure scenario:** The relay restarts (deploy, OOM, crash). All pending envelopes for
+offline recipients are lost. Recipients who were offline at relay restart never receive
+those messages. The sender's DB shows `QUEUED` or `SENT` status with no error. No retry
+from the sender occurs (F-01).
+
+**Root cause:** The relay's envelope store is an in-memory `HashMap`. There is no
+persistence layer (no SQLite, no Redis, no write-ahead log).
+
+**Recommended fix (structural):** This is a known Alpha limitation. For Kickstarter
+demo safety: add SQLite persistence to the relay store (one table: envelopes with TTL).
+This is the single highest-leverage reliability fix for the relay side before demos.
+Flagged as "needs implementation before public Beta" per ADR scope.
+
+---
+
+### F-12 — MEDIUM: KeystoreManager identity key has no setUnlockedDeviceRequired; DatabasePassphraseManager does
+
+**File:** `apps/android/src/androidMain/kotlin/phantom/android/security/KeystoreManager.kt`
+Line 38 (TODO comment, no `setUnlockedDeviceRequired`)
+`shared/core/storage/src/androidMain/kotlin/phantom/core/storage/DatabasePassphraseManager.kt`
+Line 65 (`setUnlockedDeviceRequired(true)`)
+
+**Failure scenario:** The identity private key (DH key) is encrypted with a Keystore
+key that does NOT require the device to be unlocked, while the database passphrase key
+DOES require it. This creates an asymmetry: after a biometric change, the database
+becomes inaccessible (passphrase key invalidated, F-02) but the identity key Keystore
+entry survives. On recovery, a new passphrase is generated and a new empty database is
+opened — but the identity private key can still be decrypted from the old DB entry that
+is now in an inaccessible database. This combination of partial invalidation creates
+a confusing state where the identity appears to load (from the old ciphertext, which
+was decrypted before the DB open) but there are no messages and no conversations.
+
+**Root cause:** Inconsistent `setUnlockedDeviceRequired` policy between the two
+Keystore key provisioners.
+
+**Recommended fix:** Make both Keystore keys consistent. Either both require unlock
+(preferred for security) or neither does. If `setUnlockedDeviceRequired(true)` is
+applied to the identity key, devices without a lock screen will fail to generate the key
+— add a runtime check for `KeyguardManager.isDeviceSecure()` before provisioning.
+
+---
+
+### F-13 — MEDIUM: startReceiving() is not idempotent at the flow-collection level
+
+**File:** `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt`
+Lines 313–335 (`startReceiving`)
+
+**Failure scenario:** `startReceiving` guards with `if (receiving) return`, sets
+`receiving = true`, then launches `transport.incoming.onEach {...}.launchIn(scope)`.
+If `onStartCommand` and an Activity `LaunchedEffect` both call `startReceiving` on
+the same `DefaultMessagingService` instance in a race before either has set `receiving`
+to true (e.g., two coroutines call the suspend function simultaneously), two collectors
+are launched. Every inbound envelope is then processed twice: two ratchet decrypts of
+the same ciphertext, where the second decrypt will fail MAC verification and produce an
+error log, but not before the first decrypt advances the chain state. The
+`activeProcessing` set in `handleDeliver` prevents the duplicate from completing (the
+second caller sees the ID already present), but the lock contention is a silent race that
+depends on coroutine scheduling order.
+
+**Root cause:** `receiving` flag is read and written without synchronization (it is
+`@Volatile` which prevents caching but not TOCTOU in a coroutine context where two
+coroutines can both read `false` before either writes `true`).
+
+**Recommended fix:** Gate the receiving startup with a `Mutex` rather than a bare
+boolean, or use `compareAndSet` on an `AtomicBoolean`.
+
+---
+
+### F-14 — LOW: generateAndPersistSpk does not persist the SPK; only publishBundle does
+
+**File:** `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/PreKeyLifecycleService.kt`
+Lines 184–199 (`generateAndPersistSpk`), lines 224–267 (`publishBundle`)
+
+**Failure scenario (needs verification):** `generateAndPersistSpk` generates the SPK
+keypair and constructs the entity but does NOT call `signedPreKeyRepository.upsert()`.
+The persist happens inside `publishBundle` (line 231). If the process is killed after
+`generateAndPersistSpk` returns but before `publishBundle` calls `upsert`, the SPK
+private key is lost. On next launch, `bootstrapForNewIdentity` finds
+`signedPreKeyRepository.get() != null` — false (nothing was persisted) — and runs
+bootstrap again, generating a different SPK. This double-bootstrap is harmless IF the
+relay accepts the new publish. However, if the relay's `max_payload_bytes` is exceeded
+or the relay is down, the second bootstrap also fails and the user remains permanently
+un-bootstrapped (no bundle published, no first messages possible).
+
+**Root cause:** SPK persist and network publish are bundled in a single function
+(`publishBundle`) with no intermediate persistence checkpoint.
+
+**Recommended fix:** Call `signedPreKeyRepository.upsert(entity)` inside
+`generateAndPersistSpk` immediately after generating the keypair. This ensures local
+state is durable even if network publish fails.
+
+---
+
+### F-15 — LOW: toggleMute logic is inverted
+
+**File:** `apps/android/src/androidMain/kotlin/phantom/android/calls/CallManager.kt`
+Line 268
+
+**Failure scenario:** `toggleMute()` reads `localAudioTrack?.enabled()` as `enabled`,
+then calls `setEnabled(!enabled)` (correct), but then sets `isMuted = enabled` (wrong).
+If the track was enabled (not muted), `enabled = true`, the track is set to disabled
+(muted), but `isMuted` is set to `true` — that is accidentally correct. However on the
+second call: `enabled = false` (track is now disabled), `setEnabled(true)` (unmutes),
+and `isMuted = false` — that is correct too. The logic happens to produce the right
+result because `isMuted = enabled` mirrors the pre-toggle state, which equals the
+inverse of the desired state. This is a latent bug that will break if the initial state
+of `isMuted` is ever set non-null before the first toggle.
+
+**Root cause:** Semantically incorrect assignment. `isMuted` should be `!enabled` (the
+new state) not `enabled` (the old state). Currently accidentally correct.
+
+**Recommended fix:** Change line 268 to `_activeCall.value = _activeCall.value?.copy(isMuted = !enabled)`.
+
+---
+
+## Summary Table
+
+| ID   | Severity | Area               | User-visible symptom                                  |
+|------|----------|--------------------|-------------------------------------------------------|
+| F-01 | Critical | Transport/Storage  | Messages stuck in QUEUED forever after reconnect      |
+| F-02 | Critical | Storage/Keystore   | App loses all history after biometric/PIN change      |
+| F-03 | Critical | Calls              | Caller stuck on "Calling…" after callee answers       |
+| F-04 | High     | Messaging/Crypto   | First message silently lost on crash during send      |
+| F-05 | High     | Transport          | Voice messages never deliver (silent relay drop)      |
+| F-06 | High     | Messaging          | Memory leak — one Mutex per peer, never freed         |
+| F-07 | High     | Calls/UI           | Incoming call shows pubkey instead of username        |
+| F-08 | High     | PreKey/Lifecycle   | First messages can fail if bootstrap not yet done     |
+| F-09 | High     | Transport          | Outbox lost when service is killed by Android         |
+| F-10 | Medium   | Calls              | Stale ICE candidates corrupt next call session        |
+| F-11 | Medium   | Relay              | All queued messages lost on relay restart             |
+| F-12 | Medium   | Storage/Security   | Inconsistent Keystore policy; partial invalidation    |
+| F-13 | Medium   | Messaging          | Rare: two delivery pipelines if race on startReceiving |
+| F-14 | Low      | PreKey             | SPK keypair not persisted before network publish      |
+| F-15 | Low      | Calls              | toggleMute logic accidentally correct but semantically wrong |
+
+---
+
+*End of audit. No production code was written. All findings are based on static analysis
+of the committed source as of 2026-05-01.*

@@ -46,7 +46,8 @@ import phantom.core.storage.SqlDelightRatchetStateRepository
 import phantom.core.storage.SqlDelightReactionRepository
 import phantom.core.storage.SqlDelightSenderKeyRepository
 import phantom.core.transport.KtorRelayTransport
-import phantom.core.transport.createHttpClient
+import phantom.core.transport.createHttpClientFactory
+import phantom.core.transport.createRestHttpClient
 
 /** Alpha-0 DI container — manual wiring, no framework. */
 class AppContainer(private val context: Context) {
@@ -137,7 +138,7 @@ class AppContainer(private val context: Context) {
     }
 
     // ── Transport ─────────────────────────────────────────────────────────────
-    val transport = KtorRelayTransport(createHttpClient())
+    val transport = KtorRelayTransport(createHttpClientFactory())
 
     // ── Messaging (initialised after identity is loaded) ──────────────────────
     // Nullable until onboarding completes and we have a real identity.
@@ -199,7 +200,7 @@ class AppContainer(private val context: Context) {
             .removeSuffix("/ws")
             .removeSuffix("/")
         val preKeyApi = phantom.core.transport.PreKeyApiClient(
-            httpClient = phantom.core.transport.createHttpClient(),
+            httpClient = createRestHttpClient(),
             relayBaseUrl = relayHttpBase,
         )
 

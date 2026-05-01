@@ -34,7 +34,15 @@ import kotlin.math.min
 import kotlin.time.TimeSource
 
 class KtorRelayTransport(
-    private val httpClient: HttpClient,
+    /**
+     * Factory that builds a fresh [HttpClient] each call. Per ADR-010
+     * "Updated 2026-05-01" the WebSocket transport must own a per-
+     * reconnect-generation HttpClient so it can call .close() to
+     * destroy the OkHttp engine and force-release the active socket
+     * on pong/ack timeout. The previous singleton design could not
+     * recover from a parked-radio dead WebSocket on Tecno HiOS.
+     */
+    private val httpClientFactory: () -> HttpClient,
 ) : RelayTransport {
 
     private val json = Json {
@@ -79,6 +87,13 @@ class KtorRelayTransport(
     private var identityHex: String = ""
     private var relayToken: String? = null
     private var disconnectRequested: Boolean = false
+
+    // The HttpClient owned by the currently-active reconnect generation.
+    // Promoted from a runReconnectLoop-local var so that disconnect() and
+    // the pong/ack watchdogs can close it from the outside. Volatile because
+    // it's mutated by runReconnectLoop on Dispatchers.Default and read by
+    // startPing's pong-timeout branch on the same dispatcher's other workers.
+    @Volatile private var currentGenerationClient: HttpClient? = null
 
     // In-memory outbox for envelopes and read receipts that were enqueued while
     // the WebSocket was not in the Connected state. Drained in FIFO order when
@@ -143,14 +158,19 @@ class KtorRelayTransport(
             )
             // Per-generation scope. Hoisted out of the webSocket{} block so the
             // finally below can cancelAndJoin it whether the block returned
-            // cleanly OR threw — without that guarantee, the previous
-            // generation's pingJob keeps running, ages out via PONG_TIMEOUT_MS
-            // a few seconds into the next generation, and force-cancels its
-            // brand-new session (visible in QA-v4 as a cascade of pong
-            // timeouts firing across 1–2 seconds).
+            // cleanly OR threw.
             var generationScope: CoroutineScope? = null
+            // Per-generation HttpClient. ADR-010 (Updated 2026-05-01): the
+            // only way to force-close an active WebSocket on Tecno HiOS is
+            // to destroy the OkHttp engine entirely via HttpClient.close().
+            // Each iteration of this loop allocates a fresh client so the
+            // pong/ack watchdogs can close it when they detect liveness
+            // failure, and the finally block closes it on every exit path
+            // (clean close, exception, disconnect requested).
+            val generationClient: HttpClient = httpClientFactory()
+            currentGenerationClient = generationClient
             try {
-                httpClient.webSocket(urlWithToken) {
+                generationClient.webSocket(urlWithToken) {
                     session = this
                     lastPongMark = timeSource.markNow()
                     _state.value = TransportState.Connected
@@ -160,8 +180,8 @@ class KtorRelayTransport(
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
                     generationScope = transportScope
                     scope = transportScope
-                    startPing(transportScope)
-                    startAckWatchdog(transportScope)
+                    startPing(transportScope, generationClient)
+                    startAckWatchdog(transportScope, generationClient)
 
                     // Move every still-unacknowledged envelope back to the
                     // head of the outbox. They were sent on the previous
@@ -198,13 +218,14 @@ class KtorRelayTransport(
                 delay(delayMs)
                 attempt++
             } finally {
-                // Cancel the previous generation's coroutines and WAIT for them
-                // to actually complete before the next iteration creates new
-                // ones. Bounded by withTimeoutOrNull so a non-cooperative
-                // suspension does not deadlock the reconnect loop.
+                // Cancel the previous generation's coroutines and close its
+                // HttpClient. ADR-010 (Updated 2026-05-01) — closing the
+                // HttpClient destroys the OkHttp dispatcher and connection
+                // pool, releasing any active socket the reader thread is
+                // parked on. This is what unblocks Tecno HiOS post-radio-park.
                 relayLog(
                     RelayLogLevel.INFO,
-                    "webSocket{} block exited — entering finally block, cancelling generation scope",
+                    "webSocket{} block exited — entering finally block, cancelling scope and closing generation client",
                 )
                 val joined = withTimeoutOrNull(5_000) {
                     generationScope?.coroutineContext?.get(Job)?.cancelAndJoin()
@@ -213,28 +234,30 @@ class KtorRelayTransport(
                 if (joined == null) {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Generation scope cancelAndJoin timed out (>5s) — proceeding to next reconnect anyway. " +
-                            "Stale jobs may briefly overlap; pingJob captures its own session reference so it will not race the new generation.",
-                    )
-                } else {
-                    relayLog(
-                        RelayLogLevel.INFO,
-                        "Generation scope cancelled — looping for next reconnect attempt",
+                        "Generation scope cancelAndJoin timed out (>5s) — proceeding anyway",
                     )
                 }
+                runCatching { generationClient.close() }
+                    .onFailure {
+                        relayLog(
+                            RelayLogLevel.WARN,
+                            "generationClient.close() threw: ${it::class.simpleName}: ${it.message}",
+                        )
+                    }
+                if (currentGenerationClient === generationClient) {
+                    currentGenerationClient = null
+                }
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "Generation client closed — looping for next reconnect attempt",
+                )
             }
         }
         relayLog(RelayLogLevel.INFO, "Reconnect loop exited (disconnect requested)")
         _state.value = TransportState.Disconnected
     }
 
-    private fun startPing(scope: CoroutineScope) {
-        // Capture the session/sink for *this* generation. Reading the
-        // `session` field at timeout time would race with runReconnectLoop's
-        // next iteration overwriting it — a stale pingJob that fires a few
-        // hundred ms into the next session would otherwise force-cancel the
-        // brand-new connection.
-        val mySession = session
+    private fun startPing(scope: CoroutineScope, generationClient: HttpClient) {
         pingJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.PING_INTERVAL_MS)
@@ -242,20 +265,15 @@ class KtorRelayTransport(
                 if (sinceLastPong > RelayTransportConfig.PONG_TIMEOUT_MS) {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Pong timeout (${sinceLastPong}ms without Pong) — forcing reconnect",
+                        "Pong timeout (${sinceLastPong}ms without Pong) — closing generation client to force reconnect",
                     )
-                    // forceCancelAllEngineCalls() goes around Ktor's outgoing actor by
-                    // cancelling OkHttp dispatcher calls directly — this fires onFailure
-                    // on the listener and the actor's finally then sees a failed
-                    // websocket and returns instantly. We deliberately do NOT call
-                    // mySession.cancel() afterwards: that path goes through Ktor's
-                    // graceful close which can wait for the server's CLOSE frame
-                    // (OkHttp's hardcoded CANCEL_AFTER_CLOSE_MILLIS = 60s) and on
-                    // a half-dead Wi-Fi (Tecno HiOS post-radio-parking) it deadlocks
-                    // the reconnect loop for the full 60s — caused 2026-05-01 issue
-                    // "сообщение не уходит до перезапуска". scope.cancel() stops
-                    // ackWatchdogJob; the OkHttp cancellation tears down the session.
-                    forceCancelAllEngineCalls()
+                    // ADR-010 Updated 2026-05-01: close the HttpClient to
+                    // destroy the OkHttp engine and release the active
+                    // socket the reader is parked on. This is the only
+                    // primitive that unblocks Tecno HiOS post-radio-park —
+                    // dispatcher.cancelAll() and connectionPool.evictAll()
+                    // both have no effect on an active WebSocket.
+                    runCatching { generationClient.close() }
                     scope.cancel()
                     break
                 }
@@ -264,9 +282,7 @@ class KtorRelayTransport(
         }
     }
 
-    private fun startAckWatchdog(scope: CoroutineScope) {
-        // Capture session for the same reason as startPing — see comment there.
-        val mySession = session
+    private fun startAckWatchdog(scope: CoroutineScope, generationClient: HttpClient) {
         ackWatchdogJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.ACK_WATCHDOG_INTERVAL_MS)
@@ -280,19 +296,13 @@ class KtorRelayTransport(
                 if (expired.isEmpty()) continue
                 relayLog(
                     RelayLogLevel.WARN,
-                    "ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and force-reconnecting. " +
+                    "ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and closing generation client. " +
                         "First id=${expired.first().message.messageId.take(12)}…",
                 )
-                // Push back to the front so retried envelopes are re-sent
-                // before any new outbound traffic queued in the meantime.
                 outboxMutex.withLock {
                     expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
                 }
-                // Force the session closed so the reconnect loop opens a
-                // fresh WebSocket and flushPendingOutbox re-sends them. See
-                // the comment in startPing() for why we skip the
-                // mySession.cancel() graceful-close path on Tecno HiOS.
-                forceCancelAllEngineCalls()
+                runCatching { generationClient.close() }
                 scope.cancel()
                 break
             }
@@ -541,6 +551,12 @@ class KtorRelayTransport(
         scope?.cancel()
         session?.close()
         session = null
+        // Belt-and-suspenders: close the active generation client so
+        // runReconnectLoop's webSocket{} block returns immediately if it
+        // was parked. The finally block will also close the same client
+        // (HttpClient.close() is idempotent in Ktor).
+        currentGenerationClient?.close()
+        currentGenerationClient = null
         _state.value = TransportState.Disconnected
     }
 
