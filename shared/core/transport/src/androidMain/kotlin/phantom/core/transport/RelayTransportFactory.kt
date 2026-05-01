@@ -35,11 +35,27 @@ private val sharedOkHttpClient: OkHttpClient = OkHttpClient.Builder()
     // detection still triggers forceCancelAllEngineCalls() on pong timeout —
     // see KtorRelayTransport.startPing().
     .pingInterval(0, TimeUnit.SECONDS)
-    // readTimeout is the backstop: if the OS socket is silent for this long,
-    // OkHttp throws SocketTimeoutException. Bumped from 25 s to 60 s so a
-    // slow uplink does not kill an in-flight large envelope before the
-    // app-level Ping/Pong has a chance to detect a real failure.
-    .readTimeout(60, TimeUnit.SECONDS)
+    // readTimeout is the OS-level backstop: if the kernel socket is silent
+    // for this long, OkHttp throws SocketTimeoutException, webSocket{}
+    // block exits, and runReconnectLoop opens a fresh session.
+    //
+    // Sized at 12 s deliberately, NOT 60 s. Field testing on Tecno Spark Go
+    // (HiOS / Android 12) showed that when the OS parks the Wi-Fi radio for
+    // battery reasons, dispatcher.cancelAll() does NOT propagate into the
+    // native socket reader — it stays blocked on the kernel read until OS
+    // readTimeout fires. With readTimeout=60 the user saw 60–80 s gaps
+    // between "Pong timeout" and reconnect; in the meantime any messages
+    // queued on the dead socket could not be sent and the user had to
+    // restart the app. With readTimeout=12 the dead socket recovers in
+    // ~12 s, ack timeout (60 s) re-queues unacked envelopes onto the
+    // fresh session, and the user sees normal delivery.
+    //
+    // 12 s is safe because the application-level Ping flows every 10 s
+    // and the server immediately responds with a Pong frame, so a healthy
+    // socket sees an incoming frame at least every ~10 s. 12 s is the
+    // tightest setting that still tolerates one missed ping cycle from
+    // brief jitter.
+    .readTimeout(12, TimeUnit.SECONDS)
     .build()
 
 actual fun forceCancelAllEngineCalls() {
