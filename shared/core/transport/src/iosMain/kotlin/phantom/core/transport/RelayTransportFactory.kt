@@ -14,3 +14,8 @@ actual fun createHttpClientFactory(): () -> HttpClient = {
 }
 
 actual fun createRestHttpClient(): HttpClient = HttpClient(Darwin)
+
+actual fun forceShutdownActiveEngine() {
+    // No-op on iOS — Darwin engine doesn't have the
+    // OkHttp shutdownNow / kernel-recv-blocking problem.
+}

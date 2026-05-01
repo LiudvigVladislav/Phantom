@@ -14,3 +14,7 @@ actual fun createHttpClientFactory(): () -> HttpClient = {
 }
 
 actual fun createRestHttpClient(): HttpClient = HttpClient(OkHttp)
+
+actual fun forceShutdownActiveEngine() {
+    // No-op on JVM placeholder — used only for tests/desktop.
+}

@@ -31,3 +31,28 @@ expect fun createHttpClientFactory(): () -> HttpClient
  * does not benefit from that.
  */
 expect fun createRestHttpClient(): HttpClient
+
+/**
+ * Force-interrupts every thread in the active WebSocket engine's pool.
+ *
+ * Why this exists: Ktor's `HttpClient.close()` for the OkHttp engine
+ * calls `OkHttpClient.dispatcher.executorService.shutdown()` — a
+ * GRACEFUL shutdown that waits for running tasks to finish on their
+ * own. The WebSocket reader thread is parked in a kernel `recv()`
+ * syscall on a TCP socket whose Wi-Fi radio has been parked by the
+ * OEM. Graceful shutdown does not interrupt kernel syscalls; the
+ * reader stays parked until the OS resumes the radio (observed:
+ * 60+ seconds on Tecno HiOS).
+ *
+ * `shutdownNow()` sends `InterruptedException` to every pool thread,
+ * which propagates `SocketException: Socket closed` from the kernel
+ * read and unblocks the reader within milliseconds. After this call
+ * the engine is dead — no further requests can be served — but that
+ * is fine because we are about to close the client anyway in
+ * `runReconnectLoop`'s finally block.
+ *
+ * Implementations: best-effort, never throw. Engines without a
+ * comparable mechanism (Darwin) may be a no-op — they don't have the
+ * Tecno HiOS problem because iOS doesn't park Wi-Fi the same way.
+ */
+expect fun forceShutdownActiveEngine()

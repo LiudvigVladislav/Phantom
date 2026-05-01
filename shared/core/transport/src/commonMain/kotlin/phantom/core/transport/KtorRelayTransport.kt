@@ -265,14 +265,18 @@ class KtorRelayTransport(
                 if (sinceLastPong > RelayTransportConfig.PONG_TIMEOUT_MS) {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Pong timeout (${sinceLastPong}ms without Pong) — closing generation client to force reconnect",
+                        "Pong timeout (${sinceLastPong}ms without Pong) — shutting down active engine and closing client",
                     )
-                    // ADR-010 Updated 2026-05-01: close the HttpClient to
-                    // destroy the OkHttp engine and release the active
-                    // socket the reader is parked on. This is the only
-                    // primitive that unblocks Tecno HiOS post-radio-park —
-                    // dispatcher.cancelAll() and connectionPool.evictAll()
-                    // both have no effect on an active WebSocket.
+                    // ADR-010 Updated 2026-05-01 (round 2): even
+                    // HttpClient.close() is not enough on Tecno HiOS —
+                    // Ktor's OkHttp close path does
+                    // executor.shutdown() (graceful) which does NOT
+                    // interrupt threads parked in kernel recv() on a
+                    // dead socket. forceShutdownActiveEngine calls
+                    // executor.shutdownNow() which sends
+                    // InterruptedException to those threads and
+                    // unblocks the reader within milliseconds.
+                    forceShutdownActiveEngine()
                     runCatching { generationClient.close() }
                     scope.cancel()
                     break
@@ -302,6 +306,7 @@ class KtorRelayTransport(
                 outboxMutex.withLock {
                     expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
                 }
+                forceShutdownActiveEngine()
                 runCatching { generationClient.close() }
                 scope.cancel()
                 break

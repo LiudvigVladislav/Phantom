@@ -12,11 +12,16 @@ import okhttp3.Protocol
 
 // ADR-010 (Updated 2026-05-01): WebSocket clients are NO LONGER singletons.
 // Each reconnect generation in KtorRelayTransport allocates its own
-// HttpClient via this factory and disposes it in the finally block. This
-// is the only way to force-close an active WebSocket on Tecno HiOS where
-// dispatcher.cancelAll() is a no-op (Call removed from dispatcher post-101)
-// and connectionPool.evictAll() is a partial-no-op (only evicts idle
-// connections, the active WS connection survives).
+// HttpClient via this factory and disposes it in the finally block.
+//
+// We additionally track the most recently created OkHttpClient in a volatile
+// field so forceShutdownActiveEngine() (called from the pong watchdog) can
+// reach it and call dispatcher.executorService.shutdownNow() — which sends
+// InterruptedException to the WebSocket reader thread, the only user-space
+// mechanism that unblocks a kernel recv() on a parked-Wi-Fi-radio socket.
+// Ktor's HttpClient.close() does shutdown() (graceful) not shutdownNow(),
+// which is why APK 13 still hung 4 minutes on Tecno HiOS.
+@Volatile private var activeOkHttp: OkHttpClient? = null
 
 actual fun createHttpClientFactory(): () -> HttpClient = {
     val okHttp = OkHttpClient.Builder()
@@ -37,6 +42,11 @@ actual fun createHttpClientFactory(): () -> HttpClient = {
         .protocols(listOf(Protocol.HTTP_1_1))
         .build()
 
+    // Record so forceShutdownActiveEngine() can interrupt this engine's
+    // pool threads on pong timeout. Last-write-wins is fine: we only
+    // ever have one live WebSocket generation at a time.
+    activeOkHttp = okHttp
+
     HttpClient(OkHttp) {
         engine {
             preconfigured = okHttp
@@ -46,6 +56,31 @@ actual fun createHttpClientFactory(): () -> HttpClient = {
             pingIntervalMillis = 0L
         }
     }
+}
+
+actual fun forceShutdownActiveEngine() {
+    val okHttp = activeOkHttp ?: return
+    runCatching {
+        // shutdownNow returns the list of tasks that were awaiting execution;
+        // we don't care about them — we want the side effect of interrupting
+        // every running task, including the parked WebSocket reader.
+        val pending = okHttp.dispatcher.executorService.shutdownNow()
+        val poolBefore = okHttp.connectionPool.connectionCount()
+        okHttp.connectionPool.evictAll()
+        val poolAfter = okHttp.connectionPool.connectionCount()
+        android.util.Log.w(
+            "PhantomRelay",
+            "forceShutdownActiveEngine: dispatcher.shutdownNow returned ${pending.size} pending; " +
+                "connectionPool $poolBefore → $poolAfter",
+        )
+    }.onFailure {
+        android.util.Log.e(
+            "PhantomRelay",
+            "forceShutdownActiveEngine FAILED: ${it::class.simpleName}: ${it.message}",
+            it,
+        )
+    }
+    activeOkHttp = null
 }
 
 actual fun createRestHttpClient(): HttpClient {
