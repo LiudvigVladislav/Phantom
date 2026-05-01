@@ -397,10 +397,17 @@ class DefaultMessagingService(
             // SHOULD be well-formed WireFrame.
             //
             // Tolerant fallback: if WireFrame parse fails, retry as a bare
-            // EncryptedMessage and wrap. This rescues legacy envelopes that
-            // sat in the relay store across the migration. If BOTH parses
-            // fail the envelope is unrecoverable garbage — ack it so the
-            // relay drops it and stops redelivering on every reconnect.
+            // EncryptedMessage and wrap. This rescues legacy envelopes
+            // that sat in the relay store across the migration.
+            //
+            // CRITICAL — DO NOT ack on parse failure. Earlier revision
+            // ack'd to break a perceived redeliver loop, but logs from
+            // 2026-05-01 testing showed the "unparseable" envelopes were
+            // actually fresh sealed=false payloads from the peer (delivery
+            // receipts / voice / control msgs) — silent ack ate real
+            // user data. Log a payload preview so we can identify the
+            // unknown format, and let the relay redeliver while we work
+            // out what kind of envelope it is.
             val ciphertextText = ciphertext.decodeToString()
             val wireFrame = try {
                 json.decodeFromString<WireFrame>(ciphertextText)
@@ -413,13 +420,17 @@ class DefaultMessagingService(
                     )
                     WireFrame(encryptedMessage = legacy)
                 } catch (secondErr: SerializationException) {
+                    val previewLen = minOf(ciphertextText.length, 240)
+                    val preview = ciphertextText.substring(0, previewLen)
                     messagingLog(
                         MessagingLogLevel.ERROR,
-                        "Unrecoverable wire payload (neither WireFrame nor EncryptedMessage) — " +
-                            "ack-deliver'ing to clear relay store: id=${deliver.messageId.take(12)}… " +
+                        "Unparseable wire payload (neither WireFrame nor EncryptedMessage) — " +
+                            "NOT ack'ing (relay will redeliver). " +
+                            "id=${deliver.messageId.take(12)}… sealed=${deliver.sealedSender.isNotEmpty()} " +
+                            "totalBytes=${ciphertextText.length} previewBytes=$previewLen " +
+                            "preview=<<<$preview>>> " +
                             "wireFrameErr=${firstErr.message} legacyErr=${secondErr.message}",
                     )
-                    transport.sendDeliveryAck(deliver.messageId)
                     return@runCatching
                 }
             }
