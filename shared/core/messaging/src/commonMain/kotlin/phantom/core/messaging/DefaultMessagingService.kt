@@ -16,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.datetime.Clock
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -393,8 +394,35 @@ class DefaultMessagingService(
             // every outbound message in WireFrame; Alpha 1 sent a bare
             // EncryptedMessage. Migration wipes every session so there is
             // no Alpha-1 → Alpha-2 cross traffic — anything arriving here
-            // is well-formed WireFrame.
-            val wireFrame = json.decodeFromString<WireFrame>(ciphertext.decodeToString())
+            // SHOULD be well-formed WireFrame.
+            //
+            // Tolerant fallback: if WireFrame parse fails, retry as a bare
+            // EncryptedMessage and wrap. This rescues legacy envelopes that
+            // sat in the relay store across the migration. If BOTH parses
+            // fail the envelope is unrecoverable garbage — ack it so the
+            // relay drops it and stops redelivering on every reconnect.
+            val ciphertextText = ciphertext.decodeToString()
+            val wireFrame = try {
+                json.decodeFromString<WireFrame>(ciphertextText)
+            } catch (firstErr: SerializationException) {
+                try {
+                    val legacy = json.decodeFromString<phantom.core.crypto.EncryptedMessage>(ciphertextText)
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "Legacy bare EncryptedMessage payload — wrapping into WireFrame: id=${deliver.messageId.take(12)}…",
+                    )
+                    WireFrame(encryptedMessage = legacy)
+                } catch (secondErr: SerializationException) {
+                    messagingLog(
+                        MessagingLogLevel.ERROR,
+                        "Unrecoverable wire payload (neither WireFrame nor EncryptedMessage) — " +
+                            "ack-deliver'ing to clear relay store: id=${deliver.messageId.take(12)}… " +
+                            "wireFrameErr=${firstErr.message} legacyErr=${secondErr.message}",
+                    )
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@runCatching
+                }
+            }
             val encrypted = wireFrame.encryptedMessage
 
             val conversationId = deriveConversationId(senderPubKeyHex)
@@ -404,7 +432,7 @@ class DefaultMessagingService(
             // transport.incoming.onEach, but a parallel sendMessage on the same
             // conversation could still observe a half-saved state.
             val mutex = mutexFor(conversationId)
-            val plainBytes = mutex.withLock {
+            val plainBytes: ByteArray? = mutex.withLock {
                 val state = sessionManager.tryLoadSession(conversationId)
                 if (state != null) {
                     // Existing session — decrypt directly. Any x3dhInit /
@@ -428,13 +456,22 @@ class DefaultMessagingService(
                     // bound to attach it on the first message of a new
                     // session.
                     val x3dhInit = wireFrame.x3dhInit
-                        ?: error(
-                            "handleDeliver: no session for conversationId=" +
-                                "${conversationId.take(16)}… and incoming WireFrame " +
-                                "lacks x3dhInit header. Either the peer is on Alpha 1 " +
-                                "(impossible — migration wipes sessions) or the wire " +
-                                "frame is malformed.",
+                    if (x3dhInit == null) {
+                        // Legacy Alpha 1 bare-EncryptedMessage envelope that
+                        // survived the migration in the relay store. We
+                        // cannot decrypt it (session was wiped, no x3dhInit
+                        // means no way to bootstrap). Ack so the relay
+                        // drops it instead of redelivering on every
+                        // reconnect.
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "Legacy envelope: no session for conv=${conversationId.take(16)}… " +
+                                "and no x3dhInit header — ack-deliver'ing to clear relay store: " +
+                                "id=${deliver.messageId.take(12)}…",
                         )
+                        transport.sendDeliveryAck(deliver.messageId)
+                        return@withLock null
+                    }
                     messagingLog(
                         MessagingLogLevel.INFO,
                         "Bootstrapping recipient session: conv=${conversationId.take(24)}…",
@@ -463,6 +500,10 @@ class DefaultMessagingService(
                     decrypted
                 }
             }
+
+            // Legacy/garbage envelope was already ack'd inside withLock —
+            // skip downstream payload processing.
+            if (plainBytes == null) return@runCatching
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
             messagingLog(
