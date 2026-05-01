@@ -55,6 +55,11 @@ fun AddContactScreen(
     var state by remember { mutableStateOf(AddContactState.Search) }
     var query by remember { mutableStateOf("") }
     var foundHandle by remember { mutableStateOf("") }
+    // Add-by-key sheet — same dialog ChatListScreen's pencil button
+    // shows. Mirrors that entry on the AddContactScreen for parity
+    // (2026-04-30 bug B: missing on-screen entry forced users to back
+    // out and use the pencil button instead).
+    var showAddByKey by remember { mutableStateOf(false) }
 
     val ownUsername by container.identityState.collectAsState()
     val ownHandle = ownUsername?.username.orEmpty()
@@ -114,7 +119,7 @@ fun AddContactScreen(
                     query = query,
                     onQueryChange = { query = it },
                     onScanQr = { onNavigate(Screen.QrScan) },
-                    onPasteKey = { /* AddContactDialog handles real flow */ },
+                    onPasteKey = { showAddByKey = true },
                     onSuggestedTap = { handle ->
                         foundHandle = handle
                         state = AddContactState.Found
@@ -135,6 +140,17 @@ fun AddContactScreen(
                 )
             }
         }
+    }
+
+    if (showAddByKey) {
+        phantom.android.screens.chatlist.AddContactDialog(
+            container = container,
+            onDismiss = { showAddByKey = false },
+            onAdded = { convId, username ->
+                showAddByKey = false
+                onNavigate(Screen.Chat(convId, username))
+            },
+        )
     }
 }
 
@@ -219,6 +235,49 @@ private fun SearchState(
             Spacer(Modifier.height(2.dp))
             Text(
                 text = "Camera-based handshake",
+                color = TextDim,
+                fontSize = 12.sp,
+            )
+        }
+        PhIconChevron(color = TextDim, size = 14.dp)
+    }
+
+    Spacer(Modifier.height(10.dp))
+
+    // PR fix-2026-04-30 / bug B: Add-by-key entry mirroring the
+    // ChatListScreen pencil-button flow. Tap → opens AddContactDialog
+    // which already accepts both `username:key` and bare hex key
+    // strings.
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(PhantomTokens.Colors.SurfaceElevated)
+            .border(1.dp, BorderSubtle, RoundedCornerShape(10.dp))
+            .clickable(onClick = onPasteKey)
+            .padding(horizontal = 14.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(CyanAccent.copy(alpha = 0.10f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            PhIconCopy(color = CyanAccent, size = 14.dp)
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "Add by key",
+                color = TextPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = "Paste username:key or just the key",
                 color = TextDim,
                 fontSize = 12.sp,
             )

@@ -616,8 +616,34 @@ class DefaultMessagingService(
                     "Updating existing conversation: conv=${conversationId.take(24)}… " +
                         "trustTier=${existing.trustTier} (kept) unreadCount=${existing.unreadCount + 1}",
                 )
+                // Auto-sync the contact's username if our local label is a
+                // pubkey-fallback ("b97d6aed" — first 8 chars of hex) AND
+                // the incoming message carries a non-empty senderUsername.
+                // Reproduces "added by key without username" → username
+                // appears in chat header on first message receive.
+                // 2026-04-30 bug A.
+                val pubKeyFallbackPrefix = senderPubKeyHex.take(8)
+                val labelLooksLikePubkeyFallback =
+                    existing.theirUsername.equals(pubKeyFallbackPrefix, ignoreCase = true) ||
+                    existing.theirUsername.isBlank()
+                val incomingUsername = payload.senderUsername.trim()
+                val updatedUsername = if (
+                    labelLooksLikePubkeyFallback &&
+                    incomingUsername.isNotEmpty() &&
+                    incomingUsername != existing.theirUsername
+                ) {
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "Auto-syncing contact username: '${existing.theirUsername}' → " +
+                            "'$incomingUsername' (label was pubkey-fallback)",
+                    )
+                    incomingUsername
+                } else {
+                    existing.theirUsername
+                }
                 conversationRepository.upsertConversation(
                     existing.copy(
+                        theirUsername = updatedUsername,
                         lastMessagePreview = previewText(payload.text),
                         lastMessageAt = Clock.System.now().toEpochMilliseconds(),
                         unreadCount = existing.unreadCount + 1,

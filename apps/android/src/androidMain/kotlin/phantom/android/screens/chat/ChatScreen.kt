@@ -2080,12 +2080,22 @@ private fun InputBar(
                 .fillMaxWidth()
                 .padding(horizontal = 12.dp, vertical = 10.dp)
                 .padding(bottom = 4.dp),
-            verticalAlignment = Alignment.Bottom,
+            // 2026-04-30 bug H fix: use CenterVertically so the
+            // smiley + cancel-X buttons line up with the
+            // OutlinedTextField placeholder baseline (Material 3
+            // default min-height ~56.dp). Bottom alignment used to
+            // glue the 36.dp icon to the bottom of the 56.dp row,
+            // which looked off-center with the "Message…" hint.
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Left: cancel (X) during recording, emoji toggle otherwise
+            // Left: cancel (X) during recording, emoji toggle otherwise.
+            // Square 40dp tap target + CircleShape ripple — combined with
+            // the row-level CenterVertically above, this puts the icon
+            // on the same visual baseline as the "Message…" placeholder
+            // even though the text-field default min-height is ~56.dp.
             Box(
                 modifier = Modifier
-                    .size(36.dp)
+                    .size(40.dp)
                     .clip(CircleShape)
                     .clickable(onClick = if (isRecording) onCancelRecording else onEmojiToggle),
                 contentAlignment = Alignment.Center,
