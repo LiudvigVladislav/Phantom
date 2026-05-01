@@ -249,7 +249,11 @@ private fun PhantomApp(
         }
     }
 
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.Onboarding) }
+    // currentScreen starts as null so the first frame after readiness
+    // shows the splash, NOT a brief flash of Onboarding (the prior
+    // default that surfaced as "ToS shown on every restart" in 2026-04-30
+    // testing — bug F). The when-block below treats null → splash.
+    var currentScreen by remember { mutableStateOf<Screen?>(null) }
     // scannedQrValue carries both QR-scanner results and decoded invite deep links —
     // both resolve to the same "username:pubkeyHex" format consumed by AddContactDialog.
     var scannedQrValue by remember { mutableStateOf<String?>(null) }
@@ -296,6 +300,13 @@ private fun PhantomApp(
 
     val context = androidx.compose.ui.platform.LocalContext.current
     when (val screen = currentScreen) {
+        null -> {
+            // Initial frame before LaunchedEffect resolves the start
+            // screen. Show splash, NOT Onboarding — the prior default
+            // briefly flashed the welcome screen on every relaunch
+            // even when identity already existed (bug F, 2026-04-30).
+            PhantomSplashScreen()
+        }
         is Screen.Onboarding -> OnboardingScreen(
             container = container,
             onComplete = {
