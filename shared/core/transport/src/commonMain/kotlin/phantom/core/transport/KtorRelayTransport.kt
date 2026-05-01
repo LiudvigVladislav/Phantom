@@ -124,6 +124,16 @@ class KtorRelayTransport(
     private val pendingAcksLock = Mutex()
     private val pendingAcks = mutableMapOf<String, AckPending>()
 
+    // ADR-013: scope owning the runReconnectLoop coroutine. Distinct
+    // from the per-generation scope (which is reset every reconnect).
+    // forceReconnect() abandons the current reconnectJob and launches
+    // a new one on this scope, leaving the old loop's stuck webSocket{}
+    // block as a zombie. The zombie holds one OkHttp reader thread
+    // until the kernel eventually releases recv(); it does not block
+    // the new loop from making progress.
+    private val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var reconnectJob: Job? = null
+
     override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {
         this.relayUrl = relayUrl
         this.identityHex = identityPublicKeyHex
@@ -133,7 +143,18 @@ class KtorRelayTransport(
             RelayLogLevel.INFO,
             "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… tokenSet=${token != null}",
         )
-        runReconnectLoop()
+        // Cancel any prior reconnect job (typically a noop on cold start;
+        // matters when connect() is called twice from the service double-
+        // start path). Then launch a fresh loop on transportScope.
+        reconnectJob?.cancel()
+        reconnectJob = transportScope.launch {
+            runReconnectLoop()
+        }
+        // Suspend forever (or until disconnectRequested is observed by
+        // the loop and runReconnectLoop returns) so existing callers
+        // that `await` connect() — PhantomMessagingService — keep their
+        // structured-concurrency expectations.
+        reconnectJob?.join()
     }
 
     /**
@@ -556,12 +577,15 @@ class KtorRelayTransport(
         scope?.cancel()
         session?.close()
         session = null
-        // Belt-and-suspenders: close the active generation client so
-        // runReconnectLoop's webSocket{} block returns immediately if it
-        // was parked. The finally block will also close the same client
-        // (HttpClient.close() is idempotent in Ktor).
         currentGenerationClient?.close()
         currentGenerationClient = null
+        // ADR-013: cancel the reconnect job and the parent transportScope
+        // so any zombie reconnect loops from previous forceReconnect()
+        // calls are also signalled to exit. Their webSocket{} blocks may
+        // still be parked in kernel recv(), but JVM teardown will release
+        // them eventually.
+        reconnectJob?.cancel()
+        reconnectJob = null
         _state.value = TransportState.Disconnected
     }
 
@@ -578,22 +602,41 @@ class KtorRelayTransport(
 
     override suspend fun forceReconnect() {
         relayLog(
-            RelayLogLevel.INFO,
-            "forceReconnect() called — cancelling current generation scope so runReconnectLoop opens a fresh socket",
+            RelayLogLevel.WARN,
+            "forceReconnect() called — abandoning current reconnect loop and launching a fresh one (ADR-013 hard reset)",
         )
-        // Do NOT toggle disconnectRequested. We want the reconnect loop to
-        // carry on, just with a new generation. Cancelling scope causes the
-        // current webSocket{} block to exit via cancellation; the finally
-        // block closes the generation client; the outer while loop then
-        // immediately enters its next iteration and calls the factory.
-        scope?.cancel()
-        // Belt-and-suspenders: also call forceShutdownActiveEngine() in
-        // case the scope cancellation does not propagate through the
-        // kernel-blocked reader thread (the original problem ADR-010 ran
-        // into). With AlarmManager's wakeup the radio is already awake, so
-        // the close should propagate cleanly — but the engine kill is
-        // cheap insurance.
+        // ADR-013: scope-cancel + close-client does NOT unblock a kernel-
+        // parked WebSocket reader on Tecno HiOS. Confirmed empirically:
+        // forceReconnect() previously logged every 30s with zero progress
+        // for 7+ minutes. The structural fix is to abandon the stuck loop
+        // entirely.
+        //
+        // The old reconnectJob's coroutine is cancelled at the JVM scheduler
+        // level — its current webSocket{} suspension may still be parked in
+        // kernel recv(), but that is a leaked thread, not a blocking
+        // dependency for us. Once we launch a new loop below, all new
+        // outbound traffic uses a fresh OkHttp engine and a fresh socket.
+        //
+        // Belt-and-suspenders: kill the current generation's engine and
+        // client first so the abandoned loop has no resources to use even
+        // if it does eventually unpark.
         forceShutdownActiveEngine()
         runCatching { currentGenerationClient?.close() }
+        scope?.cancel()
+        val oldJob = reconnectJob
+        // Launch a brand-new reconnect loop on transportScope. It captures
+        // the same relayUrl/identityHex/relayToken stored on the instance,
+        // and starts its own runReconnectLoop iteration from attempt 0.
+        reconnectJob = transportScope.launch {
+            runReconnectLoop()
+        }
+        // Best-effort: ask the old job to cancel after the new one has
+        // started (so any read-loop epilogue can drain queued frames),
+        // but do not wait for it — it may never complete.
+        oldJob?.cancel()
+        relayLog(
+            RelayLogLevel.INFO,
+            "forceReconnect: new reconnect loop launched; previous loop abandoned (may remain as zombie thread)",
+        )
     }
 }
