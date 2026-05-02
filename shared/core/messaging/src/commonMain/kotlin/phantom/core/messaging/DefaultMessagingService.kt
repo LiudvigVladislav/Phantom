@@ -99,6 +99,22 @@ class DefaultMessagingService(
             sessionMutexes.getOrPut(conversationId) { Mutex() }
         }
 
+    companion object {
+        const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
+        const val AUDIO_CHUNK_BYTES = 64 * 1024         // 64 KB per chunk before base64 expansion
+    }
+
+    // Buffer for reassembling incoming audio chunks. Key = chunkId.
+    // Each entry holds the received slices plus the timestamp of the last
+    // chunk arrival so the stale-entry sweep can drop incomplete reassemblies
+    // older than 5 minutes (prevents a leak when a sender goes offline mid-send).
+    private data class ChunkBuffer(
+        val chunks: MutableMap<Int, ByteArray> = mutableMapOf(),
+        var lastUpdatedMs: Long = 0L,
+    )
+    private val reassemblyMutex = Mutex()
+    private val audioReassemblyBuffer = mutableMapOf<String, ChunkBuffer>()
+
     /**
      * Loads (or bootstraps) the ratchet state for the conversation,
      * encrypts [plaintext] with the Double Ratchet, persists the
@@ -308,6 +324,108 @@ class DefaultMessagingService(
                     blocked = false,
                 )
         )
+    }
+
+    /**
+     * Split [audioBytes] into 64 KB chunks (AUDIO_CHUNK_BYTES) and send each as a
+     * separate TYPE_AUDIO_CHUNK envelope so every individual envelope finishes
+     * uploading + getting acked within the ~30 s Tecno HiOS reconnect window (ISSUE-013).
+     * The sender's own DB row uses the full reassembled base64 so AudioBubble renders
+     * immediately without waiting for chunk acknowledgements.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    override suspend fun sendAudio(
+        conversationId: String,
+        audioBytes: ByteArray,
+        durationMs: Long,
+        mimeType: String,
+    ): Result<Unit> {
+        if (audioBytes.size > MAX_AUDIO_BYTES) {
+            return Result.failure(IllegalArgumentException(
+                "Audio payload ${audioBytes.size} bytes exceeds MAX_AUDIO_BYTES cap ($MAX_AUDIO_BYTES). " +
+                    "Recording must be shorter."
+            ))
+        }
+
+        val conv = conversationRepository.getConversation(conversationId)
+            ?: return Result.failure(IllegalStateException(
+                "sendAudio: no conversation found for id=$conversationId"
+            ))
+        val recipientPublicKeyHex = conv.theirPublicKeyHex
+
+        val chunkId = uuid4().toString()
+        val total = kotlin.math.ceil(audioBytes.size.toDouble() / AUDIO_CHUNK_BYTES).toInt()
+            .coerceAtLeast(1)
+
+        val insertedAtMs = Clock.System.now().toEpochMilliseconds()
+        val outgoingTimerSecs = conversationRepository.getDisappearingTimer(conversationId)
+        val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) insertedAtMs + outgoingTimerSecs * 1_000L else null
+
+        val fullBase64 = Base64.encode(audioBytes)
+        val localMsgId = uuid4().toString()
+        messageRepository.insertMessage(
+            MessageEntity(
+                id = localMsgId,
+                conversationId = conversationId,
+                ciphertext = ByteArray(0),
+                plaintextCache = "[AUDIO:$fullBase64]",
+                sent = true,
+                status = MessageStatus.QUEUED,
+                createdAt = insertedAtMs,
+                expiresAtMs = outgoingExpiresAtMs,
+            )
+        )
+
+        return runCatching {
+            for (i in 0 until total) {
+                val start = i * AUDIO_CHUNK_BYTES
+                val end = minOf((i + 1) * AUDIO_CHUNK_BYTES, audioBytes.size)
+                val slice = audioBytes.copyOfRange(start, end)
+                val chunkBase64 = Base64.encode(slice)
+
+                val payloadBytes = json.encodeToString(
+                    MessagePayload(
+                        type = MessagePayload.TYPE_AUDIO_CHUNK,
+                        sentAt = Clock.System.now().toEpochMilliseconds(),
+                        senderUsername = identity.username,
+                        audioChunkId = chunkId,
+                        audioChunkIndex = i,
+                        audioChunkTotal = total,
+                        audioChunkB64 = chunkBase64,
+                        audioDurationMs = durationMs,
+                        audioMimeType = mimeType,
+                    )
+                ).encodeToByteArray()
+
+                val encrypted = encryptUnderLock(
+                    conversationId = conversationId,
+                    recipientPublicKeyHex = recipientPublicKeyHex,
+                    plaintext = payloadBytes,
+                )
+                val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+                val paddedCiphertext = MessagePadding.pad(ciphertext)
+
+                transport.send(
+                    RelayMessage.Send(
+                        to = recipientPublicKeyHex,
+                        from = "",
+                        sealedSender = Base64.encode(
+                            SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                        ),
+                        payload = paddedCiphertext.encodeBase64(),
+                        messageId = uuid4().toString(),
+                    )
+                )
+            }
+
+            conversationRepository.upsertConversation(
+                conv.copy(
+                    lastMessagePreview = "🎤 Voice message",
+                    lastMessageAt = Clock.System.now().toEpochMilliseconds(),
+                )
+            )
+            messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
+        }
     }
 
     override suspend fun startReceiving() {
@@ -593,6 +711,119 @@ class DefaultMessagingService(
             // Route group-related messages to GroupMessagingService before 1:1 handling.
             if (payload.type in MessagePayload.GROUP_TYPES) {
                 groupMessagingService?.handleIncoming(payload, senderPubKeyHex)
+                return@runCatching
+            }
+
+            // Chunked audio: accumulate slices and reassemble when all chunks arrived.
+            // Ack-deliver each chunk immediately so the relay stops redelivering it
+            // while reassembly accumulates the remaining chunks.
+            if (payload.type == MessagePayload.TYPE_AUDIO_CHUNK) {
+                val chunkId    = payload.audioChunkId    ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
+                val chunkIndex = payload.audioChunkIndex ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
+                val chunkTotal = payload.audioChunkTotal ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
+                val chunkB64   = payload.audioChunkB64   ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
+
+                @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+                val chunkBytes = Base64.decode(chunkB64)
+
+                val nowMs = Clock.System.now().toEpochMilliseconds()
+                val staleCutoff = nowMs - 5 * 60 * 1_000L
+
+                val complete: ByteArray? = reassemblyMutex.withLock {
+                    // Sweep entries that have not received a chunk for more than 5 minutes
+                    // before inserting so the map cannot grow unbounded when senders abandon
+                    // a send mid-way (e.g. killed by Doze while chunking).
+                    val staleIds = audioReassemblyBuffer.entries
+                        .filter { (_, buf) -> buf.lastUpdatedMs < staleCutoff }
+                        .map { (id, _) -> id }
+                    staleIds.forEach { audioReassemblyBuffer.remove(it) }
+
+                    val buf = audioReassemblyBuffer.getOrPut(chunkId) { ChunkBuffer() }
+                    buf.chunks[chunkIndex] = chunkBytes
+                    buf.lastUpdatedMs = nowMs
+
+                    if (buf.chunks.size == chunkTotal) {
+                        val assembled = (0 until chunkTotal)
+                            .flatMap { idx -> buf.chunks[idx]!!.toList() }
+                            .toByteArray()
+                        audioReassemblyBuffer.remove(chunkId)
+                        assembled
+                    } else {
+                        null
+                    }
+                }
+
+                transport.sendDeliveryAck(deliver.messageId)
+
+                if (complete != null) {
+                    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+                    val assembledB64 = Base64.encode(complete)
+                    val groupId = payload.groupId
+                    if (groupId != null) {
+                        groupMessagingService?.handleIncoming(
+                            payload.copy(
+                                type = MessagePayload.TYPE_GROUP_MESSAGE,
+                                audioDataB64 = assembledB64,
+                                audioChunkB64 = null,
+                                audioChunkId = null,
+                                audioChunkIndex = null,
+                                audioChunkTotal = null,
+                            ),
+                            senderPubKeyHex,
+                        )
+                    } else {
+                        val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
+                        val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
+                        messageRepository.insertMessage(
+                            MessageEntity(
+                                id = deliver.messageId,
+                                conversationId = conversationId,
+                                ciphertext = ByteArray(0),
+                                plaintextCache = "[AUDIO:$assembledB64]",
+                                sent = false,
+                                status = MessageStatus.DELIVERED,
+                                createdAt = nowMs,
+                                expiresAtMs = expiresAtMs,
+                            )
+                        )
+                        val existing = conversationRepository.getConversation(conversationId)
+                        val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
+                        if (existing == null) {
+                            conversationRepository.upsertConversation(
+                                ConversationEntity(
+                                    id = conversationId,
+                                    theirUsername = senderName,
+                                    theirPublicKeyHex = senderPubKeyHex,
+                                    lastMessagePreview = "🎤 Voice message",
+                                    lastMessageAt = nowMs,
+                                    unreadCount = 1,
+                                    trustTier = TrustTier.REQUEST,
+                                    blocked = false,
+                                )
+                            )
+                        } else {
+                            conversationRepository.upsertConversation(
+                                existing.copy(
+                                    lastMessagePreview = "🎤 Voice message",
+                                    lastMessageAt = nowMs,
+                                    unreadCount = existing.unreadCount + 1,
+                                )
+                            )
+                        }
+                        _incomingMessages.emit(
+                            IncomingMessage(
+                                id = deliver.messageId,
+                                conversationId = conversationId,
+                                senderPublicKeyHex = senderPubKeyHex,
+                                text = "[AUDIO:$assembledB64]",
+                                receivedAt = nowMs,
+                            )
+                        )
+                        runCatching {
+                            onNewMessageNotification?.invoke(conversationId, senderName, "🎤 Voice message", senderPubKeyHex)
+                        }
+                    }
+                }
                 return@runCatching
             }
 

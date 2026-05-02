@@ -615,7 +615,7 @@ fun ChatScreen(
                     },
                     onMicClick = {
                         if (isRecording) {
-                            // Stop recording and send audio
+                            // Stop recording and send audio as chunks
                             mediaRecorder?.stop()
                             mediaRecorder?.release()
                             mediaRecorder = null
@@ -624,18 +624,20 @@ fun ChatScreen(
                             if (file != null && file.exists()) {
                                 scope.launch {
                                     val bytes = file.readBytes()
-                                    val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-                                    val audioPayload = "[AUDIO:$base64]"
-                                    val conversation = container.conversationRepo.getConversation(conversationId)
-                                    if (conversation != null) {
-                                        container.messagingService?.sendMessage(
-                                            OutgoingMessage(
-                                                id = com.benasher44.uuid.uuid4().toString(),
-                                                conversationId = conversationId,
-                                                recipientPublicKeyHex = conversation.theirPublicKeyHex,
-                                                text = audioPayload,
-                                            )
-                                        )
+                                    val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
+                                    val result = container.messagingService?.sendAudio(
+                                        conversationId = conversationId,
+                                        audioBytes = bytes,
+                                        durationMs = recordingDurationMs,
+                                        mimeType = mimeType,
+                                    )
+                                    if (result != null && result.isFailure) {
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "Голосовое сообщение слишком длинное",
+                                            android.widget.Toast.LENGTH_SHORT,
+                                        ).show()
+                                    } else {
                                         reloadMessages()
                                         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
                                     }

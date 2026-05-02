@@ -176,7 +176,7 @@ fun GroupChatScreen(
                     },
                     onMicClick = {
                         if (isRecording) {
-                            // Stop recording and send
+                            // Stop recording and send as chunks
                             runCatching { mediaRecorder?.stop() }
                             mediaRecorder?.release()
                             mediaRecorder = null
@@ -185,13 +185,19 @@ fun GroupChatScreen(
                             if (file != null && file.exists()) {
                                 scope.launch {
                                     val bytes = runCatching { file.readBytes() }.getOrNull() ?: return@launch
-                                    val base64 = android.util.Base64.encodeToString(
-                                        bytes, android.util.Base64.NO_WRAP
+                                    val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
+                                    val result = container.groupMessagingService?.sendGroupAudio(
+                                        groupId, bytes, recordingDurationMs, mimeType
                                     )
-                                    container.groupMessagingService?.sendGroupAudio(
-                                        groupId, base64, recordingDurationMs
-                                    )
-                                    reloadMessages()
+                                    if (result != null && result.isFailure) {
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "Голосовое сообщение слишком длинное",
+                                            android.widget.Toast.LENGTH_SHORT,
+                                        ).show()
+                                    } else {
+                                        reloadMessages()
+                                    }
                                 }
                             }
                             audioFile = null

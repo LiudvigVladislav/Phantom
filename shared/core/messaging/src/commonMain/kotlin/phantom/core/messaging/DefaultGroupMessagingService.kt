@@ -119,8 +119,137 @@ class DefaultGroupMessagingService(
         sendGroupPayload(groupId = groupId, text = text, audioB64 = null, audioDurationMs = null)
     }
 
-    override suspend fun sendGroupAudio(groupId: String, audioBase64: String, durationMs: Long) {
-        sendGroupPayload(groupId = groupId, text = null, audioB64 = audioBase64, audioDurationMs = durationMs)
+    override suspend fun sendGroupAudio(
+        groupId: String,
+        audioBytes: ByteArray,
+        durationMs: Long,
+        mimeType: String,
+    ): Result<Unit> {
+        if (audioBytes.size > DefaultMessagingService.MAX_AUDIO_BYTES) {
+            return Result.failure(IllegalArgumentException(
+                "Group audio payload ${audioBytes.size} bytes exceeds MAX_AUDIO_BYTES cap " +
+                    "(${DefaultMessagingService.MAX_AUDIO_BYTES}). Recording must be shorter."
+            ))
+        }
+
+        val chunkId = uuid4().toString()
+        val total = kotlin.math.ceil(audioBytes.size.toDouble() / DefaultMessagingService.AUDIO_CHUNK_BYTES).toInt()
+            .coerceAtLeast(1)
+
+        return runCatching {
+            for (i in 0 until total) {
+                val start = i * DefaultMessagingService.AUDIO_CHUNK_BYTES
+                val end = minOf((i + 1) * DefaultMessagingService.AUDIO_CHUNK_BYTES, audioBytes.size)
+                val slice = audioBytes.copyOfRange(start, end)
+                @OptIn(ExperimentalEncodingApi::class)
+                val chunkBase64 = Base64.encode(slice)
+
+                sendGroupChunk(
+                    groupId = groupId,
+                    chunkId = chunkId,
+                    chunkIndex = i,
+                    chunkTotal = total,
+                    chunkBase64 = chunkBase64,
+                    durationMs = durationMs,
+                    mimeType = mimeType,
+                )
+            }
+
+            // Store one outgoing message row locally so the sender's UI shows
+            // the voice note immediately. The full reassembled base64 is stored
+            // so AudioBubble can play it back without waiting for chunk acks.
+            @OptIn(ExperimentalEncodingApi::class)
+            val fullBase64 = Base64.encode(audioBytes)
+            val now = Clock.System.now().toEpochMilliseconds()
+            val msgId = uuid4().toString()
+            messageRepo.insertMessage(
+                MessageEntity(
+                    id = msgId,
+                    conversationId = groupId,
+                    ciphertext = ByteArray(0),
+                    plaintextCache = "[AUDIO:$fullBase64]",
+                    sent = true,
+                    status = MessageStatus.QUEUED,
+                    createdAt = now,
+                    expiresAtMs = null,
+                )
+            )
+            groupRepo.updateLastMessage(groupId, "[voice]", now)
+        }
+    }
+
+    private suspend fun sendGroupChunk(
+        groupId: String,
+        chunkId: String,
+        chunkIndex: Int,
+        chunkTotal: Int,
+        chunkBase64: String,
+        durationMs: Long,
+        mimeType: String,
+    ) {
+        val members = groupRepo.getMembers(groupId)
+        val bundleEntity = senderKeyRepo.get(groupId, myPubKeyHex)
+        var bundle = if (bundleEntity != null) {
+            SenderKey.Bundle(
+                bundleEntity.chainKeyHex, bundleEntity.iteration.toInt(),
+                bundleEntity.signingPubHex, bundleEntity.signingPrivHex,
+            )
+        } else {
+            val b = SenderKey.generate()
+            senderKeyRepo.upsert(
+                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex,
+                    b.iteration.toLong(), b.signingPubHex, b.signingPrivHex)
+            )
+            b
+        }
+
+        val innerPayload = MessagePayload(
+            type = MessagePayload.TYPE_AUDIO_CHUNK,
+            groupId = groupId,
+            audioChunkId = chunkId,
+            audioChunkIndex = chunkIndex,
+            audioChunkTotal = chunkTotal,
+            audioChunkB64 = chunkBase64,
+            audioDurationMs = durationMs,
+            audioMimeType = mimeType,
+        )
+        val plainBytes = json.encodeToString(innerPayload).encodeToByteArray()
+        val (newBundle, cipherBytes) = SenderKey.encrypt(plainBytes, bundle)
+        bundle = newBundle
+
+        senderKeyRepo.upsert(
+            SenderKeyEntity(
+                groupId = groupId,
+                memberPubkeyHex = myPubKeyHex,
+                chainKeyHex = bundle.chainKeyHex,
+                iteration = bundle.iteration.toLong(),
+                signingPubHex = bundle.signingPubHex,
+                signingPrivHex = bundle.signingPrivHex,
+            )
+        )
+
+        @OptIn(ExperimentalEncodingApi::class)
+        val ciphertextB64 = Base64.encode(cipherBytes)
+        val outerPayload = MessagePayload(
+            type = MessagePayload.TYPE_AUDIO_CHUNK,
+            groupId = groupId,
+            groupCiphertextB64 = ciphertextB64,
+            senderKeySignPubHex = bundle.signingPubHex,
+        )
+        val outerJson = json.encodeToString(outerPayload)
+        @OptIn(ExperimentalEncodingApi::class)
+        val outerB64 = Base64.encode(outerJson.encodeToByteArray())
+
+        members.filter { it.pubkeyHex != myPubKeyHex }.forEach { member ->
+            transport.send(
+                RelayMessage.Send(
+                    to = member.pubkeyHex,
+                    from = myPubKeyHex,
+                    payload = outerB64,
+                    messageId = uuid4().toString(),
+                )
+            )
+        }
     }
 
     override suspend fun addMember(groupId: String, pubkeyHex: String, username: String) {
