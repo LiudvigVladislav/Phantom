@@ -18,6 +18,7 @@ import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -72,6 +73,7 @@ class CallManager(
 
     private var pendingRemoteSdp: String? = null
     private var pendingRemoteFrom: String? = null
+    private var ringTimeoutJob: Job? = null
 
     private val iceServers = listOf(
         PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
@@ -94,7 +96,13 @@ class CallManager(
     suspend fun startCall(toPubKeyHex: String, toUsername: String) {
         if (_activeCall.value != null) return
         val callId = uuid4().toString()
+        pendingIceCandidates.clear()
         _activeCall.value = ActiveCall(callId, toPubKeyHex, toUsername, CallState.CALLING)
+
+        ringTimeoutJob = scope.launch {
+            delay(60_000)
+            cleanupCall(CallState.ENDED)
+        }
 
         createPeerConnection(toPubKeyHex)
 
@@ -148,6 +156,7 @@ class CallManager(
             sendSignal(fromPubKeyHex, MessagePayload(type = TYPE_CALL_REJECT, callId = callId))
             return
         }
+        pendingIceCandidates.clear()
         pendingRemoteSdp = sdp
         pendingRemoteFrom = fromPubKeyHex
         _activeCall.value = ActiveCall(callId, fromPubKeyHex, fromUsername, CallState.RINGING)
@@ -212,6 +221,12 @@ class CallManager(
 
     suspend fun handleAnswer(sdp: String) {
         val call = _activeCall.value ?: return
+        if (peerConnection == null) {
+            cleanupCall(CallState.ENDED)
+            return
+        }
+        ringTimeoutJob?.cancel()
+        ringTimeoutJob = null
         val remoteDesc = SessionDescription(SessionDescription.Type.ANSWER, sdp)
         peerConnection?.setRemoteDescription(object : SdpObserver {
             override fun onSetSuccess() {
@@ -264,9 +279,9 @@ class CallManager(
     fun handleRemoteReject()  { cleanupCall(CallState.REJECTED) }
 
     fun toggleMute() {
-        val enabled = localAudioTrack?.enabled() ?: return
-        localAudioTrack?.setEnabled(!enabled)
-        _activeCall.value = _activeCall.value?.copy(isMuted = enabled) // was enabled → now muted
+        val wasEnabled = localAudioTrack?.enabled() ?: return
+        localAudioTrack?.setEnabled(!wasEnabled)
+        _activeCall.value = _activeCall.value?.copy(isMuted = wasEnabled)
     }
 
     fun toggleSpeaker() {
@@ -350,6 +365,8 @@ class CallManager(
     }
 
     private fun cleanupCall(endState: CallState) {
+        ringTimeoutJob?.cancel()
+        ringTimeoutJob = null
         peerConnection?.dispose()
         peerConnection = null
         localAudioTrack?.dispose()

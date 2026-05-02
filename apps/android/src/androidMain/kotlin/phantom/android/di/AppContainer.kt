@@ -376,7 +376,8 @@ class AppContainer(private val context: Context) {
 
         service.onCallMessage = { payload, fromPubKeyHex ->
             appScope.launch {
-                val fromUsername = conversationRepo.getConversation(fromPubKeyHex)
+                val conversationId = listOf(identity.publicKeyHex, fromPubKeyHex).sorted().joinToString("_")
+                val fromUsername = conversationRepo.getConversation(conversationId)
                     ?.theirUsername ?: fromPubKeyHex.take(8)
                 when (payload.type) {
                     TYPE_CALL_OFFER  -> cm.handleOffer(fromPubKeyHex, fromUsername, payload.callId ?: "", payload.sdp ?: "")
