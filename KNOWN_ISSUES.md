@@ -1,8 +1,8 @@
 # PHANTOM Alpha 1 — Known Issues
 
-**Last updated:** 2026-04-29
-**Build:** branch `master`, latest commit `697103d2` (`v0.1.0-alpha.1`)
-**Tested platforms:** Android (Tecno Spark 2022 / Android 12, plus Pixel 8 Pro emulator API 35), Hetzner VPS relay (`relay.phntm.pro`)
+**Last updated:** 2026-05-02
+**Build:** branch `fix/call-serializer-and-stuck-envelope-loop` (APK 19, commit `ad9f29b6`); pending merge to `master` as transport-reliability sprint PR
+**Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS, plus Pixel 8 Pro emulators API 35), Hetzner VPS relay (`relay.phntm.pro`)
 
 ---
 
@@ -214,6 +214,53 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 - Audit requirement for ACID-compliant prekey storage
 
 **Why this isn't a P3 bug:** the Signal protocol's prekey contract makes the storage replaceable — clients tolerate (and recover from) a server that "forgot" their prekeys by re-publishing. Loss of prekey state degrades to a 3-DH handshake (no OPK round) for at most one window, then fully restores after replenish. This is by design.
+
+---
+
+### ISSUE-013: Tecno HiOS firmware-level Wi-Fi radio parking — push-wakeup deferred to Phase 5
+
+**Status:** Documented limitation. Industry-standard for FOSS messengers without push-based wakeup. Real fix requires UnifiedPush integration scheduled for Phase 5 (Feb 2027).
+
+**Symptom.** On Tecno HiOS (and architecturally on every aggressive-OEM Android skin: Xiaomi MIUI, Huawei EMUI, Oppo ColorOS, Vivo OriginOS, Realme), the Wi-Fi radio is parked roughly every 30 seconds **regardless of**:
+
+- The user disabling battery optimization for PHANTOM in Android Settings → "Unrestricted"
+- The foreground notification with persistent service
+- `WifiManager.WIFI_MODE_FULL_HIGH_PERF` lock (HiOS silently downgrades it to type=3 `WIFI_MODE_FULL`)
+- `WifiManager.MulticastLock` (acquired and reported held, no observed effect on parking)
+- `ConnectivityManager.requestNetwork(NET_CAPABILITY_INTERNET)` (callback fires "network available" but radio still parks 30 s later)
+
+This is **firmware-level battery aggression** below any user-space API.
+
+**Impact.** Text messages: 1–2 second delay if the send happens to land in the brief reconnect window (~700 ms abandon-and-restart cycle). No data loss — relay's store-and-forward retains envelopes until ack. Voice messages (~270 KB single envelope today): cannot complete transit before next reconnect window — this needs voice chunking from PR 3 of the reliability sprint, not a transport-layer fix.
+
+**Diagnostic chain (2026-04-30 → 2026-05-02, 19 APK iterations).**
+
+| APK | Approach | Result |
+|---|---|---|
+| 11–14 | dispatcher.cancelAll → connectionPool.evictAll → executor.shutdownNow | All no-ops against kernel-blocked recv() |
+| 15 | AlarmManager.setExactAndAllowWhileIdle 30 s + `forceReconnect()` | Alarm fires, but cancellation cannot reach parked reader |
+| 17 | Abandon-and-restart entire reconnect loop on stale pong | **Works.** ~700 ms recovery, zombie thread released by kernel later |
+| 18 | + MulticastLock + ConnectivityManager.requestNetwork | Manifest permissions missing — silent SecurityException |
+| 19 | + `CHANGE_WIFI_MULTICAST_STATE` + `CHANGE_NETWORK_STATE` permissions | Locks acquired, callbacks fire — radio parking unchanged |
+
+Final transport architecture: APK 17's abandon-and-restart with APK 19's belt-and-suspenders Tier-1 locks. Cycle on Tecno: 30 s connection alive → 700 ms reconnect → repeat. Acceptable for Alpha; real fix requires push-based wakeup.
+
+**Industry context.** This is not a PHANTOM-specific failure mode. Comparable open-source messengers either (a) outsource wakeup to FCM (Signal, on Google-Play builds), (b) outsource to UnifiedPush (Element/Matrix on F-Droid), or (c) document the limitation and tell users to whitelist the app in OEM battery settings (Briar). PHANTOM's Phase 5 path is UnifiedPush — same approach as Element, preserves no-Google-services posture.
+
+**Workaround for Alpha users on aggressive-OEM devices:**
+
+- Keep the app open in foreground when expecting urgent messages
+- Periodic wake (screen on every few minutes) drains the queue immediately
+- VPN client running on the device sometimes keeps radio active as a side effect (the VPN's own keepalive prevents parking)
+
+**Real fix (Phase 5, Feb 2027):**
+
+- UnifiedPush client integration in Android app
+- UnifiedPush server endpoints in relay
+- Optional PHANTOM-branded distributor for users without ntfy or another distributor installed
+- See PHANTOM_ROADMAP_2026.md for Phase 5 timeline
+
+**Why this is documented as a limitation, not a P1 bug:** Every reasonable user-space mitigation has been attempted and verified ineffective. The fix lives in a different architectural layer (push wakeup) that is on the roadmap. Re-attempting transport-layer workarounds would be wasted effort. ADR-010, ADR-011, ADR-013 + `docs/research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md` document the full diagnostic chain.
 
 ---
 

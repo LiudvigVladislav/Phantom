@@ -8,69 +8,94 @@ import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.websocket.WebSockets
 import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 
-// Singleton OkHttpClient — exposed so KtorRelayTransport can call
-// dispatcher.cancelAll() to forcibly tear down a hung WebSocket on
-// application-level pong timeout. Without that escape hatch, Ktor's
-// OkHttpWebsocketSession.outgoing actor calls websocket.close() in its
-// finally block on cancellation, which initiates a graceful WS close and
-// blocks for OkHttp's hardcoded CANCEL_AFTER_CLOSE_MILLIS = 60_000L while
-// it waits for the server's matching CLOSE frame.
-private val sharedOkHttpClient: OkHttpClient = OkHttpClient.Builder()
-    // OkHttp WebSocket transport-level ping is DISABLED.
-    //
-    // Why: pingInterval is BOTH the ping cadence AND the pong-timeout in one
-    // knob — OkHttp force-cancels the socket if no pong returns within
-    // pingInterval. On slow cellular, sending a large envelope (e.g. an 83 KB
-    // base64-inlined voice note) takes 5–10 s; the transport ping fires
-    // mid-upload but the pong cannot come back because the upload is hogging
-    // the single TCP send buffer in front of it. After pingInterval ms OkHttp
-    // declares "no pong" and forcibly tears the connection down. Reconnect
-    // requeues the envelope and the cycle repeats — voice never delivers.
-    //
-    // We replace this with the application-level RelayMessage.Ping/Pong loop
-    // in KtorRelayTransport (PING_INTERVAL_MS=10 s, PONG_TIMEOUT_MS=25 s).
-    // App-level Ping flows over the same WS as data so NAT-keepalive is
-    // preserved (10 s < typical 20-30 s mobile-NAT idle timeout). Liveness
-    // detection still triggers forceCancelAllEngineCalls() on pong timeout —
-    // see KtorRelayTransport.startPing().
-    .pingInterval(0, TimeUnit.SECONDS)
-    // readTimeout is the OS-level backstop: if the kernel socket is silent
-    // for this long, OkHttp throws SocketTimeoutException, webSocket{}
-    // block exits, and runReconnectLoop opens a fresh session.
-    //
-    // Sized at 12 s deliberately, NOT 60 s. Field testing on Tecno Spark Go
-    // (HiOS / Android 12) showed that when the OS parks the Wi-Fi radio for
-    // battery reasons, dispatcher.cancelAll() does NOT propagate into the
-    // native socket reader — it stays blocked on the kernel read until OS
-    // readTimeout fires. With readTimeout=60 the user saw 60–80 s gaps
-    // between "Pong timeout" and reconnect; in the meantime any messages
-    // queued on the dead socket could not be sent and the user had to
-    // restart the app. With readTimeout=12 the dead socket recovers in
-    // ~12 s, ack timeout (60 s) re-queues unacked envelopes onto the
-    // fresh session, and the user sees normal delivery.
-    //
-    // 12 s is safe because the application-level Ping flows every 10 s
-    // and the server immediately responds with a Pong frame, so a healthy
-    // socket sees an incoming frame at least every ~10 s. 12 s is the
-    // tightest setting that still tolerates one missed ping cycle from
-    // brief jitter.
-    .readTimeout(12, TimeUnit.SECONDS)
-    .build()
+// ADR-010 (Updated 2026-05-01): WebSocket clients are NO LONGER singletons.
+// Each reconnect generation in KtorRelayTransport allocates its own
+// HttpClient via this factory and disposes it in the finally block.
+//
+// We additionally track the most recently created OkHttpClient in a volatile
+// field so forceShutdownActiveEngine() (called from the pong watchdog) can
+// reach it and call dispatcher.executorService.shutdownNow() — which sends
+// InterruptedException to the WebSocket reader thread, the only user-space
+// mechanism that unblocks a kernel recv() on a parked-Wi-Fi-radio socket.
+// Ktor's HttpClient.close() does shutdown() (graceful) not shutdownNow(),
+// which is why APK 13 still hung 4 minutes on Tecno HiOS.
+@Volatile private var activeOkHttp: OkHttpClient? = null
 
-actual fun forceCancelAllEngineCalls() {
-    runCatching { sharedOkHttpClient.dispatcher.cancelAll() }
+actual fun createHttpClientFactory(): () -> HttpClient = {
+    val okHttp = OkHttpClient.Builder()
+        // OkHttp WebSocket transport-level ping is DISABLED. App-level
+        // RelayMessage.Ping/Pong loop handles liveness — see KtorRelayTransport.startPing.
+        .pingInterval(0, TimeUnit.SECONDS)
+        // readTimeout is the OS-level backstop only. After ADR-010
+        // "Updated 2026-05-01" the primary teardown path on pong/ack
+        // timeout is `generationClient.close()` which destroys the
+        // OkHttp engine entirely, releasing the active WS socket. 60 s
+        // is generous because it never has to fire in normal recovery.
+        .readTimeout(60, TimeUnit.SECONDS)
+        // Force HTTP/1.1 only for the WebSocket upgrade. With HTTP/2 one
+        // TCP connection multiplexes many streams and the pool entry is
+        // a long-lived h2 connection — connection lifecycle reasoning
+        // gets harder. HTTP/1.1 keeps "one TCP per WS" so close() acts
+        // intuitively. See ADR-010 "Updated 2026-05-01".
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .build()
+
+    // Record so forceShutdownActiveEngine() can interrupt this engine's
+    // pool threads on pong timeout. Last-write-wins is fine: we only
+    // ever have one live WebSocket generation at a time.
+    activeOkHttp = okHttp
+
+    HttpClient(OkHttp) {
+        engine {
+            preconfigured = okHttp
+        }
+        install(WebSockets) {
+            // Disabled — app-level Ping/Pong handles liveness in KtorRelayTransport.
+            pingIntervalMillis = 0L
+        }
+    }
 }
 
-actual fun createHttpClient(): HttpClient = HttpClient(OkHttp) {
-    engine {
-        preconfigured = sharedOkHttpClient
+actual fun forceShutdownActiveEngine() {
+    val okHttp = activeOkHttp ?: return
+    runCatching {
+        // shutdownNow returns the list of tasks that were awaiting execution;
+        // we don't care about them — we want the side effect of interrupting
+        // every running task, including the parked WebSocket reader.
+        val pending = okHttp.dispatcher.executorService.shutdownNow()
+        val poolBefore = okHttp.connectionPool.connectionCount()
+        okHttp.connectionPool.evictAll()
+        val poolAfter = okHttp.connectionPool.connectionCount()
+        android.util.Log.w(
+            "PhantomRelay",
+            "forceShutdownActiveEngine: dispatcher.shutdownNow returned ${pending.size} pending; " +
+                "connectionPool $poolBefore → $poolAfter",
+        )
+    }.onFailure {
+        android.util.Log.e(
+            "PhantomRelay",
+            "forceShutdownActiveEngine FAILED: ${it::class.simpleName}: ${it.message}",
+            it,
+        )
     }
-    install(WebSockets) {
-        // Disabled — OkHttp's pingInterval handles WS protocol-level pings now.
-        // Ktor's pinger uses session.close() (graceful) on pong timeout, which
-        // re-introduces the 60-second OkHttp close-wait. OkHttp's mechanism
-        // forcibly cancels instead.
-        pingIntervalMillis = 0L
+    activeOkHttp = null
+}
+
+actual fun createRestHttpClient(): HttpClient {
+    // REST traffic (PreKey publish/fetch, future /me endpoints).
+    // Long-lived: connection pooling and TLS session reuse across short
+    // HTTP calls is desirable. Does NOT install the WebSockets plugin —
+    // unused by the REST path.
+    val okHttp = OkHttpClient.Builder()
+        .readTimeout(30, TimeUnit.SECONDS)
+        .protocols(listOf(Protocol.HTTP_1_1, Protocol.HTTP_2))
+        .build()
+
+    return HttpClient(OkHttp) {
+        engine {
+            preconfigured = okHttp
+        }
     }
 }

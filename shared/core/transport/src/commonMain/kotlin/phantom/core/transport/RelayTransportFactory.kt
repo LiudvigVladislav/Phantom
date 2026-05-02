@@ -5,17 +5,54 @@ package phantom.core.transport
 
 import io.ktor.client.HttpClient
 
-expect fun createHttpClient(): HttpClient
+/**
+ * Returns a factory that builds a fresh [HttpClient] each time it is invoked.
+ *
+ * KtorRelayTransport calls the factory once per reconnect generation and
+ * closes the resulting client in the generation's `finally` block. Per-
+ * generation clients let us recover from a deadlocked WebSocket reader on
+ * Tecno HiOS (and any OEM with similar Wi-Fi-radio parking behaviour) by
+ * destroying the entire OkHttp engine on pong/ack timeout. See ADR-010
+ * "Updated 2026-05-01" for the full reasoning.
+ *
+ * This is the WebSocket-side factory only. REST traffic uses
+ * [createRestHttpClient] which returns a long-lived shared client suitable
+ * for connection pooling across short HTTP calls.
+ */
+expect fun createHttpClientFactory(): () -> HttpClient
 
 /**
- * Force-cancel every in-flight underlying engine call so a hung WebSocket
- * tears down immediately instead of waiting on the engine's graceful-close
- * timeout. KtorRelayTransport calls this when application-level pong times
- * out — Ktor's session.cancel() alone routes through the OkHttp outgoing
- * actor's finally block which calls websocket.close() (graceful) and blocks
- * for up to 60 seconds.
+ * Returns a long-lived [HttpClient] for REST traffic (PreKey publish /
+ * fetch, future /me endpoints). One instance per app lifetime — connection
+ * pooling and TLS session reuse across short HTTP calls is desirable.
  *
- * Implementations should be best-effort and never throw. For engines without
- * a native equivalent, the implementation may be a no-op.
+ * Distinct from [createHttpClientFactory] because the WebSocket path
+ * deliberately recreates the engine on every reconnect and the REST path
+ * does not benefit from that.
  */
-expect fun forceCancelAllEngineCalls()
+expect fun createRestHttpClient(): HttpClient
+
+/**
+ * Force-interrupts every thread in the active WebSocket engine's pool.
+ *
+ * Why this exists: Ktor's `HttpClient.close()` for the OkHttp engine
+ * calls `OkHttpClient.dispatcher.executorService.shutdown()` — a
+ * GRACEFUL shutdown that waits for running tasks to finish on their
+ * own. The WebSocket reader thread is parked in a kernel `recv()`
+ * syscall on a TCP socket whose Wi-Fi radio has been parked by the
+ * OEM. Graceful shutdown does not interrupt kernel syscalls; the
+ * reader stays parked until the OS resumes the radio (observed:
+ * 60+ seconds on Tecno HiOS).
+ *
+ * `shutdownNow()` sends `InterruptedException` to every pool thread,
+ * which propagates `SocketException: Socket closed` from the kernel
+ * read and unblocks the reader within milliseconds. After this call
+ * the engine is dead — no further requests can be served — but that
+ * is fine because we are about to close the client anyway in
+ * `runReconnectLoop`'s finally block.
+ *
+ * Implementations: best-effort, never throw. Engines without a
+ * comparable mechanism (Darwin) may be a no-op — they don't have the
+ * Tecno HiOS problem because iOS doesn't park Wi-Fi the same way.
+ */
+expect fun forceShutdownActiveEngine()

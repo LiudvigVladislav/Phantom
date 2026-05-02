@@ -298,6 +298,9 @@ private class FakeRelayTransport : RelayTransport {
     override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
     override fun isConnected() = true
+    // ADR-011 / ADR-013: stubs satisfying the new RelayTransport contract.
+    override val lastPongElapsedMs: Long get() = 0L
+    override suspend fun forceReconnect() {}
 }
 
 // Passthrough ratchet — identity transform for testing
@@ -936,6 +939,9 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
     override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
     override fun isConnected(): Boolean = true
+    // ADR-011 / ADR-013: stubs satisfying the new RelayTransport contract.
+    override val lastPongElapsedMs: Long get() = 0L
+    override suspend fun forceReconnect() {}
     suspend fun deliver(d: phantom.core.transport.RelayMessage.Deliver) { _incoming.emit(d) }
 }
 

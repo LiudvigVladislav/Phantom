@@ -493,13 +493,42 @@ class DefaultMessagingService(
                         MessagingLogLevel.INFO,
                         "Session loaded: conv=${conversationId.take(24)}… decrypting…",
                     )
-                    val (newState, decrypted) = ratchet.decrypt(state, encrypted)
-                    sessionManager.saveSession(conversationId, newState)
-                    messagingLog(
-                        MessagingLogLevel.INFO,
-                        "Decrypt OK: plaintextBytes=${decrypted.size}",
-                    )
-                    decrypted
+                    try {
+                        val (newState, decrypted) = ratchet.decrypt(state, encrypted)
+                        sessionManager.saveSession(conversationId, newState)
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "Decrypt OK: plaintextBytes=${decrypted.size}",
+                        )
+                        decrypted
+                    } catch (e: IllegalArgumentException) {
+                        // ADR-012 / 2026-05-01 audit finding: a MAC
+                        // verification error is a HARD cryptographic
+                        // verdict — the chain key positions on sender
+                        // and receiver have permanently diverged
+                        // (typically: pre-migration envelope still in
+                        // relay store after PR C wiped sessions; or
+                        // double-send under the same id with chain
+                        // advanced between sends). The receiver can
+                        // never recover this envelope, no matter how
+                        // many redeliveries happen. Ack so the relay
+                        // drops it. Log the id so QA can audit which
+                        // envelopes died this way.
+                        if (e.message?.contains("MAC", ignoreCase = true) == true ||
+                            e.message?.contains("verification", ignoreCase = true) == true
+                        ) {
+                            messagingLog(
+                                MessagingLogLevel.WARN,
+                                "Permanent decrypt failure (MAC error) — ack-deliver'ing to clear " +
+                                    "relay store. id=${deliver.messageId.take(12)}… " +
+                                    "conv=${conversationId.take(16)}… err=${e.message}",
+                            )
+                            transport.sendDeliveryAck(deliver.messageId)
+                            return@withLock null
+                        }
+                        // Other IAE — rethrow, outer onFailure handles it.
+                        throw e
+                    }
                 } else {
                     // Fresh session — require x3dhInit on the wire. The
                     // initiator side (their encryptUnderLock) is contract-
