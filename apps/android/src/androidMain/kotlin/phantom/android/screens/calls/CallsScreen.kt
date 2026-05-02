@@ -3,6 +3,9 @@
 
 package phantom.android.screens.calls
 
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -18,10 +21,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import phantom.android.calls.ActiveCall
@@ -41,11 +46,28 @@ fun CallsScreen(
     onProfile: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     val identity by container.identityState.collectAsState()
     val userName = identity?.username ?: ""
     val selfAvatarBitmap by container.selfAvatar.collectAsState()
     val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
     var contacts by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
+
+    // Holds the conversation waiting for mic permission so the grant callback can start the call.
+    var pendingCallConv by remember { mutableStateOf<ConversationEntity?>(null) }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val conv = pendingCallConv ?: return@rememberLauncherForActivityResult
+        pendingCallConv = null
+        if (granted) {
+            scope.launch { container.callManager?.startCall(conv.theirPublicKeyHex, conv.theirUsername) }
+            onNavigate(Screen.ActiveCall(conv.id, conv.theirUsername))
+        } else {
+            Toast.makeText(context, "Нужно разрешение на микрофон", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     LaunchedEffect(Unit) {
         contacts = runCatching { container.conversationRepo.getActiveConversations() }.getOrElse { emptyList() }
@@ -128,10 +150,18 @@ fun CallsScreen(
                         ContactCallRow(
                             conv = conv,
                             onCall = {
-                                scope.launch {
-                                    container.callManager?.startCall(conv.theirPublicKeyHex, conv.theirUsername)
+                                val hasPermission = ContextCompat.checkSelfPermission(
+                                    context, android.Manifest.permission.RECORD_AUDIO
+                                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                if (hasPermission) {
+                                    scope.launch {
+                                        container.callManager?.startCall(conv.theirPublicKeyHex, conv.theirUsername)
+                                    }
+                                    onNavigate(Screen.ActiveCall(conv.id, conv.theirUsername))
+                                } else {
+                                    pendingCallConv = conv
+                                    micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
                                 }
-                                onNavigate(Screen.ActiveCall(conv.id, conv.theirUsername))
                             },
                         )
                     }
