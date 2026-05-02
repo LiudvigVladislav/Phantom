@@ -95,6 +95,10 @@ private class BufferingRelayTransport : RelayTransport {
 
     override fun isConnected(): Boolean = _state.value is TransportState.Connected
 
+    // ADR-011 / ADR-013: stubs satisfying the new RelayTransport contract.
+    override val lastPongElapsedMs: Long get() = 0L
+    override suspend fun forceReconnect() {}
+
     /** Flush all queued messages into the incoming flow. */
     suspend fun deliverQueued() {
         val pending = queue.toList()
