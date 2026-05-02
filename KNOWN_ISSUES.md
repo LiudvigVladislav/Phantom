@@ -1,7 +1,7 @@
 # PHANTOM Alpha 1 — Known Issues
 
 **Last updated:** 2026-05-02
-**Build:** branch `fix/call-serializer-and-stuck-envelope-loop` (APK 19, commit `ad9f29b6`); pending merge to `master` as transport-reliability sprint PR
+**Build:** master at `c62fbfff` — PR #28 (transport reliability) + PR #29 (calls UX, F-03/07/10/15) + PR #30 (calls media: mic permission, audio mode, black-screen) all merged.
 **Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS, plus Pixel 8 Pro emulators API 35), Hetzner VPS relay (`relay.phntm.pro`)
 
 ---
@@ -261,6 +261,44 @@ Final transport architecture: APK 17's abandon-and-restart with APK 19's belt-an
 - See PHANTOM_ROADMAP_2026.md for Phase 5 timeline
 
 **Why this is documented as a limitation, not a P1 bug:** Every reasonable user-space mitigation has been attempted and verified ineffective. The fix lives in a different architectural layer (push wakeup) that is on the roadmap. Re-attempting transport-layer workarounds would be wasted effort. ADR-010, ADR-011, ADR-013 + `docs/research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md` document the full diagnostic chain.
+
+---
+
+### ISSUE-014: Calls — experimental feature in Alpha
+
+**Status:** WebRTC voice calls implemented and partially functional. Marked **experimental** in Alpha. Core text messaging is the primary supported feature; voice calls are best-effort and known-unstable on aggressive-OEM Android skins.
+
+**What works (verified 2026-05-02 on Tecno Spark Go ↔ Pixel 8 Pro emulator):**
+
+- Outgoing and incoming call signalling (offer / answer / ICE / reject / hangup)
+- Username displayed correctly on incoming call (F-07 fix)
+- Sequential calls do not carry stale ICE between sessions (F-10 fix)
+- 60-second ring timeout on unanswered outgoing calls (F-03 fix)
+- Mic permission requested at call start (caller) and call answer (callee)
+- `AudioManager.MODE_IN_COMMUNICATION` set during the call, restored on cleanup
+- Mute and Speaker buttons toggle and reflect state in UI
+- Black screen after `cleanupCall` no longer occurs — the route navigates back to chat list when the call state goes null (PR #30)
+
+**Known limitations on Tecno HiOS — not fixed in Alpha:**
+
+1. **Asymmetric audio.** Phone caller's mic → emulator callee's speaker works (callee hears caller). Emulator callee's mic → phone caller's speaker is silent (caller does not hear callee), regardless of speakerphone toggle. Likely cause: HiOS-specific audio focus or default `AudioDeviceModule` initialization not coping with this routing. Not investigated to root cause; deferred to PR 2.6 post-Alpha.
+2. **Crash possible mid-call.** If the 30-second transport reconnect cycle (ISSUE-013) fires while a WebRTC session is establishing or in progress, the app may crash with a native WebRTC fault and auto-restart via the foreground-service contract. Reproduces ~1 in 5 sustained calls on Tecno; not observed on stock-Android emulator.
+3. **State desync between participants during establishment.** When transport reconnect fires between `call_offer` and `call_answer`, one side may show "in call / counting timer" while the other still shows "calling…" until ICE catches up. Self-resolves when the next signalling envelope arrives, typically within 1–3 s.
+4. **Speaker / earpiece routing varies.** On the phone, default routing is the earpiece (small speaker near the top, intended for holding to ear). Speaker toggle works but is a separate user action. On emulator there is no earpiece concept; default routes to the host audio device.
+
+**Root cause is architectural, not a localised bug.** WebRTC voice calls expect a stable persistent network session. PHANTOM's current transport on aggressive-OEM Android cycles through reconnects every ~30 seconds (ISSUE-013, by design until UnifiedPush). Each reconnect can disrupt ICE, DTLS-SRTP setup, or the foreground service hosting the WebRTC native code. There is no transport-layer fix without push-based wakeup.
+
+**Recommendation for Alpha users:**
+
+- Use **text** and (when PR 3 lands) **voice messages** for important communication. These deliver reliably under the current transport.
+- Calls are best-effort — work well between two stock-Android devices on Wi-Fi, less reliable when one side is an aggressive-OEM phone.
+
+**Real fix path:**
+
+- **PR 2.6 (deferred to post-Phase-5):** explicit `JavaAudioDeviceModule`, `AudioFocus` request, suppress transport `forceReconnect()` while a call is active, default-on speakerphone for testing. Estimated 2–3 days when picked up.
+- **Phase 5 (UnifiedPush, ~Feb 2027):** push-based transport eliminates the 30-second reconnect cycle on aggressive-OEM devices, removing the architectural cause.
+
+**Scope decision rationale.** PRs #29 and #30 closed the user-visible call-UX bugs that were definitively fixable above the transport layer. Further iteration would require Tecno-specific WebRTC ADM debugging with diminishing returns. The development sprint priority shifted to PR 3 (voice messages over regular transport) which serves the same async-voice need at much higher reliability and is independent of WebRTC.
 
 ---
 
