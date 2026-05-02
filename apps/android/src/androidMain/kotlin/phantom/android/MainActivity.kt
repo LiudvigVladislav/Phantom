@@ -10,7 +10,10 @@ import android.os.Bundle
 import android.util.Base64
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import phantom.android.notifications.PhantomNotificationManager
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
@@ -299,6 +302,25 @@ private fun PhantomApp(
     // is started from MainActivity.onCreate() and runs independently of Activity lifecycle.
 
     val context = androidx.compose.ui.platform.LocalContext.current
+
+    // Holds the ActiveCall screen to navigate to once mic permission is granted on answer.
+    var pendingAnswerScreen by remember { mutableStateOf<Screen.ActiveCall?>(null) }
+
+    val answerMicLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val dest = pendingAnswerScreen ?: return@rememberLauncherForActivityResult
+        pendingAnswerScreen = null
+        if (granted) {
+            scope.launch { container.callManager?.answerCall() }
+            currentScreen = dest
+        } else {
+            // Permission denied — cannot proceed; treat as reject so the call clears.
+            scope.launch { container.callManager?.rejectCall() }
+            currentScreen = Screen.ChatList
+        }
+    }
+
     when (val screen = currentScreen) {
         null -> {
             // Initial frame before LaunchedEffect resolves the start
@@ -462,6 +484,11 @@ private fun PhantomApp(
             val noCallFlow = remember { MutableStateFlow<ActiveCall?>(null) }
             val callState by (cm?.activeCall ?: noCallFlow).collectAsState()
             val call = callState
+            LaunchedEffect(call) {
+                if (call == null) {
+                    currentScreen = Screen.ChatList
+                }
+            }
             if (call != null && cm != null) {
                 ActiveCallScreen(
                     call = call,
@@ -475,8 +502,16 @@ private fun PhantomApp(
         is Screen.IncomingCall -> IncomingCallScreen(
             username = screen.username,
             onAnswer = {
-                scope.launch { container.callManager?.answerCall() }
-                currentScreen = Screen.ActiveCall(screen.conversationId, screen.username)
+                val hasPermission = ContextCompat.checkSelfPermission(
+                    context, android.Manifest.permission.RECORD_AUDIO
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (hasPermission) {
+                    scope.launch { container.callManager?.answerCall() }
+                    currentScreen = Screen.ActiveCall(screen.conversationId, screen.username)
+                } else {
+                    pendingAnswerScreen = Screen.ActiveCall(screen.conversationId, screen.username)
+                    answerMicLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                }
             },
             onReject = {
                 scope.launch { container.callManager?.rejectCall() }

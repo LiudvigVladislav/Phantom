@@ -63,6 +63,11 @@ class CallManager(
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
+    // Cached once; getSystemService is cheap but calling it on every audio operation is noisy.
+    private val audioManager: AudioManager by lazy {
+        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
+
     private val _activeCall = MutableStateFlow<ActiveCall?>(null)
     val activeCall: StateFlow<ActiveCall?> = _activeCall.asStateFlow()
 
@@ -98,6 +103,11 @@ class CallManager(
         val callId = uuid4().toString()
         pendingIceCandidates.clear()
         _activeCall.value = ActiveCall(callId, toPubKeyHex, toUsername, CallState.CALLING)
+
+        // MODE_IN_COMMUNICATION is required for WebRTC microphone routing and for
+        // isSpeakerphoneOn to take effect. Must be set before createAudioSource.
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        audioManager.isMicrophoneMute = false
 
         ringTimeoutJob = scope.launch {
             delay(60_000)
@@ -166,6 +176,11 @@ class CallManager(
         val call = _activeCall.value ?: return
         val remoteSdp = pendingRemoteSdp ?: return
         val remoteFrom = pendingRemoteFrom ?: return
+
+        // MODE_IN_COMMUNICATION is required for WebRTC microphone routing and for
+        // isSpeakerphoneOn to take effect. Must be set before createAudioSource.
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        audioManager.isMicrophoneMute = false
 
         createPeerConnection(remoteFrom)
 
@@ -285,9 +300,8 @@ class CallManager(
     }
 
     fun toggleSpeaker() {
-        val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audio.isSpeakerphoneOn = !audio.isSpeakerphoneOn
-        _activeCall.value = _activeCall.value?.copy(isSpeakerOn = audio.isSpeakerphoneOn)
+        audioManager.isSpeakerphoneOn = !audioManager.isSpeakerphoneOn
+        _activeCall.value = _activeCall.value?.copy(isSpeakerOn = audioManager.isSpeakerphoneOn)
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -374,6 +388,8 @@ class CallManager(
         pendingIceCandidates.clear()
         pendingRemoteSdp = null
         pendingRemoteFrom = null
+        audioManager.mode = AudioManager.MODE_NORMAL
+        audioManager.isSpeakerphoneOn = false
         _activeCall.value = _activeCall.value?.copy(state = endState)
         scope.launch {
             delay(2_000)
