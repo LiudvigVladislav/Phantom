@@ -8,11 +8,11 @@ This document is **the authoritative working plan**. When in doubt, read this fi
 
 ## Where we are right now
 
-- **Codebase status:** Alpha-2 X3DH bootstrap shipped (PR C). Real-device QA in progress on Tecno Spark Go (HiOS / Android 12), Galaxy A05 (Android 14), Pixel 8 Pro emulator.
-- **Latest APK:** APK 11, commit `fc5fff5d` on branch `fix/call-serializer-and-stuck-envelope-loop`. Ships ADR-010 transport fix (`connectionPool.evictAll()` instead of `dispatcher.cancelAll()` on pong timeout).
-- **Pending merge:** the `fix/call-serializer-and-stuck-envelope-loop` branch holds APK 7-11 changes (call signaling fast-path, ADR-010). Should merge after the user verifies APK 11 reconnect behaviour on Tecno.
-- **Active audits:** [docs/audit/ARCHITECTURE_AUDIT_2026_05_01.md](../audit/ARCHITECTURE_AUDIT_2026_05_01.md), [docs/audit/SECURITY_AUDIT_2026_05_01.md](../audit/SECURITY_AUDIT_2026_05_01.md). Both completed 2026-05-01.
-- **Architectural decisions on disk:** ADR-001…ADR-010. Latest: [ADR-010](../adr/ADR-010-transport-reconnect-deadlock.md) — transport reconnect deadlock root cause + fix.
+- **Codebase status:** Alpha-2 X3DH bootstrap shipped (PR C). Real-device QA closed on Tecno Spark Go (HiOS / Android 12) + twin Pixel 8 Pro emulators.
+- **Transport sprint: COMPLETE.** Final APK 19, commit `ad9f29b6` on branch `fix/call-serializer-and-stuck-envelope-loop`. 21 commits since master covering ADR-010 (per-reconnect HttpClient + abandon-and-restart), MAC-zombie ack-deliver, AlarmManager wakeup, Tier-1 MulticastLock + ConnectivityManager. **PR open against master**, awaiting CI green and Vladislav merge.
+- **Final transport behaviour on Tecno HiOS:** 30-second connection cycle, ~700 ms recovery, no message loss, 1–2 s send latency in worst case. **This is the Alpha baseline** — push-based wakeup deferred to Phase 5 (UnifiedPush). Documented as ISSUE-013 in `KNOWN_ISSUES.md`.
+- **Active audits on disk:** [docs/audit/ARCHITECTURE_AUDIT_2026_05_01.md](../audit/ARCHITECTURE_AUDIT_2026_05_01.md), [docs/audit/SECURITY_AUDIT_2026_05_01.md](../audit/SECURITY_AUDIT_2026_05_01.md), [docs/audit/RELAY_AUDIT_2026_05_01.md](../audit/RELAY_AUDIT_2026_05_01.md), [docs/research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md](../research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md). All completed 2026-05-01 / 2026-05-02.
+- **Architectural decisions on disk:** ADR-001…ADR-013. Latest: [ADR-010](../adr/ADR-010-transport-reconnect-deadlock.md) → [ADR-011](../adr/ADR-011-alarm-manager-network-wakeup.md) → [ADR-013](../adr/ADR-013-revised-transport-diagnosis-2026-05-02.md).
 
 ---
 
@@ -33,7 +33,9 @@ We have two independent fix sprints. They do not conflict — different files, d
 
 ### Track A — Reliability sprint (5 PRs)
 
-The goal: make the founder's manual-test sequence (add by QR → write → send → receive → call → voice) work reliably without app restarts. Ordered by user-visible impact.
+The goal: close the user-visible bugs surfaced during real-device QA on top of the now-stable transport baseline. **Ordering is set by Vladislav's priority — most-visible-broken first.** Approved 2026-05-02. Estimated total: ~15 working days.
+
+PR order: **2 → 3 → 1 → 4 → 5** (calls, voice, data integrity, durability, polish).
 
 ### Track B — Security sprint (10 items)
 
@@ -43,24 +45,10 @@ The goal: close all P1 security findings before any public Kickstarter / Beta an
 
 ## Track A — Reliability sprint
 
-### PR 1 — "Message after QR-add does not send until restart"
+**Execution order (Vladislav's priority, 2026-05-02):** PR 2 → PR 3 → PR 1 → PR 4 → PR 5.
+Reasoning: user-visible breakage first (calls, voice), then data-integrity edges, then durability, then polish.
 
-Closes the founder's #1 manual-test pain.
-
-| Finding | Where | What |
-|---------|-------|------|
-| F-08 | AppContainer.kt:255-263, 390 | `bootstrapForNewIdentity()` is fire-and-forget; UI sees `messagingService` before bootstrap completes. Await it, or gate UI send path on a `bootstrapReady` StateFlow. |
-| F-01 | KtorRelayTransport.kt:514-520 | `flushPendingOutbox` silently drops envelopes on `sendRaw` failure. Re-enqueue on failure + sweep DB for `QUEUED` rows on startup. |
-| F-09 | KtorRelayTransport.kt:538-547 | `disconnect()` does not flush outbox before cancelling. Add a 3-second best-effort flush. |
-| F-04 | DefaultMessagingService.sendMessage + SessionManager.initiatorBootstrap | `saveSession` runs before `insertMessage`. On crash between the two, message disappears from sender's history but peer receives it. Make atomic via single SQLDelight transaction. |
-
-Acceptance: in a fresh-install QA pass, "Add by QR → type → send" delivers the message without an app restart, even if the recipient's WS is briefly down at send time.
-
-Estimated scope: ~6-8 files, ~200 LOC plus tests.
-
----
-
-### PR 2 — Calls work end-to-end
+### PR 2 — Calls work end-to-end (FIRST, ~2 days)
 
 | Finding | Where | What |
 |---------|-------|------|
@@ -69,17 +57,34 @@ Estimated scope: ~6-8 files, ~200 LOC plus tests.
 | F-10 | CallManager.kt:71 | `pendingIceCandidates` never cleared between calls. Clear in `handleOffer`; add a `callId` discriminator on ICE frames. |
 | F-15 | CallManager.kt:268 | `toggleMute` sets `isMuted = enabled` (semantically inverted, works by accident). Cosmetic, fix while we're in the file. |
 
-Acceptance: caller sees "Connected" when callee answers, sees correct username on incoming call, sequential calls don't carry stale ICE.
+Acceptance: caller sees "Connected" when callee answers, sees correct username on incoming call, sequential calls don't carry stale ICE, no black-screen lock-up after end-call.
 
 ---
 
-### PR 3 — Voice messages
+### PR 3 — Voice messages (SECOND, ~5 days)
 
 | Finding | Where | What |
 |---------|-------|------|
-| F-05 | DefaultMessagingService.sendMessage + payload schema | Voice notes inline-base64 the entire blob into a single envelope. If size > relay's `max_payload_bytes` it 413s, retries forever. Chunk into multiple envelopes; reassemble on receiver. Pre-send size check with user-visible error if over hard cap. |
+| F-05 | DefaultMessagingService.sendMessage + payload schema | Voice notes inline-base64 the entire blob into a single envelope. ~270 KB single payload cannot complete transit before the next 30 s reconnect window on Tecno. Chunk into multiple envelopes; reassemble on receiver. Pre-send size check with user-visible error if over hard cap (~10 MB). |
 
-Acceptance: 30-second voice note delivers reliably between phone and emulator on the production relay.
+Acceptance: 30-second voice note delivers reliably between Tecno and emulator on the production relay, including under the 30-second reconnect cadence we accept as Alpha baseline.
+
+---
+
+### PR 1 — Data-integrity edges (THIRD, ~3 days)
+
+Closes the remaining edge cases where messages can silently disappear under crash / mid-flush conditions.
+
+| Finding | Where | What |
+|---------|-------|------|
+| F-08 | AppContainer.kt:255-263, 390 | `bootstrapForNewIdentity()` is fire-and-forget; UI sees `messagingService` before bootstrap completes. Await it, or gate UI send path on a `bootstrapReady` StateFlow. |
+| F-01 | KtorRelayTransport.kt:514-520 | `flushPendingOutbox` silently drops envelopes on `sendRaw` failure. Re-enqueue on failure + sweep DB for `QUEUED` rows on startup. |
+| F-09 | KtorRelayTransport.kt:538-547 | `disconnect()` does not flush outbox before cancelling. Add a 3-second best-effort flush. |
+| F-04 | DefaultMessagingService.sendMessage + SessionManager.initiatorBootstrap | `saveSession` runs before `insertMessage`. On crash between the two, message disappears from sender's history but peer receives it. Make atomic via single SQLDelight transaction. |
+
+Acceptance: kill the app process mid-send (`adb shell am kill phantom.android`) — on next launch the queued message either sends or is recoverable, never silently lost. Background flush window before service teardown does not drop frames.
+
+Note: 2026-05-02 QA showed "send works first try" most attempts after APK 19 — this PR closes the remaining 1-in-10 edge case.
 
 ---
 
@@ -151,8 +156,13 @@ Pre-launch security work, ordered by severity. New F19–F26 from today's audit 
 
 ## What "done" looks like
 
-- **PR 1 merged** = founder's manual test sequence works without restart. This is the user-facing fix.
-- **PR 1–5 merged** = Alpha-3 candidate. Internal dogfooding can begin.
+- **Transport branch merged** = stable Alpha baseline. Tecno-class devices: 30 s reconnect cycle, ~700 ms recovery, no message loss. Done.
+- **PR 2 merged** = user-visible call breakage closed (no more stuck "Calling…", username shows correctly, no black-screen after end-call).
+- **PR 3 merged** = voice messages deliver between any two devices including Tecno.
+- **PR 1 merged** = no message ever silently disappears even under process kill mid-send.
+- **PR 2 + 3 + 1 merged** = Alpha-3 release-candidate quality for text + voice + calls.
+- **PR 4 merged** = durability against Keystore invalidation events (biometric reset, factory-state edge cases).
+- **PR 5 merged** = visual polish + Tier-3 onboarding for aggressive-OEM users.
 - **Track B items 1–8 closed** = security clearance for Kickstarter announcement. Items 9–17 can land during the campaign window.
 - **NLNet application** can submit any time after Track B items 1–4 close (the first four cover the most user-visible privacy claims).
 
@@ -160,74 +170,38 @@ Pre-launch security work, ordered by severity. New F19–F26 from today's audit 
 
 ## What QA needs to focus on right now
 
-The current APK on test is **APK 11** (md5 `88c525b3c0515ba3c1562e7e0a423da7`, commit `fc5fff5d`). It contains only the ADR-010 transport fix; no PR 1–5 work has landed yet.
+**Transport sprint complete.** Branch `fix/call-serializer-and-stuck-envelope-loop` is open as a PR against `master`; merge after CI green and Vladislav's review.
 
-Verification matrix for this APK is in the next section of this doc — see [Manual test checklist for APK 11](#manual-test-checklist-for-apk-11) below.
-
----
-
-## Manual test checklist for APK 11
-
-APK 11 fixes ONE specific thing: the WebSocket reconnect deadlock after Pong timeout on Tecno HiOS Wi-Fi parking. Everything else from prior reports is **expected to still misbehave** until PR 1+ ships.
-
-### What MUST work after APK 11 (test focus)
-
-1. **Reconnect speed after Pong timeout.** On Tecno, leave the app idle on the chat list for ~90 seconds with screen off, then unlock. Watch logcat for the sequence:
-
-   ```
-   Pong timeout (...) — forcing reconnect
-   WebSocket connect FAILED ... SocketException: Socket closed   ← within ~1 sec of Pong timeout
-   Retry attempt #1 in 1000ms
-   Attempting WebSocket connect (attempt=1)
-   WebSocket connected successfully                                ← within ~2 sec total
-   Re-queueing N unacknowledged envelope(s) from previous session
-   Flushing N queued item(s) after reconnect
-   ```
-
-   **Pass criterion:** total elapsed time from "Pong timeout" to "WebSocket connected" is **under 3 seconds**.
-   **Fail criterion:** the gap is still 25+ seconds. That means `evictAll()` did not unblock the reader and we need to revisit ADR-010.
-
-2. **No reconnect storm.** After the recovery, the connection should stay up for at least 60 seconds without another `WebSocket connect FAILED`. APK 9's bug was a ~12-second reconnect cycle; APK 11 should not show that.
-
-3. **Queued message flush.** Send a message during the parked-radio window. After reconnect, the message should land on the peer **without an app restart**.
-
-### What is EXPECTED to still misbehave (don't file as new bugs)
-
-These are tracked above as PR 1–5 / Track B items. Don't re-report — they are known and prioritised.
-
-- ❌ "Add by QR → write → send" still hangs first message until restart (PR 1 / F-08)
-- ❌ Voice messages don't deliver (PR 3 / F-05)
-- ❌ Caller stuck on "Calling…" after callee picks up (PR 2 / F-03)
-- ❌ Username shows 8 hex chars instead of `@nickname` on incoming call (PR 2 / F-07)
-- ❌ Onboarding keyboard doesn't collapse (PR 5 / QA backlog)
-- ❌ Radar circles on welcome screen (PR 5 / QA backlog)
-- ❌ Online indicator misalignment (UI design pass, separate PR)
-
-### Logs to capture
-
-For each test session, capture both phones with the standard command:
-
-```powershell
-adb -s <device-id> logcat PhantomRelay:V PhantomMessaging:V PhantomMessagingService:V PhantomUI:V PHANTOM_INIT:V AndroidRuntime:E *:S | Tee-Object -FilePath "C:\temp\<scenario>-<device>.log"
-```
-
-Send the log file paths after each scenario.
-
-### Bonus: optional sanity checks (architect-suggested)
-
-- `curl -v --http1.1 wss://relay.phntm.pro/ws` — confirms relay uses HTTP/1.1 for the upgrade (the ADR-010 fix relies on this).
-- `adb shell dumpsys wifi | grep -i phantom` — confirms `WIFI_MODE_FULL_HIGH_PERF` is granted on HiOS.
-
-These don't block the test but are useful data points for the next debug pass.
+After merge, QA focus shifts to PR 2 (calls). The Alpha baseline transport behaviour is the new normal — text messages deliver reliably with up to 1–2 s latency in worst case on Tecno; that is acceptable per ISSUE-013.
 
 ---
 
-## Open questions for the founder
+## Transport-sprint outcome (2026-05-02 close-out)
 
-1. **PR ordering.** Confirmed: PR 1 → PR 2 → PR 3 → PR 4 → PR 5? Or surface a different order if any of these block product/marketing work?
-2. **Kickstarter timing vs Track B.** Track B items 1–8 are the gating set. If Kickstarter has a fixed launch date, we sequence Track B accordingly; otherwise we land it after Alpha-3.
-3. **Voice-message size hard cap.** PR 3 needs a number. Suggest 10 MB as the hard cap with chunking under that, but founder has the call.
-4. **Design pass timing.** Onboarding keyboard, radar circles, online indicator alignment, call-controls layout — all UI work that should run in parallel via `ui-prototyper`. Do we want that in PR 5, or as a separate "Alpha-3 visual polish" PR after reliability lands?
+Verified on Tecno Spark Go 2023 / HiOS / Android 12 + twin Pixel 8 Pro emulators across APK 7 → APK 19.
+
+| Behaviour | Tecno HiOS | Pixel emulators |
+|---|---|---|
+| Stable connection window | ~30 s | 5+ minutes |
+| Recovery after Pong timeout | ~700 ms | n/a (does not happen) |
+| Text message delivery | Yes, ≤2 s end-to-end | Yes, sub-second |
+| QR-add → first send works | Yes (was failing before APK 17) | Yes |
+| Duplicate-envelope guard | Working | Working |
+| MAC-zombie ack-deliver | Working | Not exercised |
+| Voice message delivery | **Fails** — 270 KB single envelope can't fit in 30 s window — fixed by PR 3 | n/a |
+| Call UX | Multiple bugs (F-03, F-07, F-10, F-15) — fixed by PR 2 | same UX bugs |
+
+**Conclusion:** transport architecture is final for Alpha. Remaining defects are above the transport layer and addressed by Track A.
+
+---
+
+## Decisions locked in 2026-05-02
+
+1. **Push-based wakeup** — deferred to Phase 5 (UnifiedPush, ~Feb 2027). Documented as ISSUE-013. Tier-1 user-space mitigations attempted and verified ineffective.
+2. **Voice-message hard cap** — to be set by PR 3. Default working assumption: 10 MB hard cap with chunking, ~75 KB per chunk. Vladislav can override.
+3. **UI polish (radar circles, online indicator, etc.)** — bundled into PR 5, not split into a separate "Alpha-3 visual polish" PR. Use `ui-prototyper` agent inside PR 5 scope.
+4. **Track B (security)** — runs in parallel with Track A after PR 2 ships. Items 1–8 are Kickstarter gating; 9–17 can land during the campaign window.
+5. **NLNet application** — submittable any time after Track B items 1–4 close.
 
 ---
 
