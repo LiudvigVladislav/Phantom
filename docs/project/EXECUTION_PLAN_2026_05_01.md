@@ -9,8 +9,11 @@ This document is **the authoritative working plan**. When in doubt, read this fi
 ## Where we are right now
 
 - **Codebase status:** Alpha-2 X3DH bootstrap shipped (PR C). Real-device QA closed on Tecno Spark Go (HiOS / Android 12) + twin Pixel 8 Pro emulators.
-- **Transport sprint: COMPLETE.** Final APK 19, commit `ad9f29b6` on branch `fix/call-serializer-and-stuck-envelope-loop`. 21 commits since master covering ADR-010 (per-reconnect HttpClient + abandon-and-restart), MAC-zombie ack-deliver, AlarmManager wakeup, Tier-1 MulticastLock + ConnectivityManager. **PR open against master**, awaiting CI green and Vladislav merge.
-- **Final transport behaviour on Tecno HiOS:** 30-second connection cycle, ~700 ms recovery, no message loss, 1–2 s send latency in worst case. **This is the Alpha baseline** — push-based wakeup deferred to Phase 5 (UnifiedPush). Documented as ISSUE-013 in `KNOWN_ISSUES.md`.
+- **Transport sprint: COMPLETE and merged.** Final commit `12ac26c5` on master (PR #28). 21-commit transport reliability sprint covering ADR-010 (per-reconnect HttpClient + abandon-and-restart), MAC-zombie ack-deliver, AlarmManager wakeup, Tier-1 MulticastLock + ConnectivityManager.
+- **Track A PR 2 (calls UX): COMPLETE and merged.** Commit `45338fb8` on master (PR #29). Closed F-03 (handleAnswer null-guard + ring timeout), F-07 (conversation lookup key), F-10 (pendingIceCandidates clear), F-15 (toggleMute naming).
+- **Track A PR 2.5 (calls media): COMPLETE and merged.** Commit `c62fbfff` on master (PR #30). Closed mic permission gate, audio mode `MODE_IN_COMMUNICATION`, black screen on remote hangup, speaker toggle responsiveness.
+- **Calls = experimental in Alpha.** Asymmetric audio on Tecno HiOS, occasional mid-call crashes on transport reconnect, and state-desync between participants during establishment all remain. Real fix is PR 2.6 (post-Phase-5) — see ISSUE-014 in `KNOWN_ISSUES.md`. Decision rationale below in "Decisions locked".
+- **Final transport behaviour on Tecno HiOS:** 30-second connection cycle, ~700 ms recovery, no text-message loss, 1–2 s send latency in worst case. **This is the Alpha baseline** — push-based wakeup deferred to Phase 5 (UnifiedPush). Documented as ISSUE-013 in `KNOWN_ISSUES.md`.
 - **Active audits on disk:** [docs/audit/ARCHITECTURE_AUDIT_2026_05_01.md](../audit/ARCHITECTURE_AUDIT_2026_05_01.md), [docs/audit/SECURITY_AUDIT_2026_05_01.md](../audit/SECURITY_AUDIT_2026_05_01.md), [docs/audit/RELAY_AUDIT_2026_05_01.md](../audit/RELAY_AUDIT_2026_05_01.md), [docs/research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md](../research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md). All completed 2026-05-01 / 2026-05-02.
 - **Architectural decisions on disk:** ADR-001…ADR-013. Latest: [ADR-010](../adr/ADR-010-transport-reconnect-deadlock.md) → [ADR-011](../adr/ADR-011-alarm-manager-network-wakeup.md) → [ADR-013](../adr/ADR-013-revised-transport-diagnosis-2026-05-02.md).
 
@@ -45,23 +48,43 @@ The goal: close all P1 security findings before any public Kickstarter / Beta an
 
 ## Track A — Reliability sprint
 
-**Execution order (Vladislav's priority, 2026-05-02):** PR 2 → PR 3 → PR 1 → PR 4 → PR 5.
-Reasoning: user-visible breakage first (calls, voice), then data-integrity edges, then durability, then polish.
+**Execution order (revised 2026-05-02 after calls testing):** PR 2 ✅ → PR 2.5 ✅ → **PR 3 (next)** → PR 1 → PR 4 → PR 5. PR 2.6 (calls audio plumbing) deferred to post-Phase-5.
 
-### PR 2 — Calls work end-to-end (FIRST, ~2 days)
+Reasoning: PRs 2 and 2.5 closed call UX/state bugs; remaining call issues (asymmetric audio, mid-call crash on reconnect) are architectural and need stable transport (Phase 5 / UnifiedPush, Feb 2027). Voice messages (PR 3) serve the same async-voice need with much higher reliability — independent of WebRTC, runs over the regular transport.
+
+### PR 2 — Calls work end-to-end ✅ MERGED (PR #29, commit `45338fb8`)
 
 | Finding | Where | What |
 |---------|-------|------|
-| F-03 | CallManager.kt:213-229 | `handleAnswer` no-ops silently if `peerConnection == null`. Add null-guard → ENDED transition. Add 60-second ring-timeout coroutine in `startCall`. |
-| F-07 | AppContainer.kt:378 | `onCallMessage` looks up conversation by `fromPubKeyHex` but the table key is the sorted-concat of both pubkeys. Lookup always returns null → username falls back to first 8 hex chars. Fix the lookup. |
-| F-10 | CallManager.kt:71 | `pendingIceCandidates` never cleared between calls. Clear in `handleOffer`; add a `callId` discriminator on ICE frames. |
-| F-15 | CallManager.kt:268 | `toggleMute` sets `isMuted = enabled` (semantically inverted, works by accident). Cosmetic, fix while we're in the file. |
+| F-03 | CallManager.kt | `handleAnswer` null-guards `peerConnection` → ENDED transition. 60-second ring-timeout coroutine added in `startCall`, cancelled on answer/cleanup. |
+| F-07 | AppContainer.kt | `onCallMessage` conversation lookup uses sorted-concat key matching `DefaultMessagingService.deriveConversationId`. Username now correct on incoming call. |
+| F-10 | CallManager.kt | `pendingIceCandidates.clear()` at the start of both `startCall` and `handleOffer`. ICE callId discriminator deferred. |
+| F-15 | CallManager.kt | `toggleMute` rename for clarity. |
 
-Acceptance: caller sees "Connected" when callee answers, sees correct username on incoming call, sequential calls don't carry stale ICE, no black-screen lock-up after end-call.
+### PR 2.5 — Calls media plumbing ✅ MERGED (PR #30, commit `c62fbfff`)
+
+| Bug | Where | Fix |
+|-----|-------|-----|
+| No mic at runtime | CallsScreen.kt + MainActivity.kt | `RECORD_AUDIO` permission gate before `startCall` (caller) and `answerCall` (callee). Reused ChatScreen pattern. Denied path → Toast on caller side, auto-reject on callee side. |
+| Wrong audio routing / silent toggles | CallManager.kt + manifest | `AudioManager.MODE_IN_COMMUNICATION` set before `createPeerConnection` in `startCall`/`answerCall`, restored to `MODE_NORMAL` in `cleanupCall`. `MODIFY_AUDIO_SETTINGS` permission added to manifest. Speaker and Mute toggles now actually take effect. |
+| Black screen after remote hangup | MainActivity.kt | `LaunchedEffect(call)` navigates to ChatList when `_activeCall` flips to null. Was failing because the `if (call != null)` guard had no `else`. |
+
+### Track A — known limitations remaining after PR 2.5 (intentionally not fixed in Alpha)
+
+Documented as ISSUE-014 in `KNOWN_ISSUES.md`. Calls are **experimental** in Alpha. Remaining issues:
+
+- Asymmetric audio on Tecno HiOS (caller can hear callee, callee cannot hear caller — receiver side)
+- Crash possible mid-call when transport reconnect cycle (ISSUE-013) fires during ICE/DTLS-SRTP setup
+- State desync between participants during establishment when reconnect fires between offer and answer
+
+Real fix path (deferred):
+
+- **PR 2.6 (post-Phase-5):** explicit `JavaAudioDeviceModule`, `AudioFocus` request, suppress transport `forceReconnect()` while `_activeCall != null`, default-on speakerphone for testing convenience. Estimated 2–3 days when picked up.
+- **Phase 5 (UnifiedPush, ~Feb 2027):** removes the architectural cause (30-s reconnect cycle on aggressive-OEM devices).
 
 ---
 
-### PR 3 — Voice messages (SECOND, ~5 days)
+### PR 3 — Voice messages (NEXT, ~5 days)
 
 | Finding | Where | What |
 |---------|-------|------|
@@ -202,6 +225,7 @@ Verified on Tecno Spark Go 2023 / HiOS / Android 12 + twin Pixel 8 Pro emulators
 3. **UI polish (radar circles, online indicator, etc.)** — bundled into PR 5, not split into a separate "Alpha-3 visual polish" PR. Use `ui-prototyper` agent inside PR 5 scope.
 4. **Track B (security)** — runs in parallel with Track A after PR 2 ships. Items 1–8 are Kickstarter gating; 9–17 can land during the campaign window.
 5. **NLNet application** — submittable any time after Track B items 1–4 close.
+6. **Calls = experimental in Alpha; PR 2.6 deferred.** After PRs #29 and #30 closed all definitively-fixable call UX bugs above the transport layer, real-device QA on 2026-05-02 surfaced asymmetric audio on Tecno HiOS, mid-call crash risk on reconnect, and state desync between participants. Root cause is architectural (WebRTC voice over a transport that reconnects every ~30 s on aggressive-OEM devices). Each further PR on calls would have diminishing returns relative to PR 3 (voice messages, async, runs over the regular transport, ~90 % of real-world voice use case). Decision: ship Alpha with calls labelled experimental in `KNOWN_ISSUES.md` ISSUE-014, prioritise PR 3 next. PR 2.6 (`JavaAudioDeviceModule`, `AudioFocus`, suppress reconnect during active call, default-on speakerphone) parked until Phase 5 makes the underlying transport stable enough for the work to stick.
 
 ---
 
