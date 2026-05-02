@@ -60,6 +60,16 @@ class FakeRelayTransportTest {
         }
 
         override fun isConnected(): Boolean = _state.value is TransportState.Connected
+
+        // ADR-011 / ADR-013 additions to RelayTransport. The fake does not need
+        // a real reconnect machinery for unit-test purposes; expose stable
+        // values that won't trigger the alarm receiver's stale-pong path.
+        override val lastPongElapsedMs: Long get() = 0L
+
+        override suspend fun forceReconnect() {
+            _state.value = TransportState.Disconnected
+            _state.value = TransportState.Connected
+        }
     }
 
     @Test
