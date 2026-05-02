@@ -8,6 +8,10 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.PowerManager
 import android.os.SystemClock
@@ -69,6 +73,17 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
     }
 
     private suspend fun handleWake(appContext: Context) {
+        // ADR Tier-1 (HiOS workaround): poke ConnectivityManager BEFORE
+        // checking pong staleness. This is a higher-level API the OEM
+        // is less likely to silently ignore than WifiLock/MulticastLock.
+        // It tells the OS "I need internet now"; on aggressive-OEM
+        // builds it can force the radio out of deep-park even when the
+        // battery panel says we should be unrestricted. Best-effort —
+        // never blocks for long; silently no-ops on Android <23.
+        runCatching {
+            pokeConnectivity(appContext)
+        }.onFailure { Log.w(TAG, "pokeConnectivity threw: ${it.message}") }
+
         val app = appContext as? PhantomApplication
         if (app == null) {
             Log.w(TAG, "applicationContext is not PhantomApplication — cannot reach container")
@@ -111,6 +126,42 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             .onFailure { Log.e(TAG, "forceReconnect threw: ${it.message}", it) }
     }
 
+    /**
+     * Best-effort radio wake. Sends a NetworkRequest with
+     * NET_CAPABILITY_INTERNET; the system MAY interpret this as
+     * "user wants connectivity now" and bring the radio out of low-
+     * power state. Releases the request after a short window so the
+     * scheduler doesn't think we want a permanent dedicated network.
+     */
+    private fun pokeConnectivity(appContext: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        var registered: ConnectivityManager.NetworkCallback? = null
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.i(TAG, "pokeConnectivity: network available — radio is awake")
+            }
+        }
+        runCatching {
+            cm.requestNetwork(request, callback, CONNECTIVITY_POKE_BUDGET_MS.toInt())
+            registered = callback
+        }.onFailure {
+            Log.w(TAG, "pokeConnectivity: requestNetwork failed: ${it.message}")
+        }
+        // Release the request after the budget regardless of whether
+        // the callback ever fired. unregister is idempotent.
+        if (registered != null) {
+            android.os.Handler(appContext.mainLooper).postDelayed({
+                runCatching { cm.unregisterNetworkCallback(callback) }
+            }, CONNECTIVITY_POKE_BUDGET_MS)
+        }
+    }
+
     private fun startMessagingService(appContext: Context) {
         runCatching {
             val intent = Intent(appContext, PhantomMessagingService::class.java)
@@ -149,6 +200,14 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
          * webSocket() handshake on a slow link can take several seconds.
          */
         const val WAKELOCK_BUDGET_MS: Long = 10_000L
+
+        /**
+         * Lifetime of the ConnectivityManager.requestNetwork poke
+         * inside onReceive. Long enough to give the OS time to
+         * respond, short enough that we don't accumulate held
+         * network requests across alarm fires.
+         */
+        const val CONNECTIVITY_POKE_BUDGET_MS: Long = 3_000L
 
         /**
          * Single PendingIntent request code shared between schedule and

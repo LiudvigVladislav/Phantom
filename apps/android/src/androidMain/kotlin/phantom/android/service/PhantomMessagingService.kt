@@ -53,6 +53,16 @@ class PhantomMessagingService : Service() {
     // user has chosen to keep the messenger running.
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    // ADR Tier-1 (HiOS workaround): MulticastLock changes the Wi-Fi
+    // radio idle profile on aggressive OEMs (Tecno HiOS, Infinix XOS,
+    // Xiaomi MIUI) where battery management ignores both
+    // setUnlockedDeviceRequired battery override and WifiLock.
+    // Multicast reception requires the radio not to deep-park, so
+    // holding this lock keeps the radio out of the most aggressive
+    // sleep state. Confirmed in 2026-05-02 QA: pong becomes stale
+    // every ~30 s without it, on a healthy Wi-Fi where the same
+    // emulator runs for 5+ min uninterrupted.
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -80,13 +90,24 @@ class PhantomMessagingService : Service() {
             }
             Log.d(TAG, "WakeLock acquired (PARTIAL)")
         }.onFailure { Log.w(TAG, "WakeLock acquire failed: ${it.message}") }
+
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wm.createMulticastLock("phantom:multicast").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.d(TAG, "MulticastLock acquired — keeps Wi-Fi radio out of deep-park on aggressive OEMs")
+        }.onFailure { Log.w(TAG, "MulticastLock acquire failed: ${it.message}") }
     }
 
     private fun releaseKeepAliveLocks() {
         runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
         runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        runCatching { if (multicastLock?.isHeld == true) multicastLock?.release() }
         wifiLock = null
         wakeLock = null
+        multicastLock = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
