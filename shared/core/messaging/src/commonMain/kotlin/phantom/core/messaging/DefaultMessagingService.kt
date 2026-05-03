@@ -101,7 +101,12 @@ class DefaultMessagingService(
 
     companion object {
         const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
-        const val AUDIO_CHUNK_BYTES = 64 * 1024         // 64 KB per chunk before base64 expansion
+        // 8 KB raw → ~53 KB on the wire after JSON+ratchet+padding+base64 expansion (~6.5x bloat
+        // because EncryptedMessage's ByteArray fields serialize to JSON int-arrays). At 53 KB
+        // per envelope each chunk uploads in well under the 30 s Tecno HiOS reconnect window;
+        // a 64 KB chunk produced 427 KB envelopes that timed out mid-upload (ISSUE-013). Fixing
+        // the underlying serialization bloat is tracked as a separate task.
+        const val AUDIO_CHUNK_BYTES = 8 * 1024          // 8 KB per chunk before base64 expansion
     }
 
     // Buffer for reassembling incoming audio chunks. Key = chunkId.

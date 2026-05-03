@@ -909,8 +909,8 @@ class DefaultMessagingServiceTest {
         )
         val service = buildService(this, transport = transport, msgRepo = msgRepo, convRepo = convRepo)
 
-        // 200 KB → ceil(200*1024 / 64*1024) = ceil(3.125) = 4 chunks
-        val audioBytes = ByteArray(200 * 1024) { it.toByte() }
+        // Sized to 3 full chunks + 1 partial chunk = 4 chunks regardless of AUDIO_CHUNK_BYTES.
+        val audioBytes = ByteArray(DefaultMessagingService.AUDIO_CHUNK_BYTES * 3 + 1) { it.toByte() }
         val result = service.sendAudio(
             conversationId = "conv-1",
             audioBytes = audioBytes,
@@ -918,8 +918,8 @@ class DefaultMessagingServiceTest {
             mimeType = "audio/ogg",
         )
 
-        assertEquals(true, result.isSuccess, "sendAudio must succeed for a 200 KB payload")
-        assertEquals(4, transport.sent.size, "200 KB at 64 KB/chunk must produce exactly 4 envelopes")
+        assertEquals(true, result.isSuccess, "sendAudio must succeed for the chosen payload size")
+        assertEquals(4, transport.sent.size, "3 full chunks + 1 partial chunk must produce exactly 4 envelopes")
 
         val json = Json { ignoreUnknownKeys = true }
         val chunkIds = mutableSetOf<String>()
@@ -972,8 +972,8 @@ class DefaultMessagingServiceTest {
         testScheduler.runCurrent()
 
         // Build a 4-chunk voice note from a known byte sequence.
-        // Each chunk is AUDIO_CHUNK_BYTES (64 KB) except the last.
-        val originalBytes = ByteArray(200 * 1024) { it.toByte() }
+        // Each chunk is AUDIO_CHUNK_BYTES except the last (sized as 3 full chunks + 1 partial).
+        val originalBytes = ByteArray(DefaultMessagingService.AUDIO_CHUNK_BYTES * 3 + 1) { it.toByte() }
         val chunkId = "test-chunk-id-reassembly"
         val total = 4
         val localJson = Json { ignoreUnknownKeys = true }
