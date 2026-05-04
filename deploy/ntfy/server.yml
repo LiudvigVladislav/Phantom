@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 Willen LLC
+#
+# Self-hosted ntfy distributor configuration for PHANTOM UnifiedPush
+# wakeup channel (ADR-016).
+#
+# Privacy posture:
+#   - No telemetry / phone-home (ntfy server binary does not contact
+#     ntfy.sh on its own — verified per no-go-checks/03-ntfy-audit.md).
+#   - Web UI disabled (the bundled UI references Google Fonts; we don't
+#     need it because the only consumers are the PHANTOM client and the
+#     PHANTOM relay, both of which use the HTTP push API directly).
+#   - Attachments disabled (PHANTOM only ever sends 1-byte wakeups).
+#   - FCM/APN forwarding NOT configured — leaving these unset keeps the
+#     dormant FCM/APN code paths in the binary inert. Operators MUST
+#     NOT add `firebase-key-file` or `upstream-base-url` here without an
+#     ADR amendment.
+#
+# Reverse-proxied by Caddy at https://ntfy.phntm.pro. The relay POSTs
+# wake-ups to the in-cluster URL http://ntfy:80/<topic> via Docker's
+# internal DNS — never to the public hostname.
+
+# ── Listener ──────────────────────────────────────────────────────────
+# Bind plain HTTP to the internal Docker network only. Caddy terminates
+# TLS at the edge. The container is not exposed to the host.
+listen-http: ":80"
+
+# Public-facing hostname Caddy uses to reach us. Used by ntfy when it
+# generates topic URLs in API responses (e.g. for /v1/account or auth
+# negotiation). PHANTOM clients receive their topic URL via PHANTOM's
+# own /push/register flow on the relay; this base-url ensures any
+# string ntfy itself emits matches the public hostname.
+base-url: "https://ntfy.phntm.pro"
+
+# ── Cache ─────────────────────────────────────────────────────────────
+# Small SQLite cache for in-flight wakeups. We never need to retain
+# wake-ups for long — the relay is the source of truth for queued
+# envelopes; the wake-up itself is a hint.
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "12h"
+cache-startup-queries: |
+  pragma journal_mode = WAL;
+  pragma synchronous = NORMAL;
+  pragma temp_store = memory;
+
+# ── Hardening: web UI disabled ────────────────────────────────────────
+# The bundled web UI references fonts.googleapis.com (issue #554, still
+# open upstream). We don't need the UI — the relay and clients both use
+# the raw HTTP API. Setting this to "disable" stops the asset server
+# entirely and returns 404 for all UI-only paths.
+web-root: "disable"
+
+# ── Hardening: attachments off ────────────────────────────────────────
+# PHANTOM never publishes attachments. Disable the whole feature so an
+# unexpected POST cannot start storing arbitrary data on disk.
+attachment-cache-dir: ""
+attachment-total-size-limit: "0"
+attachment-file-size-limit: "0"
+
+# ── Hardening: FCM/APN/upstream OFF ───────────────────────────────────
+# These three settings are intentionally LEFT UNSET. Setting them would
+# activate the dormant FCM/APN code paths inside the ntfy binary and
+# violate ADR-001 / ADR-016 metadata-privacy posture. Operators
+# performing future config changes MUST keep these unset:
+#
+#   firebase-key-file: ""           # leave unset
+#   upstream-base-url: ""           # leave unset
+#
+# (Comments only. Uncommenting any of these is a policy violation.)
+
+# ── Behaviour: do not require auth, but rate-limit by IP ─────────────
+# Topic URLs are 32-byte random tokens minted client-side. They function
+# as bearer credentials — possession of the URL is sufficient to publish
+# to it. We therefore do not enable ntfy's user/password auth (which
+# would add a redundant authentication layer and require client-side
+# credential storage).
+auth-default-access: "write-only"
+
+# Aggressive rate limits: each IP can publish at most 60 wake-ups per
+# minute and subscribe to at most 10 topics. Real PHANTOM workloads
+# are well below these caps; the limits exist to slow abuse if a
+# rogue actor learns a topic URL.
+visitor-request-limit-burst: 60
+visitor-request-limit-replenish: "1m"
+visitor-message-daily-limit: 5000
+visitor-subscription-limit: 10
+
+# ── Logging ───────────────────────────────────────────────────────────
+log-level: "INFO"
+log-format: "json"

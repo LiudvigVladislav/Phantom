@@ -8,8 +8,10 @@ use crate::{
         DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
         SignedPreKeyPublicBundle,
     },
+    push::wake_offline_recipient,
     state::{
-        append_block_to_disk, append_report_to_disk, AbuseReport, AppState, RateEntry,
+        append_block_to_disk, append_push_token_to_disk, append_report_to_disk,
+        AbuseReport, AppState, PushTokenRecord, RateEntry,
     },
 };
 use subtle::ConstantTimeEq;
@@ -58,6 +60,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/prekeys/bundle/{identity}",      get(fetch_bundle))
         .route("/prekeys/status/{identity}",      get(prekey_status))
         .route("/prekeys/{identity}/opk/{key_id}", delete(delete_opk))
+        // ── UnifiedPush wake-up registration (ADR-016) ─────────────────
+        // Client publishes its ntfy topic URL here so the relay can POST
+        // a one-byte wake-up when an envelope arrives while the client
+        // is offline. The relay never inspects or retains push payloads;
+        // the topic URL is the only thing stored.
+        .route("/push/register", post(register_push_token))
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
@@ -383,17 +391,13 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                     "recipient offline — queued for next reconnect"
                 );
 
-                // TODO: Send FCM silent push so the offline device wakes and drains via WebSocket.
-                // Gated on RELAY_FCM_SERVER_KEY being set (state.config.fcm_server_key.is_some()).
-                // Requires: reqwest = { version = "0.11", features = ["json"] } added to
-                //           services/relay/Cargo.toml (and the workspace Cargo.toml if needed).
-                // Once reqwest is present, use the Legacy HTTP API:
-                //   POST https://fcm.googleapis.com/fcm/send
-                //   Authorization: key=<fcm_server_key>
-                //   Body: { "to": "/topics/user_<recipient_prefix>", "priority": "high",
-                //           "data": { "type": "new_message" } }
-                // Migration note: Legacy FCM key is deprecated — switch to FCM v1 (OAuth2)
-                // before production. ADR required before implementing.
+                // ADR-016 UnifiedPush wake-up. Self-hosted ntfy distributor
+                // at `state.config.ntfy_url`; one-byte payload; fire-and-
+                // forget. The envelope is already durably queued above;
+                // this is a hint to the recipient device that a message
+                // is waiting, not a delivery primitive. See push.rs for
+                // privacy boundary and rationale.
+                wake_offline_recipient(Arc::clone(&state), to.clone());
             }
 
             // Ack back to sender
@@ -679,6 +683,85 @@ async fn admin_list_blocklist(
     }
     let list: Vec<String> = state.blocklist.read().await.iter().cloned().collect();
     (StatusCode::OK, Json(serde_json::json!({ "count": list.len(), "keys": list }))).into_response()
+}
+
+// ── UnifiedPush registration (ADR-016) ───────────────────────────────────────
+
+/// Body of POST /push/register.
+///
+/// `identity` is the hex public key of the registering client (the same
+/// value used as `?id=` on the WebSocket route). `topic_url` is the full
+/// HTTP(S) URL of the ntfy topic the relay will POST a wake-up to when
+/// an envelope arrives for this identity while the client is offline.
+///
+/// The relay does not validate the topic URL beyond basic shape — the
+/// distributor is part of the same trust domain as the relay (both run
+/// under PHANTOM operator control on the same Hetzner VPS), and a
+/// malformed URL only breaks wake-up for the calling client. Topic URL
+/// is treated as opaque metadata; the relay never inspects it for any
+/// purpose other than POSTing the one-byte payload.
+#[derive(serde::Deserialize)]
+struct PushRegisterRequest {
+    identity: String,
+    topic_url: String,
+}
+
+async fn register_push_token(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PushRegisterRequest>,
+) -> impl IntoResponse {
+    // Basic input shape.
+    if req.identity.is_empty() || req.topic_url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "identity and topic_url required" })),
+        )
+            .into_response();
+    }
+    // Sanity check identity prefix length so a buggy client doesn't blow
+    // out our state map with junk keys. Real identity keys are 64 hex
+    // chars (32 bytes) but we accept anything from 16 to 128 to remain
+    // forward-compatible.
+    if req.identity.len() < 16 || req.identity.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "identity length out of range" })),
+        )
+            .into_response();
+    }
+    // Loose URL shape check — not exhaustive.
+    if !req.topic_url.starts_with("http://") && !req.topic_url.starts_with("https://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "topic_url must be http(s)://" })),
+        )
+            .into_response();
+    }
+    if req.topic_url.len() > 512 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "topic_url too long" })),
+        )
+            .into_response();
+    }
+
+    let rec = PushTokenRecord {
+        identity: req.identity.clone(),
+        topic_url: req.topic_url.clone(),
+    };
+    // Update in-memory map (last write wins per identity) and append to
+    // jsonl so a relay restart replays the latest registration.
+    {
+        let mut tokens = state.push_tokens.write().await;
+        tokens.insert(rec.identity.clone(), rec.topic_url.clone());
+    }
+    append_push_token_to_disk(&rec);
+
+    tracing::info!(
+        identity_prefix = %&rec.identity[..rec.identity.len().min(8)],
+        "UnifiedPush topic registered"
+    );
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
 // ── X3DH prekey endpoints (ADR-009) ──────────────────────────────────────────

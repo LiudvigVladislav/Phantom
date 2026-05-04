@@ -217,50 +217,50 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 
 ---
 
-### ISSUE-013: Tecno HiOS firmware-level Wi-Fi radio parking — push-wakeup deferred to Phase 5
+### ISSUE-013: Stateful NAT/CGN/TSPU silent drops on cellular Russia — Tor + UnifiedPush hybrid in implementation
 
-**Status:** Documented limitation. Industry-standard for FOSS messengers without push-based wakeup. Real fix requires UnifiedPush integration scheduled for Phase 5 (Feb 2027).
+**Status:** Diagnosis revised 2026-05-04 (ADR-013 was wrong about firmware-radio-parking). ADR-014 TCP keepalive applied as Layer 2 — partial improvement (50 s → 120 s) but did not solve. Real fix is in implementation in `feat/tor-unified-push-transport` per **ADR-016 (Tor + UnifiedPush hybrid transport architecture)** and **ADR-017 (Threat Model v0.1 revision)**. Will move to "resolved" once ADR-016 ships and Beta validation passes.
 
-**Symptom.** On Tecno HiOS (and architecturally on every aggressive-OEM Android skin: Xiaomi MIUI, Huawei EMUI, Oppo ColorOS, Vivo OriginOS, Realme), the Wi-Fi radio is parked roughly every 30 seconds **regardless of**:
+**Revised root cause.** The 4-test matrix on 2026-05-04 (Tecno Spark Go + Pixel 8 Pro emulator on the same МТС WiFi, identical network path) demonstrated that the "WebSocket dropped silently every 50-60 s" symptom appears on the **Pixel emulator running on a stable Windows PC** as well — invalidating the Tecno-firmware-radio-parking explanation. Both devices stay perfectly stable behind any VPN. The actual root cause is a **stateful network element along the path between Russian carrier WiFi and Hetinki relay**: Carrier-Grade NAT, transit border filtering (TSPU), or both. VPN tunnels emit their own keepalives at 10-25 s and refresh the NAT entry; bare WSS without TCP keepalive does not.
 
-- The user disabling battery optimization for PHANTOM in Android Settings → "Unrestricted"
-- The foreground notification with persistent service
-- `WifiManager.WIFI_MODE_FULL_HIGH_PERF` lock (HiOS silently downgrades it to type=3 `WIFI_MODE_FULL`)
-- `WifiManager.MulticastLock` (acquired and reported held, no observed effect on parking)
-- `ConnectivityManager.requestNetwork(NET_CAPABILITY_INTERNET)` (callback fires "network available" but radio still parks 30 s later)
+**Earlier (now-superseded) diagnoses.** Original investigation in ADR-010/ADR-011/ADR-013 attributed the cycle to Tecno HiOS firmware Wi-Fi radio parking. That hypothesis explained the Tecno cycle but cannot explain the matching cycle on a Pixel emulator on a stable PC. The 2026-05-04 4-test matrix (`docs/research/transport-investigation-2026-05-04/`) refuted firmware-radio as root cause. ADR-013 should be read as historical record only.
 
-This is **firmware-level battery aggression** below any user-space API.
+**Mitigations from earlier diagnosis remain useful as defence in depth.** Foreground service WifiLock, WakeLock, MulticastLock, AlarmManager-driven force-reconnect (ADR-011), and generation-based OkHttp engine disposal (ADR-010 updated 2026-05-01) all stay in place. They reduce reconnect latency from 60 s to 1-3 s once the upstream NAT does drop the connection.
 
-**Impact.** Text messages: 1–2 second delay if the send happens to land in the brief reconnect window (~700 ms abandon-and-restart cycle). No data loss — relay's store-and-forward retains envelopes until ack. Voice messages (~270 KB single envelope today): cannot complete transit before next reconnect window — this needs voice chunking from PR 3 of the reliability sprint, not a transport-layer fix.
+**Layer 2 fix (ADR-014, deployed 2026-05-04):**
 
-**Diagnostic chain (2026-04-30 → 2026-05-02, 19 APK iterations).**
+`fix/transport-tcp-keepalive` branch enabled `SO_KEEPALIVE` with explicit `TCP_KEEPIDLE=30s / TCP_KEEPINTVL=10s / TCP_KEEPCNT=3` (60-second dead-detection window) on:
 
-| APK | Approach | Result |
-|---|---|---|
-| 11–14 | dispatcher.cancelAll → connectionPool.evictAll → executor.shutdownNow | All no-ops against kernel-blocked recv() |
-| 15 | AlarmManager.setExactAndAllowWhileIdle 30 s + `forceReconnect()` | Alarm fires, but cancellation cannot reach parked reader |
-| 17 | Abandon-and-restart entire reconnect loop on stale pong | **Works.** ~700 ms recovery, zombie thread released by kernel later |
-| 18 | + MulticastLock + ConnectivityManager.requestNetwork | Manifest permissions missing — silent SecurityException |
-| 19 | + `CHANGE_WIFI_MULTICAST_STATE` + `CHANGE_NETWORK_STATE` permissions | Locks acquired, callbacks fire — radio parking unchanged |
+- Android client — custom `KeepAliveSocketFactory` wraps the OkHttp `Socket` and applies `setsockopt` immediately after `connect()`.
+- Rust relay — `axum::serve::Listener` wrapper applies `socket2::TcpKeepalive` to each accepted stream.
+- Caddy and relay containers — namespaced kernel sysctls in `deploy/docker-compose.yml`.
 
-Final transport architecture: APK 17's abandon-and-restart with APK 19's belt-and-suspenders Tier-1 locks. Cycle on Tecno: 30 s connection alive → 700 ms reconnect → repeat. Acceptable for Alpha; real fix requires push-based wakeup.
+Test 5 (МТС WiFi, both devices): connection lifetime improved 50 s → 120 s, but voice burst delivery still fails because the connection silently goes one-way during the burst. Layer 2 is **partially effective but not sufficient on its own** for cellular Russia. Kept as defence-in-depth on the direct WSS path; Tor mode will be the primary path for users on restrictive networks.
 
-**Industry context.** This is not a PHANTOM-specific failure mode. Comparable open-source messengers either (a) outsource wakeup to FCM (Signal, on Google-Play builds), (b) outsource to UnifiedPush (Element/Matrix on F-Droid), or (c) document the limitation and tell users to whitelist the app in OEM battery settings (Briar). PHANTOM's Phase 5 path is UnifiedPush — same approach as Element, preserves no-Google-services posture.
+**Real fix (ADR-016, in implementation 2026-05-04+):**
 
-**Workaround for Alpha users on aggressive-OEM devices:**
+Hybrid transport architecture combining:
 
-- Keep the app open in foreground when expecting urgent messages
-- Periodic wake (screen on every few minutes) drains the queue immediately
-- VPN client running on the device sometimes keeps radio active as a side effect (the VPN's own keepalive prevents parking)
+- **Tor v3 onion service** for the data plane (defeats CGN/TSPU by routing through Tor circuits the stateful element does not fingerprint as PHANTOM-specific). Implemented via `kmp-tor 2.6.0` (bundled Tor 0.4.9.5, all four Android ABIs covered including ARM32 for Tecno/Itel users).
+- **Self-hosted UnifiedPush** for the wakeup channel (`ntfy.phntm.pro`, audited per `no-go-checks/03-ntfy-audit.md`). Distributor sees opaque per-install token and push timing only — never identity, never content. Push payload is a single null byte.
+- **Three Privacy Modes** (Auto / Always-Tor / Never) selectable in app settings. Auto is the default and uses direct WSS first, switches to Tor on repeated failure.
+- **Calls remain on direct WSS only.** Tor is TCP-only, WebRTC is UDP — architectural impossibility shared by Briar / Cwtch / Ricochet Refresh. Tor mode disables calls with explicit UX. Future research will explore alternative transport for calls.
 
-**Real fix (Phase 5, Feb 2027):**
+The combination delivers metadata-privacy + battery efficiency simultaneously — the unbuilt-yet architecture that no production messenger ships today (Briar = Tor, no push, battery cost; Signal = FCM push, no Tor, Google metadata leak).
 
-- UnifiedPush client integration in Android app
-- UnifiedPush server endpoints in relay
-- Optional PHANTOM-branded distributor for users without ntfy or another distributor installed
-- See PHANTOM_ROADMAP_2026.md for Phase 5 timeline
+**Implementation tracking:** `feat/tor-unified-push-transport` branch.
+- ADR-016 (architecture decision)
+- ADR-017 (Threat Model v0.1 revision — honest about Tor-mode-no-calls, UnifiedPush distributor metadata, global-passive-adversary out of scope, Vanguards-Lite as built-in default rather than full Vanguards)
+- `docs/research/tor-feasibility-2026-05-04/` — full feasibility research (10 docs + 3 NO-GO checks all passed)
 
-**Why this is documented as a limitation, not a P1 bug:** Every reasonable user-space mitigation has been attempted and verified ineffective. The fix lives in a different architectural layer (push wakeup) that is on the roadmap. Re-attempting transport-layer workarounds would be wasted effort. ADR-010, ADR-011, ADR-013 + `docs/research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md` document the full diagnostic chain.
+**Why this is now classified as "in implementation", not "limitation":**
+
+- Two disjoint research streams (transport investigation + Tor feasibility) produced consistent diagnoses
+- All architectural blockers have been reviewed: kmp-tor ARM32 GO, Vanguards-Lite GO, ntfy self-host CONDITIONAL GO with hardened config
+- Effort estimate ~3-4 weeks single-developer, comparable to original UnifiedPush-only Phase 5 plan
+- Solves both the silent-drop problem and the always-on-battery problem in one architecture
+
+**User-facing copy update (Privacy Policy + onboarding):** when ADR-016 ships, add: "PHANTOM works on restrictive networks (including Russian carriers without VPN) via a Tor-based fallback. The fallback is opt-in by default but the app will switch to it automatically if the direct connection fails repeatedly. Voice and video calls are not available in Tor mode — calls require a direct connection. Future work will explore alternative transport for calls in restrictive networks."
 
 ---
 

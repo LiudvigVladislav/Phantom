@@ -1,14 +1,17 @@
 # PHANTOM production deployment.
 #
-# Two services behind Caddy reverse proxy:
+# Services behind Caddy reverse proxy:
 #   - relay   : Rust WebSocket relay (ciphertext store-and-forward, in-memory).
 #   - caddy   : TLS termination + WebSocket passthrough + static file serving
 #               for /.well-known/assetlinks.json and a placeholder landing.
+#   - tor     : v3 onion service for the relay (ADR-016 data plane).
+#   - ntfy    : Self-hosted UnifiedPush distributor (ADR-016 wake-up plane).
 #
 # Run from the repository root:
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
 # See deploy/README.md for DNS + Cloudflare setup requirements.
+# See deploy/tor-onion-setup.md for Tor onion address retrieval.
 
 services:
   relay:
@@ -40,6 +43,10 @@ services:
       - /tmp:size=16m
     volumes:
       - phantom-reports:/var/phantom
+    # Default ntfy URL inside the docker network — overridable via .env if
+    # the operator runs ntfy outside the compose stack.
+    environment:
+      RELAY_NTFY_URL: ${RELAY_NTFY_URL:-http://ntfy:80}
 
   caddy:
     image: caddy:2.8-alpine
@@ -63,10 +70,81 @@ services:
       - phantom-internal
     depends_on:
       - relay
+      - ntfy
     cap_drop:
       - ALL
     cap_add:
       - NET_BIND_SERVICE   # needed to bind :80 and :443
+    security_opt:
+      - no-new-privileges:true
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Tor v3 onion service for the PHANTOM relay (ADR-016 data plane).
+  #
+  # The tor daemon connects out to the Tor network (clearnet egress to
+  # entry guards) and exposes the relay to v3 onion clients via an
+  # internal hidden service descriptor. Clients connect over Tor SOCKS5
+  # to <onion>.onion:80 and the daemon proxies plaintext HTTP/WS to the
+  # relay container on the same internal network. TLS is intentionally
+  # NOT used over the onion address — Tor's circuit already provides
+  # confidentiality + integrity + onion-address authentication, and
+  # adding TLS would only break the latter without adding security.
+  #
+  # The onion key is generated on first start and persisted in a named
+  # volume (see deploy/tor-onion-setup.md for retrieval procedure).
+  # NEVER share the key file outside the operator team — it IS the
+  # onion identity.
+  # ──────────────────────────────────────────────────────────────────────
+  tor:
+    build:
+      context: ./tor
+      dockerfile: Dockerfile
+    image: phantom-tor:latest
+    container_name: phantom-tor
+    restart: unless-stopped
+    volumes:
+      - ./tor/torrc:/etc/tor/torrc:ro
+      - phantom-tor-data:/var/lib/tor
+    networks:
+      - phantom-internal
+    depends_on:
+      - relay
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Self-hosted ntfy distributor for UnifiedPush (ADR-016 wake-up plane).
+  #
+  # Purpose: when an envelope is queued for an offline client, the relay
+  # POSTs a one-byte payload to <ntfy_url>/<topic> where <topic> is the
+  # client's pre-registered ntfy topic. The client's UnifiedPush
+  # distributor on-device receives the wake-up and tells the PHANTOM app
+  # to drain its queue over the regular data channel (direct WSS or
+  # Tor onion, depending on Privacy Mode).
+  #
+  # Hardening references — see no-go-checks/03-ntfy-audit.md:
+  #   - web-root: "disable" so the bundled web UI (which loads Google
+  #     Fonts) never serves to users; only the HTTP push API is exposed.
+  #   - attachment storage: disabled (we transport zero attachments).
+  #   - upstream-base-url: not set, so APN/iOS forwarding is dormant.
+  #   - firebase-key-file: not set, so FCM forwarding is dormant.
+  # ──────────────────────────────────────────────────────────────────────
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    container_name: phantom-ntfy
+    restart: unless-stopped
+    command: serve
+    volumes:
+      - ./ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - phantom-ntfy-cache:/var/cache/ntfy
+    expose:
+      - "80"
+    networks:
+      - phantom-internal
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
 
@@ -83,3 +161,11 @@ volumes:
   # re-issuance and risks Let's Encrypt rate limits (50 certs/week/domain).
   caddy-data:
   caddy-config:
+  # Tor hidden-service keys + descriptors. Losing this volume rotates
+  # the onion address; clients with the old address pinned would be
+  # unable to connect until they receive the new one. Back this up.
+  phantom-tor-data:
+  # ntfy message cache (small SQLite database). Bounded by max-message-size
+  # in server.yml; tolerable to lose at the cost of replaying any
+  # in-flight wake-ups.
+  phantom-ntfy-cache:

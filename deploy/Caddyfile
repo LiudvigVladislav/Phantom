@@ -68,6 +68,56 @@ relay.phntm.pro {
 }
 
 # -----------------------------------------------------------------------------
+# ntfy.phntm.pro — UnifiedPush distributor (ADR-016)
+# -----------------------------------------------------------------------------
+# Self-hosted ntfy serves the wake-up channel for the PHANTOM hybrid
+# transport. Caddy terminates TLS at the edge; the ntfy container itself
+# only listens plaintext on port 80 inside the phantom-internal network.
+#
+# Cloudflare configuration: DNS-only for this host (orange cloud OFF).
+# Caddy completes the HTTP-01 ACME challenge directly with Let's Encrypt;
+# proxying through Cloudflare would interfere with WebSocket upgrade and
+# is unnecessary because Cloudflare provides no value for a server-to-
+# server push API consumed only by PHANTOM relay + PHANTOM client.
+ntfy.phntm.pro {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options        "DENY"
+        Referrer-Policy        "no-referrer"
+        # ntfy bundled web UI loads fonts.googleapis.com (issue #554).
+        # We disable the UI in server.yml (web-root: "disable") so it
+        # never serves to a browser, but lock down CSP defense-in-depth
+        # in case a misconfiguration ever re-enables it.
+        Content-Security-Policy "default-src 'none'; connect-src 'self'"
+        -Server
+    }
+
+    reverse_proxy ntfy:80 {
+        # Forward client IP for ntfy's per-IP rate limiter.
+        header_up X-Real-IP        {remote_host}
+        header_up X-Forwarded-For  {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # ntfy uses long-lived HTTP for subscriptions (Server-Sent
+        # Events). Same WSS-style timeout disable as the relay vhost
+        # so subscribed clients aren't kicked.
+        transport http {
+            read_timeout  0
+            write_timeout 0
+            dial_timeout  10s
+        }
+        flush_interval -1
+    }
+
+    log {
+        output stdout
+        format json
+        level  INFO
+    }
+}
+
+# -----------------------------------------------------------------------------
 # phntm.pro — assetlinks.json + placeholder landing
 # -----------------------------------------------------------------------------
 # NOTE on Cloudflare:
