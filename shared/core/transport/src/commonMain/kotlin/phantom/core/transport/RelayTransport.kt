@@ -19,7 +19,30 @@ interface RelayTransport {
      */
     val typingEvents: SharedFlow<String>
 
-    suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String? = null)
+    /**
+     * Open the WebSocket and run the reconnect loop until [disconnect] is
+     * called. Idempotent at the call-site level — calling `connect` twice
+     * cancels the prior reconnect job before starting a new one.
+     *
+     * @param relayUrl the WebSocket URL to dial. For direct WSS this is the
+     *   public hostname (e.g. `wss://relay.phntm.pro/ws`); when [socksProxyPort]
+     *   is non-null, callers usually pass the relay's onion address (plain
+     *   `ws://…onion/ws`, plaintext over Tor by ADR-016 design).
+     * @param identityPublicKeyHex the local identity, appended as `?id=…`
+     *   so the relay can dispatch envelopes to the right queue.
+     * @param token optional auth token, appended as `&token=…` after id.
+     * @param socksProxyPort if non-null, route the WebSocket TCP connection
+     *   through `127.0.0.1:<port>` over SOCKS5 (typically the embedded
+     *   Tor's auto-bound port from [TorService.state]). Null = direct.
+     *   Privacy-Mode changes translate to disconnect → reconnect with a
+     *   new value here.
+     */
+    suspend fun connect(
+        relayUrl: String,
+        identityPublicKeyHex: String,
+        token: String? = null,
+        socksProxyPort: Int? = null,
+    )
     suspend fun disconnect()
     suspend fun send(message: RelayMessage.Send): Boolean
     suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean
