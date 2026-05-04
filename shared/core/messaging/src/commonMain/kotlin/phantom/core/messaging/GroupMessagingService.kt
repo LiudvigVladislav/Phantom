@@ -32,8 +32,13 @@ interface GroupMessagingService {
     /** Encrypt [text] with the local SenderKey and fan-out to every member. */
     suspend fun sendGroupMessage(groupId: String, text: String)
 
-    /** Encrypt OGG audio (base64) with the local SenderKey and fan-out to every member. */
-    suspend fun sendGroupAudio(groupId: String, audioBase64: String, durationMs: Long)
+    /**
+     * Chunk [audioBytes] into 64 KB envelopes and fan-out each chunk to every member.
+     * Signature accepts raw bytes (not base64) so the chunking logic in
+     * [DefaultGroupMessagingService] controls slice sizes — callers no longer
+     * pre-encode, which avoids the ~33 % base64 expansion before the size cap check.
+     */
+    suspend fun sendGroupAudio(groupId: String, audioBytes: ByteArray, durationMs: Long, mimeType: String): Result<Unit>
 
     /**
      * Add a new member to the group (admin only).

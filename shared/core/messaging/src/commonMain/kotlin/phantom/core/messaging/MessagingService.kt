@@ -12,6 +12,18 @@ interface MessagingService {
     // Send a plaintext message — encrypts, stores, transmits
     suspend fun sendMessage(message: OutgoingMessage): Result<Unit>
 
+    /**
+     * Chunk [audioBytes] into 64 KB envelopes and send each through the Double Ratchet
+     * pipeline. Returns failure immediately (no send) if [audioBytes] exceeds
+     * [DefaultMessagingService.MAX_AUDIO_BYTES].
+     */
+    suspend fun sendAudio(
+        conversationId: String,
+        audioBytes: ByteArray,
+        durationMs: Long,
+        mimeType: String,
+    ): Result<Unit>
+
     // Start listening for relay messages (call after transport is connected)
     suspend fun startReceiving()
 

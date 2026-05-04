@@ -886,6 +886,181 @@ class DefaultMessagingServiceTest {
         assertEquals("hello, bob", collected.first().text)
         assertEquals(false, bobOpkRepo.has(bobOpkIdHex), "OPK consumed on bootstrap")
     }
+
+    // ── PR 3 / F-05: voice chunking tests ─────────────────────────────────────
+
+    @Test
+    fun sendAudio_splitsIntoChunksOfCorrectSize() = runTest {
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        convRepo.upsertConversation(
+            ConversationEntity(
+                id = "conv-1",
+                theirUsername = "bob",
+                theirPublicKeyHex = "ccdd",
+                lastMessagePreview = "",
+                lastMessageAt = 0L,
+                unreadCount = 0,
+                trustTier = phantom.core.storage.TrustTier.TRUSTED,
+                blocked = false,
+            )
+        )
+        val service = buildService(this, transport = transport, msgRepo = msgRepo, convRepo = convRepo)
+
+        // Sized to 3 full chunks + 1 partial chunk = 4 chunks regardless of AUDIO_CHUNK_BYTES.
+        val audioBytes = ByteArray(DefaultMessagingService.AUDIO_CHUNK_BYTES * 3 + 1) { it.toByte() }
+        val result = service.sendAudio(
+            conversationId = "conv-1",
+            audioBytes = audioBytes,
+            durationMs = 5_000L,
+            mimeType = "audio/ogg",
+        )
+
+        assertEquals(true, result.isSuccess, "sendAudio must succeed for the chosen payload size")
+        assertEquals(4, transport.sent.size, "3 full chunks + 1 partial chunk must produce exactly 4 envelopes")
+
+        val json = Json { ignoreUnknownKeys = true }
+        val chunkIds = mutableSetOf<String>()
+        transport.sent.forEachIndexed { idx, msg ->
+            @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+            val padded = kotlin.io.encoding.Base64.decode(msg.payload)
+            val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
+            val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
+            // PassthroughDoubleRatchet stores plaintext in ciphertext field
+            val payload = json.decodeFromString<MessagePayload>(wireFrame.encryptedMessage.ciphertext.decodeToString())
+            assertEquals(MessagePayload.TYPE_AUDIO_CHUNK, payload.type)
+            assertEquals(idx, payload.audioChunkIndex, "chunk index must be sequential")
+            assertEquals(4, payload.audioChunkTotal, "each chunk must carry total=4")
+            assertNotNull(payload.audioChunkId, "audioChunkId must be present on every chunk")
+            chunkIds.add(payload.audioChunkId!!)
+        }
+        assertEquals(1, chunkIds.size, "all 4 chunks must share the same audioChunkId")
+    }
+
+    @Test
+    fun receiveAudio_reassemblesChunksInAnyOrder() = runTest {
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        val incomingTransport = ManualIncomingTransport()
+
+        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = listOf("aabb_ccdd"))
+        val sessionManager = SessionManager(
+            x3dh = PassthroughX3DH(),
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = FakeIdentityCrypto(),
+            json = json,
+        )
+        val service = DefaultMessagingService(
+            identity = identity,
+            localKeyPair = localKeyPair,
+            ratchet = PassthroughDoubleRatchet(),
+            sessionManager = sessionManager,
+            transport = incomingTransport,
+            messageRepository = msgRepo,
+            conversationRepository = convRepo,
+            scope = backgroundScope,
+            json = json,
+            preKeyApi = ThrowingPreKeyApi,
+            signingKeyProvider = { ThrowingSigningKey },
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Build a 4-chunk voice note from a known byte sequence.
+        // Each chunk is AUDIO_CHUNK_BYTES except the last (sized as 3 full chunks + 1 partial).
+        val originalBytes = ByteArray(DefaultMessagingService.AUDIO_CHUNK_BYTES * 3 + 1) { it.toByte() }
+        val chunkId = "test-chunk-id-reassembly"
+        val total = 4
+        val localJson = Json { ignoreUnknownKeys = true }
+
+        // Helper to build a padded+base64-encoded WireFrame envelope carrying a TYPE_AUDIO_CHUNK
+        // payload, using PassthroughDoubleRatchet semantics (ciphertext == plaintext).
+        fun makeChunkDeliver(index: Int, msgId: String): phantom.core.transport.RelayMessage.Deliver {
+            val start = index * DefaultMessagingService.AUDIO_CHUNK_BYTES
+            val end = minOf((index + 1) * DefaultMessagingService.AUDIO_CHUNK_BYTES, originalBytes.size)
+            @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+            val chunkB64 = kotlin.io.encoding.Base64.encode(originalBytes.copyOfRange(start, end))
+
+            val payloadJson = localJson.encodeToString(
+                MessagePayload(
+                    type = MessagePayload.TYPE_AUDIO_CHUNK,
+                    senderUsername = "sender",
+                    audioChunkId = chunkId,
+                    audioChunkIndex = index,
+                    audioChunkTotal = total,
+                    audioChunkB64 = chunkB64,
+                    audioDurationMs = 5_000L,
+                    audioMimeType = "audio/ogg",
+                )
+            )
+            val encrypted = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = payloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            )
+            val wireFrame = WireFrame(encryptedMessage = encrypted)
+            val wireFrameBytes = localJson.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+            val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+            @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+            val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+            return phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = msgId,
+            )
+        }
+
+        // Deliver out of order: 2, 0, 3, 1
+        incomingTransport.deliver(makeChunkDeliver(2, "chunk-msg-2"))
+        testScheduler.runCurrent()
+        incomingTransport.deliver(makeChunkDeliver(0, "chunk-msg-0"))
+        testScheduler.runCurrent()
+        incomingTransport.deliver(makeChunkDeliver(3, "chunk-msg-3"))
+        testScheduler.runCurrent()
+
+        // After 3 chunks: no message yet
+        assertEquals(0, msgRepo.messages.filter { !it.sent }.size, "no message before all chunks arrive")
+
+        incomingTransport.deliver(makeChunkDeliver(1, "chunk-msg-1"))
+        testScheduler.runCurrent()
+
+        // After 4th chunk: exactly one incoming message with correct audio content
+        val received = msgRepo.messages.filter { !it.sent }
+        assertEquals(1, received.size, "exactly one message after all chunks assembled")
+        val pc = received[0].plaintextCache ?: ""
+        assertEquals(true, pc.startsWith("[AUDIO:"), "assembled message must start with [AUDIO: sentinel")
+
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val assembledBytes = kotlin.io.encoding.Base64.decode(pc.removePrefix("[AUDIO:").removeSuffix("]"))
+        assertEquals(originalBytes.size, assembledBytes.size, "reassembled bytes must match original size")
+        assertEquals(originalBytes.toList(), assembledBytes.toList(), "reassembled bytes must match original content")
+    }
+
+    @Test
+    fun sendAudio_rejectsOversizedPayload() = runTest {
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val service = buildService(this, transport = transport)
+
+        // Oversized check happens before conversation lookup, so no need to seed convRepo.
+        val tooBig = ByteArray(DefaultMessagingService.MAX_AUDIO_BYTES + 1)
+        val result = service.sendAudio(
+            conversationId = "conv-1",
+            audioBytes = tooBig,
+            durationMs = 999_999L,
+            mimeType = "audio/ogg",
+        )
+
+        assertEquals(true, result.isFailure, "sendAudio must fail for payload exceeding MAX_AUDIO_BYTES")
+        assertEquals(0, transport.sent.size, "no envelopes must be sent for an oversized payload")
+    }
 }
 
 private fun ByteArray.toHexStringLower(): String =

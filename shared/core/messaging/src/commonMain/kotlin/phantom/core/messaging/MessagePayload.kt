@@ -35,6 +35,15 @@ data class MessagePayload(
     val audioDataB64: String? = null,                  // base64 OGG audio for audio type
     val audioDurationMs: Long? = null,
 
+    // ── Chunked audio (TYPE_AUDIO_CHUNK) ──────────────────────────────────────
+    // Voice notes are split into 64 KB slices so each envelope finishes
+    // uploading within the ~30 s Tecno HiOS reconnect window (ISSUE-013).
+    val audioChunkId: String? = null,       // UUID grouping all chunks of one voice note
+    val audioChunkIndex: Int? = null,       // 0-based position of this slice
+    val audioChunkTotal: Int? = null,       // total number of slices for this note
+    val audioChunkB64: String? = null,      // base64-encoded raw audio bytes for this slice
+    val audioMimeType: String? = null,      // "audio/ogg" or "audio/m4a"
+
     // ── Voice Calls (WebRTC signalling over relay) ────────────────────────────
     val sdp: String? = null,                           // SDP offer or answer
     val iceCandidateJson: String? = null,              // JSON {"sdpMid":"...","sdpMLineIndex":0,"candidate":"..."}
@@ -62,6 +71,7 @@ data class MessagePayload(
 
         // Media types (new)
         const val TYPE_AUDIO = "audio"
+        const val TYPE_AUDIO_CHUNK = "audio_chunk"
 
         // Key rotation — sender announces a new identity key
         const val TYPE_KEY_ROTATION = "key_rotation"
