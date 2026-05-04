@@ -15,9 +15,11 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -93,12 +95,48 @@ class PhantomMessagingService : Service() {
         )
     }
 
+    // Stage 2C.5: tracks the foreground notification updater coroutine so
+    // we can launch it once in onCreate and not duplicate on Android's
+    // potential redelivered onStartCommand intents.
+    private var notificationUpdaterJob: Job? = null
+
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate")
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        startForeground(NOTIFICATION_ID, buildNotification(DEFAULT_STATUS_TEXT))
         acquireKeepAliveLocks()
+        startNotificationUpdater()
+    }
+
+    /**
+     * Stage 2C.5: subscribe to [TorService.state] and rewrite the foreground
+     * notification's content text whenever the state changes. Lets the user
+     * see live bootstrap progress — and pinpoint stuck phases — without USB
+     * cable + logcat. No-op when [BuildConfig.USE_TOR] is false (the lazy
+     * [torService] is null and the launch exits immediately).
+     */
+    private fun startNotificationUpdater() {
+        val tor = torService ?: return
+        if (notificationUpdaterJob?.isActive == true) return
+        notificationUpdaterJob = serviceScope.launch {
+            tor.state.collect { state ->
+                val text = when (state) {
+                    is TorState.Off -> DEFAULT_STATUS_TEXT
+                    is TorState.Bootstrapping ->
+                        if (state.percent == 0) "Tor: connecting…"
+                        else "Tor: bootstrapping ${state.percent}%"
+                    is TorState.Ready -> "Tor: ready (SOCKS ${state.socksPort})"
+                    is TorState.Failed -> "Tor: failed — ${state.message.take(80)}"
+                }
+                runCatching {
+                    val nm = getSystemService(NotificationManager::class.java)
+                    nm?.notify(NOTIFICATION_ID, buildNotification(text))
+                }.onFailure {
+                    Log.w(TAG, "Notification update failed: ${it.message}")
+                }
+            }
+        }
     }
 
     private fun acquireKeepAliveLocks() {
@@ -278,9 +316,9 @@ class PhantomMessagingService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun buildNotification(statusText: String) = NotificationCompat.Builder(this, CHANNEL_ID)
         .setContentTitle("PHANTOM")
-        .setContentText("Encrypted connection active")
+        .setContentText(statusText)
         // ic_launcher_foreground is a vector layer, not a standalone icon — use system placeholder.
         // Replace with a dedicated monochrome status-bar icon (24dp, white-on-transparent) in Beta.
         .setSmallIcon(android.R.drawable.ic_dialog_info)
@@ -292,6 +330,9 @@ class PhantomMessagingService : Service() {
         private const val TAG = "PhantomMessagingService"
         const val CHANNEL_ID = "phantom_messaging"
         const val NOTIFICATION_ID = 1001
+        // Used for the foreground notification when no Tor state info is
+        // relevant (USE_TOR=false, or USE_TOR=true and Tor is currently Off).
+        private const val DEFAULT_STATUS_TEXT = "Encrypted connection active"
 
         // ADR-016 Stage 2C: maximum time we wait for Tor to bootstrap a
         // circuit before giving up and aborting the connect attempt.
