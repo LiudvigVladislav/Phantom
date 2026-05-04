@@ -21,6 +21,12 @@ kotlin {
         }
         androidMain.dependencies {
             implementation(libs.ktor.client.okhttp)
+            // kmp-tor — embedded Tor client for the ADR-016 hybrid transport.
+            // runtime is the public API; resource-noexec-tor ships the bundled
+            // tor 0.4.9.5 binary as a JNI library (in-process, not a child
+            // process). See gradle/libs.versions.toml for the rationale.
+            implementation(libs.kmp.tor.runtime)
+            implementation(libs.kmp.tor.resource.noexec)
         }
         jvmMain.dependencies {
             implementation(libs.ktor.client.okhttp)

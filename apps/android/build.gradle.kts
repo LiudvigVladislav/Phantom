@@ -126,6 +126,16 @@ android {
             val relayUrl = localOrEnv("relay.url", "RELAY_URL", "wss://relay.phntm.pro/ws")
             buildConfigField("String", "RELAY_URL", "\"$relayUrl\"")
             buildConfigField("String", "RELAY_TOKEN", "null")
+            // Tor onion endpoint for the relay (ADR-016 Stage 2).
+            // Wired in Stage 2B; Stage 2A only exposes the constant. Plain
+            // HTTP/WS over the onion is intentional — Tor's circuit already
+            // provides confidentiality, integrity and onion-address auth.
+            val relayOnionUrl = localOrEnv(
+                "relay.onion.url",
+                "RELAY_ONION_URL",
+                "ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws"
+            )
+            buildConfigField("String", "RELAY_ONION_URL", "\"$relayOnionUrl\"")
         }
         release {
             isMinifyEnabled = true
@@ -136,6 +146,11 @@ android {
             buildConfigField("String", "RELAY_URL", "\"wss://relay.phntm.pro/ws\"")
             // Override this via CI secrets: -PRELAY_TOKEN=<value>
             buildConfigField("String", "RELAY_TOKEN", "null")
+            buildConfigField(
+                "String",
+                "RELAY_ONION_URL",
+                "\"ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws\""
+            )
 
             // Use the release key if keystores/signing.properties or SIGNING_*
             // env vars supplied valid credentials; otherwise fall back to debug
@@ -154,5 +169,15 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    // Required by kmp-tor:resource-noexec-tor 409.x (ADR-016 Stage 2).
+    // The bundled tor JNI library must be extracted to
+    // ApplicationInfo.nativeLibraryDir at install time so dlopen() can find
+    // it; legacy packaging keeps the .so files uncompressed and out of the
+    // base.apk asset blob. Combined with
+    // android.bundle.enableUncompressedNativeLibs=false in gradle.properties.
+    packaging {
+        jniLibs.useLegacyPackaging = true
     }
 }
