@@ -32,8 +32,15 @@ sealed class TorState {
      */
     data class Bootstrapping(val percent: Int) : TorState()
 
-    /** Tor is bootstrapped and SOCKS-ready; circuits will build on demand. */
-    data object Ready : TorState()
+    /**
+     * Tor is bootstrapped and SOCKS-ready; circuits will build on demand.
+     *
+     * @property socksPort the localhost TCP port tor's SOCKS5 listener has
+     *   bound. Set by the implementation once the runtime emits its
+     *   `LISTENERS` event with a non-empty `socks` set. Stage 2C consumers
+     *   pass this through to the Ktor OkHttp engine as `Proxy.SOCKS`.
+     */
+    data class Ready(val socksPort: Int) : TorState()
 
     /**
      * Tor failed to start or lost its bootstrap. [message] is a single-line
