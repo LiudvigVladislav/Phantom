@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Willen LLC
 package phantom.core.transport
 
+import android.util.Log
 import io.matthewnelson.kmp.file.toFile
 import io.matthewnelson.kmp.tor.resource.noexec.tor.ResourceLoaderTorNoExec
 import io.matthewnelson.kmp.tor.runtime.Action
@@ -74,20 +75,43 @@ internal class TorServiceAndroid(
 
             // SOCKS listener up = tor is fully usable. Empty listener set =
             // daemon stopped or DisableNetwork toggled. The bound port is
-            // what Stage 2C will hand to OkHttp as a Proxy.SOCKS.
+            // what Stage 2C hands to OkHttp as a Proxy.SOCKS.
             observerStatic(RuntimeEvent.LISTENERS, executor) { listeners: TorListeners ->
                 val sockAddr = listeners.socks.firstOrNull()
                 _state.value = if (sockAddr == null) {
+                    Log.i(LOG_TAG, "LISTENERS: socks set empty → state Off")
                     TorState.Off
                 } else {
+                    Log.i(LOG_TAG, "LISTENERS: socks bound on port ${sockAddr.port.value} → state Ready")
                     TorState.Ready(socksPort = sockAddr.port.value)
                 }
             }
 
             // Hard runtime errors → Failed. Single-line summary; full log
-            // detail is captured by RelayLog observers in Stage 2C.
+            // detail flows through the LOG.* observers below.
             observerStatic(RuntimeEvent.ERROR, executor) { throwable ->
+                Log.e(LOG_TAG, "ERROR: ${throwable.shortMessage()}", throwable)
                 _state.value = TorState.Failed(message = throwable.shortMessage())
+            }
+
+            // Stage 2C.5 observability — pipe kmp-tor's internal log streams
+            // into Android Logcat (tag = "PhantomTor") so a USB-attached
+            // logcat session sees the full bootstrap conversation. Without
+            // these, kmp-tor's logs vanish into /dev/null and a stuck
+            // bootstrap is invisible.
+            observerStatic(RuntimeEvent.LOG.WARN, executor) { line ->
+                Log.w(LOG_TAG, "WARN: $line")
+                maybeUpdateBootstrapPercent(line)
+            }
+            observerStatic(RuntimeEvent.LOG.INFO, executor) { line ->
+                Log.i(LOG_TAG, "INFO: $line")
+                maybeUpdateBootstrapPercent(line)
+            }
+            observerStatic(RuntimeEvent.LOG.DEBUG, executor) { line ->
+                // Debug is loud — keep it at Log.d so a default logcat
+                // filter (showing INFO+) doesn't drown in it.
+                Log.d(LOG_TAG, "DEBUG: $line")
+                maybeUpdateBootstrapPercent(line)
             }
 
             config { _ ->
@@ -103,6 +127,26 @@ internal class TorServiceAndroid(
             // whether the user has any other observers attached.
             required(TorEvent.ERR)
             required(TorEvent.WARN)
+        }
+    }
+
+    /**
+     * If the line emitted by kmp-tor contains tor's `Bootstrapped N%` notice,
+     * promote that progress into [_state] as [TorState.Bootstrapping]. We
+     * never overwrite [TorState.Ready] — once LISTENERS gave us a SOCKS
+     * port, late-arriving bootstrap notices (e.g. tor finishing background
+     * directory work after circuits are usable) must not regress the state.
+     */
+    private fun maybeUpdateBootstrapPercent(line: Any?) {
+        val text = line?.toString() ?: return
+        val percent = BOOTSTRAP_REGEX.find(text)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.coerceIn(0, 100)
+            ?: return
+        if (_state.value !is TorState.Ready) {
+            _state.value = TorState.Bootstrapping(percent)
         }
     }
 
@@ -127,6 +171,14 @@ internal class TorServiceAndroid(
             // in case the listener event is lost (e.g. process death race).
             _state.value = TorState.Off
         }
+    }
+
+    private companion object {
+        private const val LOG_TAG = "PhantomTor"
+        // Matches tor's notice/info bootstrap line, e.g.
+        // "Bootstrapped 5% (conn): Connecting to a relay" or
+        // "Bootstrapped 100% (done): Done".
+        private val BOOTSTRAP_REGEX = Regex("""Bootstrapped\s+(\d{1,3})%""")
     }
 }
 
