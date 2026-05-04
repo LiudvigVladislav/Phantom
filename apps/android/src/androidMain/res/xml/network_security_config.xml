@@ -12,6 +12,19 @@
         <domain includeSubdomains="false">localhost</domain>
         <domain includeSubdomains="false">127.0.0.1</domain>
     </domain-config>
+    <!-- ADR-016 Stage 2C: cleartext ws:// to the relay's v3 onion address.
+         Plaintext over Tor is intentional (the circuit already provides
+         confidentiality, integrity, and onion-address authentication; an
+         extra TLS layer would only break the auth property). Android's
+         NetworkSecurityConfig still applies its scheme-level cleartext
+         block before SOCKS injection happens, so the onion hostname must
+         be explicitly listed here.
+         The hostname MUST match BuildConfig.RELAY_ONION_URL in
+         apps/android/build.gradle.kts. When the operator rotates the
+         onion key (deploy/tor-onion-setup.md) both must be updated. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion</domain>
+    </domain-config>
     <!-- Debug builds: also trust user-installed CAs -->
     <debug-overrides>
         <trust-anchors>
