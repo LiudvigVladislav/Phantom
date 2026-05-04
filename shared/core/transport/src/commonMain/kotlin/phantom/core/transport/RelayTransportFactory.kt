@@ -15,11 +15,22 @@ import io.ktor.client.HttpClient
  * destroying the entire OkHttp engine on pong/ack timeout. See ADR-010
  * "Updated 2026-05-01" for the full reasoning.
  *
+ * Factory parameter (ADR-016 Stage 2C):
+ *  - `socksProxyPort = null` → direct connection (existing behaviour).
+ *  - `socksProxyPort = N` → route through `127.0.0.1:N` SOCKS5 (the
+ *    embedded tor's auto-bound port discovered via [TorService.state]).
+ *
+ * The port is taken at invocation time, not at factory creation, so a
+ * single transport instance can switch between direct and Tor modes
+ * across reconnect generations. Privacy-Mode changes therefore translate
+ * to a `disconnect()` + `connect(... socksProxyPort = newPort)` rather
+ * than re-instantiating the transport.
+ *
  * This is the WebSocket-side factory only. REST traffic uses
  * [createRestHttpClient] which returns a long-lived shared client suitable
  * for connection pooling across short HTTP calls.
  */
-expect fun createHttpClientFactory(): () -> HttpClient
+expect fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient
 
 /**
  * Returns a long-lived [HttpClient] for REST traffic (PreKey publish /

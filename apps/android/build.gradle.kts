@@ -136,6 +136,13 @@ android {
                 "ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws"
             )
             buildConfigField("String", "RELAY_ONION_URL", "\"$relayOnionUrl\"")
+            // Stage 2C kill-switch for Tor transport. Privacy-Mode UI in
+            // Stage 4 will replace this with a runtime preference; until then
+            // a debug build can flip into Tor via local.properties:
+            //   tor.enabled=true
+            // Default false → existing direct-WSS path is unchanged.
+            val torEnabled = localOrEnv("tor.enabled", "USE_TOR", "false").toBoolean()
+            buildConfigField("boolean", "USE_TOR", "$torEnabled")
         }
         release {
             isMinifyEnabled = true
@@ -151,6 +158,9 @@ android {
                 "RELAY_ONION_URL",
                 "\"ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws\""
             )
+            // Release builds default to direct WSS — the Privacy-Mode UI
+            // (Stage 4) will toggle this at runtime, not at build time.
+            buildConfigField("boolean", "USE_TOR", "false")
 
             // Use the release key if keystores/signing.properties or SIGNING_*
             // env vars supplied valid credentials; otherwise fall back to debug

@@ -7,7 +7,10 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.websocket.WebSockets
 
-actual fun createHttpClientFactory(): () -> HttpClient = {
+actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { _ ->
+    // JVM target is desktop / tests only — no Tor wiring yet. The port
+    // parameter is accepted for source-compat with commonMain but ignored;
+    // when desktop integration arrives this will gain a proxy(...) branch.
     HttpClient(OkHttp) {
         install(WebSockets)
     }

@@ -6,6 +6,8 @@ package phantom.core.transport
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.websocket.WebSockets
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -23,8 +25,8 @@ import okhttp3.Protocol
 // which is why APK 13 still hung 4 minutes on Tecno HiOS.
 @Volatile private var activeOkHttp: OkHttpClient? = null
 
-actual fun createHttpClientFactory(): () -> HttpClient = {
-    val okHttp = OkHttpClient.Builder()
+actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { socksProxyPort ->
+    val builder = OkHttpClient.Builder()
         // OkHttp WebSocket transport-level ping is DISABLED. App-level
         // RelayMessage.Ping/Pong loop handles liveness — see KtorRelayTransport.startPing.
         .pingInterval(0, TimeUnit.SECONDS)
@@ -40,7 +42,19 @@ actual fun createHttpClientFactory(): () -> HttpClient = {
         // gets harder. HTTP/1.1 keeps "one TCP per WS" so close() acts
         // intuitively. See ADR-010 "Updated 2026-05-01".
         .protocols(listOf(Protocol.HTTP_1_1))
-        .build()
+
+    // ADR-016 Stage 2C: route this generation's TCP connection through
+    // the embedded tor's SOCKS5 listener. tor binds an ephemeral port
+    // discovered via TorService.state; we get it here as `socksProxyPort`.
+    // Null = direct, no proxy applied. We use Proxy.Type.SOCKS (which is
+    // SOCKS4 in older specs but SOCKS5 with a v5 server such as tor — the
+    // negotiation chooses the actual version) bound to the loopback
+    // interface so we never leak the proxy address off-device.
+    if (socksProxyPort != null) {
+        builder.proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksProxyPort)))
+    }
+
+    val okHttp = builder.build()
 
     // Record so forceShutdownActiveEngine() can interrupt this engine's
     // pool threads on pong timeout. Last-write-wins is fine: we only

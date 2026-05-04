@@ -35,14 +35,17 @@ import kotlin.time.TimeSource
 
 class KtorRelayTransport(
     /**
-     * Factory that builds a fresh [HttpClient] each call. Per ADR-010
+     * Factory that builds a fresh [HttpClient] each call, optionally
+     * routed through a SOCKS5 proxy at `127.0.0.1:<port>`. Per ADR-010
      * "Updated 2026-05-01" the WebSocket transport must own a per-
-     * reconnect-generation HttpClient so it can call .close() to
-     * destroy the OkHttp engine and force-release the active socket
-     * on pong/ack timeout. The previous singleton design could not
-     * recover from a parked-radio dead WebSocket on Tecno HiOS.
+     * reconnect-generation HttpClient so it can call .close() to destroy
+     * the OkHttp engine and force-release the active socket on pong/ack
+     * timeout; ADR-016 Stage 2C extends the factory with a SOCKS port
+     * parameter so the same transport instance can switch between direct
+     * WSS and Tor onion routing across reconnect generations without
+     * re-instantiation. Null port = direct.
      */
-    private val httpClientFactory: () -> HttpClient,
+    private val httpClientFactory: (socksProxyPort: Int?) -> HttpClient,
 ) : RelayTransport {
 
     private val json = Json {
@@ -87,6 +90,11 @@ class KtorRelayTransport(
     private var identityHex: String = ""
     private var relayToken: String? = null
     private var disconnectRequested: Boolean = false
+    // ADR-016 Stage 2C: Tor SOCKS port for the active connect lifetime.
+    // Null = direct WSS. Set by [connect] before runReconnectLoop launches;
+    // each generation's HttpClient is built with this value so a privacy-
+    // mode change is just a disconnect + reconnect with a new port.
+    private var socksProxyPort: Int? = null
 
     // The HttpClient owned by the currently-active reconnect generation.
     // Promoted from a runReconnectLoop-local var so that disconnect() and
@@ -134,14 +142,20 @@ class KtorRelayTransport(
     private val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var reconnectJob: Job? = null
 
-    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {
+    override suspend fun connect(
+        relayUrl: String,
+        identityPublicKeyHex: String,
+        token: String?,
+        socksProxyPort: Int?,
+    ) {
         this.relayUrl = relayUrl
         this.identityHex = identityPublicKeyHex
         this.relayToken = token
+        this.socksProxyPort = socksProxyPort
         disconnectRequested = false
         relayLog(
             RelayLogLevel.INFO,
-            "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… tokenSet=${token != null}",
+            "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… tokenSet=${token != null} socks=${socksProxyPort ?: "direct"}",
         )
         // Cancel any prior reconnect job (typically a noop on cold start;
         // matters when connect() is called twice from the service double-
@@ -188,7 +202,7 @@ class KtorRelayTransport(
             // pong/ack watchdogs can close it when they detect liveness
             // failure, and the finally block closes it on every exit path
             // (clean close, exception, disconnect requested).
-            val generationClient: HttpClient = httpClientFactory()
+            val generationClient: HttpClient = httpClientFactory(socksProxyPort)
             currentGenerationClient = generationClient
             try {
                 generationClient.webSocket(urlWithToken) {

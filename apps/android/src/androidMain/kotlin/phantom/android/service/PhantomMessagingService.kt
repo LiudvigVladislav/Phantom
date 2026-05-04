@@ -16,10 +16,18 @@ import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import phantom.android.BuildConfig
 import phantom.android.PhantomApplication
+import phantom.core.transport.TorService
+import phantom.core.transport.TorServiceConfig
+import phantom.core.transport.TorState
+import phantom.core.transport.createTorService
 
 /**
  * Foreground service that owns the WebSocket connection lifetime.
@@ -63,6 +71,27 @@ class PhantomMessagingService : Service() {
     // every ~30 s without it, on a healthy Wi-Fi where the same
     // emulator runs for 5+ min uninterrupted.
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    // ADR-016 Stage 2C: embedded Tor service. Lazy-constructed only when
+    // [BuildConfig.USE_TOR] is true so non-Tor builds carry zero kmp-tor
+    // initialisation cost. Lifecycle is bound to onStartCommand → onDestroy
+    // — start before connect, stop after disconnect. The work + cache
+    // directories live under the app-private dataDir so guards persist
+    // across restarts (warm bootstrap on next start) and the OS can evict
+    // the cache without breaking functionality.
+    private val torService: TorService? by lazy {
+        if (!BuildConfig.USE_TOR) return@lazy null
+        val workDir = applicationContext.filesDir.resolve("tor-data")
+        val cacheDir = applicationContext.cacheDir.resolve("tor-cache")
+        workDir.mkdirs()
+        cacheDir.mkdirs()
+        createTorService(
+            TorServiceConfig(
+                dataDirectoryPath = workDir.absolutePath,
+                cacheDirectoryPath = cacheDir.absolutePath,
+            ),
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -146,11 +175,44 @@ class PhantomMessagingService : Service() {
                 Log.w(TAG, "No local identity — cannot open WebSocket")
                 return@launch
             }
+            // ADR-016 Stage 2C: choose data path. USE_TOR=true → start the
+            // embedded Tor daemon, await its SOCKS port, route the WebSocket
+            // through it to the relay's onion address. USE_TOR=false →
+            // existing direct-WSS path, unchanged. The Privacy-Mode UI in
+            // Stage 4 will replace BuildConfig.USE_TOR with a runtime
+            // setting, but the surrounding flow remains the same.
+            val useTor = BuildConfig.USE_TOR
+            val socksProxyPort: Int? = if (useTor) {
+                val tor = torService
+                if (tor == null) {
+                    Log.e(TAG, "USE_TOR=true but TorService is null — cannot start, aborting connect")
+                    return@launch
+                }
+                Log.i(TAG, "Starting embedded Tor (USE_TOR=true)…")
+                runCatching { tor.start() }.onFailure {
+                    Log.e(TAG, "TorService.start() failed: ${it.message}", it)
+                }
+                try {
+                    val ready = withTimeout(TOR_BOOTSTRAP_TIMEOUT_MS) {
+                        tor.state.first { it is TorState.Ready }
+                    } as TorState.Ready
+                    Log.i(TAG, "Tor bootstrapped (SOCKS port ${ready.socksPort})")
+                    ready.socksPort
+                } catch (timeout: TimeoutCancellationException) {
+                    Log.e(TAG, "Tor bootstrap timed out after ${TOR_BOOTSTRAP_TIMEOUT_MS} ms — aborting connect")
+                    return@launch
+                }
+            } else {
+                null
+            }
+
+            val relayUrl = if (useTor) BuildConfig.RELAY_ONION_URL else BuildConfig.RELAY_URL
             Log.i(
                 "PhantomRelay",
                 "PhantomMessagingService about to connect: " +
-                    "BuildConfig.RELAY_URL=${BuildConfig.RELAY_URL} " +
+                    "url=$relayUrl " +
                     "tokenSet=${BuildConfig.RELAY_TOKEN != null} " +
+                    "socks=${socksProxyPort ?: "direct"} " +
                     "myPubKey=${myPubKey.take(16)}…",
             )
             // ADR-011: schedule the AlarmManager wakeup BEFORE entering
@@ -165,9 +227,10 @@ class PhantomMessagingService : Service() {
 
             runCatching {
                 container.transport.connect(
-                    relayUrl = BuildConfig.RELAY_URL,
+                    relayUrl = relayUrl,
                     identityPublicKeyHex = myPubKey,
                     token = BuildConfig.RELAY_TOKEN,
+                    socksProxyPort = socksProxyPort,
                 )
             }.onFailure { e ->
                 Log.e(TAG, "Transport connect loop exited: ${e.message}", e)
@@ -186,6 +249,17 @@ class PhantomMessagingService : Service() {
         releaseKeepAliveLocks()
         serviceScope.launch {
             runCatching { (application as PhantomApplication).container.transport.disconnect() }
+        }
+        // ADR-016 Stage 2C: tear down the embedded Tor daemon. Inline
+        // runBlocking on the main thread is acceptable in onDestroy because
+        // tor.stop() returns as soon as the kmp-tor StopDaemon action is
+        // accepted (the actual socket teardown happens off-thread); without
+        // this, a stop-and-restart of the service could see overlapping tor
+        // instances racing on the same DataDirectory volume.
+        torService?.let { tor ->
+            runCatching {
+                runBlocking { withTimeout(TOR_STOP_TIMEOUT_MS) { tor.stop() } }
+            }.onFailure { Log.w(TAG, "TorService.stop() failed: ${it.message}") }
         }
         serviceScope.cancel()
     }
@@ -218,5 +292,16 @@ class PhantomMessagingService : Service() {
         private const val TAG = "PhantomMessagingService"
         const val CHANNEL_ID = "phantom_messaging"
         const val NOTIFICATION_ID = 1001
+
+        // ADR-016 Stage 2C: maximum time we wait for Tor to bootstrap a
+        // circuit before giving up and aborting the connect attempt.
+        // Two minutes covers a fresh device on slow cellular reaching
+        // entry guards through default directory authorities; censored
+        // networks (where bridges become necessary — Stage 5) typically
+        // either succeed within this window via random luck or never.
+        private const val TOR_BOOTSTRAP_TIMEOUT_MS = 120_000L
+        // Tor stop is fast (the StopDaemon action ack is immediate), so
+        // a much shorter cap is fine in onDestroy.
+        private const val TOR_STOP_TIMEOUT_MS = 5_000L
     }
 }
