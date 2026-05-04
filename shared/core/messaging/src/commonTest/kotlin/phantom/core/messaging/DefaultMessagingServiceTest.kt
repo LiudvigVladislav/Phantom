@@ -291,7 +291,12 @@ private class FakeRelayTransport : RelayTransport {
     override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
     override val typingEvents: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 10)
     val sent = mutableListOf<RelayMessage.Send>()
-    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {}
+    override suspend fun connect(
+        relayUrl: String,
+        identityPublicKeyHex: String,
+        token: String?,
+        socksProxyPort: Int?,
+    ) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
     override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
@@ -1107,7 +1112,12 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
     override val acks: Flow<phantom.core.transport.RelayMessage.Ack> = emptyFlow()
     override val readReceipts: Flow<phantom.core.transport.RelayMessage.ReadReceipt> = emptyFlow()
     override val typingEvents: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 10)
-    override suspend fun connect(relayUrl: String, identityPublicKeyHex: String, token: String?) {}
+    override suspend fun connect(
+        relayUrl: String,
+        identityPublicKeyHex: String,
+        token: String?,
+        socksProxyPort: Int?,
+    ) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: phantom.core.transport.RelayMessage.Send): Boolean = true
     override suspend fun sendReadReceipt(message: phantom.core.transport.RelayMessage.ReadReceipt): Boolean = true
