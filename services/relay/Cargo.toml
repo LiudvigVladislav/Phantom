@@ -19,6 +19,7 @@ subtle = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+socket2 = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

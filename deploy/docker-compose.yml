@@ -40,6 +40,17 @@ services:
       - /tmp:size=16m
     volumes:
       - phantom-reports:/var/phantom
+    # ADR-014 (Transport TCP Keepalive Strategy, 2026-05-04): tighten
+    # kernel keepalive timing in this container's network namespace so
+    # any keepalive probe relay or Caddy emits actually fires within a
+    # window that beats Russian-carrier CGN idle timeouts (50-90s).
+    # Per-connection SO_KEEPALIVE + setsockopt overrides in main.rs are
+    # the primary defence; these sysctls are belt-and-braces for any
+    # tokio/hyper code path that relies on kernel defaults.
+    sysctls:
+      net.ipv4.tcp_keepalive_time: 30
+      net.ipv4.tcp_keepalive_intvl: 10
+      net.ipv4.tcp_keepalive_probes: 3
 
   caddy:
     image: caddy:2.8-alpine
@@ -69,6 +80,18 @@ services:
       - NET_BIND_SERVICE   # needed to bind :80 and :443
     security_opt:
       - no-new-privileges:true
+    # ADR-014: Caddy runs on Go, which enables SO_KEEPALIVE on accepted
+    # TCP connections by default with a 15s TCP_KEEPIDLE. The interval
+    # and probe count, however, inherit from the network-namespace
+    # kernel sysctls — which by default are 75s/9 and would not detect
+    # a dead NAT entry inside a 60s carrier idle window. Override so
+    # Go's auto-keepalive becomes effective for our scenario:
+    #   idle 15s (Go default) -> probe every 10s -> 3 probes = ~45s
+    # to dead detection. Beats CGN typical 60s idle.
+    sysctls:
+      net.ipv4.tcp_keepalive_time: 30
+      net.ipv4.tcp_keepalive_intvl: 10
+      net.ipv4.tcp_keepalive_probes: 3
 
 networks:
   phantom-internal:

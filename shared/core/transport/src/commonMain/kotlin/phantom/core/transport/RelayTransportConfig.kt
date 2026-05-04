@@ -5,9 +5,14 @@ package phantom.core.transport
 
 object RelayTransportConfig {
     // Application-level heartbeat: client sends RelayMessage.Ping on this cadence.
-    // Aggressive interval so a half-dead socket (TCP write buffer accepts the
-    // frame but the wire is broken) is detected within ~25 s instead of the
-    // 60-70 s the previous 20 s/50 s pair gave us.
+    // 10 seconds is the standard cellular-WSS sweet spot (Element/Signal use
+    // ~30 s; we picked 10 to detect a half-dead socket faster). NAT-entry
+    // freshness on cellular CGN is now defended at the TCP layer via
+    // SO_KEEPALIVE (TCP_KEEPIDLE=30s) configured in
+    // RelayTransportFactory.androidMain (Layer 2, ADR-014). The earlier 3 s
+    // experiment was reverted — it broke even the Pixel emulator on a stable
+    // PC, suggesting middlebox or server-side rate-limit triggered by
+    // frequent small frames.
     const val PING_INTERVAL_MS = 10_000L
 
     // If the relay has not emitted a Pong for this long, declare the connection

@@ -217,19 +217,19 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 
 ---
 
-### ISSUE-013: Tecno HiOS firmware-level Wi-Fi radio parking — push-wakeup deferred to Phase 5
+### ISSUE-013: Stateful NAT idle timeout on cellular carriers — Layer 2 mitigation in fix/transport-tcp-keepalive
 
-**Status:** Documented limitation. Industry-standard for FOSS messengers without push-based wakeup. Real fix requires UnifiedPush integration scheduled for Phase 5 (Feb 2027).
+**Status:** Diagnosis revised 2026-05-04 (was: Tecno HiOS firmware Wi-Fi radio parking). Layer 2 fix in branch `fix/transport-tcp-keepalive` pending Test 5 validation. If Layer 2 confirms the diagnosis, voice + calls move from experimental to production-ready without VPN requirement.
 
-**Symptom.** On Tecno HiOS (and architecturally on every aggressive-OEM Android skin: Xiaomi MIUI, Huawei EMUI, Oppo ColorOS, Vivo OriginOS, Realme), the Wi-Fi radio is parked roughly every 30 seconds **regardless of**:
+**Revised root cause.** The 4-test matrix on 2026-05-04 (Tecno Spark Go + Pixel 8 Pro emulator, both on MTS home WiFi, identical network path) showed that `Connection reset` every 50-60 s appears on the **Pixel emulator** as well. The emulator is a stock-Android process running on a stable Windows PC — Tecno-firmware-radio-parking cannot account for its behaviour. Both devices stay perfectly stable when behind any VPN. The actual root cause is a stateful network element along the client-to-Hetzner path (Carrier-Grade NAT on the Russian mobile carrier, or transit border filtering, or a stateful firewall) that drops idle TCP entries within 50-90 s. VPN tunnels emit their own keepalive packets at 10-25 s and refresh the NAT entry; bare WSS without TCP keepalive does not.
 
-- The user disabling battery optimization for PHANTOM in Android Settings → "Unrestricted"
-- The foreground notification with persistent service
-- `WifiManager.WIFI_MODE_FULL_HIGH_PERF` lock (HiOS silently downgrades it to type=3 `WIFI_MODE_FULL`)
-- `WifiManager.MulticastLock` (acquired and reported held, no observed effect on parking)
-- `ConnectivityManager.requestNetwork(NET_CAPABILITY_INTERNET)` (callback fires "network available" but radio still parks 30 s later)
+**The previous diagnosis (HiOS radio parking, ADR-013) was wrong.** ADR-014 documents the revision. ADR-010/ADR-011/ADR-013 transport-recovery patches (forceReconnect, AlarmManager wakeup, generation-based engine disposal) remain in place as defence-in-depth.
 
-This is **firmware-level battery aggression** below any user-space API.
+**Symptom.** On any client (Tecno HiOS phone OR stock-Android Pixel emulator) reaching `relay.phntm.pro` over a Russian residential WiFi without VPN, the WebSocket TCP connection is closed by peer (server-side `Connection reset` in OkHttp's `WebSocketReader.readHeader`) every 50-60 seconds. The same client behind any VPN (OpenVPN, WireGuard, commercial provider) holds the connection indefinitely. The pattern is path-specific, not device-specific.
+
+**Earlier (now-superseded) diagnosis.** Original investigation in ADR-010/ADR-011/ADR-013 attributed the cycle to Tecno HiOS firmware Wi-Fi radio parking. That hypothesis explained the Tecno cycle but cannot explain the matching cycle on a Pixel emulator on a stable PC. The 2026-05-04 4-test matrix (`docs/research/transport-investigation-2026-05-04/`) refuted firmware-radio as root cause.
+
+**Mitigations from the earlier diagnosis remain useful.** Foreground service WifiLock, WakeLock, MulticastLock, AlarmManager-driven force-reconnect (ADR-011), and generation-based OkHttp engine disposal (ADR-010 updated 2026-05-01) all stay in place as defence in depth. They reduce reconnect latency from 60 s to 1-3 s once the upstream NAT does drop the connection.
 
 **Impact.** Text messages: 1–2 second delay if the send happens to land in the brief reconnect window (~700 ms abandon-and-restart cycle). No data loss — relay's store-and-forward retains envelopes until ack. Voice messages (~270 KB single envelope today): cannot complete transit before next reconnect window — this needs voice chunking from PR 3 of the reliability sprint, not a transport-layer fix.
 
@@ -253,14 +253,29 @@ Final transport architecture: APK 17's abandon-and-restart with APK 19's belt-an
 - Periodic wake (screen on every few minutes) drains the queue immediately
 - VPN client running on the device sometimes keeps radio active as a side effect (the VPN's own keepalive prevents parking)
 
-**Real fix (Phase 5, Feb 2027):**
+**Layer 2 fix (current — pending Test 5 validation):**
+
+`fix/transport-tcp-keepalive` branch enables `SO_KEEPALIVE` with explicit `TCP_KEEPIDLE=30s / TCP_KEEPINTVL=10s / TCP_KEEPCNT=3` (60-second dead-detection window) on:
+
+- **Android client** — custom `KeepAliveSocketFactory` wraps the OkHttp `Socket` and applies `setsockopt` immediately after `connect()`. See `shared/core/transport/src/androidMain/kotlin/phantom/core/transport/KeepAliveSocketFactory.kt`.
+- **Rust relay** — `axum::serve::Listener` wrapper applies `socket2::TcpKeepalive` to each accepted stream. See `services/relay/src/main.rs` `KeepAliveListener`.
+- **Caddy and relay containers** — namespaced kernel sysctls in `deploy/docker-compose.yml` so Caddy's Go-runtime auto-keepalive uses our timing. Caddy is the primary server-side defence; relay sysctls are belt-and-braces.
+- **Optional VPS host** — `deploy/99-phantom-keepalive.conf` for `/etc/sysctl.d/`.
+
+TCP keepalive packets are 0-byte ACKs that refresh stateful NAT/firewall entries every 10 seconds once the connection has been idle 30 seconds. They do not look like app-level activity that DPI fingerprints, and they cost nothing during normal app traffic.
+
+**Why this is the right architectural layer.** Application-level WebSocket pings cannot reach all middleboxes. A tighter ping interval (3s) was tried 2026-05-03 and made the situation worse — the emulator regressed to the same 50s cycle, suggesting that frequent small-frame patterns trigger separate middlebox heuristics. TCP keepalive at the OS layer is invisible to app-level rate limits and DPI signatures.
+
+**See:** ADR-014 (Transport TCP Keepalive Strategy) for full rationale, and `docs/research/transport-investigation-2026-05-04/99-synthesis.md` for the 4-agent research that drove the redesign.
+
+**Real architectural fix (Phase 5, Feb 2027) — still planned regardless:**
 
 - UnifiedPush client integration in Android app
 - UnifiedPush server endpoints in relay
 - Optional PHANTOM-branded distributor for users without ntfy or another distributor installed
 - See PHANTOM_ROADMAP_2026.md for Phase 5 timeline
 
-**Why this is documented as a limitation, not a P1 bug:** Every reasonable user-space mitigation has been attempted and verified ineffective. The fix lives in a different architectural layer (push wakeup) that is on the roadmap. Re-attempting transport-layer workarounds would be wasted effort. ADR-010, ADR-011, ADR-013 + `docs/research/TECNO_HIOS_WIFI_PARKING_RESEARCH.md` document the full diagnostic chain.
+UnifiedPush eliminates the persistent-WebSocket requirement during background idle entirely, so it solves this problem class architecturally rather than at the transport layer. Layer 2 (TCP keepalive) closes the gap between now and Phase 5.
 
 ---
 

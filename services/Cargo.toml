@@ -42,5 +42,11 @@ rand = "0.8"
 # Hex encoding for public keys / keyIds in URL paths.
 hex = "0.4"
 
+# Low-level socket option control — used to enable SO_KEEPALIVE +
+# TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT on each accepted WS
+# connection so the relay defends the same NAT path as the client.
+# See ADR-014 (Transport TCP Keepalive Strategy).
+socket2 = { version = "0.5", features = ["all"] }
+
 # Testing
 tokio-test = "0.4"

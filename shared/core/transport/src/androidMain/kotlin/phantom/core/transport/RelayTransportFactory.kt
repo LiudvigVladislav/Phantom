@@ -40,6 +40,15 @@ actual fun createHttpClientFactory(): () -> HttpClient = {
         // gets harder. HTTP/1.1 keeps "one TCP per WS" so close() acts
         // intuitively. See ADR-010 "Updated 2026-05-01".
         .protocols(listOf(Protocol.HTTP_1_1))
+        // ADR-014 (2026-05-04): TCP keepalive defends NAT/CGN idle
+        // timeout on cellular. SO_KEEPALIVE + TCP_KEEPIDLE=30 + INTVL=10
+        // + CNT=3 → dead-detection in 60 s, with NAT-entry refresh every
+        // 10 s once the connection has been idle for 30 s. Matches the
+        // observed VPN-keepalive cadence (OpenVPN 10 s, WireGuard 25 s)
+        // that empirically restores delivery on Russian carrier WiFi.
+        // KeepAliveSocketFactory.kt sets the timing via setsockopt as
+        // soon as Socket.connect() returns.
+        .socketFactory(KeepAliveSocketFactory())
         .build()
 
     // Record so forceShutdownActiveEngine() can interrupt this engine's
