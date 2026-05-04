@@ -12,5 +12,6 @@ pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod prekeys;
+pub mod push;
 pub mod routes;
 pub mod state;

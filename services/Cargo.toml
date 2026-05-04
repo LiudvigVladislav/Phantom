@@ -42,5 +42,11 @@ rand = "0.8"
 # Hex encoding for public keys / keyIds in URL paths.
 hex = "0.4"
 
+# HTTP client for outbound POST to the ntfy distributor (UnifiedPush
+# wakeup channel — ADR-016). rustls-tls only — we deliberately avoid
+# linking native OpenSSL into the relay binary. Minimal feature set:
+# no cookies, no compression, no proxy autodetection.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
 # Testing
 tokio-test = "0.4"

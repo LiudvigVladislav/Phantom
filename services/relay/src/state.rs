@@ -48,6 +48,30 @@ pub struct AppState {
     /// `store` because the persistence shape and access patterns differ
     /// (per-identity record, atomic OPK pop, separate jsonl file).
     pub prekeys: PreKeyStore,
+    /// UnifiedPush registration tokens (ADR-016). Maps recipient identity
+    /// (hex public key) -> ntfy topic URL the client published via
+    /// POST /push/register. Set when the client (re-)registers with its
+    /// UnifiedPush distributor; consumed when the relay needs to wake the
+    /// client because an envelope was queued offline.
+    ///
+    /// Storage shape mirrors `reports` and `blocklist`:
+    ///   in-memory HashMap + JSONL append on every change.
+    /// On startup the JSONL is replayed line-by-line; the most recent
+    /// line per identity wins (matches the publish endpoint's
+    /// "replace topic for this identity" semantics).
+    ///
+    /// Privacy boundary: the relay stores the topic URL only. It never
+    /// stores the per-install secret that authenticates against the
+    /// distributor — that lives only in the client. The topic URL is
+    /// the equivalent of an FCM token in metadata sensitivity but does
+    /// not identify the user to any third party because the distributor
+    /// is self-hosted (`ntfy.phntm.pro`).
+    pub push_tokens: RwLock<HashMap<String, String>>,
+    /// HTTP client used to POST UnifiedPush wake-ups to the ntfy
+    /// distributor. Created once at startup with conservative timeouts;
+    /// reused for every push. Fire-and-forget at the call site —
+    /// envelope delivery never blocks on push completion.
+    pub http: reqwest::Client,
 }
 
 impl AppState {
@@ -56,6 +80,17 @@ impl AppState {
         let persisted = load_reports_from_disk();
         // Load persisted blocklist from disk
         let blocked = load_blocklist_from_disk();
+        // Load persisted push tokens from disk
+        let tokens = load_push_tokens_from_disk();
+        // HTTP client for outbound UnifiedPush wake-ups. 5s timeout is
+        // generous — ntfy distributor is on the same Docker network in
+        // production. On error we log and move on; envelope delivery
+        // is unaffected.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .user_agent("phantom-relay/0.1")
+            .build()
+            .expect("reqwest::Client::build with default rustls should not fail");
         Self {
             config,
             store: RwLock::new(HashMap::new()),
@@ -65,12 +100,24 @@ impl AppState {
             reports: RwLock::new(persisted),
             blocklist: RwLock::new(blocked),
             prekeys: PreKeyStore::new(),
+            push_tokens: RwLock::new(tokens),
+            http,
         }
     }
 }
 
 const REPORTS_FILE: &str = "reports.jsonl";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
+const PUSH_TOKENS_FILE: &str = "push_tokens.jsonl";
+
+/// On-disk record for a single /push/register call. `identity` is the
+/// recipient's hex public key; `topic_url` is the ntfy URL the client
+/// will subscribe to via its UnifiedPush distributor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushTokenRecord {
+    pub identity: String,
+    pub topic_url: String,
+}
 
 pub fn load_reports_from_disk() -> Vec<AbuseReport> {
     let Ok(content) = std::fs::read_to_string(REPORTS_FILE) else { return vec![] };
@@ -99,5 +146,30 @@ pub fn append_block_to_disk(key: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(BLOCKLIST_FILE) {
         let _ = writeln!(f, "{}", key);
+    }
+}
+
+pub fn load_push_tokens_from_disk() -> HashMap<String, String> {
+    let Ok(content) = std::fs::read_to_string(PUSH_TOKENS_FILE) else {
+        return HashMap::new();
+    };
+    // Replay JSONL line by line. Last write wins per identity — matches
+    // the /push/register semantics (each registration replaces the
+    // previous topic for that identity).
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        if let Ok(rec) = serde_json::from_str::<PushTokenRecord>(line) {
+            map.insert(rec.identity, rec.topic_url);
+        }
+    }
+    map
+}
+
+pub fn append_push_token_to_disk(rec: &PushTokenRecord) {
+    use std::io::Write;
+    if let Ok(line) = serde_json::to_string(rec) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(PUSH_TOKENS_FILE) {
+            let _ = writeln!(f, "{}", line);
+        }
     }
 }
