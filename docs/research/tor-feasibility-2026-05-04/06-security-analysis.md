@@ -24,12 +24,24 @@ Specific findings for PHANTOM:
 - **Single relay onion** with optional **per-conversation client-auth keys**
   is the right tradeoff for v1. Per-user onions don't buy enough at our scale
   to justify the complexity.
-- **Vanguards (Proposal 292)** are essential for the relay side to defend
-  against guard discovery, the most serious threat to v3 onion services
-  ([Tor blog: Vanguards Add-On](https://blog.torproject.org/announcing-vanguards-add-onion-services/)).
-- **Application-layer countermeasures are required**: padding, fixed-size
-  envelopes, batched delivery. Tor is not metadata privacy by itself —
-  see SUMo flow correlation attack (NDSS 2024)
+- **Vanguards-Lite (Proposal 333) is our baseline.** Built into stable
+  C-tor since 0.4.7.1-alpha and **on by default** for every onion service
+  — zero deployment work, zero performance cost. Defends against guard
+  discovery at the L2 layer, the path Tor Project upstreamed instead of
+  the original full Vanguards (Proposal 292) addon. See no-go check
+  `no-go-checks/02-vanguards-deployability.md` for why full Prop 292 is
+  not deployable today (Python addon `mikeperry-tor/vanguards`
+  unmaintained since 2021, removed from Debian Trixie). Track Arti
+  migration as the trigger for evaluating full Vanguards properties
+  again — Arti landed Vanguards support in 1.2.2, August 2024.
+- **Application-layer countermeasures defend against SUMo, not Vanguards.**
+  Padding, fixed-size envelopes, batched delivery are mandatory because
+  the SUMo flow-correlation attack (NDSS 2024) operates at a layer Vanguards
+  cannot reach. Vanguards reduces *guard-discovery* probability — making
+  obtaining a vantage point harder — but does not break correlation once
+  vantage exists. Real SUMo defences are circuit-padding machines (already
+  shipped in Tor as `circpadding-builtin`) plus short-session usage and
+  in-app application-layer padding.
   ([NDSS 2024 paper](https://www.ndss-symposium.org/wp-content/uploads/2024-337-paper.pdf)).
 
 PHANTOM's existing crypto stack (Curve25519 X25519 + Double Ratchet over
@@ -71,11 +83,17 @@ The protections:
   "Flow Correlation Attacks on Tor Onion Service Sessions with Sliding
   Subset Sum (SUMo)" demonstrated practical deanonymization with multiple
   colluding ISPs ([NDSS 2024](https://www.ndss-symposium.org/wp-content/uploads/2024-337-paper.pdf)).
-- **Hidden service guard discovery → deanonymization.** Without vanguards,
-  an adversary can probe the onion service to identify its guards and then
-  attack those specific guards. The Tor team explicitly states "the most
-  serious threat that v3 onion services currently face is guard discovery"
-  ([Vanguards Add-On announcement](https://blog.torproject.org/announcing-vanguards-add-onion-services/)).
+- **Hidden service guard discovery → deanonymization.** An adversary who
+  can probe the onion service over time can identify its guards and then
+  target attacks at those specific guards. The Tor team historically
+  called this "the most serious threat that v3 onion services currently
+  face" ([Vanguards Add-On announcement, 2018](https://blog.torproject.org/announcing-vanguards-add-onion-services/)).
+  Modern stable Tor (>= 0.4.7.1-alpha) ships **Vanguards-Lite (Proposal
+  333) on by default** for every onion service, which materially reduces
+  this attack surface at the L2 layer. Full Vanguards (Prop 292) is no
+  longer recommended deployment because the Python addon is unmaintained
+  (last real commit 2021); see no-go check
+  `no-go-checks/02-vanguards-deployability.md`.
 - **Bridge enumeration.** Russian DPI is actively enumerating obfs4 and
   WebTunnel bridges ([Tor blog: 2025 censorship recap](https://blog.torproject.org/staying-ahead-of-censors-2025/)).
   This is a bootstrap problem, not an in-circuit problem.
@@ -88,7 +106,7 @@ The protections:
 
 | Attack | Year | What it breaks | Mitigation |
 |---|---|---|---|
-| Guard discovery (general) | ongoing | onion service deanon | Vanguards (Proposal 292) |
+| Guard discovery (general) | ongoing | onion service deanon | Vanguards-Lite (Proposal 333, built-in to stable Tor by default) |
 | SUMo flow correlation | 2024 | onion session deanon by colluding ISPs | application-level padding/timing defenses |
 | obfs4 enumeration in Russia | 2022–ongoing | bootstrap blocked | rotate bridges, WebTunnel, Snowflake |
 | WebTunnel enumeration in Russia | mid-2025 | bootstrap on commodity ASNs | bridges on lesser-known ASNs, Telegram distributor |
@@ -244,17 +262,35 @@ matches SecureDrop's journalist-facing onion model.
 
 ## 3. Vanguards and the relay
 
-The Tor team's strongest recommendation for any onion service that can be
-attacked over time is to deploy **vanguards** (Proposal 292). Without them,
-a steady adversary can determine the relay's guard nodes and then launch a
-targeted attack on those guards
-([Vanguards Add-On](https://blog.torproject.org/announcing-vanguards-add-onion-services/),
-[Whonix Vanguards](https://www.whonix.org/wiki/Vanguards)).
+PHANTOM uses **Vanguards-Lite (Proposal 333)** as its baseline guard-
+discovery defence. It is built into stable C-tor since 0.4.7.1-alpha and
+**enabled by default** on every onion service — zero deployment work,
+zero performance cost. The PHANTOM relay's onion service inherits this
+defence the moment we run a recent Tor.
 
-Arti has integrated vanguard support since 1.4
+The full Vanguards system (Proposal 292) — L2/L3 layered guard rotation,
+bandguards monitoring, rendezvous-point rotation — was historically the
+strongest recommendation but is **not deployable as a 2026 dependency**.
+The Python addon `mikeperry-tor/vanguards` has not had a real code
+change since July 2021, has zero releases, has been removed from Debian
+Trixie, and Tor Project has marked Proposal 292 itself as superseded by
+Lite as the in-tree path. See `no-go-checks/02-vanguards-deployability.md`
+for the audit trail.
+
+Arti has integrated vanguard support since 1.2.2 (August 2024)
 ([Arti vanguards announcement](https://blog.torproject.org/announcing-vanguards-for-arti/)).
-The PHANTOM relay must enable vanguards in its Arti configuration. This is
-a one-time config step but a hard requirement for any production relay.
+**Track Arti maturity as the trigger for re-evaluating full Vanguards
+properties** — when Arti reaches HS-hosting parity with C-tor and its
+mobile binary size is acceptable, migration brings full Vanguards
+back as a deployable option.
+
+For the SUMo flow-correlation attack specifically (NDSS 2024), Vanguards
+is **not** the right defence — Vanguards reduces guard-discovery
+probability, while SUMo operates at a layer Vanguards cannot reach
+(end-to-end traffic correlation given AS-level vantage). The actual
+SUMo defences are circuit-padding machines (already shipped in Tor as
+`circpadding-builtin`), short sessions, and the application-layer
+padding described in section 4 below.
 
 ---
 
@@ -298,7 +334,10 @@ Tor they buy little; with Tor they meaningfully raise the SUMo bar.
    to `.onion`.
 3. **Single relay onion + client authorization** for the trusted-device
    channel. Auth key shipped in pairing payload.
-4. **Vanguards mandatory** on the relay's Arti config.
+4. **Vanguards-Lite is on by default in stable Tor** — no extra config
+   work. Track Arti maturity as the trigger for evaluating full
+   Vanguards (Prop 292) properties later. Full Prop 292 deployment via
+   the Python addon is **not** recommended (unmaintained since 2021).
 5. **Pad envelopes to fixed sizes** (1 KB / 8 KB / 64 KB tiers). PHANTOM
    already does this for voice; extend.
 6. **Document explicitly** in user-facing privacy copy what Tor protects and
