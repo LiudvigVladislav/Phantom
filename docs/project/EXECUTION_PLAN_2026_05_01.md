@@ -2,7 +2,9 @@
 
 Living roadmap for the current sprint. Ties together yesterday's strategic plan, today's audit findings (architecture + security), and the QA backlog from manual device testing.
 
-This document is **the authoritative working plan**. When in doubt, read this first.
+This document is **the authoritative working plan for the reliability-sprint mechanics** (Track A + Track B detail). For the cross-track timeline that ties Reliability + Security + Grant Readiness + Alpha 2 features together, see [`MASTER_TIMELINE_2026.md`](MASTER_TIMELINE_2026.md).
+
+When in doubt, read MASTER_TIMELINE first for the big picture, this file second for Track A/B details.
 
 ---
 

@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 Willen LLC
+#
+# Tor daemon configuration for the PHANTOM relay onion service.
+# Mounted read-only into the container at /etc/tor/torrc.
+#
+# Architecture: ADR-016 (Tor + UnifiedPush hybrid transport).
+#
+# This daemon operates ONLY as a hidden service host. It is not a
+# relay (we do not contribute bandwidth to the Tor network) and it
+# does not act as a SOCKS proxy for arbitrary outbound traffic.
+# Clients run their own embedded tor (kmp-tor on Android) and reach
+# this daemon via its v3 onion address.
+
+# Run as a daemon-friendly process. Logs to stdout so docker-compose
+# captures them.
+RunAsDaemon 0
+Log notice stdout
+
+# Data directory for keys, descriptors, state. Mounted as a named
+# Docker volume so it persists across container restarts and
+# rebuilds; losing this directory rotates the onion address.
+DataDirectory /var/lib/tor
+
+# We do not run a SOCKS port — this daemon does not proxy outbound
+# user traffic. Setting to 0 disables the default 9050 listener.
+SOCKSPort 0
+
+# Disable the control port. Operators who need to inspect state can
+# `docker exec` and read /var/lib/tor/* directly.
+ControlPort 0
+
+# ── Hidden service for the PHANTOM relay ─────────────────────────────
+# v3 onion address (ed25519, 56 base32 chars). Generated automatically
+# on first run; persisted in the named volume's hidden_service/
+# subdirectory.
+HiddenServiceDir /var/lib/tor/hidden_service/
+
+# Map onion port 80 to the relay's WebSocket port on the internal
+# Docker network. Plain HTTP/WS over the onion is intentional —
+# Tor's circuit already provides confidentiality and integrity, and
+# the onion address itself authenticates the destination via its
+# embedded ed25519 public key.
+HiddenServicePort 80 relay:8080
+
+# Vanguards-Lite (Proposal 333) is enabled by default in stable Tor
+# >= 0.4.7.1-alpha; no explicit setting needed. See
+# no-go-checks/02-vanguards-deployability.md for why this supersedes
+# the unmaintained full Vanguards (Proposal 292) Python addon.
+
+# Bind the hidden service to v3 only. v2 onions were deprecated in
+# 2021 and rejected by current tor releases anyway; explicit for
+# defence in depth.
+HiddenServiceVersion 3
+
+# Conservative connection limits at the host level.
+# These do not bound the onion service descriptor publication;
+# they bound the rate at which tor will accept incoming circuits
+# to this hidden service per second to prevent trivial DoS.
+HiddenServiceMaxStreams 100
+HiddenServiceMaxStreamsCloseCircuit 1

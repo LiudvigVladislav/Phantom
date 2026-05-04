@@ -21,12 +21,16 @@ pub struct RelayConfig {
     pub rate_limit_per_window: u32,
     /// Duration of the rate-limit sliding window in seconds.
     pub rate_limit_window_secs: u64,
-    /// Optional FCM server key (Legacy HTTP API) for sending silent push notifications
-    /// to offline recipients so their device wakes and drains via WebSocket.
-    /// When absent the relay skips FCM delivery entirely — no crash, no error.
-    /// Set via environment variable: RELAY_FCM_SERVER_KEY=<key>
-    /// TODO: migrate to FCM v1 API (OAuth2) before production — Legacy key is deprecated.
-    pub fcm_server_key: Option<String>,
+    /// Base URL of the self-hosted ntfy distributor used for UnifiedPush wakeup
+    /// (ADR-016). When set, the relay POSTs a one-byte payload to
+    /// `<ntfy_url>/<topic>` after queueing an envelope for an offline recipient,
+    /// where `<topic>` is the per-install token published via /push/register.
+    /// When absent the relay skips push delivery entirely — no crash, no error.
+    /// Set via environment variable: RELAY_NTFY_URL=https://ntfy.phntm.pro
+    /// (or for the in-cluster Docker Compose case: http://ntfy:80).
+    /// The relay never embeds Google FCM, Apple APNs, or any third-party
+    /// push provider per ADR-001 / ADR-016 metadata-privacy posture.
+    pub ntfy_url: Option<String>,
 }
 
 impl RelayConfig {
@@ -41,7 +45,7 @@ impl RelayConfig {
             envelope_ttl_secs: 7 * 24 * 3600,
             max_envelopes_per_recipient: 500,
             secret_token: None,
-            fcm_server_key: None,
+            ntfy_url: None,
             rate_limit_per_window: 60,
             rate_limit_window_secs: 60,
         }
@@ -67,7 +71,7 @@ impl RelayConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
             secret_token: std::env::var("RELAY_SECRET_TOKEN").ok(),
-            fcm_server_key: std::env::var("RELAY_FCM_SERVER_KEY").ok(),
+            ntfy_url: std::env::var("RELAY_NTFY_URL").ok(),
             rate_limit_per_window: std::env::var("RELAY_RATE_LIMIT_PER_WINDOW")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -91,7 +95,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("secret_token", &self.secret_token.as_ref().map(|_| "[REDACTED]"))
             .field("rate_limit_per_window", &self.rate_limit_per_window)
             .field("rate_limit_window_secs", &self.rate_limit_window_secs)
-            .field("fcm_server_key", &self.fcm_server_key.as_ref().map(|_| "[REDACTED]"))
+            .field("ntfy_url", &self.ntfy_url)
             .finish()
     }
 }
