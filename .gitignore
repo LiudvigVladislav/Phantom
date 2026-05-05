@@ -18,6 +18,12 @@ apps/android/local.properties
 *.apk
 *.aab
 
+# Briar tor + lyrebird native binaries — extracted at build time from
+# org.briarproject:tor-android.jar and lyrebird-android.jar by the
+# `unpackTorBinaries` task in shared/core/transport/build.gradle.kts.
+# Generated, not source.
+shared/core/transport/src/androidMain/jniLibs/
+
 # iOS
 apps/ios/Pods/
 apps/ios/*.xcworkspace

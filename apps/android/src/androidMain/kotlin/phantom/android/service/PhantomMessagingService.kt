@@ -87,11 +87,15 @@ class PhantomMessagingService : Service() {
         val cacheDir = applicationContext.cacheDir.resolve("tor-cache")
         workDir.mkdirs()
         cacheDir.mkdirs()
+        // ADR-018: Briar's AndroidTorWrapper requires the host Application
+        // for its wake-lock manager and resource extraction. We pass it
+        // through the platformContext channel of the cross-platform factory.
         createTorService(
-            TorServiceConfig(
+            config = TorServiceConfig(
                 dataDirectoryPath = workDir.absolutePath,
                 cacheDirectoryPath = cacheDir.absolutePath,
             ),
+            platformContext = application,
         )
     }
 

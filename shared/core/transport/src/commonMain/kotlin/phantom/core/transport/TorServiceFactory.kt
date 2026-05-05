@@ -3,21 +3,27 @@
 package phantom.core.transport
 
 /**
- * Platform factory for [TorService] (ADR-016 Stage 2).
+ * Platform factory for [TorService] (ADR-016 + ADR-018).
  *
  * Each platform supplies its own actual:
- *  - **androidMain** wraps kmp-tor's `TorRuntime` (resource-noexec-tor JNI).
+ *  - **androidMain** wraps Briar's `AndroidTorWrapper` (org.briarproject:
+ *    onionwrapper-android), which bundles `tor-android` + `lyrebird-android`
+ *    (Snowflake / WebTunnel / obfs4 / meek pluggable transports). The
+ *    Android wrapper requires an `Application` context for its wake-lock
+ *    manager — passed via [platformContext].
  *  - **jvmMain** is a no-op stub (TorState stays [TorState.Off]); the
- *    desktop client does not need an embedded tor and we do not bundle the
- *    JNI binaries on JVM. Future desktop work can swap this for a real
- *    implementation backed by kmp-tor's JVM runtime.
+ *    desktop client does not yet bundle a tor binary. Future desktop work
+ *    will swap this for a real implementation.
  *  - **iosMain** will arrive with the iOS XCFramework build (post-Alpha 2).
  *
- * Stage 2A only delivers the Android actual; Stage 2B exercises the
- * lifecycle from `PhantomMessagingService`, Stage 2C plugs the SOCKS proxy
- * into [KtorRelayTransport].
+ * @param config the data + cache directories. Briar's wrapper uses a single
+ *   tor directory; Android impl resolves to [TorServiceConfig.dataDirectoryPath].
+ * @param platformContext platform-specific handle:
+ *   - Android: must be an `android.app.Application`. Throws if missing or
+ *     of wrong type.
+ *   - JVM / iOS: ignored. Pass `null`.
  */
-expect fun createTorService(config: TorServiceConfig): TorService
+expect fun createTorService(config: TorServiceConfig, platformContext: Any?): TorService
 
 /**
  * Construction-time configuration for [TorService].
@@ -28,12 +34,14 @@ expect fun createTorService(config: TorServiceConfig): TorService
  *   visible to the user) but is otherwise safe — it holds no PHANTOM
  *   identity material.
  * @property cacheDirectoryPath Absolute path for transient tor cache files.
- *   May be evicted by the OS without breaking functionality; tor will
- *   simply re-fetch on next bootstrap.
+ *   With Briar's wrapper this is informational; the wrapper currently
+ *   reuses the same directory as data. Kept for API symmetry and future
+ *   extraction.
  * @property socksPort TCP port tor binds its SOCKS5 listener on. Default
- *   `0` means tor picks an ephemeral port and the implementation discovers
- *   it after bootstrap; callers consume the resolved port through the
- *   implementation rather than hard-coding 9050.
+ *   `0` means "let the implementation pick"; Briar's `AndroidTorWrapper`
+ *   requires a fixed value at construction time and uses 39050 by default.
+ *   Callers consume the resolved port through [TorState.Ready.socksPort]
+ *   rather than reading [socksPort] directly.
  */
 data class TorServiceConfig(
     val dataDirectoryPath: String,

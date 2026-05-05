@@ -29,24 +29,29 @@ libsodium-bindings = "0.9.2"
 # iOS: pod 'SQLCipher'
 sqlcipher-android = "4.5.7"
 
-# kmp-tor — embedded Tor client for Android (ADR-016 Stage 2).
+# Tor + pluggable transports for Android (ADR-016, ADR-018).
 #
-# Version map:
-#   kmp-tor:runtime  2.6.0  → public Kotlin API surface (TorRuntime, Builder, events)
-#   kmp-tor:resource 409.5.0 → bundled Tor 0.4.9.5 binary + JNI native libraries
-#                              (pinned together; the resource artifact has its own
-#                               version line that tracks the bundled tor release)
+# We use the Briar Project's Tor stack rather than kmp-tor 2.6.0 because:
+#   1. kmp-tor does not bundle pluggable transport binaries (Snowflake,
+#      WebTunnel, obfs4) and the maintainer has stated bridges support
+#      "will never be supported" via raw torrc — see ADR-018.
+#   2. Briar's stack ships a single libLyrebird.so containing obfs4 +
+#      meek + Snowflake + WebTunnel — exactly the pluggable transports
+#      we need to bypass TSPU-style censorship in Russia / Iran / China.
+#   3. Briar's onionwrapper has been production-tested for 10+ years
+#      across the same hostile networks PHANTOM targets.
 #
-# Both artifacts are Apache-2.0. We deliberately use the standard variants, NOT
-# the `-gpl` variants — the standard build links only Tor's BSD-3-Clause core,
-# keeping our license stack clean for AGPL-3.0-or-later. See ADR-016.
+# Version map (must update together — Briar pins them as a triplet):
+#   org.briarproject:tor-android        0.4.8.22 → bundled tor binary
+#   org.briarproject:lyrebird-android   0.6.2    → all 4 pluggable transports
+#   org.briarproject:onionwrapper-android 0.1.4  → Java lifecycle wrapper
 #
-# The `resource-noexec-tor` (in-process JNI) variant is preferred over
-# `resource-exec-tor` because tor's lifecycle is owned by our foreground
-# service: in-process Tor dies cleanly when our JVM dies, leaving no orphan
-# child process to confuse Android's process accounting on aggressive OEMs.
-kmp-tor = "2.6.0"
-kmp-tor-resource = "409.5.0"
+# License: GPL-3.0-or-later. Compatible with our AGPL-3.0-or-later
+# (combined work distributes under AGPL — the network-clause-stronger
+# license per FSF guidance).
+briar-tor = "0.4.8.22"
+briar-lyrebird = "0.6.2"
+briar-onionwrapper = "0.1.4"
 
 androidx-activity = "1.9.3"
 zxing-core = "3.5.3"
@@ -106,10 +111,11 @@ libsodium-bindings = { module = "com.ionspin.kotlin:multiplatform-crypto-libsodi
 # SQLCipher at-rest encryption (activate in core:storage implementation)
 sqlcipher-android = { module = "net.zetetic:sqlcipher-android", version.ref = "sqlcipher-android" }
 
-# kmp-tor — embedded Tor client (ADR-016 Stage 2 Android transport)
-# Standard (non-`-gpl`) variants only; see version comment above.
-kmp-tor-runtime = { module = "io.matthewnelson.kmp-tor:runtime", version.ref = "kmp-tor" }
-kmp-tor-resource-noexec = { module = "io.matthewnelson.kmp-tor:resource-noexec-tor", version.ref = "kmp-tor-resource" }
+# Briar Tor stack (ADR-016 Stage 2 + ADR-018 migration). See version
+# comment above. All three artifacts are GPL-3.0-or-later, AGPL-compatible.
+briar-tor-android = { module = "org.briarproject:tor-android", version.ref = "briar-tor" }
+briar-lyrebird-android = { module = "org.briarproject:lyrebird-android", version.ref = "briar-lyrebird" }
+briar-onionwrapper-android = { module = "org.briarproject:onionwrapper-android", version.ref = "briar-onionwrapper" }
 
 # QR code generation (Apache 2.0)
 zxing-core = { module = "com.google.zxing:core", version.ref = "zxing-core" }

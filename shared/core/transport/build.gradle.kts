@@ -21,12 +21,12 @@ kotlin {
         }
         androidMain.dependencies {
             implementation(libs.ktor.client.okhttp)
-            // kmp-tor — embedded Tor client for the ADR-016 hybrid transport.
-            // runtime is the public API; resource-noexec-tor ships the bundled
-            // tor 0.4.9.5 binary as a JNI library (in-process, not a child
-            // process). See gradle/libs.versions.toml for the rationale.
-            implementation(libs.kmp.tor.runtime)
-            implementation(libs.kmp.tor.resource.noexec)
+            // Briar Tor stack (ADR-018, replaces kmp-tor 2.6.0). Only the
+            // wrapper AAR is on the compile classpath — `tor-android` and
+            // `lyrebird-android` are pure resource JARs (4× ABI-flat
+            // `armeabi-v7a/libtor.so` etc), not Java/Kotlin code, and are
+            // unpacked into jniLibs by the `unpackTorBinaries` task below.
+            implementation(libs.briar.onionwrapper.android)
         }
         jvmMain.dependencies {
             implementation(libs.ktor.client.okhttp)
@@ -41,10 +41,68 @@ kotlin {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Briar tor + lyrebird native binary unpacking (ADR-018)
+//
+// The `org.briarproject:tor-android` and `org.briarproject:lyrebird-android`
+// artifacts are JAR files containing flat-prefixed ABI directories:
+//
+//   tor-android-0.4.8.22.jar:
+//     arm64-v8a/libtor.so
+//     armeabi-v7a/libtor.so
+//     x86/libtor.so
+//     x86_64/libtor.so
+//
+//   lyrebird-android-0.6.2.jar:  (same layout, libLyrebird.so)
+//
+// AGP only auto-packages native libs from AAR `jni/` directories or JARs
+// with the `lib/<abi>/` prefix. Briar's flat layout falls outside both, so
+// we extract the JARs into `src/androidMain/jniLibs/` ourselves before
+// the Android library build runs. AGP then merges them into the final
+// APK at the standard `lib/<abi>/` paths, where `dlopen` can find them.
+//
+// This mirrors the approach Briar themselves use in their `bramble-android`
+// gradle (Groovy original) — same task names, same dependency configuration
+// pattern, translated to Kotlin DSL.
+// ─────────────────────────────────────────────────────────────────────────────
+val tor: Configuration by configurations.creating
+
+dependencies {
+    add("tor", libs.briar.tor.android.get())
+    add("tor", libs.briar.lyrebird.android.get())
+}
+
+val torLibsDir = layout.projectDirectory.dir("src/androidMain/jniLibs")
+
+val cleanTorBinaries by tasks.registering {
+    outputs.dir(torLibsDir)
+    doLast {
+        delete(fileTree(torLibsDir))
+    }
+}
+
+val unpackTorBinaries by tasks.registering(Copy::class) {
+    dependsOn(cleanTorBinaries)
+    outputs.dir(torLibsDir)
+    from(tor.map { zipTree(it) })
+    into(torLibsDir)
+}
+
+tasks.named("preBuild") {
+    dependsOn(unpackTorBinaries)
+}
+
 android {
     namespace = "phantom.core.transport"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
+    }
+    // Keep tor + lyrebird native libraries uncompressed so dlopen can
+    // mmap them directly from the APK (faster start, no extra disk I/O).
+    packaging {
+        jniLibs {
+            keepDebugSymbols += listOf("**/libtor.so", "**/liblyrebird.so")
+        }
     }
 }
