@@ -26,6 +26,8 @@ Component path (planned): `apps/android/.../onboarding/PrivacyModeStep.kt`
 
 ### 1.2 Wireframe
 
+The `[icon]` placeholder in each card represents the custom-designed asset for that mode (see `PRIVACY_MODE_COMPARISON_TABLE.md` §A — `ic_privacy_mode_standard`, `ic_privacy_mode_private`, `ic_privacy_mode_ghost`). **The wireframe uses text labels, not emoji** — emoji belong to marketing renderings only.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  ←                                            [step 3 / 3]  │
@@ -34,7 +36,7 @@ Component path (planned): `apps/android/.../onboarding/PrivacyModeStep.kt`
 │  Control how visible you are to others on PHANTOM.          │
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │ 🌐  Standard                                  ◉       │  │
+│  │ [icon: standard]  Standard                    ◉       │  │
 │  │     Visible to contacts, searchable by username.      │  │
 │  │     Calls, groups, push notifications work normally.  │  │
 │  │                                                       │  │
@@ -42,7 +44,7 @@ Component path (planned): `apps/android/.../onboarding/PrivacyModeStep.kt`
 │  └───────────────────────────────────────────────────────┘  │
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │ 🔒  Private                                   ○       │  │
+│  │ [icon: private]   Private                     ○       │  │
 │  │     Visible only to confirmed contacts.               │  │
 │  │     Read receipts and typing indicators off by        │  │
 │  │     default.                                          │  │
@@ -51,7 +53,7 @@ Component path (planned): `apps/android/.../onboarding/PrivacyModeStep.kt`
 │  └───────────────────────────────────────────────────────┘  │
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │ 👻  Ghost Mode                          PRO   ○       │  │
+│  │ [icon: ghost]     Ghost Mode            PRO   ○       │  │
 │  │     Invisible to all. Receive-only.                   │  │
 │  │     Always-Tor with bridges. No calls. 24h            │  │
 │  │     disappearing messages by default.                 │  │
@@ -114,11 +116,11 @@ Top-level Settings entry. Placement (per `Design/PHANTOM_FULL_COMPOSE.md` settin
 ```
 ┌───────────────────────────────────────────────────┐
 │  Privacy Mode                                     │
-│  🌐  Standard                              >       │
+│  [icon: standard]  Standard                >      │
 └───────────────────────────────────────────────────┘
 ```
 
-The current mode is shown with its icon and name. Tapping the row opens the full chooser screen.
+The current mode is shown with its custom icon (24 dp) and name. Tapping the row opens the full chooser screen. As with onboarding, the in-app icon is the custom asset, not an emoji.
 
 ### 2.3 Chooser screen (when tapped from Settings)
 
@@ -149,10 +151,12 @@ Triggered the first time Privacy Mode becomes Ghost on a given device, regardles
 
 ### 3.1 Wireframe
 
+The hero glyph at the top is the **custom Ghost icon** (`ic_privacy_mode_ghost`) rendered at 64 dp, monochrome cyan, on the dark surface. The wireframe denotes it as `[icon: ghost · 64dp]`. **Not an emoji.**
+
 ```
 ┌─────────────────────────────────────────────────┐
 │                                                 │
-│              👻                                  │
+│            [icon: ghost · 64dp]                 │
 │                                                 │
 │       Welcome to Ghost Mode                     │
 │                                                 │
@@ -201,7 +205,7 @@ Triggered the first time Privacy Mode becomes Ghost on a given device, regardles
 ```
 ┌─────────────────────────────────────────────────┐
 │                                                 │
-│              👻                                  │
+│            [icon: ghost · 64dp]                 │
 │                                                 │
 │        Добро пожаловать в Ghost                  │
 │                                                 │
@@ -245,10 +249,12 @@ Triggered when a free-tier user taps Ghost (release builds, before subscribing).
 
 ### 4.1 Wireframe — bottom sheet
 
+The hero glyph at the top is the custom Ghost icon at 48 dp. **Not emoji.**
+
 ```
 ┌─────────────────────────────────────────────┐
 │                                             │
-│                  👻                          │
+│            [icon: ghost · 48dp]             │
 │                                             │
 │          Ghost Mode is part of              │
 │              PHANTOM PRO                    │
