@@ -1,17 +1,24 @@
 # PHANTOM production deployment.
 #
 # Services behind Caddy reverse proxy:
-#   - relay   : Rust WebSocket relay (ciphertext store-and-forward, in-memory).
-#   - caddy   : TLS termination + WebSocket passthrough + static file serving
-#               for /.well-known/assetlinks.json and a placeholder landing.
-#   - tor     : v3 onion service for the relay (ADR-016 data plane).
-#   - ntfy    : Self-hosted UnifiedPush distributor (ADR-016 wake-up plane).
+#   - relay            : Rust WebSocket relay (ciphertext store-and-forward).
+#   - caddy            : TLS termination + WebSocket passthrough + static
+#                        file serving for /.well-known/, legal pages,
+#                        landing, and the WebTunnel bridge subdomain.
+#   - tor              : v3 onion service for the relay (ADR-016 data plane).
+#   - ntfy             : Self-hosted UnifiedPush distributor (ADR-016
+#                        wake-up plane).
+#   - webtunnel-bridge : Operator-controlled Tor entry bridge with
+#                        WebTunnel pluggable transport (ADR-018 Stage 5C —
+#                        censorship resistance for users in RU / IR / CN
+#                        whose ISP blocks public Snowflake brokers).
 #
 # Run from the repository root:
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
 # See deploy/README.md for DNS + Cloudflare setup requirements.
 # See deploy/tor-onion-setup.md for Tor onion address retrieval.
+# See deploy/webtunnel-bridge-setup.md for WebTunnel bridge bring-up.
 
 services:
   relay:
@@ -60,6 +67,10 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./well-known:/srv/well-known:ro
       - ./landing:/srv/landing:ro
+      # Static placeholder landing for the WebTunnel bridge subdomain.
+      # Anyone scanning bridge.phntm.pro sees a small static site rather
+      # than an empty 404 — defence in depth against TSPU enumeration.
+      - ./webtunnel-landing:/srv/webtunnel-landing:ro
       # Legal documents (Terms of Service + Privacy Policy) served at
       # /terms and /privacy on phntm.pro. Source of truth: /legal at the
       # repository root, mounted read-only.
@@ -109,6 +120,73 @@ services:
       - phantom-internal
     depends_on:
       - relay
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Operator-controlled WebTunnel bridge for the embedded Tor client
+  # (ADR-018 Stage 5C — censorship-resistance).
+  #
+  # Why we run our own bridge: public Snowflake brokers (Netlify-hosted)
+  # are blocked on Russian carrier networks (Test 10, 2026-05-05). Our
+  # users in such networks need a bridge address that is NOT subject to
+  # third-party blocking. Running our own WebTunnel server gives clients
+  # a reachable entry point to the Tor network that looks like normal
+  # HTTPS traffic to any DPI box.
+  #
+  # Architecture:
+  #   PHANTOM client (kmp-tor + lyrebird) ──HTTPS WebSocket──▶
+  #     Caddy at bridge.phntm.pro:443 ──reverse-proxy──▶
+  #       webtunnel-bridge:15000 ──Tor protocol──▶
+  #         Tor entry/middle/exit relays ──▶ phantom-tor (our onion) ──▶ relay
+  #
+  # Caveat (ADR-018 Alpha 2 acceptable risk): bridge + relay onion
+  # currently live on the same VPS IP. A network-observing adversary
+  # capable of enumerating both endpoints can correlate "user enters
+  # PHANTOM bridge" with "PHANTOM client connects to relay onion".
+  # Mitigations:
+  #   - Most users are protected from EXTERNAL observers (TSPU, ISP) —
+  #     that is the threat we built this bridge to address.
+  #   - PHANTOM operator (us) can already see relay-side traffic by
+  #     definition — running the entry bridge does not expand what we
+  #     learn about our own users.
+  # Beta plan: distribute bridge to a separate provider / region.
+  # Documented in docs/operations/TOR_STACK_MAINTENANCE.md.
+  # ──────────────────────────────────────────────────────────────────────
+  webtunnel-bridge:
+    image: thetorproject/webtunnel-bridge:latest
+    container_name: phantom-webtunnel-bridge
+    restart: unless-stopped
+    user: debian-tor
+    environment:
+      # Bridge identity — operator-set, persisted across restarts via the
+      # webtunnel-tor-state volume. NICKNAME is what BridgeDB / Tor metrics
+      # show; OPERATOR_EMAIL is the abuse contact.
+      NICKNAME: ${WEBTUNNEL_NICKNAME:-PhantomBridge1}
+      OPERATOR_EMAIL: ${WEBTUNNEL_OPERATOR_EMAIL:-hello@phntm.pro}
+      # The PT (pluggable transport) listener inside the container.
+      # Caddy reverse-proxies bridge.phntm.pro/<secret-path> here.
+      PT_PORT: 15000
+      # Outbound OR port. Picked once per deploy and persisted so the
+      # bridge identity stays stable. Set in deploy/.env to avoid
+      # re-rolling on each compose up.
+      OR_PORT: ${WEBTUNNEL_OR_PORT:-44389}
+      # The HTTPS URL clients hit to reach this bridge. Includes the
+      # secret path so any random scanner just sees the fake landing
+      # served at bridge.phntm.pro/. Must match the Caddyfile vhost.
+      WEBTUNNEL_URL: ${WEBTUNNEL_URL}
+    expose:
+      - "15000"
+    networks:
+      - phantom-internal
+    volumes:
+      # Tor bridge state — identity keys, descriptor cache, guards. Losing
+      # this volume rotates the bridge fingerprint; clients with the old
+      # one pinned in `OperatorBridges.kt` would silently fail. Back this
+      # up alongside phantom-tor-data.
+      - webtunnel-tor-state:/var/lib/tor
     cap_drop:
       - ALL
     security_opt:
@@ -169,3 +247,9 @@ volumes:
   # in server.yml; tolerable to lose at the cost of replaying any
   # in-flight wake-ups.
   phantom-ntfy-cache:
+  # WebTunnel bridge state — Tor identity keys + descriptor cache + guards.
+  # CRITICAL to back up: losing this rotates the bridge fingerprint, and
+  # every PHANTOM client with the old fingerprint hardcoded silently
+  # stops connecting. Back up procedure mirrors phantom-tor-data — see
+  # deploy/webtunnel-bridge-setup.md.
+  webtunnel-tor-state:

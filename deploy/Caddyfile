@@ -118,6 +118,78 @@ ntfy.phntm.pro {
 }
 
 # -----------------------------------------------------------------------------
+# bridge.phntm.pro — operator-controlled WebTunnel bridge (ADR-018 Stage 5C)
+# -----------------------------------------------------------------------------
+# Tor pluggable transport: WebTunnel makes Tor circuit traffic look like
+# regular HTTPS WebSocket traffic to a normal-looking website. PHANTOM
+# clients in censored networks (РФ / Иран / Китай) connect here when public
+# Snowflake brokers are blocked.
+#
+# Architecture:
+#   client → bridge.phntm.pro/<secret-path>      (HTTPS WebSocket upgrade)
+#          → caddy reverse_proxy
+#          → webtunnel-bridge:15000               (PT listener inside docker)
+#          → tor bridge relay
+#          → tor entry guard (clearnet egress)   → … → onion service
+#
+# The "secret path" must match the WEBTUNNEL_URL env var passed to the
+# webtunnel-bridge container. Anyone hitting any other path on this
+# domain sees the placeholder landing — making the bridge look like a
+# normal small website to scanners.
+#
+# Cloudflare configuration: DNS-only for this host (orange cloud OFF).
+# The WebSocket upgrade through Cloudflare's WS proxy adds a chain that
+# could be fingerprinted; bridges work better with a direct path. Caddy
+# completes HTTP-01 ACME with Let's Encrypt directly.
+#
+# Operator setup steps in deploy/webtunnel-bridge-setup.md.
+# -----------------------------------------------------------------------------
+bridge.phntm.pro {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options        "DENY"
+        Referrer-Policy        "no-referrer"
+        -Server
+    }
+
+    # WebTunnel secret path — the URL fragment after the domain that the
+    # PT client sends. Configured per-deploy via the WEBTUNNEL_SECRET_PATH
+    # env var (Caddy reads it via {$WEBTUNNEL_SECRET_PATH}). Path is the
+    # bridge's "shared secret" with clients; rotating it invalidates the
+    # `OperatorBridges.kt` entry until the client APK is republished.
+    @webtunnel path /{$WEBTUNNEL_SECRET_PATH}
+    handle @webtunnel {
+        reverse_proxy webtunnel-bridge:15000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            transport http {
+                read_timeout  0
+                write_timeout 0
+                dial_timeout  10s
+            }
+            flush_interval -1
+        }
+    }
+
+    # Everything else: serve a tiny placeholder so a casual scan of
+    # bridge.phntm.pro looks like a small static site, not an empty 404.
+    # Defence-in-depth — TSPU operators sometimes fingerprint "domain
+    # exists but only serves 404" as suspicious.
+    handle {
+        root * /srv/webtunnel-landing
+        try_files {path} /index.html
+        file_server
+    }
+
+    log {
+        output stdout
+        format json
+        level  INFO
+    }
+}
+
+# -----------------------------------------------------------------------------
 # phntm.pro — assetlinks.json + placeholder landing
 # -----------------------------------------------------------------------------
 # NOTE on Cloudflare:

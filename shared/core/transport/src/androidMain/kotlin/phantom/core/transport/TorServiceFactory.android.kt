@@ -100,8 +100,16 @@ internal class TorServiceAndroid(
                 // directory authority, which TSPU/GFW classes drop. Order
                 // matters; reordering breaks censored-network connectivity.
                 if (config.useBridges) {
-                    Log.i(LOG_TAG, "wrapper.enableBridges(snowflake × ${SnowflakeBridges.DEFAULT.size})")
-                    wrapper.enableBridges(SnowflakeBridges.DEFAULT)
+                    // Operator-controlled WebTunnel bridges go FIRST in the list
+                    // (tor tries entries in declared order). When populated, the
+                    // very first connect attempt goes to bridge.phntm.pro — a
+                    // path we control end-to-end. Public Snowflake follows as
+                    // best-effort fallback for users whose network reaches the
+                    // Tor Project broker URLs (typically uncensored networks
+                    // where this whole branch is irrelevant anyway).
+                    val bridges = OperatorBridges.WEBTUNNEL + SnowflakeBridges.DEFAULT
+                    Log.i(LOG_TAG, "wrapper.enableBridges(operator × ${OperatorBridges.WEBTUNNEL.size}, snowflake × ${SnowflakeBridges.DEFAULT.size})")
+                    wrapper.enableBridges(bridges)
                 } else {
                     Log.i(LOG_TAG, "wrapper.disableBridges() (direct guards path)")
                     wrapper.disableBridges()
