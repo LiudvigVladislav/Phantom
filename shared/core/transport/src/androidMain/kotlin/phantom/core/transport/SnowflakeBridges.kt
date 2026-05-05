@@ -25,8 +25,18 @@ package phantom.core.transport
  * ship a patch release. See `docs/operations/TOR_STACK_MAINTENANCE.md`
  * for the operational protocol.
  *
- * Each line is the raw transport spec — Briar's `enableBridges` API
- * adds the `Bridge ` prefix internally.
+ * Each line is a complete tor control-protocol setConf entry — the
+ * leading "Bridge " is the option name (mirrors how Briar's own
+ * `CircumventionProviderImpl.getBridges()` builds its lines via
+ * `bridges.add("Bridge " + line)`). Without the prefix, tor parses the
+ * first token as the option name and rejects "snowflake" as
+ * `Unknown option 'snowflake'. Failing.` — observed empirically in
+ * Test 10 (2026-05-05) before the prefix was added.
+ *
+ * The companion `ClientTransportPlugin snowflake exec <lyrebird>`
+ * directive is auto-configured by `AbstractTorWrapper`'s initial torrc
+ * (it pre-wires obfs4 + meek_lite + snowflake against the bundled
+ * `libLyrebird.so`). We do NOT need to set it from the caller side.
  */
 internal object SnowflakeBridges {
 
@@ -39,7 +49,7 @@ internal object SnowflakeBridges {
      * `211804.html` on tor-commits mailing list).
      */
     val DEFAULT: List<String> = listOf(
-        "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 " +
+        "Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 " +
             "fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 " +
             "url=https://voluble-torrone-fc39bf.netlify.app/ " +
             "fronts=vuejs.org " +
@@ -48,7 +58,7 @@ internal object SnowflakeBridges {
             "stun:stun.nextcloud.com:443 " +
             "utls-imitate=hellorandomizedalpn",
 
-        "snowflake 192.0.2.4:80 8838024498816A039FCBBAB14E6F40A0843051FA " +
+        "Bridge snowflake 192.0.2.4:80 8838024498816A039FCBBAB14E6F40A0843051FA " +
             "fingerprint=8838024498816A039FCBBAB14E6F40A0843051FA " +
             "url=https://voluble-torrone-fc39bf.netlify.app/ " +
             "fronts=vuejs.org " +
