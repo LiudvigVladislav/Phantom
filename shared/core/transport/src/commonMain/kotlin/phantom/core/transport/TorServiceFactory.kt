@@ -47,4 +47,22 @@ data class TorServiceConfig(
     val dataDirectoryPath: String,
     val cacheDirectoryPath: String,
     val socksPort: Int = 0,
+    /**
+     * When `true`, the implementation enables pluggable-transport bridges
+     * (currently Snowflake) before bringing the tor network up. Required
+     * for any user behind a network that throttles or drops vanilla Tor
+     * TLS handshakes — confirmed in Test 6 to apply to МТС / Билайн /
+     * Ростелеком / similar Russian carriers.
+     *
+     * - Standard / Private mode: `false` by default; flipped to `true`
+     *   only by the auto-fallback path after a direct WSS attempt fails.
+     * - Ghost mode: always `true` (privacy contract — see
+     *   `docs/spec/PRIVACY_MODE_BEHAVIOR.md` §3.2).
+     *
+     * Bridge addresses are hard-coded in the Android implementation
+     * (Stage 5B) — currently the public Snowflake brokers from
+     * Tor Browser's built-in bridge list, mirrored at
+     * `gitlab.torproject.org/tpo/applications/tor-browser-build`.
+     */
+    val useBridges: Boolean = false,
 )

@@ -93,6 +93,19 @@ internal class TorServiceAndroid(
             withContext(Dispatchers.IO) {
                 Log.i(LOG_TAG, "wrapper.start()")
                 wrapper.start()
+                // ADR-018 Stage 5B: configure Snowflake bridges BEFORE
+                // enableNetwork. Once the network goes up, tor will pick
+                // its first guard — if bridges were not configured yet it
+                // would attempt a vanilla TLS handshake to a hardcoded
+                // directory authority, which TSPU/GFW classes drop. Order
+                // matters; reordering breaks censored-network connectivity.
+                if (config.useBridges) {
+                    Log.i(LOG_TAG, "wrapper.enableBridges(snowflake × ${SnowflakeBridges.DEFAULT.size})")
+                    wrapper.enableBridges(SnowflakeBridges.DEFAULT)
+                } else {
+                    Log.i(LOG_TAG, "wrapper.disableBridges() (direct guards path)")
+                    wrapper.disableBridges()
+                }
                 Log.i(LOG_TAG, "wrapper.enableNetwork(true)")
                 wrapper.enableNetwork(true)
             }

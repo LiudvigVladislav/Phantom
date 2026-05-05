@@ -94,6 +94,11 @@ class PhantomMessagingService : Service() {
             config = TorServiceConfig(
                 dataDirectoryPath = workDir.absolutePath,
                 cacheDirectoryPath = cacheDir.absolutePath,
+                // ADR-018 Stage 5B: bridges always on while USE_TOR build flag
+                // is the only Tor gate. Stage 5C will make this mode-dependent
+                // — Standard/Private use bridges only when auto-fallback path
+                // is active; Ghost always uses bridges (privacy contract).
+                useBridges = true,
             ),
             platformContext = application,
         )
