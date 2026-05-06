@@ -54,7 +54,19 @@ sed \
     config.json.template > "$tmp"
 
 mv "$tmp" config.json
-chmod 600 config.json
+# Permissions 644 (not 600): the ghcr.io/xtls/xray-core image runs the
+# daemon as a non-root container user whose UID does not match the host
+# `phantom` user. With 600 (owner-only), the container cannot open the
+# bind-mounted file → "open /etc/xray/config.json: permission denied"
+# in container logs. 644 lets the container UID read it.
+#
+# Trade-off: 644 is "world-readable" on the HOST. On a single-operator
+# VPS where only `phantom` and `root` exist, this is effectively the
+# same as 600 (root reads everything regardless). If multi-tenant
+# operator access is added later, switch to a docker-side fix:
+# `user: <container-uid>` in docker-compose + chown to that UID,
+# OR move secrets out of bind-mount into a docker secret / env file.
+chmod 644 config.json
 
 echo "Rendered config.json from template."
 echo "Verify with: docker run --rm -v \"\$(pwd)/config.json:/etc/xray/config.json:ro\" ghcr.io/xtls/xray-core:latest run -test -c /etc/xray/config.json"
