@@ -1,5 +1,5 @@
 {
-  "//": "PHANTOM Xray-core REALITY server (ADR-018 follow-on / Stage 5E.A).",
+  "//": "PHANTOM Xray-core REALITY server (ADR-018 Stage 5E.A — Path A).",
   "//": "This config is the OPERATOR-rendered version after substituting:",
   "//":   "  REPLACE_PRIVATE_KEY  → output of `xray x25519` private",
   "//":   "  REPLACE_UUID         → output of `xray uuid`",
@@ -7,12 +7,39 @@
   "//": "All three live ONLY on the server. Their public counterparts",
   "//": "(public_key, uuid, short_id, sni, dest port) are baked into",
   "//": "the Android APK by way of OperatorXrayConfig.kt.",
-  "//":   "  Keep the template at config.json.template; render to config.json",
-  "//":   "  on the VPS via deploy/xray/render-config.sh and mount that into",
-  "//":   "  the container read-only.",
+  "//":   "Keep the template at config.json.template; render to config.json",
+  "//":   "on the VPS via deploy/xray/render-config.sh and mount that into",
+  "//":   "the container read-only.",
+
+  "//": "Path A architecture: VLESS clients are routed to relay.phntm.pro,",
+  "//": "which is the Caddy container on the SAME VPS. We resolve that name",
+  "//": "to the docker container directly (DNS hosts override below) instead",
+  "//": "of going via the public IP and relying on NAT hairpin — hairpin is",
+  "//": "kernel-version-dependent on Linux and silently hangs the connection",
+  "//": "when it doesn't work. Resolving to `caddy` (the docker-compose",
+  "//": "service name, reachable via the bridge network DNS) is deterministic.",
 
   "log": {
-    "loglevel": "warning"
+    "loglevel": "warning",
+    "//": "access: none — Xray writes a per-connection access log to stdout",
+    "//": "by default (even at loglevel=warning); setting access=none keeps",
+    "//": "client IPs out of `docker logs phantom-xray`. The threat model",
+    "//": "treats the operator-VPS as untrusted-on-seize — minimising what",
+    "//": "the disk image carries shrinks the post-incident exposure.",
+    "access": "none"
+  },
+
+  "dns": {
+    "//": "Force `relay.phntm.pro` to resolve to the docker-compose service",
+    "//": "named `caddy` on the internal bridge network, so the freedom",
+    "//": "outbound below opens a TCP connection straight to the Caddy",
+    "//": "container instead of egressing to the host's public IP and",
+    "//": "depending on NAT hairpin to come back. `caddy` resolves via the",
+    "//": "bridge network's embedded DNS as long as the xray container",
+    "//": "shares the `phantom-internal` network (it does — see compose).",
+    "hosts": {
+      "relay.phntm.pro": "caddy"
+    }
   },
 
   "inbounds": [
@@ -55,6 +82,11 @@
       },
       "sniffing": {
         "enabled": true,
+        "//": "destOverride extracts the inner TLS SNI so the routing rule",
+        "//": "below can match `relay.phntm.pro`. routeOnly=true means the",
+        "//": "sniffed value is used FOR ROUTING ONLY — Xray does not rewrite",
+        "//": "the destination on the outbound, so the inner TLS handshake",
+        "//": "still presents `relay.phntm.pro` to Caddy unmodified.",
         "destOverride": ["http", "tls", "quic"],
         "routeOnly": true
       }
@@ -62,23 +94,36 @@
   ],
 
   "outbounds": [
-    { "tag": "direct", "protocol": "freedom" },
+    {
+      "tag": "to-relay",
+      "protocol": "freedom",
+      "//": "domainStrategy=UseIP forces Xray to resolve the destination",
+      "//": "domain via its own DNS subsystem (which honours the hosts",
+      "//": "override above) before opening the TCP connection. Without",
+      "//": "this, freedom would defer name resolution to the kernel which",
+      "//": "ignores Xray's hosts map.",
+      "settings": {
+        "domainStrategy": "UseIP"
+      }
+    },
     { "tag": "block",  "protocol": "blackhole" }
   ],
 
   "routing": {
-    "//": "VLESS clients can only reach the relay onion address.",
-    "//": "Everything else gets blackholed so this server is NOT a generic",
-    "//": "open proxy — limits liability + defends against misuse if",
-    "//": "credentials ever leak.",
+    "//": "VLESS clients can only reach the relay. Everything else gets",
+    "//": "blackholed so this server is NOT a generic open proxy — limits",
+    "//": "liability + defends against misuse if the shared client UUID",
+    "//": "ever leaks. (The UUID is in the Android APK; treat it as a",
+    "//": "publishable capability rather than a secret.)",
+    "domainStrategy": "AsIs",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["vless-reality-in"],
         "domain": [
-          "full:zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion"
+          "full:relay.phntm.pro"
         ],
-        "outboundTag": "direct"
+        "outboundTag": "to-relay"
       },
       {
         "type": "field",

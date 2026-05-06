@@ -12,6 +12,23 @@
 #
 # Usage: from the deploy/xray directory:
 #   ./render-config.sh
+#
+# KEY ROTATION PLAYBOOK (when VPS is suspected compromised, or on schedule):
+#   1. Generate new keypair on VPS:
+#        docker run --rm ghcr.io/xtls/xray-core:latest x25519
+#        # → Private key: <new-priv>   Password: <new-pub>
+#   2. Generate new UUID + shortId:
+#        docker run --rm ghcr.io/xtls/xray-core:latest uuid
+#        openssl rand -hex 8
+#   3. Update deploy/xray/.env on VPS — replace XRAY_PRIVATE_KEY, XRAY_UUID,
+#      XRAY_SHORT_ID. Re-run this script. Restart xray:
+#        docker compose -f deploy/docker-compose.yml up -d xray
+#   4. Edit shared/core/xray/.../OperatorXrayConfig.kt — replace PUBLIC_KEY,
+#      UUID, SHORT_ID with the new public values from step 1+2.
+#   5. Build, sign, ship a new APK. Old clients connecting with the old
+#      capability stop reaching the relay (REALITY handshake fails). Plan
+#      rollout: stage release before pulling old keys from .env, so the
+#      window of "old client can't connect" is bounded.
 
 set -euo pipefail
 

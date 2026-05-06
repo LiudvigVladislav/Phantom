@@ -27,7 +27,7 @@ package phantom.core.xray
  * config. See `deploy/xray/.env` (gitignored, on VPS only) for the canonical
  * source of truth at runtime.
  */
-internal object OperatorXrayConfig {
+object OperatorXrayConfig {
     const val SERVER_HOST: String = "65.108.154.152"
     const val SERVER_PORT: Int = 8443
     const val SNI: String = "www.microsoft.com"
