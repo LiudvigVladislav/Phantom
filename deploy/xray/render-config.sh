@@ -47,4 +47,4 @@ mv "$tmp" config.json
 chmod 600 config.json
 
 echo "Rendered config.json from template."
-echo "Verify with: docker run --rm -v \"\$(pwd)/config.json:/etc/xray/config.json:ro\" ghcr.io/xtls/xray-core test -config /etc/xray/config.json"
+echo "Verify with: docker run --rm -v \"\$(pwd)/config.json:/etc/xray/config.json:ro\" ghcr.io/xtls/xray-core:latest run -test -c /etc/xray/config.json"

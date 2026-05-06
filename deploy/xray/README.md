@@ -82,12 +82,13 @@ chmod 600 .env
 ./render-config.sh
 ```
 
-Verify with Xray's own config-test command:
+Verify with Xray's own config-test command (modern Xray syntax — `run -test`,
+not the older `test -config`):
 
 ```sh
 docker run --rm -v "$(pwd)/config.json:/etc/xray/config.json:ro" \
-    ghcr.io/xtls/xray-core:latest test -config /etc/xray/config.json
-# Expect: "Configuration OK." (or similar — exit code 0)
+    ghcr.io/xtls/xray-core:latest run -test -c /etc/xray/config.json
+# Expect: exit code 0 and a "Configuration OK." line in the output
 ```
 
 ---

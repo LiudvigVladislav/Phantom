@@ -277,11 +277,13 @@ services:
       # render-config.sh script. Mounted read-only; Xray re-reads on
       # SIGHUP (or container restart).
       - ./xray/config.json:/etc/xray/config.json:ro
-    # Healthcheck: `xray test` validates the config file syntactically
-    # without starting the daemon. Cheap and detects a broken config
-    # before docker thinks the container is "ready".
+    # Healthcheck: `xray run -test -c /etc/xray/config.json` validates
+    # config syntactically without starting the daemon. Modern Xray-core
+    # (post-1.7) merged `test` into `run -test`; the old `xray test ...`
+    # subcommand is gone. Detects broken configs before docker reports
+    # the container "ready".
     healthcheck:
-      test: ["CMD", "xray", "test", "-config", "/etc/xray/config.json"]
+      test: ["CMD", "xray", "run", "-test", "-c", "/etc/xray/config.json"]
       interval: 30s
       timeout: 5s
       retries: 3
