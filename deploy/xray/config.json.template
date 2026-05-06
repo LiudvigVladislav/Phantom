@@ -110,25 +110,26 @@
   ],
 
   "routing": {
-    "//": "VLESS clients can only reach the relay. Everything else gets",
-    "//": "blackholed so this server is NOT a generic open proxy — limits",
-    "//": "liability + defends against misuse if the shared client UUID",
-    "//": "ever leaks. (The UUID is in the Android APK; treat it as a",
-    "//": "publishable capability rather than a secret.)",
+    "//": "Stage 5E.B.5 diagnostic: relax routing to inboundTag-only.",
+    "//":   "Strict version with domain=[\"full:relay.phntm.pro\"] silently",
+    "//":   "fell through to blackhole on Xray 26.3.27 even though sniffing",
+    "//":   "did extract the SNI correctly (logs showed `accepted tcp:",
+    "//":   "relay.phntm.pro:443 [vless-reality-in -> block]`). Until we",
+    "//":   "isolate why the matcher misses, all VLESS traffic goes to the",
+    "//":   "freedom outbound — which itself relies on the dns.hosts override",
+    "//":   "above to land in the local Caddy container.",
+    "//": "Threat model in this diagnostic mode: anyone with the shared UUID",
+    "//":   "(it ships in the APK — capability auth, not identity) can",
+    "//":   "target any domain through this server. UUID is currently held",
+    "//":   "only by us; REALITY active-probing defence is unchanged. Once",
+    "//":   "the WSS path is confirmed working end-to-end, restore the",
+    "//":   "blackhole-by-default rule with correct domain syntax.",
     "domainStrategy": "AsIs",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["vless-reality-in"],
-        "domain": [
-          "full:relay.phntm.pro"
-        ],
         "outboundTag": "to-relay"
-      },
-      {
-        "type": "field",
-        "inboundTag": ["vless-reality-in"],
-        "outboundTag": "block"
       }
     ]
   }
