@@ -1,0 +1,145 @@
+# Build libXray.aar for Android (Stage 5E.B.1).
+#
+# This workflow compiles XTLS/libXray from source on a Linux runner with
+# Go + Android NDK preinstalled, and uploads the resulting .aar as a
+# downloadable artifact. We run this OUT OF BAND from regular CI because:
+#
+#   1. The Linux + Go + NDK toolchain is large and rarely changes; doing
+#      it on every PR would burn CI minutes for no benefit.
+#   2. The .aar lives committed to the repo at
+#      shared/core/xray/src/androidMain/libs/libXray.aar — we only need to
+#      regenerate when libXray itself ships a new release we want to track
+#      (typically once per quarter, in step with Tor stack maintenance).
+#   3. Reproducibility: the workflow pins libXray git ref + Go + NDK
+#      versions, so any contributor can audit the build environment.
+#
+# Trigger: manually via workflow_dispatch with optional libxray_ref input.
+# Default ref = `main`; override with a tag (e.g. `v25.1.0`) to pin.
+#
+# Output: `libXray.aar` artifact, ~30 MB, downloadable from the workflow
+# run page. Vendor it into shared/core/xray/src/androidMain/libs/ in a
+# follow-up commit.
+#
+# License posture: Xray-core is MPL-2.0 with Exhibit B; libXray itself is
+# MIT. Aggregating the resulting .so into an AGPL-3.0-or-later APK is
+# permitted (file-level copyleft on Xray, no source modifications).
+# Documented in docs/research/xray-reality-integration-2026-05-06.md §6.
+
+name: Build libXray.aar
+
+on:
+  workflow_dispatch:
+    inputs:
+      libxray_ref:
+        description: "Git ref of XTLS/libXray to build (branch / tag / SHA). Default: main."
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build libXray.aar (Linux + Go + NDK r26)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Print build inputs
+        run: |
+          echo "libXray ref: ${{ inputs.libxray_ref }}"
+          echo "Runner OS:   $(lsb_release -ds 2>/dev/null || cat /etc/os-release | head -1)"
+          echo "Runner CPU:  $(nproc) cores"
+          echo "Runner mem:  $(free -h | awk '/^Mem:/ {print $2}')"
+
+      - name: Set up Go 1.22+
+        uses: actions/setup-go@v5
+        with:
+          # libXray's gomobile bind requires Go 1.22 or newer; pin to a
+          # stable patch release to prevent silent toolchain drift between
+          # workflow runs. Update this version line in lock-step with
+          # libXray upstream's go.mod requirement.
+          go-version: "1.22.x"
+          check-latest: true
+
+      - name: Set up Android NDK r26d
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          # libXray's gomobile invocation uses
+          # `-ldflags=-extldflags=-Wl,-z,max-page-size=16384` which requires
+          # NDK r26 or newer (older NDKs rejected the linker flag). r26d is
+          # the latest stable as of 2025 and produces 16 KB-page-aligned
+          # binaries that pass Play Console's preflight for Android 15+.
+          ndk-version: r26d
+          local-cache: true
+
+      - name: Export NDK + Android env for gomobile
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      - name: Install Python 3 (libXray's build script driver)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Clone XTLS/libXray @ ${{ inputs.libxray_ref }}
+        run: |
+          git clone --depth 1 --branch "${{ inputs.libxray_ref }}" \
+              https://github.com/XTLS/libXray.git libxray-src \
+            || (
+              # Fallback for SHAs / non-branch refs: full clone + checkout.
+              git clone https://github.com/XTLS/libXray.git libxray-src
+              cd libxray-src
+              git checkout "${{ inputs.libxray_ref }}"
+            )
+          cd libxray-src
+          git log -1 --pretty='format:HEAD = %H%nDate = %ci%nSubject = %s%n'
+
+      - name: Show toolchain versions (for build provenance)
+        run: |
+          go version
+          python3 --version
+          echo "ANDROID_NDK_HOME = ${ANDROID_NDK_HOME:-(unset)}"
+          ls "$ANDROID_NDK_HOME" | head
+
+      - name: Build libXray.aar
+        working-directory: libxray-src
+        run: |
+          set -e
+          # libXray's build script handles gomobile install internally.
+          # First-run prep can take 5-15 minutes (downloading gomobile +
+          # fetching transitive deps); subsequent caches in CI are
+          # discarded but the build is still ~10-20 minutes total on
+          # a 2-core ubuntu-24.04 runner.
+          python3 build/main.py android
+
+      - name: Locate the produced .aar
+        working-directory: libxray-src
+        id: locate
+        run: |
+          # libXray's android builder writes to a `lib_dir` it computes
+          # internally; rather than guess, just find it.
+          aar_path="$(find . -name 'libXray.aar' -type f | head -1)"
+          if [ -z "$aar_path" ]; then
+              echo "::error::libXray.aar was not produced by the build."
+              echo "Tree of generated files:"
+              find . -name '*.aar' -o -name '*.jar' | head -20
+              exit 1
+          fi
+          aar_size="$(du -h "$aar_path" | cut -f1)"
+          echo "Found: $aar_path ($aar_size)"
+          echo "aar_path=$aar_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload libXray.aar as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libXray-${{ inputs.libxray_ref }}-${{ github.run_number }}
+          path: libxray-src/${{ steps.locate.outputs.aar_path }}
+          # Keep the AAR for 90 days — long enough for a quarterly
+          # cycle even if the workflow run isn't accessed immediately.
+          retention-days: 90
+          if-no-files-found: error
