@@ -39,21 +39,26 @@ internal object OperatorBridges {
     /**
      * Operator-controlled WebTunnel bridge line(s).
      *
-     * **Empty until the operator deploys the bridge and extracts the
-     * canonical line.** Until populated, PHANTOM clients on censored
-     * networks will fail to bootstrap (Snowflake fallback in
-     * `SnowflakeBridges.DEFAULT` is best-effort and depends on whether
-     * the network blocks Tor Project's broker URLs).
+     * Populated 2026-05-06 from the deployed `phantom-webtunnel-bridge`
+     * container on Hetzner via `get-bridge-line.sh`. The IP-and-port
+     * field is the IETF documentation prefix `2001:db8::/32` (RFC 3849)
+     * — this is the Tor Project's canonical placeholder for URL-based
+     * pluggable transports. WebTunnel clients ignore the IP entirely
+     * and connect through the `url=` parameter; the field exists only
+     * so the bridge line parses against tor's generic bridge syntax.
      *
-     * Expected entry format (paste from `get-bridge-line.sh` output,
-     * with "Bridge " prefix):
+     * Same convention as `SnowflakeBridges.DEFAULT` (which uses
+     * `192.0.2.3` TEST-NET reserved addresses).
      *
-     *   "Bridge webtunnel <IPv4>:443 <FINGERPRINT> " +
-     *       "url=https://bridge.phntm.pro/<secret-path> " +
-     *       "ver=0.0.1"
-     *
-     * After populating, rebuild + reship the APK. Operators rotating
-     * the bridge identity update this list and republish accordingly.
+     * To rotate the bridge identity:
+     *   1. Follow `deploy/webtunnel-bridge-setup.md` §10
+     *   2. Replace the line below with the new `get-bridge-line.sh`
+     *      output (preserve the "Bridge " prefix)
+     *   3. Rebuild + ship a new APK
      */
-    val WEBTUNNEL: List<String> = emptyList()
+    val WEBTUNNEL: List<String> = listOf(
+        "Bridge webtunnel [2001:db8:1d47:723c:6cf0:a211:e413:8887]:443 " +
+            "D2F3A6695223C0DCDBC14AF159807474673A539C " +
+            "url=https://bridge.phntm.pro/2a8652911c0cf7150ad0a0b32626434a",
+    )
 }
