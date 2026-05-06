@@ -1,0 +1,101 @@
+# PHANTOM bridge2 deployment (FlokiNET RO).
+#
+# This is a BRIDGE-ONLY stack — only Caddy + WebTunnel bridge.
+# The relay, onion service, and ntfy distributor stay on the primary
+# Hetzner host (deploy/docker-compose.yml). Bridge2 exists ONLY to give
+# Russian-carrier users an entry point that escapes Hetzner's TSPU
+# 16-KB-curtain flagging — see ADR-018 + research/bridge-host-verification-2026-05-06/.
+#
+# Hostname:    bridge2.phntm.pro  (DNS A + AAAA pointing at FlokiNET IP)
+# Architecture footprint: 2 containers, ~200 MB RAM total.
+#
+# Run from this directory on the FlokiNET VPS:
+#   docker compose -f docker-compose.yml up -d --build
+#
+# See bridge2-DEPLOY.md for the full provisioning walkthrough.
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Caddy — TLS terminator + secret-path reverse-proxy + fake landing.
+  #
+  # Same role as the Hetzner Caddy: terminates Let's Encrypt TLS for
+  # bridge2.phntm.pro, routes the secret WebSocket path to the WebTunnel
+  # bridge container, serves a tiny placeholder landing for any other
+  # path (defence-in-depth against TSPU enumeration).
+  # ──────────────────────────────────────────────────────────────────────
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: phantom-bridge2-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 via QUIC
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./webtunnel-landing:/srv/webtunnel-landing:ro
+      - caddy-data:/data        # Let's Encrypt certs + keys
+      - caddy-config:/config
+    networks:
+      - bridge2-internal
+    depends_on:
+      - webtunnel-bridge
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE   # binds 80 + 443 as non-root
+    security_opt:
+      - no-new-privileges:true
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Operator-controlled WebTunnel bridge.
+  #
+  # Identical configuration pattern to the Hetzner bridge — same image,
+  # same env-var template substitution, same volume layout. Differences:
+  #   - DIFFERENT NICKNAME (PhantomBridge2)
+  #   - DIFFERENT OR_PORT (44609, not 35137)
+  #   - DIFFERENT WEBTUNNEL_URL (bridge2.phntm.pro/<new secret>)
+  #   - DIFFERENT bridge fingerprint (auto-generated on first run)
+  #
+  # The bridge is OPERATIONALLY independent of bridge1 — losing one
+  # does not affect the other. Both will be advertised in
+  # OperatorBridges.WEBTUNNEL with operator-1 first, operator-2 second;
+  # tor's bridge-selection logic races and uses whichever responds.
+  # ──────────────────────────────────────────────────────────────────────
+  webtunnel-bridge:
+    image: thetorproject/webtunnel-bridge:latest
+    container_name: phantom-bridge2-webtunnel
+    restart: unless-stopped
+    user: debian-tor
+    environment:
+      # Container-side env names match the upstream torrc template
+      # substitution VERBATIM (see Hetzner docker-compose for rationale).
+      NICKNAME: ${WEBTUNNEL_NICKNAME:-PhantomBridge2}
+      EMAIL: ${WEBTUNNEL_OPERATOR_EMAIL:-hello@phntm.pro}
+      PT_PORT: 15000
+      OR_PORT: ${WEBTUNNEL_OR_PORT:-44609}
+      WEBTUNNEL_URL: ${WEBTUNNEL_URL}
+    expose:
+      - "15000"
+    networks:
+      - bridge2-internal
+    volumes:
+      # Bridge identity keys + descriptor cache. Losing this volume
+      # rotates the bridge fingerprint and breaks every shipped APK
+      # that pinned the old fingerprint. Back this up alongside the
+      # Hetzner phantom-tor-data volume.
+      - webtunnel-tor-state:/var/lib/tor
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  bridge2-internal:
+    driver: bridge
+
+volumes:
+  caddy-data:
+  caddy-config:
+  webtunnel-tor-state:

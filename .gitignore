@@ -71,3 +71,4 @@ services/relay/blocklist.txt
 # Logs
 *.log
 npm-debug.log*
+deploy/bridge2/.env
