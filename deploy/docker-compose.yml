@@ -266,6 +266,11 @@ services:
     image: ghcr.io/xtls/xray-core:latest
     container_name: phantom-xray
     restart: unless-stopped
+    # Override the image's default CMD (which runs `xray -confdir
+    # /usr/local/etc/xray/`, picking up the stock 00_log.json /
+    # 01_api.json / … bundled inside the image — NOT our config). We
+    # explicitly point xray at the single rendered config we mount below.
+    command: ["run", "-c", "/etc/xray/config.json"]
     # Bind 8443 directly on the host. The container itself is the TLS
     # endpoint — Caddy is NOT in front (REALITY's whole value prop is the
     # genuine TLS-1.3 handshake the daemon mimics; Caddy as a proxy would
@@ -276,6 +281,13 @@ services:
       # Rendered config — produced from config.json.template by the
       # render-config.sh script. Mounted read-only; Xray re-reads on
       # SIGHUP (or container restart).
+      #
+      # Footgun: the FILE must exist on the host BEFORE `docker compose
+      # up`. Otherwise docker creates an empty DIRECTORY at the target
+      # path (default bind-mount behaviour), and Xray then fails with
+      # "is a directory". render-config.sh defensively removes any such
+      # artefact before writing the real file. Operators: always run
+      # render-config.sh BEFORE docker compose up.
       - ./xray/config.json:/etc/xray/config.json:ro
     # Healthcheck: `xray run -test -c /etc/xray/config.json` validates
     # config syntactically without starting the daemon. Modern Xray-core

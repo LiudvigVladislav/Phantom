@@ -33,6 +33,16 @@ for var in XRAY_PRIVATE_KEY XRAY_UUID XRAY_SHORT_ID; do
     fi
 done
 
+# Defensive: if config.json was accidentally created as a DIRECTORY
+# (the classic docker bind-mount footgun — happens when `docker compose
+# up xray` runs before this script), remove it. Otherwise the mv below
+# would interpret the rename as "move tmp INTO config.json/" and fail
+# with "Permission denied".
+if [[ -d config.json ]]; then
+    echo "WARN: config.json is a directory (docker bind-mount artefact). Removing." >&2
+    rmdir config.json 2>/dev/null || rm -rf config.json
+fi
+
 # sed -i is destructive; render to a temp file then atomically rename so
 # a half-written config.json never reaches the running container.
 tmp="$(mktemp config.json.XXXXXX)"
