@@ -77,6 +77,15 @@ services:
       - ../legal:/srv/legal:ro
       - caddy-data:/data        # Let's Encrypt certs + keys
       - caddy-config:/config
+    environment:
+      # Caddyfile bridge.phntm.pro vhost uses `{$WEBTUNNEL_SECRET_PATH}`
+      # parse-time substitution to scope the WebTunnel reverse-proxy
+      # matcher to a single secret path. Without explicit forwarding
+      # of this env into the Caddy container, the matcher collapses to
+      # literal "path /" — root reverse-proxies (502s for non-WebTunnel
+      # clients) while the secret path falls through to the placeholder
+      # (defeats the bridge). Discovered during bridge2 deploy 2026-05-06.
+      WEBTUNNEL_SECRET_PATH: ${WEBTUNNEL_SECRET_PATH}
     networks:
       - phantom-internal
     depends_on:

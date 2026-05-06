@@ -37,6 +37,17 @@ services:
       - ./webtunnel-landing:/srv/webtunnel-landing:ro
       - caddy-data:/data        # Let's Encrypt certs + keys
       - caddy-config:/config
+    environment:
+      # Caddyfile uses `{$WEBTUNNEL_SECRET_PATH}` parse-time env
+      # substitution to scope the WebTunnel reverse-proxy matcher to a
+      # single secret path. Without this env explicitly forwarded into
+      # the Caddy container, the substitution becomes empty and the
+      # matcher collapses to literal "path /" — which inverts behaviour:
+      # the root reverse-proxies to webtunnel-bridge (and 502s for any
+      # non-WebTunnel client), while the secret path falls through to
+      # the placeholder landing (defeating the bridge entirely).
+      # Discovered in initial bridge2 deploy 2026-05-06.
+      WEBTUNNEL_SECRET_PATH: ${WEBTUNNEL_SECRET_PATH}
     networks:
       - bridge2-internal
     depends_on:

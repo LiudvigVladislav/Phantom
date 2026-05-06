@@ -57,6 +57,23 @@ internal object OperatorBridges {
      *   3. Rebuild + ship a new APK
      */
     val WEBTUNNEL: List<String> = listOf(
+        // bridge2.phntm.pro (FlokiNET RO, AS200651) — listed FIRST.
+        // FlokiNET sits outside TSPU's "16-kilobyte curtain" target list
+        // (research/bridge-host-verification-2026-05-06/), so users on
+        // Russian carrier networks reach it cleanly. Tor's bridge selection
+        // tries entries in order; putting FlokiNET first means censored
+        // users do not waste a connect-timeout cycle on Hetzner before
+        // falling through. Bootstrapped 2026-05-06.
+        "Bridge webtunnel [2001:db8:39d2:e768:10b6:5767:176d:9998]:443 " +
+            "8BF17C225F5BF170CB2D7E65DA19D3D73D859451 " +
+            "url=https://bridge2.phntm.pro/35ab85ebe42af5214b579de2560d955b",
+
+        // bridge.phntm.pro (Hetzner DE, AS24940) — listed SECOND.
+        // Retained as fallback for non-RU users for whom Hetzner is fine,
+        // and as an ops-redundancy backstop if FlokiNET goes down.
+        // Hetzner CIDR is on TSPU's 16-KB curtain target list — bootstrap
+        // through this bridge stalls at 25-73% on Russian carriers without
+        // VPN (Test 11 / 12, 2026-05-05/06).
         "Bridge webtunnel [2001:db8:1d47:723c:6cf0:a211:e413:8887]:443 " +
             "D2F3A6695223C0DCDBC14AF159807474673A539C " +
             "url=https://bridge.phntm.pro/2a8652911c0cf7150ad0a0b32626434a",
