@@ -163,11 +163,23 @@ services:
     environment:
       # Bridge identity — operator-set, persisted across restarts via the
       # webtunnel-tor-state volume. NICKNAME is what BridgeDB / Tor metrics
-      # show; OPERATOR_EMAIL is the abuse contact.
+      # show; EMAIL becomes the ContactInfo line in the bridge's torrc
+      # (directory authorities use it as the abuse contact for the
+      # operator).
+      #
+      # The container's entrypoint substitutes these env-var names
+      # VERBATIM into the bundled torrc template:
+      #   ${NICKNAME} → Nickname
+      #   ${EMAIL}    → ContactInfo
+      #   ${OR_PORT}  → ORPort
+      #   ${PT_PORT}  → ServerTransportListenAddr port
+      #   ${WEBTUNNEL_URL} → ServerTransportOptions webtunnel url=…
+      # Renaming the container-side var (e.g. EMAIL → OPERATOR_EMAIL)
+      # leaves ContactInfo blank, which deprioritises the bridge in
+      # directory authority queries and slows first-time bootstrap from
+      # ~90 s to several minutes (observed in Test 11, 2026-05-06).
       NICKNAME: ${WEBTUNNEL_NICKNAME:-PhantomBridge1}
-      OPERATOR_EMAIL: ${WEBTUNNEL_OPERATOR_EMAIL:-hello@phntm.pro}
-      # The PT (pluggable transport) listener inside the container.
-      # Caddy reverse-proxies bridge.phntm.pro/<secret-path> here.
+      EMAIL: ${WEBTUNNEL_OPERATOR_EMAIL:-hello@phntm.pro}
       PT_PORT: 15000
       # Outbound OR port. Picked once per deploy and persisted so the
       # bridge identity stays stable. Set in deploy/.env to avoid

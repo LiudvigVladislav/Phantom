@@ -343,13 +343,19 @@ class PhantomMessagingService : Service() {
         // relevant (USE_TOR=false, or USE_TOR=true and Tor is currently Off).
         private const val DEFAULT_STATUS_TEXT = "Encrypted connection active"
 
-        // ADR-016 Stage 2C: maximum time we wait for Tor to bootstrap a
+        // ADR-018 Stage 5C: maximum time we wait for Tor to bootstrap a
         // circuit before giving up and aborting the connect attempt.
-        // Two minutes covers a fresh device on slow cellular reaching
-        // entry guards through default directory authorities; censored
-        // networks (where bridges become necessary — Stage 5) typically
-        // either succeed within this window via random luck or never.
-        private const val TOR_BOOTSTRAP_TIMEOUT_MS = 120_000L
+        // Bumped from 120 s to 600 s (10 min) after Test 11 (2026-05-06)
+        // showed a fresh operator-controlled bridge on Hetzner takes
+        // 5-8 min for first-time bootstrap on a censored network — the
+        // bridge has no cached microdescriptors, no established guard
+        // relations, and no reputation in Tor consensus, so directory
+        // authorities deprioritise it. After 24-48 h of warm-up the
+        // expected number drops to 60-90 s; the timeout is sized for
+        // the cold-start case so the app does not abort prematurely.
+        // Once Stage 5D (multi-bridge load balancing + bridge warming)
+        // ships, this can be tightened back to ~180 s.
+        private const val TOR_BOOTSTRAP_TIMEOUT_MS = 600_000L
         // Tor stop is fast (the StopDaemon action ack is immediate), so
         // a much shorter cap is fine in onDestroy.
         private const val TOR_STOP_TIMEOUT_MS = 5_000L
