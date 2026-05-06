@@ -134,10 +134,21 @@ This applies to **Standard and Private** only. **Ghost is always Tor**, no fallb
 │   - If direct connects first → cancel Tor (it stops bootstrap)  │
 │   - If Tor reaches Ready first → connect WS over onion          │
 │                                                                 │
-│ Step 4 (post-fallback recovery, optional):                      │
+│ Step 4 (post-fallback recovery — STANDARD/PRIVATE ONLY):        │
 │   If we are connected via Tor and direct WSS becomes reachable  │
-│   for ≥ 5 minutes continuously, swap back to direct.            │
-│   Notification: "Encrypted connection active" (no "via Tor").   │
+│   for ≥ 5 minutes continuously, swap back to direct. Notif:     │
+│   "Encrypted connection active" (no "via Tor").                 │
+│                                                                 │
+│   Battery rationale: Tor circuits + bridges keep more sockets   │
+│   open, more frequent keepalive traffic, more JNI work — direct │
+│   WSS is materially cheaper. When the network proves stable     │
+│   enough that Tor is no longer protecting us from anything, we  │
+│   should not pay its cost.                                      │
+│                                                                 │
+│   GHOST never recovers to direct. Ghost = explicit privacy      │
+│   contract — silently going direct would violate the user's     │
+│   choice. Ghost stays on Tor for the lifetime of the session    │
+│   regardless of network health.                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

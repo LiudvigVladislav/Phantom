@@ -1,0 +1,68 @@
+# PHANTOM bridge2 (FlokiNET RO) — Caddyfile.
+#
+# Single vhost: bridge2.phntm.pro.
+# Same pattern as the Hetzner bridge.phntm.pro vhost — TLS terminator
+# + secret-path reverse-proxy to webtunnel-bridge:15000 + fake landing
+# for everything else.
+
+{
+    email hello@phntm.pro
+}
+
+# -----------------------------------------------------------------------------
+# bridge2.phntm.pro — operator-controlled WebTunnel bridge #2
+# -----------------------------------------------------------------------------
+# Architecture (mirrors Hetzner bridge1):
+#   client → bridge2.phntm.pro/<secret-path>     (HTTPS WebSocket upgrade)
+#          → caddy reverse_proxy
+#          → webtunnel-bridge:15000              (PT listener)
+#          → tor bridge relay
+#          → tor entry guard (clearnet egress)   → … → onion service
+#
+# Cloudflare DNS-only for this host (orange cloud OFF). Caddy completes
+# HTTP-01 ACME with Let's Encrypt directly. The WebSocket upgrade does
+# not survive Cloudflare's WS proxy reliably for bridge traffic.
+# -----------------------------------------------------------------------------
+
+bridge2.phntm.pro {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options        "DENY"
+        Referrer-Policy        "no-referrer"
+        -Server
+    }
+
+    # Secret WebTunnel path. Caddy reads {$WEBTUNNEL_SECRET_PATH} from
+    # the environment; the matching value lives in .env on this host.
+    # Rotating the path invalidates the OperatorBridges.kt entry until
+    # a new APK ships, so coordinate any rotation with a planned release.
+    @webtunnel path /{$WEBTUNNEL_SECRET_PATH}
+    handle @webtunnel {
+        reverse_proxy webtunnel-bridge:15000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            transport http {
+                read_timeout  0
+                write_timeout 0
+                dial_timeout  10s
+            }
+            flush_interval -1
+        }
+    }
+
+    # Everything else: tiny placeholder so bridge2.phntm.pro looks like
+    # a small static site to scanners. TSPU operators sometimes flag
+    # "domain exists but only serves 404" as suspicious.
+    handle {
+        root * /srv/webtunnel-landing
+        try_files {path} /index.html
+        file_server
+    }
+
+    log {
+        output stdout
+        format json
+        level  INFO
+    }
+}

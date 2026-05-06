@@ -1,0 +1,83 @@
+# Dependabot configuration for PHANTOM (ADR-018 + tor-stack maintenance).
+#
+# Two update streams:
+#   1. Tor stack (org.briarproject:* — onionwrapper, tor-android, lyrebird-android,
+#      and any transitive Briar deps). Grouped into a SINGLE PR so a Briar release
+#      bumps all three artifacts together — they are version-pinned as a triplet
+#      by Briar themselves and partial upgrades will not link.
+#      See docs/operations/TOR_STACK_MAINTENANCE.md for the operational protocol
+#      when a Tor / Lyrebird security advisory fires.
+#
+#   2. Everything else — weekly, individual PRs. Standard dependency hygiene.
+#
+# Email notifications: GitHub auto-emails the repo owner + reviewers about
+# new PRs IF watching is set to "Participating and @mentions" or stronger
+# at https://github.com/settings/notifications. Set "Watching" on the repo
+# itself for the strongest signal.
+
+version: 2
+updates:
+  # ── Tor stack — security-critical, grouped ─────────────────────────────────
+  - package-ecosystem: gradle
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 5
+    target-branch: master
+    labels:
+      - dependencies
+      - tor-stack
+      - security
+    reviewers:
+      - LiudvigVladislav
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    groups:
+      tor-stack:
+        patterns:
+          - "org.briarproject:*"
+        update-types:
+          - patch
+          - minor
+          - major
+
+  # ── Everything else (Kotlin, Ktor, AndroidX, etc.) ─────────────────────────
+  - package-ecosystem: gradle
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
+    target-branch: master
+    labels:
+      - dependencies
+    reviewers:
+      - LiudvigVladislav
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    ignore:
+      # Briar artifacts are handled by the dedicated stream above; ignore
+      # them here to avoid duplicate PRs.
+      - dependency-name: "org.briarproject:*"
+
+  # ── GitHub Actions workflow updates ────────────────────────────────────────
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    target-branch: master
+    labels:
+      - dependencies
+      - ci
+    reviewers:
+      - LiudvigVladislav
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope

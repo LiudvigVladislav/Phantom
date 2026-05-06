@@ -1,17 +1,28 @@
 # PHANTOM production deployment.
 #
 # Services behind Caddy reverse proxy:
-#   - relay   : Rust WebSocket relay (ciphertext store-and-forward, in-memory).
-#   - caddy   : TLS termination + WebSocket passthrough + static file serving
-#               for /.well-known/assetlinks.json and a placeholder landing.
-#   - tor     : v3 onion service for the relay (ADR-016 data plane).
-#   - ntfy    : Self-hosted UnifiedPush distributor (ADR-016 wake-up plane).
+#   - relay            : Rust WebSocket relay (ciphertext store-and-forward).
+#   - caddy            : TLS termination + WebSocket passthrough + static
+#                        file serving for /.well-known/, legal pages,
+#                        landing, and the WebTunnel bridge subdomain.
+#   - tor              : v3 onion service for the relay (ADR-016 data plane).
+#   - ntfy             : Self-hosted UnifiedPush distributor (ADR-016
+#                        wake-up plane).
+#   - webtunnel-bridge : Operator-controlled Tor entry bridge with
+#                        WebTunnel pluggable transport (ADR-018 Stage 5C —
+#                        censorship resistance for users in RU / IR / CN
+#                        whose ISP blocks public Snowflake brokers).
+#   - xray             : Xray-core VLESS+REALITY listener on :8443
+#                        (Stage 5E.A — outer transport that bypasses
+#                        TSPU's "16 KB curtain" by mimicking the TLS
+#                        handshake of www.microsoft.com).
 #
 # Run from the repository root:
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
 # See deploy/README.md for DNS + Cloudflare setup requirements.
 # See deploy/tor-onion-setup.md for Tor onion address retrieval.
+# See deploy/webtunnel-bridge-setup.md for WebTunnel bridge bring-up.
 
 services:
   relay:
@@ -60,12 +71,25 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./well-known:/srv/well-known:ro
       - ./landing:/srv/landing:ro
+      # Static placeholder landing for the WebTunnel bridge subdomain.
+      # Anyone scanning bridge.phntm.pro sees a small static site rather
+      # than an empty 404 — defence in depth against TSPU enumeration.
+      - ./webtunnel-landing:/srv/webtunnel-landing:ro
       # Legal documents (Terms of Service + Privacy Policy) served at
       # /terms and /privacy on phntm.pro. Source of truth: /legal at the
       # repository root, mounted read-only.
       - ../legal:/srv/legal:ro
       - caddy-data:/data        # Let's Encrypt certs + keys
       - caddy-config:/config
+    environment:
+      # Caddyfile bridge.phntm.pro vhost uses `{$WEBTUNNEL_SECRET_PATH}`
+      # parse-time substitution to scope the WebTunnel reverse-proxy
+      # matcher to a single secret path. Without explicit forwarding
+      # of this env into the Caddy container, the matcher collapses to
+      # literal "path /" — root reverse-proxies (502s for non-WebTunnel
+      # clients) while the secret path falls through to the placeholder
+      # (defeats the bridge). Discovered during bridge2 deploy 2026-05-06.
+      WEBTUNNEL_SECRET_PATH: ${WEBTUNNEL_SECRET_PATH}
     networks:
       - phantom-internal
     depends_on:
@@ -115,6 +139,85 @@ services:
       - no-new-privileges:true
 
   # ──────────────────────────────────────────────────────────────────────
+  # Operator-controlled WebTunnel bridge for the embedded Tor client
+  # (ADR-018 Stage 5C — censorship-resistance).
+  #
+  # Why we run our own bridge: public Snowflake brokers (Netlify-hosted)
+  # are blocked on Russian carrier networks (Test 10, 2026-05-05). Our
+  # users in such networks need a bridge address that is NOT subject to
+  # third-party blocking. Running our own WebTunnel server gives clients
+  # a reachable entry point to the Tor network that looks like normal
+  # HTTPS traffic to any DPI box.
+  #
+  # Architecture:
+  #   PHANTOM client (kmp-tor + lyrebird) ──HTTPS WebSocket──▶
+  #     Caddy at bridge.phntm.pro:443 ──reverse-proxy──▶
+  #       webtunnel-bridge:15000 ──Tor protocol──▶
+  #         Tor entry/middle/exit relays ──▶ phantom-tor (our onion) ──▶ relay
+  #
+  # Caveat (ADR-018 Alpha 2 acceptable risk): bridge + relay onion
+  # currently live on the same VPS IP. A network-observing adversary
+  # capable of enumerating both endpoints can correlate "user enters
+  # PHANTOM bridge" with "PHANTOM client connects to relay onion".
+  # Mitigations:
+  #   - Most users are protected from EXTERNAL observers (TSPU, ISP) —
+  #     that is the threat we built this bridge to address.
+  #   - PHANTOM operator (us) can already see relay-side traffic by
+  #     definition — running the entry bridge does not expand what we
+  #     learn about our own users.
+  # Beta plan: distribute bridge to a separate provider / region.
+  # Documented in docs/operations/TOR_STACK_MAINTENANCE.md.
+  # ──────────────────────────────────────────────────────────────────────
+  webtunnel-bridge:
+    image: thetorproject/webtunnel-bridge:latest
+    container_name: phantom-webtunnel-bridge
+    restart: unless-stopped
+    user: debian-tor
+    environment:
+      # Bridge identity — operator-set, persisted across restarts via the
+      # webtunnel-tor-state volume. NICKNAME is what BridgeDB / Tor metrics
+      # show; EMAIL becomes the ContactInfo line in the bridge's torrc
+      # (directory authorities use it as the abuse contact for the
+      # operator).
+      #
+      # The container's entrypoint substitutes these env-var names
+      # VERBATIM into the bundled torrc template:
+      #   ${NICKNAME} → Nickname
+      #   ${EMAIL}    → ContactInfo
+      #   ${OR_PORT}  → ORPort
+      #   ${PT_PORT}  → ServerTransportListenAddr port
+      #   ${WEBTUNNEL_URL} → ServerTransportOptions webtunnel url=…
+      # Renaming the container-side var (e.g. EMAIL → OPERATOR_EMAIL)
+      # leaves ContactInfo blank, which deprioritises the bridge in
+      # directory authority queries and slows first-time bootstrap from
+      # ~90 s to several minutes (observed in Test 11, 2026-05-06).
+      NICKNAME: ${WEBTUNNEL_NICKNAME:-PhantomBridge1}
+      EMAIL: ${WEBTUNNEL_OPERATOR_EMAIL:-hello@phntm.pro}
+      PT_PORT: 15000
+      # Outbound OR port. Picked once per deploy and persisted so the
+      # bridge identity stays stable. Set in deploy/.env to avoid
+      # re-rolling on each compose up.
+      OR_PORT: ${WEBTUNNEL_OR_PORT:-44389}
+      # The HTTPS URL clients hit to reach this bridge. Includes the
+      # secret path so any random scanner just sees the fake landing
+      # served at bridge.phntm.pro/. Must match the Caddyfile vhost.
+      WEBTUNNEL_URL: ${WEBTUNNEL_URL}
+    expose:
+      - "15000"
+    networks:
+      - phantom-internal
+    volumes:
+      # Tor bridge state — identity keys, descriptor cache, guards. Losing
+      # this volume rotates the bridge fingerprint; clients with the old
+      # one pinned in `OperatorBridges.kt` would silently fail. Back this
+      # up alongside phantom-tor-data.
+      - webtunnel-tor-state:/var/lib/tor
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # ──────────────────────────────────────────────────────────────────────
   # Self-hosted ntfy distributor for UnifiedPush (ADR-016 wake-up plane).
   #
   # Purpose: when an envelope is queued for an offline client, the relay
@@ -131,6 +234,79 @@ services:
   #   - upstream-base-url: not set, so APN/iOS forwarding is dormant.
   #   - firebase-key-file: not set, so FCM forwarding is dormant.
   # ──────────────────────────────────────────────────────────────────────
+  # ──────────────────────────────────────────────────────────────────────
+  # Xray-core — VLESS+REALITY outer transport (Stage 5E.A).
+  #
+  # REALITY makes the TLS handshake byte-for-byte identical to a handshake
+  # with www.microsoft.com (Xray transparently reverse-proxies the genuine
+  # cert chain on cache-miss). TSPU classifies the resulting flow as
+  # benign big-tech CDN traffic and applies no throttle — bypassing the
+  # "16-kilobyte curtain" empirically confirmed to break our WebTunnel
+  # bridges on Hetzner AND FlokiNET (Test 11/12/13, 2026-05-05/06).
+  #
+  # Stage 5E.A scope (this PR):
+  #   - Server-only. No Android changes.
+  #   - Listens on 8443/tcp (separate from Caddy's 443) — operationally
+  #     simplest. Stage 5E.B promotes to shared 443 via REALITY's
+  #     proxy_protocol fallback to Caddy.
+  #   - Validation path: desktop NekoBox client connects via this listener
+  #     from a Russian carrier vantage. If that works end-to-end, Stage
+  #     5E.B (Android libXray AAR) is unblocked.
+  #
+  # The config.json that this container reads is rendered on the host from
+  # config.json.template + .env via deploy/xray/render-config.sh — neither
+  # the rendered config nor .env are tracked in git (see .gitignore).
+  # See deploy/xray/README.md for the full operator runbook.
+  #
+  # License: MPL-2.0 (Xray-core). Aggregation with our AGPL-3.0-or-later
+  # is permitted at the docker-compose level (file-level copyleft, no
+  # Xray source files modified). Same posture as v2rayNG / Hiddify.
+  # ──────────────────────────────────────────────────────────────────────
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: phantom-xray
+    restart: unless-stopped
+    # Override the image's default CMD (which runs `xray -confdir
+    # /usr/local/etc/xray/`, picking up the stock 00_log.json /
+    # 01_api.json / … bundled inside the image — NOT our config). We
+    # explicitly point xray at the single rendered config we mount below.
+    command: ["run", "-c", "/etc/xray/config.json"]
+    # Bind 8443 directly on the host. The container itself is the TLS
+    # endpoint — Caddy is NOT in front (REALITY's whole value prop is the
+    # genuine TLS-1.3 handshake the daemon mimics; Caddy as a proxy would
+    # break the fingerprint).
+    ports:
+      - "8443:8443/tcp"
+    volumes:
+      # Rendered config — produced from config.json.template by the
+      # render-config.sh script. Mounted read-only; Xray re-reads on
+      # SIGHUP (or container restart).
+      #
+      # Footgun: the FILE must exist on the host BEFORE `docker compose
+      # up`. Otherwise docker creates an empty DIRECTORY at the target
+      # path (default bind-mount behaviour), and Xray then fails with
+      # "is a directory". render-config.sh defensively removes any such
+      # artefact before writing the real file. Operators: always run
+      # render-config.sh BEFORE docker compose up.
+      - ./xray/config.json:/etc/xray/config.json:ro
+    # Healthcheck: `xray run -test -c /etc/xray/config.json` validates
+    # config syntactically without starting the daemon. Modern Xray-core
+    # (post-1.7) merged `test` into `run -test`; the old `xray test ...`
+    # subcommand is gone. Detects broken configs before docker reports
+    # the container "ready".
+    healthcheck:
+      test: ["CMD", "xray", "run", "-test", "-c", "/etc/xray/config.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - phantom-internal
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   ntfy:
     image: binwiederhier/ntfy:v2.11.0
     container_name: phantom-ntfy
@@ -169,3 +345,9 @@ volumes:
   # in server.yml; tolerable to lose at the cost of replaying any
   # in-flight wake-ups.
   phantom-ntfy-cache:
+  # WebTunnel bridge state — Tor identity keys + descriptor cache + guards.
+  # CRITICAL to back up: losing this rotates the bridge fingerprint, and
+  # every PHANTOM client with the old fingerprint hardcoded silently
+  # stops connecting. Back up procedure mirrors phantom-tor-data — see
+  # deploy/webtunnel-bridge-setup.md.
+  webtunnel-tor-state:

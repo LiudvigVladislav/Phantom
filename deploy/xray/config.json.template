@@ -1,0 +1,136 @@
+{
+  "//": "PHANTOM Xray-core REALITY server (ADR-018 Stage 5E.A — Path A).",
+  "//": "This config is the OPERATOR-rendered version after substituting:",
+  "//":   "  REPLACE_PRIVATE_KEY  → output of `xray x25519` private",
+  "//":   "  REPLACE_UUID         → output of `xray uuid`",
+  "//":   "  REPLACE_SHORT_ID     → output of `openssl rand -hex 8`",
+  "//": "All three live ONLY on the server. Their public counterparts",
+  "//": "(public_key, uuid, short_id, sni, dest port) are baked into",
+  "//": "the Android APK by way of OperatorXrayConfig.kt.",
+  "//":   "Keep the template at config.json.template; render to config.json",
+  "//":   "on the VPS via deploy/xray/render-config.sh and mount that into",
+  "//":   "the container read-only.",
+
+  "//": "Path A architecture: VLESS clients are routed to relay.phntm.pro,",
+  "//": "which is the Caddy container on the SAME VPS. We resolve that name",
+  "//": "to the docker container directly (DNS hosts override below) instead",
+  "//": "of going via the public IP and relying on NAT hairpin — hairpin is",
+  "//": "kernel-version-dependent on Linux and silently hangs the connection",
+  "//": "when it doesn't work. Resolving to `caddy` (the docker-compose",
+  "//": "service name, reachable via the bridge network DNS) is deterministic.",
+
+  "log": {
+    "loglevel": "warning",
+    "//": "access: none — Xray writes a per-connection access log to stdout",
+    "//": "by default (even at loglevel=warning); setting access=none keeps",
+    "//": "client IPs out of `docker logs phantom-xray`. The threat model",
+    "//": "treats the operator-VPS as untrusted-on-seize — minimising what",
+    "//": "the disk image carries shrinks the post-incident exposure.",
+    "access": "none"
+  },
+
+  "dns": {
+    "//": "Force `relay.phntm.pro` to resolve to the docker-compose service",
+    "//": "named `caddy` on the internal bridge network, so the freedom",
+    "//": "outbound below opens a TCP connection straight to the Caddy",
+    "//": "container instead of egressing to the host's public IP and",
+    "//": "depending on NAT hairpin to come back. `caddy` resolves via the",
+    "//": "bridge network's embedded DNS as long as the xray container",
+    "//": "shares the `phantom-internal` network (it does — see compose).",
+    "hosts": {
+      "relay.phntm.pro": "caddy"
+    }
+  },
+
+  "inbounds": [
+    {
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "REPLACE_UUID",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "//": "dest = real Microsoft TLS endpoint that Xray reverse-proxies",
+          "//": "to whenever a non-REALITY client (TSPU active prober) hits :8443.",
+          "//": "TSPU sees a genuine www.microsoft.com cert chain on those probes;",
+          "//": "REALITY clients carry the right shortId+pubkey and get the actual",
+          "//": "tunnel.",
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.microsoft.com"
+          ],
+          "privateKey": "REPLACE_PRIVATE_KEY",
+          "shortIds": [
+            "",
+            "REPLACE_SHORT_ID"
+          ],
+          "minClientVer": "1.8.0"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "//": "destOverride extracts the inner TLS SNI so the routing rule",
+        "//": "below can match `relay.phntm.pro`. routeOnly=true means the",
+        "//": "sniffed value is used FOR ROUTING ONLY — Xray does not rewrite",
+        "//": "the destination on the outbound, so the inner TLS handshake",
+        "//": "still presents `relay.phntm.pro` to Caddy unmodified.",
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      }
+    }
+  ],
+
+  "outbounds": [
+    {
+      "tag": "to-relay",
+      "protocol": "freedom",
+      "//": "domainStrategy=UseIP forces Xray to resolve the destination",
+      "//": "domain via its own DNS subsystem (which honours the hosts",
+      "//": "override above) before opening the TCP connection. Without",
+      "//": "this, freedom would defer name resolution to the kernel which",
+      "//": "ignores Xray's hosts map.",
+      "settings": {
+        "domainStrategy": "UseIP"
+      }
+    },
+    { "tag": "block",  "protocol": "blackhole" }
+  ],
+
+  "routing": {
+    "//": "Stage 5E.B.5 diagnostic: relax routing to inboundTag-only.",
+    "//":   "Strict version with domain=[\"full:relay.phntm.pro\"] silently",
+    "//":   "fell through to blackhole on Xray 26.3.27 even though sniffing",
+    "//":   "did extract the SNI correctly (logs showed `accepted tcp:",
+    "//":   "relay.phntm.pro:443 [vless-reality-in -> block]`). Until we",
+    "//":   "isolate why the matcher misses, all VLESS traffic goes to the",
+    "//":   "freedom outbound — which itself relies on the dns.hosts override",
+    "//":   "above to land in the local Caddy container.",
+    "//": "Threat model in this diagnostic mode: anyone with the shared UUID",
+    "//":   "(it ships in the APK — capability auth, not identity) can",
+    "//":   "target any domain through this server. UUID is currently held",
+    "//":   "only by us; REALITY active-probing defence is unchanged. Once",
+    "//":   "the WSS path is confirmed working end-to-end, restore the",
+    "//":   "blackhole-by-default rule with correct domain syntax.",
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["vless-reality-in"],
+        "outboundTag": "to-relay"
+      }
+    ]
+  }
+}

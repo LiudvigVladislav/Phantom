@@ -7,25 +7,25 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * JVM (desktop) stub of [TorService] (ADR-016 Stage 2).
+ * JVM (desktop) stub of [TorService] (ADR-016 + ADR-018).
  *
- * The desktop client does not yet bundle kmp-tor's JVM runtime — the
- * desktop product itself is post-Alpha-2 — so for now the JVM target
- * compiles a no-op implementation that stays in [TorState.Off]. This keeps
- * the KMP module graph honest (the transport module advertises a
- * `TorService` API on every target it supports) without forcing the
- * desktop build to drag in tor binaries it cannot use yet.
+ * The desktop client does not yet bundle Briar's tor stack — desktop is a
+ * post-Alpha-2 product line — so for now the JVM target compiles a no-op
+ * implementation that stays in [TorState.Off]. Keeps the KMP module graph
+ * honest (the transport module advertises a `TorService` API on every
+ * target it supports) without forcing the desktop build to drag in tor
+ * binaries it cannot use yet.
  *
- * When desktop integration begins, swap this for a `kmp-tor:runtime` +
- * `resource-exec-tor` (or noexec on JVM, when supported) backed
- * implementation alongside the Android one.
+ * When desktop integration begins, swap this for `org.briarproject:
+ * onionwrapper-java` (the JVM-side variant of the same wrapper Briar
+ * publishes for Android).
  */
 internal class TorServiceJvm : TorService {
     private val _state = MutableStateFlow<TorState>(TorState.Off)
     override val state: StateFlow<TorState> = _state.asStateFlow()
 
     override suspend fun start() {
-        // Intentional no-op on desktop until kmp-tor is wired here too.
+        // Intentional no-op on desktop until the JVM Tor stack is wired here too.
     }
 
     override suspend fun stop() {
@@ -33,5 +33,5 @@ internal class TorServiceJvm : TorService {
     }
 }
 
-actual fun createTorService(config: TorServiceConfig): TorService =
+actual fun createTorService(config: TorServiceConfig, platformContext: Any?): TorService =
     TorServiceJvm()

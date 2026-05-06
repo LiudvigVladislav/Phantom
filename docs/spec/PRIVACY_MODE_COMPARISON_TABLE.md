@@ -13,21 +13,27 @@ Copyright (c) 2026 Willen LLC
 
 ## A. Visual identity
 
-| Mode | Icon | Tier | Tagline (≤ 7 words) |
-|---|---|---|---|
-| **Standard** | 🌐 | Free, default | "Normal messenger, with E2EE by default." |
-| **Private** | 🔒 | Free | "Quieter. Discoverable only by people you know." |
-| **Ghost** | 👻 | PRO | "Invisible. Anonymous. Ephemeral by design." |
+In-app icon assets are **custom-designed, not emoji**. They live in the design system and are referenced by name from this document. Engineering bundles them as vector drawables in `apps/android/src/androidMain/res/drawable/`.
+
+| Mode | In-app icon asset | Marketing emoji fallback | Tier | Tagline (≤ 7 words) |
+|---|---|---|---|---|
+| **Standard** | `ic_privacy_mode_standard` (current placeholder: Lucide `Globe`) | 🌐 | Free, default | "Normal messenger, with E2EE by default." |
+| **Private** | `ic_privacy_mode_private` (current placeholder: Lucide `Lock`) | 🔒 | Free | "Quieter. Discoverable only by people you know." |
+| **Ghost** | `ic_privacy_mode_ghost` (current placeholder: Lucide `Ghost`) | 👻 | PRO | "Invisible. Anonymous. Ephemeral by design." |
+
+The "current placeholder" column lists the Lucide icon used until Vladislav exports finals from the design system. Once the custom assets land in `Design/`, the drawable resources are swapped without any Kotlin change — the resource IDs (`R.drawable.ic_privacy_mode_*`) stay stable.
 
 Icon usage rules:
-- **Onboarding cards:** icon at 32 px alongside the mode title.
-- **Settings → Privacy Mode summary:** icon at 24 px next to current mode label.
-- **Foreground notification (Android shade):** icon NOT used (the system notification icon stays the PHANTOM mark; the text alone conveys mode).
-- **Marketing site / app store:** icons may scale to 48 px, monochrome variants permitted (white-on-cyan, cyan-on-black).
+- **In-app onboarding cards:** custom asset at 32 dp alongside the mode title. **Never emoji.**
+- **In-app Settings → Privacy Mode summary row:** custom asset at 24 dp next to current mode label. **Never emoji.**
+- **Foreground notification (Android shade):** the small icon stays the PHANTOM mark — no per-mode icon. The notification text alone conveys mode.
+- **Marketing site / app store / grant-application markdown:** emoji acceptable (web rendering, cross-platform consistency). When the marketing site moves to a CMS-managed image set, prefer the custom assets exported as web SVG.
 
 ---
 
 ## B. Compact differentiator table — for marketing & app store
+
+This table is rendered cross-platform (web, app store description). Emoji are used here for visual quick-scan; the in-app version uses the custom icon assets from §A.
 
 ```
 ┌─────────────────┬─────────────┬──────────────┬───────────────┐

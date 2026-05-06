@@ -75,6 +75,7 @@ kotlin {
             implementation(project(":shared:core:crypto"))
             implementation(project(":shared:core:storage"))
             implementation(project(":shared:core:transport"))
+            implementation(project(":shared:core:xray"))
             implementation(project(":shared:core:messaging"))
         }
     }
@@ -143,6 +144,23 @@ android {
             // Default false → existing direct-WSS path is unchanged.
             val torEnabled = localOrEnv("tor.enabled", "USE_TOR", "false").toBoolean()
             buildConfigField("boolean", "USE_TOR", "$torEnabled")
+            // Stage 5E.B kill-switch for the Xray VLESS+REALITY outer
+            // transport. Mutually exclusive with USE_TOR — both wrap the
+            // same WebSocket but in different ways, and the wiring in
+            // PhantomMessagingService picks one path. Enable via
+            // local.properties:
+            //   xray.enabled=true
+            // The reachable RELAY URL stays clearnet (RELAY_URL); Xray
+            // simply funnels the WSS through its local SOCKS5 listener
+            // and out via VLESS+REALITY to the Hetzner Xray server.
+            val xrayEnabled = localOrEnv("xray.enabled", "USE_XRAY", "false").toBoolean()
+            if (torEnabled && xrayEnabled) {
+                error(
+                    "USE_TOR and USE_XRAY are mutually exclusive: both define the outer " +
+                        "transport for the WebSocket. Set exactly one to true in local.properties.",
+                )
+            }
+            buildConfigField("boolean", "USE_XRAY", "$xrayEnabled")
         }
         release {
             isMinifyEnabled = true
@@ -161,6 +179,7 @@ android {
             // Release builds default to direct WSS — the Privacy-Mode UI
             // (Stage 4) will toggle this at runtime, not at build time.
             buildConfigField("boolean", "USE_TOR", "false")
+            buildConfigField("boolean", "USE_XRAY", "false")
 
             // Use the release key if keystores/signing.properties or SIGNING_*
             // env vars supplied valid credentials; otherwise fall back to debug
