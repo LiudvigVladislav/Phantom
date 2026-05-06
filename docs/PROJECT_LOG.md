@@ -81,6 +81,34 @@ Also tracked:
 This section records **rejected** options as well as accepted ones —
 otherwise we would re-litigate the same conversations every few weeks.
 
+### Rejected: server-side Tor outbound for Stage 5E (Path B)
+
+**Date:** 2026-05-07
+**Context:** Stage 5E's Hetzner Xray VLESS+REALITY server needs to forward
+the unwrapped client traffic somewhere. Two architectures were on the
+table — Path A (forward straight to clearnet `relay.phntm.pro` on the
+same VPS via docker bridge DNS) and Path B (run a local Tor inside the
+Xray container, route through a `.onion` to the relay).
+**Why rejected:**
+
+- Path B adds 500–800 ms per WebSocket frame on top of the REALITY
+  handshake — unacceptable for messenger UX.
+- The defence-in-depth Path B promises (Hetzner Xray operator can't
+  correlate `client X → relay Y`) is moot because the Hetzner Xray
+  operator IS the relay operator. Same VPS, same hand on the keyboard.
+- Adds another daemon (Tor) to the production stack — more attack
+  surface, more maintenance, more failure modes for the on-call rotation.
+
+**Replacement:** Path A — `dns.hosts: {"relay.phntm.pro": "caddy"}` in
+the Xray server config sends VLESS-tunnelled traffic straight to the
+Caddy container over the docker bridge network. Zero NAT hairpin, zero
+extra latency. Acceptable trade because external observers see only the
+REALITY-mimicked Microsoft TLS handshake; the relay-operator-as-attacker
+threat is out of scope for this server (it's defended at the Double
+Ratchet layer instead — relay sees only ciphertext).
+
+**See:** session entry for 2026-05-07 (Stage 5E production-validated).
+
 ### Rejected: FCM (Firebase Cloud Messaging) for push-on-disconnect
 
 **Date:** 2026-04-27
@@ -272,6 +300,103 @@ on advice that references prior commits — even from another LLM.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-07 (wed) · Stage 5E (Xray VLESS+REALITY) production-validated
+
+- **Goal:** Finish Stage 5E.B (the Android client side of ADR-018's
+  Xray-as-outer-transport plan) and prove end-to-end that PHANTOM works
+  on a Russian carrier without VPN, without Orbot, without any
+  third-party app. The TSPU "16-kilobyte curtain" — silent throttling
+  of TLS streams larger than ~16 KB to flagged datacenter IPs (Hetzner
+  confirmed by Test 11/12 on 2026-05-05/06; FlokiNET confirmed by
+  Test 13 on 2026-05-06) — had killed the Stage 5C/5D bridge approach
+  entirely. Stage 5E mimics a genuine TLS handshake to
+  `www.microsoft.com` so the censor classifies the flow as trusted CDN.
+- **Outcomes:**
+  - **`shared/core/xray/`** — new KMP module exposing
+    `XrayService` / `XrayState` (Off/Starting/Ready(socksPort)/Failed),
+    `XrayServiceConfig` data class, `OperatorXrayConfig` with the pinned
+    REALITY pubkey + shortId + UUID for the Hetzner endpoint, and an
+    Android impl that wraps libXray's gomobile JNI. JVM target gets a
+    no-op stub. libXray itself (built via the new
+    `.github/workflows/build-libxray.yml` workflow) is vendored unpacked
+    as `classes.jar` + `libgojni.so` × 4 ABI under
+    `src/androidMain/{libs,jniLibs}/` — AGP refuses to bundle a local
+    `.aar` inside another AAR, so the four-file split is the canonical
+    workaround. ~180 MB committed to git; reroll procedure in
+    `src/androidMain/libs/README.md`. Commit `96fcbf1a`.
+  - **`PhantomMessagingService` wiring** — `BuildConfig.USE_XRAY` flag
+    added alongside `USE_TOR` with a build-time mutual-exclusion check
+    (both true → gradle errors immediately). When `USE_XRAY=true`,
+    service lazy-constructs Xray, awaits Ready-or-Failed within 30 s,
+    hands the localhost SOCKS5 port to `KtorRelayTransport` via the
+    same `socksProxyPort` parameter the Tor branch already uses.
+    Notification updater extended to surface Xray state. Commit
+    `98245f69`.
+  - **Server-side Path A** (`deploy/xray/config.json.template` rewrite,
+    commit `7b4ebf77` — see Decision log entry below): VLESS routing
+    relaxed from strict-domain-match-then-blackhole to
+    `inboundTag-only → freedom outbound`, because `domain: ["full:relay.phntm.pro"]`
+    silently misses on Xray 26.3.27 even when sniffed SNI visibly equals
+    `relay.phntm.pro` in the same log line. With the relaxed rule, plus
+    a `dns.hosts` override (`relay.phntm.pro → caddy`) and `access: none`
+    in the log block (the latter two folded in from a security-reviewer
+    pass), VLESS clients land in the local Caddy container via the
+    docker bridge network — no NAT hairpin, no `docker logs` IP leak.
+  - **Test 14 (production validation, 2026-05-07 evening):** Tecno on RU
+    MTS without VPN ↔ Pixel 8 Pro emulator. After clearing emulator
+    storage (the long-standing prekey-bundle bug ate a fresh identity —
+    see Follow-ups), text messages `delivered` in 30–100 ms each way;
+    5-second voice messages chunked to 5 envelopes of ~55 KB each
+    flowed through Xray REALITY with ack `delivered` on every chunk and
+    clean `Decrypt OK` on the receiving side. The 55 KB chunk size is
+    the critical proof: it is well over the 16 KB curtain threshold,
+    bare TLS would have stalled, REALITY masks it as a Microsoft CDN
+    stream and the censor passes it.
+- **Decisions made:**
+  - **Path A (VLESS clients land at clearnet `relay.phntm.pro` on the
+    same VPS via docker DNS)** chosen over Path B (server-side Tor →
+    onion). Path B would have added 500–800 ms latency and a second
+    daemon for defence-in-depth that protects only against an insider
+    on the Hetzner Xray container — and that container is the operator's
+    own. Decision recorded in commit message `98245f69`.
+  - **Single shared client UUID** baked into the APK, treated as a
+    *capability* (anyone holding it can use the server) rather than a
+    secret tied to identity. Stage 5E's purpose is censorship
+    circumvention, not access control — relay-level auth handles abuse
+    separately. Rotation playbook in
+    `deploy/xray/render-config.sh` header.
+  - **Vendor libXray as committed git artefacts** (not Git LFS, not
+    fetch-on-build) — earlier we tried "don't commit, instruct
+    contributors to download" but Vladislav rightly pointed out that
+    creates a reproducibility hole and a bad first impression for the
+    NLnet reviewer. 180 MB one-time cost is acceptable; rebuild from
+    `XTLS/libXray@<sha>` is deterministic via the workflow.
+- **Key commits (all on `feat/tor-stage5-bridges-via-onionwrapper`,
+  pushed to origin, **NOT** yet merged to master):**
+  - `5cca2976` — workflow `.github/workflows/build-libxray.yml`
+  - `f5e21fb3` — workflow audit pass (Go pin, ABI regex, leading-./, SHA-ref fix)
+  - `96fcbf1a` — KMP module skeleton + libXray vendoring (15 files, +644 lines + ~180 MB binaries)
+  - `98245f69` — `PhantomMessagingService` wiring + Path A server template
+  - `7b4ebf77` — diagnostic routing relaxation
+- **Follow-ups:**
+  - **Prekey republish bug** (pre-existing, surfaced by Stage 5
+    testing). Long-offline identity → bundle 404 on `/prekeys/bundle/<peer>`
+    → senders' messages stay WAITING forever. Workaround that worked
+    today: Clear Data on the offline device → fresh onboarding →
+    fresh publish. Permanent fix: client-side retry publish on
+    connect when self-bundle is 404, or relay-side fallback to a
+    signed-prekey-only bundle when OPK pool is empty. ~1–2 hours.
+  - **Restore strict Xray routing** — replace the temporary
+    `inboundTag-only` rule with `domain: ["domain:relay.phntm.pro"]`
+    (without the `full:` prefix that silently missed) and re-enable
+    blackhole-by-default. Server-side, ~30 min plus redeploy.
+  - **ADR-019 Xray REALITY rationale** — write it before NLnet body
+    needs it: threat model, license posture (MPL-2.0 Xray-core
+    aggregation cleanly composable with our AGPL at the docker-compose
+    level), Beta-time multi-server fan-out plan. ~1 hour.
+  - **PR to master** — open once the three above are done, so master
+    doesn't carry the temporarily relaxed routing.
 
 ### 2026-04-27 (sat, evening) · Licence hygiene before NLnet submission
 
