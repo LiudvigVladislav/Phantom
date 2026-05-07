@@ -1,11 +1,12 @@
 # PHANTOM
 
-> A privacy-focused, censorship-resistant messenger for restricted internet environments.
-> Telegram's UX. Signal's security architecture. Built to be unstoppable.
+> **An end-to-end encrypted messenger that works on Russian mobile carriers without a VPN, without Orbot, without any third-party app.**
+> Built on the Signal protocol. Production-validated through Russia's TSPU deep-packet-inspection on 2026-05-07.
 
-[![Status: Alpha 1](https://img.shields.io/badge/status-alpha%201-orange)](#status)
-[![License: TBD](https://img.shields.io/badge/license-TBD-lightgrey)](#license)
+[![Status: Alpha 2](https://img.shields.io/badge/status-alpha%202-orange)](#status)
+[![License: AGPL--3.0--or--later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-android-green)](#platforms)
+[![Mirror: Codeberg](https://img.shields.io/badge/mirror-Codeberg-teal)](https://codeberg.org/VladislavLiudvig/Phantom)
 
 ---
 
@@ -24,26 +25,27 @@ PHANTOM is being built as an open-source project with a values-driven mission: t
 
 ## Status
 
-**Current stage:** Alpha 1 (development sprint completed 2026-04-27, tagged `v0.1.0-alpha.1`)
+**Current stage:** Alpha 2 (mid-sprint as of 2026-05-08).
+**Tagged release:** `v0.1.0-alpha.1` (2026-04-27).
+**Latest production milestone:** Stage 5E (Xray VLESS+REALITY censorship resistance) shipped 2026-05-07 and validated end-to-end on a Tecno phone connected through Russia's MTS network — text and voice messages flow through PHANTOM without any VPN, Orbot, or third-party app installed. See [ADR-019](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md) for the full architectural rationale.
 
 **What works today:**
-- End-to-end encrypted one-on-one messaging between Android devices
-- Production relay deployed at `relay.phntm.pro` (Hetzner, EU jurisdiction)
+- End-to-end encrypted one-on-one messaging between Android devices (Double Ratchet, Sealed Sender envelopes)
+- **Censorship circumvention via Xray VLESS+REALITY** — masquerades the wire traffic as a TLS handshake to `www.microsoft.com`, bypassing Russia's TSPU 16-kilobyte curtain
+- Production relay deployed at `relay.phntm.pro` (Hetzner, EU jurisdiction) with a Tor v3 onion service as fallback
+- Voice messages with chunked transport (~55 KB envelopes per chunk, delivered through the Xray tunnel)
 - Trust Tier flow (first messages from unknowns land in Message Requests)
 - QR code contact exchange
 - Store-and-forward delivery (messages queue when recipient is offline)
-- Sealed sender envelopes (relay sees only routing metadata)
 
-**What's coming next** (Alpha 2 / Beta):
-- iOS app
-- Web client (Compose Multiplatform via WASM)
-- Nearby mode (offline mesh via Bluetooth + Wi-Fi Direct)
-- Kademlia DHT-based P2P routing (reduce dependence on central relay)
-- Pluggable censorship-circumvention transports
-- Group chats
-- Voice and video calls
+**What's coming next** (rest of Alpha 2 → Beta):
+- ADR-020 Adaptive Transport Selection — runtime probe-and-pick between direct WSS, Xray, Tor (today's choice is build-time)
+- ADR-021 Multi-server Xray fan-out — closes the single-point-of-failure on the current Hetzner endpoint
+- iOS app (XCFramework via Compose Multiplatform; ADR-022)
+- Group chats (state machine + Sender Keys crypto already present in shared core)
+- Voice and video calls (signalling exists in shared core; UI wiring in active development)
 
-See [RELEASE_NOTES.md](RELEASE_NOTES.md) for full Alpha 1 details and [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for current limitations.
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for full Alpha 1 details, [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for current limitations, and [docs/PROJECT_LOG.md](docs/PROJECT_LOG.md) for the running development journal.
 
 ---
 
@@ -102,6 +104,8 @@ PHANTOM is **not** designed to protect against:
 - Endpoint compromise via malware
 
 For the most sensitive use cases, PHANTOM should be combined with operating system hardening (GrapheneOS recommended) and secure operational practices.
+
+For the formal threat model with adversary capabilities, asset inventory, and out-of-scope items, see [docs/threat-model/Threat_Model_v0.md](docs/threat-model/Threat_Model_v0.md). The full architectural decisions log lives in [docs/adr/](docs/adr/) — start with [ADR-001 (System Boundaries)](docs/adr/ADR-001-System-Boundaries.md) for the foundational scope and [ADR-019 (Xray REALITY)](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md) for the censorship-resistance rationale.
 
 ---
 
@@ -191,19 +195,16 @@ Before contributing code, please open an issue to discuss the change.
 
 ## Funding & sustainability
 
-PHANTOM is being developed by a solo founder (Russia/Delaware-incorporated US company) with the goal of building sustainable infrastructure.
+The core messenger — including all privacy guarantees, the full Double Ratchet implementation, the relay stack, and the censorship-resistance transport layer — remains free, open-source, and uncrippled for individual users, forever. Long-term sustainability is funded by a separate optional commercial track of value-added services for organisations: managed relay deployments, priority support contracts, encrypted backup-and-recovery convenience features, and specialised integrations. None of these services restrict access to or affect the privacy guarantees of the core open-source software.
 
-**Active funding pursuits:**
-- NLnet Foundation grant application (Privacy & Trust Enhancing Technologies, deadline 2026-06-01)
+**Active funding pursuits** (2026 round):
+- NLnet NGI Zero Commons Fund — deadline 2026-06-01
+- FUTO Microgrants — rolling
+- FLOSS/fund (Zerodha) — deadline 2026-06-30
 
-**Planned monetization** (to fund continued development without compromising free core):
-- Premium subscriptions (advanced features, custom themes, larger limits)
-- B2B accounts for organizations with compliance requirements
-- Bot API platform
-- White-label licensing for jurisdictions with specific deployment needs
-- Crypto donations
+**Donations:** see the **Sponsor** button at the top of this repository for direct support channels (Open Collective, Liberapay, Polar, Buy Me a Coffee).
 
-The core messenger will remain free and open-source for individual users — always.
+PHANTOM is being developed by a solo founder operating through Willen LLC (Delaware, USA).
 
 ---
 

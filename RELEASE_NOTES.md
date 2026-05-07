@@ -132,7 +132,7 @@ Final commits on `fix/bug-h-libsodium-jni` branch (most recent first):
 
 ### Prerequisites
 - Android Studio with Android SDK
-- JDK 17+
+- JDK 21 (matches the README — the toolchain compiles to Java 21 bytecode)
 - Android device or emulator (API 26+)
 
 ### Build debug APK
@@ -188,7 +188,7 @@ In rough order of importance:
 
 ## License
 
-(To be determined — likely AGPLv3 or similar copyleft for the open-source core, with possible dual-licensing for B2B / white-label business model.)
+**AGPL-3.0-or-later** for the entire repository — see [`LICENSE`](LICENSE) for the full text and [`NOTICE`](NOTICE) for third-party attributions. AGPL-3.0 §13 ensures the relay's privacy promises remain enforceable against silently-modified hosted forks. An optional commercial dual-licensing arrangement is available for white-label or B2B deployments that cannot ship under AGPL terms; contact `legal@phntm.pro`.
 
 ---
 
