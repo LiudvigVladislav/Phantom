@@ -92,6 +92,63 @@ class PreKeyLifecycleService(
     }
 
     /**
+     * Verifies the relay actually has our published bundle, and republishes
+     * if it does not. Fixes the long-offline / silent-publish-failure case
+     * where local state says "SPK exists, OPK pool full" but the relay
+     * has no record of this identity at all (so any peer who tries to
+     * fetch our bundle gets 404 and cannot start a session with us).
+     *
+     * The relay's `/prekeys/status/{identity}` endpoint returns
+     * `signed_prekey_age_days = null` when the identity has never
+     * published — that is the canonical signal we test for. Any other
+     * value (including 0 for a freshly-published bundle) means the relay
+     * has a record and no republish is needed.
+     *
+     * Returns true if a republish ran, false if the relay already had
+     * our bundle. Failures bubble as [Result.failure] (rate-limit on
+     * `/prekeys/status` is rare — 60/min per requester — and a status
+     * failure itself does not warrant a republish, since we cannot tell
+     * whether the relay is missing the bundle or just refusing to answer).
+     *
+     * Idempotent: repeated calls when the relay already has the bundle
+     * are read-only HEAD-equivalent traffic. Safe to call on every
+     * successful WS reconnect as a defence-in-depth net.
+     */
+    suspend fun verifyBundleOnRelay(): Result<Boolean> = runCatching {
+        val identity = identityManager.getIdentity()
+            ?: throw MigrationException.NoIdentity
+        val signing = identityManager.loadSigningKeyPair()
+            ?: throw MigrationException.NoIdentity
+        val spkEntity = signedPreKeyRepository.get()
+            ?: // No local SPK — onboarding has not run yet for this install.
+            // verifyBundleOnRelay is not the right place to drive onboarding;
+            // bootstrapForNewIdentity is. Skip silently.
+            return Result.success(false)
+
+        val status = preKeyApi.fetchStatus(
+            identityPubkeyHex = identity.publicKeyHex,
+            requesterPubkeyHex = identity.publicKeyHex,
+        )
+        // signed_prekey_age_days == null is the relay's signal that no
+        // entry exists for this identity. If an entry exists but the OPK
+        // pool is empty, the relay still returns Some(age_days) and the
+        // SPK-only fallback covers session bootstrap, so we do not need
+        // to republish in that case (maybeReplenishOneTimePreKeys handles
+        // the pool refill independently).
+        if (status.signed_prekey_age_days != null) {
+            return Result.success(false)
+        }
+
+        // Relay has lost (or never received) our bundle. Republish the
+        // full local state — same wire shape as the onboarding bootstrap
+        // and the steady-state replenish, so the relay's atomic publish
+        // restores us to a known-good state in one round-trip.
+        val allOpks = oneTimePreKeyRepository.getAll()
+        publishBundle(identity.publicKeyHex, signing, spkEntity, allOpks)
+        true
+    }
+
+    /**
      * Refills the OPK pool when it dips below [REPLENISH_THRESHOLD].
      * Returns true if a refill ran, false if the pool was sufficiently
      * stocked. Failures bubble as [Result.failure].
