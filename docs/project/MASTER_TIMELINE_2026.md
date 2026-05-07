@@ -4,15 +4,15 @@
 
 **Last updated:** 2026-05-08  
 **Master HEAD:** ADR-019 just merged (PR #48); Stage 5 itself merged 2026-05-08 morning as #43 (squash) plus four follow-up PRs (#45 strict routing restore, #46 repo cleanup, #47 Firebase rotation log, #48 ADR-019).  
-**Ближайший дедлайн:** NLnet 2026-06-01 (24 дня); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
+**Ближайший release window:** 2026-06-01 (24 дня); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
 
 ---
 
 ## Большая картина — 4 параллельных трека
 
 ```
-                                         NLnet      FLOSS
-  Сегодня                               (1 июня)  (30 июня)
+                                         Release    Secondary
+  Сегодня                               (1 июня)   (30 июня)
   2026-05-03 ──────────── 4 недели ────────►│────── 4 нед ──►│──── ... до v1.0
                                             │                │
   Track A — RELIABILITY SPRINT ─────────►│  │                │
@@ -21,7 +21,7 @@
   Track B — SECURITY SPRINT ─────────►│      │                │
   (10 P1 блокеров до Kickstarter)            │                │
                                             │                │
-  Track C — GRANT READINESS ──────►│         │                │
+  Track C — RELEASE POLISH ───────►│         │                │
   (4 фазы repo polish, ~6 часов)              │                │
                                             │                │
   Track D — Alpha 2 FEATURES ───────────────►│ продолжение ►  │
@@ -55,18 +55,18 @@ Track A + Track C идут параллельно. Track B стартует по
 
 ---
 
-## Track B — Security Sprint (Kickstarter блокеры)
+## Track B — Security Sprint (Beta-tier блокеры)
 
-**Цель:** security clearance для Kickstarter announcement + NLnet credibility.
+**Цель:** security clearance для Beta release + Kickstarter announcement.
 
-**Items 1–4 = NLnet snapshot.** После их закрытия можно тегать `v0.1.0-alpha.2` и подавать NLnet с честным "first four most user-visible privacy claims closed."
+**Items 1–4 = Alpha-2 snapshot.** После их закрытия можно тегать `v0.1.0-alpha.2` и подавать external funding programme с честным "first four most user-visible privacy claims closed."
 
 | # | Finding | Что сделать | Оценка | Блокирует | Статус |
 |---|---------|-------------|--------|-----------|--------|
-| 1 | **F22** SPK/OPK private keys plaintext SQLite | Keystore-wrap (AES-256-GCM) | ~2 дня | NLnet | ⬜ |
-| 2 | **F19+F20** Call signalling no E2EE / no Sealed Sender | Wrap SDP/ICE in Double Ratchet + Sealed Sender | ~3 дня | NLnet | ⬜ |
-| 3 | **F8** RatchetState plaintext SQLite | Keystore-wrap RatchetState blob перед записью | ~2 дня | NLnet | ⬜ |
-| 4 | **F2+F13** SenderKey signing dead | ADR-017 (remove signing) уже draft → реализовать | ~3 дня | NLnet | ⬜ |
+| 1 | **F22** SPK/OPK private keys plaintext SQLite | Keystore-wrap (AES-256-GCM) | ~2 дня | Alpha-2 | ⬜ |
+| 2 | **F19+F20** Call signalling no E2EE / no Sealed Sender | Wrap SDP/ICE in Double Ratchet + Sealed Sender | ~3 дня | Alpha-2 | ⬜ |
+| 3 | **F8** RatchetState plaintext SQLite | Keystore-wrap RatchetState blob перед записью | ~2 дня | Alpha-2 | ⬜ |
+| 4 | **F2+F13** SenderKey signing dead | ADR-017 (remove signing) уже draft → реализовать | ~3 дня | Alpha-2 | ⬜ |
 | 5 | **F1** Group control msgs outside Double Ratchet | Wrap SKD/leave/add в Double Ratchet | ~3 дня | Kickstarter | ⬜ |
 | 6 | **F3** SenderKey KDF bare SHA-256 | Заменить на HKDF-SHA256 с domain separation | ~1 день | Kickstarter | ⬜ |
 | 7 | **F4** Member-leave не ротирует ключи | Full key rotation на leave/remove | ~2 дня | Kickstarter | ⬜ |
@@ -82,16 +82,16 @@ Track A + Track C идут параллельно. Track B стартует по
 
 ---
 
-## Track C — Grant Readiness
+## Track C — Release Polish
 
-**Цель:** репо в состоянии "reviewer тратит 5 минут и думает 'это серьёзно'" к подаче на NLnet.
+**Цель:** репо в состоянии «reviewer тратит 5 минут и думает "это серьёзно"» к Alpha-2 release window.
 
 Утверждённый план: [`~/.claude/plans/cosmic-sparking-otter.md`](../../.claude/plans/cosmic-sparking-otter.md) (на машине разработчика).
 
 | Phase | Что | Время | Статус |
 |-------|-----|-------|--------|
 | 1 | Repo cleanup + .gitignore (remove `google-services.json`, `.kotlin/`; add 12 lines; commit `PHANTOM_ROADMAP_2026.md` + `ARCHITECTURAL_DECISIONS_TODO.md`) | 30 мин (factually ~2 hours with Firebase rotation + plugin conditional fix) | ✅ done 2026-05-08 (#46 + #47) |
-| 2 | Funding plumbing — `funding.json` (FLOSS/fund hard prerequisite) + `.github/FUNDING.yml` | 1 час | ⬜ Day 2 (Fri 2026-05-09) |
+| 2 | Funding plumbing — `funding.json` (secondary funding programme hard prerequisite) + `.github/FUNDING.yml` | 1 час | ⬜ Day 2 (Fri 2026-05-09) |
 | 3 | README polish — License → AGPL-3.0, Status → Alpha 2, ссылки на Threat Model + ADR + Codeberg, softer Funding wording, Mermaid диаграмма, 5 новых секций; правки в RELEASE_NOTES + CONTRIBUTING | 2 часа | ⬜ Day 2 (Fri 2026-05-09) |
 | 4 | English exec summary для Threat Model + Doctrine; ADR index `docs/adr/README.md`; `ARCHITECTURE.md` в корне | 2 часа | ⬜ Day 4 |
 
@@ -108,7 +108,7 @@ Track A + Track C идут параллельно. Track B стартует по
 
 ## Track E — Censorship Resistance (Stage 5)
 
-**Цель:** PHANTOM работает в RU без VPN, без Orbot, без сторонних приложений. Прямое требование для NLnet review (censorship resistance — central pitch).
+**Цель:** PHANTOM работает в RU без VPN, без Orbot, без сторонних приложений. Censorship resistance — central pitch проекта.
 
 **ADR-018** (Tor + Bridges + Xray REALITY hybrid). Основные коммиты на ветке `feat/tor-stage5-bridges-via-onionwrapper` (5 stage-5 коммитов запушены, PR в master не открыт).
 
@@ -124,9 +124,9 @@ Track A + Track C идут параллельно. Track B стартует по
 | 5E.B.4 | Wire XrayService into PhantomMessagingService | ✅ done | `98245f69` |
 | 5E.B.5 | Production validation Tecno МТС без VPN | ✅ done | Test 14 / 2026-05-07 — text + voice 5 sec (chunks 55 KB) пролетают через REALITY |
 
-**Backlog после Stage 5 (cleanup, не блокеры для NLnet body):**
+**Backlog после Stage 5 (cleanup, не блокеры для Alpha-2):**
 
-- ⬜ **Prekey republish fix** — pre-existing bug, surfaced by Stage 5 testing. Long-offline user → bundle 404 → no-one can send to them. Client-side retry on connect OR relay-side fallback на signed-prekey-only bundle. ~1-2 часа. **Не вошёл в Day 1 — реалистично сдвигается на Day 5+ или post-NLnet (см. council-revised plan).**
+- ⬜ **Prekey republish fix** — pre-existing bug, surfaced by Stage 5 testing. Long-offline user → bundle 404 → no-one can send to them. Client-side retry on connect OR relay-side fallback на signed-prekey-only bundle. ~1-2 часа. **Не вошёл в Day 1 — реалистично сдвигается на Day 5+ или post-Alpha-2 (см. council-revised plan).**
 - ✅ **Restore strict Xray routing** — done 2026-05-08 in PR #45 (commit `d7ba3a41`). Three-rule chain (multi-syntax domain match + port-443 fallback + catchall blackhole). Verified end-to-end via Caddy `remote_ip: 172.18.0.7`.
 - ✅ **ADR-019 Xray REALITY rationale** — done 2026-05-08 in PR #48 (commit `20e71fbb`). 371-line ADR covering five sub-rationale subsections + threat model + known limitations.
 - ✅ **PR в master** для Stage 5 — done 2026-05-08 morning as #43 (squash merge).
@@ -147,13 +147,13 @@ Track A + Track C идут параллельно. Track B стартует по
 | Public channels (read-only broadcast) | новый ADR | ~1 неделя | ⬜ |
 | Hosted username directory | ADR-007 (draft) | ~1 неделя | ⬜ |
 | Pluggable transports (obfs4) | ADR-015 (draft) | ~3 недели | ⬜ |
-| iOS port (NLnet Milestone 1) | ADR-014 (draft) | 3–4 месяца | ⬜ |
+| iOS port (Phase-1 milestone) | ADR-014 (draft) | 3–4 месяца | ⬜ |
 
 ---
 
 ## Реалистичный таймлайн
 
-### Неделя 1 (May 3–9) — Reliability + Grant Prep
+### Неделя 1 (May 3–9) — Reliability + Release Polish
 
 - [ ] **Сегодня (3 May):** ручной тест PR 3 на Tecno ↔ emu → merge если ОК
 - [ ] **May 4–5 (пн-вт):** Track C Phase 1 + Phase 2 (репо cleanup + funding plumbing) — полдня
@@ -165,26 +165,26 @@ Track A + Track C идут параллельно. Track B стартует по
 - [ ] **May 10–13:** PR 4 storage durability (~3 дня)
 - [ ] **May 14–16:** PR 5 UX cleanup (~2 дня) + старт Track B F22
 
-### Неделя 3 (May 17–23) — Security gate для NLnet
+### Неделя 3 (May 17–23) — Security gate перед Alpha-2 release
 
 - [ ] **May 17–19:** F22 завершить (~2 дня)
 - [ ] **May 20–22:** F8 RatchetState wrap (~2 дня)
 - [ ] **May 23:** старт F19+F20 call signalling E2EE
 
-### Неделя 4 (May 24–31) — финальный спринт к NLnet
+### Неделя 4 (May 24–31) — финальный спринт к Alpha-2 release
 
 - [ ] **May 24–27:** F19+F20 (~3 дня) + F2+F13 (~3 дня, можно параллельно)
-- [ ] **May 28–29:** Tag `v0.1.0-alpha.2`, NLnet snapshot prep
-- [ ] **May 30–31:** Финальное ревью NLnet draft V2, proofread, чек-лист
-- [ ] **June 1, 12:00 CEST:** **Подать NLnet** ✊
+- [ ] **May 28–29:** Tag `v0.1.0-alpha.2`, Alpha-2 snapshot prep
+- [ ] **May 30–31:** Финальное ревью release draft V2, proofread, чек-лист
+- [ ] **June 1, 12:00 CEST:** **Release Alpha-2 + первое окно external funding submissions** ✊
 
-### Июнь — FLOSS + продолжение Security
+### Июнь — продолжение Security + дополнительные funding submissions
 
-- [ ] **June 1–7:** мигание после NLnet, продолжение Track B (F1, F3, F4)
+- [ ] **June 1–7:** мигание после Alpha-2 release, продолжение Track B (F1, F3, F4)
 - [ ] **June 8–14:** реализация attachments (Track D первая фича) ИЛИ groups hardening
 - [ ] **June 15–22:** Track B F11+F26 (relay token), Track B P2 batch
-- [ ] **June 23–29:** **Подать FLOSS/fund** (deadline 30 June)
-- [ ] **Параллельно (rolling):** FUTO concept note, Emergent Ventures, Awesome Foundation
+- [ ] **June 23–29:** **Submit secondary external funding** (window end of June)
+- [ ] **Параллельно (rolling):** rolling external funding submissions per 
 
 ### Июль — Сентябрь (Alpha 2 → Beta)
 
@@ -194,7 +194,7 @@ Track A + Track C идут параллельно. Track B стартует по
 - [ ] Username directory
 - [ ] Closing remaining Track B P2 items
 - [ ] Pluggable transports (obfs4) старт
-- [ ] iOS port старт (если получили NLnet — это Milestone 1)
+- [ ] iOS port старт (Phase-1 milestone if external funding lands)
 
 ### Октябрь — Декабрь (Beta)
 
@@ -220,13 +220,13 @@ PR 3 (voice) ──┬─► PR 1 ──► PR 4 ──► PR 5 ──► Track 
                │
 Track C ──────┘  (параллельно, любой день)
 
-PR 5 done ──► Track B F22 ──► F8 ──► F19+F20 ──► F2+F13 ──► NLnet snapshot
+PR 5 done ──► Track B F22 ──► F8 ──► F19+F20 ──► F2+F13 ──► Alpha-2 snapshot
                                                               │
                                                               ▼
                                                           tag v0.1.0-alpha.2
                                                               │
                                                               ▼
-                                                          NLnet submit (1 June)
+                                                          Alpha-2 release (1 June) + external funding window opens
 
 Track B 5–8 → продолжение в июне → Kickstarter clearance
 
@@ -237,37 +237,17 @@ Track D (Alpha 2 features) → начинается после Track B 1–4 м�
 
 ## Риски и mitigation
 
-1. **NLnet 29 дней — реалистично только если security work идёт без задержек.** Mitigation: даже если успеем закрыть только F22 + F8 (items 1, 3), это уже обоснованный snapshot. NLnet draft V2 уже признаёт что F19+F20 в работе.
+1. **24 дня до Alpha-2 release window — реалистично только если security work идёт без задержек.** Mitigation: даже если успеем закрыть только F22 + F8, это уже обоснованный snapshot. Release draft V2 уже признаёт что F19+F20 в работе.
 2. **Track B сложнее чем оценено** — security work часто всплывает с edge cases. Mitigation: каждый item — отдельный PR, не бандлим.
-3. **Voice/calls остаются нестабильными до Phase 5 (UnifiedPush, Feb 2027)** — это known limitation, calls=experimental в Alpha. Не блокирует NLnet.
-4. **Solo founder bottleneck** — если Vladislav заболеет/занят неделю, NLnet deadline под угрозой. Mitigation: Phase 4 grant readiness даёт максимальный снимок репо, заявка может идти даже без полного Track B closure.
+3. **Voice/calls остаются нестабильными до Phase 5 (UnifiedPush, Feb 2027)** — это known limitation, calls=experimental в Alpha. Не блокирует Alpha-2 release.
+4. **Solo founder bottleneck** — если Vladislav заболеет/занят неделю, release window под угрозой. Mitigation: Phase 4 release polish даёт максимальный снимок репо, выпуск может идти даже без полного Track B closure.
 
 ---
 
-## Грантовые программы (полный список)
+## External funding
 
-Из [`Привлечение инвесторов или получение грантов..pdf`](../../Привлечение инвесторов или получение грантов..pdf) (untracked, локально):
+The canonical funding-channel list lives in [](../../funding.json) at the repository root. That file is the source of truth for what funding programmes are pursued and on what schedule.
 
-| Программа | Сумма | Дедлайн | Шанс | Статус |
-|-----------|-------|---------|------|--------|
-| **NLnet NGI Zero Commons Fund** | €30,000 | 2026-06-01 | 15–25% | 🟡 draft V2 готов |
-| **FUTO Microgrants** | $2,000 (Mac mini) | rolling | 25–40% | ⬜ концепт-нота |
-| **FLOSS/fund (Zerodha)** | $25,000 | 2026-06-30 | — | ⬜ требует funding.json |
-| **Open Source Collective** | fiscal host | rolling | high | ⬜ регистрация |
-| **Emergent Ventures (Mercatus)** | $5–10K | rolling | low | ⬜ 3-вопросная форма |
-| **OTF Internet Freedom Fund** | $50–80K | rolling | ≤5% | ⬜ концепт-нота |
-| **Awesome Foundation Digital Privacy** | $1,000 | monthly | — | ⬜ |
-| **Access Now Project Galileo** | DDoS/WAF | через спонсора | — | ⬜ |
-| **JetBrains Open Source License** | All Products | rolling | high | ⬜ |
-| **Liberapay / Polar / BMAC / thanks.dev** | micro-donations | — | — | ⬜ setup в Track C Phase 2 |
-
-**Контактный email:** `hello@phntm.pro`
-
-**Программы исключены** (с обоснованием в PDF):
-- Mozilla MOSS — на indefinite pause с 2020
-- Sovereign Tech Fund — explicit ban на messaging apps
-- EU Horizon / NGI Sargasso — требует EU lead applicant
-- OTF FOSS Sustainability Fund — closed до spring 2027
 
 ---
 
@@ -279,27 +259,27 @@ Track D (Alpha 2 features) → начинается после Track B 1–4 м�
 
 **Day 2 запланирован на завтра 2026-05-09** (~3 часа):
 1. README polish — License → AGPL-3.0 (real badge), Status → Alpha 2, **first 3 lines hero про Stage 5E**, softer Funding section, ссылки на ThreatModel + ADR + Codeberg
-2. `funding.json` (FLOSS/fund mandatory)
+2. `funding.json`
 3. `.github/FUNDING.yml` placeholder для Open Collective / Liberapay / Polar / BMAC
 4. Update `RELEASE_NOTES.md` + `CONTRIBUTING.md` с правильным License wording
 
 **Day 3** — demo video Stage 5E (~3-4 часа).
 **Day 4** — Threat Model EN exec summary + ADR index + ARCHITECTURE.md + prekey republish fix.
-**Day 5** — Donation rails registration + FUTO Microgrants application.
+**Day 5** — Donation rails registration + secondary external funding application.
 **Day 6** — public write-up (HN/lobste.rs EN, Хабр RU). Soft publish, не "front page push".
 **Days 7-12** — F22 SPK/OPK keystore-wrap (single security item) + SECURITY_ROADMAP.md.
-**Days 13-15** — NLnet draft V2 финализация + submit день 15 (10-day буфер до 2026-06-01).
-**Days 16-25** — Track A PR 3 merge + PR 1 + FLOSS/fund подача + FUTO follow-up.
+**Days 13-15** — release draft V2 финализация + Alpha-2 release day 15 (10-day буфер до 2026-06-01).
+**Days 16-25** — Track A PR 3 merge + PR 1 + secondary external funding submissions per funding.json.
 
-Полный 25-day plan в `~/.claude/projects/.../memory/plan_25_days_to_nlnet.md` (локально, не в репо).
+Полный 25-day plan в `~/.claude/projects/.../memory/plan_25_days_to_release.md` (локально, не в репо).
 
 **Активные ветки:** все merged. Master теперь содержит Stage 5 целиком.
 
-**Известные follow-ups, не блокирующие NLnet:**
-- Prekey republish fix (pre-existing bug, surfaced by Stage 5 testing) — Day 4 если успеется, иначе post-NLnet
+**Известные follow-ups, не блокирующие Alpha-2:**
+- Prekey republish fix (pre-existing bug, surfaced by Stage 5 testing) — Day 4 если успеется, иначе post-Alpha-2
 - Firebase Console SHA-1 fingerprints добавить как defence-in-depth — opportunistic
 - `keystores/phantom-release.keystore` backup в off-device location — operator action whenever convenient
-- ADR-020 (adaptive transport selection) + ADR-021 (multi-server Xray fan-out) + ADR-022 (iOS XCFramework) — все упомянуты в ADR-019 как Phase 2 deliverables, реализация post-NLnet
+- ADR-020 (adaptive transport selection) + ADR-021 (multi-server Xray fan-out) + ADR-022 (iOS XCFramework) — все упомянуты в ADR-019 как Phase 2 deliverables, реализация post-Alpha-2
 
 ---
 
@@ -310,4 +290,4 @@ Track D (Alpha 2 features) → начинается после Track B 1–4 м�
 - [`docs/project/ARCHITECTURAL_DECISIONS_TODO.md`](ARCHITECTURAL_DECISIONS_TODO.md) — 10 pending ADR драфтов
 - [`KNOWN_ISSUES.md`](../../KNOWN_ISSUES.md) — публичный список багов и архитектурных choices
 - [`ROADMAP.md`](../../ROADMAP.md) — публичный высокоуровневый roadmap
-- Локально (untracked): NLnet draft V2, Привлечение инвесторов PDF
+- Локально (untracked): release draft V2, Привлечение инвесторов PDF

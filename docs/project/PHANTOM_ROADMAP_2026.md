@@ -33,8 +33,8 @@ PHANTOM Alpha 1 **функционально полнее** чем казало�
 - **Push notifications** работают на обеих платформах
 - **F13/F14/F15** identity-architecture issue resolved (prekey infrastructure)
 - **Username uniqueness** + verification system live
-- **Audit** completed (NLnet free service Radically Open Security)
-- **NLnet milestones** все четыре delivered
+- **Audit** completed (free service from a public-interest funding programme Radically Open Security)
+- **project milestones** все четыре delivered
 - **Kickstarter** ready (если решим запускать)
 
 ### Ключевые архитектурные блокеры
@@ -47,15 +47,15 @@ PHANTOM Alpha 1 **функционально полнее** чем казало�
 4. **Attachment server** — нужен для voice/files >50KB, решает Tecno bug. ~4 недели.
 5. **Push notifications** (UnifiedPush + APNs hybrid) — критично для retention. ~3-4 недели.
 
-### Что финансирует NLnet (если получим)
+### Funding model (если получим external funding)
 
-NLnet €30,000 на 12 месяцев финансирует **только core FOSS R&D**:
+External funding (~€30,000 over 12 months from public-interest funding programmes) финансирует **только core FOSS R&D**:
 - iOS client feature parity (M1)
 - Group messaging protocol + spec (M2)
 - Censorship resistance (Tor, pluggable transports) (M3)
 - Audit + Threat Model v2 + Beta 1 (M4)
 
-Premium / Stripe / Recovery Phrase / verification authority — **отдельный коммерческий трек на собственные средства Willen LLC и/или Kickstarter**, не финансируется грантом.
+Premium / Stripe / Recovery Phrase / verification authority — **отдельный коммерческий трек на собственные средства Willen LLC и/или Kickstarter**, к funding programmes отношения не имеет.
 
 ---
 
@@ -74,13 +74,13 @@ Premium / Stripe / Recovery Phrase / verification authority — **отдельн
 **Период:** Май-Июнь 2026 (8 недель)
 
 ### Goal
-Подать NLnet, исправить **F13/F14/F15** критический security блокер, развернуть attachment server для решения Tecno bug. Завершить 10 quick wins для polish.
+Подать external funding programme, исправить **F13/F14/F15** критический security блокер, развернуть attachment server для решения Tecno bug. Завершить 10 quick wins для polish.
 
 ### Deliverables
 
-**Week 1-2 (1-14 Мая) — NLnet submission + quick wins parallel**
+**Week 1-2 (1-14 Мая) — external funding submission + quick wins parallel**
 
-- NLnet заявка submitted (31 мая дедлайн buffer)
+- external funding programme заявка submitted (release window buffer)
 - 10 quick wins implemented:
   - FLAG_SECURE на всех Activity (1 день)
   - Read receipts toggle (3 дня)
@@ -122,13 +122,13 @@ Premium / Stripe / Recovery Phrase / verification authority — **отдельн
 
 ### Risks
 
-- **NLnet rejection** (5-15% acceptance rate). Mitigation: OTF parallel application
+- **external-funding rejection** (5-15% acceptance rate). Mitigation: OTF parallel application
 - **F13/F14/F15 fix breaks existing sessions.** Mitigation: tested migration path, force re-handshake gracefully
 - **Tecno bug persists даже after attachment server.** Mitigation: testing на дополнительный Android device (Pixel 6a)
 
 ### Success Criteria
 
-- ✅ NLnet submitted перед 31 мая
+- ✅ external funding submitted перед release window end of May
 - ✅ Voice messages работают на Pixel/Samsung/Xiaomi (не только эмулятор)
 - ✅ Crypto test count grows from 16 → 25+
 - ✅ All 10 quick wins shipped в Alpha 2 (preview release Конец Июня)
@@ -136,8 +136,8 @@ Premium / Stripe / Recovery Phrase / verification authority — **отдельн
 ### Parallel: Кадровые операционные задачи
 
 - Купить **Pixel 6a/7a** (б/у, $150-250) для тестирования "обычного" Android
-- Сделать репозиторий **публичным** перед NLnet submission (или хотя бы добавить NLnet review-ers как collaborators)
-- Создать **Codeberg mirror** для NLnet (требование если хотим максимум points)
+- Сделать репозиторий **публичным** перед external funding submission (или хотя бы добавить внешних reviewer’ов как collaborators)
+- Создать **Codeberg mirror** для (улучшает discoverability)
 - **Issues** в GitHub созданы из drafts (Releases/GITHUB_ISSUES_DRAFT.md)
 
 ---
@@ -284,7 +284,7 @@ Premium / Stripe / Recovery Phrase / verification authority — **отдельн
 **Период:** Ноябрь-Декабрь 2026 (8 недель)
 
 ### Goal
-iOS клиент с feature parity с Android Alpha 1+. Этот фаза — **NLnet Milestone 1 deliverable** (если получили грант, € 9,000 покрывает эту работу).
+iOS клиент с feature parity с Android Alpha 1+. Этот фаза — **Phase-1 milestone deliverable** (если получили грант, € 9,000 покрывает эту работу).
 
 ### Prerequisites (до старта iOS)
 
@@ -347,7 +347,7 @@ iOS клиент с feature parity с Android Alpha 1+. Этот фаза — **
 **Период:** Январь-Февраль 2027 (8 недель)
 
 ### Goal
-Pluggable transports + Tor onion service для censorship resistance. Push notifications. Подготовка к security audit (NLnet Milestone 3-4).
+Pluggable transports + Tor onion service для censorship resistance. Push notifications. Подготовка к security audit (Phase-3 milestone-4).
 
 ### Deliverables
 
@@ -394,7 +394,7 @@ Pluggable transports + Tor onion service для censorship resistance. Push noti
 
 - **Tor relay attracts attention** в некоторых юрисдикциях. Mitigation: Hetzner ToS allows Tor exit nodes, our relay не exit (только onion service)
 - **Push delivery unreliable** даже с UnifiedPush. Mitigation: foreground service остаётся primary, push — supplementary
-- **Audit findings serious** (high or critical). Mitigation: бюджет (€6,000 NLnet M4) and time для remediation
+- **Audit findings serious** (high or critical). Mitigation: бюджет (€6,000 external funding programme M4) and time для remediation
 
 ### Success Criteria
 
@@ -408,7 +408,7 @@ Pluggable transports + Tor onion service для censorship resistance. Push noti
 **Период:** Март-Апрель 2027 (8 недель)
 
 ### Goal
-Закрыть audit findings. Threat Model v2 published. Beta 1 release. NLnet Milestone 4 delivered. Финальная подготовка для возможного Kickstarter.
+Закрыть audit findings. Threat Model v2 published. Beta 1 release. Phase-4 milestone delivered. Финальная подготовка для возможного Kickstarter.
 
 ### Deliverables
 
@@ -438,13 +438,13 @@ Pluggable transports + Tor onion service для censorship resistance. Push noti
 - Performance benchmarks
 - Bug bash (final testing pass)
 
-**Week 47-48 (Апрель 3-4 нед) — Beta 1 release + NLnet final report**
+**Week 47-48 (Апрель 3-4 нед) — Beta 1 release + external funding programme final report**
 
 - v0.2.0-beta.1 tagged
 - Signed APK + iOS IPA published
-- Reproducible builds verified by independent third party (можем привлечь NLnet community)
+- Reproducible builds verified by independent third party (можем привлечь external open-source community)
 - Press release / announcement (privacy-focused outlets, FOSS news, EU-tech press)
-- NLnet Milestone 4 final report submitted
+- Phase-4 milestone final report submitted
 - Public roadmap for next 12 months published
 - Decision point: Kickstarter launch or продолжение private alpha
 
@@ -464,7 +464,7 @@ Pluggable transports + Tor onion service для censorship resistance. Push noti
 - ✅ Beta 1 (v0.2.0-beta.1) shipped
 - ✅ Audit findings remediated or transparently documented
 - ✅ Threat Model v2 published
-- ✅ NLnet final report submitted
+- ✅ external funding programme final report submitted
 - ✅ 5+ languages supported
 - ✅ Test devices include Pixel, Samsung, Tecno, Xiaomi (minimum 4 OEMs)
 
@@ -550,23 +550,23 @@ Realistic decision point: **Март 2027** (после audit findings clear), �
 
 ### Kickstarter NOT for
 
-- Core development (это NLnet и собственные средства)
+- Core development (это external grant + собственные средства)
 - "Saving the project" — если project depends on Kickstarter, не запускать
 
 ---
 
-## NLNET MILESTONES — MAPPING К ROADMAP
+## EXTERNAL FUNDING — MAPPING К ROADMAP
 
-| NLnet Milestone | Roadmap Phases | Months | Budget | Deliverables |
-|-----------------|----------------|--------|--------|--------------|
+| Milestone | Roadmap Phases | Months | Budget | Deliverables |
+|-----------|----------------|--------|--------|--------------|
 | M1: iOS feature parity | Phase 4 | Nov-Dec 2026 | €9,000 | iOS app в TestFlight, KMP XCFramework, libsodium iOS, cross-platform interop tests |
 | M2: Group messaging protocol + spec | Phase 2 | Jul-Aug 2026 | €8,000 | PROTOCOL_GROUPS.md, reference implementation in shared core, supports up to 50, formal security analysis |
 | M3: Censorship resistance | Phase 5 | Jan-Feb 2027 | €7,000 | obfs4/Snowflake integration, Tor onion relay, reproducible builds, censorship threat model, empirical test results |
-| M4: Audit + Threat Model v2 + Beta 1 | Phase 5-6 | Feb-Apr 2027 | €6,000 | ROS audit completed, Threat Model v2 published, Beta 1 release, full audit response |
+| M4: Audit + Threat Model v2 + Beta 1 | Phase 5-6 | Feb-Apr 2027 | €6,000 | external audit completed, Threat Model v2 published, Beta 1 release, full audit response |
 
-**Total NLnet:** €30,000 / 12 months / 4 milestones
+**Total external funding budget:** €30,000 / 12 months / 4 milestones
 
-**Если NLnet rejected:** roadmap не меняется, но темп замедляется (нужно искать alternative funding для milestones cost). OTF parallel application provides backup.
+**Если external funding не материализуется:** roadmap не меняется, но темп замедляется (нужно искать alternative funding для milestones cost). Secondary funding sources (см. `funding.json`) provide backup.
 
 ---
 
@@ -592,7 +592,7 @@ Realistic decision point: **Март 2027** (после audit findings clear), �
 | Hetzner additional servers (directory, billing, MinIO) | ~€20-40/month | Phase 1-3 progressive |
 | Domain renewals (phntm.pro + variations) | ~$15/year | ongoing |
 
-### Free services to use (NLnet ecosystem)
+### Free services to use (open-source funding ecosystem)
 
 - **Radically Open Security** — security audit (Phase 5-6)
 - **ifrOSS** — license review
@@ -617,13 +617,13 @@ Realistic decision point: **Март 2027** (после audit findings clear), �
 | Security vulnerability discovered post-launch | Med | High | Security disclosure process, hotfix capability, audit catches most |
 | Apple App Store rejection | Med | Med | App Privacy disclosure правильный, готовность к manual review, plan B (TestFlight only initially) |
 | Stripe закрывает account из-за privacy vertical | Low-Med | High | Multiple payment processors backup (Paddle, FastSpring), accept higher fees |
-| Burnout solo развития на 12 месяцев | High | High | Sustainable pace, regular breaks, NLnet milestone-based payments help structure |
+| Burnout solo развития на 12 месяцев | High | High | Sustainable pace, regular breaks, milestone-based external funding payments help structure |
 
 ### Significant risks
 
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
-| NLnet rejection | High (~85% reject rate) | Med | OTF parallel, self-funding ability |
+| external-funding rejection | High (~85% reject rate) | Med | OTF parallel, self-funding ability |
 | iOS development takes longer than planned | High | Med | Plan B: contract iOS dev for 2-3 months |
 | Tecno / OEM bug not fully fixed | Med | Low | Document as known issue, push notification helps |
 | Translation quality issues | Med | Low | Native speaker review process |
@@ -636,7 +636,7 @@ Realistic decision point: **Март 2027** (после audit findings clear), �
 | Hetzner ban (account closure) | Low | High | Backup VPS provider configured (Vultr / OVH), data-portable architecture |
 | GitHub takedown / private | Low | High | Codeberg mirror primary, GitHub mirror secondary |
 | Cloudflare ban | Low | Med | Direct DNS+TLS works (Caddy handles) |
-| Personal circumstances (illness, family) | Med | Med | Reasonable buffers in plan, NLnet milestones flexible на месяц-два |
+| Personal circumstances (illness, family) | Med | Med | Reasonable buffers in plan, external-funding milestones flexible на месяц-два |
 
 ---
 
@@ -646,7 +646,7 @@ Realistic decision point: **Март 2027** (после audit findings clear), �
 
 | Phase | Primary metric | Target |
 |-------|----------------|--------|
-| P1 | NLnet submitted + F13/F14/F15 fixed | Yes by 30 Jun |
+| P1 | external funding submitted + F13/F14/F15 fixed | Yes by 30 Jun |
 | P2 | Unique @username works, Verified ✓ live | Yes by 31 Aug |
 | P3 | Plus subscription via app | Yes by 31 Oct |
 | P4 | iOS in TestFlight | Yes by 31 Dec |
@@ -680,7 +680,7 @@ Realistic decision point: **Март 2027** (после audit findings clear), �
 
 ### Triggered re-evaluation
 
-- NLnet decision (положительный или отрицательный) — ~Авг 2026 для June submission
+- external-funding decision (положительный или отрицательный) — ~Авг 2026 для June submission
 - OTF decision (если apply) — rolling, можем получить anywhere Q3-Q4 2026
 - Audit findings — если catastrophic, replan Phase 6
 - External offer (acquisition, investment, partnership) — discuss case-by-case
@@ -725,13 +725,13 @@ These remain in **vision document** but not in active roadmap until Beta 1 done.
 
 1. **Сначала фундамент** (security, infrastructure), потом фичи
 2. **Архитектурные решения** — write ADR before code
-3. **NLnet и Premium — параллельные треки**, не конфликт
+3. **External funding и Premium — параллельные треки**, не конфликт
 4. **Quality over coverage** — лучше 8 фич working perfectly than 20 buggy
 5. **Honesty about state** — KNOWN_ISSUES.md, threat model, audit findings — всё публично
 6. **Sustainable pace** — solo на 12 месяцев означает burnout management critical
 
 К Апрелю 2027 PHANTOM становится **production-ready privacy messenger** с Premium revenue model, audited security, multi-platform support, и foundation for scaling.
 
-Если NLnet получим — финансирует core. Если не получим — медленнее но не блокирует. Premium revenue + Kickstarter — sustainability post-grant.
+Если external funding получим — финансирует core. Если не получим — медленнее но не блокирует. Premium revenue + Kickstarter — sustainability post-grant.
 
 Roadmap живой документ. Re-evaluate quarterly, update as реальность меняется.

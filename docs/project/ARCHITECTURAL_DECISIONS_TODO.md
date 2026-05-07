@@ -19,7 +19,7 @@
 **Зачем писать ADR до кода:**
 
 - Через 6 месяцев ты (или Claude Code, или новый contributor) забудешь почему сделано именно так. ADR это память.
-- Reviewers (NLnet, audit, security researchers) видят зрелость процесса.
+- Внешние reviewers (audit, security researchers, новые contributor'ы) видят зрелость процесса.
 - Architectural drift — главная причина legacy code. ADR заранее исключает "случайные" решения.
 - Если решение оказывается неправильным — superseded ADR показывает что мы знали trade-offs и сознательно поменяли.
 
@@ -885,7 +885,7 @@ Rejected: would mean reimplementing all crypto, messaging, transport. ~10x effor
 
 ### Context
 
-NLnet Milestone 3 deliverable: censorship resistance via pluggable transports. PHANTOM in censored regions (Russia, China, Iran, Belarus) needs to circumvent DPI / SNI inspection / connection blocking.
+Phase-3 censorship-resistance deliverable: pluggable transports. PHANTOM in censored regions (Russia, China, Iran, Belarus) needs to circumvent DPI / SNI inspection / connection blocking.
 
 ### Decision
 
@@ -916,7 +916,7 @@ Implementation:
 ### Consequences
 
 **Positive:**
-- Works in censored networks (NLnet Milestone 3)
+- Works in censored networks (Phase-3 deliverable)
 - Multiple fallback layers (defense in depth)
 - Foundation for future censorship-resistance features
 - Tor onion = strongest anti-censorship guarantee
@@ -927,7 +927,7 @@ Implementation:
 - Latency: Tor ~200ms-2s vs direct ~50ms
 
 **Neutral:**
-- Need testing in actual censored environment (NLnet wants empirical proof)
+- Need testing in actual censored environment (empirical proof on real RU / IR / CN networks before claiming this works)
 
 ### Alternatives considered
 
@@ -1079,9 +1079,9 @@ This document drafts 10 ADRs covering all major architectural decisions for the 
 
 6. **Phase 4 W31-32:** Write ADR-015, ADR-016 (closer to censorship work)
 
-**For NLnet submission (May 31):**
+**For the Alpha-2 release window (~end of May):**
 
-If reviewers look at `docs/adr/`, they should see:
+If external reviewers look at `docs/adr/`, they should see:
 - ADR-001 through ADR-006 (existing)
 - ADR-007, ADR-008 (written)
 - Possibly ADR-009 (if time)

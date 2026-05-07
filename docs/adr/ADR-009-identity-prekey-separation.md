@@ -817,7 +817,7 @@ The security improvement is in separation, not in regeneration.
   - `KNOWN_ISSUES.md` ISSUE-011 — F12/F15 lines marked CLOSED post-merge
 
 - Tag `v0.1.0-alpha.2` after Phase 1 Week 4 PR merges; this is the
-  NLnet submission snapshot per Phase 1 Track E plan
+  Alpha-2 release snapshot per Phase 1 Track E plan
 
 ## References
 

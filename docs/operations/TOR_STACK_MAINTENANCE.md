@@ -90,7 +90,7 @@ A backstop for items that slip through automation. Calendar reminder every 90 da
 
 ```
 Q1 — March 1
-Q2 — June 1   (NOTE: lines up with NLnet / FLOSS-fund grant deadline awareness)
+Q2 — June 1
 Q3 — September 1
 Q4 — December 1
 ```
@@ -168,7 +168,7 @@ Each emergency hotfix appends one line:
 YYYY-MM-DD — SECURITY HOTFIX: tor X.Y.Z patches CVE-2026-NNNNN (heap overflow in directory authority parser). Briar shipped at A.B.C; we bumped within H hours of advisory. Tested on all platforms.
 ```
 
-This timestamped record is the audit trail when grant reviewers, security auditors, or users ask "how do you handle Tor updates?".
+This timestamped record is the audit trail when external reviewers, security auditors, or users ask "how do you handle Tor updates?".
 
 ---
 

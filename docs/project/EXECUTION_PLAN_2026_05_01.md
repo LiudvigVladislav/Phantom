@@ -2,7 +2,7 @@
 
 Living roadmap for the current sprint. Ties together yesterday's strategic plan, today's audit findings (architecture + security), and the QA backlog from manual device testing.
 
-This document is **the authoritative working plan for the reliability-sprint mechanics** (Track A + Track B detail). For the cross-track timeline that ties Reliability + Security + Grant Readiness + Alpha 2 features together, see [`MASTER_TIMELINE_2026.md`](MASTER_TIMELINE_2026.md).
+This document is **the authoritative working plan for the reliability-sprint mechanics** (Track A + Track B detail). For the cross-track timeline that ties Reliability + Security + Release Polish + Alpha 2 features together, see [`MASTER_TIMELINE_2026.md`](MASTER_TIMELINE_2026.md).
 
 When in doubt, read MASTER_TIMELINE first for the big picture, this file second for Track A/B details.
 
@@ -23,7 +23,7 @@ When in doubt, read MASTER_TIMELINE first for the big picture, this file second 
 
 ## Strategic context (carried over from prior sessions)
 
-From the official PHANTOM roadmap v2.0 (PHANTOM_ROADMAP_2026.md, NLNET_APPLICATION_DRAFT_V2.md):
+From the official PHANTOM roadmap v2.0 (PHANTOM_ROADMAP_2026.md):
 
 - **Mission:** Secure. Decentralised. Uncensorable. Production-quality messenger for iOS and Android with circumvention and offline modes. Not a niche tool — UX as smooth as Telegram, security as strong as Signal, resilience as good as Briar.
 - **Stack (frozen):** KMP + Compose Multiplatform, libsignal-client + libsodium, SQLDelight + SQLCipher, Ktor, Rust relay/bootstrap/discovery, Go obfuscation bridge, Kademlia DHT for P2P.
@@ -189,7 +189,7 @@ Pre-launch security work, ordered by severity. New F19–F26 from today's audit 
 - **PR 4 merged** = durability against Keystore invalidation events (biometric reset, factory-state edge cases).
 - **PR 5 merged** = visual polish + Tier-3 onboarding for aggressive-OEM users.
 - **Track B items 1–8 closed** = security clearance for Kickstarter announcement. Items 9–17 can land during the campaign window.
-- **NLNet application** can submit any time after Track B items 1–4 close (the first four cover the most user-visible privacy claims).
+- **External funding application** can submit any time after Track B items 1–4 close (the first four cover the most user-visible privacy claims).
 
 ---
 
@@ -226,7 +226,7 @@ Verified on Tecno Spark Go 2023 / HiOS / Android 12 + twin Pixel 8 Pro emulators
 2. **Voice-message hard cap** — to be set by PR 3. Default working assumption: 10 MB hard cap with chunking, ~75 KB per chunk. Vladislav can override.
 3. **UI polish (radar circles, online indicator, etc.)** — bundled into PR 5, not split into a separate "Alpha-3 visual polish" PR. Use `ui-prototyper` agent inside PR 5 scope.
 4. **Track B (security)** — runs in parallel with Track A after PR 2 ships. Items 1–8 are Kickstarter gating; 9–17 can land during the campaign window.
-5. **NLNet application** — submittable any time after Track B items 1–4 close.
+5. **External funding application** — submittable any time after Track B items 1–4 close.
 6. **Calls = experimental in Alpha; PR 2.6 deferred.** After PRs #29 and #30 closed all definitively-fixable call UX bugs above the transport layer, real-device QA on 2026-05-02 surfaced asymmetric audio on Tecno HiOS, mid-call crash risk on reconnect, and state desync between participants. Root cause is architectural (WebRTC voice over a transport that reconnects every ~30 s on aggressive-OEM devices). Each further PR on calls would have diminishing returns relative to PR 3 (voice messages, async, runs over the regular transport, ~90 % of real-world voice use case). Decision: ship Alpha with calls labelled experimental in `KNOWN_ISSUES.md` ISSUE-014, prioritise PR 3 next. PR 2.6 (`JavaAudioDeviceModule`, `AudioFocus`, suppress reconnect during active call, default-on speakerphone) parked until Phase 5 makes the underlying transport stable enough for the work to stick.
 
 ---

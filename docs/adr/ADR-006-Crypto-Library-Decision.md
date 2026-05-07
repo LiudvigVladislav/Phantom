@@ -84,7 +84,7 @@ For **Beta and beyond:**
 
 - **Re-evaluate libsignal-client** integration once:
   - Phase 1 security blockers are closed (F12, F15, F8, F1, F3, F4)
-  - Independent crypto audit performed (Phase 6, NLnet milestone)
+  - Independent crypto audit performed (Phase 6 milestone)
   - AGPL-3.0 license compatibility re-confirmed for our distribution
 - If audit recommends libsignal — migrate; otherwise stay on libsodium
   with full security hardening landed in Phase 1

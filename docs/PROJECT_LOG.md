@@ -71,7 +71,7 @@ Also tracked:
 - ⏳ GDPR review for EU compliance (Art. 13/14 disclosures)
 - ⏳ Russian translation review for legal-terminology accuracy
 - ✅ ~~`LICENSE` file at repo root matching the AGPL-3.0 intent of [ADR-006](adr/ADR-006-Crypto-Library-Decision.md)~~ shipped 2026-04-27 (`e99aac0e` + `c403b7cf` + `27cd9bd1` + `0bc715e1`)
-- ⏳ NLnet grant submission (deadline 2026-06-01)
+- ⏳ External funding programme submission (target window 2026-06-01)
 - ⏳ Locale-aware in-app linking from Onboarding to `/terms/ru` / `/privacy/ru` based on `Locale.getDefault()` (currently always English)
 
 ---
@@ -181,8 +181,9 @@ client-side reconnect cost.
   contradicts ADR-001 (zero-third-party-metadata) and the entire
   "we cannot disclose what we do not have" posture in the Privacy Policy.
 - Each push = metadata event Google sees: "device X received PHANTOM message at time T".
-- NLnet specifically funds privacy/freedom tech. A Google dependency in
-  the core delivery path damages the grant story.
+- Public-interest funding programmes that align with this project
+  specifically fund privacy/freedom tech. A Google dependency in the
+  core delivery path damages that narrative.
 - Self-hosters of the relay would be forced to provision a Firebase project.
 
 **Replacement plan:** **Unified Push** (FOSS protocol, ntfy.sh / gotify
@@ -360,12 +361,12 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
-### 2026-05-08 (thu) · Day 1 of council-revised 25-day plan to NLnet — Stage 5 closure + Phase 1 cleanup + Firebase rotation + ADR-019
+### 2026-05-08 (thu) · Day 1 of council-revised 25-day release-polish plan — Stage 5 closure + Phase 1 cleanup + Firebase rotation + ADR-019
 
 - **Goal:** close all loose ends from yesterday's Stage 5E.B production
-  validation, kick off the council-revised 25-day path to NLnet
-  submission (target submit day 15 = 2026-05-22, leaving ~10-day buffer
-  before the 2026-06-01 deadline). Day 1 specifically: restore strict
+  validation, kick off the council-revised 25-day release-polish path
+  (target submit day 15 = 2026-05-22, leaving ~10-day buffer before
+  the 2026-06-01 release window). Day 1 specifically: restore strict
   Xray routing on the Hetzner server (which had been left in
   diagnostic-relaxed state by yesterday's `7b4ebf77`); ship Track C
   Phase 1 repo cleanup (the live Firebase API key was tracked publicly
@@ -420,8 +421,9 @@ when an entry mentions a rejected approach.
     mitigation ADR — 020 adaptive transport, 021 multi-server
     fan-out, 022 iOS XCFramework), implementation plan (lists
     the five Stage 5E commit chains as DONE), production-validated
-    test plan, and references. Will anchor the Stage 5E pitch in
-    the NLnet application body.
+    test plan, and references. Will anchor the Stage 5E
+    architectural narrative in any external write-up of the
+    project.
 - **Decisions captured:** the Firebase rotation decision (Path A
   restrict vs Path B regenerate) is in `docs/PROJECT_LOG.md`
   Decision log section, written today as part of #47.
@@ -449,24 +451,25 @@ when an entry mentions a rejected approach.
     TLS-fingerprint path to the cover host.
 - **Council session and the revised 25-day plan.** Last night
   (2026-05-07 evening, after the Stage 5E production-validation
-  sign-off) I ran a five-advisor LLM Council session on "what's the
-  optimal sequencing of the next 25 days to maximise NLnet odds
-  without burning out the founder". All five lenses converged on a
-  significant pivot from the original plan: cut Track B Security
-  Sprint from 4 items to 1 (F22 only — keystore-wrap SPK/OPK), move
-  the remaining findings into a `docs/security/SECURITY_ROADMAP.md`
-  honest-roadmap document, ship Stage 5E demo video on day 3 (one
-  artefact serving NLnet body + README hero + public write-up),
-  submit NLnet on day 15 with a 10-day buffer rather than the
-  last-minute day-25 push. Full synthesis in
-  `~/.claude/projects/.../memory/council_2026_05_07_nlnet_synthesis.md`,
-  daily plan in `~/.claude/projects/.../memory/plan_25_days_to_nlnet.md`.
+  sign-off) I ran a five-advisor LLM Council session on the optimal
+  sequencing of the next 25 days of release-polish work without
+  burning out the founder. All five lenses converged on a significant
+  pivot from the original plan: cut Track B Security Sprint from 4
+  items to 1 (F22 only — keystore-wrap SPK/OPK), move the remaining
+  findings into a `docs/security/SECURITY_ROADMAP.md` honest-roadmap
+  document, ship the Stage 5E demo video on day 3 (one artefact
+  serving the README hero + a public write-up + any external review
+  context), tag the Alpha-2 release on day 15 with a 10-day buffer
+  rather than the last-minute day-25 push. Full synthesis in
+  `~/.claude/projects/.../memory/council_2026_05_07_synthesis.md`,
+  daily plan in `~/.claude/projects/.../memory/plan_25_days_to_release.md`.
   Today (Day 1) executed the Stage 5 closure + Phase 1 cleanup
-  +Firebase rotation + ADR-019 leg of that plan.
+  + Firebase rotation + ADR-019 leg of that plan.
 - **Day 2 next** (Friday 2026-05-09): README polish (License → AGPL,
   Status → Alpha 2, hero line about Stage 5E in the first three
-  lines), `funding.json` (FLOSS/fund mandatory), `.github/FUNDING.yml`,
-  and matching fixes to `RELEASE_NOTES.md` and `CONTRIBUTING.md`.
+  lines), `funding.json` (external funding portal prerequisite),
+  `.github/FUNDING.yml`, and matching fixes to `RELEASE_NOTES.md`
+  and `CONTRIBUTING.md`.
   ~3 hours estimated.
 - **Day 3 after that:** demo video for Stage 5E (5-10 min screen
   capture showing Tecno on RU MTS without VPN, plus emulator twin,
@@ -548,9 +551,10 @@ when an entry mentions a rejected approach.
   - **Vendor libXray as committed git artefacts** (not Git LFS, not
     fetch-on-build) — earlier we tried "don't commit, instruct
     contributors to download" but Vladislav rightly pointed out that
-    creates a reproducibility hole and a bad first impression for the
-    NLnet reviewer. 180 MB one-time cost is acceptable; rebuild from
-    `XTLS/libXray@<sha>` is deterministic via the workflow.
+    creates a reproducibility hole and a bad first impression for any
+    contributor cloning the repo. 180 MB one-time cost is acceptable;
+    rebuild from `XTLS/libXray@<sha>` is deterministic via the
+    workflow.
 - **Key commits (all on `feat/tor-stage5-bridges-via-onionwrapper`,
   pushed to origin, **NOT** yet merged to master):**
   - `5cca2976` — workflow `.github/workflows/build-libxray.yml`
@@ -570,22 +574,22 @@ when an entry mentions a rejected approach.
     `inboundTag-only` rule with `domain: ["domain:relay.phntm.pro"]`
     (without the `full:` prefix that silently missed) and re-enable
     blackhole-by-default. Server-side, ~30 min plus redeploy.
-  - **ADR-019 Xray REALITY rationale** — write it before NLnet body
-    needs it: threat model, license posture (MPL-2.0 Xray-core
+  - **ADR-019 Xray REALITY rationale** — write it before any external
+    write-up needs it: threat model, license posture (MPL-2.0 Xray-core
     aggregation cleanly composable with our AGPL at the docker-compose
     level), Beta-time multi-server fan-out plan. ~1 hour.
   - **PR to master** — open once the three above are done, so master
     doesn't carry the temporarily relaxed routing.
 
-### 2026-04-27 (sat, evening) · Licence hygiene before NLnet submission
+### 2026-04-27 (sat, evening) · Licence hygiene before the Alpha-2 release window
 
-- **Goal:** establish formal AGPL-3.0 licensing across the repo so the
-  NLnet grant reviewer (deadline 2026-06-01) does not see absent /
-  ambiguous licensing as a red flag. The user reported a perception
-  that the previous LICENSE file carried a Vercel copyright (likely a
-  half-remembered reference to the `prototype/web` Next.js scaffold);
-  on inspection there was no top-level LICENSE at all, which is
-  arguably worse for a grant submission.
+- **Goal:** establish formal AGPL-3.0 licensing across the repo so any
+  external reviewer ahead of the 2026-06-01 release window does not see
+  absent / ambiguous licensing as a red flag. The user reported a
+  perception that the previous LICENSE file carried a Vercel copyright
+  (likely a half-remembered reference to the `prototype/web` Next.js
+  scaffold); on inspection there was no top-level LICENSE at all,
+  which is arguably worse for any external review.
 - **Outcomes:** four-commit patch series shipped:
   1. **`e99aac0e`** — `LICENSE` at the repo root: PHANTOM header
      naming Willen LLC + Vladislav Liudvig (both 2026), the AGPL
@@ -670,7 +674,7 @@ when an entry mentions a rejected approach.
   - Three branches merged into master via `--no-ff`:
     `fix/bug-h-libsodium-jni` (everything from the QA sprint, plus
     `chore/assetlinks-real-fingerprint` which was already an ancestor),
-    and `docs/initial-drafts` (NLnet-ready public docs).
+    and `docs/initial-drafts` (release-ready public docs).
 - **Commits:** `0246b50f` (tag), `4d7d6091`, `01e955fe`, `a539695e`, `38b20f29`.
 - **Follow-ups:** Alpha 2 polish items captured as drafts in
   `Releases/GITHUB_ISSUES_DRAFT.md`.

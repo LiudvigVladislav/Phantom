@@ -7,7 +7,8 @@ labels, and click "Submit new issue".
 
 These four issues form the Alpha 2 backlog the QA-v9 session uncovered
 plus the design-brief follow-ups. They are the "post-Alpha-1 polish"
-roadmap NLnet reviewers should see in the public tracker.
+roadmap external reviewers and contributors should see in the public
+tracker.
 
 ---
 

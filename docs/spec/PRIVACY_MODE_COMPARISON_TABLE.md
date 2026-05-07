@@ -6,7 +6,7 @@ Copyright (c) 2026 Willen LLC
 # Privacy Mode — Feature Comparison
 
 **Status:** Approved 2026-05-05 by Vladislav (founder)
-**Audiences:** product team · marketing · in-app onboarding · grant applications
+**Audiences:** product team · marketing · in-app onboarding · external review
 **Companion:** behaviour spec at `docs/spec/PRIVACY_MODE_BEHAVIOR.md`
 
 ---
@@ -202,9 +202,9 @@ The PRO upsell exists because Ghost mode imposes ongoing operational costs (Tor 
 
 ---
 
-## F. Grant-application differentiation language (NLnet, FUTO, FLOSS/fund)
+## F. External-positioning differentiation language
 
-For the "What makes PHANTOM different" sections of grant proposals:
+For the "What makes PHANTOM different" sections of public write-ups, project comparisons, and external proposals:
 
 > PHANTOM is one of very few messengers that ship a **layered privacy model** — three coherent privacy contracts (Standard, Private, Ghost) that map to four orthogonal subsystems (discovery, presence, push, transport) through a single user choice. Each mode is a complete product promise, not a setting toggle. The strongest tier (Ghost) provides anonymity guarantees comparable to Briar or Cwtch — running over Tor with bridges, no third-party push, no group surface — while the everyday tier (Standard) provides a normal messenger UX at no privacy cost beyond what Signal-grade E2EE already provides.
 >
