@@ -43,6 +43,7 @@ Three reasons:
 | 016 | [Tor + UnifiedPush Hybrid Transport](ADR-016-tor-unified-push-hybrid-transport.md)                                   | Two-channel architecture: UnifiedPush wakeup + Tor data plane; three Privacy Modes (Auto/Always-Tor/Never)                                    | Accepted |
 | 017 | [SenderKey Signing Removal](ADR-017-senderkey-signing-removal.md) <br> [Threat Model Revision v0.1](ADR-017-threat-model-revision-v0_1.md) | Two ADRs collided on the same number — the SenderKey one is the load-bearing one; the threat-model-revision file is a draft that should be renumbered to ADR-018 in a follow-up | Accepted (cleanup pending) |
 | 019 | [Xray VLESS+REALITY as outer transport](ADR-019-Xray-REALITY-Outer-Transport.md)                                     | Stage 5E — TSPU 16-KB curtain bypass; Path-A vs Path-B; libXray gomobile in-process; capability-style UUID; MPL-2.0 + AGPL aggregation        | Accepted |
+| 023 | [Local prekey private-key wrap via Android Keystore](ADR-023-Local-Prekey-Keystore-Wrap.md)                          | F22 — wrap SPK + OPK private bytes with Android Keystore AES-256-GCM master key before SQLite write; defence in depth above SQLCipher          | Proposed |
 
 ## Pending ADR drafts
 
