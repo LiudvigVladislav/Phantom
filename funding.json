@@ -1,0 +1,110 @@
+{
+  "version": "v1.0.0",
+  "entity": {
+    "type": "organisation",
+    "role": "owner",
+    "name": "Willen LLC",
+    "email": "hello@phntm.pro",
+    "phone": "",
+    "description": "Single-founder Delaware LLC operating PHANTOM, an AGPL-3.0-or-later end-to-end encrypted messenger built for restrictive networks. Production-validated 2026-05-07: works on Russian mobile carriers without a VPN, without Orbot, without any third-party app, by way of an embedded Xray VLESS+REALITY transport that masquerades the wire as a TLS handshake to www.microsoft.com.",
+    "webpageUrl": {
+      "url": "https://phntm.pro"
+    }
+  },
+  "projects": [
+    {
+      "guid": "phantom-messenger",
+      "name": "PHANTOM",
+      "description": "End-to-end encrypted messenger that works in censored networks (Russia confirmed; Iran and China by architectural design) without any VPN or third-party app. Built on the Signal protocol primitives (Double Ratchet, Sealed Sender) with an embedded Xray VLESS+REALITY outer transport for censorship resistance and a Tor v3 onion service as a fallback data plane. Kotlin Multiplatform shared core; Android client today, iOS port in active planning (post-Alpha-2). Self-hostable Rust + Axum relay licensed under AGPL-3.0-or-later — §13 (Remote Network Interaction) makes the relay's privacy promise enforceable against silently-modified hosted forks.",
+      "webpageUrl": {
+        "url": "https://github.com/LiudvigVladislav/Phantom"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/LiudvigVladislav/Phantom",
+        "wellKnown": "https://github.com/LiudvigVladislav/Phantom/blob/master/funding.json"
+      },
+      "licenses": ["spdx:AGPL-3.0-or-later"],
+      "tags": [
+        "messaging",
+        "privacy",
+        "e2ee",
+        "cryptography",
+        "censorship-resistance",
+        "mobile",
+        "kotlin-multiplatform",
+        "android",
+        "tor",
+        "signal-protocol"
+      ]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "github-sponsors",
+        "type": "payment-provider",
+        "address": "https://github.com/sponsors/LiudvigVladislav",
+        "description": "GitHub Sponsors — direct support to the maintainer. Please use this channel if your organisation prefers GitHub-native billing."
+      },
+      {
+        "guid": "buy-me-a-coffee",
+        "type": "payment-provider",
+        "address": "https://www.buymeacoffee.com/phantom",
+        "description": "One-time donations of any size."
+      },
+      {
+        "guid": "open-collective",
+        "type": "payment-provider",
+        "address": "https://opencollective.com/phantom-messenger",
+        "description": "Fiscal-host backed transparent budgeting. (Registration in progress 2026-05; URL becomes live within Week 1 of the council-revised plan.)"
+      },
+      {
+        "guid": "liberapay",
+        "type": "payment-provider",
+        "address": "https://liberapay.com/phantom-messenger",
+        "description": "Recurring weekly / monthly donations. (Registration in progress 2026-05.)"
+      },
+      {
+        "guid": "polar",
+        "type": "payment-provider",
+        "address": "https://polar.sh/phantom-messenger",
+        "description": "Subscription support tier with optional milestone-based bounties. (Registration in progress 2026-05.)"
+      },
+      {
+        "guid": "operator-email",
+        "type": "other",
+        "address": "hello@phntm.pro",
+        "description": "Direct contact for grant programs, large institutional donors, and dual-licensing inquiries."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "milestone-1-ios-port",
+        "status": "proposed",
+        "name": "Milestone 1 — iOS port and adaptive transport",
+        "description": "Twelve months of single-developer work covering: (a) Compose Multiplatform iOS XCFramework build for the existing :shared:core:* modules so PHANTOM ships on iOS at parity with Android; (b) ADR-020 Adaptive Transport Selection — runtime probe-and-pick state machine across direct WSS, Xray REALITY, and Tor (today's choice is build-time only); (c) ADR-021 Multi-server Xray fan-out — closes the single-Hetzner-VPS point-of-failure with two or three operator-controlled servers in different jurisdictions; (d) closure of the four NLnet-blocking security findings (F22 SPK/OPK keystore-wrap, F19+F20 call signalling E2EE, F8 RatchetState wrap, F2+F13 SenderKey signing removal) per the security roadmap.",
+        "amount": 30000,
+        "currency": "EUR",
+        "frequency": "one-time",
+        "channels": ["operator-email"]
+      },
+      {
+        "guid": "ongoing-relay-and-bridge-hosting",
+        "status": "active",
+        "name": "Operational hosting (relay + Xray + future bridges)",
+        "description": "Recurring infrastructure cost of running the production relay, the Xray REALITY server, the Tor onion service, the WebTunnel bridge, and self-hosted ntfy — all on operator-controlled VPSes. Today this is one Hetzner CPX22 (~€8/month) and one Hetzner CPX21 (~€7/month). Multi-region rollout (ADR-021) raises this proportionally.",
+        "amount": 50,
+        "currency": "EUR",
+        "frequency": "monthly",
+        "channels": [
+          "github-sponsors",
+          "buy-me-a-coffee",
+          "open-collective",
+          "liberapay",
+          "polar"
+        ]
+      }
+    ],
+    "history": []
+  }
+}

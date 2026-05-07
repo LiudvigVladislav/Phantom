@@ -117,9 +117,14 @@ config, and the Universal Links assetlinks flow.
 ## Licensing
 
 By contributing, you agree that your contribution will be released
-under the same license as the file it touches: GPL-3.0 for the client
-modules, AGPL-3.0 for `services/relay/`. A top-level `LICENSE` file
-will be added before the first public release.
+under **AGPL-3.0-or-later** — the project-wide license recorded in
+the top-level [`LICENSE`](LICENSE) file. AGPL-3.0 §13 (Remote Network
+Interaction) is load-bearing for the relay's privacy promise: it
+forces any modified network-served version to publish its source.
+See [ADR-006](docs/adr/ADR-006-Crypto-Library-Decision.md) for the
+full rationale. An optional commercial dual-licensing arrangement
+exists for white-label or B2B deployments that cannot ship under
+AGPL terms; that path does not affect open-source contributions.
 
 ## Getting in touch
 
