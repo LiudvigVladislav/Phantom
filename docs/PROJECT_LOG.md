@@ -360,6 +360,126 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-08 (thu) · Day 1 of council-revised 25-day plan to NLnet — Stage 5 closure + Phase 1 cleanup + Firebase rotation + ADR-019
+
+- **Goal:** close all loose ends from yesterday's Stage 5E.B production
+  validation, kick off the council-revised 25-day path to NLnet
+  submission (target submit day 15 = 2026-05-22, leaving ~10-day buffer
+  before the 2026-06-01 deadline). Day 1 specifically: restore strict
+  Xray routing on the Hetzner server (which had been left in
+  diagnostic-relaxed state by yesterday's `7b4ebf77`); ship Track C
+  Phase 1 repo cleanup (the live Firebase API key was tracked publicly
+  until today); rotate the Firebase key now that it is out of git
+  tracking; write ADR-019 capturing the architectural decision behind
+  the whole Stage 5E build.
+- **Outcomes (four merged PRs in one day):**
+  - **Restore strict Xray routing** (#45, commit `d7ba3a41`). Replaced
+    the diagnostic single-rule (`VLESS in → freedom out`) with a
+    three-rule chain: domain matches `relay.phntm.pro` (with three
+    matcher syntaxes layered — `relay.phntm.pro`, `domain:`, `full:` —
+    so whichever variant Xray 26.3.27's matcher honours wins) → port
+    443 fallback → catchall blackhole. Closes the open-proxy hole.
+    Verified end-to-end via Caddy access logs:
+    `remote_ip: 172.18.0.7` (docker bridge) means traffic landed
+    through Xray, not direct.
+  - **Phase 1 repo cleanup** (#46, commits `f07bba8c` + `9b0581dd`).
+    `git rm --cached` for `apps/android/google-services.json` (live
+    Firebase API key) and `.kotlin/` (76 Kotlin Multiplatform metadata
+    cache files). Newly tracked: `docs/project/ARCHITECTURAL_DECISIONS_TODO.md`
+    and `docs/project/PHANTOM_ROADMAP_2026.md` (both internal until
+    now, Vladislav approved publication for grant-readiness signal).
+    `.gitignore` extended with `.mcp.json`, `.kotlin/`,
+    `apps/android/google-services.json`, `tag-message.txt`,
+    `private/`, and a `*.pdf` blanket with
+    `!legal/assets/*.pdf` + `!docs/**/*.pdf` exceptions. The
+    follow-up `9b0581dd` made the google-services Gradle plugin
+    conditional (`apply false` + later `if (...exists()) apply(...)`)
+    so clean-clone CI builds succeed without the Firebase config
+    file. Verified: `./gradlew :apps:android:assembleDebug` passed
+    in both states (with and without the file present).
+  - **Firebase API key SHA-1 restriction logged** (#47, commit
+    `ba830353`). Decision-log entry in `docs/PROJECT_LOG.md`
+    documenting the Path-A-vs-Path-B reasoning (restrict by
+    package name + signing-cert SHA-1, not full key regeneration —
+    full reasoning in the Decision log entry above this one).
+    Operator action (the actual restriction in Google Cloud Console)
+    completed in parallel: two SHA-1 fingerprints (debug + release)
+    added to the auto-created Android API key, plus matching
+    SHA-256 fingerprints registered in Firebase Console for
+    defence-in-depth (Firebase Auth / App Check / Dynamic Links
+    use these independently of API-key restriction).
+  - **ADR-019 Xray VLESS+REALITY as outer transport** (#48, commit
+    `20e71fbb`). 371-line architectural decision record covering
+    context (Stage 5C/5D bridge failure on Hetzner *and* FlokiNET
+    on RU MTS), decision (libXray gomobile + Path A server),
+    five sub-rationale subsections (why VLESS+REALITY beats
+    every obfuscation alternative, why same VPS as relay, why
+    in-process libXray, why single shared capability-style UUID,
+    why MPL-2.0 + AGPL aggregation is OK), threat-model
+    consequences, known limitations (each tied to a planned
+    mitigation ADR — 020 adaptive transport, 021 multi-server
+    fan-out, 022 iOS XCFramework), implementation plan (lists
+    the five Stage 5E commit chains as DONE), production-validated
+    test plan, and references. Will anchor the Stage 5E pitch in
+    the NLnet application body.
+- **Decisions captured:** the Firebase rotation decision (Path A
+  restrict vs Path B regenerate) is in `docs/PROJECT_LOG.md`
+  Decision log section, written today as part of #47.
+- **Discoveries / lessons that nearly cost time:**
+  - "Phantom not using Xray" red herring (~30 min). When Xray's
+    `docker logs phantom-xray` showed only startup messages with no
+    accepted-connection lines after a real client connect, the
+    instinct was "Phantom bypasses Xray, OkHttp SOCKS proxy bug".
+    The actual cause: `access: none` in the Xray log block (added
+    yesterday as a security-reviewer finding) intentionally
+    disables per-connection logging. Routing was always fine — we
+    just had to look at Caddy access logs (`remote_ip` field)
+    instead. Captured as a permanent reference in
+    `memory/reference_xray_diagnostics.md` so the same time-sink
+    doesn't repeat.
+  - VPN-on-host vs VPN-on-emulator confusion. Tested Xray on the
+    Pixel 8 Pro emulator while Borealis VPN was still active on
+    Windows host. Emulator inherits host networking, so the
+    "Xray ready" notification was technically correct (local SOCKS
+    bound) but no traffic actually went through Xray to the Hetzner
+    server (the host VPN intercepted all TCP). Spent ~10 min ruling
+    out a code bug before realising it was test-environment
+    contamination. Stage 5E architecturally cannot stack with
+    another VLESS-based VPN like Borealis — REALITY needs a direct
+    TLS-fingerprint path to the cover host.
+- **Council session and the revised 25-day plan.** Last night
+  (2026-05-07 evening, after the Stage 5E production-validation
+  sign-off) I ran a five-advisor LLM Council session on "what's the
+  optimal sequencing of the next 25 days to maximise NLnet odds
+  without burning out the founder". All five lenses converged on a
+  significant pivot from the original plan: cut Track B Security
+  Sprint from 4 items to 1 (F22 only — keystore-wrap SPK/OPK), move
+  the remaining findings into a `docs/security/SECURITY_ROADMAP.md`
+  honest-roadmap document, ship Stage 5E demo video on day 3 (one
+  artefact serving NLnet body + README hero + public write-up),
+  submit NLnet on day 15 with a 10-day buffer rather than the
+  last-minute day-25 push. Full synthesis in
+  `~/.claude/projects/.../memory/council_2026_05_07_nlnet_synthesis.md`,
+  daily plan in `~/.claude/projects/.../memory/plan_25_days_to_nlnet.md`.
+  Today (Day 1) executed the Stage 5 closure + Phase 1 cleanup
+  +Firebase rotation + ADR-019 leg of that plan.
+- **Day 2 next** (Friday 2026-05-09): README polish (License → AGPL,
+  Status → Alpha 2, hero line about Stage 5E in the first three
+  lines), `funding.json` (FLOSS/fund mandatory), `.github/FUNDING.yml`,
+  and matching fixes to `RELEASE_NOTES.md` and `CONTRIBUTING.md`.
+  ~3 hours estimated.
+- **Day 3 after that:** demo video for Stage 5E (5-10 min screen
+  capture showing Tecno on RU MTS without VPN, plus emulator twin,
+  plus Caddy log proof). ~3-4 hours.
+- **Follow-ups from today not blocking Day 2:**
+  - The Firebase Console SHA-1 fingerprints (defence-in-depth) were
+    optional and Vladislav can add them whenever — not on the Day 2
+    critical path.
+  - `keystores/phantom-release.keystore` backup to off-device
+    location is the single critical-asset backup the project does
+    not yet have. Captured here so it doesn't get forgotten;
+    Vladislav schedules at convenience.
+
 ### 2026-05-07 (wed) · Stage 5E (Xray VLESS+REALITY) production-validated
 
 - **Goal:** Finish Stage 5E.B (the Android client side of ADR-018's
