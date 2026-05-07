@@ -28,6 +28,20 @@ kotlin {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
         }
+
+        // F22 PR-2: instrumented tests for the Android-Keystore-backed
+        // private-key wrap. Robolectric cannot fake the Keystore provider
+        // end-to-end; verifying the real GCM round-trip requires a real
+        // (or emulated) Android runtime. Invoke with
+        // `./gradlew :shared:core:storage:connectedDebugAndroidTest`.
+        val androidInstrumentedTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+                implementation(libs.kotlinx.coroutines.test)
+                implementation(libs.androidx.test.runner)
+                implementation(libs.androidx.test.ext.junit)
+            }
+        }
     }
 }
 
@@ -46,5 +60,10 @@ android {
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
+        // AndroidJUnitRunner is the runner shipped with androidx.test:runner.
+        // It is what `connectedAndroidTest` uses to execute @RunWith(AndroidJUnit4)
+        // classes on a connected emulator or device. F22 PR-2 added the first
+        // instrumented test for this module — see AndroidKeystoreBlobCipherTest.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 }
