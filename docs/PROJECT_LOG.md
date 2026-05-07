@@ -81,6 +81,65 @@ Also tracked:
 This section records **rejected** options as well as accepted ones —
 otherwise we would re-litigate the same conversations every few weeks.
 
+### Accepted: SHA-1 application restriction for Firebase API key (instead of full key regeneration)
+
+**Date:** 2026-05-08
+**Context:** Phase 1 repo cleanup (commit `f07bba8c` + follow-up
+`9b0581dd`) removed `apps/android/google-services.json` from git
+tracking, but the live Firebase API key shipped inside that file was
+publicly visible in every commit between project inception and the
+cleanup PR. Two paths to mitigate:
+
+- **A.** Restrict the existing key by Android package name + signing
+  certificate SHA-1 fingerprints (debug + release). The leaked key
+  remains usable, but only from APKs signed with our keystores. Other
+  callers see `403 API_KEY_RESTRICTED`.
+- **B.** Regenerate the key entirely. The leaked one is fully
+  invalidated; clients with the old key (i.e. every existing PHANTOM
+  install) lose FCM push until they receive an updated APK with a fresh
+  `google-services.json`.
+
+**Decision:** Path A (restrict, do not regenerate).
+
+**Why:**
+
+- Firebase keys are publishable by design — the Android SDK literally
+  bundles them into every APK that ships, so they are extractable from
+  any release with `apksigner` + a hex editor. The threat is not
+  secrecy, it is *abuse*: someone using our key to exhaust our FCM
+  quota and DoS our push channel. Application restriction
+  (Android-package + signing-cert SHA-1) is the canonical mitigation
+  Google itself recommends.
+- Path B's blast radius hits real users: every install in the field
+  loses push notifications until they update. Pre-Alpha-2 user count
+  is small but non-zero, and the disruption is asymmetric to the
+  threat (we have no evidence the key was actually scraped).
+- Restoring the security posture is now reversible — if we later see
+  abuse on the leaked key, we can still execute Path B (regenerate)
+  without losing any of today's restriction work.
+
+**Implementation:**
+
+- Generated SHA-1 fingerprints from both keystores via `keytool -list -v`:
+    - Debug (`~/.android/debug.keystore`):
+      `B2:9E:30:6F:1F:77:83:AB:83:76:E3:EE:DB:AA:D2:AE:98:6D:74:5A`
+    - Release (`keystores/phantom-release.keystore`):
+      `A3:2B:94:CA:3A:85:C6:A1:CF:0E:8F:48:A2:86:C5:D9:64:AE:61:D9`
+- Added both as Android-app application restrictions on the Firebase
+  auto-created Android API key in Google Cloud Console
+  (`console.cloud.google.com/apis/credentials?project=phantom-app-a1ca0`).
+- Also added the matching SHA-256 fingerprints to the Firebase Console
+  app registration page (defence in depth — Firebase Auth, Dynamic
+  Links, App Check use these for client-attestation independently of
+  the API-key restriction above).
+
+**Follow-up:** if `gradle :apps:android:signingReport` ever shows a
+new SHA-1 fingerprint (e.g. release keystore rotated, additional CI
+signing key introduced), it must be added to both the Google Cloud
+Console restriction and the Firebase Console app registration *before*
+distributing the new APK. Otherwise that build will hit
+`403 API_KEY_RESTRICTED` on first FCM register.
+
 ### Rejected: server-side Tor outbound for Stage 5E (Path B)
 
 **Date:** 2026-05-07
