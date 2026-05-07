@@ -91,10 +91,9 @@ deploy/xray/config.json
 # Local working files (operator scratch — not project source).
 tag-message.txt
 
-# Private operator material — grant application drafts (NLnet, FUTO,
-# FLOSS) live here. Reviewers see the official portal submission, not
-# our internal draft history. Created 2026-05-08 to hold NLnet draft V2
-# files moved out of docs/project/.
+# Private operator material — drafts of any external-funding
+# applications live here, not in the public tracker. Created
+# 2026-05-08 to hold a draft moved out of docs/project/.
 private/
 
 # PDF working drafts (kept locally, never pushed). Two exceptions retain

@@ -1,8 +1,8 @@
 # PHANTOM — Architecture Overview
 
-**Status:** draft v0.1 (2026-04-24) · **Audience:** grant reviewers, security
-auditors, new contributors. For the authoritative decisions see the ADRs
-linked throughout this document.
+**Status:** draft v0.1 (2026-04-24) · **Audience:** external reviewers,
+security auditors, new contributors. For the authoritative decisions see
+the ADRs linked throughout this document.
 
 PHANTOM is a privacy-first end-to-end encrypted messenger. The
 cryptographic core is [libsignal](https://github.com/signalapp/libsignal)

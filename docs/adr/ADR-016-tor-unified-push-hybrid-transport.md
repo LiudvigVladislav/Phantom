@@ -29,8 +29,8 @@ Three architectures considered, three rejected explicitly:
 - **Cloudflare Tunnel.** Rejected. Threat-Model conflict (US
   corporate gatekeeper sees per-connection metadata), Russia
   reliability (Roskomnadzor blocks Cloudflare ranges
-  intermittently since 2022), public NLnet positioning conflict
-  with "no third-party metadata" claim.
+  intermittently since 2022), public-positioning conflict with
+  the project's "no third-party metadata" claim.
 - **Russian VPS relay.** Rejected. Out of policy scope.
 - **More aggressive app-level WSS pings (3 s).** Tried, rejected.
   Made the Pixel emulator regress to the same 50 s break cycle

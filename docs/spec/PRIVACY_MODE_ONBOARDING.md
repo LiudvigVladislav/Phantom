@@ -101,7 +101,7 @@ Per `Design/PHANTOM_FULL_COMPOSE.md` §10:
 
 A secondary action below the cards. On tap, opens a modal sheet with the comparison table (§5 below). Sheet has a back button; closing returns to the selection without changing the user's pick.
 
-This link gives PHANTOM-curious users — particularly grant reviewers, journalists, security researchers exploring the app — a path to the full feature matrix without forcing them to leave onboarding.
+This link gives PHANTOM-curious users — particularly journalists, security researchers, and other technically-savvy reviewers exploring the app — a path to the full feature matrix without forcing them to leave onboarding.
 
 ---
 

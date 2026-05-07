@@ -183,7 +183,7 @@ The public counterparts (X25519 public key + UUID + shortId + serverName + dest 
 
 ## 6. License posture
 
-Xray-core is **MPL-2.0 with Exhibit B** ("Incompatible With Secondary Licenses"). MPL-2.0 is a *file-level* copyleft. Aggregating the MPL daemon binary inside our docker-compose alongside our AGPL-3.0-or-later codebase is permitted (we are not modifying or relinking Xray's source files). Same posture as v2rayNG and Hiddify carry today. NLnet legal sanity-check before Beta is recommended in `docs/research/xray-reality-integration-2026-05-06.md` §6.
+Xray-core is **MPL-2.0 with Exhibit B** ("Incompatible With Secondary Licenses"). MPL-2.0 is a *file-level* copyleft. Aggregating the MPL daemon binary inside our docker-compose alongside our AGPL-3.0-or-later codebase is permitted (we are not modifying or relinking Xray's source files). Same posture as v2rayNG and Hiddify carry today. An external legal sanity-check before Beta is recommended in `docs/research/xray-reality-integration-2026-05-06.md` §6.
 
 ---
 

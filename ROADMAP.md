@@ -38,8 +38,7 @@ Rich content without sacrificing the privacy model.
 - Stable groups with Sender Keys, re-verify on member changes.
 - Public channels (read-only broadcast) with per-channel sender keys.
 - Hosted username directory with rate-limited lookup by `@username`.
-- **Grant submissions:** NLnet NGI Zero (May 2026 window), EFF
-  Digital Security Fund, Mozilla Technology Fund.
+- **External funding outreach:** see [`funding.json`](funding.json) for the canonical channel list.
 
 ---
 

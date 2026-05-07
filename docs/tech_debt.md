@@ -136,7 +136,7 @@ java.lang.NullPointerException: Cannot invoke "java.net.URL.getFile()" because "
 
 **Решение (2026-04-24):** Вариант 3 — тесты запускаются на реальной Android-машине с той же libsodium-биндингой, что уходит в production. Никаких fake-раннтаймов. Честное E2E тестирование.
 
-**Когда делать:** После VPS-деплоя релея, перед подачей заявки в NLnet (до 1 июня 2026). Причина такого порядка: NLnet-ревьюеры захотят видеть зелёный CI — инструментированные тесты на Android эмуляторе закрывают и unit-тестирование crypto, и демонстрируют что production-стек проверяется целиком.
+**Когда делать:** После VPS-деплоя релея, перед Alpha-2 release window (~1 июня 2026). Причина такого порядка: внешние ревьюеры захотят видеть зелёный CI — инструментированные тесты на Android эмуляторе закрывают и unit-тестирование crypto, и демонстрируют что production-стек проверяется целиком.
 
 **Статус:** ✅ **ЗАКРЫТ 2026-04-24** на ветке `fix/bug-h-libsodium-jni`.
 
@@ -180,7 +180,7 @@ java.lang.NullPointerException: Cannot invoke "java.net.URL.getFile()" because "
 - Receiver stores in a new `contact_profile` SQLite table (avatar bytes + version + last-updated-at), separate from `conversation` (which is identity-keyed routing data).
 - Top-bar and contact-row avatars on the recipient side observe the new repo via StateFlow, same pattern as the self-avatar fix in [ProfileScreen.kt:106](apps/android/src/androidMain/kotlin/phantom/android/screens/profile/ProfileScreen.kt#L106).
 
-**When to do it:** Alpha 2 — bundle with the related Alpha 2 backlog items (per-message status indicators, encrypted profile sync). Not before NLnet (2026-06-01) submission; this is product polish, not a security or correctness blocker.
+**When to do it:** Alpha 2 — bundle with the related Alpha 2 backlog items (per-message status indicators, encrypted profile sync). Not before the Alpha-2 release window (~2026-06-01); this is product polish, not a security or correctness blocker.
 
 **Risk note for the security review:** Avatar bytes flow through the existing Double Ratchet, so confidentiality and authenticity are already covered. The metadata exposure is the same as for any other message (relay sees envelope size; peer sees content). No additional trust assumptions.
 
@@ -194,7 +194,7 @@ java.lang.NullPointerException: Cannot invoke "java.net.URL.getFile()" because "
 
 **Scope:** Outside `fix/bug-h-libsodium-jni` — that branch only touches the crypto module to keep the change surgical. The messaging-module integration test needs the same treatment (move to `androidInstrumentedTest` + add AndroidX Test deps + `@RunWith(AndroidJUnit4::class)`).
 
-**When to do it:** After the VPS relay is deployed and before the NLnet submission (2026-06-01). The relay deploy unblocks end-to-end testing against a real server, at which point the integration test's value is much higher and the migration effort pays off.
+**When to do it:** After the VPS relay is deployed and before the Alpha-2 release window (~2026-06-01). The relay deploy unblocks end-to-end testing against a real server, at which point the integration test's value is much higher and the migration effort pays off.
 
 ---
 
