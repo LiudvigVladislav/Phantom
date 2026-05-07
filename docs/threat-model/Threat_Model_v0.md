@@ -82,8 +82,8 @@ in the project's backlog with target windows in
 For the formal threat model with full adversary specifications,
 priority matrices, and engineering obligations before each
 release stage, read the Russian body below. A full English
-translation is planned for the OTF / Article 19 review window
-post-NLnet submission.
+translation is planned alongside the Beta milestone, when an
+external audit pass becomes appropriate.
 
 ---
 

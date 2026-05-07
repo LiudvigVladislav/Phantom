@@ -12,7 +12,7 @@ PHANTOM is a three-layer system:
   with an Android-first UI shell (`apps/android/`). The shared core
   hosts identity, crypto, storage, transport, messaging, and the
   censorship-resistance modules; iOS reuses the same core through
-  an XCFramework once the post-NLnet iOS milestone lands.
+  an XCFramework once the post-Alpha-2 iOS milestone lands.
 - **Relay** — a stateless Rust + Axum store-and-forward service
   (`services/relay/`) that holds ciphertext envelopes only. It
   speaks WebSocket over Caddy-terminated TLS, enforces per-identity
