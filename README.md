@@ -38,12 +38,11 @@ PHANTOM is being built as an open-source project with a values-driven mission: t
 - QR code contact exchange
 - Store-and-forward delivery (messages queue when recipient is offline)
 
-**What's coming next** (rest of Alpha 2 → Beta):
-- ADR-020 Adaptive Transport Selection — runtime probe-and-pick between direct WSS, Xray, Tor (today's choice is build-time)
-- ADR-021 Multi-server Xray fan-out — closes the single-point-of-failure on the current Hetzner endpoint
-- iOS app (XCFramework via Compose Multiplatform; ADR-022)
-- Group chats (state machine + Sender Keys crypto already present in shared core)
-- Voice and video calls (signalling exists in shared core; UI wiring in active development)
+**Roadmap, by realistic horizon:**
+
+- **Alpha 2 (next release):** Group chats foundation (state machine + Sender Keys crypto already present in shared core, surface work pending), ADR-020 *Adaptive Transport Selection* — runtime probe-and-pick between direct WSS, Xray, Tor (today's choice is a build-time flag), encrypted attachments (photos and files via the encrypted MinIO design in the ADR backlog).
+- **Beta:** Voice and video calls (call-signalling already exists in shared core; UI wiring in active development), ADR-021 *Multi-server Xray fan-out* — closes the single-point-of-failure on the current Hetzner endpoint, iOS app (XCFramework via Compose Multiplatform; ADR-022), additional pluggable transports (obfs4, Snowflake) joining today's Tor + Xray pair.
+- **Post-Beta research:** Wi-Fi Direct + Bluetooth Mesh nearby modes for offline-first delivery (Briar-class), Kademlia DHT P2P routing as a fallback to the central relay, post-quantum migration of the cryptographic primitives.
 
 See [RELEASE_NOTES.md](RELEASE_NOTES.md) for full Alpha 1 details, [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for current limitations, and [docs/PROJECT_LOG.md](docs/PROJECT_LOG.md) for the running development journal.
 
@@ -84,9 +83,20 @@ PHANTOM is a 5-layer system:
 - **Caddy** for TLS termination and reverse proxy
 - **Docker Compose** for relay deployment
 
+### Documented decisions
+
+Every architectural choice has a public rationale captured as an Architecture Decision Record. Index: [docs/adr/](docs/adr/) (also exported as a short table at the top of [docs/adr/README.md](docs/adr/README.md)). Highlighted entries:
+
+- [ADR-001 (System Boundaries)](docs/adr/ADR-001-System-Boundaries.md) — what PHANTOM is and is not
+- [ADR-006 (Crypto Library Decision)](docs/adr/ADR-006-Crypto-Library-Decision.md) — libsodium-only stack and the AGPL-3.0-or-later licensing rationale
+- [ADR-016 (Tor + UnifiedPush hybrid transport)](docs/adr/ADR-016-tor-unified-push-hybrid-transport.md) — the two-channel data-plane / wakeup-plane architecture
+- [ADR-019 (Xray VLESS+REALITY)](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md) — Stage 5E censorship-resistance rationale, threat model, known limitations
+
 ---
 
 ## Threat model
+
+PHANTOM has a formal threat model documenting adversary capabilities, asset inventory, security goals, and explicit out-of-scope items. Read it at [docs/threat-model/Threat_Model_v0.md](docs/threat-model/Threat_Model_v0.md) — an English executive summary sits at the top of the file, with the formal model body below in Russian. Headline summary:
 
 PHANTOM is designed to protect against:
 
@@ -104,8 +114,6 @@ PHANTOM is **not** designed to protect against:
 - Endpoint compromise via malware
 
 For the most sensitive use cases, PHANTOM should be combined with operating system hardening (GrapheneOS recommended) and secure operational practices.
-
-For the formal threat model with adversary capabilities, asset inventory, and out-of-scope items, see [docs/threat-model/Threat_Model_v0.md](docs/threat-model/Threat_Model_v0.md). The full architectural decisions log lives in [docs/adr/](docs/adr/) — start with [ADR-001 (System Boundaries)](docs/adr/ADR-001-System-Boundaries.md) for the foundational scope and [ADR-019 (Xray REALITY)](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md) for the censorship-resistance rationale.
 
 ---
 
@@ -220,8 +228,9 @@ A commercial dual-licensing option is available for white-label or B2B deploymen
 
 ## Contact
 
+- **Source code:** [GitHub](https://github.com/LiudvigVladislav/Phantom) · [Codeberg mirror](https://codeberg.org/VladislavLiudvig/Phantom) (non-US, AGPL-aligned host)
 - **GitHub Issues:** https://github.com/LiudvigVladislav/Phantom/issues
-- **Author:** WladislaW
+- **Author:** Vladislav Liudvig
 - **Company:** Willen LLC (Delaware, USA)
 
 ### Email routing
@@ -243,11 +252,12 @@ See [SECURITY.md](SECURITY.md) for full security-disclosure terms.
 
 PHANTOM stands on the shoulders of many open-source projects and research efforts. Special recognition to:
 
-- The **Signal** protocol designers (Trevor Perrin, Moxie Marlinspike)
-- The **libsodium** project (Frank Denis et al.)
-- The **Tor Project** for foundational work on censorship circumvention
+- The **Signal** protocol designers (Trevor Perrin, Moxie Marlinspike) — the Double Ratchet and Sealed Sender constructions PHANTOM builds on
+- The **libsodium** project (Frank Denis et al.) — the cryptographic primitives underneath every E2EE operation in the codebase
+- The **Tor Project** — PHANTOM embeds an in-process tor daemon (via [kmp-tor](https://github.com/05nelsonm/kmp-tor) packaging Briar's `onionwrapper` fork) for the onion-service data path; Stage 5A-5C of the transport layer would not exist without their work
+- The **XTLS / Xray-core** maintainers — Stage 5E's REALITY transport (the censorship-resistance path validated through Russia's TSPU) is built on top of their daemon
+- The **Briar** project — the `onionwrapper` Android packaging of Tor that we depend on, plus the broader research on offline mesh delivery that informs our post-Beta direction
 - The wider open-source privacy-tech community whose libraries, research, and review effort make work like this possible
-- Anyone who has built tools that help people communicate freely
 
 ---
 
