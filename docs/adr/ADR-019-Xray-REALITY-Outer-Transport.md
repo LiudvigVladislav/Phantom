@@ -248,14 +248,15 @@ What Stage 5E **does not change**:
 
 ## Known limitations
 
-Documented honestly so a NLnet/FUTO/FLOSS reviewer doesn't have to
-discover these by reading the code:
+Documented honestly here so an external reviewer (auditor, future
+contributor, security researcher) does not have to discover these
+by reading the code:
 
 - **Single point of failure.** All Stage 5E clients reach the same
   Hetzner VPS. If that IP is added to TSPU's active block-list
   (separate from the curtain throttle), no PHANTOM client can reach
   the relay through the Xray path until the IP changes. ADR-021
-  (planned, post-NLnet) addresses this with a multi-server
+  (planned, Beta-tier) addresses this with a multi-server
   operator-controlled fan-out and a client-side server-discovery
   mechanism.
 - **Adaptive transport selection is manual.** Stage 5E.B ships with
@@ -263,11 +264,12 @@ discover these by reading the code:
   A user on a network where direct WSS works gets no benefit from
   Xray (it just adds CPU + battery cost), and a user on a network
   where Xray is blocked has no automatic fall-back to Tor. ADR-020
-  (planned, post-NLnet) introduces a runtime probe + state machine
+  (planned, Beta-tier) introduces a runtime probe + state machine
   that selects the working transport per connection. The current
-  static flag is a pragmatic interim because the Stage 5E hero
-  result (RU MTS without VPN) needs to ship before NLnet's
-  2026-06-01 deadline.
+  static flag is a pragmatic interim — the censorship-resistance
+  primitive needed to ship as soon as it was production-validated
+  on a Russian carrier rather than waiting on the runtime probe
+  layer.
 - **VPN co-existence is competitive, not additive.** When a user
   has a VPN active on the device (or on the host running an
   emulator), the device's TUN interface captures all TCP and routes
@@ -336,7 +338,7 @@ recipe — Xray's own access log is intentionally disabled
 (`access: none`) for privacy hygiene, so Caddy logs are the canonical
 source for confirming connections go through Xray.
 
-## Future work (referenced in NLnet body as Phase 2 deliverables)
+## Future work (Phase 2 deliverables)
 
 - **ADR-020: Adaptive Transport Selection.** Runtime probe-and-pick
   state machine across direct WSS, Xray, Tor. Removes the build-time

@@ -197,12 +197,7 @@ Before contributing code, please open an issue to discuss the change.
 
 The core messenger — including all privacy guarantees, the full Double Ratchet implementation, the relay stack, and the censorship-resistance transport layer — remains free, open-source, and uncrippled for individual users, forever. Long-term sustainability is funded by a separate optional commercial track of value-added services for organisations: managed relay deployments, priority support contracts, encrypted backup-and-recovery convenience features, and specialised integrations. None of these services restrict access to or affect the privacy guarantees of the core open-source software.
 
-**Active funding pursuits** (2026 round):
-- NLnet NGI Zero Commons Fund — deadline 2026-06-01
-- FUTO Microgrants — rolling
-- FLOSS/fund (Zerodha) — deadline 2026-06-30
-
-**Donations:** see the **Sponsor** button at the top of this repository for direct support channels (Open Collective, Liberapay, Polar, Buy Me a Coffee).
+**Donations:** see the **Sponsor** button at the top of this repository for direct support channels. Public-interest funding programmes that align with the project's privacy mission are also pursued from time to time; the canonical funding-channel list lives in [`funding.json`](funding.json).
 
 PHANTOM is being developed by a solo founder operating through Willen LLC (Delaware, USA).
 
@@ -251,7 +246,7 @@ PHANTOM stands on the shoulders of many open-source projects and research effort
 - The **Signal** protocol designers (Trevor Perrin, Moxie Marlinspike)
 - The **libsodium** project (Frank Denis et al.)
 - The **Tor Project** for foundational work on censorship circumvention
-- The **NLnet Foundation** for funding privacy-enhancing technology
+- The wider open-source privacy-tech community whose libraries, research, and review effort make work like this possible
 - Anyone who has built tools that help people communicate freely
 
 ---

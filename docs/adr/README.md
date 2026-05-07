@@ -16,10 +16,11 @@ Three reasons:
   developer after a long break) opens this directory and gets the
   load-bearing decisions of the project in one read instead of
   spelunking through git history.
-- **Honest grant readiness.** NLnet, FUTO, and FLOSS reviewers
-  expect an architectural paper trail. Stage 5E's NLnet pitch
-  rests on ADR-019; the licensing pitch rests on ADR-006; the
-  privacy posture rests on ADR-001 and ADR-016.
+- **External review readiness.** Auditors, security researchers,
+  and contributors evaluating the project expect an architectural
+  paper trail. Stage 5E's censorship-resistance posture rests on
+  ADR-019; the licensing posture rests on ADR-006; the privacy
+  posture rests on ADR-001 and ADR-016.
 - **Anti-relitigation.** The Decision log in
   [`../PROJECT_LOG.md`](../PROJECT_LOG.md) records *rejected*
   options too — if we ever circle back on "why don't we use FCM
@@ -57,14 +58,14 @@ header.
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | Username uniqueness via relay namespace      | Closes ADR-005's "username directory deferred" gap once the operator-controlled username layer is in scope                | Alpha 2 → Beta                                                             |
 | Verification authority (Willen LLC central)  | Defines who can issue the org-verified badge; needed before any "verified by PHANTOM" UI                                  | Beta                                                                       |
-| Group encryption hardening                   | Closes Track B Security Sprint findings F1, F3, F4 — Group control msgs inside Double Ratchet, HKDF KDF, leave-rotation   | Post-NLnet (or later in Track B if Council scope expands)                  |
+| Group encryption hardening                   | Closes the security findings around group control messages — wrap them inside the Double Ratchet, HKDF KDF, leave-rotation | Beta-tier                                                                  |
 | Premium feature gating architecture          | Records how the optional commercial track plugs in without touching the open-source core                                  | Beta                                                                       |
 | Account migration via seed phrase            | The user-side recovery story; today's identity loss is irrecoverable                                                      | Beta                                                                       |
 | Attachment server architecture               | Encrypted MinIO-backed attachment store (photos, files); architecturally separate from relay                              | Alpha 2 → Beta                                                             |
-| iOS architecture (SwiftUI + KMP shared)      | Tracked in ADR-019 as ADR-022; the iOS port itself is NLnet Milestone 1                                                   | Post-NLnet (Milestone 1 deliverable)                                       |
+| iOS architecture (SwiftUI + KMP shared)      | Tracked in ADR-019 as ADR-022; the iOS port itself is the next major platform deliverable after Alpha 2                   | Beta-tier                                                                  |
 | Pluggable transports (obfs4, Snowflake, fronting) | Once ADR-019's Xray REALITY ages, additional outer transports will need a structured slot                              | Beta                                                                       |
-| Adaptive Transport Selection                 | Runtime probe-and-pick across direct WSS, Xray, Tor; replaces today's build-time `USE_TOR` / `USE_XRAY` flag mutex        | ADR-020, post-NLnet                                                        |
-| Multi-server Xray fan-out                    | Closes the single-Hetzner-VPS point-of-failure on Stage 5E                                                                | ADR-021, post-NLnet                                                        |
+| Adaptive Transport Selection                 | Runtime probe-and-pick across direct WSS, Xray, Tor; replaces today's build-time `USE_TOR` / `USE_XRAY` flag mutex        | ADR-020, Beta-tier                                                         |
+| Multi-server Xray fan-out                    | Closes the single-Hetzner-VPS point-of-failure on Stage 5E                                                                | ADR-021, Beta-tier                                                         |
 
 ## Conventions
 
@@ -76,8 +77,8 @@ header.
   `deprecated`. Once an ADR ships, its status only ever moves
   forward.
 - **Cross-references** use relative links so the directory works
-  off-line (cloned repo, NLnet reviewer reading offline) — never
-  absolute GitHub URLs.
+  off-line (cloned repo, offline review session) — never absolute
+  GitHub URLs.
 
 ## See also
 
