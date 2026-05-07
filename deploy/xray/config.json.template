@@ -110,26 +110,47 @@
   ],
 
   "routing": {
-    "//": "Stage 5E.B.5 diagnostic: relax routing to inboundTag-only.",
-    "//":   "Strict version with domain=[\"full:relay.phntm.pro\"] silently",
-    "//":   "fell through to blackhole on Xray 26.3.27 even though sniffing",
-    "//":   "did extract the SNI correctly (logs showed `accepted tcp:",
-    "//":   "relay.phntm.pro:443 [vless-reality-in -> block]`). Until we",
-    "//":   "isolate why the matcher misses, all VLESS traffic goes to the",
-    "//":   "freedom outbound — which itself relies on the dns.hosts override",
-    "//":   "above to land in the local Caddy container.",
-    "//": "Threat model in this diagnostic mode: anyone with the shared UUID",
-    "//":   "(it ships in the APK — capability auth, not identity) can",
-    "//":   "target any domain through this server. UUID is currently held",
-    "//":   "only by us; REALITY active-probing defence is unchanged. Once",
-    "//":   "the WSS path is confirmed working end-to-end, restore the",
-    "//":   "blackhole-by-default rule with correct domain syntax.",
+    "//": "Restored strict routing (was diagnostic-relaxed in the Stage 5",
+    "//":   "PR's last commit). We try three rules in order — the first",
+    "//":   "matching wins:",
+    "//":   "  1. SNI matches relay.phntm.pro (covers normal client path).",
+    "//":   "  2. Destination port == 443 (covers IP-literal CONNECT where",
+    "//":   "     sniffing did not surface a domain).",
+    "//":   "  3. Catchall blackhole — closes the open-proxy hole that the",
+    "//":   "     diagnostic config left open for any UUID holder.",
+    "//": "Why three domain-matcher syntaxes in rule 1: Xray 26.3.27 silently",
+    "//":   "missed `full:relay.phntm.pro` during Test 14 prep even when",
+    "//":   "sniffing visibly extracted that exact value. Listing the bare",
+    "//":   "host AND the `domain:` prefix AND `full:` prefix means whichever",
+    "//":   "variant the matcher actually honours wins — defence in depth",
+    "//":   "against version-specific matcher quirks. Cost is zero: at most",
+    "//":   "one extra string compare per connection.",
+    "//": "domainStrategy=AsIs deliberately — we do NOT want Xray pre-resolving",
+    "//":   "domains to IPs before matching, because that would make rule 1",
+    "//":   "depend on dns.hosts (which only overrides relay.phntm.pro). With",
+    "//":   "AsIs, the sniffed SNI is matched as a string against the rule.",
     "domainStrategy": "AsIs",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["vless-reality-in"],
+        "domain": [
+          "relay.phntm.pro",
+          "domain:relay.phntm.pro",
+          "full:relay.phntm.pro"
+        ],
         "outboundTag": "to-relay"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["vless-reality-in"],
+        "port": "443",
+        "outboundTag": "to-relay"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["vless-reality-in"],
+        "outboundTag": "block"
       }
     ]
   }
