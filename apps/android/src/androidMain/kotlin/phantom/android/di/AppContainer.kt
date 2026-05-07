@@ -365,6 +365,54 @@ class AppContainer(private val context: Context) {
             }
         }
 
+        // Prekey-lifecycle reconnect hooks. The 24-hour ticker above
+        // covers steady-state OPK refill and SPK rotation, but a long-
+        // offline device that just woke up should not have to wait up
+        // to a day for the next tick to publish a missing bundle. This
+        // block fires three idempotent operations on every successful
+        // WS reconnect:
+        //
+        //   1. verifyBundleOnRelay() — defence against the silent-
+        //      onboarding-publish-failure case. Issues a single GET to
+        //      /prekeys/status; if the relay reports
+        //      `signed_prekey_age_days = null` it republishes the full
+        //      local bundle. Cheap when the bundle is already there.
+        //   2. maybeReplenishOneTimePreKeys() — handles the case where
+        //      we have been offline long enough for peers to drain our
+        //      OPK pool below the threshold while the 24-hour ticker
+        //      slept.
+        //   3. maybeRotateSignedPreKey() — same idea for the weekly
+        //      SPK rotation cadence.
+        //
+        // All three are no-ops on the common path; cost is one GET +
+        // one tiny pool-count read on each reconnect.
+        appScope.launch {
+            transport.state.collect { st ->
+                if (st !is phantom.core.transport.TransportState.Connected) return@collect
+                runCatching { lifecycleService.verifyBundleOnRelay() }
+                    .onFailure {
+                        android.util.Log.w(
+                            "PreKeyLifecycle",
+                            "verifyBundleOnRelay on reconnect failed: ${it.message}",
+                        )
+                    }
+                runCatching { lifecycleService.maybeReplenishOneTimePreKeys() }
+                    .onFailure {
+                        android.util.Log.w(
+                            "PreKeyLifecycle",
+                            "Replenish on reconnect failed: ${it.message}",
+                        )
+                    }
+                runCatching { lifecycleService.maybeRotateSignedPreKey() }
+                    .onFailure {
+                        android.util.Log.w(
+                            "PreKeyLifecycle",
+                            "Rotate on reconnect failed: ${it.message}",
+                        )
+                    }
+            }
+        }
+
         // Initialise CallManager and wire call-signalling routing.
         val cm = CallManager(
             context = context,

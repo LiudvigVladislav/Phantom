@@ -80,6 +80,11 @@ class PreKeyLifecycleServiceTest {
         var publishCount = 0
         var lastRequest: PublishRequest? = null
         var publishResult: PublishResult = PublishResult.Stored(0)
+        var statusCount = 0
+        // Default: relay reports the identity is unknown
+        // (signed_prekey_age_days = null). Tests that exercise the
+        // "relay already has our bundle" branch override this.
+        var fetchStatusResult: PreKeyStatus = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = null)
         override suspend fun publishBundle(request: PublishRequest): PublishResult {
             publishCount++
             lastRequest = request
@@ -92,7 +97,10 @@ class PreKeyLifecycleServiceTest {
         override suspend fun fetchStatus(
             identityPubkeyHex: String,
             requesterPubkeyHex: String?,
-        ) = PreKeyStatus(0, null)
+        ): PreKeyStatus {
+            statusCount++
+            return fetchStatusResult
+        }
     }
 
     private suspend fun makeAlpha2Identity(): Triple<IdentityManager, InMemoryIdentityRepository, IdentityRecord> {
@@ -164,6 +172,72 @@ class PreKeyLifecycleServiceTest {
         rig.service.bootstrapForNewIdentity().getOrThrow()
         assertEquals(firstPublishCount, rig.api.publishCount, "no second publish")
         assertEquals(firstSpk.keyId, rig.spkRepo.get()!!.keyId, "SPK unchanged")
+    }
+
+    // ── Verify-bundle-on-relay ──────────────────────────────────────────────
+
+    @Test
+    fun verifyBundleOnRelay_republishesWhenRelayHasNoBundle() = runTest {
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        // Onboarding-equivalent local state: SPK + 100 OPKs, but the
+        // relay-side publish is simulated to have failed silently
+        // (publishCount remains 0 here because we bypass the publish
+        // path and seed local state via bootstrap, then reset the
+        // publish counter before running verify).
+        rig.service.bootstrapForNewIdentity().getOrThrow()
+        rig.api.publishCount = 0
+        rig.api.lastRequest = null
+
+        // Relay reports the identity is unknown (default
+        // FakePreKeyApi.fetchStatusResult). verify must republish.
+        val result = rig.service.verifyBundleOnRelay()
+        assertTrue(result.isSuccess, "verify must succeed; got $result")
+        assertTrue(result.getOrNull()!!, "verify must report a republish ran")
+        assertEquals(1, rig.api.statusCount, "exactly one status probe")
+        assertEquals(1, rig.api.publishCount, "exactly one republish")
+        // The republished bundle is the existing local pool, not a fresh
+        // generation: 100 OPKs from bootstrap, no new OPK creation.
+        assertEquals(100, rig.api.lastRequest!!.one_time_pre_keys.size)
+    }
+
+    @Test
+    fun verifyBundleOnRelay_doesNothingWhenRelayHasBundle() = runTest {
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        rig.service.bootstrapForNewIdentity().getOrThrow()
+        rig.api.publishCount = 0
+        rig.api.lastRequest = null
+
+        // Relay says: identity is registered, SPK is 0 days old.
+        // verify must NOT republish.
+        rig.api.fetchStatusResult = PreKeyStatus(remaining_opks = 50, signed_prekey_age_days = 0)
+
+        val result = rig.service.verifyBundleOnRelay()
+        assertTrue(result.isSuccess)
+        assertFalse(result.getOrNull()!!, "verify must NOT report a republish")
+        assertEquals(1, rig.api.statusCount, "status probed exactly once")
+        assertEquals(0, rig.api.publishCount, "no republish when relay already has bundle")
+    }
+
+    @Test
+    fun verifyBundleOnRelay_skipsSilentlyWhenLocalSpkMissing() = runTest {
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        // No bootstrapForNewIdentity call: local SPK absent. verify
+        // returns false silently — driving onboarding is
+        // bootstrapForNewIdentity's job, not verify's.
+        val result = rig.service.verifyBundleOnRelay()
+        assertTrue(result.isSuccess)
+        assertFalse(result.getOrNull()!!, "verify is a no-op when local SPK missing")
+        assertEquals(0, rig.api.statusCount, "no relay round-trip when local has nothing to verify")
+        assertEquals(0, rig.api.publishCount)
     }
 
     // ── Replenish ────────────────────────────────────────────────────────────
