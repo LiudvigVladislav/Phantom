@@ -7,8 +7,25 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import phantom.core.storage.db.PhantomDatabase
 
+/**
+ * SqlDelight-backed [LocalOneTimePreKeyRepository].
+ *
+ * As of F22 (see [docs/adr/ADR-023-Local-Prekey-Keystore-Wrap.md](../../../../../docs/adr/ADR-023-Local-Prekey-Keystore-Wrap.md))
+ * the `private_key_hex` column value is wrapped through
+ * [PrivateKeyStorageCodec] before it touches SQLite. The schema column
+ * type stays `TEXT`; the value stored is the codec's `v1:` + Base64
+ * form. Reads transparently accept both the new wrapped form and any
+ * legacy raw-hex value still present from before the F22 PR landed
+ * (lazy migration — see codec docstring).
+ *
+ * The cipher is injected so non-Android callers (today: unit tests
+ * via [IdentityCipher]; tomorrow: a JVM desktop port) construct the
+ * repository against an implementation that matches their platform's
+ * key-storage facility.
+ */
 class SqlDelightLocalOneTimePreKeyRepository(
     private val db: PhantomDatabase,
+    private val privateKeyCipher: KeystoreBlobCipher = IdentityCipher,
 ) : LocalOneTimePreKeyRepository {
 
     override suspend fun get(keyIdHex: String): LocalOneTimePreKeyEntity? =
@@ -30,7 +47,9 @@ class SqlDelightLocalOneTimePreKeyRepository(
             db.localOneTimePreKeyQueries.insert(
                 key_id_hex       = entity.keyIdHex,
                 public_key_hex   = entity.publicKeyHex,
-                private_key_hex  = entity.privateKeyHex,
+                private_key_hex  = PrivateKeyStorageCodec.encodeForStorage(
+                    entity.privateKeyHex, privateKeyCipher,
+                ),
                 uploaded_at_ms   = entity.uploadedAtMs,
             )
         }
@@ -45,7 +64,9 @@ class SqlDelightLocalOneTimePreKeyRepository(
                     db.localOneTimePreKeyQueries.insert(
                         key_id_hex       = e.keyIdHex,
                         public_key_hex   = e.publicKeyHex,
-                        private_key_hex  = e.privateKeyHex,
+                        private_key_hex  = PrivateKeyStorageCodec.encodeForStorage(
+                            e.privateKeyHex, privateKeyCipher,
+                        ),
                         uploaded_at_ms   = e.uploadedAtMs,
                     )
                 }
@@ -64,7 +85,9 @@ class SqlDelightLocalOneTimePreKeyRepository(
     private fun Local_one_time_pre_key.toEntity() = LocalOneTimePreKeyEntity(
         keyIdHex      = key_id_hex,
         publicKeyHex  = public_key_hex,
-        privateKeyHex = private_key_hex,
+        privateKeyHex = PrivateKeyStorageCodec.decodeFromStorage(
+            private_key_hex, privateKeyCipher,
+        ),
         uploadedAtMs  = uploaded_at_ms,
     )
 }
