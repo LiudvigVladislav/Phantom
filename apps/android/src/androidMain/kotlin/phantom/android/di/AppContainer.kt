@@ -177,8 +177,21 @@ class AppContainer(private val context: Context) {
         // bootstrap path looks up own keypairs by id) and IdentityCrypto
         // (verifies peer's published SPK signature). The full bundle-
         // fetch + first-message bootstrap wiring lands in commit 11.
-        val signedPreKeyRepo = phantom.core.storage.SqlDelightLocalSignedPreKeyRepository(dbHolder.database)
-        val oneTimePreKeyRepo = phantom.core.storage.SqlDelightLocalOneTimePreKeyRepository(dbHolder.database)
+        // F22 / ADR-023: wrap the prekey-repository private-key TEXT
+        // columns with an Android Keystore AES-256-GCM master key
+        // (alias `phantom_prekey_wrap_v1`). Reads transparently fall
+        // back to the legacy raw-hex format for any rows still on the
+        // pre-wrap schema; lazy migration via `maybeReplenishOneTimePreKeys`
+        // / `maybeRotateSignedPreKey` rewrites them on the next cycle.
+        val prekeyKeystoreCipher = phantom.core.storage.createAndroidPrekeyKeystoreCipher()
+        val signedPreKeyRepo = phantom.core.storage.SqlDelightLocalSignedPreKeyRepository(
+            db = dbHolder.database,
+            privateKeyCipher = prekeyKeystoreCipher,
+        )
+        val oneTimePreKeyRepo = phantom.core.storage.SqlDelightLocalOneTimePreKeyRepository(
+            db = dbHolder.database,
+            privateKeyCipher = prekeyKeystoreCipher,
+        )
         val sessionManagerIdentityCrypto = phantom.core.identity.LibsodiumIdentityCrypto()
         val sessionManager = SessionManager(
             x3dh = x3dh,
