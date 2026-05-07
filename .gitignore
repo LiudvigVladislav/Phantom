@@ -4,6 +4,8 @@
 # project source). Tracked variants (project-level skills/agents/commands)
 # live elsewhere under .claude/ and are added explicitly when needed.
 .claude/skills/
+# Per-user MCP server configuration (Claude Code).
+.mcp.json
 
 # Gradle / KMP
 .gradle/
@@ -12,11 +14,19 @@ build/
 local.properties
 *.iml
 .idea/
+# Kotlin Multiplatform / KSP per-module metadata cache. Regenerated on
+# every clean build; bloats the repo when committed (76 .klib files
+# observed before this gitignore landed).
+.kotlin/
 
 # Android
 apps/android/local.properties
 *.apk
 *.aab
+# Firebase config — regenerate locally per Firebase project. Live API
+# key was tracked publicly until 2026-05-08; key rotation in Firebase
+# Console is a separate operator action documented in PROJECT_LOG.
+apps/android/google-services.json
 
 # Briar tor + lyrebird native binaries — extracted at build time from
 # org.briarproject:tor-android.jar and lyrebird-android.jar by the
@@ -77,3 +87,18 @@ deploy/bridge2/.env
 # config.json is rendered from config.json.template + .env at deploy time.
 deploy/xray/.env
 deploy/xray/config.json
+
+# Local working files (operator scratch — not project source).
+tag-message.txt
+
+# Private operator material — grant application drafts (NLnet, FUTO,
+# FLOSS) live here. Reviewers see the official portal submission, not
+# our internal draft history. Created 2026-05-08 to hold NLnet draft V2
+# files moved out of docs/project/.
+private/
+
+# PDF working drafts (kept locally, never pushed). Two exceptions retain
+# the legitimate published-PDF locations under legal/assets/ and docs/**.
+*.pdf
+!legal/assets/*.pdf
+!docs/**/*.pdf
