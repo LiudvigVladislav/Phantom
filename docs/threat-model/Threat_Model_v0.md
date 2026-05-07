@@ -1,6 +1,91 @@
 # Threat Model v0
 
-Статус: draft v0.1
+Status: draft v0.1
+Английский executive summary — основной документ ниже на русском.
+The English executive summary is at the top; the formal threat
+model body is in Russian below it.
+
+---
+
+## English executive summary
+
+PHANTOM is a privacy-first messenger built for users on networks
+they cannot trust. This document defines what we defend against,
+what we explicitly do not, and how the trust model is laid out
+across the actors in the system.
+
+**What PHANTOM defends against.** A passive network observer
+(ISP, carrier middlebox, transit-level adversary) sees only
+TLS-encrypted bytes — message content, sender, recipient, and
+contact graph remain confidential because every envelope is
+end-to-end encrypted with the Double Ratchet and wrapped in a
+Sealed Sender header before it reaches the relay. An active
+network adversary that blocks endpoints (Russia's TSPU is the
+worked example — see ADR-019) is defeated by the censorship-
+resistance transport layer: today either Tor with operator-
+controlled WebTunnel bridges (ADR-016) or Xray VLESS+REALITY
+masquerading as a TLS handshake to `www.microsoft.com` (ADR-019),
+production-validated 2026-05-07 on a Russian carrier. A
+malicious or seized relay sees only opaque ciphertext blobs —
+no plaintext, no decryptable messages; the relay's trust
+posture is recorded in ADR-004 and enforced at the protocol
+level. A compromise of a single device's identity key cannot
+retroactively read past messages — forward secrecy is provided
+by the per-message ratchet. Finally, the device-thief case:
+local data is encrypted at rest via SQLCipher with a key derived
+from the user's unlock authentication, so a powered-off seized
+device leaks nothing useful without the user's biometric or PIN.
+
+**What PHANTOM does not defend against.** A compromised endpoint
+with the screen unlocked and the user logged in (a malicious
+process with `READ_USER_DATA` permission, or root-level
+adversary on the device, or a coercion scenario where the user
+is forced to unlock and read messages) reveals the cleartext
+view that the user themselves sees. A sophisticated state-level
+adversary with hardware access (forensic memory imaging while
+the app is running, side-channel attacks against the SoC's
+TrustZone) is out of scope for the Alpha-stage threat model
+and pushed to GrapheneOS-class hardening as user-side
+operational guidance. Traffic-analysis adversaries who can
+correlate metadata at the network egress *and* the relay
+ingress simultaneously can probabilistically link sender to
+recipient — this is the same global-passive-adversary case Tor
+itself does not solve, and we accept it as out-of-scope at the
+PHANTOM layer.
+
+**Adversary capability matrix** (formalised in §3 of the Russian
+body below): six adversary classes are tracked — network observer,
+malicious relay, compromised backend component, malicious user
+(spam / scam / flood), device thief / local compromise, fake
+contact / impersonator. For each, the body documents what the
+adversary can do and what they explicitly cannot. Priorities
+are ranked P0/P1/P2 in §4.
+
+**Trust model.** The user trusts only their own device's
+crypto state. The relay is treated as untrusted-but-honest-by-
+default and protected against by encryption rather than
+authentication. The sender and recipient devices are mutually
+trusted at the protocol layer (Double Ratchet contract) but
+each manages its own identity-key secrecy. Verification of
+contacts is user-driven — currently QR-code at first contact;
+post-Alpha-2 a username directory adds a second verification
+channel (ADR-005 + the "Username uniqueness" pending ADR
+draft).
+
+**Out-of-scope today, in-scope later.** Group-chat hardening
+findings (Track B Security Sprint), iOS port (ADR-022 planned),
+adaptive transport selection (ADR-020), and multi-server
+fan-out for the Stage 5E Xray endpoint (ADR-021) are tracked
+in the project's backlog with target windows in
+`docs/project/MASTER_TIMELINE_2026.md` and the SECURITY_ROADMAP.
+
+For the formal threat model with full adversary specifications,
+priority matrices, and engineering obligations before each
+release stage, read the Russian body below. A full English
+translation is planned for the OTF / Article 19 review window
+post-NLnet submission.
+
+---
 
 ## 1. Цель документа
 

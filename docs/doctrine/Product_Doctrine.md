@@ -1,8 +1,32 @@
 # Product Doctrine
 
-Статус: draft v0.1  
-Владелец: Founder  
-Обязателен для всех архитектурных и продуктовых решений
+Status: draft v0.1
+Owner: Founder
+Binding on every architectural and product decision
+
+---
+
+## English summary
+
+PHANTOM follows seven product invariants, each binding on every
+architectural and product decision in this repository: (1)
+end-to-end encryption is non-negotiable — private chats and
+small private groups are an inviolable encrypted zone; (2)
+phone numbers are optional, never identity-load-bearing; (3)
+the public discovery layer is separable from the encrypted
+core, so the public surface can be moderated without ever
+touching private content; (4) no custom cryptography — only
+audited primitives (libsodium, Signal-protocol-derived ratchet
+constructions); (5) the transport layer is replaceable — the
+client must work over direct WSS, Tor, Xray, and any future
+pluggable transport without architectural change; (6) the app
+degrades gracefully under network restrictions rather than
+failing closed; (7) anti-scam protection is by design (Trust
+Tier flow, Message Requests funnel, no public unsolicited
+messaging surface) rather than added on as a moderation layer.
+The full doctrine in Russian follows below.
+
+---
 
 ## 1. Миссия
 
