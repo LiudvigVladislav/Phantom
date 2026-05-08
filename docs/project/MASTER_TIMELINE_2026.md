@@ -2,8 +2,8 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-05-08  
-**Master HEAD:** Track A PR 4 merged (#67) — F-02/F-12/F-06/F-13 storage durability. PR 5 open (#68) — UX cleanup. Track B items 1–4 все закрыты — Alpha-2 security gate пройден.  
+**Last updated:** 2026-05-09  
+**Master HEAD:** Track A complete (5 PRs ✅). Track B items 1–8 ALL merged — **Kickstarter security blockers closed**. F11+F26 signed-challenge auth production-validated on Tecno МТС + emulator with the new APK 2026-05-09.  
 **Ближайший release window:** 2026-06-01 (24 дня); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
 
 ---
@@ -67,10 +67,10 @@ Track A + Track C идут параллельно. Track B стартует по
 | 2 | **F19+F20** Call signalling no E2EE / no Sealed Sender | Wrap SDP/ICE in Double Ratchet + Sealed Sender | ~3 дня | Alpha-2 | ✅ merged `569b868e` (#62, 2026-05-08) |
 | 3 | **F8** RatchetState plaintext SQLite | Keystore-wrap RatchetState blob перед записью | ~2 дня | Alpha-2 | ✅ merged `bb36705f` (#60, 2026-05-08) |
 | 4 | **F2+F13** SenderKey signing dead | ADR-017 (remove signing) уже draft → реализовать | ~3 дня | Alpha-2 | ✅ merged `c1fe16ed` (#63, 2026-05-08) |
-| 5 | **F1** Group control msgs outside Double Ratchet | Wrap SKD/leave/add в Double Ratchet | ~3 дня | Kickstarter | ⬜ |
-| 6 | **F3** SenderKey KDF bare SHA-256 | Заменить на HKDF-SHA256 с domain separation | ~1 день | Kickstarter | ⬜ |
-| 7 | **F4** Member-leave не ротирует ключи | Full key rotation на leave/remove | ~2 дня | Kickstarter | ⬜ |
-| 8 | **F11+F26** Shared relay token | Per-user signed challenge | ~3 дня | Kickstarter | ⬜ |
+| 5 | **F1** Group control msgs outside Double Ratchet | Wrap SKD/leave/add в Double Ratchet | ~3 дня | Kickstarter | ✅ merged `cceb83fd` (#70, ADR-026, 2026-05-08) |
+| 6 | **F3** SenderKey KDF bare SHA-256 | Заменить на HKDF-SHA256 с domain separation | ~1 день | Kickstarter | ✅ merged `1a04dadc` (#69, 2026-05-08) |
+| 7 | **F4** Member-leave не ротирует ключи | Full key rotation на leave/remove | ~2 дня | Kickstarter | ✅ merged `6a38e232` (#71, 2026-05-08) |
+| 8 | **F11+F26** Shared relay token | Per-user signed challenge | ~3 дня | Kickstarter | ✅ merged `6e90e3c6` (#72, ADR-027, 2026-05-08) — production-validated 2026-05-09 |
 | 9–17 | P2 batch (F6, F7, F9, F10, F12 retry, F14, F18, F23, F25) | Зачистка во время Beta-полировки | — | — | ⬜ |
 
 **Verified clean / уже закрыто:**
@@ -84,6 +84,10 @@ Track A + Track C идут параллельно. Track B стартует по
 - ✅ **C-2** Read receipts routed through sealed DR pipeline — `f62569e6` (#59, 2026-05-08)
 - ✅ **F19+F20** Call signalling through Double Ratchet + Sealed Sender; ADR-025 — `569b868e` (#62, 2026-05-08)
 - ✅ **F2+F13** Dead SenderKey signing keypair removed; ADR-017 Accepted; migration 14.sqm — `c1fe16ed` (#63, 2026-05-08)
+- ✅ **F3** SenderKey KDF: bare SHA-256 → HKDF-SHA256 with iteration-bound salt + `_v2` info strings — `1a04dadc` (#69, 2026-05-08)
+- ✅ **F1** Group control messages (invite/SKD/leave/add) + group ciphertext broadcasts now route through DR + Sealed Sender; ADR-026 — `cceb83fd` (#70, 2026-05-08)
+- ✅ **F4** Member-leave proactively rotates own SenderKey + redistributes fresh SKD to remaining members — `6a38e232` (#71, 2026-05-08)
+- ✅ **F11+F26** Shared WS token replaced with per-user Ed25519 signed-challenge auth (TOFU first connect + 1:1 binding); ADR-027 — `6e90e3c6` (#72, 2026-05-08). Production-validated on Tecno МТС + emulator 2026-05-09. RELAY_TOKEN BuildConfig field removed from APK.
 
 ---
 
@@ -260,38 +264,39 @@ The canonical funding-channel list lives in [](../../funding.json) at the reposi
 
 > Обновляется по мере прогресса. Когда задача меняется — менять этот блок и резерв-помечать в треках выше.
 
-**Текущий фокус (2026-05-08):** Track B items 1–4 все закрыты — **Alpha-2 security gate пройден**. F22 + F8 + C-2 + F19+F20 + F2+F13 — все merged в этой рабочей сессии.
+**Текущий фокус (2026-05-09):** **ВСЯ Track A + ВСЯ Track B (1–8) закрыты.** Repository security gate для Alpha-2 + Kickstarter обоих пройден. Council-revised план задумывал submit на день 15 с одним security item (F22) — фактически закрыли 8 items за два рабочих дня.
 
-**Что закрыто за сессию 2026-05-08:**
-- F8 (RatchetState Keystore-wrap) → PR #60
-- C-2 (read receipts via Sealed Sender) → PR #59
-- F19+F20 (call signalling E2EE) → PR #62 + ADR-025
-- F2+F13 (dead SenderKey signing removal) → PR #63 + ADR-017 Accepted + migration 14.sqm
+**Что закрыто за сессии 2026-05-08 → 2026-05-09:**
+- Track A: PR #65 data-integrity (F-08/F-01/F-09/F-04), #67 storage durability (F-02/F-12/F-06/F-13), #68 UX cleanup (F-14/F-21/F-24 + 3 QA fixes)
+- Track B: #56–#58 (F22 + tests + roadmap), #59 (C-2 read receipts), #60 (F8 RatchetState wrap), #62 (F19+F20 calls E2EE + ADR-025), #63 (F2+F13 + ADR-017 Accepted), #69 (F3 HKDF), #70 (F1 group control + ADR-026), #71 (F4 leave rotation), #72 (F11+F26 + ADR-027)
+- Production validation 2026-05-09: signed-challenge auth работает на Tecno МТС без VPN через Xray; text + voice + call signaling round-trip OK на двух устройствах
 
-**Что НЕ закрыто из council-плана:**
-- Day 3 — demo video (записывает Vladislav)
-- Day 5 — donation rails registration (Open Collective / Liberapay / Polar / BMAC — ручные действия)
-- Day 6 — public write-up (HN/Хабр)
-- Day 14-15 — NLnet draft V2 финализация + submission
+**Что НЕ кодовая работа, ручные действия Vladislav:**
+- Demo video Stage 5E (council plan Day 3 — ещё не снято)
+- Donation rails: Open Collective / Liberapay / Polar / BMAC
+- FUTO Microgrants application
+- Public write-up HN + Хабр
+- NLnet draft V2 финализация + submission через portal
+- FLOSS/fund submission
+- Tag `v0.1.0-alpha.2` (можно сразу — security gate пройден)
 
-**Следующий шаг (Track A):** PR 5 (#68) — UX cleanup (F-14/F-21/F-24 + 3 fixes) открыт, ждёт merge. После merge — Track A complete → Track B items 5–8 (F1, F3, F4, F11+F26).
-
-**Что ещё ⬜ (не кодовая работа, ручные действия Vladislav):**
-- Demo video Stage 5E (Day 3 в плане — ещё не снято)
-- Donation rails: Open Collective / Liberapay / Polar / BMAC (Day 5)
-- FUTO Microgrants application (Day 5)
-- Public write-up HN + Хабр (Day 6)
-- FLOSS/fund submission (Days 20-22)
+**QA bugs reported 2026-05-09 (parked, не блокеры):**
+1. **Mic one-way audio при звонке** — phone↔emu testing показал что одна сторона не слышит другую. Совпадает с известным deferred PR 2.6 ("Calls audio plumbing — JavaAudioDeviceModule + AudioFocus + suppress reconnect"). Severity: medium (calls = experimental в Alpha).
+2. **После hangup возврат на ChatList, не на ChatScreen** — нав баг, ~5 строк. Severity: low.
+3. **Реакции не доходят до собеседника** — send-path или receive-path сломан для TYPE_REACTION. Нужна диагностика. Severity: medium.
+4. **Нет "Удалить чат" в long-press menu на ChatList** — фича отсутствует, нужна с подменю "Удалить у себя / Удалить у обоих" (аналог `deleteMessageForBoth`). Severity: low.
+5. **Дизайн полировка + значки не соответствуют референсам** — отдельный sprint, ui-prototyper agent + Vladislav как arbiter. Severity: low (но visible to NLnet reviewers).
 
 Полный 25-day plan в `~/.claude/projects/.../memory/plan_25_days_to_release.md` (локально, не в репо).
 
-**Активные ветки:** все merged. Master теперь содержит Stage 5 целиком.
+**Активные ветки:** все merged. Master в clean state.
 
-**Известные follow-ups, не блокирующие Alpha-2:**
-- Prekey republish fix (pre-existing bug, surfaced by Stage 5 testing) — Day 4 если успеется, иначе post-Alpha-2
-- Firebase Console SHA-1 fingerprints добавить как defence-in-depth — opportunistic
-- `keystores/phantom-release.keystore` backup в off-device location — operator action whenever convenient
-- ADR-020 (adaptive transport selection) + ADR-021 (multi-server Xray fan-out) + ADR-022 (iOS XCFramework) — все упомянуты в ADR-019 как Phase 2 deliverables, реализация post-Alpha-2
+**Известные follow-ups (deferred, не блокеры Alpha-2):**
+- Track B P2 batch (F6, F7, F9, F10, F12 retry, F14, F18, F23, F25) — Beta polish window
+- Track D Alpha-2 features (attachments, stable groups, channels, username dir, iOS port) — post-NLnet roadmap
+- PR 2.6 calls audio plumbing — заодно с Bug 1 выше
+- Firebase Console SHA-1 fingerprints — defence-in-depth
+- ADR-020/021/022 (adaptive transport, multi-server Xray, iOS XCFramework) — Phase 2 per ADR-019
 
 ---
 
