@@ -83,7 +83,8 @@ class DefaultMessagingService(
     )
     override val incomingMessages: Flow<IncomingMessage> = _incomingMessages.asSharedFlow()
 
-    @Volatile private var receiving = false
+    private val startReceivingLock = Mutex()
+    private var receiving = false   // guarded by startReceivingLock
 
     // Guard against duplicate in-flight delivery: if startReceiving() is somehow
     // called twice a SharedFlow delivers to both collectors simultaneously. The
@@ -107,6 +108,10 @@ class DefaultMessagingService(
         sessionMutexesLock.withLock {
             sessionMutexes.getOrPut(conversationId) { Mutex() }
         }
+
+    override suspend fun removeConversationMutex(conversationId: String) {
+        sessionMutexesLock.withLock { sessionMutexes.remove(conversationId) }
+    }
 
     companion object {
         const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
@@ -453,8 +458,13 @@ class DefaultMessagingService(
     }
 
     override suspend fun startReceiving() {
-        if (receiving) return
-        receiving = true
+        // compareAndSet under the lock: two concurrent callers cannot both see
+        // receiving == false, preventing duplicate flow collectors.
+        val alreadyStarted = startReceivingLock.withLock {
+            if (receiving) true else { receiving = true; false }
+        }
+        if (alreadyStarted) return
+
         transport.incoming
             .onEach { deliver -> handleDeliver(deliver) }
             .launchIn(scope)

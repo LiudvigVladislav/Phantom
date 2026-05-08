@@ -3,6 +3,7 @@
 
 package phantom.android.security
 
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import java.security.KeyStore
@@ -29,16 +30,23 @@ object KeystoreManager {
         keyStore.getKey(KEY_ALIAS, null)?.let { return it as SecretKey }
 
         val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
-        keyGen.init(
-            KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
-                // TODO Beta: add setUnlockedDeviceRequired(true) once we gate on
-                // BiometricManager.canAuthenticate() at first launch — without a
-                // secure lock screen the key generation throws InvalidAlgorithmParameterException.
-                .build()
+        val spec = KeyGenParameterSpec.Builder(
+            KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
         )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .apply {
+                // Require device to be unlocked for key use, matching the policy on the
+                // DB passphrase key (DatabasePassphraseManager). API 28+ only; the flag
+                // does not require a biometric or credential at key-generation time.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    setUnlockedDeviceRequired(true)
+                }
+            }
+            .build()
+        keyGen.init(spec)
         return keyGen.generateKey()
     }
 

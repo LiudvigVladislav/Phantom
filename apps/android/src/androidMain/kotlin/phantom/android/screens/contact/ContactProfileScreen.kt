@@ -115,6 +115,7 @@ fun ContactProfileScreen(
                     showDeleteDialog = false
                     scope.launch {
                         container.conversationRepo.deleteConversation(conversationId)
+                        container.messagingService?.removeConversationMutex(conversationId)
                         onDeleteConversation()
                     }
                 }) { Text("Delete", color = Danger) }
