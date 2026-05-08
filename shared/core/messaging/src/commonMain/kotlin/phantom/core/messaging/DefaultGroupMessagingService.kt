@@ -418,9 +418,33 @@ class DefaultGroupMessagingService(
     private suspend fun handleLeave(payload: MessagePayload, fromPubKeyHex: String) {
         val groupId = payload.groupId ?: return
         groupRepo.deleteMember(groupId, fromPubKeyHex)
-        // Rotate: delete all SenderKeys so they are re-distributed at next send.
-        // Full key rotation (re-invite remaining members) is deferred to a future ADR.
-        senderKeyRepo.deleteForGroup(groupId)
+
+        // F4 fix: the leaver retained a copy of our previous SenderKey from
+        // every SKD they received, so any group message we send under the old
+        // chain remains decryptable by them indefinitely. Rotate our own
+        // SenderKey now and broadcast a fresh SKD to all remaining members
+        // BEFORE the next group send. Forward secrecy from this point on is
+        // restored: the leaver's stored chain key is no longer the one we
+        // use to encrypt new messages, and SenderKey.advance is one-way so
+        // they cannot derive the new chain key from the old one.
+        //
+        // Other members' SenderKeys are intentionally NOT deleted here —
+        // those are owned by their respective senders, and only those senders
+        // can rotate them. Each remaining member runs this same handler when
+        // they observe the LEAVE, so the network converges on fresh keys.
+        val newBundle = SenderKey.generate()
+        senderKeyRepo.upsert(
+            SenderKeyEntity(
+                groupId = groupId,
+                memberPubkeyHex = myPubKeyHex,
+                chainKeyHex = newBundle.chainKeyHex,
+                iteration = newBundle.iteration.toLong(),
+            )
+        )
+        val remainingMembers = groupRepo.getMembers(groupId)
+        remainingMembers.filter { it.pubkeyHex != myPubKeyHex }.forEach { member ->
+            sendSenderKeyDistribution(groupId, member.pubkeyHex, newBundle)
+        }
     }
 
     // ── Send helpers ──────────────────────────────────────────────────────────
