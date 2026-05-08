@@ -3,7 +3,7 @@
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
 **Last updated:** 2026-05-08  
-**Master HEAD:** ADR-019 just merged (PR #48); Stage 5 itself merged 2026-05-08 morning as #43 (squash) plus four follow-up PRs (#45 strict routing restore, #46 repo cleanup, #47 Firebase rotation log, #48 ADR-019).  
+**Master HEAD:** F2+F13 merged (PR #63, `c1fe16ed`). Track B items 1–4 все закрыты — Alpha-2 security gate пройден.  
 **Ближайший release window:** 2026-06-01 (24 дня); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
 
 ---
@@ -64,9 +64,9 @@ Track A + Track C идут параллельно. Track B стартует по
 | # | Finding | Что сделать | Оценка | Блокирует | Статус |
 |---|---------|-------------|--------|-----------|--------|
 | 1 | **F22** SPK/OPK private keys plaintext SQLite | Keystore-wrap (AES-256-GCM) | ~2 дня | Alpha-2 | ✅ merged `6737be91` + `2bcd891e` + `22f0c30c`; QA-pass телефон+эму 2026-05-08 |
-| 2 | **F19+F20** Call signalling no E2EE / no Sealed Sender | Wrap SDP/ICE in Double Ratchet + Sealed Sender | ~3 дня | Alpha-2 | ⬜ |
+| 2 | **F19+F20** Call signalling no E2EE / no Sealed Sender | Wrap SDP/ICE in Double Ratchet + Sealed Sender | ~3 дня | Alpha-2 | ✅ merged `569b868e` (#62, 2026-05-08) |
 | 3 | **F8** RatchetState plaintext SQLite | Keystore-wrap RatchetState blob перед записью | ~2 дня | Alpha-2 | ✅ merged `bb36705f` (#60, 2026-05-08) |
-| 4 | **F2+F13** SenderKey signing dead | ADR-017 (remove signing) уже draft → реализовать | ~3 дня | Alpha-2 | ⬜ |
+| 4 | **F2+F13** SenderKey signing dead | ADR-017 (remove signing) уже draft → реализовать | ~3 дня | Alpha-2 | ✅ merged `c1fe16ed` (#63, 2026-05-08) |
 | 5 | **F1** Group control msgs outside Double Ratchet | Wrap SKD/leave/add в Double Ratchet | ~3 дня | Kickstarter | ⬜ |
 | 6 | **F3** SenderKey KDF bare SHA-256 | Заменить на HKDF-SHA256 с domain separation | ~1 день | Kickstarter | ⬜ |
 | 7 | **F4** Member-leave не ротирует ключи | Full key rotation на leave/remove | ~2 дня | Kickstarter | ⬜ |
@@ -82,6 +82,8 @@ Track A + Track C идут параллельно. Track B стартует по
 - ✅ F12 partial — SPK Ed25519 sig verify + OPK atomic single-use
 - ✅ **F8** RatchetState Keystore-wrapped — `bb36705f` (#60). Read receipts via Sealed Sender — `f62569e6` (#59). 2026-05-08.
 - ✅ **C-2** Read receipts routed through sealed DR pipeline — `f62569e6` (#59, 2026-05-08)
+- ✅ **F19+F20** Call signalling through Double Ratchet + Sealed Sender; ADR-025 — `569b868e` (#62, 2026-05-08)
+- ✅ **F2+F13** Dead SenderKey signing keypair removed; ADR-017 Accepted; migration 14.sqm — `c1fe16ed` (#63, 2026-05-08)
 
 ---
 
@@ -258,23 +260,21 @@ The canonical funding-channel list lives in [](../../funding.json) at the reposi
 
 > Обновляется по мере прогресса. Когда задача меняется — менять этот блок и резерв-помечать в треках выше.
 
-**Текущий фокус (2026-05-08, F22 QA-pass):** Days 1–13 council-revised plan закрыты. Stage 5E (Day 1), README + funding (Day 2), Threat Model EN + ADR index (Day 4), F22 impl + тесты + SECURITY_ROADMAP (Days 8–13) — всё merged.
+**Текущий фокус (2026-05-08):** Track B items 1–4 все закрыты — **Alpha-2 security gate пройден**. F22 + F8 + C-2 + F19+F20 + F2+F13 — все merged в этой рабочей сессии.
 
-**QA F22 подтверждён 2026-05-08:** Tecno (после reinstall) + emulator. X3DH bootstrap с новыми Keystore-wrapped ключами ✅, двусторонний текст ✅, голос (audio_chunk) ✅, звонки ✅.
+**Что закрыто за сессию 2026-05-08:**
+- F8 (RatchetState Keystore-wrap) → PR #60
+- C-2 (read receipts via Sealed Sender) → PR #59
+- F19+F20 (call signalling E2EE) → PR #62 + ADR-025
+- F2+F13 (dead SenderKey signing removal) → PR #63 + ADR-017 Accepted + migration 14.sqm
 
-**Что НЕ закрыто из плана:**
+**Что НЕ закрыто из council-плана:**
 - Day 3 — demo video (записывает Vladislav)
 - Day 5 — donation rails registration (Open Collective / Liberapay / Polar / BMAC — ручные действия)
 - Day 6 — public write-up (HN/Хабр)
+- Day 14-15 — NLnet draft V2 финализация + submission
 
-**Следующий шаг — Day 14:** NLnet draft V2 финализация (~4-5 часов):
-- Обновить body: Stage 5E как hero deliverable
-- Обновить body: F22 как proof of security progress
-- Reference SECURITY_ROADMAP.md для остальных находок
-- Reference demo video URL (когда будет готово)
-- **Day 15 (22 мая):** Submit NLnet через официальный портал
-
-**Days 16-25:** Catch breath + Track A PR 1 (data integrity, F-08/F-01/F-09/F-04) + 8 KB chunk fix merge.
+**Следующий шаг (Track A):** PR 1 — Data integrity edges (F-08/F-01/F-09/F-04, ~3 дня).
 
 **Что ещё ⬜ (не кодовая работа, ручные действия Vladislav):**
 - Demo video Stage 5E (Day 3 в плане — ещё не снято)
