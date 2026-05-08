@@ -355,13 +355,28 @@ class PhantomMessagingService : Service() {
             connectStarted = true
 
             val relayUrl = if (useTor) BuildConfig.RELAY_ONION_URL else BuildConfig.RELAY_URL
+            // F11 + F26: signed-challenge auth replaces the shared RELAY_TOKEN.
+            // Resolve our Ed25519 signing pubkey here; null means the Alpha 1 →
+            // Alpha 2 backfill hasn't run yet and we must defer the connect.
+            val signingPair = container.identityManager.loadSigningKeyPair()
+            if (signingPair == null) {
+                Log.w(
+                    TAG,
+                    "Cannot connect: Ed25519 signing keypair not provisioned yet (migration pending). Service will exit; foreground restart after onboarding will reconnect.",
+                )
+                connectStarted = false
+                return@launch
+            }
+            val signingPubKeyHex = signingPair.publicKey.bytes
+                .joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
             Log.i(
                 "PhantomRelay",
                 "PhantomMessagingService about to connect: " +
                     "url=$relayUrl " +
-                    "tokenSet=${BuildConfig.RELAY_TOKEN != null} " +
+                    "auth=signed-challenge " +
                     "socks=${socksProxyPort ?: "direct"} " +
-                    "myPubKey=${myPubKey.take(16)}…",
+                    "myPubKey=${myPubKey.take(16)}… " +
+                    "signing=${signingPubKeyHex.take(16)}…",
             )
             // ADR-011: schedule the AlarmManager wakeup BEFORE entering
             // the suspending connect loop. connect() doesn't return until
@@ -377,7 +392,8 @@ class PhantomMessagingService : Service() {
                 container.transport.connect(
                     relayUrl = relayUrl,
                     identityPublicKeyHex = myPubKey,
-                    token = BuildConfig.RELAY_TOKEN,
+                    signingPublicKeyHex = signingPubKeyHex,
+                    signChallenge = { nonce -> container.identityManager.signRelayChallenge(nonce) },
                     socksProxyPort = socksProxyPort,
                 )
             }.onFailure { e ->

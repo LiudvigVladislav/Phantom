@@ -293,7 +293,8 @@ private class FakeRelayTransport : RelayTransport {
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
-        token: String?,
+        signingPublicKeyHex: String,
+        signChallenge: suspend (challenge: ByteArray) -> ByteArray?,
         socksProxyPort: Int?,
     ) {}
     override suspend fun disconnect() {}
@@ -1329,7 +1330,8 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
-        token: String?,
+        signingPublicKeyHex: String,
+        signChallenge: suspend (challenge: ByteArray) -> ByteArray?,
         socksProxyPort: Int?,
     ) {}
     override suspend fun disconnect() {}

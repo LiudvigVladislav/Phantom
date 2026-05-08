@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Willen LLC
 
+use crate::auth::{ChallengeStore, SigningKeyBindings};
 use crate::config::RelayConfig;
 use crate::envelope::Envelope;
 use crate::prekeys::PreKeyStore;
@@ -72,6 +73,15 @@ pub struct AppState {
     /// reused for every push. Fire-and-forget at the call site —
     /// envelope delivery never blocks on push completion.
     pub http: reqwest::Client,
+    /// Per-identity outstanding signed-challenge nonces. Replaces the
+    /// shared-secret `?token=` previously used by the WS upgrade
+    /// (closes F11 + F26). Single-shot consume on first WS handshake;
+    /// background sweep purges expired entries every minute.
+    pub auth_challenges: ChallengeStore,
+    /// Identity → Ed25519 signing pubkey binding used by the WS auth
+    /// signature verify. Populated by both `publish_prekeys` (long-term
+    /// binding) and the WS handshake itself (TOFU first connect).
+    pub signing_keys: SigningKeyBindings,
 }
 
 impl AppState {
@@ -102,7 +112,18 @@ impl AppState {
             prekeys: PreKeyStore::new(),
             push_tokens: RwLock::new(tokens),
             http,
+            auth_challenges: ChallengeStore::new(),
+            signing_keys: SigningKeyBindings::new(),
         }
+    }
+
+    /// Seed the in-memory signing-key bindings from the disk-replayed
+    /// `PreKeyStore` so a relay restart keeps every previously-published
+    /// identity's signing-key binding stable for WS auth. Call once after
+    /// `AppState::new()` and before serving traffic.
+    pub async fn rebuild_signing_keys_from_prekeys(&self) {
+        let pairs = self.prekeys.iter_identity_signing_pairs().await;
+        self.signing_keys.load(pairs).await;
     }
 }
 

@@ -66,7 +66,8 @@ private class BufferingRelayTransport : RelayTransport {
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
-        token: String?,
+        signingPublicKeyHex: String,
+        signChallenge: suspend (challenge: ByteArray) -> ByteArray?,
         socksProxyPort: Int?,
     ) {
         _state.value = TransportState.Connected
