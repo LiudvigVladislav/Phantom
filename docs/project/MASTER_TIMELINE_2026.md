@@ -3,7 +3,7 @@
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
 **Last updated:** 2026-05-08  
-**Master HEAD:** Track A PR 1 open (#65) — F-08/F-01/F-09/F-04 data integrity edges, awaiting merge. Track B items 1–4 все закрыты — Alpha-2 security gate пройден.  
+**Master HEAD:** Track A PR 4 merged (#67) — F-02/F-12/F-06/F-13 storage durability. PR 5 open (#68) — UX cleanup. Track B items 1–4 все закрыты — Alpha-2 security gate пройден.  
 **Ближайший release window:** 2026-06-01 (24 дня); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
 
 ---
@@ -46,9 +46,9 @@ Track A + Track C идут параллельно. Track B стартует по
 | 3 | [#30](https://github.com/LiudvigVladislav/Phantom/pull/30) | Calls media (mic permission, audio mode, чёрный экран) | — | ~1 день | ✅ merged `c62fbfff` |
 | 4 | docs/calls-experimental | Calls=experimental decision + Track A schedule lock | — | 30 мин | ✅ merged `d094ca8f` |
 | 5 | feat/voice-message-chunking-pr3 | **Voice messages chunking** | F-05 | ~5 дней | ✅ merged `41b9fb94` (#32, 2026-05-04). ⚠️ 8 KB chunk-size fix `6d0215d3` (Tecno reconnect window) остался на ветке — нужен отдельный merge |
-| 6 | [#65](https://github.com/LiudvigVladislav/Phantom/pull/65) | Data integrity edges | F-08, F-01, F-09, F-04 | ~3 дня | 🟡 PR open — awaiting merge |
-| 7 | (PR 4) | Storage durability | F-02, F-12, F-06, F-13 | ~3 дня | ⬜ |
-| 8 | (PR 5) | UX cleanup + small fixes | F-14, F-21, F-24 + 3 QA bugs | ~2 дня | ⬜ |
+| 6 | [#65](https://github.com/LiudvigVladislav/Phantom/pull/65) | Data integrity edges | F-08, F-01, F-09, F-04 | ~3 дня | ✅ merged `df127bc1` (#65, 2026-05-08) |
+| 7 | [#67](https://github.com/LiudvigVladislav/Phantom/pull/67) | Storage durability | F-02, F-12, F-06, F-13 | ~3 дня | ✅ merged `367a3d61` (#67, 2026-05-08) |
+| 8 | [#68](https://github.com/LiudvigVladislav/Phantom/pull/68) | UX cleanup + small fixes | F-14, F-21, F-24 + 3 fixes | ~2 дня | 🟡 PR open — awaiting merge |
 | 9 | (PR 2.6) | Calls audio plumbing — `JavaAudioDeviceModule` + AudioFocus + suppress reconnect during call | — | 2–3 дня | 🟦 **отложен post-Phase-5** |
 
 **После завершения Track A** = Alpha-3 release-candidate. Voice + text + calls работают надёжно (calls = experimental, остальное production-quality).
@@ -274,7 +274,7 @@ The canonical funding-channel list lives in [](../../funding.json) at the reposi
 - Day 6 — public write-up (HN/Хабр)
 - Day 14-15 — NLnet draft V2 финализация + submission
 
-**Следующий шаг (Track A):** PR 1 (#65) — Data integrity edges (F-08/F-01/F-09/F-04) открыт, ждёт merge. После merge — PR 4 Storage durability (F-02, F-12, F-06, F-13).
+**Следующий шаг (Track A):** PR 5 (#68) — UX cleanup (F-14/F-21/F-24 + 3 fixes) открыт, ждёт merge. После merge — Track A complete → Track B items 5–8 (F1, F3, F4, F11+F26).
 
 **Что ещё ⬜ (не кодовая работа, ручные действия Vladislav):**
 - Demo video Stage 5E (Day 3 в плане — ещё не снято)

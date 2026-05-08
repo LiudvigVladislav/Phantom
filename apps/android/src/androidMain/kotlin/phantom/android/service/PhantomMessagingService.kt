@@ -67,6 +67,7 @@ class PhantomMessagingService : Service() {
     // user has chosen to keep the messenger running.
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile private var connectStarted = false
     // ADR Tier-1 (HiOS workaround): MulticastLock changes the Wi-Fi
     // radio idle profile on aggressive OEMs (Tecno HiOS, Infinix XOS,
     // Xiaomi MIUI) where battery management ignores both
@@ -344,6 +345,15 @@ class PhantomMessagingService : Service() {
             // RELAY_ONION_URL is consumed only by the Tor branch; both Xray
             // and direct paths exit via the public WSS endpoint (Xray just
             // tunnels that exit through its REALITY outer envelope).
+            // Guard against a second onStartCommand (e.g. AlarmManager wakeup)
+            // arriving while the first connect loop is still establishing.
+            // @Volatile guarantees the write is visible across threads.
+            if (connectStarted) {
+                Log.d(TAG, "connect already in progress — duplicate onStartCommand ignored")
+                return@launch
+            }
+            connectStarted = true
+
             val relayUrl = if (useTor) BuildConfig.RELAY_ONION_URL else BuildConfig.RELAY_URL
             Log.i(
                 "PhantomRelay",
@@ -374,6 +384,7 @@ class PhantomMessagingService : Service() {
                 Log.e(TAG, "Transport connect loop exited: ${e.message}", e)
                 Log.e("PhantomRelay", "Transport connect loop exited: ${e.message}", e)
             }
+            connectStarted = false
         }
         return START_STICKY
     }

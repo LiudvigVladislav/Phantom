@@ -30,7 +30,7 @@ fun AddContactDialog(
     val parsed = remember(pasteValue) { parseContactString(pasteValue.trim()) }
     val resolvedKey = parsed?.second ?: ""
     val resolvedName = parsed?.first ?: ""
-    val isValid = resolvedKey.length >= 64
+    val isValid = resolvedKey.length == 64 && resolvedKey.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -67,7 +67,7 @@ fun AddContactDialog(
                             isValid ->
                                 Text("✓  Key recognised", color = Success, fontSize = 11.sp)
                             else ->
-                                Text("Key looks too short", color = Danger, fontSize = 11.sp)
+                                Text("Must be 64 hex characters", color = Danger, fontSize = 11.sp)
                         }
                     },
                     colors = OutlinedTextFieldDefaults.colors(
