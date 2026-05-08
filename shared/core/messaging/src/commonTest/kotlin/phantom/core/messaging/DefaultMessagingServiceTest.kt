@@ -288,7 +288,6 @@ private class FakeRelayTransport : RelayTransport {
     override val state: StateFlow<TransportState> = _state
     override val incoming: Flow<RelayMessage.Deliver> = emptyFlow()
     override val acks: Flow<RelayMessage.Ack> = emptyFlow()
-    override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
     override val typingEvents: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 10)
     val sent = mutableListOf<RelayMessage.Send>()
     override suspend fun connect(
@@ -299,7 +298,6 @@ private class FakeRelayTransport : RelayTransport {
     ) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
-    override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
     override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
     override fun isConnected() = true
@@ -1066,6 +1064,179 @@ class DefaultMessagingServiceTest {
         assertEquals(true, result.isFailure, "sendAudio must fail for payload exceeding MAX_AUDIO_BYTES")
         assertEquals(0, transport.sent.size, "no envelopes must be sent for an oversized payload")
     }
+
+    // ── C-2: read receipts via sealed Double Ratchet pipeline ─────────────────
+
+    @Test
+    fun markConversationRead_sendsOneReadReceiptPerUnreadMessage() = runTest {
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        val transport = FakeRelayTransport()
+
+        convRepo.upsertConversation(
+            ConversationEntity(
+                id = "conv-1",
+                theirUsername = "bob",
+                theirPublicKeyHex = "ccdd",
+                lastMessagePreview = "",
+                lastMessageAt = 0L,
+                unreadCount = 2,
+                trustTier = phantom.core.storage.TrustTier.TRUSTED,
+                blocked = false,
+            )
+        )
+        msgRepo.insertMessage(
+            MessageEntity(
+                id = "msg-rx-1",
+                conversationId = "conv-1",
+                ciphertext = ByteArray(0),
+                plaintextCache = "Hi",
+                sent = false,
+                status = MessageStatus.DELIVERED,
+                createdAt = 0L,
+            )
+        )
+        msgRepo.insertMessage(
+            MessageEntity(
+                id = "msg-rx-2",
+                conversationId = "conv-1",
+                ciphertext = ByteArray(0),
+                plaintextCache = "Hey",
+                sent = false,
+                status = MessageStatus.DELIVERED,
+                createdAt = 0L,
+            )
+        )
+
+        val service = buildService(this, msgRepo = msgRepo, convRepo = convRepo, transport = transport)
+        service.markConversationRead(
+            conversationId = "conv-1",
+            theirPublicKeyHex = "ccdd",
+            sendReceipt = true,
+        )
+
+        // One sealed envelope per unread message; relay must not see the sender identity.
+        assertEquals(2, transport.sent.size, "one receipt per unread message")
+        transport.sent.forEach { envelope ->
+            assertEquals("", envelope.from, "read receipt must not expose sender to relay")
+            assertEquals("ccdd", envelope.to)
+        }
+        // Local status updated for both messages.
+        assertEquals(MessageStatus.READ, msgRepo.statusUpdates["msg-rx-1"])
+        assertEquals(MessageStatus.READ, msgRepo.statusUpdates["msg-rx-2"])
+    }
+
+    @Test
+    fun markConversationRead_suppressedReceipt_noEnvelopeSent() = runTest {
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val transport = FakeRelayTransport()
+
+        msgRepo.insertMessage(
+            MessageEntity(
+                id = "msg-rx-3",
+                conversationId = "conv-1",
+                ciphertext = ByteArray(0),
+                plaintextCache = "Silent",
+                sent = false,
+                status = MessageStatus.DELIVERED,
+                createdAt = 0L,
+            )
+        )
+
+        val service = buildService(this, msgRepo = msgRepo, transport = transport)
+        service.markConversationRead(
+            conversationId = "conv-1",
+            theirPublicKeyHex = "ccdd",
+            sendReceipt = false,
+        )
+
+        assertEquals(0, transport.sent.size, "no envelope when receipt suppressed (privacy mode)")
+        assertEquals(MessageStatus.READ, msgRepo.statusUpdates["msg-rx-3"], "local status still updated")
+    }
+
+    @Test
+    fun handleDeliver_readReceipt_updatesOutgoingMessageStatusToRead() = runTest {
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        val incomingTransport = ManualIncomingTransport()
+
+        // Outgoing message whose read-status we expect to be updated.
+        msgRepo.insertMessage(
+            MessageEntity(
+                id = "msg-sent-1",
+                conversationId = "aabb_ccdd",
+                ciphertext = ByteArray(0),
+                plaintextCache = "Hey",
+                sent = true,
+                status = MessageStatus.DELIVERED,
+                createdAt = 0L,
+            )
+        )
+
+        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = listOf("aabb_ccdd"))
+        val sessionManager = SessionManager(
+            x3dh = PassthroughX3DH(),
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = FakeIdentityCrypto(),
+            json = json,
+        )
+        val service = DefaultMessagingService(
+            identity = identity,
+            localKeyPair = localKeyPair,
+            ratchet = PassthroughDoubleRatchet(),
+            sessionManager = sessionManager,
+            transport = incomingTransport,
+            messageRepository = msgRepo,
+            conversationRepository = convRepo,
+            scope = backgroundScope,
+            json = json,
+            preKeyApi = ThrowingPreKeyApi,
+            signingKeyProvider = { ThrowingSigningKey },
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Build a read_receipt payload pointing at our outgoing message.
+        val localJson = Json { ignoreUnknownKeys = true }
+        val payloadJson = localJson.encodeToString(
+            MessagePayload(
+                type = MessagePayload.TYPE_READ_RECEIPT,
+                targetMessageId = "msg-sent-1",
+                sentAt = 0L,
+                senderUsername = "bob",
+            )
+        )
+        // PassthroughDoubleRatchet treats ciphertext == plaintext.
+        val encrypted = phantom.core.crypto.EncryptedMessage(
+            ratchetPublicKey = ByteArray(32),
+            messageIndex = 0,
+            ciphertext = payloadJson.encodeToByteArray(),
+            nonce = ByteArray(24),
+        )
+        val wireFrame = WireFrame(encryptedMessage = encrypted)
+        val wireFrameBytes = localJson.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        incomingTransport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "receipt-envelope-1",
+            )
+        )
+        testScheduler.runCurrent()
+
+        assertEquals(MessageStatus.READ, msgRepo.statusUpdates["msg-sent-1"],
+            "incoming read receipt must update the outgoing message status to READ")
+    }
 }
 
 private fun ByteArray.toHexStringLower(): String =
@@ -1110,7 +1281,6 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
     )
     override val incoming: Flow<phantom.core.transport.RelayMessage.Deliver> = _incoming
     override val acks: Flow<phantom.core.transport.RelayMessage.Ack> = emptyFlow()
-    override val readReceipts: Flow<phantom.core.transport.RelayMessage.ReadReceipt> = emptyFlow()
     override val typingEvents: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 10)
     override suspend fun connect(
         relayUrl: String,
@@ -1120,7 +1290,6 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
     ) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: phantom.core.transport.RelayMessage.Send): Boolean = true
-    override suspend fun sendReadReceipt(message: phantom.core.transport.RelayMessage.ReadReceipt): Boolean = true
     override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
     override fun isConnected(): Boolean = true

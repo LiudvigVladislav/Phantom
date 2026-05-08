@@ -35,14 +35,6 @@ sealed class RelayMessage {
         val status: String,    // "relayed" | "delivered"
     ) : RelayMessage()
 
-    @Serializable
-    @SerialName("read")
-    data class ReadReceipt(
-        val to: String,         // recipient public key hex
-        val from: String,       // sender public key hex
-        val messageId: String,  // the message that was read
-    ) : RelayMessage()
-
     /**
      * Sent by the recipient AFTER an inbound envelope has been fully processed
      * (Sealed-Sender unseal → Double-Ratchet decrypt → DB insert succeeded).

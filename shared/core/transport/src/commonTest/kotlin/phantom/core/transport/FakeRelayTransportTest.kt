@@ -26,7 +26,6 @@ class FakeRelayTransportTest {
         override val state: StateFlow<TransportState> = _state.asStateFlow()
         override val incoming: Flow<RelayMessage.Deliver> = emptyFlow()
         override val acks: Flow<RelayMessage.Ack> = emptyFlow()
-        override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
 
         private val _typingEvents = MutableSharedFlow<String>(extraBufferCapacity = 10)
         override val typingEvents: SharedFlow<String> = _typingEvents.asSharedFlow()
@@ -52,8 +51,6 @@ class FakeRelayTransportTest {
             outbox.trySend(message)
             return true
         }
-
-        override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = false
 
         override suspend fun sendDeliveryAck(messageId: String): Boolean = isConnected()
 

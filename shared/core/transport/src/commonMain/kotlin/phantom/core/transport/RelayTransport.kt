@@ -11,7 +11,6 @@ interface RelayTransport {
     val state: StateFlow<TransportState>
     val incoming: Flow<RelayMessage.Deliver>
     val acks: Flow<RelayMessage.Ack>
-    val readReceipts: Flow<RelayMessage.ReadReceipt>
 
     /**
      * Emits the sender's pubKeyHex each time a "typing" event arrives from the relay.
@@ -45,7 +44,6 @@ interface RelayTransport {
     )
     suspend fun disconnect()
     suspend fun send(message: RelayMessage.Send): Boolean
-    suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean
 
     /**
      * Tells the relay that [messageId] has been fully processed on the recipient.

@@ -449,12 +449,6 @@ class DefaultMessagingService(
                 messageRepository.updateStatus(ack.messageId, newStatus)
             }
             .launchIn(scope)
-
-        transport.readReceipts
-            .onEach { receipt ->
-                messageRepository.updateStatus(receipt.messageId, MessageStatus.READ)
-            }
-            .launchIn(scope)
     }
 
     private suspend fun handleDeliver(deliver: RelayMessage.Deliver) {
@@ -916,6 +910,15 @@ class DefaultMessagingService(
                 }
                 return@runCatching
             }
+            if (payload.type == MessagePayload.TYPE_READ_RECEIPT && payload.targetMessageId.isNotEmpty()) {
+                // The peer has read one of our outgoing messages. Update its
+                // status locally — no DB row is created for the receipt itself.
+                // C-2: receipt arrived via the sealed Double Ratchet pipeline,
+                // so the relay never saw `from`, `to`, or `messageId`.
+                messageRepository.updateStatus(payload.targetMessageId, MessageStatus.READ)
+                transport.sendDeliveryAck(deliver.messageId)
+                return@runCatching
+            }
 
             val nowMs = Clock.System.now().toEpochMilliseconds()
             val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
@@ -1063,6 +1066,53 @@ class DefaultMessagingService(
         }
     }
 
+    /**
+     * Encrypts [payload] under the Double Ratchet and ships it as a
+     * sealed envelope — identical to the send path in [sendMessage]
+     * but without persisting a DB row or updating conversation state.
+     *
+     * Used for control messages that must not appear as chat bubbles
+     * (currently: read receipts). The generated messageId is ephemeral
+     * and is only used as the relay's deduplication key.
+     *
+     * C-2: replaces the old plaintext [RelayMessage.ReadReceipt] path so
+     * the relay never learns `from`, `to`, or the referenced messageId.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    private suspend fun sendSealedPayload(
+        payload: MessagePayload,
+        conversationId: String,
+        theirPublicKeyHex: String,
+    ) {
+        val plaintext = json.encodeToString(payload).encodeToByteArray()
+        val encrypted = try {
+            encryptUnderLock(
+                conversationId = conversationId,
+                recipientPublicKeyHex = theirPublicKeyHex,
+                plaintext = plaintext,
+            )
+        } catch (e: Exception) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "sendSealedPayload: encrypt failed for type=${payload.type} — dropping. ${e.message}",
+            )
+            return
+        }
+        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+        val paddedCiphertext = MessagePadding.pad(ciphertext)
+        transport.send(
+            RelayMessage.Send(
+                to = theirPublicKeyHex,
+                from = "",
+                sealedSender = Base64.encode(
+                    SealedSender.seal(identity.publicKeyHex, hexToBytes(theirPublicKeyHex))
+                ),
+                payload = paddedCiphertext.encodeBase64(),
+                messageId = uuid4().toString(),
+            )
+        )
+    }
+
     override suspend fun markConversationRead(
         conversationId: String,
         theirPublicKeyHex: String,
@@ -1072,12 +1122,18 @@ class DefaultMessagingService(
             .filter { !it.sent && it.status != MessageStatus.READ }
         unreadMessages.forEach { msg ->
             if (sendReceipt) {
-                transport.sendReadReceipt(
-                    phantom.core.transport.RelayMessage.ReadReceipt(
-                        to = theirPublicKeyHex,
-                        from = identity.publicKeyHex,
-                        messageId = msg.id,
-                    )
+                // C-2: route the read receipt through the sealed Double Ratchet
+                // pipeline. The relay sees just another sealed envelope — no
+                // `from`, `to`, or `messageId` in plaintext.
+                sendSealedPayload(
+                    payload = MessagePayload(
+                        type = MessagePayload.TYPE_READ_RECEIPT,
+                        targetMessageId = msg.id,
+                        sentAt = Clock.System.now().toEpochMilliseconds(),
+                        senderUsername = identity.username,
+                    ),
+                    conversationId = conversationId,
+                    theirPublicKeyHex = theirPublicKeyHex,
                 )
             }
             messageRepository.updateStatus(msg.id, MessageStatus.READ)

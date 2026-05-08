@@ -55,7 +55,6 @@ private class BufferingRelayTransport : RelayTransport {
     private val _incoming = MutableSharedFlow<RelayMessage.Deliver>(extraBufferCapacity = 64)
     override val incoming: Flow<RelayMessage.Deliver> = _incoming
     override val acks: Flow<RelayMessage.Ack> = emptyFlow()
-    override val readReceipts: Flow<RelayMessage.ReadReceipt> = emptyFlow()
     override val typingEvents: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 10)
 
     val sent = mutableListOf<RelayMessage.Send>()
@@ -94,7 +93,6 @@ private class BufferingRelayTransport : RelayTransport {
         }
     }
 
-    override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean = true
     override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true
 
