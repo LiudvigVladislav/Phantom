@@ -430,10 +430,11 @@ class AppContainer(private val context: Context) {
         }
 
         // Initialise CallManager and wire call-signalling routing.
+        // ADR-025: call signals are routed through the DR + Sealed Sender pipeline;
+        // CallManager no longer holds a direct reference to RelayTransport.
         val cm = CallManager(
             context = context,
-            myPubKeyHex = identity.publicKeyHex,
-            transport = transport,
+            messagingService = service,
         )
         cm.initialize()
         callManager = cm
