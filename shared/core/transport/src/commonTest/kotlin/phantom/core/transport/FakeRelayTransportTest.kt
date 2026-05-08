@@ -36,7 +36,8 @@ class FakeRelayTransportTest {
         override suspend fun connect(
             relayUrl: String,
             identityPublicKeyHex: String,
-            token: String?,
+            signingPublicKeyHex: String,
+            signChallenge: suspend (challenge: ByteArray) -> ByteArray?,
             socksProxyPort: Int?,
         ) {
             _state.value = TransportState.Connected
@@ -78,14 +79,14 @@ class FakeRelayTransportTest {
     fun connect_setsStateToConnected() = runTest {
         val transport = FakeRelayTransport()
         assertEquals(TransportState.Disconnected, transport.state.value)
-        transport.connect("ws://relay", "pubkey")
+        transport.connect("ws://relay", "pubkey", signingPublicKeyHex = "sig", signChallenge = { ByteArray(64) })
         assertEquals(TransportState.Connected, transport.state.value)
     }
 
     @Test
     fun send_appearsInOutbox() = runTest {
         val transport = FakeRelayTransport()
-        transport.connect("ws://relay", "pubkey")
+        transport.connect("ws://relay", "pubkey", signingPublicKeyHex = "sig", signChallenge = { ByteArray(64) })
         val msg = RelayMessage.Send(to = "bob", from = "alice", payload = "abc", messageId = "1")
         val result = transport.send(msg)
         assertTrue(result)
@@ -103,7 +104,7 @@ class FakeRelayTransportTest {
     @Test
     fun disconnect_setsStateToDisconnected() = runTest {
         val transport = FakeRelayTransport()
-        transport.connect("ws://relay", "pubkey")
+        transport.connect("ws://relay", "pubkey", signingPublicKeyHex = "sig", signChallenge = { ByteArray(64) })
         transport.disconnect()
         assertEquals(TransportState.Disconnected, transport.state.value)
     }
@@ -113,7 +114,7 @@ class FakeRelayTransportTest {
     @Test
     fun sendTyping_appearsInTypingOutbox_whenConnected() = runTest {
         val transport = FakeRelayTransport()
-        transport.connect("ws://relay", "pubkey")
+        transport.connect("ws://relay", "pubkey", signingPublicKeyHex = "sig", signChallenge = { ByteArray(64) })
         val result = transport.sendTyping("bob-pubkey-hex")
         assertTrue(result)
         assertEquals("bob-pubkey-hex", transport.typingOutbox.receive())
@@ -130,7 +131,7 @@ class FakeRelayTransportTest {
     @Test
     fun typingEvents_emitsRecipientKey_whenSendTypingCalled() = runTest {
         val transport = FakeRelayTransport()
-        transport.connect("ws://relay", "pubkey")
+        transport.connect("ws://relay", "pubkey", signingPublicKeyHex = "sig", signChallenge = { ByteArray(64) })
 
         val collected = mutableListOf<String>()
         // `launch` is a CoroutineScope extension; inside runTest the

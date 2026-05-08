@@ -316,6 +316,21 @@ impl PreKeyStore {
         Some(bundle)
     }
 
+    /// Snapshot every (identity, signing_pubkey) pair currently in the
+    /// store. Used at startup to seed [`crate::auth::SigningKeyBindings`] so
+    /// every previously-published identity's WS auth binding survives a
+    /// relay restart. Empty `signing_pubkey_hex` records (legacy persisted
+    /// shape) are skipped.
+    pub async fn iter_identity_signing_pairs(&self) -> Vec<(String, String)> {
+        self.inner
+            .read()
+            .await
+            .iter()
+            .filter(|(_, v)| !v.signing_pubkey_hex.is_empty())
+            .map(|(k, v)| (k.clone(), v.signing_pubkey_hex.clone()))
+            .collect()
+    }
+
     pub async fn status(&self, identity_pubkey_hex: &str, now_ms: i64) -> PreKeyStatus {
         let map = self.inner.read().await;
         match map.get(identity_pubkey_hex) {

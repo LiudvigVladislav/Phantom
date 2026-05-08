@@ -23,23 +23,42 @@ interface RelayTransport {
      * called. Idempotent at the call-site level — calling `connect` twice
      * cancels the prior reconnect job before starting a new one.
      *
-     * @param relayUrl the WebSocket URL to dial. For direct WSS this is the
-     *   public hostname (e.g. `wss://relay.phntm.pro/ws`); when [socksProxyPort]
-     *   is non-null, callers usually pass the relay's onion address (plain
+     * Per F11 + F26 fix the relay no longer accepts a shared `?token=`. Each
+     * (re)connect performs a per-user signed-challenge handshake:
+     *
+     *   1. HTTP `GET /auth/challenge?identity=<X25519_hex>` — relay returns
+     *      a single-shot 32-byte nonce.
+     *   2. The implementation calls [signChallenge] with the nonce; the
+     *      caller's Ed25519 signing private key produces a 64-byte signature.
+     *   3. WS upgrade to `?id=<X25519>&signing_pubkey=<Ed25519>
+     *      &challenge=<nonce_hex>&signature=<sig_hex>`.
+     *
+     * The transport layer holds no signing-key material — the [signChallenge]
+     * lambda owns it. A null return signals "cannot sign" (e.g. signing key
+     * not yet provisioned during onboarding); the connect attempt aborts and
+     * is retried on the next reconnect tick.
+     *
+     * @param relayUrl the WebSocket URL to dial. The same hostname is used
+     *   for the HTTP `/auth/challenge` round-trip with the `/ws` path
+     *   stripped. For direct WSS this is the public hostname
+     *   (e.g. `wss://relay.phntm.pro/ws`); when [socksProxyPort] is non-null,
+     *   callers usually pass the relay's onion address (plain
      *   `ws://…onion/ws`, plaintext over Tor by ADR-016 design).
-     * @param identityPublicKeyHex the local identity, appended as `?id=…`
-     *   so the relay can dispatch envelopes to the right queue.
-     * @param token optional auth token, appended as `&token=…` after id.
+     * @param identityPublicKeyHex the local X25519 identity, appended as
+     *   `?id=…` so the relay can dispatch envelopes to the right queue.
+     * @param signingPublicKeyHex the local Ed25519 signing pubkey that the
+     *   relay verifies the challenge signature against. Must match the one
+     *   already bound to the identity (TOFU on first connect).
+     * @param signChallenge produces an Ed25519 signature over the issued
+     *   nonce. Returning null aborts this connect attempt.
      * @param socksProxyPort if non-null, route the WebSocket TCP connection
-     *   through `127.0.0.1:<port>` over SOCKS5 (typically the embedded
-     *   Tor's auto-bound port from [TorService.state]). Null = direct.
-     *   Privacy-Mode changes translate to disconnect → reconnect with a
-     *   new value here.
+     *   through `127.0.0.1:<port>` over SOCKS5. Null = direct.
      */
     suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
-        token: String? = null,
+        signingPublicKeyHex: String,
+        signChallenge: suspend (challenge: ByteArray) -> ByteArray?,
         socksProxyPort: Int? = null,
     )
     suspend fun disconnect()

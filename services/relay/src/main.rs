@@ -18,6 +18,10 @@ async fn main() {
 
     let cfg = config::RelayConfig::from_env();
     let app_state = Arc::new(state::AppState::new(cfg.clone()));
+    // F11 + F26: rebuild the WS-auth signing-key bindings from the
+    // disk-replayed prekey store before serving traffic so a relay restart
+    // keeps every previously-published identity's binding stable.
+    app_state.rebuild_signing_keys_from_prekeys().await;
 
     let app = routes::router(Arc::clone(&app_state));
 
@@ -32,7 +36,8 @@ async fn main() {
         max_payload_kb = cfg.max_payload_bytes / 1024,
         ttl_days = cfg.envelope_ttl_secs / 86400,
         rate_limit = cfg.rate_limit_per_window,
-        auth = cfg.secret_token.is_some(),
+        admin_token_set = cfg.secret_token.is_some(),
+        ws_auth = "signed-challenge (Ed25519)",
         "phantom-relay starting"
     );
 
@@ -58,7 +63,10 @@ async fn main() {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             cleanup_state.prekeys.purge_expired_previous_spks(now_ms).await;
-            tracing::debug!("Cleanup: purged expired envelopes + previous SPKs");
+            cleanup_state.auth_challenges.purge_expired(now_ms).await;
+            tracing::debug!(
+                "Cleanup: purged expired envelopes + previous SPKs + auth challenges"
+            );
         }
     });
 

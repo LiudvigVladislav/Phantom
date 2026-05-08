@@ -5,6 +5,8 @@ package phantom.core.transport
 
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.websocket.webSocket
+import io.ktor.client.request.get
+import io.ktor.client.statement.bodyAsText
 import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
@@ -82,7 +84,9 @@ class KtorRelayTransport(
     private var ackWatchdogJob: Job? = null
     private var relayUrl: String = ""
     private var identityHex: String = ""
-    private var relayToken: String? = null
+    // F11 + F26: per-user signed-challenge auth replaces the shared relay token.
+    private var signingPubKeyHex: String = ""
+    private var challengeSigner: (suspend (ByteArray) -> ByteArray?)? = null
     private var disconnectRequested: Boolean = false
     // ADR-016 Stage 2C: Tor SOCKS port for the active connect lifetime.
     // Null = direct WSS. Set by [connect] before runReconnectLoop launches;
@@ -139,17 +143,19 @@ class KtorRelayTransport(
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
-        token: String?,
+        signingPublicKeyHex: String,
+        signChallenge: suspend (challenge: ByteArray) -> ByteArray?,
         socksProxyPort: Int?,
     ) {
         this.relayUrl = relayUrl
         this.identityHex = identityPublicKeyHex
-        this.relayToken = token
+        this.signingPubKeyHex = signingPublicKeyHex
+        this.challengeSigner = signChallenge
         this.socksProxyPort = socksProxyPort
         disconnectRequested = false
         relayLog(
             RelayLogLevel.INFO,
-            "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… tokenSet=${token != null} socks=${socksProxyPort ?: "direct"}",
+            "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
         )
         // Cancel any prior reconnect job (typically a noop on cold start;
         // matters when connect() is called twice from the service double-
@@ -176,15 +182,6 @@ class KtorRelayTransport(
         var attempt = 0
         while (!disconnectRequested) {
             _state.value = TransportState.Connecting
-            val urlWithId = if (identityHex.isNotEmpty()) "$relayUrl?id=$identityHex" else relayUrl
-            val urlWithToken = if (relayToken != null) "$urlWithId&token=$relayToken" else urlWithId
-            val redactedUrl = urlWithToken
-                .replace(Regex("""id=[^&]+"""),    "id=<redacted>")
-                .replace(Regex("""token=[^&]+"""), "token=<redacted>")
-            relayLog(
-                RelayLogLevel.INFO,
-                "Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
-            )
             // Per-generation scope. Hoisted out of the webSocket{} block so the
             // finally below can cancelAndJoin it whether the block returned
             // cleanly OR threw.
@@ -198,8 +195,53 @@ class KtorRelayTransport(
             // (clean close, exception, disconnect requested).
             val generationClient: HttpClient = httpClientFactory(socksProxyPort)
             currentGenerationClient = generationClient
+            // F11 + F26: every reconnect generation does a fresh signed-challenge
+            // handshake. Failing the handshake aborts THIS attempt only — the
+            // outer loop backs off and retries.
+            val authedWsUrl = try {
+                buildAuthedWsUrl(generationClient)
+            } catch (t: Throwable) {
+                relayLog(
+                    RelayLogLevel.ERROR,
+                    "Auth handshake failed (attempt=$attempt): ${t::class.simpleName} ${t.message}",
+                )
+                runCatching { generationClient.close() }
+                if (disconnectRequested) break
+                val delayMs = min(
+                    RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
+                    RelayTransportConfig.RECONNECT_MAX_DELAY_MS,
+                )
+                relayLog(RelayLogLevel.INFO, "Retry attempt #${attempt + 1} in ${delayMs}ms")
+                delay(delayMs)
+                attempt++
+                continue
+            }
+            if (authedWsUrl == null) {
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "Auth handshake aborted (attempt=$attempt) — signing key not ready or relay returned no challenge",
+                )
+                runCatching { generationClient.close() }
+                if (disconnectRequested) break
+                val delayMs = min(
+                    RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
+                    RelayTransportConfig.RECONNECT_MAX_DELAY_MS,
+                )
+                delay(delayMs)
+                attempt++
+                continue
+            }
+            val redactedUrl = authedWsUrl
+                .replace(Regex("""id=[^&]+"""),             "id=<redacted>")
+                .replace(Regex("""signing_pubkey=[^&]+"""), "signing_pubkey=<redacted>")
+                .replace(Regex("""challenge=[^&]+"""),      "challenge=<redacted>")
+                .replace(Regex("""signature=[^&]+"""),      "signature=<redacted>")
+            relayLog(
+                RelayLogLevel.INFO,
+                "Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
+            )
             try {
-                generationClient.webSocket(urlWithToken) {
+                generationClient.webSocket(authedWsUrl) {
                     session = this
                     lastPongMark = timeSource.markNow()
                     _state.value = TransportState.Connected
@@ -285,6 +327,58 @@ class KtorRelayTransport(
         relayLog(RelayLogLevel.INFO, "Reconnect loop exited (disconnect requested)")
         _state.value = TransportState.Disconnected
     }
+
+    /**
+     * F11 + F26 signed-challenge handshake. Fetches a fresh nonce from the
+     * relay's `/auth/challenge` endpoint, asks the caller-supplied
+     * [challengeSigner] to sign it with the local Ed25519 signing private
+     * key, and returns the WS URL with `?id=&signing_pubkey=&challenge=
+     * &signature=` ready for [HttpClient.webSocket].
+     *
+     * Returns `null` when the signer declines (typically because the signing
+     * key has not been provisioned yet — onboarding race; the caller backs
+     * off and retries). Throws on HTTP / parse errors so the caller's
+     * outer catch path logs and counts the attempt.
+     */
+    private suspend fun buildAuthedWsUrl(client: HttpClient): String? {
+        val signer = challengeSigner ?: return null
+        if (identityHex.isEmpty() || signingPubKeyHex.isEmpty()) return null
+
+        val httpScheme = when {
+            relayUrl.startsWith("wss://") -> "https://"
+            relayUrl.startsWith("ws://")  -> "http://"
+            else                          -> "https://"
+        }
+        val hostAndPath = relayUrl.removePrefix("wss://").removePrefix("ws://")
+        val hostOnly = hostAndPath.substringBefore("/")
+        val challengeUrl = "$httpScheme$hostOnly/auth/challenge?identity=$identityHex"
+
+        val body = client.get(challengeUrl).bodyAsText()
+        val nonceHex = json.parseToJsonElement(body)
+            .let { it as? kotlinx.serialization.json.JsonObject }
+            ?.get("nonce_hex")
+            ?.let { it as? kotlinx.serialization.json.JsonPrimitive }
+            ?.content
+            ?: error("auth/challenge response missing nonce_hex: $body")
+
+        val nonceBytes = hexToBytes(nonceHex)
+        val signature = signer(nonceBytes) ?: return null
+        if (signature.size != 64) error("signer returned ${signature.size}-byte signature, expected 64")
+
+        return relayUrl +
+            "?id=$identityHex" +
+            "&signing_pubkey=$signingPubKeyHex" +
+            "&challenge=$nonceHex" +
+            "&signature=${bytesToHex(signature)}"
+    }
+
+    private fun hexToBytes(hex: String): ByteArray =
+        ByteArray(hex.length / 2) { i ->
+            ((hex[i * 2].digitToInt(16) shl 4) or hex[i * 2 + 1].digitToInt(16)).toByte()
+        }
+
+    private fun bytesToHex(bytes: ByteArray): String =
+        bytes.joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
 
     private fun startPing(scope: CoroutineScope, generationClient: HttpClient) {
         pingJob = scope.launch {
@@ -621,7 +715,8 @@ class KtorRelayTransport(
         scope?.cancel()
         val oldJob = reconnectJob
         // Launch a brand-new reconnect loop on transportScope. It captures
-        // the same relayUrl/identityHex/relayToken stored on the instance,
+        // the same relayUrl/identityHex/signingPubKeyHex/challengeSigner
+        // stored on the instance, fetches a fresh challenge per generation,
         // and starts its own runReconnectLoop iteration from attempt 0.
         reconnectJob = transportScope.launch {
             runReconnectLoop()

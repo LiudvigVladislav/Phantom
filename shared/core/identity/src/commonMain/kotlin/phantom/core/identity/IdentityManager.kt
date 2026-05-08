@@ -68,6 +68,19 @@ class IdentityManager(
     }
 
     /**
+     * F11 + F26: produce a 64-byte Ed25519 detached signature over [nonce]
+     * using the local signing keypair. Returns null when the signing key has
+     * not been provisioned yet (Alpha 1 record awaiting migration backfill);
+     * the relay-auth caller treats null as "abort this connect attempt and
+     * back off" so the WS reconnect loop simply retries after the migration
+     * runs.
+     */
+    suspend fun signRelayChallenge(nonce: ByteArray): ByteArray? {
+        val pair = loadSigningKeyPair() ?: return null
+        return crypto.signWithIdentity(message = nonce, privateKey = pair.privateKey)
+    }
+
+    /**
      * Generate a fresh Ed25519 signing keypair and atomically attach it to
      * the existing IdentityRecord. Idempotent: returns the existing keypair
      * if one is already present (so a double-tap on "Continue" or a crash

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Willen LLC
 
 use crate::{
+    auth::{AuthError, NONCE_LEN},
     envelope::*,
     error::RelayError,
     prekeys::{
@@ -14,6 +15,7 @@ use crate::{
         AbuseReport, AppState, PushTokenRecord, RateEntry,
     },
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use subtle::ConstantTimeEq;
 use axum::{
     extract::{
@@ -45,6 +47,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // to the HTTP sub-router only; /ws is mounted separately with no timeout.
     let http_routes = Router::new()
         .route("/health",             get(health))
+        .route("/auth/challenge",     get(auth_challenge))
         .route("/send",               post(send_envelope))
         .route("/fetch/{recipient}",  get(fetch_envelopes))
         .route("/ack/{id}",           delete(ack_envelope))
@@ -94,21 +97,118 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let id = params.get("id").cloned().unwrap_or_default();
+    let signing_pub_hex = params.get("signing_pubkey").cloned().unwrap_or_default();
+    let challenge_hex = params.get("challenge").cloned().unwrap_or_default();
+    let signature_hex = params.get("signature").cloned().unwrap_or_default();
 
-    // Token check: if RELAY_SECRET_TOKEN is set, require a matching ?token=
-    // query parameter.  The relay never logs the token value — only compares it.
-    // Trust boundary: this is Alpha-0 shared-secret protection for a private
-    // demo relay; it is not a replacement for per-user authentication.
-    if let Some(expected) = &state.config.secret_token {
-        let provided = params.get("token").map(|s| s.as_str()).unwrap_or("");
-        let token_ok: bool = provided.as_bytes().ct_eq(expected.as_bytes()).into();
-        if !token_ok {
-            tracing::warn!(id = %&id[..id.len().min(16)], "ws rejected: bad or missing token");
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    match authorise_ws(
+        &state,
+        &id,
+        &signing_pub_hex,
+        &challenge_hex,
+        &signature_hex,
+    )
+    .await
+    {
+        Ok(()) => ws.on_upgrade(move |socket| handle_socket(socket, id, state)),
+        Err(err) => {
+            tracing::warn!(
+                id = %&id[..id.len().min(16)],
+                reason = ?err,
+                "ws rejected: signed-challenge auth failed",
+            );
+            (StatusCode::UNAUTHORIZED, err.public_message()).into_response()
         }
     }
+}
 
-    ws.on_upgrade(move |socket| handle_socket(socket, id, state))
+/// Verify a per-user signed challenge for the WS upgrade. Replaces the
+/// shared-secret `?token=` (closes F11 + F26).
+///
+/// On success, the supplied `(identity, signing_pubkey)` pair is bound in
+/// [`SigningKeyBindings`] (TOFU first connect; rejected on later mismatch).
+/// The challenge is single-shot consumed.
+async fn authorise_ws(
+    state: &Arc<AppState>,
+    id: &str,
+    signing_pub_hex: &str,
+    challenge_hex: &str,
+    signature_hex: &str,
+) -> Result<(), AuthError> {
+    if !is_pubkey_hex(id) || !is_pubkey_hex(signing_pub_hex) {
+        return Err(AuthError::BadFormat);
+    }
+    if challenge_hex.len() != NONCE_LEN * 2
+        || !challenge_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(AuthError::BadFormat);
+    }
+    if signature_hex.len() != 128 || !signature_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(AuthError::BadFormat);
+    }
+
+    let nonce_vec = hex::decode(challenge_hex).map_err(|_| AuthError::BadFormat)?;
+    let nonce: [u8; 32] = nonce_vec.try_into().map_err(|_| AuthError::BadFormat)?;
+    let sig_vec = hex::decode(signature_hex).map_err(|_| AuthError::BadFormat)?;
+    let sig_arr: [u8; 64] = sig_vec.try_into().map_err(|_| AuthError::BadFormat)?;
+    let signing_vec = hex::decode(signing_pub_hex).map_err(|_| AuthError::BadFormat)?;
+    let signing_arr: [u8; 32] = signing_vec.try_into().map_err(|_| AuthError::BadFormat)?;
+
+    let now_ms = now_millis();
+
+    // One-shot consume the nonce — even if the signature later fails to
+    // verify, an attacker cannot replay this exact nonce against a different
+    // signing key: it is gone after this call.
+    state.auth_challenges.consume(id, &nonce, now_ms).await?;
+
+    // TOFU lookup or first-time bind. If a binding already exists, the
+    // returned key MUST equal the supplied one or the upgrade is rejected
+    // — exactly mirrors the `publish_prekeys` 1:1 invariant so an attacker
+    // who steals a captured X25519 identity cannot pivot to a different
+    // Ed25519 key just because they connect first.
+    let bound = state
+        .signing_keys
+        .get_or_register_tofu(id, signing_pub_hex)
+        .await;
+    if bound != signing_pub_hex {
+        return Err(AuthError::SigningKeyMismatch);
+    }
+
+    let verifying_key =
+        VerifyingKey::from_bytes(&signing_arr).map_err(|_| AuthError::BadFormat)?;
+    let signature = Signature::from_bytes(&sig_arr);
+    verifying_key
+        .verify(&nonce, &signature)
+        .map_err(|_| AuthError::BadSignature)?;
+    Ok(())
+}
+
+fn is_pubkey_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// `GET /auth/challenge?identity={X25519_hex}` — issues a fresh single-shot
+/// nonce that the client signs with its Ed25519 signing key for the WS
+/// upgrade. Replaces the shared-secret `?token=` (F11 + F26).
+async fn auth_challenge(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let identity = params.get("identity").cloned().unwrap_or_default();
+    if !is_pubkey_hex(&identity) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bad identity" })),
+        )
+            .into_response();
+    }
+    let entry = state.auth_challenges.issue(&identity, now_millis()).await;
+    Json(serde_json::json!({
+        "nonce_hex": hex::encode(entry.nonce),
+        "expires_at_ms": entry.expires_at_ms,
+    }))
+    .into_response()
 }
 
 async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppState>) {
@@ -843,6 +943,22 @@ async fn publish_prekeys(
         .await
     {
         Ok(stored_count) => {
+            // Keep the WS-auth signing-key binding in sync. publish has
+            // already enforced the 1:1 invariant; if signing_keys ever
+            // disagrees we treat that as a publish-side mismatch too,
+            // since both stores must agree per identity.
+            if let Err(e) = state
+                .signing_keys
+                .bind(&req.identity_pubkey_hex, &req.signing_pubkey_hex)
+                .await
+            {
+                tracing::warn!(
+                    identity = %&req.identity_pubkey_hex[..req.identity_pubkey_hex.len().min(16)],
+                    error = ?e,
+                    "publish_prekeys: signing_keys.bind failed (TOFU mismatch with prior WS handshake?)",
+                );
+                return publish_error_response(PublishError::SigningKeyMismatch);
+            }
             tracing::info!(
                 event = "prekey_publish",
                 identity = %&req.identity_pubkey_hex[..req.identity_pubkey_hex.len().min(16)],

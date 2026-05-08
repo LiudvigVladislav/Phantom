@@ -8,6 +8,7 @@
 //! pushing all logic behind `lib.rs` is the standard Rust pattern; nothing
 //! about the runtime behaviour changes — `main.rs` is just one consumer.
 
+pub mod auth;
 pub mod config;
 pub mod envelope;
 pub mod error;

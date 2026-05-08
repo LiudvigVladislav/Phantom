@@ -148,7 +148,9 @@ android {
             // network_security_config.xml; for a LAN IP you must also add it there locally.
             val relayUrl = localOrEnv("relay.url", "RELAY_URL", "wss://relay.phntm.pro/ws")
             buildConfigField("String", "RELAY_URL", "\"$relayUrl\"")
-            buildConfigField("String", "RELAY_TOKEN", "null")
+            // RELAY_TOKEN removed in F11+F26 fix — relay no longer accepts a
+            // shared `?token=`; auth is per-user signed challenge (see
+            // KtorRelayTransport.buildAuthedWsUrl).
             // Tor onion endpoint for the relay (ADR-016 Stage 2).
             // Wired in Stage 2B; Stage 2A only exposes the constant. Plain
             // HTTP/WS over the onion is intentional — Tor's circuit already
@@ -191,8 +193,9 @@ android {
                 "proguard-rules.pro",
             )
             buildConfigField("String", "RELAY_URL", "\"wss://relay.phntm.pro/ws\"")
-            // Override this via CI secrets: -PRELAY_TOKEN=<value>
-            buildConfigField("String", "RELAY_TOKEN", "null")
+            // RELAY_TOKEN removed in F11+F26 fix — relay no longer accepts a
+            // shared `?token=`; auth is per-user signed challenge (see
+            // KtorRelayTransport.buildAuthedWsUrl).
             buildConfigField(
                 "String",
                 "RELAY_ONION_URL",
