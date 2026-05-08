@@ -8,7 +8,10 @@ import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +70,12 @@ class DefaultMessagingService(
      */
     private val signingKeyProvider: suspend () -> IdentitySigningKeyPair?,
 ) : MessagingService {
+
+    private val _bootstrapReady = MutableStateFlow(false)
+    override val bootstrapReady: StateFlow<Boolean> = _bootstrapReady.asStateFlow()
+
+    /** Called by the platform container after the initial prekey-bundle publish attempt. */
+    fun markBootstrapReady() { _bootstrapReady.value = true }
 
     private val _incomingMessages = MutableSharedFlow<IncomingMessage>(
         replay = 0,
@@ -145,13 +154,20 @@ class DefaultMessagingService(
         conversationId: String,
         recipientPublicKeyHex: String,
         plaintext: ByteArray,
+        // Runs inside the mutex BEFORE saveSession so the message is in the
+        // DB before the ratchet state advances. On crash between the two DB
+        // writes the message stays visible (QUEUED) and the session resets —
+        // better than the inverse (lost message, advanced chain).
+        afterEncrypt: suspend (WireFrame) -> Unit = {},
     ): WireFrame =
         mutexFor(conversationId).withLock {
             val existingState = sessionManager.tryLoadSession(conversationId)
             if (existingState != null) {
                 val (newState, encrypted) = ratchet.encrypt(existingState, plaintext)
+                val wireFrame = WireFrame(encryptedMessage = encrypted)
+                afterEncrypt(wireFrame)
                 sessionManager.saveSession(conversationId, newState)
-                WireFrame(encryptedMessage = encrypted)
+                wireFrame
             } else {
                 // Bootstrap path: peer has no session here yet.
                 // Fetch their bundle, run 4-DH, ship the bootstrap
@@ -167,7 +183,6 @@ class DefaultMessagingService(
                     bundle = pkBundle,
                 )
                 val (newState, encrypted) = ratchet.encrypt(bootstrap.ratchetState, plaintext)
-                sessionManager.saveSession(conversationId, newState)
 
                 // Attach our Ed25519 signing pubkey so the recipient can
                 // cache it under our X25519 identity for verifying our
@@ -180,11 +195,14 @@ class DefaultMessagingService(
                 val ourSigningHex = ourSigning.publicKey.bytes
                     .joinToString("") { "%02x".format(it.toInt().and(0xFF)) }
 
-                WireFrame(
+                val wireFrame = WireFrame(
                     encryptedMessage = encrypted,
                     x3dhInit = bootstrap.x3dhInit,
                     senderSigningPublicKeyHex = ourSigningHex,
                 )
+                afterEncrypt(wireFrame)
+                sessionManager.saveSession(conversationId, newState)
+                wireFrame
             }
         }
 
@@ -228,17 +246,33 @@ class DefaultMessagingService(
         val outgoingTimerSecs = conversationRepository.getDisappearingTimer(message.conversationId)
         val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) insertedAtMs + outgoingTimerSecs * 1_000L else null
 
-        // PR C-followup-3: encrypt FIRST (under per-conversation mutex)
-        // and only insert the message into the local store on the
-        // successful path. The pending-bundle case below inserts a
-        // placeholder row so the UI shows the message and the retry
-        // ticker can pick it up later — without that row the user's
-        // message vanishes into a runCatching-swallowed exception.
-        val encrypted = try {
+        // insertMessage runs inside the per-conversation mutex (via afterEncrypt),
+        // BEFORE saveSession — so on crash the message is visible in the DB (QUEUED)
+        // and the ratchet state has not yet advanced. Better than the inverse
+        // (advanced state, lost message).
+        var ciphertextBytes = ByteArray(0) // captured from afterEncrypt
+
+        try {
             encryptUnderLock(
                 conversationId = message.conversationId,
                 recipientPublicKeyHex = message.recipientPublicKeyHex,
                 plaintext = payload,
+                afterEncrypt = { wireFrame ->
+                    val ct = json.encodeToString(wireFrame).encodeToByteArray()
+                    ciphertextBytes = ct
+                    messageRepository.insertMessage(
+                        MessageEntity(
+                            id = message.id,
+                            conversationId = message.conversationId,
+                            ciphertext = ct,
+                            plaintextCache = message.text,
+                            sent = true,
+                            status = MessageStatus.QUEUED,
+                            createdAt = insertedAtMs,
+                            expiresAtMs = outgoingExpiresAtMs,
+                        )
+                    )
+                },
             )
         } catch (e: PeerBundleMissingException) {
             // Peer has no published prekey bundle yet — either they
@@ -274,21 +308,6 @@ class DefaultMessagingService(
             return@runCatching Unit
         }
 
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-
-        messageRepository.insertMessage(
-            MessageEntity(
-                id = message.id,
-                conversationId = message.conversationId,
-                ciphertext = ciphertext,
-                plaintextCache = message.text,
-                sent = true,
-                status = MessageStatus.QUEUED,
-                createdAt = insertedAtMs,
-                expiresAtMs = outgoingExpiresAtMs,
-            )
-        )
-
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         val sealedSenderB64 = Base64.encode(
             SealedSender.seal(
@@ -297,7 +316,7 @@ class DefaultMessagingService(
             )
         )
 
-        val paddedCiphertext = MessagePadding.pad(ciphertext)
+        val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
 
         val sent = transport.send(
             RelayMessage.Send(

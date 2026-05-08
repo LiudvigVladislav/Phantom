@@ -263,13 +263,9 @@ class AppContainer(private val context: Context) {
         )
         preKeyLifecycle = lifecycleService
 
-        // Onboarding bootstrap — fire-and-forget. On Alpha-1 records
-        // (no signing keypair yet) this is a no-op until migration
-        // runs because lifecycleService.bootstrapForNewIdentity ()
-        // requires loadSigningKeyPair() to return non-null. After
-        // migration completes the user's next foreground hits the
-        // 24-h ticker which retries publish.
-        appScope.launch {
+        // Onboarding bootstrap. Runs asynchronously; the resulting Job is
+        // joined below (after service creation) to signal bootstrapReady.
+        val bootstrapJob = appScope.launch {
             runCatching { lifecycleService.bootstrapForNewIdentity() }
                 .onFailure { e ->
                     android.util.Log.w(
@@ -317,6 +313,13 @@ class AppContainer(private val context: Context) {
             // (PR C commit 12). DMS surfaces null as a hard send error.
             signingKeyProvider = { identityManager.loadSigningKeyPair() },
         )
+        // Join the bootstrap job and mark ready (success or failure) so the UI
+        // can observe bootstrapReady and remove any "setting up keys…" indicator.
+        appScope.launch {
+            bootstrapJob.join()
+            service.markBootstrapReady()
+        }
+
         // Wire local notification callback — Android-only side-effect, not part of the KMP interface.
         service.onNewMessageNotification = { convId, sender, preview, senderPubKeyHex ->
             try {
