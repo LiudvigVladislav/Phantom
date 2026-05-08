@@ -8,6 +8,4 @@ data class SenderKeyEntity(
     val memberPubkeyHex: String,
     val chainKeyHex: String,
     val iteration: Long,
-    val signingPubHex: String,
-    val signingPrivHex: String,
 )

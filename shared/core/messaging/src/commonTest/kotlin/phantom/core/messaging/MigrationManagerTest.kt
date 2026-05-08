@@ -286,8 +286,6 @@ class MigrationManagerTest {
                 memberPubkeyHex = "deadbeef",
                 chainKeyHex = "00",
                 iteration = 0,
-                signingPubHex = "ee",
-                signingPrivHex = "ff",
             ),
         )
         rig.convRepo.upsertConversation(

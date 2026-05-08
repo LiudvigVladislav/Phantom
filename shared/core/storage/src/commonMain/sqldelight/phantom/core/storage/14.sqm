@@ -1,0 +1,25 @@
+-- 14.sqm — drop unused SenderKey signing columns (ADR-017, F2/F13).
+--
+-- signing_pub_hex and signing_priv_hex were generated but never used in
+-- the SenderKey AEAD encrypt/decrypt path. Removing them eliminates the
+-- plaintext private-key storage (F2) and the unverified public-key
+-- distribution (F13).
+--
+-- SQLite < 3.35 cannot DROP COLUMN; recreate the table via the
+-- CREATE + INSERT + DROP + RENAME pattern for API compatibility.
+
+CREATE TABLE sender_key_store_new (
+    group_id          TEXT NOT NULL,
+    member_pubkey_hex TEXT NOT NULL,
+    chain_key_hex     TEXT NOT NULL,
+    iteration         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (group_id, member_pubkey_hex)
+);
+
+INSERT INTO sender_key_store_new (group_id, member_pubkey_hex, chain_key_hex, iteration)
+SELECT group_id, member_pubkey_hex, chain_key_hex, iteration
+FROM sender_key_store;
+
+DROP TABLE sender_key_store;
+
+ALTER TABLE sender_key_store_new RENAME TO sender_key_store;

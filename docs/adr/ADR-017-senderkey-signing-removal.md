@@ -1,6 +1,6 @@
 # ADR-017: SenderKey signing keypair removal
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-29
 **Author:** Vladislav Liudvig
 **Reviewers:** (Claude Code post-implementation; ADR-010 author at Phase 2)

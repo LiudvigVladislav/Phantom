@@ -14,18 +14,13 @@ object SenderKey {
     data class Bundle(
         val chainKeyHex: String,
         val iteration: Int,
-        val signingPubHex: String,
-        val signingPrivHex: String,
     )
 
     fun generate(): Bundle {
-        val chainKey    = LibsodiumRandom.buf(32)
-        val signingPair = com.ionspin.kotlin.crypto.box.Box.keypair()
+        val chainKey = LibsodiumRandom.buf(32)
         return Bundle(
-            chainKeyHex    = chainKey.toHex(),
-            iteration      = 0,
-            signingPubHex  = signingPair.publicKey.toHex(),
-            signingPrivHex = signingPair.secretKey.toHex(),
+            chainKeyHex = chainKey.toHex(),
+            iteration   = 0,
         )
     }
 

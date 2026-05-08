@@ -26,8 +26,6 @@ class SqlDelightSenderKeyRepository(
                 member_pubkey_hex = entity.memberPubkeyHex,
                 chain_key_hex     = entity.chainKeyHex,
                 iteration         = entity.iteration,
-                signing_pub_hex   = entity.signingPubHex,
-                signing_priv_hex  = entity.signingPrivHex,
             )
         }
 
@@ -45,11 +43,9 @@ class SqlDelightSenderKeyRepository(
     // ---------------------------------------------------------------------------
 
     private fun Sender_key_store.toEntity() = SenderKeyEntity(
-        groupId          = group_id,
-        memberPubkeyHex  = member_pubkey_hex,
-        chainKeyHex      = chain_key_hex,
-        iteration        = iteration,
-        signingPubHex    = signing_pub_hex,
-        signingPrivHex   = signing_priv_hex,
+        groupId         = group_id,
+        memberPubkeyHex = member_pubkey_hex,
+        chainKeyHex     = chain_key_hex,
+        iteration       = iteration,
     )
 }

@@ -89,8 +89,6 @@ class DefaultGroupMessagingService(
                 memberPubkeyHex = myPubKeyHex,
                 chainKeyHex = myBundle.chainKeyHex,
                 iteration = myBundle.iteration.toLong(),
-                signingPubHex = myBundle.signingPubHex,
-                signingPrivHex = myBundle.signingPrivHex,
             )
         )
 
@@ -107,7 +105,6 @@ class DefaultGroupMessagingService(
                 groupMembers = allMembers,
                 senderKeyChainHex = myBundle.chainKeyHex,
                 senderKeyIter = myBundle.iteration,
-                senderKeySignPubHex = myBundle.signingPubHex,
             )
             sendControlMessage(pubkey, invitePayload)
         }
@@ -192,13 +189,11 @@ class DefaultGroupMessagingService(
         var bundle = if (bundleEntity != null) {
             SenderKey.Bundle(
                 bundleEntity.chainKeyHex, bundleEntity.iteration.toInt(),
-                bundleEntity.signingPubHex, bundleEntity.signingPrivHex,
             )
         } else {
             val b = SenderKey.generate()
             senderKeyRepo.upsert(
-                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex,
-                    b.iteration.toLong(), b.signingPubHex, b.signingPrivHex)
+                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex, b.iteration.toLong())
             )
             b
         }
@@ -223,8 +218,6 @@ class DefaultGroupMessagingService(
                 memberPubkeyHex = myPubKeyHex,
                 chainKeyHex = bundle.chainKeyHex,
                 iteration = bundle.iteration.toLong(),
-                signingPubHex = bundle.signingPubHex,
-                signingPrivHex = bundle.signingPrivHex,
             )
         )
 
@@ -234,7 +227,6 @@ class DefaultGroupMessagingService(
             type = MessagePayload.TYPE_AUDIO_CHUNK,
             groupId = groupId,
             groupCiphertextB64 = ciphertextB64,
-            senderKeySignPubHex = bundle.signingPubHex,
         )
         val outerJson = json.encodeToString(outerPayload)
         @OptIn(ExperimentalEncodingApi::class)
@@ -261,13 +253,11 @@ class DefaultGroupMessagingService(
         val myBundle = if (myEntity != null) {
             SenderKey.Bundle(
                 myEntity.chainKeyHex, myEntity.iteration.toInt(),
-                myEntity.signingPubHex, myEntity.signingPrivHex,
             )
         } else {
             val b = SenderKey.generate()
             senderKeyRepo.upsert(
-                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex,
-                    b.iteration.toLong(), b.signingPubHex, b.signingPrivHex)
+                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex, b.iteration.toLong())
             )
             b
         }
@@ -331,15 +321,13 @@ class DefaultGroupMessagingService(
         }
 
         // Store inviter's SenderKey if it arrived with the invite
-        if (payload.senderKeyChainHex != null && payload.senderKeySignPubHex != null) {
+        if (payload.senderKeyChainHex != null) {
             senderKeyRepo.upsert(
                 SenderKeyEntity(
                     groupId = groupId,
                     memberPubkeyHex = fromPubKeyHex,
                     chainKeyHex = payload.senderKeyChainHex,
                     iteration = (payload.senderKeyIter ?: 0).toLong(),
-                    signingPubHex = payload.senderKeySignPubHex,
-                    signingPrivHex = "",
                 )
             )
         }
@@ -349,13 +337,11 @@ class DefaultGroupMessagingService(
         val myBundle = if (myEntity != null) {
             SenderKey.Bundle(
                 myEntity.chainKeyHex, myEntity.iteration.toInt(),
-                myEntity.signingPubHex, myEntity.signingPrivHex,
             )
         } else {
             val b = SenderKey.generate()
             senderKeyRepo.upsert(
-                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex,
-                    b.iteration.toLong(), b.signingPubHex, b.signingPrivHex)
+                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex, b.iteration.toLong())
             )
             b
         }
@@ -372,8 +358,6 @@ class DefaultGroupMessagingService(
                 memberPubkeyHex = fromPubKeyHex,
                 chainKeyHex = payload.senderKeyChainHex ?: return,
                 iteration = (payload.senderKeyIter ?: 0).toLong(),
-                signingPubHex = payload.senderKeySignPubHex ?: return,
-                signingPrivHex = "",
             )
         )
     }
@@ -385,7 +369,6 @@ class DefaultGroupMessagingService(
         val keyEntity = senderKeyRepo.get(groupId, fromPubKeyHex) ?: return
         val bundle = SenderKey.Bundle(
             keyEntity.chainKeyHex, keyEntity.iteration.toInt(),
-            keyEntity.signingPubHex, keyEntity.signingPrivHex,
         )
 
         val cipherBytes = Base64.decode(ciphertextB64)
@@ -397,8 +380,6 @@ class DefaultGroupMessagingService(
                 memberPubkeyHex = fromPubKeyHex,
                 chainKeyHex = newBundle.chainKeyHex,
                 iteration = newBundle.iteration.toLong(),
-                signingPubHex = newBundle.signingPubHex,
-                signingPrivHex = "",
             )
         )
 
@@ -437,7 +418,6 @@ class DefaultGroupMessagingService(
             val myEntity = senderKeyRepo.get(groupId, myPubKeyHex) ?: return@forEach
             val myBundle = SenderKey.Bundle(
                 myEntity.chainKeyHex, myEntity.iteration.toInt(),
-                myEntity.signingPubHex, myEntity.signingPrivHex,
             )
             sendSenderKeyDistribution(groupId, member.pubkeyHex, myBundle)
         }
@@ -467,13 +447,11 @@ class DefaultGroupMessagingService(
         var bundle = if (bundleEntity != null) {
             SenderKey.Bundle(
                 bundleEntity.chainKeyHex, bundleEntity.iteration.toInt(),
-                bundleEntity.signingPubHex, bundleEntity.signingPrivHex,
             )
         } else {
             val b = SenderKey.generate()
             senderKeyRepo.upsert(
-                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex,
-                    b.iteration.toLong(), b.signingPubHex, b.signingPrivHex)
+                SenderKeyEntity(groupId, myPubKeyHex, b.chainKeyHex, b.iteration.toLong())
             )
             b
         }
@@ -496,8 +474,6 @@ class DefaultGroupMessagingService(
                 memberPubkeyHex = myPubKeyHex,
                 chainKeyHex = bundle.chainKeyHex,
                 iteration = bundle.iteration.toLong(),
-                signingPubHex = bundle.signingPubHex,
-                signingPrivHex = bundle.signingPrivHex,
             )
         )
 
@@ -523,7 +499,6 @@ class DefaultGroupMessagingService(
             type = type,
             groupId = groupId,
             groupCiphertextB64 = ciphertextB64,
-            senderKeySignPubHex = bundle.signingPubHex,
         )
         val outerJson = json.encodeToString(outerPayload)
         val outerB64 = Base64.encode(outerJson.encodeToByteArray())
@@ -576,7 +551,6 @@ class DefaultGroupMessagingService(
             groupId = groupId,
             senderKeyChainHex = bundle.chainKeyHex,
             senderKeyIter = bundle.iteration,
-            senderKeySignPubHex = bundle.signingPubHex,
         )
         sendControlMessage(toPubKeyHex, skdPayload)
     }

@@ -28,7 +28,6 @@ data class MessagePayload(
     // ── SenderKey distribution ────────────────────────────────────────────────
     val senderKeyChainHex: String? = null,             // sender_key_distribution
     val senderKeyIter: Int? = null,
-    val senderKeySignPubHex: String? = null,
     val groupCiphertextB64: String? = null,            // base64 SenderKey ciphertext in group_message
 
     // ── Voice / Audio ─────────────────────────────────────────────────────────
