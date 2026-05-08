@@ -65,7 +65,7 @@ Track A + Track C идут параллельно. Track B стартует по
 |---|---------|-------------|--------|-----------|--------|
 | 1 | **F22** SPK/OPK private keys plaintext SQLite | Keystore-wrap (AES-256-GCM) | ~2 дня | Alpha-2 | ✅ merged `6737be91` + `2bcd891e` + `22f0c30c`; QA-pass телефон+эму 2026-05-08 |
 | 2 | **F19+F20** Call signalling no E2EE / no Sealed Sender | Wrap SDP/ICE in Double Ratchet + Sealed Sender | ~3 дня | Alpha-2 | ⬜ |
-| 3 | **F8** RatchetState plaintext SQLite | Keystore-wrap RatchetState blob перед записью | ~2 дня | Alpha-2 | ⬜ |
+| 3 | **F8** RatchetState plaintext SQLite | Keystore-wrap RatchetState blob перед записью | ~2 дня | Alpha-2 | ✅ merged `bb36705f` (#60, 2026-05-08) |
 | 4 | **F2+F13** SenderKey signing dead | ADR-017 (remove signing) уже draft → реализовать | ~3 дня | Alpha-2 | ⬜ |
 | 5 | **F1** Group control msgs outside Double Ratchet | Wrap SKD/leave/add в Double Ratchet | ~3 дня | Kickstarter | ⬜ |
 | 6 | **F3** SenderKey KDF bare SHA-256 | Заменить на HKDF-SHA256 с domain separation | ~1 день | Kickstarter | ⬜ |
@@ -80,6 +80,8 @@ Track A + Track C идут параллельно. Track B стартует по
 - ✅ F15 (identity-as-ratchet-key) — fixed via fresh ephemeral DH
 - ✅ F17 — notification callback exception swallow logged
 - ✅ F12 partial — SPK Ed25519 sig verify + OPK atomic single-use
+- ✅ **F8** RatchetState Keystore-wrapped — `bb36705f` (#60). Read receipts via Sealed Sender — `f62569e6` (#59). 2026-05-08.
+- ✅ **C-2** Read receipts routed through sealed DR pipeline — `f62569e6` (#59, 2026-05-08)
 
 ---
 
