@@ -1237,6 +1237,50 @@ class DefaultMessagingServiceTest {
         assertEquals(MessageStatus.READ, msgRepo.statusUpdates["msg-sent-1"],
             "incoming read receipt must update the outgoing message status to READ")
     }
+
+    // ── sendCallSignal tests (F19 + F20) ─────────────────────────────────────
+
+    @Test
+    fun sendCallSignal_sendsOneSealedEnvelope() = runTest {
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val service = buildService(this, transport = transport)
+
+        service.sendCallSignal(
+            recipientPublicKeyHex = "ccdd",
+            payload = MessagePayload(
+                type = MessagePayload.TYPE_CALL_OFFER,
+                callId = "call-123",
+                sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n",
+            ),
+        )
+
+        assertEquals(1, transport.sent.size, "exactly one envelope must be sent for a call signal")
+        assertEquals("ccdd", transport.sent[0].to, "envelope must be addressed to recipient")
+        assertEquals("", transport.sent[0].from, "from must be empty — identity is sealed, not exposed to relay")
+        assertNotNull(
+            transport.sent[0].sealedSender.takeIf { it.isNotEmpty() },
+            "sealedSender must be non-empty for call signals (Sealed Sender applied)",
+        )
+    }
+
+    @Test
+    fun sendCallSignal_doesNotStoreChatMessage() = runTest {
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val service = buildService(this, msgRepo = msgRepo)
+
+        service.sendCallSignal(
+            recipientPublicKeyHex = "ccdd",
+            payload = MessagePayload(
+                type = MessagePayload.TYPE_CALL_ICE,
+                callId = "call-456",
+                iceCandidateJson = """{"sdpMid":"0","sdpMLineIndex":0,"candidate":"candidate:1 1 UDP 2130706431 192.168.1.1 54321 typ host"}""",
+            ),
+        )
+
+        assertEquals(0, msgRepo.messages.size, "call signal must not be stored as a chat message in MessageRepository")
+    }
 }
 
 private fun ByteArray.toHexStringLower(): String =

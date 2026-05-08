@@ -3,19 +3,18 @@
 
 package phantom.android.calls
 
-// Architecture note (ADR reference):
-// Call signalling payloads are routed through the existing Double Ratchet / relay pipeline:
+// Architecture note (ADR-025):
+// Call signalling payloads ride the same Double Ratchet + Sealed Sender pipeline as chat messages:
 //   Incoming  — DefaultMessagingService decrypts → calls onCallMessage → CallManager.handle*
-//   Outgoing  — CallManager serialises MessagePayload → base64 → RelayMessage.Send (from = myPubKeyHex).
-//               This mirrors DefaultGroupMessagingService's control-message pattern.
-//               Sealed sender is NOT used for call signalling because the call offer must
-//               already identify the caller (ring screen shows who is calling).
+//   Outgoing  — CallManager calls MessagingService.sendCallSignal() which encrypts via DR and
+//               seals the sender identity. The relay sees only an opaque blob; it cannot read
+//               SDP / ICE candidates or correlate caller identity.
+//   Ring UI   — The caller's identity is recovered from the decrypted payload (fromPubKeyHex
+//               passed through onCallMessage), not from the relay `from` field.
 
 import android.content.Context
 import android.media.AudioManager
 import com.benasher44.uuid.uuid4
-import kotlin.io.encoding.Base64
-import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -45,8 +44,7 @@ import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_HANGUP
 import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_ICE
 import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_OFFER
 import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_REJECT
-import phantom.core.transport.RelayMessage
-import phantom.core.transport.RelayTransport
+import phantom.core.messaging.MessagingService
 
 @Serializable
 private data class IceCandidateJson(
@@ -57,8 +55,7 @@ private data class IceCandidateJson(
 
 class CallManager(
     private val context: Context,
-    private val myPubKeyHex: String,
-    private val transport: RelayTransport,
+    private val messagingService: MessagingService,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
     private val json = Json { ignoreUnknownKeys = true }
@@ -360,22 +357,11 @@ class CallManager(
         )
     }
 
-    @OptIn(ExperimentalEncodingApi::class)
     private suspend fun sendSignal(to: String, payload: MessagePayload) {
-        // Call signals are sent as plain base64 JSON (not Double Ratchet encrypted).
-        // Rationale: the offer/answer/ice payloads contain no secret content — SDP describes
-        // codec/network parameters. The actual audio stream is DTLS-SRTP encrypted end-to-end
-        // by WebRTC itself. Adding a Double Ratchet layer here would require sharing the
-        // session manager with CallManager which crosses module boundaries.
-        val payloadB64 = Base64.encode(json.encodeToString(payload).encodeToByteArray())
-        transport.send(
-            RelayMessage.Send(
-                to = to,
-                from = myPubKeyHex,
-                payload = payloadB64,
-                messageId = uuid4().toString(),
-            )
-        )
+        messagingService.sendCallSignal(
+            recipientPublicKeyHex = to,
+            payload = payload,
+        ).getOrElse { }
     }
 
     private fun cleanupCall(endState: CallState) {

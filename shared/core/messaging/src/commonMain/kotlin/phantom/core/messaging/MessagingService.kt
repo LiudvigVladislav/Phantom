@@ -84,4 +84,19 @@ interface MessagingService {
         recipientPublicKeyHex: String,
         pinned: Boolean,
     ): Result<Unit>
+
+    /**
+     * Send a call-signalling payload (offer / answer / ice / hangup / reject)
+     * through the Double Ratchet + Sealed Sender pipeline.
+     *
+     * The payload is never stored as a chat message. The relay sees only an
+     * opaque sealed blob — indistinguishable from any other encrypted envelope.
+     * The callee's ring screen still shows the caller's identity because it is
+     * recovered from the decrypted payload via [onCallMessage], not from the
+     * relay `from` field.
+     */
+    suspend fun sendCallSignal(
+        recipientPublicKeyHex: String,
+        payload: MessagePayload,
+    ): Result<Unit>
 }
