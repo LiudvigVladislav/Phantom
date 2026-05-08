@@ -4,8 +4,19 @@
 package phantom.core.messaging
 
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 
 interface MessagingService {
+    /**
+     * Becomes true once the initial prekey-bundle bootstrap succeeds (or
+     * definitively fails). False only during the brief window between app
+     * start and the first network attempt to publish the user's bundle.
+     * The UI can observe this to show a "setting up keys…" indicator;
+     * it does not gate sends (which work regardless — bootstrap affects
+     * incoming session establishment, not outgoing messages).
+     */
+    val bootstrapReady: StateFlow<Boolean>
+
     // Stream of decrypted incoming messages
     val incomingMessages: Flow<IncomingMessage>
 
