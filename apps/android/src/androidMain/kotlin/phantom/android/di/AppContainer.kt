@@ -87,7 +87,10 @@ class AppContainer(private val context: Context) {
     )
     val conversationRepo = SqlDelightConversationRepository(dbHolder.database)
     val messageRepo      = SqlDelightMessageRepository(dbHolder.database)
-    private val ratchetRepo = SqlDelightRatchetStateRepository(dbHolder.database)
+    private val ratchetRepo = SqlDelightRatchetStateRepository(
+        db = dbHolder.database,
+        blobCipher = phantom.core.storage.createAndroidRatchetKeystoreCipher(),
+    )
     val reactionRepo     = SqlDelightReactionRepository(dbHolder.database)
     val groupRepo        = SqlDelightGroupRepository(dbHolder.database)
     val senderKeyRepo    = SqlDelightSenderKeyRepository(dbHolder.database)
