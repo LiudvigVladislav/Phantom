@@ -1138,6 +1138,14 @@ class DefaultMessagingService(
         sendSealedPayload(payload, conversationId, recipientPublicKeyHex)
     }
 
+    override suspend fun sendGroupControlMessage(
+        toPubKeyHex: String,
+        payload: MessagePayload,
+    ): Result<Unit> = runCatching {
+        val conversationId = deriveConversationId(toPubKeyHex)
+        sendSealedPayload(payload, conversationId, toPubKeyHex)
+    }
+
     private fun deriveConversationId(theirPublicKeyHex: String): String {
         val keys = listOf(identity.publicKeyHex, theirPublicKeyHex).sorted()
         return "${keys[0]}_${keys[1]}"

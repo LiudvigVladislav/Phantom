@@ -21,20 +21,20 @@ import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.SenderKeyEntity
 import phantom.core.storage.SenderKeyRepository
-import phantom.core.transport.RelayMessage
-import phantom.core.transport.RelayTransport
 
 /**
  * Default implementation of [GroupMessagingService].
  *
  * Encryption model:
  *   - Each group member holds a [SenderKey.Bundle] for every other member.
- *   - On send the local bundle advances once; the resulting ciphertext is broadcast
- *     to all members as identical [MessagePayload.groupCiphertextB64] blobs wrapped in
- *     individual relay envelopes (relay sees only the outer recipient, not the group).
- *   - Control messages (invite, SKD, add-member, leave) are sent as plaintext JSON
- *     over the relay. They reach the recipient already authenticated by the outer
- *     Double-Ratchet layer applied by [DefaultMessagingService].
+ *   - On send the local bundle advances once; the resulting ciphertext (the
+ *     group's inner SenderKey envelope) is broadcast to every other member,
+ *     wrapped per-recipient in a Double Ratchet + Sealed Sender envelope by
+ *     [MessagingService.sendGroupControlMessage] (ADR-026). The relay sees
+ *     only opaque sealed blobs.
+ *   - Control messages (invite, SKD, add-member, leave) take the same path
+ *     so SenderKey chain keys and member rosters never touch the relay in
+ *     plaintext.
  *
  * Threading: all suspend functions are safe to call from any coroutine context.
  * The [groupMessageFlow] MutableSharedFlow uses tryEmit (fire-and-forget) so it
@@ -47,7 +47,7 @@ class DefaultGroupMessagingService(
     private val groupRepo: GroupRepository,
     private val senderKeyRepo: SenderKeyRepository,
     private val messageRepo: MessageRepository,
-    private val transport: RelayTransport,
+    private val messagingService: MessagingService,
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) : GroupMessagingService {
 
@@ -228,19 +228,11 @@ class DefaultGroupMessagingService(
             groupId = groupId,
             groupCiphertextB64 = ciphertextB64,
         )
-        val outerJson = json.encodeToString(outerPayload)
-        @OptIn(ExperimentalEncodingApi::class)
-        val outerB64 = Base64.encode(outerJson.encodeToByteArray())
 
+        // ADR-026: per-recipient group audio chunks go through the Double
+        // Ratchet + Sealed Sender pipeline like every other group envelope.
         members.filter { it.pubkeyHex != myPubKeyHex }.forEach { member ->
-            transport.send(
-                RelayMessage.Send(
-                    to = member.pubkeyHex,
-                    from = myPubKeyHex,
-                    payload = outerB64,
-                    messageId = uuid4().toString(),
-                )
-            )
+            messagingService.sendGroupControlMessage(member.pubkeyHex, outerPayload)
         }
     }
 
@@ -500,45 +492,25 @@ class DefaultGroupMessagingService(
             groupId = groupId,
             groupCiphertextB64 = ciphertextB64,
         )
-        val outerJson = json.encodeToString(outerPayload)
-        val outerB64 = Base64.encode(outerJson.encodeToByteArray())
 
+        // ADR-026: per-recipient envelopes go through the Double Ratchet +
+        // Sealed Sender pipeline so the relay cannot link the broadcast to a
+        // single sender or correlate the per-recipient sends as one event.
         members.filter { it.pubkeyHex != myPubKeyHex }.forEach { member ->
-            transport.send(
-                RelayMessage.Send(
-                    to = member.pubkeyHex,
-                    from = myPubKeyHex,
-                    payload = outerB64,
-                    messageId = uuid4().toString(),
-                )
-            )
+            messagingService.sendGroupControlMessage(member.pubkeyHex, outerPayload)
         }
     }
 
     /**
-     * Send a control payload (invite / SKD / leave / add-member) to one peer.
-     * The relay delivers it like any other message; [DefaultMessagingService] will
-     * route it back here via [handleIncoming] on the recipient's side.
-     *
-     * Note: control messages are NOT encrypted by Double-Ratchet here — that layer is
-     * applied by [DefaultMessagingService] when it wraps outgoing payloads. Since
-     * [DefaultGroupMessagingService] has no access to ratchet sessions it sends the
-     * JSON directly over the raw transport. This is acceptable for control messages
-     * because the relay transport itself uses TLS, and group membership metadata is
-     * already visible to both endpoints. Full E2E wrapping of control messages is
-     * tracked as a future ADR item.
+     * Send a control payload (invite / SKD / leave / add-member) to one peer
+     * through the Double Ratchet + Sealed Sender pipeline (ADR-026, F1 fix).
+     * The relay sees only an opaque sealed envelope; chain keys and the member
+     * roster never touch it in plaintext. The recipient's
+     * [DefaultMessagingService.handleDeliver] decrypts and routes back here
+     * via [handleIncoming].
      */
     private suspend fun sendControlMessage(toPubKeyHex: String, payload: MessagePayload) {
-        val payloadJson = json.encodeToString(payload)
-        val payloadB64 = Base64.encode(payloadJson.encodeToByteArray())
-        transport.send(
-            RelayMessage.Send(
-                to = toPubKeyHex,
-                from = myPubKeyHex,
-                payload = payloadB64,
-                messageId = uuid4().toString(),
-            )
-        )
+        messagingService.sendGroupControlMessage(toPubKeyHex, payload)
     }
 
     private suspend fun sendSenderKeyDistribution(

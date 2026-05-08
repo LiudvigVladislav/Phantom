@@ -118,4 +118,19 @@ interface MessagingService {
         recipientPublicKeyHex: String,
         payload: MessagePayload,
     ): Result<Unit>
+
+    /**
+     * Send a group control payload (invite / SKD / add-member / leave / group
+     * message envelope) to one peer through the Double Ratchet + Sealed Sender
+     * pipeline. Used by [GroupMessagingService] for every outgoing group-related
+     * relay envelope so chain keys and member rosters never touch the relay in
+     * plaintext (ADR-026, closes F1).
+     *
+     * The payload is not stored as a chat message; the generated relay
+     * messageId is ephemeral and used only as the deduplication key.
+     */
+    suspend fun sendGroupControlMessage(
+        toPubKeyHex: String,
+        payload: MessagePayload,
+    ): Result<Unit>
 }
