@@ -341,7 +341,7 @@ class AppContainer(private val context: Context) {
             groupRepo = groupRepo,
             senderKeyRepo = senderKeyRepo,
             messageRepo = messageRepo,
-            transport = transport,
+            messagingService = service,
             json = json,
         )
         service.groupMessagingService = groupService
