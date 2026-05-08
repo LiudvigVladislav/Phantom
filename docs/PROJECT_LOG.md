@@ -361,6 +361,32 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-08 (thu, late) · F22 QA-pass + MASTER_TIMELINE sync
+
+- **Goal:** verify that the F22 prekey-wrap implementation (PR-1 `6737be91` +
+  PR-2 `2bcd891e`) and `SECURITY_ROADMAP.md` (`22f0c30c`) are correct
+  end-to-end by running a real-device test with the freshly-merged code.
+- **Test scenario:** Vladislav deleted PHANTOM from the Tecno, reinstalled
+  from a fresh APK, re-registered, then exchanged text messages and voice
+  notes with the emulator. The reinstall forced a fresh keygen — new SPK/OPK
+  bytes are generated and stored via the new `AndroidKeystoreBlobCipher` path.
+- **Outcomes:**
+  - First launch after reinstall: `messagingService is null after init — no
+    identity yet, stopping` — expected sentinel. ✅
+  - Xray SOCKS5 up, WS connected in ~1 s. ✅
+  - Text messages both directions: `sealed=true`, `Decrypt OK`. ✅
+  - Voice (audio_chunk): 13+ chunks each direction, all `Decrypt OK`. ✅
+  - X3DH bootstrap on emulator: `Bootstrapping recipient session` fired
+    correctly for new phone identity; session established without error. ✅
+  - Key finding for F22: bootstrap worked → new SPK/OPK private bytes
+    (Keystore-wrapped) are correctly unwrapped for X3DH. Production-proven. ✅
+  - Call signalling: `call_offer → call_answer → ICE × 4 → call_hangup`. ✅
+  - No crashes, no `AndroidRuntime:E`. ✅
+- **F22 status:** CLOSED. All three sub-commits merged; QA confirmed on
+  physical Tecno (MTS, REALITY/SOCKS) + emulator.
+- **MASTER_TIMELINE updated:** Track B item 1 F22 → ✅; Track C phases 2-4 → ✅.
+- **Follow-up next session:** Day 14 NLnet draft V2 finalization.
+
 ### 2026-05-08 (thu) · Day 1 of council-revised 25-day release-polish plan — Stage 5 closure + Phase 1 cleanup + Firebase rotation + ADR-019
 
 - **Goal:** close all loose ends from yesterday's Stage 5E.B production

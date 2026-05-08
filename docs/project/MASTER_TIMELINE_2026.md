@@ -45,7 +45,7 @@ Track A + Track C идут параллельно. Track B стартует по
 | 2 | [#29](https://github.com/LiudvigVladislav/Phantom/pull/29) | Calls UX | F-03, F-07, F-10, F-15 | ~2 дня | ✅ merged `45338fb8` |
 | 3 | [#30](https://github.com/LiudvigVladislav/Phantom/pull/30) | Calls media (mic permission, audio mode, чёрный экран) | — | ~1 день | ✅ merged `c62fbfff` |
 | 4 | docs/calls-experimental | Calls=experimental decision + Track A schedule lock | — | 30 мин | ✅ merged `d094ca8f` |
-| 5 | feat/voice-message-chunking-pr3 | **Voice messages chunking** | F-05 | ~5 дней | 🟡 pushed `638fbbdd`, ждёт ручной тест |
+| 5 | feat/voice-message-chunking-pr3 | **Voice messages chunking** | F-05 | ~5 дней | ✅ merged `41b9fb94` (#32, 2026-05-04). ⚠️ 8 KB chunk-size fix `6d0215d3` (Tecno reconnect window) остался на ветке — нужен отдельный merge |
 | 6 | (PR 1) | Data integrity edges | F-08, F-01, F-09, F-04 | ~3 дня | ⬜ |
 | 7 | (PR 4) | Storage durability | F-02, F-12, F-06, F-13 | ~3 дня | ⬜ |
 | 8 | (PR 5) | UX cleanup + small fixes | F-14, F-21, F-24 + 3 QA bugs | ~2 дня | ⬜ |
@@ -63,7 +63,7 @@ Track A + Track C идут параллельно. Track B стартует по
 
 | # | Finding | Что сделать | Оценка | Блокирует | Статус |
 |---|---------|-------------|--------|-----------|--------|
-| 1 | **F22** SPK/OPK private keys plaintext SQLite | Keystore-wrap (AES-256-GCM) | ~2 дня | Alpha-2 | ⬜ |
+| 1 | **F22** SPK/OPK private keys plaintext SQLite | Keystore-wrap (AES-256-GCM) | ~2 дня | Alpha-2 | ✅ merged `6737be91` + `2bcd891e` + `22f0c30c`; QA-pass телефон+эму 2026-05-08 |
 | 2 | **F19+F20** Call signalling no E2EE / no Sealed Sender | Wrap SDP/ICE in Double Ratchet + Sealed Sender | ~3 дня | Alpha-2 | ⬜ |
 | 3 | **F8** RatchetState plaintext SQLite | Keystore-wrap RatchetState blob перед записью | ~2 дня | Alpha-2 | ⬜ |
 | 4 | **F2+F13** SenderKey signing dead | ADR-017 (remove signing) уже draft → реализовать | ~3 дня | Alpha-2 | ⬜ |
@@ -75,6 +75,7 @@ Track A + Track C идут параллельно. Track B стартует по
 
 **Verified clean / уже закрыто:**
 - ✅ Identity DH private key Keystore-wrapped
+- ✅ **F22** SPK/OPK private keys Keystore-wrapped — `6737be91` (impl) + `2bcd891e` (инструментированный тест) + `22f0c30c` (SECURITY_ROADMAP). QA-pass 2026-05-08.
 - ✅ Sealed Sender на каждом regular 1:1 message type
 - ✅ F15 (identity-as-ratchet-key) — fixed via fresh ephemeral DH
 - ✅ F17 — notification callback exception swallow logged
@@ -91,9 +92,9 @@ Track A + Track C идут параллельно. Track B стартует по
 | Phase | Что | Время | Статус |
 |-------|-----|-------|--------|
 | 1 | Repo cleanup + .gitignore (remove `google-services.json`, `.kotlin/`; add 12 lines; commit `PHANTOM_ROADMAP_2026.md` + `ARCHITECTURAL_DECISIONS_TODO.md`) | 30 мин (factually ~2 hours with Firebase rotation + plugin conditional fix) | ✅ done 2026-05-08 (#46 + #47) |
-| 2 | Funding plumbing — `funding.json` (secondary funding programme hard prerequisite) + `.github/FUNDING.yml` | 1 час | ⬜ Day 2 (Fri 2026-05-09) |
-| 3 | README polish — License → AGPL-3.0, Status → Alpha 2, ссылки на Threat Model + ADR + Codeberg, softer Funding wording, Mermaid диаграмма, 5 новых секций; правки в RELEASE_NOTES + CONTRIBUTING | 2 часа | ⬜ Day 2 (Fri 2026-05-09) |
-| 4 | English exec summary для Threat Model + Doctrine; ADR index `docs/adr/README.md`; `ARCHITECTURE.md` в корне | 2 часа | ⬜ Day 4 |
+| 2 | Funding plumbing — `funding.json` (secondary funding programme hard prerequisite) + `.github/FUNDING.yml` | 1 час | ✅ done (#49) |
+| 3 | README polish — License → AGPL-3.0, Status → Alpha 2, ссылки на Threat Model + ADR + Codeberg, softer Funding wording, Mermaid диаграмма, 5 новых секций; правки в RELEASE_NOTES + CONTRIBUTING | 2 часа | ✅ done (#49 + #51 + #52 + #55) |
+| 4 | English exec summary для Threat Model + Doctrine; ADR index `docs/adr/README.md`; `ARCHITECTURE.md` в корне | 2 часа | ✅ done (#50 + #52) |
 
 **Итого Track C:** один день работы, не блокирует другие треки.
 
@@ -126,7 +127,7 @@ Track A + Track C идут параллельно. Track B стартует по
 
 **Backlog после Stage 5 (cleanup, не блокеры для Alpha-2):**
 
-- ⬜ **Prekey republish fix** — pre-existing bug, surfaced by Stage 5 testing. Long-offline user → bundle 404 → no-one can send to them. Client-side retry on connect OR relay-side fallback на signed-prekey-only bundle. ~1-2 часа. **Не вошёл в Day 1 — реалистично сдвигается на Day 5+ или post-Alpha-2 (см. council-revised plan).**
+- ✅ **Prekey republish fix** — merged `1fc454cc` (#53, 2026-05-07). Client-side: verify and republish bundle on every WS reconnect. Closes the long-offline user → bundle 404 path.
 - ✅ **Restore strict Xray routing** — done 2026-05-08 in PR #45 (commit `d7ba3a41`). Three-rule chain (multi-syntax domain match + port-443 fallback + catchall blackhole). Verified end-to-end via Caddy `remote_ip: 172.18.0.7`.
 - ✅ **ADR-019 Xray REALITY rationale** — done 2026-05-08 in PR #48 (commit `20e71fbb`). 371-line ADR covering five sub-rationale subsections + threat model + known limitations.
 - ✅ **PR в master** для Stage 5 — done 2026-05-08 morning as #43 (squash merge).
@@ -255,21 +256,30 @@ The canonical funding-channel list lives in [](../../funding.json) at the reposi
 
 > Обновляется по мере прогресса. Когда задача меняется — менять этот блок и резерв-помечать в треках выше.
 
-**Текущий фокус (2026-05-08, конец Day 1 council-revised plan):** Day 1 закрыт целиком — Stage 5E в master + cleanup + Firebase rotation + ADR-019. Шесть PR-ов смержено за сутки (#43, #45, #46, #47, #48 + PR #44 из chore/add-libxray-build-workflow).
+**Текущий фокус (2026-05-08, F22 QA-pass):** Days 1–13 council-revised plan закрыты. Stage 5E (Day 1), README + funding (Day 2), Threat Model EN + ADR index (Day 4), F22 impl + тесты + SECURITY_ROADMAP (Days 8–13) — всё merged.
 
-**Day 2 запланирован на завтра 2026-05-09** (~3 часа):
-1. README polish — License → AGPL-3.0 (real badge), Status → Alpha 2, **first 3 lines hero про Stage 5E**, softer Funding section, ссылки на ThreatModel + ADR + Codeberg
-2. `funding.json`
-3. `.github/FUNDING.yml` placeholder для Open Collective / Liberapay / Polar / BMAC
-4. Update `RELEASE_NOTES.md` + `CONTRIBUTING.md` с правильным License wording
+**QA F22 подтверждён 2026-05-08:** Tecno (после reinstall) + emulator. X3DH bootstrap с новыми Keystore-wrapped ключами ✅, двусторонний текст ✅, голос (audio_chunk) ✅, звонки ✅.
 
-**Day 3** — demo video Stage 5E (~3-4 часа).
-**Day 4** — Threat Model EN exec summary + ADR index + ARCHITECTURE.md + prekey republish fix.
-**Day 5** — Donation rails registration + secondary external funding application.
-**Day 6** — public write-up (HN/lobste.rs EN, Хабр RU). Soft publish, не "front page push".
-**Days 7-12** — F22 SPK/OPK keystore-wrap (single security item) + SECURITY_ROADMAP.md.
-**Days 13-15** — release draft V2 финализация + Alpha-2 release day 15 (10-day буфер до 2026-06-01).
-**Days 16-25** — Track A PR 3 merge + PR 1 + secondary external funding submissions per funding.json.
+**Что НЕ закрыто из плана:**
+- Day 3 — demo video (записывает Vladislav)
+- Day 5 — donation rails registration (Open Collective / Liberapay / Polar / BMAC — ручные действия)
+- Day 6 — public write-up (HN/Хабр)
+
+**Следующий шаг — Day 14:** NLnet draft V2 финализация (~4-5 часов):
+- Обновить body: Stage 5E как hero deliverable
+- Обновить body: F22 как proof of security progress
+- Reference SECURITY_ROADMAP.md для остальных находок
+- Reference demo video URL (когда будет готово)
+- **Day 15 (22 мая):** Submit NLnet через официальный портал
+
+**Days 16-25:** Catch breath + Track A PR 1 (data integrity, F-08/F-01/F-09/F-04) + 8 KB chunk fix merge.
+
+**Что ещё ⬜ (не кодовая работа, ручные действия Vladislav):**
+- Demo video Stage 5E (Day 3 в плане — ещё не снято)
+- Donation rails: Open Collective / Liberapay / Polar / BMAC (Day 5)
+- FUTO Microgrants application (Day 5)
+- Public write-up HN + Хабр (Day 6)
+- FLOSS/fund submission (Days 20-22)
 
 Полный 25-day plan в `~/.claude/projects/.../memory/plan_25_days_to_release.md` (локально, не в репо).
 

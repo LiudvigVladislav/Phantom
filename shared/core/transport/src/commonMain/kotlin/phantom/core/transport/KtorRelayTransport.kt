@@ -68,12 +68,6 @@ class KtorRelayTransport(
     )
     override val acks: Flow<RelayMessage.Ack> = _acks.asSharedFlow()
 
-    private val _readReceipts = MutableSharedFlow<RelayMessage.ReadReceipt>(
-        replay = 0,
-        extraBufferCapacity = 64,
-    )
-    override val readReceipts: Flow<RelayMessage.ReadReceipt> = _readReceipts.asSharedFlow()
-
     // Typing events are ephemeral and never stored or encrypted.
     // extraBufferCapacity = 10 ensures rapid keystrokes never block the read loop.
     private val _typingEvents = MutableSharedFlow<String>(
@@ -410,13 +404,6 @@ class KtorRelayTransport(
                             )
                             _acks.emit(msg)
                         }
-                        is RelayMessage.ReadReceipt -> {
-                            relayLog(
-                                RelayLogLevel.INFO,
-                                "ReadReceipt: messageId=${msg.messageId.take(12)}…",
-                            )
-                            _readReceipts.emit(msg)
-                        }
                         is RelayMessage.Pong -> {
                             lastPongMark = timeSource.markNow()
                         }
@@ -471,20 +458,6 @@ class KtorRelayTransport(
             outboxMutex.withLock { pendingOutbox.addLast(message) }
         }
         return ok
-    }
-
-    override suspend fun sendReadReceipt(message: RelayMessage.ReadReceipt): Boolean {
-        if (!isConnected()) {
-            // Read receipts are also queued — the recipient wants to know their
-            // message was read even if the sender of the receipt was briefly offline.
-            outboxMutex.withLock { pendingOutbox.addLast(message) }
-            relayLog(
-                RelayLogLevel.INFO,
-                "Queued read receipt until reconnect: messageId=${message.messageId.take(12)}…",
-            )
-            return false
-        }
-        return sendRaw(message)
     }
 
     override suspend fun sendDeliveryAck(messageId: String): Boolean {
@@ -548,10 +521,6 @@ class KtorRelayTransport(
                 is RelayMessage.Send -> relayLog(
                     RelayLogLevel.INFO,
                     "Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}…",
-                )
-                is RelayMessage.ReadReceipt -> relayLog(
-                    RelayLogLevel.INFO,
-                    "Flush → send read receipt: id=${msg.messageId.take(12)}…",
                 )
                 is RelayMessage.AckDelivery -> relayLog(
                     RelayLogLevel.INFO,

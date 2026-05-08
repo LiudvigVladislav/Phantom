@@ -76,6 +76,12 @@ data class MessagePayload(
         // Key rotation — sender announces a new identity key
         const val TYPE_KEY_ROTATION = "key_rotation"
 
+        // Read receipt — notifies the sender that their message was read.
+        // Travels through the standard Double Ratchet + Sealed Sender
+        // pipeline so the relay never sees `from`, `to`, or `messageId`
+        // in plaintext (C-2 fix).
+        const val TYPE_READ_RECEIPT = "read_receipt"
+
         // Voice call signalling — these are never stored as chat messages
         const val TYPE_CALL_OFFER  = "call_offer"
         const val TYPE_CALL_ANSWER = "call_answer"
