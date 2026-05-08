@@ -500,10 +500,8 @@ class KtorRelayTransport(
 
     /**
      * Drains the in-memory outbox in FIFO order after a successful reconnect.
-     * Each entry goes through sendRaw directly; failures leave the remaining
-     * items in the queue only if we add explicit re-enqueue logic — for now a
-     * single write failure per entry is accepted (an immediate reconnect will
-     * cover the case where the session dies mid-flush).
+     * Stops at the first sendRaw failure and re-enqueues all unsent items at
+     * the front so the next reconnect cycle picks them up in order.
      */
     private suspend fun flushPendingOutbox() {
         val toFlush = outboxMutex.withLock {
@@ -516,6 +514,7 @@ class KtorRelayTransport(
             RelayLogLevel.INFO,
             "Flushing ${toFlush.size} queued item(s) after reconnect",
         )
+        var sentCount = 0
         for (msg in toFlush) {
             when (msg) {
                 is RelayMessage.Send -> relayLog(
@@ -530,11 +529,20 @@ class KtorRelayTransport(
             }
             val ok = sendRaw(msg)
             if (!ok) {
+                val remaining = toFlush.size - sentCount
                 relayLog(
                     RelayLogLevel.ERROR,
-                    "Flush failed for one queued item — message will not be retried in this cycle",
+                    "Flush failed — re-enqueuing $remaining item(s) for next reconnect",
                 )
+                // Re-enqueue from the failed item onwards, preserving order.
+                outboxMutex.withLock {
+                    toFlush.subList(sentCount, toFlush.size)
+                        .asReversed()
+                        .forEach { pendingOutbox.addFirst(it) }
+                }
+                return
             }
+            sentCount++
         }
     }
 
@@ -555,6 +563,11 @@ class KtorRelayTransport(
     override suspend fun disconnect() {
         relayLog(RelayLogLevel.INFO, "disconnect() called")
         disconnectRequested = true
+        // Best-effort flush of any pending outbox items before tearing down the
+        // scope. Bounded to 3 s so disconnect never blocks indefinitely.
+        withTimeoutOrNull(3_000L) {
+            if (session != null) flushPendingOutbox()
+        }
         pingJob?.cancel()
         ackWatchdogJob?.cancel()
         scope?.cancel()
