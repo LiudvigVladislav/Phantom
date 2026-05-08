@@ -4,11 +4,14 @@
 package phantom.core.storage
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
 import java.security.SecureRandom
+import javax.crypto.BadPaddingException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -36,7 +39,20 @@ internal object DatabasePassphraseManager {
 
         if (stored != null) {
             val ivAndCipher = Base64.decode(stored, Base64.NO_WRAP)
-            return decrypt(ivAndCipher)
+            try {
+                return decrypt(ivAndCipher)
+            } catch (_: KeyPermanentlyInvalidatedException) {
+                // Biometric/PIN change permanently invalidated the Keystore key.
+                // The old passphrase is unrecoverable — wipe the entry and fall
+                // through to generate a fresh one. History will be empty after this
+                // but the app stays functional. AppContainer should show a one-time
+                // warning to the user explaining the data loss.
+                wipeEncryptedEntry(prefs)
+            } catch (_: BadPaddingException) {
+                // Pre-API-28 firmware: KeyPermanentlyInvalidatedException may surface
+                // as BadPaddingException. Same recovery path applies.
+                wipeEncryptedEntry(prefs)
+            }
         }
 
         val passphrase = ByteArray(32).also { SecureRandom().nextBytes(it) }
@@ -45,6 +61,14 @@ internal object DatabasePassphraseManager {
             .putString(PREFS_KEY, Base64.encodeToString(encrypted, Base64.NO_WRAP))
             .apply()
         return passphrase
+    }
+
+    private fun wipeEncryptedEntry(prefs: SharedPreferences) {
+        prefs.edit().remove(PREFS_KEY).apply()
+        runCatching {
+            val ks = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+            if (ks.containsAlias(KEYSTORE_ALIAS)) ks.deleteEntry(KEYSTORE_ALIAS)
+        }
     }
 
     private fun getOrCreateKey(): SecretKey {

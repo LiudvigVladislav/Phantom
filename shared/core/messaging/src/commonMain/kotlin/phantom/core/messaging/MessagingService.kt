@@ -39,6 +39,14 @@ interface MessagingService {
     suspend fun startReceiving()
 
     /**
+     * Release the per-conversation [kotlinx.coroutines.sync.Mutex] entry held for
+     * [conversationId]. Call this whenever a conversation is permanently deleted so
+     * the entry is not retained in the session-mutex map indefinitely.
+     * Default is a no-op; [DefaultMessagingService] overrides.
+     */
+    suspend fun removeConversationMutex(conversationId: String) {}
+
+    /**
      * Re-attempt every locally-stored message that's currently sitting
      * in [phantom.core.storage.MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE].
      * Returns the number of messages re-attempted (success OR continued
