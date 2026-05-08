@@ -38,114 +38,24 @@
 | **F17** | Notification callback exception was swallowed silently | Logged at `WARN` and surfaced through the foreground-service notification updater. |
 | **F22** | Local SPK + OPK private bytes were plaintext in SQLite | Wrapped via Android Keystore AES-256-GCM (alias `phantom_prekey_wrap_v1`). See [ADR-023](../adr/ADR-023-Local-Prekey-Keystore-Wrap.md). Lazy migration: rows rewrite themselves on the next `maybeReplenishOneTimePreKeys` / `maybeRotateSignedPreKey` cycle. |
 | **Sealed Sender envelope** | Was missing on some 1:1 message paths | Now applied to every regular 1:1 message type. The relay sees only routing metadata, not sender identity. |
-
-## Scheduled — post-Alpha-2 security pass
-
-These are the four remaining substantial items from the project's
-running security findings list. They are scheduled rather than
-shipped in the Alpha-2 release because the Council-revised release
-plan deliberately kept the security workload to one item (F22) and
-deferred the rest to the next release window — a five-item security
-sprint inside one month was assessed as the wrong use of a single
-maintainer's time, and the honest roadmap below is the explicit
-trade.
-
-### F8 — RatchetState plaintext in SQLite 🟦
-
-**What.** The Double Ratchet state (root key, chain keys, message
-counters, header keys, current and previous DH ratchets) is
-serialized into a `BLOB` column on the `ratchet_state` table without
-the same Keystore wrap that F11 and F22 already apply to identity
-and prekey private bytes. A memory image of an unlocked device that
-captures the SQLCipher decryption window can read the entire
-ratchet state and decrypt every past-and-future message in every
-active conversation.
-
-**Why it sits behind F22 in the queue.** The OPK / SPK private
-bytes (F22) are read on every X3DH bootstrap — every first-contact
-ever made. The ratchet state is read on every message receive but
-the *attack* against it requires both an unlocked-device memory
-image AND a captured ratchet snapshot for the right conversation
-window. The attacker surface is smaller, the implementation is
-larger (every ratchet step persists; the wrap path has to be
-hot-path friendly).
-
-**Plan.** Reuse `KeystoreBlobCipher` from ADR-023 — the same
-helper, the same alias family, no new crypto primitive. Add a
-`RatchetState` codec analogous to `PrivateKeyStorageCodec` that
-wraps the BLOB on persist and unwraps on load. Lazy migration via
-the same "rewrite on next ratchet step" pattern. Estimated
-1.5-2 working days end-to-end.
-
-**Target window.** Post-Alpha-2 security pass (next release cycle).
-
-### F19 + F20 — Call signalling not wrapped in Double Ratchet, no Sealed Sender 🟦
-
-**What.** WebRTC call setup messages (SDP offers / answers, ICE
-candidates) currently flow through the relay as their own envelope
-type, outside the Double Ratchet that protects regular text
-messages. They are TLS-encrypted on the wire, but the relay sees
-who is calling whom (caller pubkey + callee pubkey, plus call IDs
-that link the entire session). On a compromised relay, the call
-metadata graph is fully visible.
-
-**Why it sits behind F22.** Calls in PHANTOM are explicitly
-labelled experimental in `KNOWN_ISSUES.md` ISSUE-014; the bigger
-calls reliability work (PR 2.6, deferred until the underlying
-transport is stable on aggressive-OEM devices) sits under it as a
-prerequisite. Wrapping signalling in the ratchet is structurally
-similar to wrapping any other message type — but doing it before
-the calls subsystem is past its experimental tag mostly produces
-churn rather than value.
-
-**Plan.** Wrap SDP / ICE payloads inside the Double Ratchet message
-type already used for regular 1:1 text. Add Sealed Sender envelope
-at the same time so the relay sees only `to=<recipient>` for call
-signalling (same posture every regular message type already has).
-Estimated 3-4 working days.
-
-**Target window.** Post-Alpha-2 security pass, after the calls
-subsystem leaves experimental status.
-
-### F2 + F13 — Dead-code SenderKey signing path 🟦
-
-**What.** The Group Sender Keys subsystem carries a signing path
-that is no longer reachable from any production code path
-(superseded by an earlier refactor). It still allocates and stores
-an Ed25519 keypair on every group entry, increasing the attack
-surface (an extra long-lived key on disk that nothing reads) and
-the maintenance surface (anyone reading the code wonders why it is
-there).
-
-**Why it sits in the queue.** Removal is not user-visible, so it
-does not buy a new release headline. The cleanup is small but
-needs migration code — existing group entries carry the dead key
-material and the next-launch read path must handle the absent
-column gracefully.
-
-**Plan.** Implementation already drafted in
-[ADR-017 (SenderKey signing removal)](../adr/ADR-017-senderkey-signing-removal.md);
-this roadmap entry is the schedule, not the design. Estimated
-2-3 working days including the migration test.
-
-**Target window.** Post-Alpha-2, bundled with the group-chat
-hardening pass.
-
----
+| **F8** | Double Ratchet state was plaintext in SQLite | Wrapped via Android Keystore AES-256-GCM (alias family `phantom_ratchet_wrap_v1`). See [ADR-024](../adr/ADR-024-Ratchet-State-Keystore-Wrap.md). |
+| **F19 + F20** | WebRTC call signalling (SDP / ICE / hangup) was sent unencrypted with `from`/`to` visible to the relay | Routed through the same Double Ratchet + Sealed Sender pipeline as regular messages. See [ADR-025](../adr/ADR-025-Call-Signaling-E2EE.md). |
+| **F2 + F13** | Dead-code SenderKey signing path retained an Ed25519 keypair on every group entry | Signing path removed entirely. Migration `14.sqm` drops the dead columns. See [ADR-017](../adr/ADR-017-senderkey-signing-removal.md) (Status: Accepted). |
+| **F1** | Group control messages (invite / SKD / add-member / leave) and per-recipient group ciphertext envelopes travelled outside the Double Ratchet | All outgoing group-related envelopes now route through `MessagingService.sendGroupControlMessage` → DR + Sealed Sender. The relay no longer sees chain keys, member rosters, or group activity timing. See [ADR-026](../adr/ADR-026-Group-Control-Messages-E2EE.md). |
+| **F3** | Group SenderKey KDF used bare `SHA256(chainKey \|\| tag)` | Replaced with RFC 5869 HKDF-SHA256 with the iteration counter bound into the salt and `_v2` info-string suffixes. Built on `phantom.core.crypto.Hkdf` (the same primitive X3DH already uses). |
+| **F4** | Member-leave did not rotate remaining members' keys (the leaver retained chain keys forever) | `handleLeave` now generates a fresh local SenderKey and broadcasts a fresh SKD to every remaining member before any post-leave send. Convergent: each remaining member runs the same handler, no coordinator state needed. |
+| **F11 + F26** | Shared `?token=` WS auth (single secret across all installs; leaks via APK extraction + reverse-proxy access logs) | Replaced with per-user Ed25519 signed-challenge handshake bound to the existing identity signing keypair. TOFU first connect, 1:1 binding enforced thereafter (mirrors the `publish_prekeys` invariant). `RELAY_TOKEN` `BuildConfig` field removed. See [ADR-027](../adr/ADR-027-Per-User-Signed-Challenge-Auth.md). Production-validated on Tecno МТС + emulator 2026-05-09. |
 
 ## Acknowledged — Beta-tier hardening
 
 These are recorded in the project's running findings list but are
-neither scheduled nor blocking. They become real work after the
-post-Alpha-2 security pass above lands.
+neither scheduled nor blocking. They become real work during the
+Beta polish window.
 
 | ID | What | Plan |
 |----|------|------|
-| F1 | Group control messages travel outside the Double Ratchet | Wrap SKD / leave / add control messages inside the ratchet. ~3 working days. Bundled with the broader group-chat hardening pass. |
-| F3 | Group SenderKey KDF uses bare SHA-256 | Replace with HKDF-SHA256 with explicit domain separation. ~1 working day. Same group-chat pass. |
-| F4 | Member-leave event does not rotate group keys | Implement full key rotation on `leave` and `remove`. ~2 working days. Same pass. |
-| F11 + F26 | Shared relay token across all installs | Per-user signed challenge replaces the shared token. ~3 working days. Standalone PR. |
 | P2 batch (F6, F7, F9, F10, F12 retry, F14, F18, F23, F25) | Lower-severity findings (logging, edge cases, validation tightening) | Cleanup pass during Beta polish. No standalone PR planned; rolled into routine work. |
+| Calls audio plumbing (PR 2.6) | One-way audio observed in 2026-05-09 cross-device QA — `JavaAudioDeviceModule` + `AudioFocus` integration deferred when calls were marked experimental | Bundled with the broader calls-leave-experimental milestone. |
 
 ---
 
@@ -183,5 +93,8 @@ Three inputs feed this roadmap:
 
 ---
 
-*Last reviewed: 2026-05-08. Next review: when the post-Alpha-2
-security pass kicks off.*
+*Last reviewed: 2026-05-09. The post-Alpha-2 security pass landed
+ahead of schedule: F8 + F19+F20 + F2+F13 + F1 + F3 + F4 + F11+F26
+all closed in the 2026-05-08 → 2026-05-09 sprint. Next review:
+when the calls subsystem leaves experimental status (PR 2.6 audio
+plumbing) or when an external auditor surfaces new findings.*
