@@ -3,7 +3,6 @@
 
 package phantom.core.crypto
 
-import com.ionspin.kotlin.crypto.auth.Auth
 import com.ionspin.kotlin.crypto.box.Box
 import com.ionspin.kotlin.crypto.hash.Hash
 import com.ionspin.kotlin.crypto.scalarmult.ScalarMultiplication
@@ -211,35 +210,11 @@ class LibsodiumX3DH : X3DHProtocol {
         internal val INFO_ROOTKEY: ByteArray =
             "phantom-x3dh-rootkey-v1".encodeToByteArray()
 
-        /**
-         * HKDF-SHA256 with output length L = 32 (RFC 5869).
-         *
-         *   PRK = HMAC-SHA256(salt, IKM)
-         *   OKM = HMAC-SHA256(PRK, info || 0x01)   (single block — L ≤ 32)
-         *
-         * libsodium's `Auth.authHmacSha256` is HMAC-SHA-256 directly; we use
-         * it for both Extract and Expand. For L = 32 the Expand stage is a
-         * single HMAC call with counter byte 0x01.
-         */
-        @OptIn(ExperimentalUnsignedTypes::class)
+        /** Delegates to the shared [Hkdf.sha256L32]; kept for test compatibility. */
         internal fun hkdfSha256L32(
             ikm: ByteArray,
             salt: ByteArray,
             info: ByteArray,
-        ): ByteArray {
-            // Extract: PRK = HMAC(salt, IKM)
-            val prk = Auth.authHmacSha256(
-                message = ikm.toUByteArray(),
-                key     = salt.toUByteArray(),
-            ).toByteArray()
-            // Expand (single block, L ≤ 32): OKM = HMAC(PRK, info || 0x01)
-            val expandInput = info + byteArrayOf(0x01)
-            val okm = Auth.authHmacSha256(
-                message = expandInput.toUByteArray(),
-                key     = prk.toUByteArray(),
-            ).toByteArray()
-            prk.zeroize()
-            return okm
-        }
+        ): ByteArray = Hkdf.sha256L32(ikm = ikm, salt = salt, info = info)
     }
 }
