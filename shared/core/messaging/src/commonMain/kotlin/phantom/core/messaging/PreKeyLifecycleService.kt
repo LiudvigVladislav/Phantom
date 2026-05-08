@@ -238,7 +238,7 @@ class PreKeyLifecycleService(
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private fun generateAndPersistSpk(signing: IdentitySigningKeyPair): LocalSignedPreKeyEntity {
+    private suspend fun generateAndPersistSpk(signing: IdentitySigningKeyPair): LocalSignedPreKeyEntity {
         val pair = x3dh.generateDhKeyPair()
         val createdAt = nowMsProvider()
         val sig = SignedPreKeySigner.sign(
@@ -253,6 +253,9 @@ class PreKeyLifecycleService(
             createdAtMs = createdAt,
             signatureHex = sig.toHex(),
         )
+        // Persist immediately so the private key survives a crash that occurs
+        // between this call and the publishBundle network round-trip.
+        signedPreKeyRepository.upsert(entity)
         return entity
     }
 

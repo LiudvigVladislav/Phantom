@@ -568,15 +568,12 @@ class DefaultMessagingService(
                     )
                     WireFrame(encryptedMessage = legacy)
                 } catch (secondErr: SerializationException) {
-                    val previewLen = minOf(ciphertextText.length, 240)
-                    val preview = ciphertextText.substring(0, previewLen)
                     messagingLog(
                         MessagingLogLevel.ERROR,
                         "Unparseable wire payload (neither WireFrame nor EncryptedMessage) — " +
                             "NOT ack'ing (relay will redeliver). " +
                             "id=${deliver.messageId.take(12)}… sealed=${deliver.sealedSender.isNotEmpty()} " +
-                            "totalBytes=${ciphertextText.length} previewBytes=$previewLen " +
-                            "preview=<<<$preview>>> " +
+                            "totalBytes=${ciphertextText.length} " +
                             "wireFrameErr=${firstErr.message} legacyErr=${secondErr.message}",
                     )
                     return@runCatching

@@ -43,6 +43,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -115,9 +116,6 @@ private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
             .background(BgDeep)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
-        // Ambient motif — 5 concentric circles, 0.028 opacity per FULL_COMPOSE.
-        AmbientMotif()
-
         HorizontalPager(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
@@ -245,6 +243,7 @@ private fun IdentityKeyStep(
     onContinue: () -> Unit,
 ) {
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
     val valid = username.length >= 3
     val sampleFingerprint = "A4B2  C8D1  E3F7  2A9B  4C6D  8E1F  3A5B  7C2D"
     val ctx = LocalContext.current
@@ -423,7 +422,7 @@ private fun IdentityKeyStep(
                 ),
                 cursorBrush = SolidColor(CyanAccent),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                keyboardActions = KeyboardActions(onNext = { if (valid) onContinue() }),
+                keyboardActions = KeyboardActions(onNext = { if (valid) { focusManager.clearFocus(); onContinue() } }),
                 decorationBox = { inner ->
                     if (username.isEmpty()) {
                         Text(
@@ -442,7 +441,7 @@ private fun IdentityKeyStep(
 
         IntroCta(
             label = "Continue",
-            onClick = onContinue,
+            onClick = { focusManager.clearFocus(); onContinue() },
             enabled = valid,
         )
 
