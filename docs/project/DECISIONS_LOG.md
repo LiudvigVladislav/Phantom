@@ -15,6 +15,46 @@
 
 ---
 
+## D-20: Stage 5G Phase 1 succeeded — proceed to full implementation — 2026-05-09
+
+**Decided:** Test 13.1 on Tecno МТС (RU, no VPN) reached
+`Online via Tor · Ghost` via the obfs4 bridge on FlokiNET. The hypothesis
+from D-16 is confirmed: obfs4's uniform-random wire signature bypasses the
+TSPU 16-KB curtain that catches WebTunnel TLS handshakes.
+
+Per the decision gate criteria in
+[`docs/research/stage-5g-phase-1-2026-05-09/README.md`](../research/stage-5g-phase-1-2026-05-09/README.md):
+**continue Stage 5G full implementation** — Variant C (RU carrier
+checkpoint warning) is no longer needed.
+
+**Next steps:**
+- Stage 5G Phase 2 — multi-run reliability characterisation (Tests 2-5),
+  EU emulator control runs, round-trip text + voice via Tor circuit.
+- Stage 5G Phase 3 — multi-bridge fan-out (additional obfs4 bridges on
+  geographically distinct hosts) + obfs4-only mode for the Ghost path so
+  the failing WebTunnel entry is dropped from the chain. Drafted as
+  ADR-015.
+
+**Caveats from the run captured in the research doc:**
+- First Tor cold start through the bridge took ~5 min (acceptable for a
+  privacy-paranoid Ghost-mode user; Stage 5G Phase 2 will measure warm
+  reconnect time).
+- `ChatList` header showed `Connecting…` for ~5 min after the foreground
+  notification already read `Online via Tor · Ghost` — UI consistency
+  follow-up tracked in `TECHNICAL_BACKLOG.md` (notification updater reads
+  `TransportManager.state`, ChatList header reads `transport.state`; the
+  Tor-circuit WS upgrade is the slow step that drives the second flag).
+- Switching back to Standard with `lastWorkingTransport=Tor` hint
+  retained from Ghost causes the chain walk to try Tor first in Standard
+  too — counter-intuitive on mode switch. Fix queued as a follow-up
+  (clear hint inside `setPrivacyMode`).
+
+**Reference:** Vladislav cross-device test 2026-05-09. See
+[`docs/research/stage-5g-phase-1-2026-05-09/README.md`](../research/stage-5g-phase-1-2026-05-09/README.md)
+for the captured run data.
+
+---
+
 ## D-19: FlokiNET server reuse, not new VPS for Stage 5G — 2026-05-09
 
 **Decided:** Test 13 problem was the TSPU 16-KB curtain itself, not the
