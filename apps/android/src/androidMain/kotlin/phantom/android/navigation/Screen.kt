@@ -28,6 +28,12 @@ sealed class Screen {
     object CreateChannel : Screen()
     data class Chat(val conversationId: String, val theirUsername: String) : Screen()
     data class ContactProfile(val conversationId: String, val theirUsername: String) : Screen()
+    /**
+     * Full-screen identity verification flow per FULL_COMPOSE Verification.
+     * Carries Compare → Verified / Mismatch states internally; exits back
+     * to ContactProfile when the user taps the trailing close-arrow.
+     */
+    data class Verify(val conversationId: String, val theirUsername: String) : Screen()
     data class GroupChat(val groupId: String, val groupName: String, val isChannel: Boolean) : Screen()
     data class ActiveCall(val conversationId: String, val username: String) : Screen()
     data class IncomingCall(val conversationId: String, val username: String) : Screen()

@@ -44,6 +44,10 @@ fun ContactProfileScreen(
     onBack: () -> Unit,
     onMessage: () -> Unit = onBack,
     onDeleteConversation: () -> Unit,
+    /** Tap → full-screen `Screen.Verify(...)` flow. The legacy in-place
+     *  bottom-sheet stays as a fallback for the rare case the host nav
+     *  doesn't wire this prop (default = open the sheet locally). */
+    onVerify: (() -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -311,7 +315,7 @@ fun ContactProfileScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Danger.copy(alpha = 0.12f))
-                        .clickable { showVerifySheet = true }
+                        .clickable { if (onVerify != null) onVerify() else showVerifySheet = true }
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -570,7 +574,7 @@ fun ContactProfileScreen(
                             drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
                         }
                     },
-                    onClick = { showVerifySheet = true },
+                    onClick = { if (onVerify != null) onVerify() else showVerifySheet = true },
                 )
             }
 

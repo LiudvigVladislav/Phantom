@@ -196,9 +196,17 @@ fun ProfileScreen(
                 )
             }
 
-            // ── Connection card ──────────────────────────────────────────────
+            // ── Account card ─────────────────────────────────────────────────
+            // Per FULL_COMPOSE Profile/Mobile 1: Username / Plan / Member
+            // since. Replaces the prior "Connection" panel (relay URL,
+            // pubkey hex preview) — that data is for diagnostics, not for
+            // the user-facing identity surface, and the canonical mock
+            // doesn't include it.
             identity?.let { id ->
-                ConnectionCard(identity = id)
+                AccountCard(
+                    handle = id.username,
+                    onUpgrade = { /* TODO: nav to Premium */ },
+                )
             }
 
             // ── Delete section ───────────────────────────────────────────────
@@ -812,7 +820,111 @@ private fun QrKeyCard(
     }
 }
 
-// ── Connection card ───────────────────────────────────────────────────────────
+// ── Account card (Username / Plan / Member since) ────────────────────────────
+// FULL_COMPOSE Profile/Mobile 1: three rows on a SurfaceElevated card with
+// 12dp radius and BorderSubtle hairlines between rows. The Plan row carries
+// an inline "UPGRADE" cyan pill that routes to Premium when the upsell flow
+// lands. Member-since is rendered from the keystore install date — we don't
+// log identity creation timestamp yet, so the row reads "—" until it does.
+
+@Composable
+private fun AccountCard(handle: String, onUpgrade: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(PhantomTokens.Colors.SurfaceElevated)
+            .border(1.dp, BorderSubtle, RoundedCornerShape(12.dp)),
+    ) {
+        // Section overline
+        Text(
+            text = "ACCOUNT",
+            color = TextDim,
+            fontSize = 10.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 1.8.sp,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+        )
+        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+
+        AccountRow(
+            label = "Username",
+            value = "@${handle.ifEmpty { "—" }}",
+        )
+        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+
+        // Plan row with inline UPGRADE pill (FREE tier).
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Plan",
+                color = TextDim,
+                fontSize = 14.sp,
+                modifier = Modifier.width(120.dp),
+            )
+            Text(
+                text = "Free",
+                color = TextPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(CyanAccent)
+                    .clickable(onClick = onUpgrade)
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            ) {
+                Text(
+                    text = "UPGRADE",
+                    color = BgDeep,
+                    fontSize = 9.sp,
+                    fontFamily = PhantomFontMono,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 1.5.sp,
+                )
+            }
+        }
+        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+
+        AccountRow(
+            label = "Member since",
+            value = "—",
+        )
+    }
+    Spacer(Modifier.height(12.dp))
+}
+
+@Composable
+private fun AccountRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            color = TextDim,
+            fontSize = 14.sp,
+            modifier = Modifier.width(120.dp),
+        )
+        Text(
+            text = value,
+            color = TextPrimary,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
+
+// ── Connection card (legacy — kept for diagnostics, not rendered) ───────────
 
 @Composable
 private fun ConnectionCard(identity: IdentityRecord) {
