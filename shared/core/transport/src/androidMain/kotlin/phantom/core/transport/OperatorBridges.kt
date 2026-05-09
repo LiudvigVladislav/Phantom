@@ -109,10 +109,18 @@ internal object OperatorBridges {
      * a `+` of an empty list to the WebTunnel one) — no behaviour change
      * until the first real entry lands.
      */
-    val OBFS4: List<String> = emptyList()
-        // Example shape (do NOT commit example values — produce real ones
-        // from the deploy script):
-        //
-        // "Bridge obfs4 192.0.2.10:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 " +
-        //     "cert=AAAA…BBBB iat-mode=0",
+    val OBFS4: List<String> = listOf(
+        // bridge2.phntm.pro (FlokiNET RO, AS200651) — same VPS as the
+        // existing WebTunnel bridge, separate Tor instance + separate
+        // listener port (TCP/8443 obfs4 vs TCP/443 WebTunnel-Caddy).
+        // Bootstrapped 2026-05-09 (deploy log:
+        // deploy/obfs4-bridge-setup.md, Vladislav SSH session).
+        // ORPort 9001 fixed; obfs4 transport on 8443.
+        // Self-test passed: "Self-testing indicates your ORPort
+        // 185.165.171.206:9001 is reachable from the outside."
+        "Bridge obfs4 185.165.171.206:8443 " +
+            "5EDD29A187D8354D68DDDB2E711005D6DFFD6F3A " +
+            "cert=yU6ljZFFQ49J6VCipe7QBQt38fQ6O3ncJoNzTQzk8tJ/hg9n1GyOKpYF1YSC/OBib4tqVA " +
+            "iat-mode=0",
+    )
 }
