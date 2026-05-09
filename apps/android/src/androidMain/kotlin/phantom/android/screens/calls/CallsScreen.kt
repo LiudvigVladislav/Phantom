@@ -167,7 +167,27 @@ fun CallsScreen(
                     }
 
                     item { SectionHeader(text = "Recent") }
-                    item { ComingSoonBanner() }
+                    item {
+                        // No call_log table yet — render the canonical
+                        // CallHistoryRow only when entries exist. For now,
+                        // the section reads honestly that history starts
+                        // when the user makes their first call.
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 20.dp, vertical = 14.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "No calls yet · all calls are end-to-end encrypted",
+                                color = TextDim,
+                                fontSize = 12.sp,
+                                lineHeight = 18.sp,
+                                fontFamily = PhantomFontMono,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            )
+                        }
+                    }
                 }
             }
 
@@ -233,6 +253,124 @@ private fun SectionHeader(text: String) {
         letterSpacing = 2.8.sp,
         color = TextDim,
     )
+}
+
+// ── Call history (FULL_COMPOSE Calls/History) ───────────────────────────────
+// Direction-typed history entry + canonical row composable. No data source
+// yet — call_log table lands with the recents milestone — so these are
+// dormant. Defined now so the wire-up is a single LazyColumn item insertion
+// when the storage layer ships.
+
+enum class CallDirection { INCOMING, OUTGOING, MISSED }
+
+data class CallHistoryEntry(
+    val id: String,
+    val theirUsername: String,
+    val direction: CallDirection,
+    val occurredAt: Long,
+    val durationSeconds: Long,
+)
+
+@Suppress("unused")
+@Composable
+private fun CallDateGroupHeader(label: String) {
+    // Mono 10sp tertiary 1.6sp tracking, uppercase. Matches FULL_COMPOSE
+    // Calls/History grouping.
+    Text(
+        text = label.uppercase(),
+        color = TextDim,
+        fontSize = 10.sp,
+        fontFamily = PhantomFontMono,
+        letterSpacing = 1.6.sp,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 4.dp),
+    )
+}
+
+@Suppress("unused")
+@Composable
+private fun CallHistoryRow(entry: CallHistoryEntry, onCallback: () -> Unit) {
+    val nameColor = if (entry.direction == CallDirection.MISSED) Danger else TextPrimary
+    val directionLabel = when (entry.direction) {
+        CallDirection.INCOMING -> "Incoming"
+        CallDirection.OUTGOING -> "Outgoing"
+        CallDirection.MISSED -> "Missed"
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        GradientAvatar(name = entry.theirUsername, size = 40.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = entry.theirUsername,
+                color = nameColor,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(Modifier.height(3.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                when (entry.direction) {
+                    CallDirection.INCOMING -> PhIconArrowIn(color = Success, size = 12.dp)
+                    CallDirection.OUTGOING -> PhIconArrowOut(color = TextDim, size = 12.dp)
+                    CallDirection.MISSED -> PhIconArrowIn(color = Danger, size = 12.dp)
+                }
+                Text(
+                    text = directionLabel,
+                    color = TextDim,
+                    fontSize = 13.sp,
+                )
+            }
+        }
+        Column(
+            horizontalAlignment = Alignment.End,
+        ) {
+            Text(
+                text = formatCallDate(entry.occurredAt),
+                color = TextDim,
+                fontSize = 11.sp,
+                fontFamily = PhantomFontMono,
+            )
+            if (entry.durationSeconds > 0) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = formatCallDuration(entry.durationSeconds),
+                    color = TextDim.copy(alpha = 0.6f),
+                    fontSize = 10.sp,
+                    fontFamily = PhantomFontMono,
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        IconButton(onClick = onCallback, modifier = Modifier.size(36.dp)) {
+            PhIconPhone(color = CyanAccent, size = 18.dp)
+        }
+    }
+}
+
+private fun formatCallDate(millis: Long): String {
+    val cal = java.util.Calendar.getInstance().apply { timeInMillis = millis }
+    val now = java.util.Calendar.getInstance()
+    val sameDay = cal.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) &&
+            cal.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR)
+    return if (sameDay) {
+        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(millis))
+    } else {
+        java.text.SimpleDateFormat("MMM d", java.util.Locale.getDefault()).format(java.util.Date(millis))
+    }
+}
+
+private fun formatCallDuration(seconds: Long): String {
+    val m = seconds / 60
+    val s = seconds % 60
+    return "%d:%02d".format(m, s)
 }
 
 @Composable
