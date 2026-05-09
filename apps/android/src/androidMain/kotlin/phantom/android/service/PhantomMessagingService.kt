@@ -17,23 +17,17 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import phantom.android.BuildConfig
 import phantom.android.PhantomApplication
-import phantom.core.transport.TorService
-import phantom.core.transport.TorServiceConfig
-import phantom.core.transport.TorState
-import phantom.core.transport.createTorService
-import phantom.core.xray.OperatorXrayConfig
-import phantom.core.xray.XrayService
-import phantom.core.xray.XrayState
-import phantom.core.xray.createXrayService
+import phantom.core.transport.ConnectedTransport
+import phantom.core.transport.ManagerState
+import phantom.core.transport.NoTransportReachableException
+import phantom.core.transport.TransportKind
 
 /**
  * Foreground service that owns the WebSocket connection lifetime.
@@ -79,52 +73,12 @@ class PhantomMessagingService : Service() {
     // emulator runs for 5+ min uninterrupted.
     private var multicastLock: WifiManager.MulticastLock? = null
 
-    // ADR-016 Stage 2C: embedded Tor service. Lazy-constructed only when
-    // [BuildConfig.USE_TOR] is true so non-Tor builds carry zero kmp-tor
-    // initialisation cost. Lifecycle is bound to onStartCommand → onDestroy
-    // — start before connect, stop after disconnect. The work + cache
-    // directories live under the app-private dataDir so guards persist
-    // across restarts (warm bootstrap on next start) and the OS can evict
-    // the cache without breaking functionality.
-    private val torService: TorService? by lazy {
-        if (!BuildConfig.USE_TOR) return@lazy null
-        val workDir = applicationContext.filesDir.resolve("tor-data")
-        val cacheDir = applicationContext.cacheDir.resolve("tor-cache")
-        workDir.mkdirs()
-        cacheDir.mkdirs()
-        // ADR-018: Briar's AndroidTorWrapper requires the host Application
-        // for its wake-lock manager and resource extraction. We pass it
-        // through the platformContext channel of the cross-platform factory.
-        createTorService(
-            config = TorServiceConfig(
-                dataDirectoryPath = workDir.absolutePath,
-                cacheDirectoryPath = cacheDir.absolutePath,
-                // ADR-018 Stage 5B: bridges always on while USE_TOR build flag
-                // is the only Tor gate. Stage 5C will make this mode-dependent
-                // — Standard/Private use bridges only when auto-fallback path
-                // is active; Ghost always uses bridges (privacy contract).
-                useBridges = true,
-            ),
-            platformContext = application,
-        )
-    }
+    // ADR-020 Phase 2: embedded Tor and Xray subsystems are now owned by
+    // AppContainer.transportManager. The service no longer holds direct
+    // references — it asks the manager for a connected transport and gets back
+    // a ConnectedTransport(kind, socksPort) it then hands to KtorRelayTransport.
 
-    // ADR-018 Stage 5E.B: embedded Xray VLESS+REALITY transport. Lazy —
-    // libXray's gomobile JNI is heavy (loads ~45 MB native lib on the
-    // first call) so non-Xray builds pay nothing. Mutually exclusive with
-    // [torService] at compile time (build.gradle.kts errors on both flags),
-    // so we never have to arbitrate two outer transports at runtime.
-    //
-    // Pinned production endpoint comes from [OperatorXrayConfig] — the
-    // matching server lives at deploy/xray/ on the Hetzner VPS.
-    private val xrayService: XrayService? by lazy {
-        if (!BuildConfig.USE_XRAY) return@lazy null
-        val dataDir = applicationContext.filesDir.resolve("xray-data")
-        dataDir.mkdirs()
-        createXrayService(OperatorXrayConfig.toConfig(dataDir.absolutePath))
-    }
-
-    // Stage 2C.5: tracks the foreground notification updater coroutine so
+    // Tracks the foreground notification updater coroutine so
     // we can launch it once in onCreate and not duplicate on Android's
     // potential redelivered onStartCommand intents.
     private var notificationUpdaterJob: Job? = null
@@ -135,49 +89,29 @@ class PhantomMessagingService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(DEFAULT_STATUS_TEXT))
         acquireKeepAliveLocks()
-        startNotificationUpdater()
+        // ADR-020 Phase 2: subscribe to TransportManager state for live
+        // foreground-notification text. This replaces the old per-subsystem
+        // updater (one branch per Tor / Xray / direct) — the manager surfaces
+        // a single ManagerState that already abstracts the chain walk.
+        startTransportNotificationUpdater()
     }
 
-    /**
-     * Subscribe to whichever outer-transport service is enabled in this
-     * build (Tor *or* Xray — they are mutually exclusive at compile time)
-     * and rewrite the foreground notification text on state changes. Lets
-     * the user see live bootstrap progress and pinpoint stuck phases
-     * without USB cable + logcat.
-     *
-     * Stage 2C.5: introduced for Tor.
-     * Stage 5E.B.4: extended to Xray (single branch — only one of the two
-     * services is non-null in any given build).
-     */
-    private fun startNotificationUpdater() {
+    private fun startTransportNotificationUpdater() {
         if (notificationUpdaterJob?.isActive == true) return
-        val tor = torService
-        val xray = xrayService
-        if (tor == null && xray == null) return
         notificationUpdaterJob = serviceScope.launch {
-            when {
-                xray != null -> xray.state.collect { state ->
-                    pushNotificationText(
-                        when (state) {
-                            is XrayState.Off -> DEFAULT_STATUS_TEXT
-                            is XrayState.Starting -> "Xray: starting…"
-                            is XrayState.Ready -> "Xray: ready (SOCKS ${state.socksPort})"
-                            is XrayState.Failed -> "Xray: failed — ${state.message.take(80)}"
-                        },
-                    )
-                }
-                tor != null -> tor.state.collect { state ->
-                    pushNotificationText(
-                        when (state) {
-                            is TorState.Off -> DEFAULT_STATUS_TEXT
-                            is TorState.Bootstrapping ->
-                                if (state.percent == 0) "Tor: connecting…"
-                                else "Tor: bootstrapping ${state.percent}%"
-                            is TorState.Ready -> "Tor: ready (SOCKS ${state.socksPort})"
-                            is TorState.Failed -> "Tor: failed — ${state.message.take(80)}"
-                        },
-                    )
-                }
+            val app = application as PhantomApplication
+            runCatching { app.ready.await() }
+            val mgr = app.container.transportManager
+            mgr.state.collect { state ->
+                pushNotificationText(
+                    when (state) {
+                        is ManagerState.Idle -> DEFAULT_STATUS_TEXT
+                        is ManagerState.Probing -> "Connecting via ${state.kind}…"
+                        is ManagerState.Connected -> "Online via ${state.kind}"
+                        is ManagerState.AllFailed ->
+                            "Cannot reach relay (tried ${state.attempts.size}). Tap to retry."
+                    },
+                )
             }
         }
     }
@@ -265,104 +199,29 @@ class PhantomMessagingService : Service() {
                 Log.w(TAG, "No local identity — cannot open WebSocket")
                 return@launch
             }
-            // ADR-016 Stage 2C / ADR-018 Stage 5E.B.4: choose outer transport.
-            //   USE_TOR=true   → embed kmp-tor, route through onion (slow,
-            //                    resilient against everything except an
-            //                    onion-aware DPI).
-            //   USE_XRAY=true  → embed libXray (VLESS+REALITY), funnel WSS
-            //                    through it to clearnet relay.phntm.pro.
-            //                    Built specifically for the TSPU 16 KB
-            //                    curtain that breaks the Tor path on RU
-            //                    mobile carriers.
-            //   neither        → direct WSS, no proxy. Default for clean
-            //                    networks (debug builds + production until
-            //                    Stage 4 ships the runtime mode toggle).
-            // ADR-020 Phase 2 TODO: replace the `when` block below with a
-            // call into TransportManager.connect(strategy = privacyMode.toStrategy())
-            // which walks DIRECT_FIRST / REALITY_FIRST / TOR_FIRST chains and
-            // returns the first transport whose /auth/challenge round-trip
-            // succeeds. The block as written today picks one transport and
-            // aborts the connect on failure — no fallback. Phase 1 (this PR)
-            // dropped only the build-time mutual-exclusion error; runtime
-            // selection is still single-shot.
-            val useTor = BuildConfig.USE_TOR
-            val useXray = BuildConfig.USE_XRAY
-            val socksProxyPort: Int? = when {
-                useTor -> {
-                    val tor = torService
-                    if (tor == null) {
-                        Log.e(TAG, "USE_TOR=true but TorService is null — cannot start, aborting connect")
-                        return@launch
-                    }
-                    Log.i(TAG, "Starting embedded Tor (USE_TOR=true)…")
-                    runCatching { tor.start() }.onFailure {
-                        Log.e(TAG, "TorService.start() failed: ${it.message}", it)
-                    }
-                    try {
-                        val ready = withTimeout(TOR_BOOTSTRAP_TIMEOUT_MS) {
-                            tor.state.first { it is TorState.Ready }
-                        } as TorState.Ready
-                        Log.i(TAG, "Tor bootstrapped (SOCKS port ${ready.socksPort})")
-                        ready.socksPort
-                    } catch (timeout: TimeoutCancellationException) {
-                        Log.e(TAG, "Tor bootstrap timed out after $TOR_BOOTSTRAP_TIMEOUT_MS ms — aborting connect")
-                        return@launch
-                    }
-                }
-                useXray -> {
-                    val xray = xrayService
-                    if (xray == null) {
-                        Log.e(TAG, "USE_XRAY=true but XrayService is null — cannot start, aborting connect")
-                        return@launch
-                    }
-                    Log.i(TAG, "Starting embedded Xray (USE_XRAY=true)…")
-                    // XrayService.start swallows failures into XrayState.Failed
-                    // rather than throwing — we observe the state below to
-                    // distinguish "starting" from "starting and already broke".
-                    runCatching { xray.start() }.onFailure {
-                        Log.e(TAG, "XrayService.start() threw: ${it.message}", it)
-                    }
-                    try {
-                        // Wait for either Ready or Failed — if Failed, fail
-                        // fast instead of timing out a minute later.
-                        val terminal = withTimeout(XRAY_START_TIMEOUT_MS) {
-                            xray.state.first { it is XrayState.Ready || it is XrayState.Failed }
-                        }
-                        when (terminal) {
-                            is XrayState.Ready -> {
-                                Log.i(TAG, "Xray ready (SOCKS port ${terminal.socksPort})")
-                                terminal.socksPort
-                            }
-                            is XrayState.Failed -> {
-                                Log.e(TAG, "Xray failed to start: ${terminal.message} — aborting connect")
-                                return@launch
-                            }
-                            else -> error("first { Ready || Failed } returned $terminal")
-                        }
-                    } catch (timeout: TimeoutCancellationException) {
-                        Log.e(TAG, "Xray start timed out after $XRAY_START_TIMEOUT_MS ms — aborting connect")
-                        return@launch
-                    }
-                }
-                else -> null
-            }
-
-            // RELAY_ONION_URL is consumed only by the Tor branch; both Xray
-            // and direct paths exit via the public WSS endpoint (Xray just
-            // tunnels that exit through its REALITY outer envelope).
+            // ADR-020 Phase 2: outer transport is now selected at runtime by
+            // TransportManager. It walks the strategy chain implied by the
+            // user's PrivacyMode (Standard → DIRECT_FIRST, Private →
+            // REALITY_FIRST, Ghost → TOR_FIRST), starts the matching
+            // subsystem, probes /health through it, and returns the first
+            // ConnectedTransport that reaches the relay. Last-working hint
+            // is recorded so subsequent connects skip dead paths.
+            //
+            // RELAY_ONION_URL is consumed only when the chosen kind is Tor;
+            // Direct and Reality both exit via the public WSS endpoint
+            // (Reality just tunnels that exit through its outer envelope).
             // Guard against a second onStartCommand (e.g. AlarmManager wakeup)
             // arriving while the first connect loop is still establishing.
-            // @Volatile guarantees the write is visible across threads.
             if (connectStarted) {
                 Log.d(TAG, "connect already in progress — duplicate onStartCommand ignored")
                 return@launch
             }
             connectStarted = true
 
-            val relayUrl = if (useTor) BuildConfig.RELAY_ONION_URL else BuildConfig.RELAY_URL
-            // F11 + F26: signed-challenge auth replaces the shared RELAY_TOKEN.
-            // Resolve our Ed25519 signing pubkey here; null means the Alpha 1 →
-            // Alpha 2 backfill hasn't run yet and we must defer the connect.
+            // F11 + F26: signed-challenge auth requires our Ed25519 signing
+            // keypair. Resolve BEFORE asking TransportManager to start an
+            // outer subsystem — no point bootstrapping Tor / Xray if we
+            // cannot present a valid signed challenge once the WSS opens.
             val signingPair = container.identityManager.loadSigningKeyPair()
             if (signingPair == null) {
                 Log.w(
@@ -374,6 +233,22 @@ class PhantomMessagingService : Service() {
             }
             val signingPubKeyHex = signingPair.publicKey.bytes
                 .joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
+
+            val connected: ConnectedTransport = try {
+                container.transportManager.connect()
+            } catch (e: NoTransportReachableException) {
+                Log.e(TAG, "TransportManager: no path reachable — ${e.message}", e)
+                connectStarted = false
+                return@launch
+            } catch (t: Throwable) {
+                Log.e(TAG, "TransportManager.connect threw: ${t::class.simpleName}: ${t.message}", t)
+                connectStarted = false
+                return@launch
+            }
+            val socksProxyPort: Int? = connected.socksPort
+            val relayUrl =
+                if (connected.kind == TransportKind.Tor) BuildConfig.RELAY_ONION_URL
+                else BuildConfig.RELAY_URL
             Log.i(
                 "PhantomRelay",
                 "PhantomMessagingService about to connect: " +
@@ -417,28 +292,18 @@ class PhantomMessagingService : Service() {
         // the device after the user has explicitly stopped the service.
         runCatching { PhantomWakeupReceiver.cancel(applicationContext) }
         releaseKeepAliveLocks()
+        // ADR-020 Phase 2: a single release tears down both Tor and Xray
+        // (whichever the chain walk happened to start). Bounded inline so
+        // a stop-and-restart cannot race two daemons on the same DataDir.
+        runCatching {
+            runBlocking {
+                withTimeout(SUBSYSTEM_STOP_TIMEOUT_MS) {
+                    (application as PhantomApplication).container.transportManager.release()
+                }
+            }
+        }.onFailure { Log.w(TAG, "TransportManager.release failed: ${it.message}") }
         serviceScope.launch {
             runCatching { (application as PhantomApplication).container.transport.disconnect() }
-        }
-        // ADR-016 Stage 2C: tear down the embedded Tor daemon. Inline
-        // runBlocking on the main thread is acceptable in onDestroy because
-        // tor.stop() returns as soon as the kmp-tor StopDaemon action is
-        // accepted (the actual socket teardown happens off-thread); without
-        // this, a stop-and-restart of the service could see overlapping tor
-        // instances racing on the same DataDirectory volume.
-        torService?.let { tor ->
-            runCatching {
-                runBlocking { withTimeout(TOR_STOP_TIMEOUT_MS) { tor.stop() } }
-            }.onFailure { Log.w(TAG, "TorService.stop() failed: ${it.message}") }
-        }
-        // Stage 5E.B.4: tear down the embedded Xray runtime. Same reasoning
-        // as the Tor stop above — libXray's stopXray() returns immediately
-        // once the daemon's stop signal is queued, the actual socket
-        // teardown happens off-thread, so blocking here is bounded.
-        xrayService?.let { xray ->
-            runCatching {
-                runBlocking { withTimeout(XRAY_STOP_TIMEOUT_MS) { xray.stop() } }
-            }.onFailure { Log.w(TAG, "XrayService.stop() failed: ${it.message}") }
         }
         serviceScope.cancel()
     }
@@ -471,36 +336,14 @@ class PhantomMessagingService : Service() {
         private const val TAG = "PhantomMessagingService"
         const val CHANNEL_ID = "phantom_messaging"
         const val NOTIFICATION_ID = 1001
-        // Used for the foreground notification when no Tor state info is
-        // relevant (USE_TOR=false, or USE_TOR=true and Tor is currently Off).
+        // Default text when TransportManager is Idle (pre-connect) or has no
+        // useful state to surface; the notification updater overwrites this
+        // as soon as the manager transitions to Probing / Connected / AllFailed.
         private const val DEFAULT_STATUS_TEXT = "Encrypted connection active"
 
-        // ADR-018 Stage 5C: maximum time we wait for Tor to bootstrap a
-        // circuit before giving up and aborting the connect attempt.
-        // Bumped from 120 s to 600 s (10 min) after Test 11 (2026-05-06)
-        // showed a fresh operator-controlled bridge on Hetzner takes
-        // 5-8 min for first-time bootstrap on a censored network — the
-        // bridge has no cached microdescriptors, no established guard
-        // relations, and no reputation in Tor consensus, so directory
-        // authorities deprioritise it. After 24-48 h of warm-up the
-        // expected number drops to 60-90 s; the timeout is sized for
-        // the cold-start case so the app does not abort prematurely.
-        // Once Stage 5D (multi-bridge load balancing + bridge warming)
-        // ships, this can be tightened back to ~180 s.
-        private const val TOR_BOOTSTRAP_TIMEOUT_MS = 600_000L
-        // Tor stop is fast (the StopDaemon action ack is immediate), so
-        // a much shorter cap is fine in onDestroy.
-        private const val TOR_STOP_TIMEOUT_MS = 5_000L
-
-        // ADR-018 Stage 5E.B.4: Xray's REALITY handshake to the operator
-        // server is one TCP round-trip + one TLS-1.3 round-trip + the
-        // libXray runtime warm-up. Healthy link is sub-second; allow 30 s
-        // for first start on a slow mobile carrier so we don't abort
-        // before the JNI even finishes initialising. If we hit this
-        // timeout, the most likely cause is the operator's REALITY
-        // handshake being actively interfered with — surface as Failed
-        // and move on rather than retrying from inside this coroutine.
-        private const val XRAY_START_TIMEOUT_MS = 30_000L
-        private const val XRAY_STOP_TIMEOUT_MS = 5_000L
+        // ADR-020 Phase 2: outer-subsystem start/stop timeouts moved into
+        // [TransportManager] (PER_ATTEMPT_TIMEOUT_MS = 5 s). The service only
+        // bounds the synchronous tear-down in onDestroy.
+        private const val SUBSYSTEM_STOP_TIMEOUT_MS = 5_000L
     }
 }

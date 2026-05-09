@@ -91,14 +91,33 @@ class TransportManager(
 ordered chain:
 
 1. Build the next transport in the chain.
-2. Start it; wait for SOCKS readiness with `PER_ATTEMPT_TIMEOUT_MS = 5_000` ms.
-3. Probe the relay's `/auth/challenge` endpoint through the resulting SOCKS
-   port (cheapest-possible round trip that proves the path works end-to-end —
-   not just that the local SOCKS listener bound).
+2. Start it; wait for SOCKS readiness with a per-kind budget that allows for
+   cold-start native-init time (split timeout — see §"Per-kind timeouts" below).
+3. Probe the relay's `/health` endpoint through the resulting SOCKS port
+   (cheapest-possible round trip that proves the path works end-to-end —
+   not just that the local SOCKS listener bound). Probe budget is uniform
+   `PROBE_TIMEOUT_MS = 5_000` ms.
 4. Success → record `lastWorkingTransport` + `lastSuccessAt` in
    `LocalConfig`; return the connected transport.
 5. Failure → tear down, log the reason, advance to the next entry in the chain.
 6. Chain exhausted → return `Result.failure(NoTransportReachableException)`.
+
+#### Per-kind timeouts (split prepare vs probe)
+
+The chain walk uses a split timeout: cold subsystem boot needs much longer
+than the steady-state probe. A previous draft used a single 5 s budget
+covering both — that would have aborted the chain on first launch under
+MTS Tecno because libXray cold init takes ~30 s; regression caught in
+review before merge.
+
+| Kind | Prepare budget | Reason |
+|---|---|---|
+| `Direct` | 0 ms (no subsystem) | nothing to start |
+| `Reality` | `REALITY_PREPARE_TIMEOUT_MS = 30_000` ms | libXray gomobile JNI cold init (~30 s) + REALITY handshake; warm restarts return in ms |
+| `Tor` | `TOR_PREPARE_TIMEOUT_MS = 600_000` ms | Briar wrapper + bridge bootstrap on a censored network (5–8 min on a fresh operator-controlled bridge); warm restarts in seconds |
+
+Probe budget is uniform 5 s for every kind — once the path is up, the
+relay's `/health` round-trip is sub-second.
 
 ### Memory of last working transport
 

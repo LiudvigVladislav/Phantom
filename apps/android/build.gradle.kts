@@ -161,32 +161,13 @@ android {
                 "ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws"
             )
             buildConfigField("String", "RELAY_ONION_URL", "\"$relayOnionUrl\"")
-            // Stage 2C kill-switch for Tor transport. Privacy-Mode UI in
-            // Stage 4 will replace this with a runtime preference; until then
-            // a debug build can flip into Tor via local.properties:
-            //   tor.enabled=true
-            // Default false → existing direct-WSS path is unchanged.
-            val torEnabled = localOrEnv("tor.enabled", "USE_TOR", "false").toBoolean()
-            buildConfigField("boolean", "USE_TOR", "$torEnabled")
-            // Stage 5E.B kill-switch for the Xray VLESS+REALITY outer
-            // transport. Mutually exclusive with USE_TOR — both wrap the
-            // same WebSocket but in different ways, and the wiring in
-            // PhantomMessagingService picks one path. Enable via
-            // local.properties:
-            //   xray.enabled=true
-            // The reachable RELAY URL stays clearnet (RELAY_URL); Xray
-            // simply funnels the WSS through its local SOCKS5 listener
-            // and out via VLESS+REALITY to the Hetzner Xray server.
-            val xrayEnabled = localOrEnv("xray.enabled", "USE_XRAY", "false").toBoolean()
-            // ADR-020 Phase 1: compile-time mutual-exclusion dropped. Both
-            // subsystems now coexist in the APK; runtime TransportManager
-            // (Phase 2) picks one or walks them as a fallback chain driven by
-            // the user's Privacy Mode setting. Until Phase 2 ships,
-            // PhantomMessagingService still consumes the single-enabled flag,
-            // so a debug build with both true would do nothing useful — keep
-            // local.properties consistent (one of {tor.enabled, xray.enabled},
-            // not both) for now.
-            buildConfigField("boolean", "USE_XRAY", "$xrayEnabled")
+            // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
+            // Outer transport selection is now a runtime decision driven by
+            // the user's Privacy Mode (TransportManager walks the strategy
+            // chain). Both Tor and Xray subsystems are always present in the
+            // APK; whichever is needed by the current chain walk starts on
+            // demand. Legacy local.properties keys `tor.enabled` /
+            // `xray.enabled` are silently ignored.
         }
         release {
             isMinifyEnabled = true
@@ -203,10 +184,9 @@ android {
                 "RELAY_ONION_URL",
                 "\"ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws\""
             )
-            // Release builds default to direct WSS — the Privacy-Mode UI
-            // (Stage 4) will toggle this at runtime, not at build time.
-            buildConfigField("boolean", "USE_TOR", "false")
-            buildConfigField("boolean", "USE_XRAY", "false")
+            // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
+            // for release as well — outer transport is selected at runtime by
+            // TransportManager + the user's Privacy Mode preference.
 
             // Use the release key if keystores/signing.properties or SIGNING_*
             // env vars supplied valid credentials; otherwise fall back to debug

@@ -46,8 +46,19 @@ import phantom.core.storage.SqlDelightRatchetStateRepository
 import phantom.core.storage.SqlDelightReactionRepository
 import phantom.core.storage.SqlDelightSenderKeyRepository
 import phantom.core.transport.KtorRelayTransport
+import phantom.core.transport.KtorTransportProbe
+import phantom.core.transport.TorService
+import phantom.core.transport.TorServiceConfig
+import phantom.core.transport.TransportManager
+import phantom.core.transport.TransportManagerLog
+import phantom.core.transport.TransportPreferences
+import phantom.core.transport.TransportPreferencesAndroid
 import phantom.core.transport.createHttpClientFactory
 import phantom.core.transport.createRestHttpClient
+import phantom.core.transport.createTorService
+import phantom.core.xray.OperatorXrayConfig
+import phantom.core.xray.XrayService
+import phantom.core.xray.createXrayService
 
 /** Alpha-0 DI container — manual wiring, no framework. */
 class AppContainer(private val context: Context) {
@@ -142,6 +153,61 @@ class AppContainer(private val context: Context) {
 
     // ── Transport ─────────────────────────────────────────────────────────────
     val transport = KtorRelayTransport(createHttpClientFactory())
+
+    // ADR-020 Phase 2: outer-transport subsystems are always-on at construction.
+    // The runtime [transportManager] decides which to start (or both, in the
+    // chain-walk fallback path) based on the user's [PrivacyMode] preference.
+    // Both fields are lazy so the heavy native init (libtor ~25 MB, libXray
+    // ~45 MB) is paid only on first reach into the subsystem.
+    val torService: TorService by lazy {
+        val workDir = context.applicationContext.filesDir.resolve("tor-data")
+        val cacheDir = context.applicationContext.cacheDir.resolve("tor-cache")
+        workDir.mkdirs(); cacheDir.mkdirs()
+        createTorService(
+            config = TorServiceConfig(
+                dataDirectoryPath = workDir.absolutePath,
+                cacheDirectoryPath = cacheDir.absolutePath,
+                useBridges = true,
+            ),
+            platformContext = context.applicationContext,
+        )
+    }
+    val xrayService: XrayService by lazy {
+        val dataDir = context.applicationContext.filesDir.resolve("xray-data")
+        dataDir.mkdirs()
+        createXrayService(OperatorXrayConfig.toConfig(dataDir.absolutePath))
+    }
+
+    /** ADR-020 transport prefs (privacy mode + last-working hint) stored under `phantom_prefs`. */
+    val transportPreferences: TransportPreferences = TransportPreferencesAndroid(
+        prefs = context.applicationContext
+            .getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE),
+    )
+
+    /**
+     * ADR-020 adaptive transport selector. Walks the strategy chain implied by
+     * [TransportPreferences.privacyMode], starts the matching subsystem, probes
+     * the relay's `/health` through it, and returns the first reachable
+     * [phantom.core.transport.ConnectedTransport]. PhantomMessagingService
+     * delegates to this on every connect.
+     */
+    val transportManager: TransportManager by lazy {
+        val healthUrl = phantom.android.BuildConfig.RELAY_URL
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .removeSuffix("/ws")
+            .removeSuffix("/") + "/health"
+        TransportManager(
+            torServiceProvider = { torService },
+            xrayServiceProvider = { xrayService },
+            preferences = transportPreferences,
+            probe = KtorTransportProbe(healthUrl = healthUrl),
+            log = object : TransportManagerLog {
+                override fun info(msg: String) { android.util.Log.i("TransportManager", msg) }
+                override fun warn(msg: String) { android.util.Log.w("TransportManager", msg) }
+            },
+        )
+    }
 
     // ── Messaging (initialised after identity is loaded) ──────────────────────
     // Nullable until onboarding completes and we have a real identity.
