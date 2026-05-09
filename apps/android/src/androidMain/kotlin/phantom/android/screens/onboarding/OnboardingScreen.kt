@@ -56,6 +56,7 @@ import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+import phantom.core.transport.PrivacyMode
 
 /**
  * OnboardingScreen — Design/PHANTOM_FULL_COMPOSE.md §09 (3 steps).
@@ -141,6 +142,10 @@ private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
                         if (!loading) {
                             scope.launch {
                                 loading = true
+                                // ADR-020 Phase 3: persist the chosen Privacy Mode so
+                                // TransportManager picks the matching strategy on the
+                                // first connect after onboarding.
+                                container.transportPreferences.privacyMode = privacyMode
                                 runOnboarding(container, username, finalize) {
                                     error = it; loading = false
                                 }
@@ -450,8 +455,9 @@ private fun IdentityKeyStep(
 }
 
 // ── Step 3 · Privacy Mode ───────────────────────────────────────────────────
-
-private enum class PrivacyMode { Standard, Private, Ghost }
+// Uses the canonical phantom.core.transport.PrivacyMode (imported above) so
+// the choice the user makes here drives the same TransportManager strategy
+// the Settings selector toggles (ADR-020 Phase 3).
 
 @Composable
 private fun PrivacyModeStep(

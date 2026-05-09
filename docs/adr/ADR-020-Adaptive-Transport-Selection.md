@@ -1,7 +1,10 @@
 # ADR-020: Adaptive Transport Selection
 
-**Status:** Accepted (Phase 1: this PR drops the compile-time mutex; Phase 2 in
-follow-up PR ships the runtime TransportManager + Privacy Mode wiring)
+**Status:** Accepted (all three phases shipped: Phase 1 #77 dropped the
+compile-time mutex; Phase 2 #80 added the `TransportManager` runtime selector
+with per-kind cold-start timeouts; Phase 3 wires the Settings UI selector +
+Ghost confirm dialog + mode-switch graceful reconnect; behaviour documented
+in [`PRIVACY_MODE_BEHAVIOR.md`](../PRIVACY_MODE_BEHAVIOR.md))
 **Date:** 2026-05-09
 **Deciders:** Vladislav Liudvig (solo author)
 **Related:** [ADR-016](ADR-016-tor-unified-push-hybrid-transport.md) (Tor +
