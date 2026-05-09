@@ -65,7 +65,9 @@ Larger features that wait for the Alpha-2 release window to close.
 
 | Item | Notes |
 |---|---|
-| ADR-015 — Pluggable transports beyond REALITY + Tor (obfs4, Snowflake, fronting) | Driven by Stage 5G Phase 1 outcome (D-16) |
+| ADR-015 — Pluggable transports beyond REALITY + Tor (obfs4, Snowflake, fronting) | **Promoted by [D-20](DECISIONS_LOG.md#d-20)** — Stage 5G Phase 1 obfs4 bridge succeeded on Tecno МТС. Phase 2 = reliability characterisation (multi-run, control, round-trip). Phase 3 = multi-bridge fan-out + obfs4-only Ghost path |
+| Mode-switch clears `lastWorkingTransport` hint in `setPrivacyMode` | Bug surfaced 2026-05-09: switching Ghost → Standard with hint=Tor caused the new chain walk to try Tor first in Standard too. Two-line fix in `AppContainer.setPrivacyMode` (set hint + lastSuccessAt to null after the mode write). |
+| `ChatList` "Connecting…" header reads `transport.state` not `TransportManager.state` | Surfaced 2026-05-09: notification correctly showed `Online via Tor · Ghost` but ChatList header stayed `Connecting…` for ~5 min until WS upgrade through Tor finished. Pick one source of truth or rename the second indicator |
 | ADR-020 / Phase-3-follow-on — Privacy Mode mid-conversation network change polish | Reconnecting state visible in UI when chain re-walks during a network handover |
 | ADR-021 — Multi-server REALITY fan-out | Reduce single-Hetzner-IP correlation risk; mentioned in ADR-019 Phase 2 |
 | ADR-022 — iOS XCFramework export of shared core | Stage gate for iOS port; mentioned in ADR-019 Phase 2 |

@@ -63,29 +63,40 @@ exactly where the curtain catches us if it does.
 
 ## Result template — fill in after test
 
-### Tecno МТС (RU, no VPN)
+### Tecno МТС (RU, no VPN) — 2026-05-09
 
 | Run | Bootstrap progression | Final state | Time to final | Notes |
 |---|---|---|---|---|
-| 1 | _e.g. 0% → 25% → 50% → 100%_ | _Online via Tor · Ghost_ | _45 s_ | _first cold start, includes obfs4proxy spawn_ |
-| 2 | | | | |
-| 3 | | | | |
-| 4 | | | | |
-| 5 | | | | |
+| 1 | bootstrap completed (no logcat capture — phone not on USB) | **Online via Tor · Ghost** | ~5 min | First cold start; obfs4proxy via FlokiNET bridge bootstrapped successfully through TSPU. Foreground notification reached `Online via Tor · Ghost`. UI on ChatList showed `Connecting…` for ~5 min before clearing — see "Known follow-up" below. |
+
+**Single-run result captured manually by Vladislav (no USB logcat available
+during this test). Reproducibility runs (2-5) deferred — the success of
+run 1 is the headline finding; reliability characterisation lives in
+Stage 5G Phase 2.**
 
 ### Pixel emulator (EU, clean network)
 
-| Run | Bootstrap progression | Final state | Time to final | Notes |
-|---|---|---|---|---|
-| 1 | | | | |
-| 2 | | | | |
+Not exercised in this round — Ghost-mode test on the Tecno was the
+critical-path validation. Control-network confirmation will land with
+the Stage 5G Phase 2 reliability matrix.
 
-### Round-trip text (after Tecno success)
+### Round-trip text
 
-| Direction | Result |
-|---|---|
-| Tecno → emulator | _e.g. delivered in 1.2 s_ |
-| Emulator → Tecno | |
+Not tested in this run. Voice-message + text round-trip on Ghost mode
+will be exercised in Stage 5G Phase 2 alongside the multi-run
+reliability characterisation.
+
+### Known follow-up (not blocking the decision gate)
+
+`ChatList` header rendered `Connecting…` for ~5 minutes after the
+foreground notification already showed `Online via Tor · Ghost`. The
+notification updater reads `TransportManager.state` (which transitions
+to `Connected` as soon as the `/health` probe succeeds), but the
+`ChatList` header reads `transport.state` — the WebSocket upgrade
+through the Tor circuit is the slow step that drives that flag. Both
+are correct in isolation; they just disagree on what "online" means.
+Tracked in [`TECHNICAL_BACKLOG.md`](../../project/TECHNICAL_BACKLOG.md)
+as a Stage 5G Phase 2 polish item.
 
 ---
 
