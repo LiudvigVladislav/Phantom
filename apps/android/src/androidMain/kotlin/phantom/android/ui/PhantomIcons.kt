@@ -745,11 +745,33 @@ fun PhIconReplyAll(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp
     )
 }
 
-// message-circle — speech bubble
+// message-circle — round speech bubble (Lucide MessageCircle).
+// Drawn via Canvas (circle + short tail) instead of PathParser-fed
+// SVG arcs, because the upstream Lucide path renders as overlapping
+// rings at 16dp through our parser. Clean stroke at any size now.
 @Composable
 fun PhIconMessageCircle(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Bubble — main round body, sized to leave room for the bottom-left tail.
+        drawCircle(color, radius = 8.5f * s, center = Offset(12.5f * s, 11f * s), style = st)
+        // Tail — short stroke from the bubble's bottom-left edge down to the speech tip.
+        drawPath(
+            parsePath("M6 17.5L3 21", s),
+            color, style = st,
+        )
+    }
+}
+
+// Lucide Send — paper plane. Used wherever the action literally sends
+// something (compose, submit). Kept available even though the Settings
+// "Send Feedback" row now uses the speech-bubble PhIconMessageCircle
+// per Vladislav's design preference.
+@Composable
+fun PhIconSend(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
     PhStrokePath(
-        "M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z",
+        "M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z",
         color, modifier.then(Modifier.size(size)),
     )
 }
