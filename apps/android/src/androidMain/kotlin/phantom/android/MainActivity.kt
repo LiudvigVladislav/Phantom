@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.util.Base64
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -321,6 +322,19 @@ private fun PhantomApp(
         }
     }
 
+    // System-back / predictive-back gesture handler — the per-screen
+    // onBack lambdas only fire when the user taps the in-UI back arrow.
+    // Without this, a hardware back press / left-edge swipe drops the
+    // user out of the app instead of navigating up the screen tree.
+    // The parent-of map mirrors the literal `onBack` wiring in the
+    // when block below; top-level destinations (ChatList / Calls /
+    // Nearby / Settings) return null so Android's default behaviour
+    // (move task to back / exit) kicks in.
+    val parent = parentScreenOf(currentScreen)
+    BackHandler(enabled = parent != null) {
+        currentScreen = parent
+    }
+
     when (val screen = currentScreen) {
         null -> {
             // Initial frame before LaunchedEffect resolves the start
@@ -550,4 +564,52 @@ private fun PhantomApp(
             }
         }
     }
+}
+
+/**
+ * Maps each [Screen] to the destination its in-UI back arrow / system
+ * back gesture should pop to. Returns `null` for screens where Android's
+ * default behaviour (move task to back / exit) is desired:
+ *
+ *  - Top-level destinations (ChatList / Calls / Nearby / Settings) —
+ *    pressing back exits the app, matching mainstream Android apps.
+ *  - Onboarding / Migration / Splash — modal flows that own their own
+ *    back semantics; system back during onboarding shouldn't tear it
+ *    down mid-key-generation.
+ *  - IncomingCall / ActiveCall — call screens have explicit hangup /
+ *    accept actions and shouldn't be dismissed by accidental gesture.
+ *
+ * The mapping mirrors the literal `onBack` lambdas wired in the main
+ * `when` block so swipe-back behaviour matches the in-UI back button.
+ */
+private fun parentScreenOf(screen: Screen?): Screen? = when (screen) {
+    null,
+    Screen.Onboarding,
+    Screen.Migration,
+    Screen.ChatList,
+    Screen.Calls,
+    Screen.Nearby,
+    Screen.Settings -> null
+
+    Screen.Premium -> Screen.Settings
+    Screen.PrivacyModeDetail -> Screen.Settings
+    Screen.AddContact -> Screen.ChatList
+    Screen.Profile -> Screen.ChatList
+    Screen.MessageRequests -> Screen.ChatList
+    Screen.QrScan -> Screen.ChatList
+    Screen.SavedMessages -> Screen.ChatList
+    Screen.Archive -> Screen.ChatList
+    Screen.CreateGroup -> Screen.ChatList
+    Screen.CreateChannel -> Screen.ChatList
+
+    is Screen.Chat -> Screen.ChatList
+    is Screen.GroupChat -> Screen.ChatList
+    is Screen.ContactProfile -> Screen.Chat(screen.conversationId, screen.theirUsername)
+    is Screen.Verify -> Screen.ContactProfile(screen.conversationId, screen.theirUsername)
+
+    // Calls screens own their lifecycle — declining via the on-screen
+    // controls is the supported path; back gesture is intentionally
+    // a no-op so a stray swipe doesn't drop the user out of the call.
+    is Screen.ActiveCall,
+    is Screen.IncomingCall -> null
 }
