@@ -136,6 +136,7 @@ fun ChatListScreen(
             PhantomTopBar(
                 userName = userName,
                 title = "PHANTOM",
+                centerTitle = true,
                 onProfile = onProfile,
                 onAddContact = { showAddDialog = true },
                 onScanQr = onScanQr,
@@ -514,12 +515,33 @@ private fun NotesRow(onClick: () -> Unit) {
             PhIconBookmark(color = TextDim, size = 18.dp)
         }
         Spacer(Modifier.width(14.dp))
+        // FULL_COMPOSE §03 mobile mock copy: title "Personal notes & saved"
+        // (the user-facing label), subtitle "Your private space" (the
+        // helper text). Right-aligned mono "PINNED" tag instead of a
+        // weekday timestamp — Notes is the canonical pinned row, so the
+        // tag reinforces the role rather than implying recency.
         Column(modifier = Modifier.weight(1f)) {
-            Text("Notes", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = "Personal notes & saved",
+                color = TextPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.05).sp,
+            )
             Spacer(Modifier.height(3.dp))
-            Text("Personal notes & saved", color = TextDim, fontSize = 13.sp)
+            Text(
+                text = "Your private space",
+                color = TextDim.copy(alpha = 0.65f),
+                fontSize = 13.sp,
+            )
         }
-        Text("Wed", color = TextDim, fontSize = 11.sp)
+        Text(
+            text = "PINNED",
+            color = TextDim.copy(alpha = 0.5f),
+            fontSize = 9.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 1.4.sp,
+        )
     }
 }
 
