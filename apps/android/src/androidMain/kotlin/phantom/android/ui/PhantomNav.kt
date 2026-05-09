@@ -444,6 +444,78 @@ fun SettingsRowItem(
     }
 }
 
+/**
+ * Toggle row for Settings — same anatomy as [SettingsRowItem] but trailing
+ * is a Material3 Switch instead of value text + chevron. Carries an
+ * optional `proBadge` flag that renders the FULL_COMPOSE PRO chip inline
+ * with the label (Pro-only privacy controls like Screenshot Protection).
+ */
+@Composable
+fun SettingsToggleRow(
+    icon: @Composable () -> Unit,
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    proBadge: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(
+            modifier = Modifier.size(20.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            icon()
+        }
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = label,
+                color = TextPrimary,
+                fontSize = 15.sp,
+            )
+            if (proBadge) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(CyanAccent.copy(alpha = 0.10f))
+                        .border(1.dp, CyanAccent.copy(alpha = 0.30f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = "PRO",
+                        color = CyanAccent,
+                        fontSize = 8.sp,
+                        fontFamily = PhantomFontMono,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 1.4.sp,
+                    )
+                }
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = phantom.android.ui.theme.BgDeep,
+                checkedTrackColor = CyanAccent,
+                checkedBorderColor = CyanAccent,
+                uncheckedThumbColor = TextDim,
+                uncheckedTrackColor = phantom.android.ui.theme.PhantomTokens.Colors.SurfaceHover,
+                uncheckedBorderColor = phantom.android.ui.theme.BorderSubtle,
+            ),
+        )
+    }
+}
+
 @Composable
 fun PrivacySettingsRow() {
     Row(
