@@ -14,10 +14,15 @@ kotlin {
         commonMain.dependencies {
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
+            implementation(libs.kotlinx.datetime)
             implementation(libs.ktor.client.core)
             implementation(libs.ktor.client.websockets)
             implementation(libs.ktor.client.content.negotiation)
             implementation(libs.ktor.serialization.json)
+            // ADR-020 Phase 2: TransportManager imports XrayService directly
+            // (commonMain interface) so the chain walk drives REALITY the same
+            // way it drives Tor.
+            implementation(project(":shared:core:xray"))
         }
         androidMain.dependencies {
             implementation(libs.ktor.client.okhttp)
