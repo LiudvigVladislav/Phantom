@@ -41,7 +41,7 @@ authority), demo video (Vladislav), funding-application paperwork.
 |---|---|---|---|---|
 | 0 | Persistence layer | `feat/project-persistence-docs` | 30 min | ✅ merged (#82) |
 | 1 | Bug #2 + Bug #3 fix (notification + retry) | `feat/notification-and-reset-fixes` | ~1 h | ✅ merged (#83) |
-| 2 | Stage 5G Phase 1 experiment (FlokiNET reuse + obfs4) | `feat/stage-5g-phase-1-bridges` | 2-3 days | 🟡 client patch ready, awaiting Vladislav VPS deploy + Test 13.1 |
+| 2 | Stage 5G Phase 1 experiment (FlokiNET reuse + obfs4) | `feat/stage-5g-phase-1-bridges` + `feat/obfs4-bridge-line-populated` | 2-3 days | 🟡 server deployed 2026-05-09, bridge line populated; awaiting Test 13.1 cross-device |
 | 3 | Settings rewrite per FULL_COMPOSE §06 | `feat/settings-screen-rewrite` | 4-6 h | ⬜ |
 | 4 | Other-screen UI audit + rewrite (multiple PRs) | per screen | 3-5 days | ⬜ |
 | 5 | Operational: keystore backup + tag | n/a | <1 h | ⬜ |
