@@ -452,6 +452,17 @@ private fun PhantomApp(
             container = container,
             onBack = { currentScreen = Screen.Chat(screen.conversationId, screen.theirUsername) },
             onDeleteConversation = { currentScreen = Screen.ChatList },
+            onVerify = {
+                currentScreen = Screen.Verify(screen.conversationId, screen.theirUsername)
+            },
+        )
+        is Screen.Verify -> phantom.android.screens.verify.VerifyScreen(
+            container = container,
+            conversationId = screen.conversationId,
+            theirUsername = screen.theirUsername,
+            onBack = {
+                currentScreen = Screen.ContactProfile(screen.conversationId, screen.theirUsername)
+            },
         )
         is Screen.SavedMessages -> SavedMessagesScreen(
             container = container,
