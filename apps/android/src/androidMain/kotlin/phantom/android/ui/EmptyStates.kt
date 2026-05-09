@@ -84,16 +84,19 @@ fun EmptyState(
             )
             if (ctaLabel != null) {
                 Spacer(Modifier.height(24.dp))
+                // FULL_COMPOSE §13: ghost CTA is a full pill, matching the
+                // pill-button language now shared across Onboarding,
+                // AddContact, Premium and Settings polishing PRs.
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
+                        .clip(RoundedCornerShape(50))
                         .border(
                             1.dp,
                             PhantomTokens.Colors.Cyan.copy(alpha = 0.30f),
-                            RoundedCornerShape(8.dp),
+                            RoundedCornerShape(50),
                         )
                         .clickable(onClick = onCta)
-                        .padding(horizontal = 20.dp, vertical = 12.dp),
+                        .padding(horizontal = 22.dp, vertical = 12.dp),
                 ) {
                     Text(
                         text = ctaLabel,

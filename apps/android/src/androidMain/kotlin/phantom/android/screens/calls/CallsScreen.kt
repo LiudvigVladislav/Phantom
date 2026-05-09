@@ -209,38 +209,6 @@ fun CallsScreen(
 }
 
 @Composable
-private fun ComingSoonBanner() {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 24.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Surface)
-            .border(1.dp, CyanAccent.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
-            .padding(horizontal = 20.dp, vertical = 24.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            PhIconPhone(color = CyanAccent.copy(alpha = 0.5f), size = 36.dp)
-            Text(
-                text = "Call history — coming soon",
-                color = TextPrimary,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-            )
-            Text(
-                text = "Stay tuned for updates",
-                color = TextDim,
-                fontSize = 13.sp,
-            )
-        }
-    }
-}
-
-@Composable
 private fun SectionHeader(text: String) {
     Text(
         text = text.uppercase(),
@@ -378,11 +346,14 @@ private fun ContactCallRow(conv: ConversationEntity, onCall: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 10.dp),
+            .padding(horizontal = 20.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        GradientAvatar(name = conv.theirUsername, size = 44.dp)
+        // FULL_COMPOSE §08 Calls row: avatar 40dp (was 44dp). The 68dp
+        // row height is composed of 14dp vertical padding × 2 + 40dp
+        // avatar.
+        GradientAvatar(name = conv.theirUsername, size = 40.dp)
 
         Text(
             text = conv.theirUsername,
