@@ -277,9 +277,14 @@ class PhantomMessagingService : Service() {
             //   neither        → direct WSS, no proxy. Default for clean
             //                    networks (debug builds + production until
             //                    Stage 4 ships the runtime mode toggle).
-            // The two flags are mutually exclusive at compile time
-            // (build.gradle.kts errors if both are true), so this `when`
-            // is exhaustive without arbitration logic.
+            // ADR-020 Phase 2 TODO: replace the `when` block below with a
+            // call into TransportManager.connect(strategy = privacyMode.toStrategy())
+            // which walks DIRECT_FIRST / REALITY_FIRST / TOR_FIRST chains and
+            // returns the first transport whose /auth/challenge round-trip
+            // succeeds. The block as written today picks one transport and
+            // aborts the connect on failure — no fallback. Phase 1 (this PR)
+            // dropped only the build-time mutual-exclusion error; runtime
+            // selection is still single-shot.
             val useTor = BuildConfig.USE_TOR
             val useXray = BuildConfig.USE_XRAY
             val socksProxyPort: Int? = when {

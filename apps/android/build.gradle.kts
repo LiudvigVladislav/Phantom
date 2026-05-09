@@ -178,12 +178,14 @@ android {
             // simply funnels the WSS through its local SOCKS5 listener
             // and out via VLESS+REALITY to the Hetzner Xray server.
             val xrayEnabled = localOrEnv("xray.enabled", "USE_XRAY", "false").toBoolean()
-            if (torEnabled && xrayEnabled) {
-                error(
-                    "USE_TOR and USE_XRAY are mutually exclusive: both define the outer " +
-                        "transport for the WebSocket. Set exactly one to true in local.properties.",
-                )
-            }
+            // ADR-020 Phase 1: compile-time mutual-exclusion dropped. Both
+            // subsystems now coexist in the APK; runtime TransportManager
+            // (Phase 2) picks one or walks them as a fallback chain driven by
+            // the user's Privacy Mode setting. Until Phase 2 ships,
+            // PhantomMessagingService still consumes the single-enabled flag,
+            // so a debug build with both true would do nothing useful — keep
+            // local.properties consistent (one of {tor.enabled, xray.enabled},
+            // not both) for now.
             buildConfigField("boolean", "USE_XRAY", "$xrayEnabled")
         }
         release {
