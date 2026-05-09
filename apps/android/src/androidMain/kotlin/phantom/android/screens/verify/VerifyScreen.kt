@@ -307,21 +307,11 @@ fun VerifyScreen(
                     }
                 }
 
-                VerifyState.Verified -> Button(
+                VerifyState.Verified -> phantom.android.ui.PhantomPrimaryButton(
+                    label = "Back to chat",
                     onClick = onBack,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = CyanAccent,
-                        contentColor = BgDeep,
-                    ),
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                ) {
-                    Text(
-                        "Back to chat",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                }
+                )
 
                 VerifyState.Mismatch -> Row(
                     modifier = Modifier.fillMaxWidth(),
