@@ -461,7 +461,10 @@ private fun ProfileCard(
         modifier = Modifier
             .fillMaxWidth()
             .padding(14.dp),
-        color = Surface,
+        // FULL_COMPOSE §07: identity card sits on the deeper surface so it
+        // separates from the page Surface. The earlier matched-Surface bg
+        // collapsed the visual hierarchy of the identity zone.
+        color = BgDeep,
         shape = RoundedCornerShape(16.dp),
     ) {
         Column(
@@ -470,9 +473,11 @@ private fun ProfileCard(
                 .padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 18.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // Avatar with badge
+            // Avatar with badge — 80dp per FULL_COMPOSE §07 (Phase 2 React
+            // ProfileScreen avatar is 80px). The earlier 96dp dominated the
+            // identity block and broke the size-relationship to the name.
             Box(
-                modifier = Modifier.size(96.dp),
+                modifier = Modifier.size(80.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 if (avatarBitmap != null) {
@@ -481,14 +486,14 @@ private fun ProfileCard(
                         contentDescription = "Profile photo",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
-                            .size(96.dp)
+                            .size(80.dp)
                             .clip(CircleShape),
                     )
                 } else {
                     // Gradient avatar box
                     Box(
                         modifier = Modifier
-                            .size(96.dp)
+                            .size(80.dp)
                             .clip(CircleShape)
                             .background(avatarBrush),
                         contentAlignment = Alignment.Center,
@@ -499,20 +504,21 @@ private fun ProfileCard(
                         Text(
                             text = initial,
                             color = Color.White,
-                            fontSize = 40.sp,
+                            fontSize = 34.sp,
                             fontWeight = FontWeight.Light,
                         )
                     }
                 }
 
-                // Camera badge — bottom-right
+                // Camera badge — bottom-right (border now matches the
+                // BgDeep card it sits on so the cut-out reads cleanly)
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .size(30.dp)
+                        .size(28.dp)
                         .clip(CircleShape)
                         .background(CyanAccent)
-                        .border(3.dp, Surface, CircleShape)
+                        .border(3.dp, BgDeep, CircleShape)
                         .clickable { onBadgeTap() },
                     contentAlignment = Alignment.Center,
                 ) {
@@ -1010,28 +1016,33 @@ private fun DeleteSection(onDeleteTap: () -> Unit) {
             .padding(start = 14.dp, end = 14.dp, top = 14.dp, bottom = 28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Box(
+        // FULL_COMPOSE §07: delete is a de-emphasized text link, not a
+        // bordered destructive button. The earlier outlined-Danger box read
+        // as a primary destructive CTA — violates the "architecture of
+        // restraint" doctrine. Hairline divider + low-opacity danger label
+        // keeps the option findable without visually shouting.
+        HorizontalDivider(
+            modifier = Modifier.fillMaxWidth(),
+            color = BorderSubtle,
+            thickness = 1.dp,
+        )
+        Spacer(Modifier.height(18.dp))
+        Text(
+            text = "Delete account",
+            color = Danger.copy(alpha = 0.55f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Normal,
             modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .border(1.dp, Danger.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
-                .clickable { onDeleteTap() },
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                text = "Delete Account",
-                color = Danger,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-            )
-        }
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { onDeleteTap() }
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        )
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(8.dp))
 
         Text(
-            text = "Destructive action. Keys deleted forever.\nYour contacts will see \"Account deleted by user\".",
-            color = TextDim,
+            text = "Destructive. Keys deleted forever. Contacts see “Account deleted by user”.",
+            color = TextDim.copy(alpha = 0.7f),
             fontSize = 11.sp,
             textAlign = TextAlign.Center,
             lineHeight = 16.sp,
