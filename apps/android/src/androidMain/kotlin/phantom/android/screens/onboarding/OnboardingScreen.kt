@@ -165,11 +165,14 @@ private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
         ) {
             repeat(3) { i ->
                 val active = pagerState.currentPage == i
+                // FULL_COMPOSE §09: bars are 2px tall, active 22px / inactive
+                // 14px wide. Earlier 3dp/28dp/16dp values felt heavier than
+                // the React mock's restrained step indicator.
                 Box(
                     modifier = Modifier
-                        .height(3.dp)
-                        .width(if (active) 28.dp else 16.dp)
-                        .clip(RoundedCornerShape(2.dp))
+                        .height(2.dp)
+                        .width(if (active) 22.dp else 14.dp)
+                        .clip(RoundedCornerShape(50))
                         .background(
                             if (active) CyanAccent
                             else BorderSubtle,
@@ -192,11 +195,13 @@ private fun WelcomeStep(onContinue: () -> Unit) {
     ) {
         Spacer(Modifier.weight(0.55f))
 
-        // PHANTOM logo — phantom_logo.png used AS-IS, height 60dp, no clip.
+        // PHANTOM logo — phantom_logo.png used AS-IS. Sized to 60dp per
+        // FULL_COMPOSE §09 OnboardingScreen reference (Phase 2 React mock
+        // uses height: 60px). The earlier 72dp value crowded the wordmark.
         Image(
             painter = painterResource(R.drawable.phantom_logo),
             contentDescription = "PHANTOM",
-            modifier = Modifier.height(72.dp),
+            modifier = Modifier.height(60.dp),
         )
 
         Spacer(Modifier.height(20.dp))
@@ -694,7 +699,11 @@ private fun IntroCta(
             disabledContainerColor = CyanAccent.copy(alpha = 0.18f),
             disabledContentColor = TextDim.copy(alpha = 0.5f),
         ),
-        shape = RoundedCornerShape(8.dp),
+        // FULL_COMPOSE §09: primary CTAs are full pills (border-radius
+        // 9999px in the React mock). The earlier 8dp rounded-rect breaks
+        // PHANTOM's pill-button language used across Onboarding, AddContact
+        // and Settings.
+        shape = RoundedCornerShape(50),
     ) {
         if (showLoader) {
             CircularProgressIndicator(
