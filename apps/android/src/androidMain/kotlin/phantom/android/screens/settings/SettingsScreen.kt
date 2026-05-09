@@ -10,6 +10,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -19,7 +20,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -27,12 +27,33 @@ import kotlinx.coroutines.launch
 import phantom.android.BuildConfig
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
-import phantom.android.service.PhantomMessagingService
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
-import phantom.core.transport.PrivacyMode
 
+/**
+ * Settings screen — rewritten 2026-05-09 to match
+ * `Design/PHANTOM_FULL_COMPOSE.md` §06 +
+ * `Design/src/app/components/phase2/SettingsScreen.tsx`.
+ *
+ * Structure (top → bottom):
+ *   1. Profile card (avatar + name + tier badge + chevron → ProfileScreen)
+ *   2. Account            — Profile, Username, Plan
+ *   3. Privacy & Security — Encryption Protocol, Privacy Mode, Read Receipts,
+ *                           Last Seen, Screenshot Protection
+ *   4. Notifications      — Message Alerts, Call Alerts, Sound
+ *   5. Appearance         — Theme (Locked), Language
+ *   6. Advanced           — Storage & Cache, Export Data
+ *   7. About              — Version, Send Feedback, Privacy Policy
+ *
+ * Per [`DECISIONS_LOG`](../../docs/project/DECISIONS_LOG.md):
+ *   - D-17: Developer Mode toggle removed (dead pref).
+ *   - D-18: Pro infrastructure ships full UI in Alpha 2 (badges visible),
+ *           payment integration deferred to Beta. Pro-gated controls
+ *           remain functionally OPEN for testers.
+ *   - ADR-020 Phase 3: Privacy Mode is a row with chevron → opens
+ *     [`PrivacyModeDetailScreen`] (the pill picker + Ghost confirm).
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
@@ -47,44 +68,29 @@ fun SettingsScreen(
     val userName = identity?.username ?: ""
     val selfAvatarBitmap by container.selfAvatar.collectAsState()
     val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
-    // ADR-020 Phase 3: Privacy Mode is the canonical typed enum from
-    // phantom.core.transport. The legacy `privacy_mode` String preference
-    // (read by ChatScreen for read-receipt suppression) is mirrored from
-    // the typed value via container.setPrivacyMode.
-    var privacyMode by remember { mutableStateOf(container.transportPreferences.privacyMode) }
-    var showBackupSheet by remember { mutableStateOf(false) }
-    // First-time confirmation when the user picks Ghost — must explicitly
-    // accept the "no automatic fallback out of Tor" trade-off.
-    var pendingGhost by remember { mutableStateOf(false) }
 
-    if (pendingGhost) {
-        AlertDialog(
-            onDismissRequest = { pendingGhost = false },
-            containerColor = Surface,
-            title = { Text("Switch to Ghost mode?", color = TextPrimary) },
-            text = {
-                Text(
-                    "Ghost routes every message through Tor only. If Tor cannot " +
-                        "bootstrap on the current network the app will show " +
-                        "\"Cannot reach relay\" instead of silently falling back to " +
-                        "REALITY or direct WSS — that silent downgrade would defeat " +
-                        "the privacy promise you are opting into.",
-                    color = TextDim, fontSize = 13.sp, lineHeight = 18.sp,
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    pendingGhost = false
-                    privacyMode = PrivacyMode.Ghost
-                    scope.launch { applyPrivacyMode(container, context, PrivacyMode.Ghost) }
-                }) { Text("Switch", color = CyanAccent) }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingGhost = false }) {
-                    Text("Cancel", color = TextDim)
-                }
-            },
-        )
+    // Toggle state — backed by `phantom_prefs` so the value survives the
+    // Settings round-trip (re-entry sees the last toggle position).
+    val prefs = remember {
+        context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
+    }
+    var readReceipts by remember { mutableStateOf(prefs.getBoolean("read_receipts", true)) }
+    var screenshotProtection by remember { mutableStateOf(prefs.getBoolean("screenshot_protection", false)) }
+    var messageAlerts by remember { mutableStateOf(prefs.getBoolean("message_alerts", true)) }
+    var callAlerts by remember { mutableStateOf(prefs.getBoolean("call_alerts", true)) }
+
+    // Privacy Mode value displayed in the row (no inline picker — that's a
+    // separate detail screen now per ADR-020 Phase 3 spec).
+    val privacyModeLabel = remember(identity) {
+        container.transportPreferences.privacyMode.name
+    }
+
+    // Storage & Cache — sum of cacheDir + databases dir, recomputed on entry.
+    var cacheSize by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            cacheSize = formatByteSize(computeCacheSizeBytes(context))
+        }
     }
 
     fun showComingSoon() {
@@ -99,7 +105,7 @@ fun SettingsScreen(
         snackbarHost = {
             SnackbarHost(snackbarHostState) { data ->
                 Snackbar(
-                    modifier = androidx.compose.ui.Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
                     containerColor = Surface,
                     contentColor = TextPrimary,
                     shape = RoundedCornerShape(12.dp),
@@ -108,14 +114,12 @@ fun SettingsScreen(
                             Text("OK", color = CyanAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     },
-                ) {
-                    Text(data.visuals.message, fontSize = 13.sp)
-                }
+                ) { Text(data.visuals.message, fontSize = 13.sp) }
             }
         },
         topBar = {
-            // Design Brief v3 §11.4: Settings has its own minimal header — no
-            // PHANTOM wordmark, just "Settings" set in Geist Medium 20pt.
+            // Settings header per Design Brief v3 §11.4 — Geist Medium 20pt,
+            // 64pt header height, single divider underneath.
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -139,669 +143,399 @@ fun SettingsScreen(
             }
         },
     ) { padding ->
-        Box(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
         ) {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(top = 6.dp, bottom = 110.dp),
-            ) {
-                // Profile card — PHANTOM_FULL_COMPOSE §06: avatar 56dp +
-                // display name Geist 17px + @handle mono 12px tertiary +
-                // inline FREE/PLUS/PRO tier badge. Tap → full Profile.
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                start = PhantomTokens.Spacing.comfortable,
-                                end = PhantomTokens.Spacing.comfortable,
-                                top = PhantomTokens.Spacing.tight,
-                                bottom = PhantomTokens.Spacing.baseUnit,
-                            )
-                            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
-                            .background(PhantomTokens.Colors.SurfaceElevated)
-                            .border(
-                                1.dp,
-                                BorderSubtle,
-                                RoundedCornerShape(PhantomTokens.Radius.md),
-                            )
-                            .clickable(onClick = onProfile)
-                            .padding(
-                                horizontal = PhantomTokens.Spacing.comfortable,
-                                vertical = PhantomTokens.Spacing.tight,
-                            ),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        GradientAvatar(
-                            name = userName.ifEmpty { "?" },
-                            size = 56.dp,
-                            imageBitmap = selfAvatarImage,
-                        )
-                        Spacer(Modifier.width(PhantomTokens.Spacing.comfortable))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = if (userName.isNotEmpty()) userName else "Loading…",
-                                    color = TextPrimary,
-                                    fontSize = 17.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    letterSpacing = (-0.17).sp,
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(Color.White.copy(alpha = 0.04f))
-                                        .border(
-                                            1.dp,
-                                            Color.White.copy(alpha = 0.08f),
-                                            RoundedCornerShape(4.dp),
-                                        )
-                                        .padding(horizontal = 5.dp, vertical = 2.dp),
-                                ) {
-                                    Text(
-                                        text = "FREE",
-                                        color = TextDim,
-                                        fontSize = 8.sp,
-                                        fontFamily = PhantomFontMono,
-                                        fontWeight = FontWeight.Medium,
-                                        letterSpacing = 1.4.sp,
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                text = if (userName.isNotEmpty()) "@$userName" else "—",
-                                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
-                                fontSize = 12.sp,
-                                fontFamily = PhantomFontMono,
-                                letterSpacing = 0.4.sp,
-                            )
-                        }
-                        PhIconChevron(color = TextDim, size = 14.dp)
-                    }
-                }
+            // ── 1. Profile card ──────────────────────────────────────────
+            item {
+                ProfileCard(
+                    name = userName,
+                    handle = if (userName.isNotEmpty()) "@$userName" else "",
+                    avatar = selfAvatarImage,
+                    initials = userName.take(2).uppercase(),
+                    tierBadge = "FREE", // D-18: Pro infrastructure UI visible, no payment yet
+                    onClick = onProfile,
+                )
+            }
 
-                // PHANTOM PRO upsell — restrained card with cyan accent.
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                horizontal = PhantomTokens.Spacing.comfortable,
-                                vertical = PhantomTokens.Spacing.baseUnit,
-                            )
-                            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
-                            .background(PhantomTokens.Colors.SurfaceElevated)
-                            .border(
-                                1.dp,
-                                PhantomTokens.Colors.Cyan.copy(alpha = 0.20f),
-                                RoundedCornerShape(PhantomTokens.Radius.md),
-                            )
-                            .clickable { onNavigate(Screen.Premium) }
-                            .padding(
-                                horizontal = PhantomTokens.Spacing.comfortable,
-                                vertical = PhantomTokens.Spacing.tight,
-                            ),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(PhantomTokens.Colors.Cyan.copy(alpha = 0.10f))
-                                .border(
-                                    1.dp,
-                                    PhantomTokens.Colors.Cyan.copy(alpha = 0.30f),
-                                    RoundedCornerShape(10.dp),
-                                ),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            PhIconShieldCheck(color = PhantomTokens.Colors.Cyan, size = 18.dp)
-                        }
-                        Spacer(Modifier.width(PhantomTokens.Spacing.tight))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "PHANTOM PRO",
-                                color = PhantomTokens.Colors.Cyan,
-                                style = PhantomType.overline,
-                                fontWeight = FontWeight.Medium,
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                text = "Operator-grade privacy",
-                                color = TextPrimary,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium,
-                            )
-                        }
-                        PhIconChevron(color = TextDim, size = 14.dp)
-                    }
-                }
-
-                // Account
-                item { SettingsGroupHeader("Account") }
-                item {
-                    SettingsGroupCard {
-                        // Privacy mode — three pills (Standard / Private / Ghost) that
-                        // change real client behavior. Persisted in SharedPreferences
-                        // under key "privacy_mode"; consulted by ChatScreen before
-                        // calling markConversationRead so Private/Ghost suppress
-                        // outgoing read receipts at the wire level.
-                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
-                            Text("Privacy Mode", color = TextPrimary, fontSize = 14.sp)
-                            Spacer(Modifier.height(2.dp))
-                            Text(
-                                // ADR-020 Phase 3: text describes the FULL behaviour
-                                // (transport choice + read-receipt suppression) per
-                                // mode, not just the read-receipt half.
-                                text = when (privacyMode) {
-                                    PrivacyMode.Private ->
-                                        "Private — REALITY tunnel first, Tor onion fallback. " +
-                                            "Read receipts not sent."
-                                    PrivacyMode.Ghost ->
-                                        "Ghost — Tor onion only. No silent downgrade. " +
-                                            "Read receipts not sent."
-                                    PrivacyMode.Standard ->
-                                        "Standard — direct WSS first, REALITY + Tor fallback. " +
-                                            "Read receipts on. Best balance of latency and reach."
-                                },
-                                color = TextDim,
-                                fontSize = 11.sp,
-                                lineHeight = 15.sp,
-                            )
-                            Spacer(Modifier.height(8.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                PrivacyMode.values().forEach { mode ->
-                                    val active = privacyMode == mode
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(20.dp))
-                                            .background(if (active) CyanAccent else Color.Transparent)
-                                            .border(
-                                                1.dp,
-                                                if (active) Color.Transparent else Color.White.copy(alpha = 0.12f),
-                                                RoundedCornerShape(20.dp),
-                                            )
-                                            .clickable {
-                                                if (mode == privacyMode) return@clickable
-                                                if (mode == PrivacyMode.Ghost) {
-                                                    // First-time Ghost requires confirm
-                                                    pendingGhost = true
-                                                } else {
-                                                    privacyMode = mode
-                                                    scope.launch {
-                                                        applyPrivacyMode(container, context, mode)
-                                                    }
-                                                }
-                                            }
-                                            .padding(horizontal = 10.dp, vertical = 4.dp),
-                                    ) {
-                                        Text(
-                                            mode.name.uppercase(),
-                                            color = if (active) BgDeep else TextDim,
-                                            fontSize = 9.sp,
-                                            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                            fontFamily = PhantomFontMono,
-                                            letterSpacing = 1.8.sp,
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconDevice(color = CyanAccent, size = 16.dp) },
-                            label = "Linked Devices",
-                            value = "Add device",
-                            onClick = { showComingSoon() },
-                        )
-                    }
-                }
-
-                // Appearance
-                item { SettingsGroupHeader("Appearance") }
-                item {
-                    SettingsGroupCard {
-                        SettingsRowItem(
-                            icon = { PhIconGlobe(color = CyanAccent, size = 16.dp) },
-                            label = "Language",
-                            value = "English",
-                            onClick = { showComingSoon() },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        // Theme row with inline LOCKED badge (per FULL_COMPOSE
-                        // Settings Mobile 2). Dark is the only theme PHANTOM
-                        // ships — light mode would weaken the architectural
-                        // tone the design language is built on, so it stays
-                        // locked rather than "coming soon".
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        ) {
-                            Box(
-                                modifier = Modifier.size(20.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                PhIconSun(color = CyanAccent, size = 16.dp)
-                            }
-                            Row(
-                                modifier = Modifier.weight(1f),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text(
-                                    text = "Theme",
-                                    color = TextPrimary,
-                                    fontSize = 15.sp,
-                                )
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(Color.White.copy(alpha = 0.04f))
-                                        .border(
-                                            1.dp,
-                                            Color.White.copy(alpha = 0.08f),
-                                            RoundedCornerShape(4.dp),
-                                        )
-                                        .padding(horizontal = 6.dp, vertical = 2.dp),
-                                ) {
-                                    Text(
-                                        text = "LOCKED",
-                                        color = TextDim,
-                                        fontSize = 8.sp,
-                                        fontFamily = PhantomFontMono,
-                                        fontWeight = FontWeight.Medium,
-                                        letterSpacing = 1.4.sp,
-                                    )
-                                }
-                            }
-                            Text(
-                                text = "Dark",
-                                color = TextDim,
-                                fontSize = 13.sp,
-                            )
-                        }
-                    }
-                }
-
-                // Notifications — FULL_COMPOSE Settings Mobile 2.
-                item { SettingsGroupHeader("Notifications") }
-                item {
-                    val prefs = context.getSharedPreferences(
-                        "phantom_prefs",
-                        android.content.Context.MODE_PRIVATE,
+            // ── 2. Account ───────────────────────────────────────────────
+            item { SettingsGroupHeader("Account") }
+            item {
+                SettingsGroupCard {
+                    SettingsRowItem(
+                        icon = { PhIconPerson(color = CyanAccent, size = 16.dp) },
+                        label = "Profile",
+                        value = userName,
+                        onClick = onProfile,
                     )
-                    var messageAlerts by remember {
-                        mutableStateOf(prefs.getBoolean("notif_message_alerts", true))
-                    }
-                    var callAlerts by remember {
-                        mutableStateOf(prefs.getBoolean("notif_call_alerts", true))
-                    }
-                    SettingsGroupCard {
-                        SettingsToggleRow(
-                            icon = { PhIconBell(color = CyanAccent, size = 16.dp) },
-                            label = "Message Alerts",
-                            checked = messageAlerts,
-                            onCheckedChange = {
-                                messageAlerts = it
-                                prefs.edit().putBoolean("notif_message_alerts", it).apply()
-                            },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsToggleRow(
-                            icon = { PhIconPhone(color = CyanAccent, size = 16.dp) },
-                            label = "Call Alerts",
-                            checked = callAlerts,
-                            onCheckedChange = {
-                                callAlerts = it
-                                prefs.edit().putBoolean("notif_call_alerts", it).apply()
-                            },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconVolume(color = CyanAccent, size = 16.dp) },
-                            label = "Sound",
-                            value = "Default",
-                            onClick = { showComingSoon() },
-                        )
-                    }
-                }
-
-                // Privacy
-                item { SettingsGroupHeader("Privacy") }
-                item {
-                    val prefs = context.getSharedPreferences(
-                        "phantom_prefs",
-                        android.content.Context.MODE_PRIVATE,
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconKey(color = CyanAccent, size = 16.dp) },
+                        label = "Username",
+                        value = if (userName.isNotEmpty()) "@$userName" else "",
+                        onClick = { showComingSoon() },
                     )
-                    var appLockEnabled by remember {
-                        mutableStateOf(prefs.getBoolean("app_lock_enabled", false))
-                    }
-                    var lockTimeoutMs by remember {
-                        mutableStateOf(prefs.getLong("app_lock_timeout_ms", 60_000L))
-                    }
-                    var showTimeoutDialog by remember { mutableStateOf(false) }
-                    // FULL_COMPOSE Settings Mobile 1 toggles. Defaults match the
-                    // canonical reference: receipts on, last-seen on, screenshot
-                    // protection off (Pro tier — gate on subscription later).
-                    var readReceiptsEnabled by remember {
-                        mutableStateOf(prefs.getBoolean("read_receipts", true))
-                    }
-                    var lastSeenEnabled by remember {
-                        mutableStateOf(prefs.getBoolean("last_seen", true))
-                    }
-                    var screenshotProtectionEnabled by remember {
-                        mutableStateOf(prefs.getBoolean("screenshot_protection", false))
-                    }
-
-                    SettingsGroupCard {
-                        SettingsRowItem(
-                            icon = { PhIconLock(color = CyanAccent, size = 16.dp) },
-                            label = "App Lock",
-                            value = if (appLockEnabled) "On" else "Off",
-                            onClick = {
-                                val newVal = !appLockEnabled
-                                appLockEnabled = newVal
-                                prefs.edit().putBoolean("app_lock_enabled", newVal).apply()
-                            },
-                        )
-                        if (appLockEnabled) {
-                            SettingsRowItem(
-                                icon = { PhIconTimer(color = CyanAccent, size = 16.dp) },
-                                label = "Auto-lock",
-                                value = lockTimeoutLabel(lockTimeoutMs),
-                                onClick = { showTimeoutDialog = true },
-                            )
-                        }
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsToggleRow(
-                            icon = { PhIconCheck3(color = CyanAccent, size = 16.dp) },
-                            label = "Read Receipts",
-                            checked = readReceiptsEnabled,
-                            onCheckedChange = {
-                                readReceiptsEnabled = it
-                                prefs.edit().putBoolean("read_receipts", it).apply()
-                            },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsToggleRow(
-                            icon = { PhIconEye(color = CyanAccent, size = 16.dp) },
-                            label = "Last Seen",
-                            checked = lastSeenEnabled,
-                            onCheckedChange = {
-                                lastSeenEnabled = it
-                                prefs.edit().putBoolean("last_seen", it).apply()
-                            },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsToggleRow(
-                            icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
-                            label = "Screenshot Protection",
-                            proBadge = true,
-                            checked = screenshotProtectionEnabled,
-                            onCheckedChange = {
-                                screenshotProtectionEnabled = it
-                                prefs.edit().putBoolean("screenshot_protection", it).apply()
-                            },
-                        )
-                    }
-
-                    if (showTimeoutDialog) {
-                        AppLockTimeoutDialog(
-                            current = lockTimeoutMs,
-                            onPick = { ms ->
-                                lockTimeoutMs = ms
-                                prefs.edit().putLong("app_lock_timeout_ms", ms).apply()
-                                showTimeoutDialog = false
-                            },
-                            onDismiss = { showTimeoutDialog = false },
-                        )
-                    }
-                }
-
-                // Advanced — Data export + Clear cache (FULL_COMPOSE §06).
-                // "Export data" opens the BackupExport bottom-sheet (§14).
-                // Real export wiring lands with the BackupExport milestone;
-                // the sheet exists now so the IA matches the canonical doc.
-                item { SettingsGroupHeader("Advanced") }
-                item {
-                    val prefs = context.getSharedPreferences(
-                        "phantom_prefs",
-                        android.content.Context.MODE_PRIVATE,
-                    )
-                    var developerMode by remember {
-                        mutableStateOf(prefs.getBoolean("developer_mode", false))
-                    }
-                    // Cache size — sum of cacheDir + databases dir. Computed
-                    // once on composition; refreshes when "Clear cache" runs.
-                    var cacheSize by remember { mutableStateOf<String?>(null) }
-                    LaunchedEffect(Unit) {
-                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            val total = computeCacheSizeBytes(context)
-                            cacheSize = formatByteSize(total)
-                        }
-                    }
-
-                    SettingsGroupCard {
-                        SettingsToggleRow(
-                            icon = { PhIconShieldCheck(color = CyanAccent, size = 16.dp) },
-                            label = "Developer Mode",
-                            checked = developerMode,
-                            onCheckedChange = {
-                                developerMode = it
-                                prefs.edit().putBoolean("developer_mode", it).apply()
-                            },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconBookmark(color = CyanAccent, size = 16.dp) },
-                            label = "Storage & Cache",
-                            value = cacheSize ?: "…",
-                            onClick = { showComingSoon() },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconDownload(color = CyanAccent, size = 16.dp) },
-                            label = "Export data",
-                            value = "Encrypted",
-                            onClick = { showBackupSheet = true },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconTrash(color = CyanAccent, size = 16.dp) },
-                            label = "Clear cache",
-                            value = null,
-                            onClick = {
-                                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                                    runCatching {
-                                        context.cacheDir.deleteRecursively()
-                                        context.cacheDir.mkdirs()
-                                    }
-                                    val total = computeCacheSizeBytes(context)
-                                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                        cacheSize = formatByteSize(total)
-                                        snackbarHostState.showSnackbar("Cache cleared")
-                                    }
-                                }
-                            },
-                        )
-                    }
-                }
-
-                // Danger zone — destructive actions, danger-tinted, isolated
-                // from the rest of the list.
-                item { SettingsGroupHeader("Danger zone") }
-                item {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(PhantomTokens.Colors.SurfaceElevated)
-                            .border(
-                                1.dp,
-                                Danger.copy(alpha = 0.30f),
-                                RoundedCornerShape(12.dp),
-                            ),
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onNavigate(Screen.Profile) }
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        ) {
-                            Box(
-                                modifier = Modifier.size(20.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                PhIconTrash(color = Danger, size = 16.dp)
-                            }
-                            Text(
-                                text = "Delete account",
-                                color = Danger,
-                                fontSize = 15.sp,
-                                modifier = Modifier.weight(1f),
-                            )
-                            PhIconChevron(color = Danger.copy(alpha = 0.6f), size = 14.dp)
-                        }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                }
-
-                // About — version + categorised contact addresses (per
-                // SECURITY.md / Releases/README.md routing table). Each entry
-                // launches an ACTION_SENDTO intent so the user picks their own
-                // mail client; we never embed an email body or attachment, so
-                // these links carry no app data of their own.
-                item { SettingsGroupHeader("About") }
-                item {
-                    SettingsGroupCard {
-                        SettingsRowItem(
-                            icon = { PhIconGlobe(color = CyanAccent, size = 16.dp) },
-                            label = "App version",
-                            value = BuildConfig.VERSION_NAME,
-                            onClick = { /* no-op: read-only */ },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconMessage(color = CyanAccent, size = 16.dp) },
-                            label = "Send feedback",
-                            value = "support@phntm.pro",
-                            onClick = { context.openMailto("support@phntm.pro", subject = "PHANTOM feedback") },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
-                            label = "Report abuse",
-                            value = "abuse@phntm.pro",
-                            onClick = { context.openMailto("abuse@phntm.pro", subject = "PHANTOM abuse report") },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconLock(color = CyanAccent, size = 16.dp) },
-                            label = "Security disclosure",
-                            value = "security@phntm.pro",
-                            onClick = { context.openMailto("security@phntm.pro", subject = "PHANTOM security report") },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconShieldCheck(color = CyanAccent, size = 16.dp) },
-                            label = "Privacy & data",
-                            value = "privacy@phntm.pro",
-                            onClick = { context.openMailto("privacy@phntm.pro", subject = "PHANTOM privacy request") },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconBookmark(color = CyanAccent, size = 16.dp) },
-                            label = "Legal",
-                            value = "legal@phntm.pro",
-                            onClick = { context.openMailto("legal@phntm.pro", subject = "PHANTOM legal inquiry") },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconMegaphone(color = CyanAccent, size = 16.dp) },
-                            label = "Press",
-                            value = "press@phntm.pro",
-                            onClick = { context.openMailto("press@phntm.pro", subject = "PHANTOM press inquiry") },
-                        )
-                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconShare(color = CyanAccent, size = 14.dp) },
-                            label = "Source code on GitHub",
-                            value = "LiudvigVladislav/Phantom",
-                            onClick = { context.openUrl("https://github.com/LiudvigVladislav/Phantom") },
-                        )
-                    }
-                }
-
-                // Mono footer below About — FULL_COMPOSE Settings Mobile 3.
-                // Quiet attribution, sits on the SurfaceDeep tail of the list.
-                item {
-                    Spacer(Modifier.height(28.dp))
-                    Text(
-                        text = "PHANTOM · v${BuildConfig.VERSION_NAME}",
-                        color = TextDim.copy(alpha = 0.45f),
-                        fontSize = 10.sp,
-                        fontFamily = PhantomFontMono,
-                        letterSpacing = 1.6.sp,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 12.dp),
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItemWithBadge(
+                        icon = { PhIconCreditCard(color = CyanAccent, size = 16.dp) },
+                        label = "Plan",
+                        badge = { UpgradeBadge() },
+                        value = "Free",
+                        onClick = { onNavigate(Screen.Premium) },
                     )
                 }
             }
 
-            BottomNavPill(
-                activeTab = NavTab.SETTINGS,
-                onTabSelected = { tab ->
-                    when (tab) {
-                        NavTab.CALLS -> onNavigate(Screen.Calls)
-                        NavTab.CHATS -> onNavigate(Screen.ChatList)
-                        NavTab.NEARBY -> onNavigate(Screen.Nearby)
-                        NavTab.SETTINGS -> {}
-                    }
-                },
-                modifier = Modifier.align(Alignment.BottomCenter),
-            )
+            // ── 3. Privacy & Security ────────────────────────────────────
+            item { SettingsGroupHeader("Privacy & Security") }
+            item {
+                SettingsGroupCard {
+                    SettingsRowItem(
+                        icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
+                        label = "Encryption Protocol",
+                        value = "ED25519",
+                        onClick = { showComingSoon() },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconEyeOff(color = CyanAccent, size = 16.dp) },
+                        label = "Privacy Mode",
+                        value = privacyModeLabel,
+                        onClick = { onNavigate(Screen.PrivacyModeDetail) },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsToggleRow(
+                        icon = { PhIconDoubleCheck(color = CyanAccent, size = 16.dp) },
+                        label = "Read Receipts",
+                        checked = readReceipts,
+                        onCheckedChange = {
+                            readReceipts = it
+                            prefs.edit().putBoolean("read_receipts", it).apply()
+                        },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconClock(color = CyanAccent, size = 16.dp) },
+                        label = "Last Seen",
+                        value = "Contacts only",
+                        onClick = { showComingSoon() },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsToggleRow(
+                        icon = { PhIconCamera(color = CyanAccent, size = 16.dp) },
+                        label = "Screenshot Protection",
+                        checked = screenshotProtection,
+                        onCheckedChange = {
+                            screenshotProtection = it
+                            prefs.edit().putBoolean("screenshot_protection", it).apply()
+                        },
+                        proBadge = true, // D-18: visible badge, control still functional
+                    )
+                }
+            }
+
+            // ── 4. Notifications ─────────────────────────────────────────
+            item { SettingsGroupHeader("Notifications") }
+            item {
+                SettingsGroupCard {
+                    SettingsToggleRow(
+                        icon = { PhIconBell(color = CyanAccent, size = 16.dp) },
+                        label = "Message Alerts",
+                        checked = messageAlerts,
+                        onCheckedChange = {
+                            messageAlerts = it
+                            prefs.edit().putBoolean("message_alerts", it).apply()
+                        },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsToggleRow(
+                        icon = { PhIconPhone(color = CyanAccent, size = 16.dp) },
+                        label = "Call Alerts",
+                        checked = callAlerts,
+                        onCheckedChange = {
+                            callAlerts = it
+                            prefs.edit().putBoolean("call_alerts", it).apply()
+                        },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconVolume(color = CyanAccent, size = 16.dp) },
+                        label = "Sound",
+                        value = "Default",
+                        onClick = { showComingSoon() },
+                    )
+                }
+            }
+
+            // ── 5. Appearance ────────────────────────────────────────────
+            item { SettingsGroupHeader("Appearance") }
+            item {
+                SettingsGroupCard {
+                    SettingsRowItemWithBadge(
+                        icon = { PhIconSun(color = CyanAccent, size = 16.dp) },
+                        label = "Theme",
+                        badge = { LockedBadge() },
+                        value = "Dark",
+                        onClick = { showComingSoon() },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconGlobe(color = CyanAccent, size = 16.dp) },
+                        label = "Language",
+                        value = "English",
+                        onClick = { showComingSoon() },
+                    )
+                }
+            }
+
+            // ── 6. Advanced ──────────────────────────────────────────────
+            // D-17: Developer Mode toggle removed.
+            item { SettingsGroupHeader("Advanced") }
+            item {
+                SettingsGroupCard {
+                    SettingsRowItem(
+                        icon = { PhIconDatabase(color = CyanAccent, size = 16.dp) },
+                        label = "Storage & Cache",
+                        value = cacheSize ?: "…",
+                        onClick = { showComingSoon() },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconDownload(color = CyanAccent, size = 16.dp) },
+                        label = "Export Data",
+                        onClick = { showComingSoon() },
+                    )
+                }
+            }
+
+            // ── 7. About ─────────────────────────────────────────────────
+            item { SettingsGroupHeader("About") }
+            item {
+                SettingsGroupCard {
+                    SettingsRowItem(
+                        icon = { PhIconInfo(color = CyanAccent, size = 16.dp) },
+                        label = "Version",
+                        value = BuildConfig.VERSION_NAME,
+                        onClick = { /* read-only */ },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconMessageCircle(color = CyanAccent, size = 16.dp) },
+                        label = "Send Feedback",
+                        onClick = {
+                            context.openMailto("support@phntm.pro", subject = "PHANTOM feedback")
+                        },
+                    )
+                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                    SettingsRowItem(
+                        icon = { PhIconFileText(color = CyanAccent, size = 16.dp) },
+                        label = "Privacy Policy",
+                        onClick = {
+                            context.openUrl("https://phntm.pro/privacy")
+                        },
+                    )
+                }
+            }
+
+            // Footer — quiet build identifier per FULL_COMPOSE
+            item {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "PHANTOM · ${BuildConfig.VERSION_NAME}",
+                    color = TextDim.copy(alpha = 0.55f),
+                    fontSize = 10.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 1.4.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp, bottom = 8.dp)
+                        .wrapContentWidth(Alignment.CenterHorizontally),
+                )
+            }
         }
     }
+}
 
-    if (showBackupSheet) {
-        val identity by container.identityState.collectAsState()
-        val pubKey = identity?.publicKeyHex.orEmpty()
-        val fingerprint = remember(pubKey) {
-            if (pubKey.length >= 32) pubKey.substring(0, 32).uppercase().chunked(4).joinToString("  ")
-            else ""
+// ── Profile card ──────────────────────────────────────────────────────────────
+
+/**
+ * Top-of-Settings profile card per FULL_COMPOSE §06. Surface elevated, 12dp
+ * radius, 16dp inner padding, 14dp gap between avatar and text. Right-aligned
+ * chevron signals tap-through to the profile screen.
+ */
+@Composable
+private fun ProfileCard(
+    name: String,
+    handle: String,
+    avatar: androidx.compose.ui.graphics.ImageBitmap?,
+    initials: String,
+    tierBadge: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(PhantomTokens.Colors.SurfaceElevated)
+            .border(1.dp, BorderSubtle, RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        // Avatar 52dp — bitmap if available, otherwise initials on indigo.
+        Box(
+            modifier = Modifier
+                .size(52.dp)
+                .clip(CircleShape)
+                .background(Color(0xFF4853C2)),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (avatar != null) {
+                androidx.compose.foundation.Image(
+                    bitmap = avatar,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize().clip(CircleShape),
+                )
+            } else {
+                Text(
+                    text = initials.ifEmpty { "?" },
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
         }
-        BackupExportSheet(
-            fingerprint = fingerprint,
-            onExport = {
-                showBackupSheet = false
-                showComingSoon()
-            },
-            onDismiss = { showBackupSheet = false },
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = name.ifEmpty { "—" },
+                    color = TextPrimary,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = (-0.16).sp,
+                )
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Surface)
+                        .border(1.dp, BorderSubtle, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
+                ) {
+                    Text(
+                        text = tierBadge,
+                        color = TextDim,
+                        fontSize = 9.sp,
+                        fontFamily = PhantomFontMono,
+                        letterSpacing = 0.7.sp,
+                    )
+                }
+            }
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = handle,
+                color = TextDim.copy(alpha = 0.55f),
+                fontSize = 11.sp,
+                fontFamily = PhantomFontMono,
+            )
+        }
+        PhIconChevron(color = TextDim.copy(alpha = 0.55f), size = 14.dp)
+    }
+    Spacer(Modifier.height(8.dp))
+}
+
+// ── Settings row variants with badges ─────────────────────────────────────────
+
+/**
+ * Settings row with a trailing badge between label and value/chevron. Used
+ * for rows that need a Pro / Locked / Upgrade indicator (see [UpgradeBadge],
+ * [LockedBadge]). Otherwise identical anatomy to [SettingsRowItem].
+ */
+@Composable
+private fun SettingsRowItemWithBadge(
+    icon: @Composable () -> Unit,
+    label: String,
+    badge: @Composable () -> Unit,
+    value: String? = null,
+    onClick: () -> Unit = {},
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(modifier = Modifier.size(20.dp), contentAlignment = Alignment.Center) { icon() }
+        Text(
+            text = label,
+            color = TextPrimary,
+            fontSize = 15.sp,
+            modifier = Modifier.weight(1f),
+        )
+        badge()
+        if (value != null) {
+            Text(
+                text = value,
+                color = PhantomTokens.Colors.TextSecondary,
+                fontSize = 13.sp,
+            )
+        }
+        PhIconChevron(color = TextDim, size = 14.dp)
+    }
+}
+
+@Composable
+private fun UpgradeBadge() {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(CyanAccent)
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        Text(
+            text = "UPGRADE",
+            color = BgDeep,
+            fontSize = 8.sp,
+            fontFamily = PhantomFontMono,
+            fontWeight = FontWeight.SemiBold,
+            letterSpacing = 1.0.sp,
         )
     }
 }
 
+@Composable
+private fun LockedBadge() {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(Surface)
+            .border(1.dp, BorderSubtle, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        Text(
+            text = "LOCKED",
+            color = TextDim,
+            fontSize = 8.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 1.0.sp,
+        )
+    }
+}
+
+// ── Helpers (preserved from previous Settings implementation) ─────────────────
+
 /**
- * Launches the user's mail client with a pre-addressed message. Uses
- * `mailto:` via `ACTION_SENDTO` rather than `ACTION_SEND`, so only apps
- * registered as email handlers (not arbitrary share targets) appear in the
- * chooser. The body is left empty on purpose — the relay-routing addresses
- * are categorised enough that the recipient inbox tag tells us what the
- * user is reporting; we never want PHANTOM to leak local context into an
- * outgoing draft.
+ * Open a `mailto:` link with subject pre-filled. ACTION_SENDTO ensures only
+ * apps registered as email handlers (not arbitrary share targets) appear in
+ * the chooser. Body is intentionally empty — we never want PHANTOM to leak
+ * local context into an outgoing draft.
  */
 private fun android.content.Context.openMailto(address: String, subject: String) {
     val uri = Uri.parse("mailto:$address?subject=${Uri.encode(subject)}")
@@ -818,18 +552,10 @@ private fun android.content.Context.openUrl(url: String) {
     runCatching { startActivity(intent) }
 }
 
-// ── App Lock timeout ────────────────────────────────────────────────────────
-
-private val LOCK_TIMEOUT_OPTIONS: List<Pair<Long, String>> = listOf(
-    0L            to "Immediately",
-    60_000L       to "After 1 minute",
-    5 * 60_000L   to "After 5 minutes",
-    60 * 60_000L  to "After 1 hour",
-)
-
-// Sum cacheDir + database files recursively. Used to render the
-// "Storage & Cache" row trailing value in the Advanced section, and is
-// recomputed after "Clear cache" runs so the user sees the result.
+/**
+ * Sum cacheDir + database files recursively. Used to render the "Storage &
+ * Cache" row trailing value in the Advanced section.
+ */
 private fun computeCacheSizeBytes(context: android.content.Context): Long {
     fun walk(file: java.io.File): Long {
         if (!file.exists()) return 0L
@@ -845,70 +571,4 @@ private fun formatByteSize(bytes: Long): String {
     if (bytes < 1_024) return "$bytes B"
     if (bytes < 1_024 * 1_024) return "${bytes / 1_024} KB"
     return "%.1f MB".format(bytes / 1_048_576.0)
-}
-
-private fun lockTimeoutLabel(ms: Long): String =
-    LOCK_TIMEOUT_OPTIONS.firstOrNull { it.first == ms }?.second
-        ?: "After ${ms / 60_000} minutes"
-
-@Composable
-private fun AppLockTimeoutDialog(
-    current: Long,
-    onPick: (Long) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = Surface,
-        title = { Text("Auto-lock", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Medium) },
-        text = {
-            Column {
-                LOCK_TIMEOUT_OPTIONS.forEach { (ms, label) ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onPick(ms) }
-                            .padding(horizontal = 4.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        // Selected indicator: cyan dot for the active option.
-                        Box(
-                            modifier = Modifier
-                                .size(10.dp)
-                                .clip(androidx.compose.foundation.shape.CircleShape)
-                                .background(if (ms == current) CyanAccent else TextDim.copy(alpha = 0.25f)),
-                        )
-                        Text(
-                            text = label,
-                            color = TextPrimary,
-                            fontSize = 14.sp,
-                            modifier = Modifier.padding(start = 12.dp),
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Done", color = CyanAccent, fontSize = 14.sp)
-            }
-        },
-    )
-}
-
-/**
- * ADR-020 Phase 3: persist the chosen [PrivacyMode] (typed + legacy mirror)
- * and force a transport reconnect so the new strategy chain takes effect
- * immediately. The foreground-service `startForegroundService` call here
- * delivers a fresh `onStartCommand` to the existing service after
- * `container.setPrivacyMode` has torn down the old connection.
- */
-private suspend fun applyPrivacyMode(
-    container: AppContainer,
-    context: android.content.Context,
-    mode: PrivacyMode,
-) {
-    container.setPrivacyMode(mode)
-    val intent = Intent(context.applicationContext, PhantomMessagingService::class.java)
-    context.applicationContext.startForegroundService(intent)
 }
