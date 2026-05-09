@@ -326,6 +326,10 @@ fun SettingsScreen(
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
+                        // Speech-bubble glyph per Vladislav's design ref —
+                        // PhIconMessageCircle was rebuilt on Canvas so it
+                        // renders cleanly at 16dp instead of as overlapping
+                        // rings (the old Lucide-arc path did).
                         icon = { PhIconMessageCircle(color = CyanAccent, size = 16.dp) },
                         label = "Send Feedback",
                         onClick = {

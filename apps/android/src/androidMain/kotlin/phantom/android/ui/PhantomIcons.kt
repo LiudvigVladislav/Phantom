@@ -745,11 +745,33 @@ fun PhIconReplyAll(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp
     )
 }
 
-// message-circle — speech bubble
+// message-circle — round speech bubble (Lucide MessageCircle).
+// Drawn via Canvas (circle + short tail) instead of PathParser-fed
+// SVG arcs, because the upstream Lucide path renders as overlapping
+// rings at 16dp through our parser. Clean stroke at any size now.
 @Composable
 fun PhIconMessageCircle(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Bubble — main round body, sized to leave room for the bottom-left tail.
+        drawCircle(color, radius = 8.5f * s, center = Offset(12.5f * s, 11f * s), style = st)
+        // Tail — short stroke from the bubble's bottom-left edge down to the speech tip.
+        drawPath(
+            parsePath("M6 17.5L3 21", s),
+            color, style = st,
+        )
+    }
+}
+
+// Lucide Send — paper plane. Used wherever the action literally sends
+// something (compose, submit). Kept available even though the Settings
+// "Send Feedback" row now uses the speech-bubble PhIconMessageCircle
+// per Vladislav's design preference.
+@Composable
+fun PhIconSend(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
     PhStrokePath(
-        "M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z",
+        "M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z",
         color, modifier.then(Modifier.size(size)),
     )
 }
@@ -893,4 +915,729 @@ fun PhIconFileText(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp
             "M14 2v6h6M9 13h6M9 17h6M9 9h2",
         color, modifier.then(Modifier.size(size)),
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CATALOG COMPLETION — PHANTOM_ICONS_COMPOSE.md, all categories.
+// Added 2026-05-09 so callers can pull from any category without
+// importing Lucide directly. Each icon mirrors its Lucide-canonical
+// path; Canvas-based bodies are used where complex SVG arcs would
+// confuse PathParser at small sizes (see PhIconMessageCircle for the
+// historical issue).
+// ─────────────────────────────────────────────────────────────────────
+
+// ── 02 Trust ────────────────────────────────────────────────────────
+
+// CheckCircle — circle outline + interior check. Distinct from
+// PhIconShieldCheck (shield body); used for "verified" success states.
+@Composable
+fun PhIconCheckCircle(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 9f * s, Offset(12f * s, 12f * s), style = st)
+        drawPath(parsePath("M8 12l3 3 5-6", s), color, style = st)
+    }
+}
+
+// ── 03 Input & Control ──────────────────────────────────────────────
+
+// SlidersHorizontal — three horizontal tracks each with a draggable
+// handle dot. Tweaks-panel control glyph.
+@Composable
+fun PhIconSlidersHorizontal(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(
+            parsePath("M21 6H10M6 6H3M21 12H16M12 12H3M21 18H14M10 18H3", s),
+            color, style = st,
+        )
+        drawCircle(color, 1.6f * s, Offset(8f * s, 6f * s), style = st)
+        drawCircle(color, 1.6f * s, Offset(14f * s, 12f * s), style = st)
+        drawCircle(color, 1.6f * s, Offset(12f * s, 18f * s), style = st)
+    }
+}
+
+// ArrowRight — straight arrow pointing right.
+@Composable
+fun PhIconArrowRight(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath("M5 12h14M12 5l7 7-7 7", color, modifier.then(Modifier.size(size)))
+}
+
+// ── 04 Media & Communication ────────────────────────────────────────
+
+// Video — outlined camera body + lens triangle.
+@Composable
+fun PhIconVideoOff(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Camera body sketched with two paths so the slash reads through cleanly.
+        drawPath(
+            parsePath(
+                "M16 16v1a2 2 0 0 1 -2 2H4a2 2 0 0 1 -2 -2V8a2 2 0 0 1 2 -2h2" +
+                    "M11 6h3a2 2 0 0 1 2 2v3.5l4 -3.5v10",
+                s,
+            ),
+            color, style = st,
+        )
+        drawLine(color, Offset(2f * s, 2f * s), Offset(22f * s, 22f * s), 1.6f * s, StrokeCap.Round)
+    }
+}
+
+// Volume1 — speaker + a single sound wave (mid level).
+@Composable
+fun PhIconVolume1(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M11 5L6 9H2v6h4l5 4V5z M15 9.5a3 3 0 0 1 0 5",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Image — landscape rounded rect with sun + diagonal mountain line.
+@Composable
+fun PhIconImage(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawRoundRect(
+            color, Offset(3f * s, 3f * s), Size(18f * s, 18f * s),
+            CornerRadius(2f * s), st,
+        )
+        drawCircle(color, 1.6f * s, Offset(8.5f * s, 8.5f * s), style = st)
+        drawPath(parsePath("M21 15l-5-5L5 21", s), color, style = st)
+    }
+}
+
+// File — page with folded top-right corner.
+@Composable
+fun PhIconFile(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M14 2H6a2 2 0 0 0 -2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2V8z M14 2v6h6",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ── 05 Notifications & Status ───────────────────────────────────────
+
+// Loader — 8-spoke spinner. Static; rotation is the caller's job.
+@Composable
+fun PhIconLoader(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" +
+            "M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// RefreshCw — circular arrow pair, clockwise.
+@Composable
+fun PhIconRefresh(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M23 4v6h-6M1 20v-6h6" +
+            "M3.51 9a9 9 0 0 1 14.85 -3.36L23 10" +
+            "M1 14l4.64 4.36A9 9 0 0 0 20.49 15",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// HelpCircle — circle + question mark.
+@Composable
+fun PhIconHelpCircle(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 9f * s, Offset(12f * s, 12f * s), style = st)
+        drawPath(
+            parsePath("M9.09 9a3 3 0 0 1 5.83 1c0 2 -3 3 -3 3", s),
+            color, style = st,
+        )
+        // Dot under the question mark.
+        drawCircle(color, 0.9f * s, Offset(12f * s, 17f * s))
+    }
+}
+
+// Calendar — header bar + grid frame + two top hangers.
+@Composable
+fun PhIconCalendar(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawRoundRect(
+            color, Offset(3f * s, 4f * s), Size(18f * s, 18f * s),
+            CornerRadius(2f * s), st,
+        )
+        drawPath(
+            parsePath("M16 2v4M8 2v4M3 10h18", s),
+            color, style = st,
+        )
+    }
+}
+
+// ── 06 Organization ─────────────────────────────────────────────────
+
+// Heart — outlined heart shape, used for likes / reactions.
+@Composable
+fun PhIconHeart(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M20.84 4.61a5.5 5.5 0 0 0 -7.78 0L12 5.67l-1.06 -1.06" +
+            "a5.5 5.5 0 0 0 -7.78 7.78l1.06 1.06L12 21.23l7.78 -7.78 1.06 -1.06" +
+            "a5.5 5.5 0 0 0 0 -7.78z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Tag — diamond-cut tag glyph with a rivet circle.
+@Composable
+fun PhIconTag(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(
+            parsePath(
+                "M20.59 13.41l-7.17 7.17a2 2 0 0 1 -2.83 0L2 12V2h10l8.59 8.59" +
+                    "a2 2 0 0 1 0 2.82z",
+                s,
+            ),
+            color, style = st,
+        )
+        drawCircle(color, 0.9f * s, Offset(7f * s, 7f * s))
+    }
+}
+
+// Layers — three stacked diamond outlines.
+@Composable
+fun PhIconLayers(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Grid — 2×2 square layout.
+@Composable
+fun PhIconGrid(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val r = CornerRadius(1.5f * s)
+        drawRoundRect(color, Offset(3f * s, 3f * s), Size(7f * s, 7f * s), r, st)
+        drawRoundRect(color, Offset(14f * s, 3f * s), Size(7f * s, 7f * s), r, st)
+        drawRoundRect(color, Offset(14f * s, 14f * s), Size(7f * s, 7f * s), r, st)
+        drawRoundRect(color, Offset(3f * s, 14f * s), Size(7f * s, 7f * s), r, st)
+    }
+}
+
+// List — three rows each with a leading bullet dot.
+@Composable
+fun PhIconList(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(parsePath("M8 6h13M8 12h13M8 18h13", s), color, style = st)
+        drawCircle(color, 0.9f * s, Offset(3.5f * s, 6f * s))
+        drawCircle(color, 0.9f * s, Offset(3.5f * s, 12f * s))
+        drawCircle(color, 0.9f * s, Offset(3.5f * s, 18f * s))
+    }
+}
+
+// ── 07 Utilities ────────────────────────────────────────────────────
+
+// Upload — arrow-up + tray; mirror of PhIconDownload.
+@Composable
+fun PhIconUpload(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M21 15v4a2 2 0 0 1 -2 2H5a2 2 0 0 1 -2 -2v-4M17 8l-5 -5 -5 5M12 3v12",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Link — two interlocking chain links (Lucide Link2 layout).
+@Composable
+fun PhIconLink(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M10 13a5 5 0 0 0 7.54 0.54l3 -3a5 5 0 0 0 -7.07 -7.07l-1.72 1.71" +
+            "M14 11a5 5 0 0 0 -7.54 -0.54l-3 3a5 5 0 0 0 7.07 7.07l1.71 -1.71",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Unlink — broken chain links.
+@Composable
+fun PhIconUnlink(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M18.84 12.25l1.72 -1.71a5 5 0 0 0 -7.07 -7.07l-1.72 1.71" +
+            "M5.16 11.75l-1.72 1.71a5 5 0 0 0 7.07 7.07l1.72 -1.71" +
+            "M2 2l20 20M2 18h2M5 22v-2M22 6h-2M19 2v2",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ExternalLink — square frame + arrow exiting top-right.
+@Composable
+fun PhIconExternalLink(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M18 13v6a2 2 0 0 1 -2 2H5a2 2 0 0 1 -2 -2V8a2 2 0 0 1 2 -2h6" +
+            "M15 3h6v6M10 14L21 3",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// LogOut — door + arrow exiting right.
+@Composable
+fun PhIconLogOut(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M9 21H5a2 2 0 0 1 -2 -2V5a2 2 0 0 1 2 -2h4M16 17l5 -5 -5 -5M21 12H9",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ── 08 Layout & Display Controls ────────────────────────────────────
+
+// ZoomIn — magnifying glass with + inside.
+@Composable
+fun PhIconZoomIn(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 7f * s, Offset(11f * s, 11f * s), style = st)
+        drawPath(parsePath("M21 21l-4.35 -4.35M11 8v6M8 11h6", s), color, style = st)
+    }
+}
+
+// ZoomOut — magnifying glass with - inside.
+@Composable
+fun PhIconZoomOut(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 7f * s, Offset(11f * s, 11f * s), style = st)
+        drawPath(parsePath("M21 21l-4.35 -4.35M8 11h6", s), color, style = st)
+    }
+}
+
+// Maximize — four corner brackets pointing outward.
+@Composable
+fun PhIconMaximize(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M8 3H5a2 2 0 0 0 -2 2v3M21 8V5a2 2 0 0 0 -2 -2h-3" +
+            "M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2 -2v-3",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Minimize — four corner brackets pointing inward.
+@Composable
+fun PhIconMinimize(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M8 3v3a2 2 0 0 1 -2 2H3M21 8h-3a2 2 0 0 1 -2 -2V3" +
+            "M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2 -2h3",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// PanelLeft — outlined frame with a vertical divider near the left edge.
+@Composable
+fun PhIconPanelLeft(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawRoundRect(
+            color, Offset(3f * s, 3f * s), Size(18f * s, 18f * s),
+            CornerRadius(2f * s), st,
+        )
+        drawPath(parsePath("M9 3v18", s), color, style = st)
+    }
+}
+
+// GripVertical — six dots in a 2×3 grid; reorder handle.
+@Composable
+fun PhIconGripVertical(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val r = 1.4f * s
+        for (cx in listOf(9f, 15f)) {
+            for (cy in listOf(6f, 12f, 18f)) {
+                drawCircle(color, r, Offset(cx * s, cy * s))
+            }
+        }
+    }
+}
+
+// Minus — single horizontal stroke. Used for collapse / decrement.
+@Composable
+fun PhIconMinus(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath("M5 12h14", color, modifier.then(Modifier.size(size)))
+}
+
+// ── 09 Media Playback ───────────────────────────────────────────────
+
+// SkipBack — previous-track triangle + leading bar.
+@Composable
+fun PhIconSkipBack(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath("M19 20L9 12l10 -8v16zM5 19V5", color, modifier.then(Modifier.size(size)))
+}
+
+// SkipForward — next-track triangle + trailing bar.
+@Composable
+fun PhIconSkipForward(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath("M5 4l10 8 -10 8V4zM19 5v14", color, modifier.then(Modifier.size(size)))
+}
+
+// Repeat — loop with two arrowheads.
+@Composable
+fun PhIconRepeat(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M17 1l4 4 -4 4M3 11V9a4 4 0 0 1 4 -4h14M7 23l-4 -4 4 -4M21 13v2a4 4 0 0 1 -4 4H3",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Shuffle — crossed arrows.
+@Composable
+fun PhIconShuffle(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ── 10 Connectivity ─────────────────────────────────────────────────
+
+// Wifi — three concentric arcs + a bottom dot.
+@Composable
+fun PhIconWifi(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(
+            parsePath(
+                "M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0" +
+                    "M8.53 16.11a6 6 0 0 1 6.95 0",
+                s,
+            ),
+            color, style = st,
+        )
+        drawCircle(color, 1.2f * s, Offset(12f * s, 20f * s))
+    }
+}
+
+// WifiOff — Wifi glyph with diagonal slash.
+@Composable
+fun PhIconWifiOff(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(
+            parsePath(
+                "M16.72 11.06A10.94 10.94 0 0 1 19 12.55" +
+                    "M5 12.55a10.94 10.94 0 0 1 5.17 -2.39" +
+                    "M10.71 5.05A16 16 0 0 1 22.58 9" +
+                    "M1.42 9a15.91 15.91 0 0 1 4.7 -2.88" +
+                    "M8.53 16.11a6 6 0 0 1 6.95 0",
+                s,
+            ),
+            color, style = st,
+        )
+        drawCircle(color, 1.2f * s, Offset(12f * s, 20f * s))
+        drawLine(color, Offset(1f * s, 1f * s), Offset(23f * s, 23f * s), 1.6f * s, StrokeCap.Round)
+    }
+}
+
+// Bluetooth — angular B glyph drawn as a single zig-zag stroke.
+@Composable
+fun PhIconBluetooth(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M6.5 6.5L17.5 17.5L12 23V1L17.5 6.5L6.5 17.5",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Cast — TV box + diagonal radio waves emanating from bottom-left.
+@Composable
+fun PhIconCast(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(
+            parsePath(
+                "M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20" +
+                    "M2 8V6a2 2 0 0 1 2 -2h16a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-6",
+                s,
+            ),
+            color, style = st,
+        )
+        drawCircle(color, 0.9f * s, Offset(2f * s, 20f * s))
+    }
+}
+
+// Airplay — TV box outline + triangle indicator below.
+@Composable
+fun PhIconAirplay(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M5 17H4a2 2 0 0 1 -2 -2V5a2 2 0 0 1 2 -2h16a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-1" +
+            "M12 15l5 6H7l5 -6z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Battery — body rectangle + side terminal.
+@Composable
+fun PhIconBattery(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawRoundRect(
+            color, Offset(2f * s, 7f * s), Size(18f * s, 10f * s),
+            CornerRadius(2f * s), st,
+        )
+        drawPath(parsePath("M23 13v-2", s), color, style = st)
+    }
+}
+
+// BatteryCharging — battery body + lightning bolt.
+@Composable
+fun PhIconBatteryCharging(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M5 18H3a2 2 0 0 1 -2 -2V8a2 2 0 0 1 2 -2h3.19" +
+            "M15 6h2a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-3.19" +
+            "M23 13v-2M11 6l-4 6h6l-4 6",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// MapPin — teardrop pin with inner dot.
+@Composable
+fun PhIconMapPin(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(
+            parsePath("M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z", s),
+            color, style = st,
+        )
+        drawCircle(color, 2.6f * s, Offset(12f * s, 10f * s), style = st)
+    }
+}
+
+// Radio — central dot + concentric arcs left and right.
+@Composable
+fun PhIconRadioWaves(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(
+            parsePath(
+                "M4.9 19.1C1 15.2 1 8.8 4.9 4.9M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5" +
+                    "M19.1 4.9C23 8.8 23 15.2 19.1 19.1M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5",
+                s,
+            ),
+            color, style = st,
+        )
+        drawCircle(color, 1.6f * s, Offset(12f * s, 12f * s), style = st)
+    }
+}
+
+// ── 11 Data & Analytics ─────────────────────────────────────────────
+
+// BarChart2 — three vertical bars of varying height.
+@Composable
+fun PhIconBarChart2(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M18 20V10M12 20V4M6 20v-6",
+        color, modifier.then(Modifier.size(size)), 2.0f,
+    )
+}
+
+// PieChart — circle quadrant + missing slice.
+@Composable
+fun PhIconPieChart(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M21.21 15.89A10 10 0 1 1 8 2.83M22 12A10 10 0 0 0 12 2v10z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// Activity — heartbeat line.
+@Composable
+fun PhIconActivity(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M22 12h-4l-3 9L9 3l-3 9H2",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// TrendingUp — arrow trending up.
+@Composable
+fun PhIconTrendingUp(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M23 6l-9.5 9.5 -5 -5L1 18M17 6h6v6",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// TrendingDown — arrow trending down.
+@Composable
+fun PhIconTrendingDown(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M23 18l-9.5 -9.5 -5 5L1 6M17 18h6v-6",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ── 12 Premium & Special ────────────────────────────────────────────
+
+// AtSign — @ symbol via inner circle + sweeping outer arc.
+@Composable
+fun PhIconAtSign(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawCircle(color, 4f * s, Offset(12f * s, 12f * s), style = st)
+        drawPath(
+            parsePath(
+                "M16 16v1.5a2.5 2.5 0 0 0 5 0V12a10 10 0 1 0 -3.92 7.94",
+                s,
+            ),
+            color, style = st,
+        )
+    }
+}
+
+// Percent — diagonal line with two terminator dots.
+@Composable
+fun PhIconPercent(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(parsePath("M19 5L5 19", s), color, style = st)
+        drawCircle(color, 2.5f * s, Offset(6.5f * s, 6.5f * s), style = st)
+        drawCircle(color, 2.5f * s, Offset(17.5f * s, 17.5f * s), style = st)
+    }
+}
+
+// Command — Apple ⌘ key glyph.
+@Composable
+fun PhIconCommand(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M18 3a3 3 0 0 0 -3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3 -3 3 3 0 0 0 -3 -3" +
+            "H6a3 3 0 0 0 -3 3 3 3 0 0 0 3 3 3 3 0 0 0 3 -3V6a3 3 0 0 0 -3 -3" +
+            " 3 3 0 0 0 -3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3 -3 3 3 0 0 0 -3 -3z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// DESIGN PARITY — icons referenced by Design/src/app/** but missing
+// from the catalog. Added 2026-05-09 after a full sweep of the
+// Lucide imports across the React mock files.
+// ─────────────────────────────────────────────────────────────────────
+
+// CheckCheck — double-check Lucide name; Phantom already shipped the
+// glyph as PhIconDoubleCheck. Alias keeps callers using either name.
+@Composable
+fun PhIconCheckCheck(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) =
+    PhIconDoubleCheck(color, modifier, size)
+
+// CornerUpLeft — Lucide name for the same glyph PhIconReply already
+// draws (arrow curling up-left). Alias for catalog symmetry.
+@Composable
+fun PhIconCornerUpLeft(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) =
+    PhIconReply(color, modifier, size)
+
+// ChevronUp — collapse / sort-ascending direction. Mirror of
+// PhIconChevronDown.
+@Composable
+fun PhIconChevronUp(color: Color, modifier: Modifier = Modifier, size: Dp = 14.dp) {
+    PhStrokePath("M18 15l-6 -6 -6 6", color, modifier.then(Modifier.size(size)))
+}
+
+// Code — `<>` chevron pair, used for fingerprint / diagnostic surfaces.
+@Composable
+fun PhIconCode(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath("M16 18l6 -6 -6 -6M8 6l-6 6 6 6", color, modifier.then(Modifier.size(size)))
+}
+
+// Edit2 — Lucide simple pencil (no baseline tick). Distinct from
+// PhIconEdit which now follows Edit3 with the eraser tick.
+@Composable
+fun PhIconEdit2(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
+    PhStrokePath(
+        "M17 3a2.828 2.828 0 0 1 4 4L7.5 20.5 2 22l1.5 -5.5L17 3z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// PhoneIncoming — phone glyph + diagonal arrow into the body
+// (top-right → bottom-left). Used in the Calls history "incoming" row.
+@Composable
+fun PhIconPhoneIncoming(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M16 2v6h6M21 3l-7 7" +
+            "M22 16.92v3a2 2 0 0 1 -2.18 2 19.79 19.79 0 0 1 -8.63 -3.07" +
+            " 19.5 19.5 0 0 1 -6 -6 19.79 19.79 0 0 1 -3.07 -8.67A2 2 0 0 1 4.11 2h3" +
+            "a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1 -.45 2.11L8.09 9.91" +
+            "a16 16 0 0 0 6 6l1.27 -1.27a2 2 0 0 1 2.11 -.45 12.84 12.84 0 0 0 2.81 .7" +
+            "A2 2 0 0 1 22 16.92z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// PhoneOutgoing — phone glyph + diagonal arrow out of the body
+// (bottom-left → top-right). Used in the Calls history "outgoing" row.
+@Composable
+fun PhIconPhoneOutgoing(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M22 8V2h-6M16 8l6 -6" +
+            "M22 16.92v3a2 2 0 0 1 -2.18 2 19.79 19.79 0 0 1 -8.63 -3.07" +
+            " 19.5 19.5 0 0 1 -6 -6 19.79 19.79 0 0 1 -3.07 -8.67A2 2 0 0 1 4.11 2h3" +
+            "a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1 -.45 2.11L8.09 9.91" +
+            "a16 16 0 0 0 6 6l1.27 -1.27a2 2 0 0 1 2.11 -.45 12.84 12.84 0 0 0 2.81 .7" +
+            "A2 2 0 0 1 22 16.92z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// PhoneMissed — phone glyph + an X mark; used for the missed-call row
+// in the Calls history.
+@Composable
+fun PhIconPhoneMissed(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M22 2L16 8M16 2l6 6" +
+            "M22 16.92v3a2 2 0 0 1 -2.18 2 19.79 19.79 0 0 1 -8.63 -3.07" +
+            " 19.5 19.5 0 0 1 -6 -6 19.79 19.79 0 0 1 -3.07 -8.67A2 2 0 0 1 4.11 2h3" +
+            "a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1 -.45 2.11L8.09 9.91" +
+            "a16 16 0 0 0 6 6l1.27 -1.27a2 2 0 0 1 2.11 -.45 12.84 12.84 0 0 0 2.81 .7" +
+            "A2 2 0 0 1 22 16.92z",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// ThumbsUp — Lucide hand/thumb glyph for like-style reactions.
+@Composable
+fun PhIconThumbsUp(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M14 9V5a3 3 0 0 0 -3 -3l-4 9v11h11.28a2 2 0 0 0 2 -1.7l1.38 -9" +
+            "a2 2 0 0 0 -2 -2.3zM7 22H4a2 2 0 0 1 -2 -2v-7a2 2 0 0 1 2 -2h3",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// UserPlus — silhouette + small + badge in the upper-right; canonical
+// "add contact" glyph.
+@Composable
+fun PhIconUserPlus(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Body: shoulders + head circle.
+        drawPath(
+            parsePath("M16 21v-2a4 4 0 0 0 -4 -4H5a4 4 0 0 0 -4 4v2", s),
+            color, style = st,
+        )
+        drawCircle(color, 4f * s, Offset(8.5f * s, 7f * s), style = st)
+        // Plus badge.
+        drawPath(parsePath("M20 8v6M23 11h-6", s), color, style = st)
+    }
 }
