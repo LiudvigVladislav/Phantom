@@ -17,6 +17,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
@@ -143,11 +144,13 @@ fun SettingsScreen(
             }
         },
     ) { padding ->
+        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
         LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
-            contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
+            modifier = Modifier.fillMaxSize(),
+            // Bottom contentPadding accounts for the floating BottomNavPill
+            // (pill is 64dp tall + 16dp from screen edge + a little breathing
+            // room) so the last "About" row stays scroll-reachable above it.
+            contentPadding = PaddingValues(top = 8.dp, bottom = 110.dp),
         ) {
             // ── 1. Profile card ──────────────────────────────────────────
             item {
@@ -356,7 +359,55 @@ fun SettingsScreen(
                 )
             }
         }
+            // Floating bottom-nav pill — Settings is a top-level destination
+            // alongside Chats / Calls / Nearby, so the pill stays visible.
+            // Earlier the pill was missing here, leaving Settings the only
+            // top-level tab without app-wide navigation. Bug surfaced
+            // during 2026-05-09 visual QA.
+            BottomNavPill(
+                activeTab = NavTab.SETTINGS,
+                onTabSelected = { tab ->
+                    when (tab) {
+                        NavTab.CHATS    -> onNavigate(Screen.ChatList)
+                        NavTab.CALLS    -> onNavigate(Screen.Calls)
+                        NavTab.NEARBY   -> onNavigate(Screen.Nearby)
+                        NavTab.SETTINGS -> {}
+                    }
+                },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
+        }
     }
+}
+
+// ── Self-profile gradient helper ──────────────────────────────────────────────
+
+/**
+ * Re-derives the self-profile gradient brush every recomposition so the
+ * Settings ProfileCard reflects gradient picks made in ProfileScreen
+ * without needing an explicit refresh signal. Returns null when the user
+ * has not picked a preset (the avatar then derives a brush from the
+ * username, which is the GradientAvatar default behaviour).
+ */
+@Composable
+private fun rememberSelfProfileGradient(): Brush? {
+    val context = LocalContext.current
+    val prefs = remember {
+        context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
+    }
+    val idx = prefs.getInt("profile_gradient_index", -1)
+    if (idx < 0) return null
+    val presets = listOf(
+        Color(0xFF00D4FF) to Color(0xFF0055CC),
+        Color(0xFF8B5CF6) to Color(0xFFEC4899),
+        Color(0xFF2FBF71) to Color(0xFF0099AA),
+        Color(0xFFF97316) to Color(0xFFE85D75),
+        Color(0xFFF59E0B) to Color(0xFFD97706),
+        Color(0xFF3B82F6) to Color(0xFF1D4ED8),
+        Color(0xFFFB7185) to Color(0xFFF43F5E),
+        Color(0xFF10B981) to Color(0xFF065F46),
+    )
+    return presets.getOrNull(idx)?.let { (a, b) -> Brush.linearGradient(listOf(a, b)) }
 }
 
 // ── Profile card ──────────────────────────────────────────────────────────────
@@ -371,7 +422,7 @@ private fun ProfileCard(
     name: String,
     handle: String,
     avatar: androidx.compose.ui.graphics.ImageBitmap?,
-    initials: String,
+    @Suppress("UNUSED_PARAMETER") initials: String,
     tierBadge: String,
     onClick: () -> Unit,
 ) {
@@ -387,29 +438,17 @@ private fun ProfileCard(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        // Avatar 52dp — bitmap if available, otherwise initials on indigo.
-        Box(
-            modifier = Modifier
-                .size(52.dp)
-                .clip(CircleShape)
-                .background(Color(0xFF4853C2)),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (avatar != null) {
-                androidx.compose.foundation.Image(
-                    bitmap = avatar,
-                    contentDescription = null,
-                    modifier = Modifier.fillMaxSize().clip(CircleShape),
-                )
-            } else {
-                Text(
-                    text = initials.ifEmpty { "?" },
-                    color = Color.White,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-            }
-        }
+        // Avatar 52dp via GradientAvatar so the user's chosen profile
+        // gradient (or photo) from ProfileScreen is reflected here too.
+        // The earlier hand-rolled Box with hardcoded indigo bg ignored the
+        // preset picker and the avatar felt out-of-sync after a gradient
+        // change in ProfileScreen.
+        GradientAvatar(
+            name = name.ifEmpty { handle.removePrefix("@").ifEmpty { "?" } },
+            size = 52.dp,
+            brushOverride = rememberSelfProfileGradient(),
+            imageBitmap = avatar,
+        )
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
