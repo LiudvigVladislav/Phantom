@@ -419,6 +419,10 @@ private fun PhantomApp(
             onNavigate = { currentScreen = it },
             onProfile = { currentScreen = Screen.Profile },
         )
+        is Screen.PrivacyModeDetail -> phantom.android.screens.settings.PrivacyModeDetailScreen(
+            container = container,
+            onBack = { currentScreen = Screen.Settings },
+        )
         is Screen.Profile -> ProfileScreen(
             container = container,
             onBack = { currentScreen = Screen.ChatList },

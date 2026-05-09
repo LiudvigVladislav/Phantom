@@ -789,3 +789,85 @@ fun PhIconArchive(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp)
         color, modifier.then(Modifier.size(size)),
     )
 }
+
+// ── Settings-screen icons (FULL_COMPOSE §06) ──────────────────────
+
+// key — circle bow + shaft with two notches
+@Composable
+fun PhIconKey(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // bow — circle at (8, 15) radius 4
+        drawPath(parsePath(
+            "M12 15a4 4 0 1 1 -8 0 4 4 0 0 1 8 0z", s), color, style = st)
+        // shaft from (12, 11) to (21, 2) with two notches
+        drawPath(parsePath(
+            "M11.5 11.5L21 2M16.5 6.5l3 3M19 4l3 3", s), color, style = st)
+    }
+}
+
+// credit card — rounded rect + magstripe
+@Composable
+fun PhIconCreditCard(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawRoundRect(color, Offset(2f * s, 5f * s), Size(20f * s, 14f * s),
+            CornerRadius(2f * s), st)
+        drawPath(parsePath("M2 10h20", s), color, style = st)
+    }
+}
+
+// clock — circle + two hands at 12 and 3
+@Composable
+fun PhIconClock(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M12 22a10 10 0 1 0 0 -20 10 10 0 0 0 0 20zM12 6v6l4 2",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// camera — body + viewfinder bump + lens circle
+@Composable
+fun PhIconCamera(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val st = Stroke(1.6f * s, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawPath(parsePath(
+            "M3 7h3l2-3h8l2 3h3v13H3z", s), color, style = st)
+        // lens circle at (12, 13) radius 4
+        drawPath(parsePath(
+            "M16 13a4 4 0 1 1 -8 0 4 4 0 0 1 8 0z", s), color, style = st)
+    }
+}
+
+// database — three stacked ellipses (cylinder side view)
+@Composable
+fun PhIconDatabase(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M4 6c0-1.66 3.58-3 8-3s8 1.34 8 3-3.58 3-8 3-8-1.34-8-3z" +
+            "M4 6v6c0 1.66 3.58 3 8 3s8-1.34 8-3V6" +
+            "M4 12v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// info — circle + i (dot + vertical bar)
+@Composable
+fun PhIconInfo(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M12 22a10 10 0 1 0 0 -20 10 10 0 0 0 0 20zM12 16v-5M12 8h0.01",
+        color, modifier.then(Modifier.size(size)),
+    )
+}
+
+// file with text — page outline + folded corner + 3 lines of text
+@Composable
+fun PhIconFileText(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    PhStrokePath(
+        "M14 2H6a2 2 0 0 0 -2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2V8z" +
+            "M14 2v6h6M9 13h6M9 17h6M9 9h2",
+        color, modifier.then(Modifier.size(size)),
+    )
+}

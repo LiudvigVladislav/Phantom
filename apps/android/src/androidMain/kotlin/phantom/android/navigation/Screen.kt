@@ -18,6 +18,12 @@ sealed class Screen {
     object Nearby : Screen()
     object Premium : Screen()
     object Settings : Screen()
+    /**
+     * ADR-020 Phase 3 + Settings rewrite: dedicated detail screen for the
+     * Privacy Mode selector. Reached from the Privacy & Security row in
+     * Settings (chevron). Hosts the existing pill picker + Ghost confirm.
+     */
+    object PrivacyModeDetail : Screen()
     object MessageRequests : Screen()
     object Profile : Screen()
     object AddContact : Screen()
