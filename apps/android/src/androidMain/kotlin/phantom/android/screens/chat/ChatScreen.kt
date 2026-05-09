@@ -25,6 +25,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -2153,24 +2154,45 @@ private fun InputBar(
                     }
                 }
             } else {
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = onTextChange,
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message…", color = TextDim, fontSize = 14.sp) },
-                    singleLine = false,
-                    maxLines = 5,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = TextPrimary,
-                        unfocusedTextColor = TextPrimary,
-                        focusedBorderColor = Color.Transparent,
-                        unfocusedBorderColor = Color.Transparent,
-                        cursorColor = CyanAccent,
-                        focusedContainerColor = Surface2,
-                        unfocusedContainerColor = Surface2,
-                    ),
-                    shape = RoundedCornerShape(18.dp),
-                )
+                // FULL_COMPOSE §05 composer input: 38dp pill (radius
+                // 9999), Surface bg + Border 1px. The earlier
+                // OutlinedTextField was ~56dp tall (Material 3 default
+                // min-height) with a 18dp rounded-rect — visually too
+                // heavy for the Phase-2 composer aesthetic. BasicTextField
+                // in a custom container reproduces the React mock exactly.
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 38.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(PhantomTokens.Colors.Surface)
+                        .border(1.dp, PhantomTokens.Colors.Border, RoundedCornerShape(50))
+                        .padding(horizontal = 16.dp, vertical = 9.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    BasicTextField(
+                        value = text,
+                        onValueChange = onTextChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = false,
+                        maxLines = 5,
+                        textStyle = androidx.compose.ui.text.TextStyle(
+                            color = TextPrimary,
+                            fontSize = 14.sp,
+                        ),
+                        cursorBrush = androidx.compose.ui.graphics.SolidColor(CyanAccent),
+                        decorationBox = { inner ->
+                            if (text.isEmpty()) {
+                                Text(
+                                    text = "Message…",
+                                    color = TextDim.copy(alpha = 0.4f),
+                                    fontSize = 14.sp,
+                                )
+                            }
+                            inner()
+                        },
+                    )
+                }
             }
 
             Spacer(Modifier.width(8.dp))
@@ -2495,15 +2517,34 @@ private fun ChatTopBar(
                     .weight(1f)
                     .clickable(onClick = onContactProfile),
             ) {
-                Text(
-                    text = theirUsername,
-                    color = PhantomTokens.Colors.TextPrimary,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Medium,
-                    letterSpacing = (-0.15).sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                // Name row + tiny lock badge per FULL_COMPOSE §05 — the
+                // 14×14 SurfaceDeep circle with cyan lock is the chat-level
+                // E2EE trust signal. Reinforces the encryption strip below
+                // the header without being loud.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = theirUsername,
+                        color = PhantomTokens.Colors.TextPrimary,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = (-0.15).sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(14.dp)
+                            .clip(CircleShape)
+                            .background(PhantomTokens.Colors.SurfaceDeep)
+                            .border(1.dp, PhantomTokens.Colors.BorderSubtle, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        PhIconLock(color = CyanAccent, size = 7.dp)
+                    }
+                }
+                Spacer(Modifier.height(2.dp))
                 if (isTyping) {
                     Text(
                         text = "typing…",
@@ -2511,6 +2552,27 @@ private fun ChatTopBar(
                         fontSize = 11.sp,
                         fontFamily = PhantomFontMono,
                     )
+                } else if (isConnected) {
+                    // Online state row per FULL_COMPOSE §05: 5dp Success
+                    // dot + mono "online" label. Falls back to the @handle
+                    // line when the transport is offline so the user always
+                    // sees something meaningful below the name.
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(5.dp)
+                                .clip(CircleShape)
+                                .background(Success),
+                        )
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            text = "online",
+                            color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.65f),
+                            fontSize = 10.sp,
+                            fontFamily = PhantomFontMono,
+                            letterSpacing = 0.4.sp,
+                        )
+                    }
                 } else {
                     Text(
                         text = "@$theirUsername",
@@ -2528,7 +2590,7 @@ private fun ChatTopBar(
             }
             Box {
                 IconButton(onClick = onMoreMenu, modifier = Modifier.size(40.dp)) {
-                    PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
+                    PhIconMoreHoriz(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
                 }
                 DropdownMenu(
                     expanded = showMenu,
