@@ -25,7 +25,13 @@ import com.google.zxing.qrcode.QRCodeWriter
 fun generateQrBitmap(content: String, sizePx: Int = 512): Bitmap {
     val hints = mapOf(EncodeHintType.MARGIN to 1)
     val bits = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
-    val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.RGB_565)
+    // ARGB_8888 not RGB_565 — `setPixel(Color.BLACK / WHITE)` writes ARGB
+    // ints, which RGB_565 (16-bit, no alpha) silently corrupts on some
+    // Android 13+ vendor stacks (Tecno, several emulator AVDs). Result
+    // observed in the field: the QR card rendered as a solid black square
+    // on the user's Profile screen. ARGB_8888 keeps full int semantics
+    // and adds only ~340 KiB per 512×512 bitmap, which is fine here.
+    val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
     for (x in 0 until sizePx) {
         for (y in 0 until sizePx) {
             bmp.setPixel(x, y, if (bits[x, y]) Color.BLACK else Color.WHITE)
