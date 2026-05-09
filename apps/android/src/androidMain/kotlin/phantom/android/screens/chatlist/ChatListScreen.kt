@@ -490,26 +490,19 @@ private fun NotesRow(onClick: () -> Unit) {
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Notes row leading: outline bookmark glyph on a Surface2 circle —
+        // FULL_COMPOSE Chats Screen mock. Cyan-filled pentagon glyph was too
+        // loud; the system uses cyan for trust/active only, not for static
+        // list-item decoration.
         Box(
             modifier = Modifier
-                .size(46.dp)
+                .size(40.dp)
                 .clip(CircleShape)
-                .background(CyanAccent.copy(alpha = 0.10f))
-                .border(1.dp, CyanAccent.copy(alpha = 0.28f), CircleShape),
+                .background(Surface2)
+                .border(1.dp, BorderSubtle, CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            Canvas(modifier = Modifier.size(22.dp)) {
-                val w = size.width; val h = size.height
-                val path = Path().apply {
-                    moveTo(w * 0.25f, 0f)
-                    lineTo(w * 0.75f, 0f)
-                    lineTo(w * 0.75f, h)
-                    lineTo(w * 0.5f, h * 0.72f)
-                    lineTo(w * 0.25f, h)
-                    close()
-                }
-                drawPath(path, color = CyanAccent)
-            }
+            PhIconBookmark(color = TextDim, size = 18.dp)
         }
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
@@ -620,7 +613,11 @@ private fun ChatRow(
             .padding(horizontal = PhantomTokens.Spacing.comfortable, vertical = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        GradientAvatar(name = conv.theirUsername, size = 40.dp)
+        GradientAvatar(
+            name = conv.theirUsername,
+            size = 40.dp,
+            verified = conv.isVerified,
+        )
         Spacer(Modifier.width(PhantomTokens.Spacing.tight))
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
