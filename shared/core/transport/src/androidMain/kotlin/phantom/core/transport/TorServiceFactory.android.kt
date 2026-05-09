@@ -100,15 +100,23 @@ internal class TorServiceAndroid(
                 // directory authority, which TSPU/GFW classes drop. Order
                 // matters; reordering breaks censored-network connectivity.
                 if (config.useBridges) {
-                    // Operator-controlled WebTunnel bridges go FIRST in the list
-                    // (tor tries entries in declared order). When populated, the
-                    // very first connect attempt goes to bridge.phntm.pro — a
-                    // path we control end-to-end. Public Snowflake follows as
-                    // best-effort fallback for users whose network reaches the
-                    // Tor Project broker URLs (typically uncensored networks
-                    // where this whole branch is irrelevant anyway).
-                    val bridges = OperatorBridges.WEBTUNNEL + SnowflakeBridges.DEFAULT
-                    Log.i(LOG_TAG, "wrapper.enableBridges(operator × ${OperatorBridges.WEBTUNNEL.size}, snowflake × ${SnowflakeBridges.DEFAULT.size})")
+                    // Bridge order matters — tor tries entries in declared sequence.
+                    // ADR-020 Stage 5G Phase 1: obfs4 first (different wire signature
+                    //   from WebTunnel — bypasses TSPU 16-KB curtain that classified
+                    //   our WebTunnel handshakes).
+                    // WebTunnel second (kept as fallback for non-RU users / networks
+                    //   where the curtain is not active).
+                    // Snowflake last (public Tor Project bridges; only useful on
+                    //   uncensored networks anyway).
+                    val bridges = OperatorBridges.OBFS4 +
+                        OperatorBridges.WEBTUNNEL +
+                        SnowflakeBridges.DEFAULT
+                    Log.i(
+                        LOG_TAG,
+                        "wrapper.enableBridges(obfs4 × ${OperatorBridges.OBFS4.size}, " +
+                            "webtunnel × ${OperatorBridges.WEBTUNNEL.size}, " +
+                            "snowflake × ${SnowflakeBridges.DEFAULT.size})",
+                    )
                     wrapper.enableBridges(bridges)
                 } else {
                     Log.i(LOG_TAG, "wrapper.disableBridges() (direct guards path)")

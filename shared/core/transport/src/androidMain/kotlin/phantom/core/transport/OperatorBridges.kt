@@ -78,4 +78,41 @@ internal object OperatorBridges {
             "D2F3A6695223C0DCDBC14AF159807474673A539C " +
             "url=https://bridge.phntm.pro/2a8652911c0cf7150ad0a0b32626434a",
     )
+
+    /**
+     * Operator-controlled obfs4 bridge entries (ADR-020 Stage 5G Phase 1).
+     *
+     * Why obfs4 alongside WebTunnel:
+     *   Test 13 (2026-05-06) showed that **WebTunnel** TLS handshakes hit
+     *   the TSPU 16-KB curtain even on FlokiNET (the curtain is a
+     *   behavioural classifier, not an ASN block). obfs4 has a different
+     *   wire signature — it does not present a TLS ClientHello at all but
+     *   a uniform-random byte stream — so it bypasses the curtain's TLS
+     *   pattern matching. obfs4 is also Tor's most battle-tested PT
+     *   (deployed since 2014, used by Tor Browser default-bridges).
+     *
+     * Where the line comes from:
+     *   Run an obfs4 bridge on the existing FlokiNET VPS following
+     *   `deploy/obfs4-bridge-setup.md`. After the bridge has been online
+     *   for ~1 hour, extract the canonical line from
+     *   `/var/lib/tor/pt_state/obfs4_bridgeline.txt` and paste it here
+     *   (preserving the leading "Bridge " prefix).
+     *
+     * Listed BEFORE [WEBTUNNEL] in the chain that
+     * `TorServiceFactory.android.kt` builds — when this list is non-empty
+     * tor tries obfs4 first on the assumption that any user landing in
+     * the bridge code path is on a network where vanilla guards already
+     * failed (i.e. likely TSPU territory).
+     *
+     * Empty by default until Vladislav populates after running the deploy
+     * script. An empty list contributes nothing to the bridge chain (just
+     * a `+` of an empty list to the WebTunnel one) — no behaviour change
+     * until the first real entry lands.
+     */
+    val OBFS4: List<String> = emptyList()
+        // Example shape (do NOT commit example values — produce real ones
+        // from the deploy script):
+        //
+        // "Bridge obfs4 192.0.2.10:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 " +
+        //     "cert=AAAA…BBBB iat-mode=0",
 }
