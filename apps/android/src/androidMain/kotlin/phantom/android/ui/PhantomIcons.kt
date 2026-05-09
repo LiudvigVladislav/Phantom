@@ -68,10 +68,14 @@ fun PhIconPencilCompose(color: Color, modifier: Modifier = Modifier, size: Dp = 
     }
 }
 
-// simple pencil/edit (no tip line)
+// Lucide Edit3 — pencil with the canonical baseline tick under the
+// eraser so it reads as "edit" rather than a generic pencil.
 @Composable
 fun PhIconEdit(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
-    PhStrokePath("M4 20h4l11-11-4-4L4 16v4z", color, modifier.then(Modifier.size(size)))
+    PhStrokePath(
+        "M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z",
+        color, modifier.then(Modifier.size(size)),
+    )
 }
 
 // ── Messaging ────────────────────────────────────────────────────
@@ -167,11 +171,12 @@ fun PhIconCopy(color: Color, modifier: Modifier = Modifier, size: Dp = 14.dp) {
     }
 }
 
-// trash / delete
+// Lucide Trash2 — trash bin with two inner vertical guide lines so it
+// reads as "delete content" rather than just an empty container.
 @Composable
 fun PhIconTrash(color: Color, modifier: Modifier = Modifier, size: Dp = 15.dp) {
     PhStrokePath(
-        "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13",
+        "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6",
         color, modifier.then(Modifier.size(size)),
     )
 }
@@ -185,10 +190,15 @@ fun PhIconPin(color: Color, modifier: Modifier = Modifier, size: Dp = 12.dp) {
     }
 }
 
-// pin action (upright pin shape)
+// Lucide Pin — front-view pushpin with the canonical 4.76 head ratio
+// and a 5dp tail. Replaces the earlier hand-rolled glyph that read
+// more like a vertical needle than a pin.
 @Composable
 fun PhIconPinAction(color: Color, modifier: Modifier = Modifier, size: Dp = 16.dp) {
-    PhStrokePath("M12 2v8M12 10l5 4v4H7v-4l5-4zM12 18v4", color, modifier.then(Modifier.size(size)))
+    PhStrokePath(
+        "M12 17v5M9 10.76V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v4.76l3 4.24v2H6v-2l3-4.24z",
+        color, modifier.then(Modifier.size(size)),
+    )
 }
 
 // bookmark
