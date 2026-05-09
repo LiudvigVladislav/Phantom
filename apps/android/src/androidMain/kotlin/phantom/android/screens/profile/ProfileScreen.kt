@@ -763,14 +763,33 @@ private fun QrKeyCard(
         ) {
             QrCodeImage(content = identityString, size = 172.dp)
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(14.dp))
 
+            // First 32 hex chars of the public key, formatted as 8 groups
+            // of 4. FULL_COMPOSE Profile/Mobile 1 uses this hex as the
+            // verify-by-eye channel; we keep the QR above for QR-scan and
+            // add the hex below so both modes are reachable from one card.
+            val hexFingerprint = remember(identityString) {
+                val pubHex = identityString.substringAfter(":", "")
+                if (pubHex.length >= 32)
+                    pubHex.substring(0, 32).uppercase().chunked(4).joinToString("  ")
+                else "—"
+            }
             Text(
-                text = "QR code and key are visible only to you.\nShare only with people you trust.",
-                color = TextDim,
+                text = hexFingerprint,
+                color = TextPrimary,
+                fontSize = 13.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 0.65.sp,
+                lineHeight = 22.sp,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Your public identity fingerprint",
+                color = TextDim.copy(alpha = 0.65f),
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
-                lineHeight = 18.sp,
             )
 
             Spacer(Modifier.height(16.dp))

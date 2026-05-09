@@ -326,22 +326,102 @@ fun SettingsScreen(
                             onClick = { showComingSoon() },
                         )
                         HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                        SettingsRowItem(
-                            icon = { PhIconSun(color = CyanAccent, size = 16.dp) },
-                            label = "Theme",
-                            value = "Dark",
-                            onClick = { showComingSoon() },
-                        )
+                        // Theme row with inline LOCKED badge (per FULL_COMPOSE
+                        // Settings Mobile 2). Dark is the only theme PHANTOM
+                        // ships — light mode would weaken the architectural
+                        // tone the design language is built on, so it stays
+                        // locked rather than "coming soon".
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier.size(20.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                PhIconSun(color = CyanAccent, size = 16.dp)
+                            }
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "Theme",
+                                    color = TextPrimary,
+                                    fontSize = 15.sp,
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(Color.White.copy(alpha = 0.04f))
+                                        .border(
+                                            1.dp,
+                                            Color.White.copy(alpha = 0.08f),
+                                            RoundedCornerShape(4.dp),
+                                        )
+                                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                                ) {
+                                    Text(
+                                        text = "LOCKED",
+                                        color = TextDim,
+                                        fontSize = 8.sp,
+                                        fontFamily = PhantomFontMono,
+                                        fontWeight = FontWeight.Medium,
+                                        letterSpacing = 1.4.sp,
+                                    )
+                                }
+                            }
+                            Text(
+                                text = "Dark",
+                                color = TextDim,
+                                fontSize = 13.sp,
+                            )
+                        }
                     }
                 }
 
-                // Notifications
+                // Notifications — FULL_COMPOSE Settings Mobile 2.
                 item { SettingsGroupHeader("Notifications") }
                 item {
+                    val prefs = context.getSharedPreferences(
+                        "phantom_prefs",
+                        android.content.Context.MODE_PRIVATE,
+                    )
+                    var messageAlerts by remember {
+                        mutableStateOf(prefs.getBoolean("notif_message_alerts", true))
+                    }
+                    var callAlerts by remember {
+                        mutableStateOf(prefs.getBoolean("notif_call_alerts", true))
+                    }
                     SettingsGroupCard {
-                        SettingsRowItem(
+                        SettingsToggleRow(
                             icon = { PhIconBell(color = CyanAccent, size = 16.dp) },
-                            label = "Notifications & Sounds",
+                            label = "Message Alerts",
+                            checked = messageAlerts,
+                            onCheckedChange = {
+                                messageAlerts = it
+                                prefs.edit().putBoolean("notif_message_alerts", it).apply()
+                            },
+                        )
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                        SettingsToggleRow(
+                            icon = { PhIconPhone(color = CyanAccent, size = 16.dp) },
+                            label = "Call Alerts",
+                            checked = callAlerts,
+                            onCheckedChange = {
+                                callAlerts = it
+                                prefs.edit().putBoolean("notif_call_alerts", it).apply()
+                            },
+                        )
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                        SettingsRowItem(
+                            icon = { PhIconVolume(color = CyanAccent, size = 16.dp) },
+                            label = "Sound",
+                            value = "Default",
                             onClick = { showComingSoon() },
                         )
                     }
@@ -445,7 +525,41 @@ fun SettingsScreen(
                 // the sheet exists now so the IA matches the canonical doc.
                 item { SettingsGroupHeader("Advanced") }
                 item {
+                    val prefs = context.getSharedPreferences(
+                        "phantom_prefs",
+                        android.content.Context.MODE_PRIVATE,
+                    )
+                    var developerMode by remember {
+                        mutableStateOf(prefs.getBoolean("developer_mode", false))
+                    }
+                    // Cache size — sum of cacheDir + databases dir. Computed
+                    // once on composition; refreshes when "Clear cache" runs.
+                    var cacheSize by remember { mutableStateOf<String?>(null) }
+                    LaunchedEffect(Unit) {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            val total = computeCacheSizeBytes(context)
+                            cacheSize = formatByteSize(total)
+                        }
+                    }
+
                     SettingsGroupCard {
+                        SettingsToggleRow(
+                            icon = { PhIconShieldCheck(color = CyanAccent, size = 16.dp) },
+                            label = "Developer Mode",
+                            checked = developerMode,
+                            onCheckedChange = {
+                                developerMode = it
+                                prefs.edit().putBoolean("developer_mode", it).apply()
+                            },
+                        )
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                        SettingsRowItem(
+                            icon = { PhIconBookmark(color = CyanAccent, size = 16.dp) },
+                            label = "Storage & Cache",
+                            value = cacheSize ?: "…",
+                            onClick = { showComingSoon() },
+                        )
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                         SettingsRowItem(
                             icon = { PhIconDownload(color = CyanAccent, size = 16.dp) },
                             label = "Export data",
@@ -457,7 +571,19 @@ fun SettingsScreen(
                             icon = { PhIconTrash(color = CyanAccent, size = 16.dp) },
                             label = "Clear cache",
                             value = null,
-                            onClick = { showComingSoon() },
+                            onClick = {
+                                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                    runCatching {
+                                        context.cacheDir.deleteRecursively()
+                                        context.cacheDir.mkdirs()
+                                    }
+                                    val total = computeCacheSizeBytes(context)
+                                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                        cacheSize = formatByteSize(total)
+                                        snackbarHostState.showSnackbar("Cache cleared")
+                                    }
+                                }
+                            },
                         )
                     }
                 }
@@ -653,6 +779,26 @@ private val LOCK_TIMEOUT_OPTIONS: List<Pair<Long, String>> = listOf(
     5 * 60_000L   to "After 5 minutes",
     60 * 60_000L  to "After 1 hour",
 )
+
+// Sum cacheDir + database files recursively. Used to render the
+// "Storage & Cache" row trailing value in the Advanced section, and is
+// recomputed after "Clear cache" runs so the user sees the result.
+private fun computeCacheSizeBytes(context: android.content.Context): Long {
+    fun walk(file: java.io.File): Long {
+        if (!file.exists()) return 0L
+        if (file.isFile) return file.length()
+        return file.listFiles()?.sumOf { walk(it) } ?: 0L
+    }
+    val cache = walk(context.cacheDir)
+    val db = walk(context.getDatabasePath("placeholder").parentFile ?: java.io.File(""))
+    return cache + db
+}
+
+private fun formatByteSize(bytes: Long): String {
+    if (bytes < 1_024) return "$bytes B"
+    if (bytes < 1_024 * 1_024) return "${bytes / 1_024} KB"
+    return "%.1f MB".format(bytes / 1_048_576.0)
+}
 
 private fun lockTimeoutLabel(ms: Long): String =
     LOCK_TIMEOUT_OPTIONS.firstOrNull { it.first == ms }?.second
