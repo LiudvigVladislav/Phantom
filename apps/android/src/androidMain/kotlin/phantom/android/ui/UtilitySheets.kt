@@ -296,7 +296,9 @@ private fun SheetPrimaryCta(label: String, onClick: () -> Unit, enabled: Boolean
         ),
         border = if (!enabled)
             androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle) else null,
-        shape = RoundedCornerShape(8.dp),
+        // FULL_COMPOSE §14: utility-sheet primary CTAs are full pills,
+        // matching the design system's pill-button language.
+        shape = RoundedCornerShape(50),
     ) {
         Text(
             text = label,
