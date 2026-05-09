@@ -32,6 +32,12 @@ enum class NavTab { CALLS, CHATS, NEARBY, SETTINGS }
 fun PhantomTopBar(
     userName: String = "",
     title: String = "Messages",
+    /** When true the [title] is rendered as a centered wordmark — used by
+     *  the home (chat list) screen so the PHANTOM brand mark sits
+     *  symmetrically between the avatar and the compose action, per
+     *  FULL_COMPOSE §03 mobile mock. Other top-level tabs keep
+     *  left-aligned literal titles ("Calls" / "Settings"). */
+    centerTitle: Boolean = false,
     onProfile: () -> Unit = {},
     onAddContact: () -> Unit = {},
     onScanQr: () -> Unit = {},
@@ -136,48 +142,74 @@ fun PhantomTopBar(
             .background(Surface)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
-        Row(
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 18.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Avatar + dropdown
-            Box {
-                Box(
-                    modifier = Modifier
-                        .clip(CircleShape)
-                        .clickable { showAvatarMenu = !showAvatarMenu },
-                ) {
-                    // Phase 2 mockup: 32dp avatar in the chats header.
-                    GradientAvatar(
-                        name = userName.ifEmpty { "?" },
-                        size = 32.dp,
-                        brushOverride = gradientBrush,
-                        imageBitmap = avatarBitmap,
-                    )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // Avatar + dropdown
+                Box {
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .clickable { showAvatarMenu = !showAvatarMenu },
+                    ) {
+                        // Phase 2 mockup: 32dp avatar in the chats header.
+                        GradientAvatar(
+                            name = userName.ifEmpty { "?" },
+                            size = 32.dp,
+                            brushOverride = gradientBrush,
+                            imageBitmap = avatarBitmap,
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = showAvatarMenu,
+                        onDismissRequest = { showAvatarMenu = false },
+                    ) {
+                        avatarMenuContent { showAvatarMenu = false }
+                    }
                 }
-                DropdownMenu(
-                    expanded = showAvatarMenu,
-                    onDismissRequest = { showAvatarMenu = false },
-                ) {
-                    avatarMenuContent { showAvatarMenu = false }
+
+                // Left-aligned title path (Calls / Settings / Nearby).
+                // The chat list opts into [centerTitle] = true and uses the
+                // overlay below instead so the wordmark stays geometrically
+                // centered regardless of avatar / trailing widths.
+                if (!centerTitle) {
+                    Box(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
+                        Text(
+                            text = title,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Medium,
+                            letterSpacing = (-0.20).sp,
+                            color = TextPrimary,
+                        )
+                    }
+                } else {
+                    // When centred, the avatar still occupies the leading
+                    // edge and trailing() the trailing edge — the wordmark
+                    // overlay below sits between them, geometrically.
+                    Spacer(modifier = Modifier.weight(1f))
                 }
+
+                trailing()
             }
 
-            // Title is parametrised so each tab can supply its own header
-            // ("Messages" / "Calls" / "Settings" / "Nearby"). PHANTOM_FULL_COMPOSE §03.
-            Box(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
+            // Centred wordmark overlay — sits in the middle of the row
+            // independent of the avatar / trailing widths.
+            if (centerTitle) {
                 Text(
                     text = title,
-                    fontSize = 20.sp,
+                    fontSize = 17.sp,
                     fontWeight = FontWeight.Medium,
-                    letterSpacing = (-0.20).sp,
+                    letterSpacing = (-0.10).sp,
                     color = TextPrimary,
+                    modifier = Modifier.align(Alignment.Center),
                 )
             }
-
-            trailing()
         }
 
         // Hairline divider — BorderSubtle from design system.
