@@ -534,6 +534,19 @@ fun PhIconMoreVert(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp
     }
 }
 
+// three-dot horizontal menu (filled dots) — chat-header overflow per
+// FULL_COMPOSE §05 ActiveChatScreen mock.
+@Composable
+fun PhIconMoreHoriz(color: Color, modifier: Modifier = Modifier, size: Dp = 18.dp) {
+    Canvas(modifier = modifier.then(Modifier.size(size))) {
+        val s = this.size.width / 24f
+        val r = 1.8f * s; val cy = 12f * s
+        drawCircle(color, r, Offset(5f * s, cy))
+        drawCircle(color, r, Offset(12f * s, cy))
+        drawCircle(color, r, Offset(19f * s, cy))
+    }
+}
+
 // radar — concentric rings + sweep line + center dot.
 // Used for the Nearby (mesh) bottom-nav tab. Architectural truth, not a wifi
 // glyph: PHANTOM finds peers via BLE/WiFi-Direct, not internet APs.
