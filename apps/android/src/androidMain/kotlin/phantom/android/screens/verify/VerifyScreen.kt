@@ -13,7 +13,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -372,15 +371,17 @@ private fun FingerprintBlock(
         VerifyState.Mismatch -> Danger.copy(alpha = 0.70f)
         else -> TextPrimary
     }
-    val blockAlpha = if (accent == VerifyState.Mismatch) 0.70f else 1f
+    // FULL_COMPOSE §12: only the fingerprint hex carries the danger tint
+    // on mismatch — the surrounding card (avatar, name, label) stays at
+    // full opacity so it remains readable. Earlier `.alpha(0.70f)` on the
+    // whole Column dimmed everything and felt overcautious.
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .alpha(blockAlpha)
             .clip(RoundedCornerShape(12.dp))
             .background(BgDeep)
             .border(1.dp, borderColor, RoundedCornerShape(12.dp))
-            .padding(horizontal = 20.dp, vertical = 18.dp),
+            .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             GradientAvatar(name = name, size = 32.dp)
