@@ -164,6 +164,13 @@ fun ProfileScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                // Window insets disabled at the Scaffold (line 156:
+                // `contentWindowInsets = WindowInsets(0)`); re-add the
+                // navigation-bar inset on the scroll body so the
+                // DeleteSection helper text below the link doesn't get
+                // clipped by the gesture area at the bottom of the
+                // screen. Surfaced in 2026-05-09 visual QA.
+                .windowInsetsPadding(WindowInsets.navigationBars)
                 .verticalScroll(rememberScrollState()),
         ) {
             // ── Profile card ─────────────────────────────────────────────────
@@ -561,8 +568,15 @@ private fun ProfileCard(
 
             // PHANTOM_FULL_COMPOSE §07 Zone A — display name in Geist 24px
             // textPrimary, then @handle in Mono 12px textTertiary opacity 0.55.
+            // Combine first + last name when both are filled so the header
+            // matches the React mock ("Maya Hertzog", not just "Maya").
+            // Falls through: full name → first name only → @username → "Loading…".
+            val displayName = listOf(firstName, lastName)
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
+                .ifEmpty { username.ifEmpty { "Loading…" } }
             Text(
-                text = if (firstName.isNotEmpty()) firstName else (if (username.isNotEmpty()) username else "Loading…"),
+                text = displayName,
                 color = TextPrimary,
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Medium,
@@ -953,7 +967,12 @@ private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) 
 
 private fun formatMemberSince(createdAtMs: Long): String {
     if (createdAtMs <= 0L) return "—"
-    val fmt = java.text.SimpleDateFormat("MMMM yyyy", java.util.Locale.getDefault())
+    // App copy is English-only — Locale.getDefault() picked up the
+    // device locale and rendered Russian month names (e.g. "мая 2026")
+    // even though every other label in the screen is English.
+    // Force Locale.ENGLISH so Member-since stays consistent with the
+    // surrounding UI until full localisation lands.
+    val fmt = java.text.SimpleDateFormat("MMMM yyyy", java.util.Locale.ENGLISH)
     return fmt.format(java.util.Date(createdAtMs))
 }
 
