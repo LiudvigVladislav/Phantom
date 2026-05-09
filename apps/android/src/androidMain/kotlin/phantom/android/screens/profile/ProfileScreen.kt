@@ -95,6 +95,7 @@ fun ProfileScreen(
     var dateOfBirth by remember { mutableStateOf("") }
     var city by remember { mutableStateOf("") }
     var country by remember { mutableStateOf("") }
+    var bio by remember { mutableStateOf("") }
 
     // Gradient index: -1 = use name-based default
     var gradientIndex by remember { mutableIntStateOf(-1) }
@@ -132,6 +133,7 @@ fun ProfileScreen(
             dateOfBirth = prefs.getString("profile_dob", "") ?: ""
             city = prefs.getString("profile_city", "") ?: ""
             country = prefs.getString("profile_country", "") ?: ""
+            bio = prefs.getString("profile_bio", "") ?: ""
             gradientIndex = prefs.getInt("profile_gradient_index", -1)
             if (avatarFile.exists()) {
                 val bmp = BitmapFactory.decodeFile(avatarFile.absolutePath)
@@ -174,6 +176,7 @@ fun ProfileScreen(
                 dateOfBirth = dateOfBirth,
                 city = city,
                 country = country,
+                bio = bio,
                 onBadgeTap = { showAvatarChoiceDialog = true },
                 onEditField = { label, currentValue ->
                     editingField = label
@@ -205,6 +208,7 @@ fun ProfileScreen(
             identity?.let { id ->
                 AccountCard(
                     handle = id.username,
+                    createdAt = id.createdAt,
                     onUpgrade = { /* TODO: nav to Premium */ },
                 )
             }
@@ -364,6 +368,7 @@ fun ProfileScreen(
                     "Date of birth" -> "profile_dob"
                     "City" -> "profile_city"
                     "Country" -> "profile_country"
+                    "About" -> "profile_bio"
                     else -> null
                 }
                 prefKey?.let { key ->
@@ -374,6 +379,7 @@ fun ProfileScreen(
                         "Date of birth" -> dateOfBirth = newValue
                         "City" -> city = newValue
                         "Country" -> country = newValue
+                        "About" -> bio = newValue
                     }
                 }
                 editingField = null
@@ -454,6 +460,7 @@ private fun ProfileCard(
     dateOfBirth: String,
     city: String,
     country: String,
+    bio: String,
     onBadgeTap: () -> Unit,
     onEditField: (label: String, currentValue: String) -> Unit,
 ) {
@@ -642,7 +649,19 @@ private fun ProfileCard(
                     label = "Country",
                     value = country,
                     onTap = { onEditField("Country", country) },
+                )
+                ProfileFieldDivider()
+                // Bio row last per FULL_COMPOSE §07 — sits at the bottom
+                // of the editable list so the structured fields stay
+                // grouped above. Multi-line value preview wraps to 2
+                // lines with ellipsis to keep the row height predictable.
+                ProfileEditField(
+                    label = "About",
+                    value = bio,
+                    placeholder = "Add a short bio…",
+                    onTap = { onEditField("About", bio) },
                     isLast = true,
+                    valueMaxLines = 2,
                 )
             }
         }
@@ -654,14 +673,16 @@ private fun ProfileEditField(
     label: String,
     value: String,
     onTap: () -> Unit,
-    isLast: Boolean = false,
+    @Suppress("UNUSED_PARAMETER") isLast: Boolean = false,
+    placeholder: String = "—",
+    valueMaxLines: Int = 1,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(50.dp)
+            .heightIn(min = 50.dp)
             .clickable(onClick = onTap)
-            .padding(horizontal = 16.dp),
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -671,11 +692,12 @@ private fun ProfileEditField(
             modifier = Modifier.width(112.dp),
         )
         Text(
-            text = value.ifEmpty { "—" },
+            text = value.ifEmpty { placeholder },
             color = if (value.isEmpty()) PhantomTokens.Colors.TextDisabled else PhantomTokens.Colors.TextPrimary,
             fontSize = 14.sp,
+            lineHeight = 19.sp,
             modifier = Modifier.weight(1f),
-            maxLines = 1,
+            maxLines = valueMaxLines,
             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
         )
     }
@@ -853,7 +875,7 @@ private fun QrKeyCard(
 // log identity creation timestamp yet, so the row reads "—" until it does.
 
 @Composable
-private fun AccountCard(handle: String, onUpgrade: () -> Unit) {
+private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -920,10 +942,19 @@ private fun AccountCard(handle: String, onUpgrade: () -> Unit) {
 
         AccountRow(
             label = "Member since",
-            value = "—",
+            // FULL_COMPOSE §07 AccountCard: month-year string from the
+            // identity creation timestamp. Earlier hardcoded "—" was a
+            // placeholder waiting for the real value to be wired through.
+            value = formatMemberSince(createdAt),
         )
     }
     Spacer(Modifier.height(12.dp))
+}
+
+private fun formatMemberSince(createdAtMs: Long): String {
+    if (createdAtMs <= 0L) return "—"
+    val fmt = java.text.SimpleDateFormat("MMMM yyyy", java.util.Locale.getDefault())
+    return fmt.format(java.util.Date(createdAtMs))
 }
 
 @Composable
