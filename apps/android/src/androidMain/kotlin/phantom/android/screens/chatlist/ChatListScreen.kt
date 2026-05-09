@@ -127,8 +127,14 @@ fun ChatListScreen(
     Scaffold(
         containerColor = BgDeep,
         topBar = {
+            // FULL_COMPOSE Chats Screen mock shows "PHANTOM" wordmark
+            // (not "Messages") in the home-screen header — the chat list IS
+            // the home screen, so the brand mark belongs here. Settings,
+            // Calls, Nearby keep their literal titles ("Settings" / "Calls"
+            // / "Nearby") so users always know where they are.
             PhantomTopBar(
                 userName = userName,
+                title = "PHANTOM",
                 onProfile = onProfile,
                 onAddContact = { showAddDialog = true },
                 onScanQr = onScanQr,
