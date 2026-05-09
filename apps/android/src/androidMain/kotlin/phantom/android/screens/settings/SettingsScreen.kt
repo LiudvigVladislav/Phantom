@@ -27,9 +27,11 @@ import kotlinx.coroutines.launch
 import phantom.android.BuildConfig
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
+import phantom.android.service.PhantomMessagingService
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+import phantom.core.transport.PrivacyMode
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -45,12 +47,44 @@ fun SettingsScreen(
     val userName = identity?.username ?: ""
     val selfAvatarBitmap by container.selfAvatar.collectAsState()
     val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
-    var privacyMode by remember { mutableStateOf("Standard") }
+    // ADR-020 Phase 3: Privacy Mode is the canonical typed enum from
+    // phantom.core.transport. The legacy `privacy_mode` String preference
+    // (read by ChatScreen for read-receipt suppression) is mirrored from
+    // the typed value via container.setPrivacyMode.
+    var privacyMode by remember { mutableStateOf(container.transportPreferences.privacyMode) }
     var showBackupSheet by remember { mutableStateOf(false) }
+    // First-time confirmation when the user picks Ghost — must explicitly
+    // accept the "no automatic fallback out of Tor" trade-off.
+    var pendingGhost by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
-        val prefs = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
-        privacyMode = prefs.getString("privacy_mode", "Standard") ?: "Standard"
+    if (pendingGhost) {
+        AlertDialog(
+            onDismissRequest = { pendingGhost = false },
+            containerColor = Surface,
+            title = { Text("Switch to Ghost mode?", color = TextPrimary) },
+            text = {
+                Text(
+                    "Ghost routes every message through Tor only. If Tor cannot " +
+                        "bootstrap on the current network the app will show " +
+                        "\"Cannot reach relay\" instead of silently falling back to " +
+                        "REALITY or direct WSS — that silent downgrade would defeat " +
+                        "the privacy promise you are opting into.",
+                    color = TextDim, fontSize = 13.sp, lineHeight = 18.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingGhost = false
+                    privacyMode = PrivacyMode.Ghost
+                    scope.launch { applyPrivacyMode(container, context, PrivacyMode.Ghost) }
+                }) { Text("Switch", color = CyanAccent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingGhost = false }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
     }
 
     fun showComingSoon() {
@@ -261,10 +295,19 @@ fun SettingsScreen(
                             Text("Privacy Mode", color = TextPrimary, fontSize = 14.sp)
                             Spacer(Modifier.height(2.dp))
                             Text(
+                                // ADR-020 Phase 3: text describes the FULL behaviour
+                                // (transport choice + read-receipt suppression) per
+                                // mode, not just the read-receipt half.
                                 text = when (privacyMode) {
-                                    "Private" -> "Private — read receipts not sent. Local read state still updates."
-                                    "Ghost" -> "Ghost — read receipts not sent. (Future Phase 5: notification preview hidden, sealed sender extended.)"
-                                    else -> "Standard — full delivery + read receipts visible to your contacts."
+                                    PrivacyMode.Private ->
+                                        "Private — REALITY tunnel first, Tor onion fallback. " +
+                                            "Read receipts not sent."
+                                    PrivacyMode.Ghost ->
+                                        "Ghost — Tor onion only. No silent downgrade. " +
+                                            "Read receipts not sent."
+                                    PrivacyMode.Standard ->
+                                        "Standard — direct WSS first, REALITY + Tor fallback. " +
+                                            "Read receipts on. Best balance of latency and reach."
                                 },
                                 color = TextDim,
                                 fontSize = 11.sp,
@@ -272,7 +315,7 @@ fun SettingsScreen(
                             )
                             Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf("Standard", "Private", "Ghost").forEach { mode ->
+                                PrivacyMode.values().forEach { mode ->
                                     val active = privacyMode == mode
                                     Box(
                                         modifier = Modifier
@@ -284,17 +327,21 @@ fun SettingsScreen(
                                                 RoundedCornerShape(20.dp),
                                             )
                                             .clickable {
-                                                privacyMode = mode
-                                                val prefs = context.getSharedPreferences(
-                                                    "phantom_prefs",
-                                                    android.content.Context.MODE_PRIVATE,
-                                                )
-                                                prefs.edit().putString("privacy_mode", mode).apply()
+                                                if (mode == privacyMode) return@clickable
+                                                if (mode == PrivacyMode.Ghost) {
+                                                    // First-time Ghost requires confirm
+                                                    pendingGhost = true
+                                                } else {
+                                                    privacyMode = mode
+                                                    scope.launch {
+                                                        applyPrivacyMode(container, context, mode)
+                                                    }
+                                                }
                                             }
                                             .padding(horizontal = 10.dp, vertical = 4.dp),
                                     ) {
                                         Text(
-                                            mode.uppercase(),
+                                            mode.name.uppercase(),
                                             color = if (active) BgDeep else TextDim,
                                             fontSize = 9.sp,
                                             fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
@@ -847,4 +894,21 @@ private fun AppLockTimeoutDialog(
             }
         },
     )
+}
+
+/**
+ * ADR-020 Phase 3: persist the chosen [PrivacyMode] (typed + legacy mirror)
+ * and force a transport reconnect so the new strategy chain takes effect
+ * immediately. The foreground-service `startForegroundService` call here
+ * delivers a fresh `onStartCommand` to the existing service after
+ * `container.setPrivacyMode` has torn down the old connection.
+ */
+private suspend fun applyPrivacyMode(
+    container: AppContainer,
+    context: android.content.Context,
+    mode: PrivacyMode,
+) {
+    container.setPrivacyMode(mode)
+    val intent = Intent(context.applicationContext, PhantomMessagingService::class.java)
+    context.applicationContext.startForegroundService(intent)
 }

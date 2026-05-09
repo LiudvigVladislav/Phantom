@@ -47,6 +47,7 @@ import phantom.core.storage.SqlDelightReactionRepository
 import phantom.core.storage.SqlDelightSenderKeyRepository
 import phantom.core.transport.KtorRelayTransport
 import phantom.core.transport.KtorTransportProbe
+import phantom.core.transport.PrivacyMode
 import phantom.core.transport.TorService
 import phantom.core.transport.TorServiceConfig
 import phantom.core.transport.TransportManager
@@ -207,6 +208,36 @@ class AppContainer(private val context: Context) {
                 override fun warn(msg: String) { android.util.Log.w("TransportManager", msg) }
             },
         )
+    }
+
+    /**
+     * ADR-020 Phase 3: Privacy Mode setter that handles graceful reconnect.
+     *
+     * Writes the new mode to the canonical [TransportPreferences.privacyMode]
+     * AND mirrors it into the legacy `privacy_mode` SharedPreferences key
+     * (the read-receipt suppression in `ChatScreen` still reads that key —
+     * keeping both in sync avoids a behaviour split mid-migration).
+     *
+     * Then forces a transport teardown so the next connect generation walks
+     * the chain implied by the new mode. The foreground service's
+     * `onStartCommand` will be re-invoked by the caller's
+     * `startForegroundService` Intent (see [SettingsScreen]); the resulting
+     * fresh [TransportManager.connect] call sees the new preference.
+     */
+    suspend fun setPrivacyMode(mode: PrivacyMode) {
+        transportPreferences.privacyMode = mode
+        // Legacy mirror so ChatScreen's read-receipt gate keeps working
+        // until everything is migrated to read from TransportPreferences.
+        context.applicationContext
+            .getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("privacy_mode", mode.name)
+            .apply()
+        // Tear down the live socket — the service's connect coroutine exits
+        // its runReconnectLoop and the connectStarted flag flips back so a
+        // subsequent startForegroundService picks up the new mode cleanly.
+        runCatching { transport.disconnect() }
+        runCatching { transportManager.release() }
     }
 
     // ── Messaging (initialised after identity is loaded) ──────────────────────
