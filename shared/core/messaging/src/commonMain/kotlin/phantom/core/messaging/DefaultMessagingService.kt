@@ -699,6 +699,7 @@ class DefaultMessagingService(
             // Route group-related messages to GroupMessagingService before 1:1 handling.
             if (payload.type in MessagePayload.GROUP_TYPES) {
                 groupMessagingService?.handleIncoming(payload, senderPubKeyHex)
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
 
@@ -818,10 +819,15 @@ class DefaultMessagingService(
             // Route call-signalling messages to CallManager; never store as chat messages.
             if (payload.type in MessagePayload.CALL_TYPES) {
                 onCallMessage?.invoke(payload, senderPubKeyHex)
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
 
-            // Handle control messages — do not store as chat messages
+            // Handle control messages — do not store as chat messages.
+            // Every branch ack-delivers BEFORE returning so the relay drops the
+            // envelope from its store; without the explicit ack the relay keeps
+            // re-delivering the same control message on every reconnect for up
+            // to RELAY_ENVELOPE_TTL_SECS (7 days).
             if (payload.type == MessagePayload.TYPE_DELETE && payload.targetMessageId.isNotEmpty()) {
                 messageRepository.deleteMessage(payload.targetMessageId)
                 _incomingMessages.emit(
@@ -833,6 +839,7 @@ class DefaultMessagingService(
                         receivedAt = Clock.System.now().toEpochMilliseconds(),
                     )
                 )
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_EDIT && payload.targetMessageId.isNotEmpty()) {
@@ -846,6 +853,7 @@ class DefaultMessagingService(
                         receivedAt = Clock.System.now().toEpochMilliseconds(),
                     )
                 )
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_DISAPPEARING_TIMER) {
@@ -855,11 +863,22 @@ class DefaultMessagingService(
                 if (secs > 0L) {
                     conversationRepository.setDisappearingTimer(conversationId, secs)
                 }
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_REACTION && payload.targetMessageId.isNotEmpty()) {
-                val em = payload.emoji ?: return@runCatching
-                val repo = reactionRepository ?: return@runCatching
+                val em = payload.emoji
+                val repo = reactionRepository
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "Reaction received: target=${payload.targetMessageId.take(12)}… " +
+                        "sender=${senderPubKeyHex.take(16)}… emoji=${em ?: "<null>"} " +
+                        "repoSet=${repo != null}",
+                )
+                if (em == null || repo == null) {
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@runCatching
+                }
                 if (em.isEmpty()) {
                     repo.deleteReaction(payload.targetMessageId, senderPubKeyHex)
                 } else {
@@ -870,6 +889,8 @@ class DefaultMessagingService(
                         createdAt = Clock.System.now().toEpochMilliseconds(),
                     )
                 }
+                messagingLog(MessagingLogLevel.INFO, "Reaction upserted/deleted OK")
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_PIN && payload.targetMessageId.isNotEmpty()) {
@@ -883,6 +904,7 @@ class DefaultMessagingService(
                     pinned = pinnedFlag,
                     pinnedByPubkey = if (pinnedFlag) senderPubKeyHex else null,
                 )
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_KEY_ROTATION) {
@@ -897,6 +919,7 @@ class DefaultMessagingService(
                     )
                     sessionManager.deleteSession(conversationId)
                 }
+                transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_READ_RECEIPT && payload.targetMessageId.isNotEmpty()) {
@@ -1308,6 +1331,11 @@ class DefaultMessagingService(
         recipientPublicKeyHex: String,
         emoji: String,
     ): Result<Unit> = runCatching {
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "sendReaction: target=${messageId.take(12)}… emoji=${emoji.ifEmpty { "<remove>" }} " +
+                "to=${recipientPublicKeyHex.take(16)}…",
+        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = "",
