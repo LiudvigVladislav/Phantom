@@ -226,6 +226,11 @@ class AppContainer(private val context: Context) {
      */
     suspend fun setPrivacyMode(mode: PrivacyMode) {
         transportPreferences.privacyMode = mode
+        // Drop the previous-mode "preferred transport" hint. Without this, a
+        // Ghost → Standard switch reorders the new chain to put Tor first
+        // because the last successful Ghost connect recorded Tor as the hint.
+        transportPreferences.lastWorkingTransport = null
+        transportPreferences.lastSuccessAt = null
         // Legacy mirror so ChatScreen's read-receipt gate keeps working
         // until everything is migrated to read from TransportPreferences.
         context.applicationContext
