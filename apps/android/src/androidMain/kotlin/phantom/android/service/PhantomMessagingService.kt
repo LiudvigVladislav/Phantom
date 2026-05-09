@@ -102,16 +102,33 @@ class PhantomMessagingService : Service() {
             val app = application as PhantomApplication
             runCatching { app.ready.await() }
             val mgr = app.container.transportManager
+            val prefs = app.container.transportPreferences
             mgr.state.collect { state ->
-                pushNotificationText(
-                    when (state) {
-                        is ManagerState.Idle -> DEFAULT_STATUS_TEXT
-                        is ManagerState.Probing -> "Connecting via ${state.kind}…"
-                        is ManagerState.Connected -> "Online via ${state.kind}"
-                        is ManagerState.AllFailed ->
-                            "Cannot reach relay (tried ${state.attempts.size}). Tap to retry."
-                    },
+                // Bug #2 fix: include PrivacyMode in the visible text so a
+                // mode switch that lands on the SAME working transport (e.g.
+                // Standard → Private both end up on REALITY) is still visible
+                // to the user.
+                val mode = prefs.privacyMode.name
+                val text = when (state) {
+                    is ManagerState.Idle ->
+                        "$DEFAULT_STATUS_TEXT · $mode"
+                    is ManagerState.Probing ->
+                        "Connecting via ${state.kind}… · $mode"
+                    is ManagerState.Connected ->
+                        "Online via ${state.kind} · $mode"
+                    is ManagerState.AllFailed ->
+                        // Bug #3 fix: drop the misleading "Tap to retry" — the
+                        // notification body has no PendingIntent for it, so
+                        // tapping does nothing. Real retry path is the Privacy
+                        // Mode selector in Settings (which calls
+                        // setPrivacyMode → release → fresh chain walk).
+                        "Cannot reach relay (tried ${state.attempts.size}) · $mode"
+                }
+                Log.i(
+                    TAG,
+                    "TransportManager state → ${state::class.simpleName} mode=$mode text=\"$text\"",
                 )
+                pushNotificationText(text)
             }
         }
     }

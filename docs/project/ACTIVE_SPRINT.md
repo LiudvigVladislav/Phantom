@@ -9,7 +9,7 @@
 > [`TECHNICAL_BACKLOG.md`](TECHNICAL_BACKLOG.md) — prioritised waiting items.
 > [`MASTER_TIMELINE_2026.md`](MASTER_TIMELINE_2026.md) — high-level tracks.
 
-**Last updated:** 2026-05-09
+**Last updated:** 2026-05-09 (Step 1 in flight)
 
 ---
 
@@ -39,8 +39,8 @@ authority), demo video (Vladislav), funding-application paperwork.
 
 | # | Step | Branch | Estimate | Status |
 |---|---|---|---|---|
-| 0 | Persistence layer (this PR) | `feat/project-persistence-docs` | 30 min | 🟡 in progress |
-| 1 | Bug #2 + Bug #3 fix (notification + retry) | `feat/notification-and-reset-fixes` | ~1 h | ⬜ next |
+| 0 | Persistence layer | `feat/project-persistence-docs` | 30 min | ✅ merged (#82) |
+| 1 | Bug #2 + Bug #3 fix (notification + retry) | `feat/notification-and-reset-fixes` | ~1 h | 🟡 in progress |
 | 2 | Stage 5G Phase 1 experiment (FlokiNET reuse + obfs4/Snowflake) | `feat/stage-5g-phase-1-bridges` | 2-3 days | ⬜ |
 | 3 | Settings rewrite per FULL_COMPOSE §06 | `feat/settings-screen-rewrite` | 4-6 h | ⬜ |
 | 4 | Other-screen UI audit + rewrite (multiple PRs) | per screen | 3-5 days | ⬜ |
