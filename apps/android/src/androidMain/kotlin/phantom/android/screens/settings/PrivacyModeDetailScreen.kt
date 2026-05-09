@@ -51,8 +51,27 @@ fun PrivacyModeDetailScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     var selected by remember { mutableStateOf(container.transportPreferences.privacyMode) }
     var pendingGhost by remember { mutableStateOf(false) }
+
+    // Wait-time disclaimer surfaced on every mode switch. The chain walk
+    // can take 30 s for Reality init alone; falling all the way through
+    // to Tor on a censored network adds several minutes on top. Without
+    // this snackbar the foreground notification ("Connecting via Tor… ·
+    // Privacy") is the only feedback the user sees, which was confusing
+    // when the chain takes >30 s on Tecno МТС (cross-device test 2026-05-10).
+    fun snackForMode(mode: PrivacyMode) {
+        val msg = when (mode) {
+            PrivacyMode.Standard -> "Switching to Standard — direct connection should be ready in seconds."
+            PrivacyMode.Private  -> "Switching to Private — Reality probe up to 30 s, falls back to Tor (several minutes) if blocked."
+            PrivacyMode.Ghost    -> "Switching to Ghost — Tor bootstrap can take several minutes on censored networks."
+        }
+        scope.launch {
+            snackbarHostState.currentSnackbarData?.dismiss()
+            snackbarHostState.showSnackbar(msg)
+        }
+    }
 
     if (pendingGhost) {
         AlertDialog(
@@ -73,6 +92,7 @@ fun PrivacyModeDetailScreen(
                 TextButton(onClick = {
                     pendingGhost = false
                     selected = PrivacyMode.Ghost
+                    snackForMode(PrivacyMode.Ghost)
                     scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Ghost) }
                 }) { Text("Switch", color = CyanAccent) }
             },
@@ -86,6 +106,18 @@ fun PrivacyModeDetailScreen(
 
     Scaffold(
         containerColor = BgDeep,
+        snackbarHost = {
+            SnackbarHost(snackbarHostState) { data ->
+                Snackbar(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    containerColor = Surface,
+                    contentColor = TextPrimary,
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Text(data.visuals.message, fontSize = 13.sp, lineHeight = 18.sp)
+                }
+            }
+        },
         topBar = {
             Column(
                 modifier = Modifier
@@ -147,6 +179,7 @@ fun PrivacyModeDetailScreen(
                 onClick = {
                     if (selected == PrivacyMode.Standard) return@ModeCard
                     selected = PrivacyMode.Standard
+                    snackForMode(PrivacyMode.Standard)
                     scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Standard) }
                 },
             )
@@ -155,11 +188,13 @@ fun PrivacyModeDetailScreen(
                 title = "Private",
                 tagline = "REALITY → Tor",
                 description = "Skip direct WSS entirely. The relay never sees your " +
-                    "source IP. Read receipts suppressed.",
+                    "source IP. Read receipts suppressed. Connect can take up to " +
+                    "30 seconds for Reality, longer if it falls back to Tor.",
                 active = selected == PrivacyMode.Private,
                 onClick = {
                     if (selected == PrivacyMode.Private) return@ModeCard
                     selected = PrivacyMode.Private
+                    snackForMode(PrivacyMode.Private)
                     scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Private) }
                 },
             )
@@ -170,7 +205,8 @@ fun PrivacyModeDetailScreen(
                 description = "Maximum unlinkability. If Tor cannot bootstrap on " +
                     "your network the app will show \"Cannot reach relay\" rather " +
                     "than silently downgrading to a less-private path. Read receipts " +
-                    "suppressed.",
+                    "suppressed. First-connect can take several minutes on " +
+                    "censored networks while bridges bootstrap.",
                 active = selected == PrivacyMode.Ghost,
                 onClick = {
                     if (selected == PrivacyMode.Ghost) return@ModeCard
