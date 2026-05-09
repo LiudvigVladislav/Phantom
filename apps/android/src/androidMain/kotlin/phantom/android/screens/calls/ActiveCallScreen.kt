@@ -4,6 +4,7 @@
 package phantom.android.screens.calls
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -185,83 +186,58 @@ fun ActiveCallScreen(
 
             Spacer(Modifier.weight(1f))
 
-            // Mute + Speaker toggle row
+            // Controls tray — single pill (radius 9999) holding Mute, End,
+            // Speaker. FULL_COMPOSE Calls/In Progress: SurfaceElevated bg
+            // with BorderSubtle outline, three tap targets inside, end-call
+            // is a Danger-filled circle that pops above the pill rhythm.
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(24.dp, Alignment.CenterHorizontally),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(9999.dp))
+                    .background(PhantomTokens.Colors.SurfaceElevated)
+                    .border(
+                        1.dp,
+                        PhantomTokens.Colors.BorderSubtle,
+                        RoundedCornerShape(9999.dp),
+                    )
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                // Mute button
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                // Mute
+                Box(
+                    modifier = Modifier
+                        .size(54.dp)
+                        .clip(CircleShape)
+                        .background(if (call.isMuted) CyanAccent else PhantomTokens.Colors.SurfaceHover)
+                        .clickable(onClick = onToggleMute),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(60.dp)
-                            .clip(CircleShape)
-                            .background(if (call.isMuted) CyanAccent else Surface2)
-                            .clickable(onClick = onToggleMute),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (call.isMuted) PhIconMicOff(color = BgDeep, size = 24.dp)
-                        else PhIconMic(color = TextPrimary, size = 24.dp)
-                    }
-                    Text(
-                        text = if (call.isMuted) "Muted" else "Mute",
-                        color = if (call.isMuted) CyanAccent else TextDim,
-                        fontSize = 11.sp,
-                        fontFamily = PhantomFontMono,
-                    )
+                    if (call.isMuted) PhIconMicOff(color = BgDeep, size = 22.dp)
+                    else PhIconMic(color = TextPrimary, size = 22.dp)
                 }
-
-                // Speaker button
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                // End — Danger fill, slightly larger to read as primary
+                Box(
+                    modifier = Modifier
+                        .size(58.dp)
+                        .clip(CircleShape)
+                        .background(Danger)
+                        .clickable(onClick = onHangup),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(60.dp)
-                            .clip(CircleShape)
-                            .background(if (call.isSpeakerOn) CyanAccent else Surface2)
-                            .clickable(onClick = onToggleSpeaker),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (call.isSpeakerOn) PhIconVolume(color = BgDeep, size = 24.dp)
-                        else PhIconVolumeOff(color = TextPrimary, size = 24.dp)
-                    }
-                    Text(
-                        text = if (call.isSpeakerOn) "Speaker" else "Speaker",
-                        color = if (call.isSpeakerOn) CyanAccent else TextDim,
-                        fontSize = 11.sp,
-                        fontFamily = PhantomFontMono,
-                    )
+                    PhIconCallEnd(color = Color.White, size = 26.dp)
                 }
-            }
-
-            Spacer(Modifier.height(40.dp))
-
-            // End call button — large, red, centered
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                FloatingActionButton(
-                    onClick = onHangup,
-                    containerColor = Danger,
-                    contentColor = Color.White,
-                    shape = CircleShape,
-                    modifier = Modifier.size(72.dp),
+                // Speaker
+                Box(
+                    modifier = Modifier
+                        .size(54.dp)
+                        .clip(CircleShape)
+                        .background(if (call.isSpeakerOn) CyanAccent else PhantomTokens.Colors.SurfaceHover)
+                        .clickable(onClick = onToggleSpeaker),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    PhIconCallEnd(color = Color.White, size = 30.dp)
+                    if (call.isSpeakerOn) PhIconVolume(color = BgDeep, size = 22.dp)
+                    else PhIconVolumeOff(color = TextPrimary, size = 22.dp)
                 }
-                Text(
-                    text = "End Call",
-                    color = Danger.copy(alpha = 0.8f),
-                    fontSize = 12.sp,
-                    fontFamily = PhantomFontMono,
-                )
             }
 
             Spacer(Modifier.height(56.dp))
