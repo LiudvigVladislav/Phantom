@@ -360,12 +360,14 @@ private fun FoundState(
     onSendHandshake: () -> Unit,
     onVerifyFirst: () -> Unit,
 ) {
+    // FULL_COMPOSE §10 FoundState card: tighter padding (16/14) so the
+    // identity panel feels dense and intentional rather than bloated.
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(PhantomTokens.Colors.SurfaceDeep)
-            .padding(horizontal = 20.dp, vertical = 22.dp),
+            .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             GradientAvatar(name = handle, size = 56.dp)
@@ -440,7 +442,8 @@ private fun FoundState(
             containerColor = CyanAccent,
             contentColor = BgDeep,
         ),
-        shape = RoundedCornerShape(8.dp),
+        // FULL_COMPOSE §10: primary CTAs are full pills.
+        shape = RoundedCornerShape(50),
     ) {
         Text(
             text = "Send handshake",
@@ -461,7 +464,7 @@ private fun FoundState(
             contentColor = TextPrimary,
         ),
         border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle),
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(50),
     ) {
         Text(
             text = "Verify first",
@@ -560,7 +563,8 @@ private fun ConnectedState(
             containerColor = CyanAccent,
             contentColor = BgDeep,
         ),
-        shape = RoundedCornerShape(8.dp),
+        // FULL_COMPOSE §10: primary CTAs are full pills.
+        shape = RoundedCornerShape(50),
     ) {
         Text(
             text = "Open chat",
@@ -572,12 +576,14 @@ private fun ConnectedState(
 
 @Composable
 private fun IdentityCard(ownerLabel: String, handle: String, keyHex: String) {
+    // FULL_COMPOSE §10 IdentityCard: tighter padding so the fingerprint
+    // line stays dense and the card feels intentional.
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(PhantomTokens.Colors.SurfaceDeep)
-            .padding(horizontal = 20.dp, vertical = 18.dp),
+            .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             GradientAvatar(name = handle.removePrefix("@"), size = 40.dp)
