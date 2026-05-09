@@ -484,18 +484,22 @@ private fun PhantomApp(
             val noCallFlow = remember { MutableStateFlow<ActiveCall?>(null) }
             val callState by (cm?.activeCall ?: noCallFlow).collectAsState()
             val call = callState
+            // After hangup / remote-hangup return to the chat we came from, NOT
+            // back to ChatList. The user expects context continuity: end the
+            // call, see the conversation thread.
+            val backToChat = Screen.Chat(screen.conversationId, screen.username)
             LaunchedEffect(call) {
                 if (call == null) {
-                    currentScreen = Screen.ChatList
+                    currentScreen = backToChat
                 }
             }
             if (call != null && cm != null) {
                 ActiveCallScreen(
                     call = call,
-                    onHangup = { scope.launch { cm.hangup() }; currentScreen = Screen.ChatList },
+                    onHangup = { scope.launch { cm.hangup() }; currentScreen = backToChat },
                     onToggleMute = { cm.toggleMute() },
                     onToggleSpeaker = { cm.toggleSpeaker() },
-                    onBack = { currentScreen = Screen.ChatList },
+                    onBack = { currentScreen = backToChat },
                 )
             }
         }
