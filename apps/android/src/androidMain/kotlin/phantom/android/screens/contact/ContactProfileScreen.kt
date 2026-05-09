@@ -911,24 +911,18 @@ fun ContactProfileScreen(
                     Spacer(Modifier.height(4.dp))
                 }
 
-                // CTA row varies by state.
+                // CTA row varies by state. Compare-state priority follows
+                // FULL_COMPOSE Verification: the affirmative is a success-
+                // bordered ghost ("Keys match — Verified"), NOT a cyan
+                // primary. Cyan primary is reserved for the post-verified
+                // "Back to chat" CTA, where commitment has already happened.
+                // The negative ("Something doesn't match") is the dimmer
+                // text-only danger ghost — calm precision, no panic.
                 when (verifyState) {
-                    VerifyState.Compare -> Row(
+                    VerifyState.Compare -> Column(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        Button(
-                            onClick = { verifyState = VerifyState.Mismatch },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color.Transparent,
-                                contentColor = Danger,
-                            ),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, Danger.copy(alpha = 0.40f)),
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1f).height(46.dp),
-                        ) {
-                            Text("Mismatch", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                        }
                         Button(
                             onClick = {
                                 scope.launch {
@@ -941,13 +935,34 @@ fun ContactProfileScreen(
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = CyanAccent,
-                                contentColor = BgDeep,
+                                containerColor = Color.Transparent,
+                                contentColor = Success,
                             ),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Success.copy(alpha = 0.55f)),
                             shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.weight(1.4f).height(46.dp),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
                         ) {
-                            Text("It's a match", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                text = "Keys match — Verified",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                        Button(
+                            onClick = { verifyState = VerifyState.Mismatch },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.Transparent,
+                                contentColor = Danger.copy(alpha = 0.65f),
+                            ),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Danger.copy(alpha = 0.30f)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                        ) {
+                            Text(
+                                text = "Something doesn't match",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
                         }
                     }
                     VerifyState.Verified -> Button(
@@ -1204,22 +1219,34 @@ private fun FingerprintBlock(
             .border(1.dp, borderColor, RoundedCornerShape(12.dp))
             .padding(horizontal = 20.dp, vertical = 18.dp),
     ) {
-        Text(
-            text = ownerLabel,
-            color = TextDim.copy(alpha = 0.45f),
-            fontSize = 10.sp,
-            fontFamily = PhantomFontMono,
-            letterSpacing = 1.5.sp,
-        )
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = name,
-            color = TextPrimary,
-            fontSize = 16.sp,
-            fontWeight = FontWeight.Medium,
-            letterSpacing = (-0.16).sp,
-        )
-        Spacer(Modifier.height(12.dp))
+        // FULL_COMPOSE Verification: each FingerprintBlock leads with a
+        // 32dp avatar + name (Geist 16sp) + owner-tag (mono 10sp 0.45),
+        // so user sees whose key is whose without parsing the label.
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            phantom.android.ui.GradientAvatar(
+                name = name,
+                size = 32.dp,
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = name,
+                    color = TextPrimary,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = (-0.16).sp,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = ownerLabel,
+                    color = TextDim.copy(alpha = 0.45f),
+                    fontSize = 10.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 1.5.sp,
+                )
+            }
+        }
+        Spacer(Modifier.height(14.dp))
         Text(
             text = fingerprint,
             color = hexColor,

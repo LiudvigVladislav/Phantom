@@ -361,6 +361,18 @@ fun SettingsScreen(
                         mutableStateOf(prefs.getLong("app_lock_timeout_ms", 60_000L))
                     }
                     var showTimeoutDialog by remember { mutableStateOf(false) }
+                    // FULL_COMPOSE Settings Mobile 1 toggles. Defaults match the
+                    // canonical reference: receipts on, last-seen on, screenshot
+                    // protection off (Pro tier — gate on subscription later).
+                    var readReceiptsEnabled by remember {
+                        mutableStateOf(prefs.getBoolean("read_receipts", true))
+                    }
+                    var lastSeenEnabled by remember {
+                        mutableStateOf(prefs.getBoolean("last_seen", true))
+                    }
+                    var screenshotProtectionEnabled by remember {
+                        mutableStateOf(prefs.getBoolean("screenshot_protection", false))
+                    }
 
                     SettingsGroupCard {
                         SettingsRowItem(
@@ -381,6 +393,37 @@ fun SettingsScreen(
                                 onClick = { showTimeoutDialog = true },
                             )
                         }
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                        SettingsToggleRow(
+                            icon = { PhIconCheck3(color = CyanAccent, size = 16.dp) },
+                            label = "Read Receipts",
+                            checked = readReceiptsEnabled,
+                            onCheckedChange = {
+                                readReceiptsEnabled = it
+                                prefs.edit().putBoolean("read_receipts", it).apply()
+                            },
+                        )
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                        SettingsToggleRow(
+                            icon = { PhIconEye(color = CyanAccent, size = 16.dp) },
+                            label = "Last Seen",
+                            checked = lastSeenEnabled,
+                            onCheckedChange = {
+                                lastSeenEnabled = it
+                                prefs.edit().putBoolean("last_seen", it).apply()
+                            },
+                        )
+                        HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                        SettingsToggleRow(
+                            icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
+                            label = "Screenshot Protection",
+                            proBadge = true,
+                            checked = screenshotProtectionEnabled,
+                            onCheckedChange = {
+                                screenshotProtectionEnabled = it
+                                prefs.edit().putBoolean("screenshot_protection", it).apply()
+                            },
+                        )
                     }
 
                     if (showTimeoutDialog) {
@@ -525,6 +568,23 @@ fun SettingsScreen(
                             onClick = { context.openUrl("https://github.com/LiudvigVladislav/Phantom") },
                         )
                     }
+                }
+
+                // Mono footer below About — FULL_COMPOSE Settings Mobile 3.
+                // Quiet attribution, sits on the SurfaceDeep tail of the list.
+                item {
+                    Spacer(Modifier.height(28.dp))
+                    Text(
+                        text = "PHANTOM · v${BuildConfig.VERSION_NAME}",
+                        color = TextDim.copy(alpha = 0.45f),
+                        fontSize = 10.sp,
+                        fontFamily = PhantomFontMono,
+                        letterSpacing = 1.6.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
                 }
             }
 

@@ -4,7 +4,6 @@
 package phantom.android.screens.splash
 
 import androidx.compose.animation.core.*
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -15,9 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -83,8 +80,12 @@ fun PhantomSplashScreen() {
 
 @Composable
 private fun LogoWithSonar() {
+    // Sonar rings around the logo were too easily read as a radar / network
+    // animation, which conflicts with PHANTOM's "no servers, no metadata"
+    // narrative on the very first screen the user sees. Replaced with a
+    // restrained scale-pulse on the logo itself — same sense of life, none
+    // of the architectural lie.
     val infiniteTransition = rememberInfiniteTransition(label = "splash")
-
     val logoPulse by infiniteTransition.animateFloat(
         initialValue = 1f,
         targetValue = 1.04f,
@@ -95,48 +96,12 @@ private fun LogoWithSonar() {
         label = "logoPulse",
     )
 
-    val ring1 by sonarRingProgress(infiniteTransition, offsetFraction = 0f)
-    val ring2 by sonarRingProgress(infiniteTransition, offsetFraction = 0.333f)
-    val ring3 by sonarRingProgress(infiniteTransition, offsetFraction = 0.666f)
-
-    Box(
-        modifier = Modifier.size(160.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            listOf(ring1, ring2, ring3).forEach { progress ->
-                val scale = 1f + progress * 1.4f
-                val alpha = (1f - progress).coerceIn(0f, 1f) * 0.18f
-                drawCircle(
-                    color = CyanAccent,
-                    radius = (size.minDimension / 2f) * scale,
-                    style = Stroke(width = 1.5.dp.toPx()),
-                    alpha = alpha,
-                )
-            }
-        }
-
-        Image(
-            painter = painterResource(R.drawable.phantom_logo),
-            contentDescription = "PHANTOM logo",
-            modifier = Modifier
-                .size(160.dp)
-                .scale(logoPulse)
-                .clip(RoundedCornerShape(36.dp)),
-        )
-    }
+    Image(
+        painter = painterResource(R.drawable.phantom_logo),
+        contentDescription = "PHANTOM logo",
+        modifier = Modifier
+            .size(160.dp)
+            .scale(logoPulse)
+            .clip(RoundedCornerShape(36.dp)),
+    )
 }
-
-@Composable
-private fun sonarRingProgress(
-    transition: InfiniteTransition,
-    offsetFraction: Float,
-): State<Float> = transition.animateFloat(
-    initialValue = offsetFraction,
-    targetValue = 1f + offsetFraction,
-    animationSpec = infiniteRepeatable(
-        animation = tween(3000, easing = LinearEasing),
-        repeatMode = RepeatMode.Restart,
-    ),
-    label = "sonar_$offsetFraction",
-)

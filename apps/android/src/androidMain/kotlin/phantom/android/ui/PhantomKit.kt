@@ -83,7 +83,7 @@ fun nameInitials(name: String): String =
         .mapNotNull { it.firstOrNull()?.uppercaseChar() }
         .joinToString("")
 
-// ── Gradient avatar with optional presence dot ───────────────
+// ── Gradient avatar with optional presence dot + verified shield ───────────
 @Composable
 fun GradientAvatar(
     name: String,
@@ -92,6 +92,11 @@ fun GradientAvatar(
     ring: Boolean = false,
     brushOverride: Brush? = null,
     imageBitmap: ImageBitmap? = null,
+    /** When true, replaces the presence dot with a small cyan shield-lock
+     *  badge in the bottom-right — the FULL_COMPOSE §02 "verified avatar"
+     *  treatment. `online` is ignored if `verified=true` (verified outranks
+     *  presence in the badge slot, since trust is the more important signal). */
+    verified: Boolean = false,
 ) {
     Box(
         modifier = Modifier.size(size),
@@ -124,7 +129,25 @@ fun GradientAvatar(
                 )
             }
         }
-        if (online != null) {
+        if (verified) {
+            // Verified shield badge — cyan circle with a small lock glyph.
+            // Sizes scale from the avatar size so a 32dp avatar gets a 14dp
+            // badge / 7dp lock per the canonical reference.
+            val badgeSize = (size.value * 0.32f).coerceAtLeast(14f).dp
+            val lockSize = (size.value * 0.18f).coerceAtLeast(7f).dp
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .size(badgeSize)
+                    .offset(x = 1.dp, y = 1.dp)
+                    .clip(CircleShape)
+                    .background(CyanAccent)
+                    .border(2.dp, BgDeep, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                phantom.android.ui.PhIconLock(color = BgDeep, size = lockSize)
+            }
+        } else if (online != null) {
             val dotSize = (size.value * 0.26f).coerceAtLeast(10f).dp
             Box(
                 modifier = Modifier

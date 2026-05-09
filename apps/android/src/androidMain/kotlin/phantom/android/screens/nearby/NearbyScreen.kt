@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -44,6 +45,17 @@ fun NearbyScreen(
     onNavigate: (Screen) -> Unit,
     onProfile: () -> Unit = {},
 ) {
+    // Discoverable toggle persists per-user — until BLE / WiFi-Direct
+    // discovery actually ships (Phase 7), the switch is decorative but
+    // the preference still round-trips so users get the visual feedback
+    // they expect.
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val prefs = ctx.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
+    var discoverable by remember {
+        mutableStateOf(prefs.getBoolean("nearby_discoverable", true))
+    }
+    val deviceCount = 0  // No mesh transport yet; honest count.
+
     Scaffold(
         containerColor = PhantomTokens.Colors.SurfaceDeep,
         topBar = {
@@ -56,21 +68,32 @@ fun NearbyScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp)
+                        .height(64.dp)
                         .padding(horizontal = PhantomTokens.Spacing.comfortable),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Nearby",
+                            color = TextPrimary,
+                            style = PhantomType.headline,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = "BLUETOOTH · WI-FI DIRECT · MESH",
+                            color = PhantomTokens.Colors.TextTertiary,
+                            fontSize = 9.sp,
+                            fontFamily = PhantomFontMono,
+                            letterSpacing = 1.5.sp,
+                        )
+                    }
                     Text(
-                        text = "Nearby",
-                        color = TextPrimary,
-                        style = PhantomType.headline,
-                        modifier = Modifier.weight(1f),
+                        text = "$deviceCount DEVICE${if (deviceCount == 1) "" else "S"}",
+                        color = PhantomTokens.Colors.TextTertiary,
+                        fontSize = 10.sp,
+                        fontFamily = PhantomFontMono,
+                        letterSpacing = 1.6.sp,
                     )
-                    // Filter icon hidden in Alpha 2: there is no filter sheet
-                    // and no trusted-vs-untrusted partitioning to filter on
-                    // until BLE / WiFi-Direct nearby discovery actually ships
-                    // (Phase 7+). Re-add the IconButton(PhIconFunnel) here when
-                    // the filter sheet exists.
                 }
                 HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
             }
@@ -86,6 +109,62 @@ fun NearbyScreen(
                 contentPadding = PaddingValues(bottom = 110.dp),
             ) {
                 item { RadarPanel() }
+
+                // Discoverable toggle card — FULL_COMPOSE Nearby Screen:
+                // visible BLE / WiFi-Direct beacon switch with a short
+                // helper line. State stored in `phantom_prefs` so the
+                // preference survives across launches.
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                horizontal = PhantomTokens.Spacing.comfortable,
+                                vertical = PhantomTokens.Spacing.baseUnit,
+                            )
+                            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
+                            .background(PhantomTokens.Colors.SurfaceElevated)
+                            .border(
+                                1.dp,
+                                BorderSubtle,
+                                RoundedCornerShape(PhantomTokens.Radius.md),
+                            )
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Discoverable by others",
+                                color = TextPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                            )
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                text = "Broadcast a short-range beacon so contacts can find you.",
+                                color = PhantomTokens.Colors.TextTertiary,
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp,
+                            )
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Switch(
+                            checked = discoverable,
+                            onCheckedChange = {
+                                discoverable = it
+                                prefs.edit().putBoolean("nearby_discoverable", it).apply()
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = PhantomTokens.Colors.SurfaceDeep,
+                                checkedTrackColor = PhantomTokens.Colors.Cyan,
+                                checkedBorderColor = PhantomTokens.Colors.Cyan,
+                                uncheckedThumbColor = TextDim,
+                                uncheckedTrackColor = PhantomTokens.Colors.SurfaceHover,
+                                uncheckedBorderColor = BorderSubtle,
+                            ),
+                        )
+                    }
+                }
 
                 // BLE / WiFi-Direct discovery isn't wired into the transport
                 // layer yet, so we surface an honest empty state instead of

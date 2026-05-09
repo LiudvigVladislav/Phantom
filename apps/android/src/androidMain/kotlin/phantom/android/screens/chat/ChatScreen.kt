@@ -178,6 +178,11 @@ fun ChatScreen(
     var forwardSenderLabel by remember { mutableStateOf("") }
     var conversations by remember { mutableStateOf<List<phantom.core.storage.ConversationEntity>>(emptyList()) }
     var theirPublicKeyHex by remember { mutableStateOf("") }
+    // Verified flag drives the cyan shield-lock badge on the chat header
+    // avatar (FULL_COMPOSE §02 verified-avatar treatment). Refreshed each
+    // time the chat is opened — after a successful Verify flow the user
+    // expects the badge to appear without a manual reload.
+    var isVerified by remember { mutableStateOf(false) }
 
     // Typing indicator: hidden in Alpha 2.
     // Re-enabled in Phase 5 alongside sealed-sender extension to control
@@ -203,7 +208,9 @@ fun ChatScreen(
 
     LaunchedEffect(Unit) {
         conversations = container.conversationRepo.getActiveConversations()
-        theirPublicKeyHex = container.conversationRepo.getConversation(conversationId)?.theirPublicKeyHex ?: ""
+        val conv = container.conversationRepo.getConversation(conversationId)
+        theirPublicKeyHex = conv?.theirPublicKeyHex ?: ""
+        isVerified = conv?.isVerified == true
     }
 
     val transportState by container.transport.state.collectAsState()
@@ -487,6 +494,7 @@ fun ChatScreen(
             ChatTopBar(
                 theirUsername = theirUsername,
                 isConnected = isConnected,
+                isVerified = isVerified,
                 isTyping = isContactTyping,
                 onBack = onBack,
                 onContactProfile = onContactProfile,
@@ -2434,6 +2442,7 @@ private val CircleShape = RoundedCornerShape(50)
 private fun ChatTopBar(
     theirUsername: String,
     isConnected: Boolean,
+    isVerified: Boolean = false,
     isTyping: Boolean = false,
     onBack: () -> Unit,
     onContactProfile: () -> Unit,
@@ -2477,6 +2486,7 @@ private fun ChatTopBar(
                     name = theirUsername,
                     size = 36.dp,
                     online = if (isConnected) true else null,
+                    verified = isVerified,
                 )
             }
             Spacer(Modifier.width(10.dp))
