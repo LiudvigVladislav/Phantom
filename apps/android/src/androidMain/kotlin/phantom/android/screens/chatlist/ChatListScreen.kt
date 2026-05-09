@@ -21,6 +21,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -398,6 +399,7 @@ private fun GroupRow(group: GroupEntity, onClick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
+            .rowHairline()
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -493,6 +495,7 @@ private fun NotesRow(onClick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
+            .rowHairline()
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -528,6 +531,7 @@ private fun ArchiveRow(onClick: () -> Unit = {}) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
+            .rowHairline()
             .padding(horizontal = 20.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -614,6 +618,7 @@ private fun ChatRow(
                 onClick = onClick,
                 onLongClick = { showContextMenu = true },
             )
+            .rowHairline()
             // PHANTOM_FULL_COMPOSE §03: avatar 40dp, total row 72dp height
             // (16dp vertical padding × 2 + 40dp avatar = 72dp).
             .padding(horizontal = PhantomTokens.Spacing.comfortable, vertical = 16.dp),
@@ -787,4 +792,18 @@ private fun formatChatTime(millis: Long): String {
         diff < 7 * dayMs -> java.text.SimpleDateFormat("EEE", java.util.Locale.US).format(java.util.Date(millis))
         else -> java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(java.util.Date(millis))
     }
+}
+
+// FULL_COMPOSE §03: every chat-list row carries a 1px borderSubtle hairline
+// at its bottom edge. Drawn via drawBehind so the divider lives inside the
+// row's own bounds — no separate LazyColumn item, no offset surprises with
+// section headers or the floating bottom nav.
+private fun Modifier.rowHairline(): Modifier = this.drawBehind {
+    val y = size.height - 0.5f
+    drawLine(
+        color = Color.White.copy(alpha = 0.045f),
+        start = Offset(0f, y),
+        end = Offset(size.width, y),
+        strokeWidth = 1f,
+    )
 }

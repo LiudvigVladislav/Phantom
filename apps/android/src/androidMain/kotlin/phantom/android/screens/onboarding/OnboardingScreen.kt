@@ -281,29 +281,35 @@ private fun IdentityKeyStep(
 
         Spacer(Modifier.height(18.dp))
 
+        // FULL_COMPOSE §09 Step 2: heading is 24sp Medium left-aligned per
+        // React mock, not 28sp Light centered. Tighter and matches the
+        // step-card content rhythm (cards below also start at the left edge).
         Text(
-            text = "You are your key.",
+            text = "Your identity key",
             color = TextPrimary,
-            fontSize = 28.sp,
-            fontWeight = FontWeight.Light,
-            lineHeight = 34.sp,
-            textAlign = TextAlign.Center,
-            letterSpacing = (-0.6).sp,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Medium,
+            lineHeight = 30.sp,
+            letterSpacing = (-0.24).sp,
+            modifier = Modifier.fillMaxWidth(),
         )
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(8.dp))
 
         Text(
-            text = "Your account is a cryptographic key generated on this device. There is no password to leak.",
-            color = TextDim,
-            fontSize = 14.sp,
-            lineHeight = 22.sp,
-            textAlign = TextAlign.Center,
+            text = "Generated on your device and never transmitted. This key is your cryptographic identity on PHANTOM.",
+            color = PhantomTokens.Colors.TextTertiary,
+            fontSize = 13.sp,
+            lineHeight = 19.sp,
+            modifier = Modifier.fillMaxWidth(),
         )
 
         Spacer(Modifier.height(28.dp))
 
         // ED25519 fingerprint card — surfaceDeep bg, cyan-tinted border.
+        // FULL_COMPOSE §09 Step 2: header row carries the cyan kicker on
+        // the left and a small Success status dot on the right, separated
+        // from the fingerprint body by a hairline divider.
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -313,33 +319,48 @@ private fun IdentityKeyStep(
                     1.dp,
                     CyanAccent.copy(alpha = 0.22f),
                     RoundedCornerShape(12.dp),
-                )
-                .padding(horizontal = 20.dp, vertical = 18.dp),
+                ),
             horizontalAlignment = Alignment.Start,
         ) {
-            Text(
-                text = "ED25519 · GENERATED ON DEVICE · NEVER TRANSMITTED",
-                color = CyanAccent.copy(alpha = 0.85f),
-                fontSize = 9.sp,
-                fontFamily = PhantomFontMono,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 1.5.sp,
-            )
-            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "ED25519 · GENERATED",
+                    color = CyanAccent.copy(alpha = 0.85f),
+                    fontSize = 9.sp,
+                    fontFamily = PhantomFontMono,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = 1.5.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(Success),
+                )
+            }
+            HorizontalDivider(color = CyanAccent.copy(alpha = 0.12f), thickness = 1.dp)
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
             Text(
                 text = sampleFingerprint,
-                color = TextPrimary,
-                fontSize = 13.sp,
+                color = PhantomTokens.Colors.TextSecondary,
+                fontSize = 12.sp,
                 fontFamily = PhantomFontMono,
-                letterSpacing = 0.65.sp,
+                letterSpacing = 0.4.sp,
                 lineHeight = 22.sp,
             )
             Spacer(Modifier.height(10.dp))
             Text(
-                text = "Generated on your device. Never stored, never transmitted.",
-                color = PhantomTokens.Colors.TextTertiary,
-                fontSize = 12.sp,
-                lineHeight = 18.sp,
+                text = "Generated on device · Never transmitted",
+                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.45f),
+                fontSize = 9.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 1.4.sp,
             )
             Spacer(Modifier.height(14.dp))
             // Copy fingerprint to clipboard — useful for verifying via another
@@ -379,6 +400,7 @@ private fun IdentityKeyStep(
                     )
                 }
             }
+            } // end inner body Column
         }
         SnackbarHost(snack)
 
@@ -394,9 +416,14 @@ private fun IdentityKeyStep(
         )
         Spacer(Modifier.height(10.dp))
         val fieldInteraction = remember { MutableInteractionSource() }
+        // FULL_COMPOSE §09 Step 2 username field: 44dp tall, SurfaceElevated
+        // bg, vertical hairline separates the @ glyph from the input value
+        // — gives the field an architectural feel rather than a generic
+        // text-with-prefix.
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .height(44.dp)
                 .clip(RoundedCornerShape(10.dp))
                 .background(Surface2)
                 .border(
@@ -407,28 +434,33 @@ private fun IdentityKeyStep(
                 .clickable(
                     interactionSource = fieldInteraction,
                     indication = null,
-                ) { focusRequester.requestFocus() }
-                .padding(horizontal = 16.dp, vertical = 14.dp),
+                ) { focusRequester.requestFocus() },
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
                 text = "@",
-                color = CyanAccent,
-                fontSize = 17.sp,
+                color = PhantomTokens.Colors.TextTertiary,
+                fontSize = 14.sp,
                 fontFamily = PhantomFontMono,
+                modifier = Modifier.padding(horizontal = 14.dp),
             )
-            Spacer(Modifier.width(8.dp))
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .fillMaxHeight()
+                    .background(BorderSubtle),
+            )
+            Spacer(Modifier.width(14.dp))
             BasicTextField(
                 value = username,
                 onValueChange = {
                     onUsernameChange(it.lowercase().filter { c -> c.isLetterOrDigit() || c == '_' })
                 },
-                modifier = Modifier.weight(1f).focusRequester(focusRequester),
+                modifier = Modifier.weight(1f).focusRequester(focusRequester).padding(end = 14.dp),
                 singleLine = true,
                 textStyle = LocalTextStyle.current.copy(
                     color = TextPrimary,
-                    fontSize = 17.sp,
-                    fontFamily = PhantomFontMono,
+                    fontSize = 14.sp,
                 ),
                 cursorBrush = SolidColor(CyanAccent),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
@@ -438,8 +470,7 @@ private fun IdentityKeyStep(
                         Text(
                             text = "yourname",
                             color = TextDim.copy(alpha = 0.5f),
-                            fontSize = 17.sp,
-                            fontFamily = PhantomFontMono,
+                            fontSize = 14.sp,
                         )
                     }
                     inner()
@@ -493,46 +524,58 @@ private fun PrivacyModeStep(
 
         Spacer(Modifier.height(18.dp))
 
+        // FULL_COMPOSE §09 Step 3: heading 24sp Medium left-aligned to
+        // match the Step-2 rhythm. Body copy includes the "you can change
+        // this any time in Settings" reassurance from the React mock — a
+        // commitment-anxiety release that converts hesitant users.
         Text(
             text = "Choose your privacy mode",
             color = TextPrimary,
-            fontSize = 26.sp,
+            fontSize = 24.sp,
             fontWeight = FontWeight.Medium,
-            lineHeight = 32.sp,
-            textAlign = TextAlign.Center,
-            letterSpacing = (-0.5).sp,
+            lineHeight = 30.sp,
+            letterSpacing = (-0.24).sp,
+            modifier = Modifier.fillMaxWidth(),
         )
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(8.dp))
 
         Text(
-            text = "Control how visible you are to others on PHANTOM.",
-            color = TextDim,
-            fontSize = 14.sp,
-            textAlign = TextAlign.Center,
+            text = "Control how visible you are. You can change this any time in Settings.",
+            color = PhantomTokens.Colors.TextTertiary,
+            fontSize = 13.sp,
+            lineHeight = 19.sp,
+            modifier = Modifier.fillMaxWidth(),
         )
 
         Spacer(Modifier.height(28.dp))
 
+        // Card desc copy aligned with FULL_COMPOSE §09 Step 3 React mock —
+        // each line tells the user concretely what the mode DOES (read
+        // receipts, last-seen, discovery) rather than abstractly who can
+        // see them. More actionable for first-time users.
         PrivacyModeCard(
             title = "Standard",
-            body = "Visible to contacts, searchable by username.",
+            body = "Visible to contacts. Read receipts enabled.",
+            icon = ModeIcon.Eye,
             active = selected == PrivacyMode.Standard,
             locked = false,
             onClick = { onSelect(PrivacyMode.Standard) },
         )
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(8.dp))
         PrivacyModeCard(
             title = "Private",
-            body = "Visible only to confirmed contacts.",
+            body = "No read receipts. Last seen hidden from all.",
+            icon = ModeIcon.EyeOff,
             active = selected == PrivacyMode.Private,
             locked = false,
             onClick = { onSelect(PrivacyMode.Private) },
         )
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(8.dp))
         PrivacyModeCard(
             title = "Ghost Mode",
-            body = "Invisible to all. Receive-only.",
+            body = "Invisible to Nearby. No activity signals.",
+            icon = ModeIcon.Shield,
             active = selected == PrivacyMode.Ghost,
             locked = true,
             onClick = { /* PRO-locked, informative not blocking */ },
@@ -562,10 +605,13 @@ private fun PrivacyModeStep(
     }
 }
 
+private enum class ModeIcon { Eye, EyeOff, Shield }
+
 @Composable
 private fun PrivacyModeCard(
     title: String,
     body: String,
+    icon: ModeIcon,
     active: Boolean,
     locked: Boolean,
     onClick: () -> Unit,
@@ -574,12 +620,12 @@ private fun PrivacyModeCard(
         modifier = Modifier
             .fillMaxWidth()
             .alpha(if (locked) 0.5f else 1f)
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (active) Surface2 else Surface)
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (active) SurfaceHover else Surface2)
             .border(
                 width = 1.dp,
                 color = if (active) CyanAccent.copy(alpha = 0.35f) else BorderSubtle,
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(10.dp),
             )
             .then(
                 if (active) Modifier.drawWithContent {
@@ -591,15 +637,30 @@ private fun PrivacyModeCard(
                 } else Modifier,
             )
             .clickable(enabled = !locked, onClick = onClick)
-            .padding(horizontal = 18.dp, vertical = 16.dp),
+            .padding(horizontal = 14.dp, vertical = 14.dp),
     ) {
         Row(verticalAlignment = Alignment.Top) {
+            // FULL_COMPOSE §09 Step 3: each card carries a mode icon on the
+            // left (Eye / EyeOff / Shield). Active state tints it cyan; the
+            // inactive tint is textTertiary so the icon reinforces the card
+            // colour state without becoming visually loud.
+            Box(
+                modifier = Modifier.padding(top = 1.dp),
+            ) {
+                val tint = if (active) CyanAccent else PhantomTokens.Colors.TextTertiary
+                when (icon) {
+                    ModeIcon.Eye -> phantom.android.ui.PhIconEye(color = tint, size = 16.dp)
+                    ModeIcon.EyeOff -> phantom.android.ui.PhIconEyeOff(color = tint, size = 16.dp)
+                    ModeIcon.Shield -> phantom.android.ui.PhIconShield(color = tint, size = 16.dp)
+                }
+            }
+            Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = title,
                         color = TextPrimary,
-                        fontSize = 16.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Medium,
                     )
                     if (locked) {
@@ -629,26 +690,28 @@ private fun PrivacyModeCard(
                 Spacer(Modifier.height(6.dp))
                 Text(
                     text = body,
-                    color = PhantomTokens.Colors.TextSecondary,
-                    fontSize = 13.sp,
-                    lineHeight = 19.sp,
+                    color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.85f),
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
                 )
             }
             if (active) {
                 Spacer(Modifier.width(8.dp))
-                // FULL_COMPOSE §09 Step 3: 15×15dp check badge top-right.
+                // FULL_COMPOSE §09 Step 3: 15dp rounded-square check badge
+                // top-right (React mock uses a 4dp-radius square, not a
+                // circle — the cyan check sits inside cyan-tinted bg).
                 Box(
                     modifier = Modifier
                         .size(15.dp)
-                        .clip(CircleShape)
-                        .background(CyanAccent.copy(alpha = 0.12f))
-                        .border(1.dp, CyanAccent.copy(alpha = 0.35f), CircleShape),
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(CyanAccent.copy(alpha = 0.10f))
+                        .border(1.dp, CyanAccent.copy(alpha = 0.30f), RoundedCornerShape(4.dp)),
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
                         text = "✓",
                         color = CyanAccent,
-                        fontSize = 12.sp,
+                        fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
                     )
                 }
