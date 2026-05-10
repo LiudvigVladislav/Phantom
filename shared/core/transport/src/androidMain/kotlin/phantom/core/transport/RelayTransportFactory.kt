@@ -36,6 +36,18 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // OkHttp engine entirely, releasing the active WS socket. 60 s
         // is generous because it never has to fire in normal recovery.
         .readTimeout(60, TimeUnit.SECONDS)
+        // connectTimeout is per-path. Direct WSS keeps the OkHttp default
+        // (10 s) — relay.phntm.pro resolves and connects in <500 ms on a
+        // healthy network, longer means real outage. SOCKS-proxied paths
+        // (Reality / Tor) get 90 s because the auth/challenge GET is the
+        // first traffic over a freshly-established Reality tunnel or a
+        // brand-new Tor circuit; on Tor the HS-descriptor fetch +
+        // rendezvous can comfortably eat 30–60 s. The 10 s default was
+        // firing as ConnectTimeoutException on /auth/challenge under Tor
+        // (cross-device test 2026-05-10), making the WS attempt cycle
+        // for ~3 minutes before succeeding even though the underlying
+        // transport had reached Connected.
+        .connectTimeout(if (socksProxyPort != null) 90 else 10, TimeUnit.SECONDS)
         // Force HTTP/1.1 only for the WebSocket upgrade. With HTTP/2 one
         // TCP connection multiplexes many streams and the pool entry is
         // a long-lived h2 connection — connection lifecycle reasoning

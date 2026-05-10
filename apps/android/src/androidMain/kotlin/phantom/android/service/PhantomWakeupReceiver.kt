@@ -112,6 +112,43 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             Log.i(TAG, "no identity yet — skipping wake action")
             return
         }
+
+        // Skip the keepalive nudge while the outer TransportManager is
+        // mid-Probing (Reality libXray init / Tor bridge bootstrap) or
+        // sitting on AllFailed after chain exhaustion.
+        //
+        // Why: forceReconnect() tears down the OkHttp engine the
+        // in-flight HTTP / WS attempt is using. During a fresh Tor
+        // bootstrap that means we kill the auth-handshake mid-traversal
+        // every 30 s and bounce off the start, indefinitely. Surfaced
+        // in cross-device test 2026-05-10: Ghost mode 2nd entry cycled
+        // 7× forceReconnect during Tor bootstrap and ended in
+        // `Tor probe returned false` instead of completing.
+        //
+        // The inner `transport.isConnected() == false` check below would
+        // otherwise misread Probing as "WS dead, reconnect". The outer
+        // ManagerState is the source of truth for whether a reconnect
+        // would be useful right now.
+        val managerState = runCatching {
+            container.transportManager.state.value
+        }.getOrNull()
+        if (managerState is phantom.core.transport.ManagerState.Probing) {
+            Log.i(
+                TAG,
+                "TransportManager Probing(${managerState.kind}) — skipping keepalive forceReconnect",
+            )
+            return
+        }
+        if (managerState is phantom.core.transport.ManagerState.AllFailed) {
+            Log.i(
+                TAG,
+                "TransportManager AllFailed (chain exhausted, " +
+                    "${managerState.attempts.size} attempts) — skipping " +
+                    "keepalive forceReconnect; the foreground service owns the retry cadence",
+            )
+            return
+        }
+
         val elapsed = transport.lastPongElapsedMs
         val connected = transport.isConnected()
         if (connected && elapsed < PONG_STALE_THRESHOLD_MS) {
