@@ -62,7 +62,7 @@ class TransportManager(
                 continue
             }
             val probeOk = try {
-                withTimeout(PROBE_TIMEOUT_MS) { probe.reachable(kind, socksPort) }
+                withTimeout(probeTimeoutFor(kind)) { probe.reachable(kind, socksPort) }
             } catch (_: TimeoutCancellationException) {
                 false
             } catch (t: Throwable) {
@@ -168,12 +168,29 @@ class TransportManager(
         preferences.transportFailureCount += 1
     }
 
+    /**
+     * Per-kind probe budget. Direct on a healthy network finishes in
+     * <100 ms — 5 s covers worst-case cellular RTT with margin, longer
+     * means real outage and we want to fall through fast. Reality is
+     * already-warm in the libXray pool, but the first /health call after
+     * the tunnel comes up still pays one TCP handshake + one TLS+REALITY
+     * round-trip — 10 s is comfortable. Tor needs onion HS-descriptor
+     * fetch + rendezvous on the second /health call (the first warmed
+     * the bootstrap circuit but not the relay path) — 30 s prevents the
+     * cold-circuit `Tor probe returned false` we hit on the second
+     * Ghost-mode entry in the 2026-05-10 cross-device test.
+     */
+    private fun probeTimeoutFor(kind: TransportKind): Long = when (kind) {
+        TransportKind.Direct  -> 5_000L
+        TransportKind.Reality -> 10_000L
+        TransportKind.Tor     -> 30_000L
+    }
+
     companion object {
         /**
-         * Probe phase budget — applies to every kind. The probe is a single
-         * `GET /health` round-trip; if it does not return 200 in this window
-         * the path is considered dead. Five seconds covers the worst-case
-         * cellular RTT plus relay handler time with margin.
+         * Default probe budget — kept for callers / tests that import the
+         * constant directly. The runtime path uses [probeTimeoutFor] so
+         * the per-kind budget above is what actually fires.
          */
         const val PROBE_TIMEOUT_MS: Long = 5_000L
 
