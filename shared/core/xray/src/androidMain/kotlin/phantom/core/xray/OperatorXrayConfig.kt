@@ -39,8 +39,16 @@ object OperatorXrayConfig {
      * Build an [XrayServiceConfig] for the production endpoint. [dataDir]
      * must be an absolute path the runtime can write to (typically
      * `Context.filesDir.resolve("xray").absolutePath`).
+     *
+     * [socksPort] defaults to an OS-assigned ephemeral port via
+     * [pickFreeLoopbackPort] so PHANTOM never collides with another
+     * Xray-style client (V2RayNG / Outline / shadowsocks-android) that
+     * may already hold the canonical 10808 port. Cross-device test
+     * 2026-05-10 hit `bind: address already in use` on every fresh
+     * install when Vladislav's VPN-app SOCKS listener was already on
+     * 10808.
      */
-    fun toConfig(dataDir: String, socksPort: Int = 10808): XrayServiceConfig =
+    fun toConfig(dataDir: String, socksPort: Int = pickFreeLoopbackPort()): XrayServiceConfig =
         XrayServiceConfig(
             serverHost = SERVER_HOST,
             serverPort = SERVER_PORT,
@@ -51,4 +59,20 @@ object OperatorXrayConfig {
             dataDirectoryPath = dataDir,
             socksPort = socksPort,
         )
+}
+
+/**
+ * Asks the OS for a free TCP port on 127.0.0.1 by opening and immediately
+ * closing a `ServerSocket(0)`. There is a small race window between close
+ * and the subsequent `runXrayFromJSON` bind — in practice nothing else on
+ * the device picks the port in that microsecond gap, but a future caller
+ * who sees an `EADDRINUSE` here can simply call this helper again and
+ * retry. The function intentionally binds to the loopback interface only
+ * so we never request a public-facing socket.
+ */
+internal fun pickFreeLoopbackPort(): Int {
+    return java.net.ServerSocket().use { socket ->
+        socket.bind(java.net.InetSocketAddress("127.0.0.1", 0))
+        socket.localPort
+    }
 }

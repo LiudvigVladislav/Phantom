@@ -3,11 +3,11 @@
 
 package phantom.core.transport
 
+import android.util.Log
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.request.get
 import io.ktor.client.statement.HttpResponse
-import io.ktor.http.HttpStatusCode
 import java.net.InetSocketAddress
 import java.net.Proxy
 
@@ -24,33 +24,64 @@ import java.net.Proxy
  * `BuildConfig`) by stripping `/ws` and rewriting the scheme to `https://`.
  * The relay's `/health` endpoint always returns 200 with no auth required,
  * so the probe is identity-agnostic and replay-safe.
+ *
+ * Per-kind call timeout: Direct + Reality finish in <1 s on a healthy
+ * link, so 4 s catches real outages quickly. Tor needs the first onion
+ * roundtrip after Ready (HS-descriptor fetch + rendezvous + relay-side
+ * /health roundtrip) which routinely eats 30+ s on cold circuits — the
+ * earlier flat 4 s callTimeout was clamping the probe well below the
+ * outer 90 s budget, surfacing as `Tor probe returned false` on every
+ * cold attempt (cross-device test 2026-05-10). Now the per-kind call
+ * timeout matches what the network actually does.
  */
 class KtorTransportProbe(
     private val healthUrl: String,
-    /** Per-probe HTTP-call timeout; gated above by [TransportManager.PER_ATTEMPT_TIMEOUT_MS]. */
-    private val perCallTimeoutMs: Long = 4_000L,
 ) : TransportProbe {
 
     override suspend fun reachable(kind: TransportKind, socksPort: Int?): Boolean {
-        val client = buildClient(socksPort)
+        val callTimeoutMs = callTimeoutFor(kind)
+        Log.i(
+            TAG,
+            "probe start: kind=$kind socks=${socksPort ?: "direct"} url=$healthUrl callTimeoutMs=$callTimeoutMs",
+        )
+        val client = buildClient(socksPort, callTimeoutMs)
         return try {
             val response: HttpResponse = client.get(healthUrl)
-            response.status == HttpStatusCode.OK
-        } catch (_: Throwable) {
+            val ok = response.status.value == 200
+            Log.i(
+                TAG,
+                "probe done: kind=$kind status=${response.status.value} ok=$ok",
+            )
+            ok
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "probe failed: kind=$kind exception=${t::class.simpleName} message=${t.message}",
+            )
             false
         } finally {
             runCatching { client.close() }
         }
     }
 
-    private fun buildClient(socksPort: Int?): HttpClient = HttpClient(OkHttp) {
+    private fun callTimeoutFor(kind: TransportKind): Long = when (kind) {
+        TransportKind.Direct  -> 4_000L
+        TransportKind.Reality -> 8_000L
+        TransportKind.Tor     -> 60_000L
+    }
+
+    private fun buildClient(socksPort: Int?, callTimeoutMs: Long): HttpClient = HttpClient(OkHttp) {
         engine {
             config {
-                callTimeout(perCallTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                callTimeout(callTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
                 if (socksPort != null) {
                     proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort)))
                 }
             }
         }
+    }
+
+    private companion object {
+        private const val TAG = "TransportProbe"
     }
 }

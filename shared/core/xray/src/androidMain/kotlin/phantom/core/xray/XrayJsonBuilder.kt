@@ -153,18 +153,19 @@ internal data class XrayResponse(val success: Boolean, val data: String?)
  * runXrayFromJSON entry point. The schema is a thin wrapper around the
  * RunXrayFromJSONRequest fields plus a base64 result envelope.
  *
- * The response shape varies by libXray version:
+ * The response shape varies by libXray version *and* by code path:
  *   - `{"success": true, "data": null}`               — happy path
  *   - `{"success": false, "data": "error message"}`   — string error
  *   - `{"success": false, "data": {"code":1,"msg":…}} — structured error
- *   - `{"success": false}`                            — empty error (the
- *     case that surfaced on Vladislav's Tecno МТС fresh install:
- *     2026-05-10 → "no detail" message in the prepare-failed log)
+ *   - `{"success": false, "error": "EADDRINUSE …"}`   — bind / listen
+ *     errors (libXray >= 2024-late takes the inbound failure straight
+ *     from the inbound listener and puts it under `error`, leaving
+ *     `data` absent; we hit this with the SOCKS port collision on
+ *     Vladislav's Tecno МТС test 2026-05-10).
  *
- * Earlier impl used `obj["data"]?.toString()?.trim('"')` which collapsed
- * a structured-error object to JSON-noise and silently returned null
- * when the field was absent — losing the actual diagnostic. Now we
- * unwrap each element type explicitly.
+ * Earlier impl looked at `data` only and collapsed structured errors
+ * via `toString().trim('"')`. Now we walk the well-known message-bearing
+ * fields in order and unwrap each element type explicitly.
  */
 internal fun parseXrayResponse(json: String): XrayResponse {
     val obj = kotlinx.serialization.json.Json.parseToJsonElement(json) as? JsonObject
@@ -173,18 +174,25 @@ internal fun parseXrayResponse(json: String): XrayResponse {
     val success = (obj["success"] as? kotlinx.serialization.json.JsonPrimitive)
         ?.booleanOrNull == true
 
-    val dataElement = obj["data"]
-    val data: String? = when (dataElement) {
+    // libXray names the diagnostic field differently across versions /
+    // failure paths — `data` for happy-path output and structured errors,
+    // `error` for inbound bind/listen failures. Walking both means we
+    // surface the real reason instead of "no detail".
+    val data: String? = listOf("data", "error", "msg", "message")
+        .firstNotNullOfOrNull { key -> extractDiagnosticString(obj[key]) }
+    return XrayResponse(success = success, data = data)
+}
+
+private fun extractDiagnosticString(element: kotlinx.serialization.json.JsonElement?): String? =
+    when (element) {
         null -> null
         is kotlinx.serialization.json.JsonNull -> null
         is kotlinx.serialization.json.JsonPrimitive ->
             // Strings come through with quotes from .toString(); contentOrNull
             // gives us the raw value. Numbers / bools are stringified verbatim.
-            dataElement.contentOrNull?.takeIf { it.isNotEmpty() && it != "null" }
-        else -> dataElement.toString().takeIf { it.isNotEmpty() && it != "null" }
+            element.contentOrNull?.takeIf { it.isNotEmpty() && it != "null" }
+        else -> element.toString().takeIf { it.isNotEmpty() && it != "null" }
     }
-    return XrayResponse(success = success, data = data)
-}
 
 private val kotlinx.serialization.json.JsonPrimitive.booleanOrNull: Boolean?
     get() = if (isString) null else content.toBooleanStrictOrNull()
