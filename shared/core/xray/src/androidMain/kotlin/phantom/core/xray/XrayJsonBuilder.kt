@@ -152,15 +152,42 @@ internal data class XrayResponse(val success: Boolean, val data: String?)
  * libXray returns base64-encoded JSON for both request and response on its
  * runXrayFromJSON entry point. The schema is a thin wrapper around the
  * RunXrayFromJSONRequest fields plus a base64 result envelope.
+ *
+ * The response shape varies by libXray version:
+ *   - `{"success": true, "data": null}`               — happy path
+ *   - `{"success": false, "data": "error message"}`   — string error
+ *   - `{"success": false, "data": {"code":1,"msg":…}} — structured error
+ *   - `{"success": false}`                            — empty error (the
+ *     case that surfaced on Vladislav's Tecno МТС fresh install:
+ *     2026-05-10 → "no detail" message in the prepare-failed log)
+ *
+ * Earlier impl used `obj["data"]?.toString()?.trim('"')` which collapsed
+ * a structured-error object to JSON-noise and silently returned null
+ * when the field was absent — losing the actual diagnostic. Now we
+ * unwrap each element type explicitly.
  */
 internal fun parseXrayResponse(json: String): XrayResponse {
-    // Parse minimally — we only need success + an optional message string.
-    // Avoid pulling in the kotlinx-serialization plugin processor for this
-    // one-shot decode; manual JsonObject access is sufficient.
     val obj = kotlinx.serialization.json.Json.parseToJsonElement(json) as? JsonObject
         ?: return XrayResponse(success = false, data = "malformed response: $json")
-    val successElement = obj["success"]
-    val success = successElement?.toString() == "true"
-    val data = obj["data"]?.toString()?.trim('"')?.takeIf { it.isNotEmpty() && it != "null" }
+
+    val success = (obj["success"] as? kotlinx.serialization.json.JsonPrimitive)
+        ?.booleanOrNull == true
+
+    val dataElement = obj["data"]
+    val data: String? = when (dataElement) {
+        null -> null
+        is kotlinx.serialization.json.JsonNull -> null
+        is kotlinx.serialization.json.JsonPrimitive ->
+            // Strings come through with quotes from .toString(); contentOrNull
+            // gives us the raw value. Numbers / bools are stringified verbatim.
+            dataElement.contentOrNull?.takeIf { it.isNotEmpty() && it != "null" }
+        else -> dataElement.toString().takeIf { it.isNotEmpty() && it != "null" }
+    }
     return XrayResponse(success = success, data = data)
 }
+
+private val kotlinx.serialization.json.JsonPrimitive.booleanOrNull: Boolean?
+    get() = if (isString) null else content.toBooleanStrictOrNull()
+
+private val kotlinx.serialization.json.JsonPrimitive.contentOrNull: String?
+    get() = if (this is kotlinx.serialization.json.JsonNull) null else content

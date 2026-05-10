@@ -97,16 +97,53 @@ internal class XrayServiceAndroid(
     private fun startBlocking() {
         // Ensure the runtime's working directory exists; libXray will not
         // create missing parents.
-        val datDir = File(config.dataDirectoryPath).apply { mkdirs() }.absolutePath
+        val dirFile = File(config.dataDirectoryPath).apply { mkdirs() }
+        val datDir = dirFile.absolutePath
         val mphCachePath = File(datDir, "mph.cache").absolutePath
 
+        // Diagnostic snapshot of the runtime environment libXray will see.
+        // Surfaced because cross-device test 2026-05-10 had libXray return
+        // `success=false` with an empty `data` field on every fresh install
+        // — the bare error message gave us nothing to act on. Logging the
+        // dir state + config size + pre-call XrayState lets the next test
+        // pinpoint whether it's a missing asset, a config oversize, or a
+        // stale in-process state (the gomobile binding is per-process).
+        val dirContents = runCatching {
+            dirFile.list()?.toList()?.sorted()?.joinToString(",") ?: "<null>"
+        }.getOrElse { "<list-failed: ${it.message}>" }
+        val preState = runCatching { LibXray.getXrayState() }.getOrElse { "<state-call threw>" }
+        Log.i(
+            LOG_TAG,
+            "startBlocking: datDir=$datDir exists=${dirFile.exists()} writable=${dirFile.canWrite()} " +
+                "contents=[$dirContents] preLibXrayState=$preState",
+        )
+
         val xrayConfigJson = buildXrayClientConfig(config)
+        Log.i(
+            LOG_TAG,
+            "startBlocking: configLen=${xrayConfigJson.length} configHead=" +
+                xrayConfigJson.take(240).replace("\n", "\\n"),
+        )
+
         val requestB64 = LibXray.newXrayRunFromJSONRequest(datDir, mphCachePath, xrayConfigJson)
+        Log.i(LOG_TAG, "startBlocking: requestB64Len=${requestB64.length}")
 
         val responseB64 = LibXray.runXrayFromJSON(requestB64)
+        // Always log the raw response — the only authoritative source for
+        // libXray's own error reporting. Truncated to 4 KB so we never
+        // spam the buffer if libXray returns a massive blob.
+        val rawResponse = runCatching {
+            String(Base64.decode(responseB64, Base64.NO_WRAP or Base64.URL_SAFE))
+        }.getOrElse { "<decode-failed: ${it.message}>" }
+        Log.i(
+            LOG_TAG,
+            "startBlocking: responseB64Len=${responseB64.length} " +
+                "decodedLen=${rawResponse.length} decoded=${rawResponse.take(4_096)}",
+        )
+
         val parsed = decodeAndParse(responseB64)
         if (!parsed.success) {
-            error("runXrayFromJSON failed: ${parsed.data ?: "no detail"}")
+            error("runXrayFromJSON failed: ${parsed.data ?: "no detail"} (rawResponse=${rawResponse.take(512)})")
         }
         // Defensive cross-check — getXrayState should report true after a
         // successful run. If it doesn't, the JNI succeeded but the inbound
