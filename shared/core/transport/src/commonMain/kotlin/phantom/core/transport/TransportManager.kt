@@ -175,15 +175,16 @@ class TransportManager(
      * already-warm in the libXray pool, but the first /health call after
      * the tunnel comes up still pays one TCP handshake + one TLS+REALITY
      * round-trip — 10 s is comfortable. Tor needs onion HS-descriptor
-     * fetch + rendezvous on the second /health call (the first warmed
-     * the bootstrap circuit but not the relay path) — 30 s prevents the
-     * cold-circuit `Tor probe returned false` we hit on the second
-     * Ghost-mode entry in the 2026-05-10 cross-device test.
+     * fetch + rendezvous on a brand-new circuit — 30 s was insufficient
+     * (2026-05-10 cross-device test still hit `Tor probe returned false`
+     * after a 6-min bootstrap on Tecno МТС because the post-Ready
+     * circuit hadn't warmed up enough by the time the 30 s budget
+     * elapsed). 90 s gives the cold path a realistic chance.
      */
     private fun probeTimeoutFor(kind: TransportKind): Long = when (kind) {
         TransportKind.Direct  -> 5_000L
         TransportKind.Reality -> 10_000L
-        TransportKind.Tor     -> 30_000L
+        TransportKind.Tor     -> 90_000L
     }
 
     companion object {
