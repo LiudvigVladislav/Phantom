@@ -66,7 +66,15 @@ class KtorTransportProbe(
 
     private fun callTimeoutFor(kind: TransportKind): Long = when (kind) {
         TransportKind.Direct  -> 4_000L
-        TransportKind.Reality -> 8_000L
+        // 20 s lets us distinguish "slow Reality handshake" from "path
+        // is hard-blocked by an upstream filter" (e.g. VPN exit IP
+        // refused by the Hetzner REALITY endpoint, or REALITY
+        // fingerprint mismatched at the CDN-mock). Architect review
+        // 2026-05-10 asked for 20-30 s for that exact distinction;
+        // 20 s is the lower bound that still keeps Tor fallback fast
+        // (so a hard-blocked Reality only adds 20 s, not 30, to the
+        // user-perceived connect time).
+        TransportKind.Reality -> 20_000L
         TransportKind.Tor     -> 60_000L
     }
 

@@ -153,6 +153,14 @@ class KtorRelayTransport(
         this.challengeSigner = signChallenge
         this.socksProxyPort = socksProxyPort
         disconnectRequested = false
+        // Reset the pong staleness mark so the AlarmManager keepalive does
+        // not see a stale value inherited from the previous WS session
+        // (e.g. after a Privacy-mode switch the new connect runs an outer
+        // chain walk + auth-handshake that can take 30-90 s; without this
+        // reset `lastPongElapsedMs` would already report 100s+ at the very
+        // first alarm and trigger forceReconnect that tears down the
+        // in-flight handshake — observed cross-device test 2026-05-10).
+        lastPongMark = timeSource.markNow()
         relayLog(
             RelayLogLevel.INFO,
             "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",

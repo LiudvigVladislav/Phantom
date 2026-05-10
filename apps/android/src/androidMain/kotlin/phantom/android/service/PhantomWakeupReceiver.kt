@@ -149,6 +149,28 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             return
         }
 
+        // Skip the keepalive nudge when the WS layer itself is mid-handshake.
+        // After Reality / Tor probe success TransportManager flips to
+        // Connected and the foreground service notification updates to
+        // "Online via …" — but the WS auth-handshake (GET /auth/challenge
+        // + WS upgrade) can still take 30-90 s on a cold onion circuit.
+        // During that window `isConnected()` returns false because the WS
+        // hasn't reached TransportState.Connected yet, and the inherited
+        // `lastPongElapsedMs` from the previous session looks "stale" by
+        // wall-clock — without this guard the alarm fires forceReconnect
+        // and tears down the in-flight handshake mid-flight, requiring a
+        // retry from scratch (cross-device test 2026-05-10 saw 2 cycles
+        // before the handshake finally landed).
+        val wsState = runCatching { transport.state.value }.getOrNull()
+        if (wsState is phantom.core.transport.TransportState.Connecting) {
+            Log.i(
+                TAG,
+                "WS layer still mid-handshake (Connecting) — skipping " +
+                    "keepalive forceReconnect; let the auth handshake finish",
+            )
+            return
+        }
+
         val elapsed = transport.lastPongElapsedMs
         val connected = transport.isConnected()
         if (connected && elapsed < PONG_STALE_THRESHOLD_MS) {
