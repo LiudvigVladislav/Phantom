@@ -135,11 +135,59 @@ class TransportManager(
         TransportKind.Direct -> null
         TransportKind.Tor -> {
             val tor = torServiceProvider()
+            log.info("Tor: start() called, current state=${tor.state.value}")
             tor.start()
-            val ready = withTimeout(TOR_PREPARE_TIMEOUT_MS) {
-                tor.state.first { it is TorState.Ready }
-            } as TorState.Ready
-            ready.socksPort
+            // Diagnostic: stream Bootstrapping percent + terminal state to
+            // the log. Architect review 2026-05-11 noted that with only
+            // `Probing(Tor)` on the wire we could not tell whether Tor
+            // was stalling at 14 % vs 95 %, vs never starting at all.
+            // Coroutine-launched on the same scope as the await below so
+            // both finish together (cancelled by the outer withTimeout
+            // when the budget elapses).
+            val terminal = try {
+                withTimeout(TOR_PREPARE_TIMEOUT_MS) {
+                    var lastPercent = -1
+                    tor.state.first { st ->
+                        when (st) {
+                            is TorState.Bootstrapping -> {
+                                if (st.percent != lastPercent) {
+                                    log.info("Tor bootstrap: percent=${st.percent}")
+                                    lastPercent = st.percent
+                                }
+                                false
+                            }
+                            is TorState.Ready -> {
+                                log.info("Tor bootstrap: Ready socksPort=${st.socksPort}")
+                                true
+                            }
+                            is TorState.Failed -> {
+                                log.warn("Tor bootstrap: Failed message=${st.message}")
+                                true
+                            }
+                            else -> false
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                // Defensive cleanup per architect review: a stuck Tor
+                // service must be torn down before the next chain walk
+                // (Private → Tor → Ghost) so we don't await a corpse
+                // descriptor / circuit pool. tor.stop() is idempotent.
+                log.warn("Tor: prepare aborted (${t::class.simpleName}: ${t.message}) — calling tor.stop()")
+                runCatching { tor.stop() }
+                throw t
+            }
+            when (terminal) {
+                is TorState.Ready -> terminal.socksPort
+                is TorState.Failed -> {
+                    runCatching { tor.stop() }
+                    error("Tor Failed: ${terminal.message}")
+                }
+                else -> {
+                    runCatching { tor.stop() }
+                    error("Tor returned unexpected state: $terminal")
+                }
+            }
         }
         TransportKind.Reality -> {
             val xray = xrayServiceProvider()
@@ -169,21 +217,27 @@ class TransportManager(
     }
 
     /**
-     * Per-kind probe budget. Direct on a healthy network finishes in
-     * <100 ms — 5 s covers worst-case cellular RTT with margin, longer
-     * means real outage and we want to fall through fast. Reality is
-     * already-warm in the libXray pool, but the first /health call after
-     * the tunnel comes up still pays one TCP handshake + one TLS+REALITY
-     * round-trip — 10 s is comfortable. Tor needs onion HS-descriptor
-     * fetch + rendezvous on a brand-new circuit — 30 s was insufficient
-     * (2026-05-10 cross-device test still hit `Tor probe returned false`
-     * after a 6-min bootstrap on Tecno МТС because the post-Ready
-     * circuit hadn't warmed up enough by the time the 30 s budget
-     * elapsed). 90 s gives the cold path a realistic chance.
+     * Outer probe budget per kind. Each entry MUST be at least as large
+     * as the corresponding `KtorTransportProbe.callTimeoutFor()` value
+     * — otherwise the outer `withTimeout` here cancels the inner OkHttp
+     * `callTimeout` and the inner-budget bump never gets to fire.
+     *
+     * 2026-05-11 regression: Track A bumped Reality call-timeout to
+     * 20 s but the outer budget here was still 10 s, so the inner bump
+     * silently had no effect — every Reality probe under VPN failed
+     * with `CancellationException: Timed out waiting for 10000 ms`.
+     *
+     * Buffers (outer = inner + 5 s) so a slow probe gets the inner
+     * budget plus a small grace window for response decode + flow
+     * resumption.
+     *
+     *   Direct  inner=4 s  outer=5 s
+     *   Reality inner=20 s outer=30 s
+     *   Tor     inner=60 s outer=90 s
      */
     private fun probeTimeoutFor(kind: TransportKind): Long = when (kind) {
         TransportKind.Direct  -> 5_000L
-        TransportKind.Reality -> 10_000L
+        TransportKind.Reality -> 30_000L
         TransportKind.Tor     -> 90_000L
     }
 
