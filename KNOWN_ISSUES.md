@@ -337,6 +337,45 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 ---
 
+### ISSUE-016: Tor on RU carrier networks without VPN currently does not bootstrap in any bridge profile
+
+**Status:** Architecturally bound by upstream censorship (TSPU on Russian carrier networks). Mitigated client-side by retuned [bridge rotation order](shared/core/transport/src/commonMain/kotlin/phantom/core/transport/TransportManager.kt) (PR-D, 2026-05-12) and a Ghost-mode AllFailed copy that explicitly tells the user to switch to Private/Reality or enable a VPN.
+
+**Symptom.** Selecting Ghost privacy mode on МТС Wi-Fi without a VPN: every one of the four bridge profiles in [`BRIDGE_ROTATION_ORDER`] times out without reaching `Ready`. Test #5 (2026-05-11, captured logcat at 11:22-11:34 МТС Wi-Fi):
+
+| Profile | Reached % | Result |
+|---|---|---|
+| obfs4 (FlokiNET) | 10% | timeout 180 s — TSPU blocks the bridge handshake |
+| webtunnel (FlokiNET + Hetzner) | 10% | timeout 120 s — same wire-pattern blocking |
+| snowflake (Tor Project defaults) | 50% | timeout 180 s — broker fronting works, circuit build fails |
+| mixed (all five bridges in parallel) | 72% | timeout 240 s — best result; tor selects whichever bridge wins handshake first, but the post-bridge circuit traffic still gets throttled |
+
+`AllFailed (chain exhausted, 4 profiles tried)` after 12 min total walk.
+
+**Root cause.** Upstream censorship layer (TSPU) on Russian carrier networks blocks Tor bridge wire signatures and throttles Tor circuit traffic even when an individual bridge handshake succeeds. The 50%/72% stall on snowflake/mixed is the classic "circuit build" or "loading consensus document" phase — the bridge negotiated a connection but the underlying Tor protocol traffic between guard and middle relays is being filtered. This matches the externally documented behaviour of TSPU against Tor (see e.g. Tor Project's "Russia" bridge guidance, which itself recommends VPN+Tor for users in cellular RU). It is below the application layer and cannot be fixed in PHANTOM code without either deploying additional bridges in non-blocked CIDR ranges or adding alternative pluggable transports.
+
+**What works on МТС without VPN (verified Test #5 + earlier tests):**
+- ✅ Standard (Direct WSS) — connects in ~1.3 s.
+- ✅ Private (Reality through our Hetzner Xray endpoint) — connects in ~0.6 s on a healthy day.
+
+**What does not work on МТС without VPN:**
+- 🔴 Ghost (Tor) — fails in all four bridge profiles. The user-facing Ghost AllFailed notification is now `"Tor is blocked or slowed by this network. Try Private/Reality or enable a VPN."` so the next step is unambiguous.
+
+**What works with a VPN active:**
+- ✅ Ghost — Tor bootstraps via mixed/snowflake/webtunnel profile within 2-7 minutes (Tests #2 + Day-of-PR-C visual smoke).
+
+**Mitigation shipped (PR-D, master 2026-05-12):**
+
+1. `BRIDGE_ROTATION_ORDER` reordered with `Mixed` first (600 s budget) — empirically the best-performing profile per Test #5, and it is the entry point that gives tor a chance to select whichever bridge in our pool the network does not block. `SnowflakeOnly` follows with a 360 s budget; the two stable-stuck single-PT profiles get short 90 s budgets so the rotation moves on quickly.
+2. Worst-case rotation walk = 19 minutes. On uncensored networks the first profile reaches `Ready` in 1-3 minutes and the rotation ends.
+3. Ghost-mode AllFailed copy gives the user a concrete next step (Private/Reality or VPN) instead of a dead-end "Cannot reach relay".
+
+**Why we did not deploy more bridges first.** Adding new bridges (e.g. a snowflake server on a non-blocked CIDR, or obfs4 / webtunnel on a different ASN) is operations work that requires a separate sprint of provisioning, key generation, fingerprint distribution, and APK release coordination. The PR-D mitigation buys us the most-likely-to-work behaviour with code-only changes, while the operations work is tracked as a follow-up post-Alpha-2.
+
+**Cross-reference.** Original transport-investigation work that motivated the Tor track is in [ISSUE-013](#issue-013-stateful-natcgntspu-silent-drops-on-cellular-russia--tor--unifiedpush-hybrid-in-implementation). ISSUE-013 describes the WSS-side TSPU behaviour; ISSUE-016 documents that even the Tor-side fallback we built to get around ISSUE-013 also runs into TSPU at the bridge / circuit layer when used without a VPN on the same network class.
+
+---
+
 ## Bugs that have been fixed in Alpha 1 development
 
 These are documented for transparency about what we resolved during the development sprint:
