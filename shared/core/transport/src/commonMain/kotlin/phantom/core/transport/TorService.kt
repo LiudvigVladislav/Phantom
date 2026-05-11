@@ -30,12 +30,16 @@ interface TorService {
     val state: StateFlow<TorState>
 
     /**
-     * Start the embedded tor daemon and bootstrap a circuit. Idempotent — if
-     * already running, this is a no-op. Returns when the daemon process
-     * (or in-process JNI runtime) has been launched; [state] then transitions
-     * through [TorState.Bootstrapping] to [TorState.Ready] asynchronously.
+     * Start the embedded tor daemon and bootstrap a circuit using
+     * [bridgeProfile] as the pluggable-transport mix. Idempotent — if
+     * already running, this is a no-op (the existing profile is kept;
+     * callers must [stop] first to switch profiles).
+     *
+     * The default is [BridgeProfile.Mixed] for backward compatibility
+     * with code that does not yet care about per-profile rotation
+     * (PR-C bridge-rotation lives in TransportManager).
      */
-    suspend fun start()
+    suspend fun start(bridgeProfile: BridgeProfile = BridgeProfile.Mixed)
 
     /**
      * Stop the embedded tor daemon and tear down all circuits. Idempotent.
@@ -44,4 +48,38 @@ interface TorService {
      * so guard caching survives the next [start].
      */
     suspend fun stop()
+}
+
+/**
+ * Pluggable-transport mix for [TorService.start]. PR-C (2026-05-11)
+ * uses this to walk one censorship-resistance profile at a time:
+ *
+ *   1. [Obfs4Only]      — uniform-random byte stream, no TLS shape;
+ *                         best on networks where DPI flags TLS-like
+ *                         transports (TSPU 16-KB curtain).
+ *   2. [WebtunnelOnly]  — looks like vanilla HTTPS on port 443 to
+ *                         our operator-controlled bridge; works where
+ *                         obfs4 ports are reset.
+ *   3. [SnowflakeOnly]  — WebRTC DataChannel via volunteer browser
+ *                         proxies; best where the broker fronting
+ *                         domain is reachable (often unreliable on
+ *                         RU carriers without a VPN).
+ *   4. [Mixed]          — full obfs4 + webtunnel + snowflake stack
+ *                         in declared order; the all-of-the-above
+ *                         fallback that matches pre-PR-C behaviour.
+ *
+ * The androidMain `TorServiceAndroid.start()` maps each profile to a
+ * concrete `List<String>` of bridge lines built from `OperatorBridges`
+ * and `SnowflakeBridges`. Profiles that resolve to an empty list (e.g.
+ * `Obfs4Only` if no obfs4 bridge is provisioned) fall back to running
+ * tor with `disableBridges()` rather than starting with no bridges at
+ * all — that path is then equivalent to the direct-guards path and
+ * will fail fast on censored networks, which is the right signal for
+ * the rotation walker to advance to the next profile.
+ */
+enum class BridgeProfile(val displayName: String) {
+    Obfs4Only("obfs4"),
+    WebtunnelOnly("webtunnel"),
+    SnowflakeOnly("snowflake"),
+    Mixed("mixed"),
 }

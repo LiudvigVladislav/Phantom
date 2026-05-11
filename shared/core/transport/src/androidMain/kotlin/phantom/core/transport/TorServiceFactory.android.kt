@@ -86,38 +86,43 @@ internal class TorServiceAndroid(
         }
     }
 
-    override suspend fun start() {
+    override suspend fun start(bridgeProfile: BridgeProfile) {
         if (_state.value is TorState.Ready) return
         _state.value = TorState.Bootstrapping(percent = 0)
         try {
             withContext(Dispatchers.IO) {
-                Log.i(LOG_TAG, "wrapper.start()")
+                Log.i(LOG_TAG, "wrapper.start() bridgeProfile=${bridgeProfile.displayName}")
                 wrapper.start()
-                // ADR-018 Stage 5B: configure Snowflake bridges BEFORE
-                // enableNetwork. Once the network goes up, tor will pick
-                // its first guard — if bridges were not configured yet it
-                // would attempt a vanilla TLS handshake to a hardcoded
-                // directory authority, which TSPU/GFW classes drop. Order
-                // matters; reordering breaks censored-network connectivity.
+                // ADR-018 Stage 5B: configure bridges BEFORE enableNetwork.
+                // Once the network goes up, tor picks its first guard —
+                // if bridges were not configured yet it would attempt a
+                // vanilla TLS handshake to a hardcoded directory authority,
+                // which TSPU/GFW classes drop. Order matters; reordering
+                // breaks censored-network connectivity.
                 if (config.useBridges) {
-                    // Bridge order matters — tor tries entries in declared sequence.
-                    // ADR-020 Stage 5G Phase 1: obfs4 first (different wire signature
-                    //   from WebTunnel — bypasses TSPU 16-KB curtain that classified
-                    //   our WebTunnel handshakes).
-                    // WebTunnel second (kept as fallback for non-RU users / networks
-                    //   where the curtain is not active).
-                    // Snowflake last (public Tor Project bridges; only useful on
-                    //   uncensored networks anyway).
-                    val bridges = OperatorBridges.OBFS4 +
-                        OperatorBridges.WEBTUNNEL +
-                        SnowflakeBridges.DEFAULT
-                    Log.i(
-                        LOG_TAG,
-                        "wrapper.enableBridges(obfs4 × ${OperatorBridges.OBFS4.size}, " +
-                            "webtunnel × ${OperatorBridges.WEBTUNNEL.size}, " +
-                            "snowflake × ${SnowflakeBridges.DEFAULT.size})",
-                    )
-                    wrapper.enableBridges(bridges)
+                    val bridges = bridgesFor(bridgeProfile)
+                    if (bridges.isEmpty()) {
+                        // PR-C: an empty list for a single-PT profile
+                        // (e.g. Obfs4Only on a build without provisioned
+                        // obfs4) would tell tor to use no bridges at all,
+                        // i.e. the direct-guards path, which fails fast
+                        // on censored networks. Honest signal back to the
+                        // rotation walker — disable bridges for this
+                        // attempt so tor surfaces Failed quickly instead
+                        // of stalling indefinitely on a misconfiguration.
+                        Log.w(
+                            LOG_TAG,
+                            "bridgeProfile=${bridgeProfile.displayName} resolved to empty list — " +
+                                "calling disableBridges() so the attempt fails fast",
+                        )
+                        wrapper.disableBridges()
+                    } else {
+                        Log.i(
+                            LOG_TAG,
+                            "wrapper.enableBridges(profile=${bridgeProfile.displayName}, count=${bridges.size})",
+                        )
+                        wrapper.enableBridges(bridges)
+                    }
                 } else {
                     Log.i(LOG_TAG, "wrapper.disableBridges() (direct guards path)")
                     wrapper.disableBridges()
@@ -130,6 +135,23 @@ internal class TorServiceAndroid(
             _state.value = TorState.Failed(message = t.shortMessage())
             throw t
         }
+    }
+
+    /**
+     * Resolve a [BridgeProfile] to the concrete bridge lines tor will
+     * try, in priority order. Single-PT profiles return only their PT;
+     * [BridgeProfile.Mixed] returns the full pre-PR-C stack (obfs4 →
+     * webtunnel → snowflake) so the all-of-the-above fallback matches
+     * historical behaviour. Order within the list matters: tor tries
+     * entries top-down, so the most-likely-to-work entry should appear
+     * first within each profile (already the case in the source lists).
+     */
+    private fun bridgesFor(profile: BridgeProfile): List<String> = when (profile) {
+        BridgeProfile.Obfs4Only -> OperatorBridges.OBFS4
+        BridgeProfile.WebtunnelOnly -> OperatorBridges.WEBTUNNEL
+        BridgeProfile.SnowflakeOnly -> SnowflakeBridges.DEFAULT
+        BridgeProfile.Mixed ->
+            OperatorBridges.OBFS4 + OperatorBridges.WEBTUNNEL + SnowflakeBridges.DEFAULT
     }
 
     override suspend fun stop() {
