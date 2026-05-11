@@ -81,7 +81,24 @@ class KtorTransportProbe(
     private fun buildClient(socksPort: Int?, callTimeoutMs: Long): HttpClient = HttpClient(OkHttp) {
         engine {
             config {
+                // callTimeout is the outer ceiling for the entire HTTP exchange.
+                // OkHttp also has separate connect/read/write timeouts that
+                // default to 10 s each; if any of those fires before callTimeout,
+                // the request aborts with a SocketTimeoutException at the lower
+                // bound rather than at our intended ceiling.
+                //
+                // 2026-05-11 Test #2 surfaced exactly that: under VPN the Reality
+                // probe reported `callTimeoutMs=20000` but failed at 10.07 s with
+                // `SocketTimeoutException [socket_timeout=unknown]` — the inner
+                // 10 s read-timeout on the slow VPN-routed REALITY handshake
+                // tripped first. Synchronising connect/read/write to match
+                // callTimeout means the inner timers no longer override the
+                // outer budget, so we get a true measurement of whether the
+                // probe ever finishes within `callTimeoutMs`.
                 callTimeout(callTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                connectTimeout(callTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                readTimeout(callTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                writeTimeout(callTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
                 if (socksPort != null) {
                     proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort)))
                 }

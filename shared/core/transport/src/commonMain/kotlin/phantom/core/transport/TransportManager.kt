@@ -34,6 +34,12 @@ class TransportManager(
     private val probe: TransportProbe,
     private val nowMs: () -> Long = { kotlinx.datetime.Clock.System.now().toEpochMilliseconds() },
     private val log: TransportManagerLog = TransportManagerLog.Noop,
+    // Diagnostic-only for now (PR-A1): caller reports whether a system VPN is
+    // active at the moment we walk the chain. We just log it. Behavioural
+    // changes (e.g. skipping Reality when a VPN is active) are deferred to
+    // PR-A2 once the audit confirms whether Reality+VPN is genuinely broken
+    // by upstream / Hetzner exit-IP filtering or just slow.
+    private val vpnDetector: () -> Boolean = { false },
 ) {
     private val _state = MutableStateFlow<ManagerState>(ManagerState.Idle)
     val state: StateFlow<ManagerState> = _state.asStateFlow()
@@ -47,7 +53,8 @@ class TransportManager(
     suspend fun connect(): ConnectedTransport {
         val strategy = TransportStrategy.from(preferences.privacyMode)
         val orderedChain = reorderChain(strategy)
-        log.info("connect: mode=${preferences.privacyMode} strategy=$strategy ordered=$orderedChain")
+        val vpnActive = runCatching { vpnDetector() }.getOrDefault(false)
+        log.info("connect: mode=${preferences.privacyMode} strategy=$strategy ordered=$orderedChain vpnActive=$vpnActive")
         _state.value = ManagerState.Probing(orderedChain.first())
 
         val failures = mutableListOf<TransportAttemptFailure>()
