@@ -302,6 +302,41 @@ The combination delivers metadata-privacy + battery efficiency simultaneously �
 
 ---
 
+### ISSUE-015: Reality (VLESS+REALITY) does not work over a system-wide VPN — Reality is skipped automatically when a VPN is active
+
+**Status:** Documented limitation. Mitigated in client by skipping Reality from the transport chain whenever the system reports an active VPN, so the user does not pay a 20 s per-mode connect penalty for a guaranteed-failing probe.
+
+**Symptom.** With any system-wide Android VPN active (tested with one commercial provider on МТС Wi-Fi 2026-05-11), the Reality probe (`GET https://relay.phntm.pro/health` over the local SOCKS listener that Xray exposes) times out at the full 20 s budget with `InterruptedIOException: timeout`. Without the VPN, the same probe succeeds in ~0.6 s on the same network and the same Xray configuration.
+
+**Server-side audit (2026-05-11).** Caddy access logs (`docker logs phantom-caddy --since 12h`) show **zero requests** in the probe window for the test from the device's VPN exit IP. The relay's `phantom-relay` container correspondingly logs no `connect` event for that identity. The packets do not reach the relay's edge.
+
+**Root cause.** Below the application layer; cannot be fixed in PHANTOM. Three plausible mechanisms (only one needs to apply for the symptom to occur):
+
+- The VPN provider's egress applies DPI / classifier rules that drop the REALITY-mirrored TLS handshake (REALITY's TLS fingerprint is designed to look like a legitimate site visit, but heuristics on long-lived single-host TLS streams from a residential IP can still flag it).
+- Path-MTU on the VPN tunnel fragments the REALITY ClientHello / ServerHello, breaking the ECH-like state machine that REALITY relies on.
+- Hetzner's ingress filtering applies an IDS / abuse-list entry to the VPN provider's exit-IP range and silently drops the SYN before our edge sees it.
+
+We did not narrow it further because the user-visible result is the same in all three cases — the probe never completes — and the fix on our side is identical: do not waste 20 s per connect attempt on a transport that the network upstream has already decided to refuse.
+
+**Mitigation shipped (2026-05-11).** `TransportManager` calls a small Android-side `vpnDetector` (`ConnectivityManager.NetworkCapabilities` checking `NET_CAPABILITY_NOT_VPN` / `TRANSPORT_VPN`). When the detector reports `vpnActive=true`, Reality is filtered out of the walked chain at the start of every `connect()`:
+
+| Privacy mode | Without VPN                  | With VPN active            |
+|--------------|------------------------------|----------------------------|
+| Standard     | `[Direct, Reality, Tor]`     | `[Direct, Tor]`            |
+| Private      | `[Reality, Tor]`             | `[Tor]`                    |
+| Ghost        | `[Tor]`                      | `[Tor]` (unchanged)        |
+
+The non-VPN path is unchanged — Reality remains the privacy-preferred default for users who have no VPN running. Logs surface the decision as `vpnActive=true realityFiltered=true` next to the `ordered=...` line, so future test logs make the chain choice obvious without re-reading the source.
+
+**User-visible effect.** With a VPN on:
+- `Standard` connects in ~2 s via Direct (unchanged).
+- `Private` connects via Tor — bootstrap time depends on bridge availability (~2 min on the audited VPN+МТС Wi-Fi path; without VPN this is much slower on МТС, see ISSUE-013 / Tor bridge work).
+- `Ghost` is unchanged.
+
+**Why we do not try Reality as a "last resort" under VPN.** With a 20 s per-attempt budget and a server-side audit showing the packets do not arrive, Reality under VPN is a guaranteed 20 s wasted per fallback walk. Adding it as a tail of the chain would make every fallback to Tor strictly worse without ever rescuing a real user.
+
+---
+
 ## Bugs that have been fixed in Alpha 1 development
 
 These are documented for transparency about what we resolved during the development sprint:

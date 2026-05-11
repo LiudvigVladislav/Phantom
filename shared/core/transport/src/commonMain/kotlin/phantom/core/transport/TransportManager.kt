@@ -52,9 +52,32 @@ class TransportManager(
      */
     suspend fun connect(): ConnectedTransport {
         val strategy = TransportStrategy.from(preferences.privacyMode)
-        val orderedChain = reorderChain(strategy)
+        val baseChain = reorderChain(strategy)
         val vpnActive = runCatching { vpnDetector() }.getOrDefault(false)
-        log.info("connect: mode=${preferences.privacyMode} strategy=$strategy ordered=$orderedChain vpnActive=$vpnActive")
+        // Reality runs over the system network stack, so when an Android VPN
+        // is active the REALITY-mirrored TLS traffic is tunnelled through the
+        // VPN egress before reaching Hetzner. The 2026-05-11 audit cycle
+        // (Test #3 + Caddy access-log review) confirmed those packets do not
+        // arrive at the relay's edge — Caddy logged zero requests in the
+        // probe window. The cause sits below us (VPN-side DPI / MTU /
+        // Hetzner ingress policy), and the symptom is a 20 s timeout that
+        // adds latency without ever succeeding.
+        //
+        // Drop Reality from the walked chain when a VPN is active so we
+        // skip straight to the next viable transport (Tor for Private/Ghost,
+        // Direct→Tor for Standard). The non-VPN path is unchanged and
+        // Reality remains the privacy-preferred default there.
+        val orderedChain = if (vpnActive) {
+            baseChain.filterNot { it == TransportKind.Reality }
+                .ifEmpty { baseChain } // safety net; current chains always include Tor
+        } else {
+            baseChain
+        }
+        val realityFiltered = vpnActive && baseChain.contains(TransportKind.Reality)
+        log.info(
+            "connect: mode=${preferences.privacyMode} strategy=$strategy " +
+                "ordered=$orderedChain vpnActive=$vpnActive realityFiltered=$realityFiltered",
+        )
         _state.value = ManagerState.Probing(orderedChain.first())
 
         val failures = mutableListOf<TransportAttemptFailure>()
