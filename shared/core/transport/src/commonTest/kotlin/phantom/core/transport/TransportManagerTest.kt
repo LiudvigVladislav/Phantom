@@ -227,7 +227,7 @@ class TransportManagerTest {
     private fun fakeTor(): TorService = object : TorService {
         private val flow = MutableStateFlow<TorState>(TorState.Ready(socksPort = 9050))
         override val state: StateFlow<TorState> = flow.asStateFlow()
-        override suspend fun start() { /* already Ready */ }
+        override suspend fun start(bridgeProfile: BridgeProfile) { /* already Ready */ }
         override suspend fun stop() { flow.value = TorState.Off }
     }
 

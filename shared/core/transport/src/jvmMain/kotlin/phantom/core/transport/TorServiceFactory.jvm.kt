@@ -24,8 +24,10 @@ internal class TorServiceJvm : TorService {
     private val _state = MutableStateFlow<TorState>(TorState.Off)
     override val state: StateFlow<TorState> = _state.asStateFlow()
 
-    override suspend fun start() {
+    override suspend fun start(bridgeProfile: BridgeProfile) {
         // Intentional no-op on desktop until the JVM Tor stack is wired here too.
+        // The bridgeProfile parameter is accepted for interface conformance;
+        // it has no effect because no tor instance is launched.
     }
 
     override suspend fun stop() {

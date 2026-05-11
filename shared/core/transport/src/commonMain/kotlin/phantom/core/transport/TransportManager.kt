@@ -159,114 +159,18 @@ class TransportManager(
      *  - Reality (libXray gomobile JNI): up to [REALITY_PREPARE_TIMEOUT_MS]
      *    on first launch (~30 s for the 45 MB native lib). Warm restarts
      *    return immediately because the service is already in `Ready`.
-     *  - Tor (Briar wrapper + bridges): up to [TOR_PREPARE_TIMEOUT_MS] on
-     *    first bridge bootstrap (5–8 min on a censored network without a
-     *    cached consensus). Warm restarts return in seconds.
+     *  - Tor (Briar wrapper + bridges): walked through the
+     *    [BRIDGE_ROTATION_ORDER] (PR-C) — each profile gets its own
+     *    per-attempt budget (180 s / 120 s / 180 s / 240 s = 720 s
+     *    worst-case if every profile must be tried). Warm restarts
+     *    return inside the first profile in seconds.
      *
      * The probe phase that follows has its own short [PROBE_TIMEOUT_MS] (5 s)
      * — we prove the path works end-to-end fast even after a slow init.
      */
     private suspend fun prepareTransport(kind: TransportKind): Int? = when (kind) {
         TransportKind.Direct -> null
-        TransportKind.Tor -> {
-            val tor = torServiceProvider()
-            log.info("Tor: start() called, current state=${tor.state.value}")
-            tor.start()
-            val torStartMs = nowMs()
-            // Diagnostic: stream Bootstrapping percent + terminal state to
-            // the log. Architect review 2026-05-11 noted that with only
-            // `Probing(Tor)` on the wire we could not tell whether Tor
-            // was stalling at 14 % vs 95 %, vs never starting at all.
-            //
-            // PR-B (2026-05-11): also publish per-percent + per-stage
-            // updates into ManagerState.Probing.torStatus so the
-            // foreground notification + UI can display "Searching for a
-            // reachable route… 57 %" instead of a silent ~7-minute
-            // "Connecting via Tor…". Stage advances are time-driven (not
-            // percent-driven) because the percent can stall for minutes
-            // — a parallel poller ticks every TOR_STAGE_POLL_INTERVAL_MS
-            // so the UI re-renders to "Slow"/"Throttled" even when no
-            // new percent arrives. The poller is cancelled in `finally`
-            // so it never outlives the prepare phase.
-            val terminal = try {
-                coroutineScope {
-                    var lastPercent = 0
-                    val pollerJob: Job = launch {
-                        while (isActive) {
-                            val elapsedMs = nowMs() - torStartMs
-                            val stage = TorBootstrapStage.forElapsedMs(elapsedMs)
-                            _state.value = ManagerState.Probing(
-                                kind = TransportKind.Tor,
-                                torStatus = TorProbingStatus(
-                                    percent = lastPercent,
-                                    stage = stage,
-                                    elapsedMs = elapsedMs,
-                                ),
-                            )
-                            delay(TOR_STAGE_POLL_INTERVAL_MS)
-                        }
-                    }
-                    try {
-                        withTimeout(TOR_PREPARE_TIMEOUT_MS) {
-                            tor.state.first { st ->
-                                when (st) {
-                                    is TorState.Bootstrapping -> {
-                                        if (st.percent != lastPercent) {
-                                            log.info("Tor bootstrap: percent=${st.percent}")
-                                            lastPercent = st.percent
-                                            // Push an immediate state update on
-                                            // every percent change so the UI
-                                            // does not have to wait up to one
-                                            // poller tick to reflect progress.
-                                            val elapsedMs = nowMs() - torStartMs
-                                            _state.value = ManagerState.Probing(
-                                                kind = TransportKind.Tor,
-                                                torStatus = TorProbingStatus(
-                                                    percent = st.percent,
-                                                    stage = TorBootstrapStage.forElapsedMs(elapsedMs),
-                                                    elapsedMs = elapsedMs,
-                                                ),
-                                            )
-                                        }
-                                        false
-                                    }
-                                    is TorState.Ready -> {
-                                        log.info("Tor bootstrap: Ready socksPort=${st.socksPort}")
-                                        true
-                                    }
-                                    is TorState.Failed -> {
-                                        log.warn("Tor bootstrap: Failed message=${st.message}")
-                                        true
-                                    }
-                                    else -> false
-                                }
-                            }
-                        }
-                    } finally {
-                        pollerJob.cancel()
-                    }
-                }
-            } catch (t: Throwable) {
-                // Defensive cleanup per architect review: a stuck Tor
-                // service must be torn down before the next chain walk
-                // (Private → Tor → Ghost) so we don't await a corpse
-                // descriptor / circuit pool. tor.stop() is idempotent.
-                log.warn("Tor: prepare aborted (${t::class.simpleName}: ${t.message}) — calling tor.stop()")
-                runCatching { tor.stop() }
-                throw t
-            }
-            when (terminal) {
-                is TorState.Ready -> terminal.socksPort
-                is TorState.Failed -> {
-                    runCatching { tor.stop() }
-                    error("Tor Failed: ${terminal.message}")
-                }
-                else -> {
-                    runCatching { tor.stop() }
-                    error("Tor returned unexpected state: $terminal")
-                }
-            }
-        }
+        TransportKind.Tor -> prepareTorWithRotation()
         TransportKind.Reality -> {
             val xray = xrayServiceProvider()
             xray.start()
@@ -280,6 +184,228 @@ class TransportManager(
                 else -> error("Xray returned unexpected state: $terminal")
             }
         }
+    }
+
+    // ── Tor bridge rotation (PR-C, 2026-05-11) ────────────────────────────────
+
+    /**
+     * Walk [BRIDGE_ROTATION_ORDER] sequentially, calling [prepareTorOnce]
+     * for each profile with its per-profile budget. Return the first
+     * profile that reaches [TorState.Ready] within its budget. Between
+     * attempts, fully stop tor so each profile starts from a clean
+     * wrapper state (Briar's `enableBridges` can be called on a running
+     * wrapper but the bridge re-selection only takes effect after a
+     * full restart of tor's network state — stop+start is the safe
+     * primitive).
+     *
+     * Why per-profile timeouts instead of one big budget:
+     *   The 2026-05-11 audit cycle showed Tor on МТС can sit on a single
+     *   percent for 3-4 minutes mid-bootstrap. With one 600 s budget we
+     *   would burn the entire window on a stuck obfs4 attempt before
+     *   noticing snowflake might have worked in 60 s. Splitting into
+     *   shorter per-profile slots gives a stuck profile time to make a
+     *   serious attempt while still letting the next profile try inside
+     *   the user's patience window.
+     *
+     * Why obfs4 first (not webtunnel as the architect originally proposed):
+     *   Empirical: Test 13 (2026-05-06) confirmed our WebTunnel handshakes
+     *   trip the TSPU 16-KB curtain on Hetzner-hosted bridges. obfs4's
+     *   uniform-random byte stream wire signature dodges that classifier
+     *   entirely. Observed 2026-05-09 onwards on МТС: obfs4 to FlokiNET
+     *   is the most reliable single-PT path. Webtunnel/snowflake follow
+     *   as fallbacks for networks where obfs4 ports are blocked.
+     */
+    private suspend fun prepareTorWithRotation(): Int {
+        val tor = torServiceProvider()
+        val total = BRIDGE_ROTATION_ORDER.size
+        var lastError: Throwable? = null
+        for ((index, attempt) in BRIDGE_ROTATION_ORDER.withIndex()) {
+            val attemptNum = index + 1
+            log.info(
+                "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
+                    "budgetMs=${attempt.budgetMs}",
+            )
+            // Defensive: ensure no leftover tor from a previous profile.
+            // First iteration the service is already Off (chain walker
+            // calls release() between connect generations); later
+            // iterations need this stop to flip the wrapper out of any
+            // half-bootstrapped state from the previous profile.
+            if (index > 0) {
+                runCatching { tor.stop() }
+            }
+            val socksPort = try {
+                prepareTorOnce(
+                    tor = tor,
+                    profile = attempt.profile,
+                    perProfileBudgetMs = attempt.budgetMs,
+                    attemptNum = attemptNum,
+                    totalAttempts = total,
+                )
+            } catch (t: Throwable) {
+                log.warn(
+                    "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
+                        "raised ${t::class.simpleName}: ${t.message}",
+                )
+                lastError = t
+                runCatching { tor.stop() }
+                null
+            }
+            if (socksPort != null) {
+                log.info(
+                    "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
+                        "READY socksPort=$socksPort",
+                )
+                return socksPort
+            }
+            log.warn(
+                "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
+                    "did not reach Ready in ${attempt.budgetMs} ms",
+            )
+        }
+        // All profiles exhausted — surface a diagnostic error so the
+        // outer chain walker logs "Tor subsystem prepare failed" with
+        // a useful reason. Last error (if any) gives the most recent
+        // upstream signal.
+        val msg = "All ${total} bridge profiles exhausted" +
+            (lastError?.let { " (last: ${it::class.simpleName}: ${it.message})" } ?: "")
+        error(msg)
+    }
+
+    /**
+     * Try one bridge profile. Returns the SOCKS port on success, or
+     * null when the per-profile budget elapses without reaching Ready.
+     * Throws on hard failure (Tor reported `Failed`, prepare-coroutine
+     * cancelled, etc.) so the rotation walker can decide whether to
+     * propagate or move on.
+     *
+     * The percent-streaming + time-keyed stage poller from PR-B is kept
+     * here verbatim — it now also publishes the active [profile] +
+     * [attemptNum] / [totalAttempts] into [TorProbingStatus] so the
+     * notification text can show "Trying webtunnel… 50% (2/4) · Ghost".
+     */
+    private suspend fun prepareTorOnce(
+        tor: TorService,
+        profile: BridgeProfile,
+        perProfileBudgetMs: Long,
+        attemptNum: Int,
+        totalAttempts: Int,
+    ): Int? {
+        log.info("Tor: start(profile=${profile.displayName})")
+        tor.start(profile)
+        val torStartMs = nowMs()
+        val terminal: TorState = try {
+            coroutineScope {
+                var lastPercent = 0
+                val pollerJob: Job = launch {
+                    while (isActive) {
+                        publishTorProbing(
+                            percent = lastPercent,
+                            torStartMs = torStartMs,
+                            profile = profile,
+                            attemptNum = attemptNum,
+                            totalAttempts = totalAttempts,
+                        )
+                        delay(TOR_STAGE_POLL_INTERVAL_MS)
+                    }
+                }
+                try {
+                    withTimeout(perProfileBudgetMs) {
+                        tor.state.first { st ->
+                            when (st) {
+                                is TorState.Bootstrapping -> {
+                                    if (st.percent != lastPercent) {
+                                        log.info(
+                                            "Tor bootstrap: profile=${profile.displayName} percent=${st.percent}",
+                                        )
+                                        lastPercent = st.percent
+                                        publishTorProbing(
+                                            percent = st.percent,
+                                            torStartMs = torStartMs,
+                                            profile = profile,
+                                            attemptNum = attemptNum,
+                                            totalAttempts = totalAttempts,
+                                        )
+                                    }
+                                    false
+                                }
+                                is TorState.Ready -> {
+                                    log.info(
+                                        "Tor bootstrap: profile=${profile.displayName} Ready " +
+                                            "socksPort=${st.socksPort}",
+                                    )
+                                    true
+                                }
+                                is TorState.Failed -> {
+                                    log.warn(
+                                        "Tor bootstrap: profile=${profile.displayName} Failed " +
+                                            "message=${st.message}",
+                                    )
+                                    true
+                                }
+                                else -> false
+                            }
+                        }
+                    }
+                } finally {
+                    pollerJob.cancel()
+                }
+            }
+        } catch (_: TimeoutCancellationException) {
+            // Per-profile budget elapsed. Not an error — caller advances
+            // to the next profile. Defensive stop() so the next profile
+            // does not inherit a half-bootstrapped wrapper.
+            log.warn(
+                "Tor: profile=${profile.displayName} budget elapsed (${perProfileBudgetMs} ms)",
+            )
+            runCatching { tor.stop() }
+            return null
+        } catch (t: Throwable) {
+            log.warn(
+                "Tor: profile=${profile.displayName} prepare aborted " +
+                    "(${t::class.simpleName}: ${t.message})",
+            )
+            runCatching { tor.stop() }
+            throw t
+        }
+        return when (terminal) {
+            is TorState.Ready -> terminal.socksPort
+            is TorState.Failed -> {
+                runCatching { tor.stop() }
+                // Hard failure for this profile but not for the rotation
+                // — return null so the walker can advance.
+                null
+            }
+            else -> {
+                runCatching { tor.stop() }
+                null
+            }
+        }
+    }
+
+    /**
+     * Push a fresh [ManagerState.Probing] with the current Tor probe
+     * snapshot. Centralised so the percent-update path and the time-tick
+     * path build the [TorProbingStatus] identically.
+     */
+    private fun publishTorProbing(
+        percent: Int,
+        torStartMs: Long,
+        profile: BridgeProfile,
+        attemptNum: Int,
+        totalAttempts: Int,
+    ) {
+        val elapsedMs = nowMs() - torStartMs
+        _state.value = ManagerState.Probing(
+            kind = TransportKind.Tor,
+            torStatus = TorProbingStatus(
+                percent = percent,
+                stage = TorBootstrapStage.forElapsedMs(elapsedMs),
+                elapsedMs = elapsedMs,
+                bridgeProfile = profile,
+                attempt = attemptNum,
+                totalAttempts = totalAttempts,
+            ),
+        )
     }
 
     // ── Hint maintenance ──────────────────────────────────────────────────────
@@ -339,18 +465,6 @@ class TransportManager(
         const val REALITY_PREPARE_TIMEOUT_MS: Long = 30_000L
 
         /**
-         * Tor (Briar wrapper + WebTunnel bridges) prepare-phase budget. A
-         * fresh operator-controlled bridge with no cached descriptors and
-         * no guard-relay reputation takes 5–8 minutes to bootstrap on a
-         * censored network — `TOR_BOOTSTRAP_TIMEOUT_MS` from the pre-ADR-020
-         * code was 600 s for exactly that reason. Sized for cold-start so
-         * Ghost-mode users on first launch are not aborted prematurely.
-         * Warm restarts return in seconds. After Stage 5D (multi-bridge
-         * load-balanced bootstrap) ships this can tighten back to ~180 s.
-         */
-        const val TOR_PREPARE_TIMEOUT_MS: Long = 600_000L
-
-        /**
          * Tor stage-poller tick (PR-B). Re-emits ManagerState.Probing with
          * the current [TorBootstrapStage] every 5 s so the foreground
          * notification + UI advance from "Connecting…" to "Searching for a
@@ -359,8 +473,52 @@ class TransportManager(
          * responsive without flooding the StateFlow.
          */
         const val TOR_STAGE_POLL_INTERVAL_MS: Long = 5_000L
+
+        /**
+         * Bridge rotation order for [prepareTorWithRotation] (PR-C).
+         *
+         * obfs4 first because Test 13 (2026-05-06) showed our WebTunnel
+         * handshakes hit the TSPU 16-KB curtain on Hetzner-hosted bridges
+         * — obfs4's uniform-random byte stream wire signature dodges that
+         * classifier entirely, and obfs4 to FlokiNET has been the most
+         * reliable single-PT path on МТС since 2026-05-09.
+         *
+         * Webtunnel second with a shorter budget — when the curtain is
+         * not active it succeeds quickly; when it is active it stalls,
+         * and 120 s is enough to detect that and move on.
+         *
+         * Snowflake third — broker-fronted, generally unreliable on RU
+         * carriers without VPN (Test 10, 2026-05-05) but fine elsewhere
+         * and useful as a third independent transport.
+         *
+         * Mixed last — historical pre-PR-C behaviour as a safety net.
+         * If single-PT attempts all fail, a stack of all-of-the-above
+         * is the final shot before declaring Tor unreachable on this
+         * network.
+         *
+         * Total walk budget = 180 + 120 + 180 + 240 = 720 s. Per-profile
+         * budgets dominate; there is no longer a single outer cap on the
+         * Tor prepare phase.
+         */
+        val BRIDGE_ROTATION_ORDER: List<BridgeRotationAttempt> = listOf(
+            BridgeRotationAttempt(BridgeProfile.Obfs4Only, budgetMs = 180_000L),
+            BridgeRotationAttempt(BridgeProfile.WebtunnelOnly, budgetMs = 120_000L),
+            BridgeRotationAttempt(BridgeProfile.SnowflakeOnly, budgetMs = 180_000L),
+            BridgeRotationAttempt(BridgeProfile.Mixed, budgetMs = 240_000L),
+        )
     }
 }
+
+/**
+ * One step in the [TransportManager.BRIDGE_ROTATION_ORDER] walk: which
+ * [BridgeProfile] to try and how long to give it before advancing to
+ * the next profile. Per-profile budgets keep a single stuck profile
+ * from monopolising the user's patience window.
+ */
+data class BridgeRotationAttempt(
+    val profile: BridgeProfile,
+    val budgetMs: Long,
+)
 
 /** [TransportManager] state for foreground-service notification + UI. */
 sealed class ManagerState {
@@ -400,6 +558,23 @@ data class TorProbingStatus(
     val percent: Int,
     val stage: TorBootstrapStage,
     val elapsedMs: Long,
+    /**
+     * Which bridge profile is currently being attempted. PR-C
+     * (2026-05-11) walks profiles sequentially with their own per-
+     * profile timeout; surfacing the active profile in the UI lets
+     * the user see "Trying webtunnel… 50%" → "Trying snowflake…" so
+     * the rotation is not invisible during a long bootstrap.
+     */
+    val bridgeProfile: BridgeProfile,
+    /**
+     * 1-based attempt index for the current rotation walk (1 = first
+     * profile, 2 = second, …). Surfaced in logs / notification copy
+     * so a user / reviewer can see "attempt 3 of 4" without re-deriving
+     * it from the profile order. Useful in support diagnostics.
+     */
+    val attempt: Int,
+    /** Total number of profiles in the rotation order (typically 4). */
+    val totalAttempts: Int,
 )
 
 /**
