@@ -3,11 +3,16 @@
 
 package phantom.core.transport
 
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import phantom.core.xray.XrayService
 import phantom.core.xray.XrayState
@@ -167,35 +172,78 @@ class TransportManager(
             val tor = torServiceProvider()
             log.info("Tor: start() called, current state=${tor.state.value}")
             tor.start()
+            val torStartMs = nowMs()
             // Diagnostic: stream Bootstrapping percent + terminal state to
             // the log. Architect review 2026-05-11 noted that with only
             // `Probing(Tor)` on the wire we could not tell whether Tor
             // was stalling at 14 % vs 95 %, vs never starting at all.
-            // Coroutine-launched on the same scope as the await below so
-            // both finish together (cancelled by the outer withTimeout
-            // when the budget elapses).
+            //
+            // PR-B (2026-05-11): also publish per-percent + per-stage
+            // updates into ManagerState.Probing.torStatus so the
+            // foreground notification + UI can display "Searching for a
+            // reachable route… 57 %" instead of a silent ~7-minute
+            // "Connecting via Tor…". Stage advances are time-driven (not
+            // percent-driven) because the percent can stall for minutes
+            // — a parallel poller ticks every TOR_STAGE_POLL_INTERVAL_MS
+            // so the UI re-renders to "Slow"/"Throttled" even when no
+            // new percent arrives. The poller is cancelled in `finally`
+            // so it never outlives the prepare phase.
             val terminal = try {
-                withTimeout(TOR_PREPARE_TIMEOUT_MS) {
-                    var lastPercent = -1
-                    tor.state.first { st ->
-                        when (st) {
-                            is TorState.Bootstrapping -> {
-                                if (st.percent != lastPercent) {
-                                    log.info("Tor bootstrap: percent=${st.percent}")
-                                    lastPercent = st.percent
-                                }
-                                false
-                            }
-                            is TorState.Ready -> {
-                                log.info("Tor bootstrap: Ready socksPort=${st.socksPort}")
-                                true
-                            }
-                            is TorState.Failed -> {
-                                log.warn("Tor bootstrap: Failed message=${st.message}")
-                                true
-                            }
-                            else -> false
+                coroutineScope {
+                    var lastPercent = 0
+                    val pollerJob: Job = launch {
+                        while (isActive) {
+                            val elapsedMs = nowMs() - torStartMs
+                            val stage = TorBootstrapStage.forElapsedMs(elapsedMs)
+                            _state.value = ManagerState.Probing(
+                                kind = TransportKind.Tor,
+                                torStatus = TorProbingStatus(
+                                    percent = lastPercent,
+                                    stage = stage,
+                                    elapsedMs = elapsedMs,
+                                ),
+                            )
+                            delay(TOR_STAGE_POLL_INTERVAL_MS)
                         }
+                    }
+                    try {
+                        withTimeout(TOR_PREPARE_TIMEOUT_MS) {
+                            tor.state.first { st ->
+                                when (st) {
+                                    is TorState.Bootstrapping -> {
+                                        if (st.percent != lastPercent) {
+                                            log.info("Tor bootstrap: percent=${st.percent}")
+                                            lastPercent = st.percent
+                                            // Push an immediate state update on
+                                            // every percent change so the UI
+                                            // does not have to wait up to one
+                                            // poller tick to reflect progress.
+                                            val elapsedMs = nowMs() - torStartMs
+                                            _state.value = ManagerState.Probing(
+                                                kind = TransportKind.Tor,
+                                                torStatus = TorProbingStatus(
+                                                    percent = st.percent,
+                                                    stage = TorBootstrapStage.forElapsedMs(elapsedMs),
+                                                    elapsedMs = elapsedMs,
+                                                ),
+                                            )
+                                        }
+                                        false
+                                    }
+                                    is TorState.Ready -> {
+                                        log.info("Tor bootstrap: Ready socksPort=${st.socksPort}")
+                                        true
+                                    }
+                                    is TorState.Failed -> {
+                                        log.warn("Tor bootstrap: Failed message=${st.message}")
+                                        true
+                                    }
+                                    else -> false
+                                }
+                            }
+                        }
+                    } finally {
+                        pollerJob.cancel()
                     }
                 }
             } catch (t: Throwable) {
@@ -301,15 +349,94 @@ class TransportManager(
          * load-balanced bootstrap) ships this can tighten back to ~180 s.
          */
         const val TOR_PREPARE_TIMEOUT_MS: Long = 600_000L
+
+        /**
+         * Tor stage-poller tick (PR-B). Re-emits ManagerState.Probing with
+         * the current [TorBootstrapStage] every 5 s so the foreground
+         * notification + UI advance from "Connecting…" to "Searching for a
+         * reachable route…" / "Slow…" / "Throttled…" even when the
+         * underlying Tor percent is stalled. 5 s is fast enough to feel
+         * responsive without flooding the StateFlow.
+         */
+        const val TOR_STAGE_POLL_INTERVAL_MS: Long = 5_000L
     }
 }
 
 /** [TransportManager] state for foreground-service notification + UI. */
 sealed class ManagerState {
     object Idle : ManagerState()
-    data class Probing(val kind: TransportKind) : ManagerState()
+
+    /**
+     * Currently probing [kind]. For Tor, [torStatus] carries the
+     * bootstrap percent + the time-based [TorBootstrapStage] so the UI
+     * can render a meaningful message during the multi-minute bridge
+     * negotiation. Null for Direct / Reality probes (they are sub-second
+     * and do not need staged messaging) and for the very first emission
+     * before the poller has run.
+     */
+    data class Probing(
+        val kind: TransportKind,
+        val torStatus: TorProbingStatus? = null,
+    ) : ManagerState()
+
     data class Connected(val kind: TransportKind) : ManagerState()
     data class AllFailed(val attempts: List<TransportAttemptFailure>) : ManagerState()
+}
+
+/**
+ * Tor bootstrap snapshot for [ManagerState.Probing]. PR-B (2026-05-11)
+ * lets the UI surface what Tor is actually doing during the long
+ * bridge-negotiation window instead of a silent "Connecting via Tor…".
+ *
+ * `percent` is the last value reported by the Tor wrapper (0–100).
+ * `stage` is derived purely from `elapsedMs` so it advances even when
+ * the underlying percent stalls — that is the situation we most want to
+ * surface ("This network is slowing Tor connections…" after 2 min, etc).
+ * `elapsedMs` is the ms since the prepare-Tor branch started, useful
+ * for the UI to show "Tor • 1:34 • 50 %" if it wants finer-grained
+ * timing without re-deriving it from logs.
+ */
+data class TorProbingStatus(
+    val percent: Int,
+    val stage: TorBootstrapStage,
+    val elapsedMs: Long,
+)
+
+/**
+ * Time-keyed Tor bootstrap stages for user-facing messages. Thresholds
+ * picked from the architect-suggested staging (PR-B 2026-05-11):
+ *
+ *   0–15 s    Initial         "Connecting to Tor network…"
+ *   15–45 s   Negotiating     "Negotiating censorship-resistant bridge…"
+ *   45–120 s  Searching       "Searching for a reachable route…"
+ *   120–240 s Slow            "This network is slowing Tor connections…"
+ *   ≥ 240 s   Throttled       "Tor is heavily throttled on this network. VPN may improve connection speed."
+ *
+ * Wording is deliberate: never say "blocked" without certainty (we do
+ * not have certainty without explicit DPI fingerprints), prefer "slow",
+ * "restricted", "throttled", "difficult network". The "VPN may improve"
+ * line on the Throttled stage is the one piece of actionable advice we
+ * have for the user — it is consistent with what the 2026-05-11 audit
+ * cycle empirically observed (Tor under VPN: ~2-7 min; without VPN on
+ * МТС: 10+ min and frequent timeout).
+ */
+enum class TorBootstrapStage(val userText: String) {
+    Initial("Connecting to Tor network…"),
+    Negotiating("Negotiating censorship-resistant bridge…"),
+    Searching("Searching for a reachable route…"),
+    Slow("This network is slowing Tor connections…"),
+    Throttled("Tor is heavily throttled on this network. VPN may improve connection speed."),
+    ;
+
+    companion object {
+        fun forElapsedMs(elapsedMs: Long): TorBootstrapStage = when {
+            elapsedMs < 15_000L -> Initial
+            elapsedMs < 45_000L -> Negotiating
+            elapsedMs < 120_000L -> Searching
+            elapsedMs < 240_000L -> Slow
+            else -> Throttled
+        }
+    }
 }
 
 /**
