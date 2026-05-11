@@ -207,8 +207,36 @@ class AppContainer(private val context: Context) {
                 override fun info(msg: String) { android.util.Log.i("TransportManager", msg) }
                 override fun warn(msg: String) { android.util.Log.w("TransportManager", msg) }
             },
+            vpnDetector = ::isSystemVpnActive,
         )
     }
+
+    /**
+     * Returns true when the active default network advertises the VPN
+     * transport (i.e. NET_CAPABILITY_NOT_VPN is missing). Diagnostic-only
+     * for PR-A1: the result is logged inside TransportManager.connect so a
+     * test log shows whether a VPN was active when probes ran. Behavioural
+     * gating is deferred to PR-A2 once we have audit evidence on whether
+     * Reality+VPN is genuinely broken or just slow on the user's network.
+     *
+     * Defensive against API quirks (no active network, missing capabilities,
+     * security exceptions on locked-down OEMs) — any failure returns false
+     * so we never accidentally claim a VPN is active when we cannot tell.
+     */
+    private fun isSystemVpnActive(): Boolean = runCatching {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager
+            ?: return@runCatching false
+        val activeNetwork = cm.activeNetwork ?: return@runCatching false
+        val caps = cm.getNetworkCapabilities(activeNetwork) ?: return@runCatching false
+        // NET_CAPABILITY_NOT_VPN absent ⇒ this network IS a VPN.
+        // hasTransport(TRANSPORT_VPN) is the same idea via the transport
+        // axis — we check both to cover the (rare) case where a VPN app
+        // sets the transport but the framework forgets to clear the
+        // NOT_VPN capability, or vice versa.
+        !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN) ||
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
+    }.getOrDefault(false)
 
     /**
      * ADR-020 Phase 3: Privacy Mode setter that handles graceful reconnect.
