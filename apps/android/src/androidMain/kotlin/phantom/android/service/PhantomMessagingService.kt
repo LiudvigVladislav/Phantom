@@ -135,7 +135,25 @@ class PhantomMessagingService : Service() {
                         // tapping does nothing. Real retry path is the Privacy
                         // Mode selector in Settings (which calls
                         // setPrivacyMode → release → fresh chain walk).
-                        "Cannot reach relay (tried ${state.attempts.size}) · $mode"
+                        //
+                        // PR-D (2026-05-12): give Ghost-mode users a concrete
+                        // next step instead of a dead-end "Cannot reach". On
+                        // some censored networks (notably МТС RU without VPN)
+                        // every Tor bridge profile times out — telling the
+                        // user to try Private/Reality or enable a VPN turns
+                        // a frustrating wall into actionable advice. Standard
+                        // and Private already keep the original copy because
+                        // a Direct/Reality failure usually means the relay
+                        // itself is unreachable, not a censorship layer.
+                        if (state.attempts.any {
+                                it.kind == phantom.core.transport.TransportKind.Tor
+                            }
+                        ) {
+                            "Tor is blocked or slowed by this network. " +
+                                "Try Private/Reality or enable a VPN. · $mode"
+                        } else {
+                            "Cannot reach relay (tried ${state.attempts.size}) · $mode"
+                        }
                 }
                 Log.i(
                     TAG,

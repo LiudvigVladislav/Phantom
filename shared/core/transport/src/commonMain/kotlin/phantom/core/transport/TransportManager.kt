@@ -475,36 +475,44 @@ class TransportManager(
         const val TOR_STAGE_POLL_INTERVAL_MS: Long = 5_000L
 
         /**
-         * Bridge rotation order for [prepareTorWithRotation] (PR-C).
+         * Bridge rotation order for [prepareTorWithRotation].
          *
-         * obfs4 first because Test 13 (2026-05-06) showed our WebTunnel
-         * handshakes hit the TSPU 16-KB curtain on Hetzner-hosted bridges
-         * — obfs4's uniform-random byte stream wire signature dodges that
-         * classifier entirely, and obfs4 to FlokiNET has been the most
-         * reliable single-PT path on МТС since 2026-05-09.
+         * Order + budgets retuned 2026-05-12 from Test #5 (МТС Wi-Fi
+         * without VPN, see KNOWN_ISSUES ISSUE-016) where we observed
+         * the inverse of the original PR-C ordering's assumption:
          *
-         * Webtunnel second with a shorter budget — when the curtain is
-         * not active it succeeds quickly; when it is active it stalls,
-         * and 120 s is enough to detect that and move on.
+         *   obfs4      reached 10%  — TSPU blocks bridge handshake
+         *   webtunnel  reached 10%  — TSPU blocks bridge handshake
+         *   snowflake  reached 50%  — partial circuit build
+         *   mixed      reached 72%  — best result by a wide margin
          *
-         * Snowflake third — broker-fronted, generally unreliable on RU
-         * carriers without VPN (Test 10, 2026-05-05) but fine elsewhere
-         * and useful as a third independent transport.
+         * Mixed wins because tor selects its first reachable bridge
+         * out of the full obfs4+webtunnel+snowflake pool in parallel,
+         * which gives the underlying PT layer the best chance against
+         * a censorship adversary that only blocks SOME wire signatures.
          *
-         * Mixed last — historical pre-PR-C behaviour as a safety net.
-         * If single-PT attempts all fail, a stack of all-of-the-above
-         * is the final shot before declaring Tor unreachable on this
-         * network.
+         * Reordering puts our biggest gun first and gives it a real
+         * 10-minute window to complete — long enough that on healthy
+         * censored networks the rotation walk usually ends after the
+         * first attempt. Single-PT fallbacks stay in the list so a
+         * network that breaks one PT but not another (e.g. obfs4 OK
+         * but snowflake broker fronting blocked) still has a chance.
          *
-         * Total walk budget = 180 + 120 + 180 + 240 = 720 s. Per-profile
-         * budgets dominate; there is no longer a single outer cap on the
-         * Tor prepare phase.
+         * Single-PT budgets are short (90 s each) — empirically these
+         * stall at percent=10 on networks where TSPU is active, so a
+         * long budget there only delays the next attempt. Snowflake
+         * keeps a longer 6-minute budget because it's the second-best
+         * standalone transport per Test #5.
+         *
+         * Total worst-case walk = 600 + 360 + 90 + 90 = 1140 s (19 min).
+         * On uncensored networks the first profile reaches Ready in
+         * 60-180 s and the rotation ends.
          */
         val BRIDGE_ROTATION_ORDER: List<BridgeRotationAttempt> = listOf(
-            BridgeRotationAttempt(BridgeProfile.Obfs4Only, budgetMs = 180_000L),
-            BridgeRotationAttempt(BridgeProfile.WebtunnelOnly, budgetMs = 120_000L),
-            BridgeRotationAttempt(BridgeProfile.SnowflakeOnly, budgetMs = 180_000L),
-            BridgeRotationAttempt(BridgeProfile.Mixed, budgetMs = 240_000L),
+            BridgeRotationAttempt(BridgeProfile.Mixed,         budgetMs = 600_000L),
+            BridgeRotationAttempt(BridgeProfile.SnowflakeOnly, budgetMs = 360_000L),
+            BridgeRotationAttempt(BridgeProfile.Obfs4Only,     budgetMs = 90_000L),
+            BridgeRotationAttempt(BridgeProfile.WebtunnelOnly, budgetMs = 90_000L),
         )
     }
 }
