@@ -361,6 +361,95 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-11 (sun) · Transport reliability deep-dive — Reality+VPN audit, Tor staged UX, bridge rotation
+
+- **Goal:** turn the May 10–11 cross-device transport tests into shipped fixes.
+  Three real symptoms surfaced under MTS Wi-Fi ± VPN: Reality probe under VPN
+  failing at the wrong (~10 s) timeout, Tor on МТС stalling for 10+ minutes
+  with zero user feedback, and Reality+VPN never reaching the relay edge at all.
+  Goal was to land all three in one focused day so the transport story is
+  reviewer-ready before further grant-readiness work.
+- **What shipped (5 PRs, all merged into master):**
+  - **PR #107 `2ad57a09`** — sync Reality outer probe budget (10 s → 30 s) so
+    the inner OkHttp callTimeout=20 s is no longer cancelled prematurely; add
+    Tor bootstrap percent streaming so logs surface the real stall point
+    instead of a silent `Probing(Tor)`; defensive `tor.stop()` on prepare
+    failure so a corpse Tor service does not leak between mode switches.
+  - **PR #108 `a953d3e4`** — diagnostic-only PR-A1: sync OkHttp inner
+    `connect/read/write` timeouts to `callTimeout` so the per-stage 10 s
+    defaults stop tripping before our outer ceiling, and add an Android
+    `vpnDetector` (NetworkCapabilities `NET_CAPABILITY_NOT_VPN` + `TRANSPORT_VPN`)
+    that logs `vpnActive=true|false` on every `connect()`. No behavioural
+    change; data-collection step ahead of PR-A2.
+  - **PR #109 `75775c00`** — PR-A2: server-side audit on `relay.phntm.pro`
+    (Caddy access logs) confirmed Reality probes under VPN do not arrive at
+    the relay edge — zero requests in the 20 s probe window for the device's
+    VPN exit IP. Cause is below the application layer (VPN egress DPI / MTU /
+    Hetzner ingress IDS); fixing it is not in scope. Mitigation: `TransportManager`
+    filters Reality out of the chain when `vpnActive=true`. Standard+VPN walks
+    `[Direct, Tor]`, Private+VPN walks `[Tor]` only. Saves 20 s of guaranteed-
+    failing probe per chain walk under VPN. Documented as ISSUE-015 in
+    `KNOWN_ISSUES.md` with the audit narrative.
+  - **PR #110 `53a02967`** — PR-B: replace silent `Probing(Tor)` with a staged,
+    time-keyed UX. `ManagerState.Probing` carries an optional
+    `TorProbingStatus(percent, stage, elapsedMs)`; a 5 s poller advances the
+    `TorBootstrapStage` (Initial → Negotiating → Searching → Slow → Throttled)
+    even when the percent is stalled, and percent updates push immediate state
+    emissions. Notification text becomes "Searching for a reachable route…
+    50 % · Ghost" instead of nothing for 7 minutes. Architect-suggested copy
+    deliberately avoids "blocked" without certainty.
+  - **PR #111 `ed143c60`** — PR-C: bridge profile rotation. Replace the single
+    all-of-the-above Tor attempt with sequential `obfs4-only` (180 s) →
+    `webtunnel-only` (120 s) → `snowflake-only` (180 s) → `mixed` (240 s) walk.
+    `BridgeProfile` enum in commonMain, `TorService.start(profile)` mapped on
+    Android to `OperatorBridges` / `SnowflakeBridges`, `tor.stop()` between
+    profiles for clean wrapper restart. Total budget 720 s but most users land
+    on the first profile in 1–3 min. Notification copy renders
+    `"<stage> NN% · obfs4 (1/4) · Ghost"` so the rotation is visible.
+- **Audit evidence underpinning PR-A2:** `docker logs --since 12h phantom-caddy`
+  on relay.phntm.pro showed every legitimate test client's `/health` request
+  in the last 12 hours from real domestic IPs, but **zero entries** in the
+  exact 20 s window of Test #3 (МТС Wi-Fi + commercial VPN, identity
+  `8c858658b4c426ae`, 22:38:18 UTC 2026-05-10). Same Xray config + same
+  network without the VPN succeeds in 0.6 s. Inferred cause is one of
+  VPN egress DPI / MTU on the tunnel / Hetzner ingress IDS — the user-visible
+  result is identical for all three so the client-side fix is the same.
+- **Validation cycles (post-merge smoke):**
+  - PR-A1+A2: Test #4 (МТС + VPN) — `vpnActive=true realityFiltered=true
+    ordered=[Direct, Tor]` (Standard) and `ordered=[Tor]` (Private) confirmed
+    in logs, no Reality probe attempted.
+  - PR-B: visual smoke on different network (with VPN) — staged copy walked
+    `Negotiating → Searching → Slow → Throttled` with live percent. Tor
+    stalled at 73 % in this run and AllFailed at the previous 600 s budget,
+    which directly motivated PR-C.
+- **Decisions / why:**
+  - **Skip Reality under VPN entirely (PR-A2)** — would not retry as
+    last-resort because every retry is 20 s of guaranteed waste. Saved as
+    durable architectural fact in
+    `memory/project_reality_vpn_audit_2026_05_11.md`.
+  - **obfs4 first in rotation (not webtunnel as architect originally
+    suggested)** — empirical: Test 13 (2026-05-06) showed our WebTunnel
+    handshakes hit the TSPU 16-KB curtain on Hetzner-hosted bridges. obfs4
+    to FlokiNET has been the most reliable single-PT path on МТС since
+    2026-05-09, so it gets the longest budget and goes first.
+  - **Per-profile budgets, no single global Tor cap** — old
+    `TOR_PREPARE_TIMEOUT_MS = 600 000L` removed. Per-profile budgets dominate.
+- **Files touched (sample):** `shared/core/transport/.../TransportManager.kt`,
+  `KtorTransportProbe.kt`, `TorService.kt`, `TorServiceFactory.android.kt`,
+  `TorServiceFactory.jvm.kt`, `apps/android/.../AppContainer.kt`,
+  `PhantomMessagingService.kt`, `KNOWN_ISSUES.md`,
+  `commonTest/.../TransportManagerTest.kt`.
+- **Architect involvement:** dispute resolution (5 May architect claim about
+  signed-challenge auth + VpnService conflict — both wrong, evidence in PR
+  #72 history); audit framing for Reality+VPN; staged Tor UX copy thresholds;
+  bridge rotation order recommendation (we adapted it to put obfs4 first
+  per our local empirical data).
+- **Follow-ups:** (a) Vladislav post-merge smoke test of PR-C — confirm
+  rotation actually walks profiles when first profile stalls. (b) Telemetry
+  PR (architect's third recommendation) deferred — not blocking for NLnet.
+  (c) Resume grant-readiness sprint Phase 1 cleanup once transport story is
+  fully smoke-tested.
+
 ### 2026-05-08 (thu, late) · F22 QA-pass + MASTER_TIMELINE sync
 
 - **Goal:** verify that the F22 prekey-wrap implementation (PR-1 `6737be91` +

@@ -2,9 +2,9 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-05-09  
-**Master HEAD:** Track A complete (5 PRs ✅). Track B items 1–8 ALL merged — **Kickstarter security blockers closed**. F11+F26 signed-challenge auth production-validated on Tecno МТС + emulator with the new APK 2026-05-09.  
-**Ближайший release window:** 2026-06-01 (24 дня); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
+**Last updated:** 2026-05-11  
+**Master HEAD:** Track A complete (5 PRs ✅). Track B items 1–8 ALL merged — **Kickstarter security blockers closed**. F11+F26 signed-challenge auth production-validated on Tecno МТС + emulator with the new APK 2026-05-09. **Transport reliability mini-sprint (PRs #103–#111) merged 2026-05-10/11** — Reality+VPN audited and gated, Tor staged-UX shipped, bridge profile rotation live. See dedicated section below.  
+**Ближайший release window:** 2026-06-01 (21 day); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
 
 ---
 
@@ -52,6 +52,34 @@ Track A + Track C идут параллельно. Track B стартует по
 | 9 | (PR 2.6) | Calls audio plumbing — `JavaAudioDeviceModule` + AudioFocus + suppress reconnect during call | — | 2–3 дня | 🟦 **отложен post-Phase-5** |
 
 **После завершения Track A** = Alpha-3 release-candidate. Voice + text + calls работают надёжно (calls = experimental, остальное production-quality).
+
+### Transport reliability mini-sprint (2026-05-10/11) — 9 PRs merged
+
+Triggered by real-device cross-device tests on Tecno МТС ± VPN that surfaced three concrete failure modes: 70-second connect cycles from keepalive forceReconnect during WS handshake, Reality probe timing out at the wrong (~10 s) inner-socket budget, and Tor on МТС stalling 10+ minutes with zero user feedback. Resolved over two intensive days; all PRs merged into master.
+
+| # | PR | Задача | Статус |
+|---|----|--------|--------|
+| 1 | [#103](https://github.com/LiudvigVladislav/Phantom/pull/103) | SOCKS connect-timeout, per-kind probe budget, keepalive guard | ✅ merged `647f369d` |
+| 2 | [#104](https://github.com/LiudvigVladislav/Phantom/pull/104) | Instrument `XrayService.startBlocking` + robust libXray response parser; bump Tor probe to 90 s | ✅ merged `2f67e218` |
+| 3 | [#105](https://github.com/LiudvigVladislav/Phantom/pull/105) | Ephemeral Xray SOCKS port, error-field parser, per-kind probe timeout | ✅ merged `18317548` |
+| 4 | [#106](https://github.com/LiudvigVladislav/Phantom/pull/106) | Keepalive guard for WS handshake, `lastPongMark` reset, Reality probe → 20 s | ✅ merged `6b4c4ff5` |
+| 5 | [#107](https://github.com/LiudvigVladislav/Phantom/pull/107) | Sync Reality outer probe budget, stream Tor bootstrap %, defensive `tor.stop()` on prepare failure | ✅ merged `2ad57a09` |
+| 6 | [#108](https://github.com/LiudvigVladislav/Phantom/pull/108) | **PR-A1 (diag):** sync OkHttp inner timeouts to `callTimeout`, log `vpnActive=true|false` on every `connect()` | ✅ merged `a953d3e4` |
+| 7 | [#109](https://github.com/LiudvigVladislav/Phantom/pull/109) | **PR-A2:** filter Reality from chain when `vpnActive=true` (Caddy-log audit confirmed Reality+VPN never reaches the relay edge); ISSUE-015 in KNOWN_ISSUES.md | ✅ merged `75775c00` |
+| 8 | [#110](https://github.com/LiudvigVladislav/Phantom/pull/110) | **PR-B:** staged Tor-bootstrap UX with time-keyed copy + live percent (Initial → Negotiating → Searching → Slow → Throttled) | ✅ merged `53a02967` |
+| 9 | [#111](https://github.com/LiudvigVladislav/Phantom/pull/111) | **PR-C:** sequential Tor bridge profile rotation — `obfs4-only` (180 s) → `webtunnel-only` (120 s) → `snowflake-only` (180 s) → `mixed` (240 s) with per-profile `tor.stop()` between attempts; UI shows `<profile> (k/4)` | ✅ merged `ed143c60` |
+
+**State after mini-sprint:**
+
+- ✅ Standard works on every tested network (МТС ±VPN, other carriers).
+- ✅ Private without VPN works via Reality (production-quality).
+- ✅ Private under VPN works via Tor (Reality auto-skipped per audit evidence).
+- ✅ Ghost works via Tor; bootstrap rotates through 4 profiles instead of stalling on a bad bridge for 10 minutes.
+- 🟡 Tor cold-start on МТС without VPN still depends on which profile reaches Ready first; obfs4-to-FlokiNET is the primary expected path.
+
+**Deferred follow-ups:**
+- Telemetry PR (architect's third recommendation — average bootstrap time, bridge success rate, country/network heuristics) — not blocking for NLnet.
+- Retrospective ADR documenting bridge rotation (after PR-C smoke-test confirmation).
 
 ---
 
