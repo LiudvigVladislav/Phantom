@@ -113,7 +113,16 @@ class PhantomMessagingService : Service() {
                     is ManagerState.Idle ->
                         "$DEFAULT_STATUS_TEXT · $mode"
                     is ManagerState.Probing ->
-                        "Connecting via ${state.kind}… · $mode"
+                        // For Tor: surface the time-based bootstrap stage +
+                        // current percent so the user sees what's happening
+                        // during the multi-minute bridge negotiation instead
+                        // of a silent "Connecting via Tor…" (PR-B). For
+                        // Direct / Reality: keep the original short text —
+                        // those probes are sub-second and the staged copy
+                        // would only flicker.
+                        state.torStatus?.let { tor ->
+                            "${tor.stage.userText} ${tor.percent}% · $mode"
+                        } ?: "Connecting via ${state.kind}… · $mode"
                     is ManagerState.Connected ->
                         "Online via ${state.kind} · $mode"
                     is ManagerState.AllFailed ->
