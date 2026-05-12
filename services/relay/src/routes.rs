@@ -322,7 +322,28 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                         // makes ping/pong correctness independent of the
                         // identity-keyed routing entirely.
                         let raw = text.as_str();
-                        if raw == r#"{"type":"ping"}"# {
+                        // PR-G2-relay (2026-05-12): use JSON parse instead of
+                        // strict string equality. The previous version matched
+                        // only the exact byte sequence `{"type":"ping"}` —
+                        // brittle to any client-side serializer reformat
+                        // (e.g. an extra space, field reordering, future
+                        // protocol additions like a sequence number). When
+                        // the equality check missed, the ping fell through
+                        // to handle_message whose `Some("ping")` arm was
+                        // removed in PR-F2-relay, so the ping was silently
+                        // dropped and pong never sent — symptom: Test #27
+                        // showed Pong timeout cascades despite the relay
+                        // route fix being deployed. Parsing once and reading
+                        // the discriminator is < 5 µs and removes the entire
+                        // class of "client serializer reformat breaks pong"
+                        // bugs.
+                        let is_ping = serde_json::from_str::<serde_json::Value>(raw)
+                            .ok()
+                            .and_then(|v| v.get("type")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s == "ping"))
+                            .unwrap_or(false);
+                        if is_ping {
                             if socket
                                 .send(Message::Text(r#"{"type":"pong"}"#.to_string().into()))
                                 .await
@@ -330,6 +351,7 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                             {
                                 break;
                             }
+                            tracing::trace!(identity = %identity, "ws ping → pong (inline)");
                         } else {
                             handle_message(raw, &identity, &state).await;
                         }
