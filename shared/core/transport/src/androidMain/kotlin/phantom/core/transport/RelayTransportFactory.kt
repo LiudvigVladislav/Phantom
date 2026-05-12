@@ -110,13 +110,39 @@ actual fun forceShutdownActiveEngine() {
 }
 
 actual fun createRestHttpClient(): HttpClient {
-    // REST traffic (PreKey publish/fetch, future /me endpoints).
+    // REST traffic (PreKey publish/fetch, /auth/challenge, future /me endpoints).
     // Long-lived: connection pooling and TLS session reuse across short
     // HTTP calls is desirable. Does NOT install the WebSockets plugin —
     // unused by the REST path.
+    //
+    // PR-G4 (2026-05-13): force HTTP/1.1 only. Test29 caught OkHttp's HTTP/2
+    // implementation getting stuck on REST requests in two distinct ways:
+    //
+    //   1. POST /prekeys/publish: client opened the H2 stream and sent
+    //      headers (Content-Length: 13903) but never delivered the body.
+    //      Caddy waited 30 s for body bytes (`bytes_read: 0`) and returned
+    //      408 Request Timeout. Client surfaced this as
+    //      `SocketException: Connection reset` from `Http2Reader.nextFrame`.
+    //   2. GET /prekeys/bundle/{peer}: client never sent the request at
+    //      all — the 4 failed phone fetches in Test29 are absent from the
+    //      Caddy access log entirely. They timed out client-side after 8 s
+    //      with `CancellationException` from
+    //      `attachToUserJob$cleanupHandler`. Most likely a stale H2
+    //      connection in the OkHttp pool that the server (or NAT) had
+    //      half-closed; OkHttp kept routing new requests onto it instead
+    //      of opening a fresh one.
+    //
+    // The WebSocket path is unaffected because WS upgrade requires HTTP/1.1
+    // anyway (see WS factory above). The relay (Caddy) speaks both H1.1 and
+    // H2 happily, and the access log shows H1.1 REST clients completing in
+    // <2 ms — there is no throughput cost here at our request volume.
+    //
+    // If/when we revisit H2 for REST, the fix is upstream in OkHttp / Ktor's
+    // okhttp engine. For now we trade multiplexing we do not need for
+    // reliability we do.
     val okHttp = OkHttpClient.Builder()
         .readTimeout(30, TimeUnit.SECONDS)
-        .protocols(listOf(Protocol.HTTP_1_1, Protocol.HTTP_2))
+        .protocols(listOf(Protocol.HTTP_1_1))
         .build()
 
     return HttpClient(OkHttp) {
