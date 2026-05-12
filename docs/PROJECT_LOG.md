@@ -361,6 +361,122 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-12 (mon) · Transport mini-sprint continued — PR-D (rotation reorder) + Briar bridge research + PR-E (RU-tuned bridges with Google AMP fallback)
+
+- **Goal.** Test #5 (МТС Wi-Fi without VPN, 2026-05-11) showed all four
+  PR-C bridge profiles fail to bootstrap; the original "transport story
+  closed" framing was wrong because Ghost without VPN on МТС is a key
+  scenario for the target audience (RU users without VPN). Continue the
+  mini-sprint until either Ghost works or every reasonable code-only
+  option is exhausted.
+- **Two PRs shipped today:**
+  - **PR #112 `feat/tor-rotation-reorder-mts-tuned`** — bridge rotation
+    reordered per Test #5 data: `Mixed (600s) → Snowflake (360s) →
+    Obfs4 (90s) → Webtunnel (90s)`. Mixed first because it reached
+    72 % vs single-PT 10–50 %. Ghost-mode AllFailed copy now reads
+    "Tor is blocked or slowed by this network. Try Private/Reality or
+    enable a VPN." Documented as ISSUE-016 in `KNOWN_ISSUES.md`. Test
+    #5 retest with PR-D order: Mixed still stalled at 30 %, Snowflake
+    at 50 % — confirmed the bridge IPs/fronts themselves are the
+    bottleneck, not the rotation order alone.
+  - **PR #113 `feat/tor-bridges-from-briar-ru-tuned`** — bridge data
+    import from `briar/onionwrapper @ master` (GPL-3 → AGPL-3
+    compatible). 4 RU-tuned snowflake entries (`bridges-s-ru` — cdn77
+    + Google AMP cache fronted on `www.google.com`), 9 non-default
+    obfs4 entries (`bridges-n-zz`, multi-ASN, mixed iat-mode), 1
+    meek_lite entry (`bridges-m-zz`, fronted on `www.phpmyadmin.net`).
+    New `BridgeProfile.KitchenSink` puts every bridge entry across
+    every transport in a single `enableBridges()` call (Briar's
+    empirical winning strategy) and is placed first in the rotation.
+    Net pool grew from 5 → ~17 bridges per Tor bootstrap attempt.
+    Worst-case rotation walk now 21 min (was 19 min).
+- **Briar research findings (`briar/onionwrapper` deep-dive,
+  2026-05-12).**
+  - Briar does NOT have any Tor magic for RU mobile beyond what we
+    already do; their stack is functionally a subset of ours plus one
+    trick (concat-all-bridges) and the per-country bridge resources.
+  - Briar does NOT have a BridgeDB / Moat fetcher either — bridges are
+    baked-in resources updated at release time by syncing from the
+    Tor Project. Option 3 from Vladislav's Friday plan
+    (BridgeDB-on-device fetcher) is therefore deferred — it would be a
+    genuine differentiator from Briar but solves a different problem
+    (bridge freshness, not RU bootstrap).
+  - The real PHANTOM advantage on МТС remains Stage 5E Xray
+    REALITY+SOCKS+WSS (Private mode, May 2026-05-07) — Briar has no
+    answer to the TSPU 16-KB curtain, and our Reality path cleared
+    that curtain definitively. Tor is the secondary path for users
+    who specifically want onion routing.
+- **Privacy trade-off explicitly accepted (Vladislav A+C, in-chat).**
+  Two of the four imported `bridges-s-ru` entries route their
+  broker-discovery TLS through Google's AMP cache fronted on
+  `www.google.com`. Google sees: client IP making encrypted TLS
+  requests in a pattern broadly classifiable as "Snowflake-style
+  broker discovery". Google does NOT see: PHANTOM identity, onion
+  address, contacts, or message content (actual Tor circuit traffic
+  flows over WebRTC DataChannel directly to a volunteer browser
+  proxy, not through Google). The previous `vuejs.org`/Netlify
+  fronting saw exactly the same pattern Google now sees — privacy
+  property unchanged in kind, Google's value here is resilience
+  against censorship. This is the same pattern Tor Browser ships by
+  default for RU users and that Briar ships in `bridges-s-ru`. Both
+  KNOWN_ISSUES ISSUE-016 and the source-level KDoc on
+  `SnowflakeBridges.RU_TUNED` carry an explicit "what Google sees /
+  does not see / what TSPU sees" matrix.
+- **🎉 BREAKTHROUGH — Ghost on МТС WITHOUT VPN now works.** Test #6
+  (2026-05-11 21:25-21:32 МТС Wi-Fi, no VPN, Tecno Spark Go) reached
+  `Online via Tor · Ghost` in **~6 minutes** end-to-end on the very
+  first KitchenSink (1/4) attempt — bootstrap walked 0 % → 30 % in
+  one second, stalled at 50 % for ~5 min while Tor built guard
+  circuits, then climbed 50 % → 100 % in another minute. Probe (200
+  OK over the onion) and WebSocket handshake both succeeded
+  immediately after `Ready`. This is the first time PHANTOM has
+  proven Ghost-without-VPN on a Russian carrier network in a captured
+  logcat. Compare: PR-D + old snowflake bridges in the same scenario
+  timed out at 30 % after 12 minutes; today the 17-bridge Briar-
+  imported pool reached 100 % half that fast. The Google-AMP-cache
+  snowflake entries in `bridges-s-ru` are the most likely cause of
+  the win — TSPU cannot block `www.google.com` without breaking the
+  local internet, so the broker-discovery TLS request gets through.
+- **Status — closed-success.** Mini-sprint goal "Ghost without VPN
+  on МТС at all" achieved on PR-E's bridge data alone, no operations
+  work required. KNOWN_ISSUES ISSUE-016 updated from "documented
+  limitation" to "now works on bridges imported in PR-E (test #6
+  evidence)". Worth a real-world re-verification on a few more
+  МТС sessions before claiming production stability — single-test
+  caveat noted — but the architecture-side question is answered.
+- **Decisions / why:**
+  - **Reopened transport mini-sprint after the previous "closed"
+    framing.** Vladislav correctly flagged that I had labelled the
+    transport story closed when Ghost without VPN was still broken.
+    Bias correction noted; transport story remains open until either
+    Ghost-without-VPN works or we have explicit user-facing
+    explanation of why it cannot in the bridge profile we ship.
+  - **Did NOT take Vladislav's plan Options 2 or 4.** Option 2 (deploy
+    additional snowflake bridges on non-Hetzner / non-FlokiNET ASN)
+    needs VPS budget we don't have right now. Option 4 (test on other
+    RU operators — Beeline / Megafon / Tele2) needs a SIM card we
+    don't have. Both are good ideas, both deferred to post-NLnet.
+  - **Did Options 1 + 3 + 5 from Vladislav's plan.** Option 1 (snowflake
+    bridge freshness check) and Option 5 (Briar research) merged into
+    PR-E above. Option 3 (BridgeDB-on-device fetcher) deferred — Briar
+    research showed Briar doesn't have one either, the value is in the
+    bridge data not the fetcher.
+- **Files touched (today, beyond yesterday's transport entry).**
+  PR-D: `TransportManager.kt` (rotation order + budgets),
+  `PhantomMessagingService.kt` (Ghost AllFailed copy), `KNOWN_ISSUES.md`
+  (ISSUE-016).
+  PR-E: `SnowflakeBridges.kt` (RU_TUNED + DEFAULT refresh + privacy
+  KDoc), `OperatorBridges.kt` (OBFS4_NON_DEFAULT), `MeekBridges.kt`
+  (new), `TorService.kt` (BridgeProfile.KitchenSink + MeekLite),
+  `TorServiceFactory.android.kt` (bridgesFor mapping),
+  `TransportManager.kt` (rotation order with KitchenSink first),
+  `KNOWN_ISSUES.md` (ISSUE-016 PR-E privacy section).
+- **Architect involvement.** The PR-D rotation order (Mixed first,
+  90 s short budgets for known-stuck PT-only profiles) came directly
+  from architect review of the Test #5 logcat. Briar research +
+  bridge import (PR-E) was self-directed after Vladislav explicitly
+  selected Options 1 + 3 + 5 from the plan.
+
 ### 2026-05-11 (sun) · Transport reliability deep-dive — Reality+VPN audit, Tor staged UX, bridge rotation
 
 - **Goal:** turn the May 10–11 cross-device transport tests into shipped fixes.
