@@ -2,9 +2,9 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-05-11  
-**Master HEAD:** Track A complete (5 PRs ✅). Track B items 1–8 ALL merged — **Kickstarter security blockers closed**. F11+F26 signed-challenge auth production-validated on Tecno МТС + emulator with the new APK 2026-05-09. **Transport reliability mini-sprint (PRs #103–#111) merged 2026-05-10/11** — Reality+VPN audited and gated, Tor staged-UX shipped, bridge profile rotation live. See dedicated section below.  
-**Ближайший release window:** 2026-06-01 (21 day); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
+**Last updated:** 2026-05-12  
+**Master HEAD:** Track A complete (5 PRs ✅). Track B items 1–8 ALL merged — **Kickstarter security blockers closed**. F11+F26 signed-challenge auth production-validated on Tecno МТС + emulator with the new APK 2026-05-09. **Transport reliability mini-sprint extended to 11 PRs (#103–#113) merged 2026-05-10/12 — closed-success 2026-05-11 21:32 МТС.** Reality+VPN audited and gated, Tor staged-UX shipped, bridge profile rotation live and re-tuned per МТС data, Briar's RU-tuned bridge set imported (Snowflake-via-Google-AMP fallback). **🎉 Test #6 confirms Ghost on МТС WITHOUT VPN works** — `Online via Tor · Ghost` in ~6 minutes via KitchenSink (1/4) on the very first attempt; bootstrap reached 100 %, probe 200 OK, WS handshake successful through onion. First captured logcat proof of Ghost-without-VPN on a Russian carrier network in PHANTOM's history.  
+**Ближайший release window:** 2026-06-01 (20 days); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
 
 ---
 
@@ -53,9 +53,11 @@ Track A + Track C идут параллельно. Track B стартует по
 
 **После завершения Track A** = Alpha-3 release-candidate. Voice + text + calls работают надёжно (calls = experimental, остальное production-quality).
 
-### Transport reliability mini-sprint (2026-05-10/11) — 9 PRs merged
+### Transport reliability mini-sprint (2026-05-10/12) — 11 PRs merged, closed-success ✅
 
-Triggered by real-device cross-device tests on Tecno МТС ± VPN that surfaced three concrete failure modes: 70-second connect cycles from keepalive forceReconnect during WS handshake, Reality probe timing out at the wrong (~10 s) inner-socket budget, and Tor on МТС stalling 10+ minutes with zero user feedback. Resolved over two intensive days; all PRs merged into master.
+Triggered by real-device cross-device tests on Tecno МТС ± VPN that surfaced three concrete failure modes: 70-second connect cycles from keepalive forceReconnect during WS handshake, Reality probe timing out at the wrong (~10 s) inner-socket budget, and Tor on МТС stalling 10+ minutes with zero user feedback. Resolved over three days; all PRs merged into master.
+
+**🎉 Outcome (Test #6, 2026-05-11 21:25-21:32 МТС Wi-Fi without VPN, Tecno Spark Go):** Ghost mode reached `Online via Tor · Ghost` in ~6 minutes on the very first KitchenSink (1/4) attempt of PR-E's Briar-imported bridge pool — bootstrap walked 0 % → 30 % in 1 second, paused at 50 % for ~5 min while Tor built guard circuits, then climbed 50 % → 100 % in another minute. Probe 200 OK over the onion address, WebSocket handshake successful immediately after `Ready`. **First captured logcat proof of Ghost-without-VPN on a Russian carrier network in PHANTOM's history.** Compare: PR-D + old snowflake bridges in the same scenario timed out at 30 % after 12 minutes. The Google-AMP-cache snowflake entries in `bridges-s-ru` (fronted on `www.google.com`) are the most likely cause of the win.
 
 | # | PR | Задача | Статус |
 |---|----|--------|--------|
@@ -68,18 +70,26 @@ Triggered by real-device cross-device tests on Tecno МТС ± VPN that surfaced
 | 7 | [#109](https://github.com/LiudvigVladislav/Phantom/pull/109) | **PR-A2:** filter Reality from chain when `vpnActive=true` (Caddy-log audit confirmed Reality+VPN never reaches the relay edge); ISSUE-015 in KNOWN_ISSUES.md | ✅ merged `75775c00` |
 | 8 | [#110](https://github.com/LiudvigVladislav/Phantom/pull/110) | **PR-B:** staged Tor-bootstrap UX with time-keyed copy + live percent (Initial → Negotiating → Searching → Slow → Throttled) | ✅ merged `53a02967` |
 | 9 | [#111](https://github.com/LiudvigVladislav/Phantom/pull/111) | **PR-C:** sequential Tor bridge profile rotation — `obfs4-only` (180 s) → `webtunnel-only` (120 s) → `snowflake-only` (180 s) → `mixed` (240 s) with per-profile `tor.stop()` between attempts; UI shows `<profile> (k/4)` | ✅ merged `ed143c60` |
+| 10 | [#112](https://github.com/LiudvigVladislav/Phantom/pull/112) | **PR-D:** rotation order retuned per Test #5 МТС data — `Mixed (600 s)` → `Snowflake (360 s)` → `Obfs4 (90 s)` → `Webtunnel (90 s)`; Ghost-mode AllFailed copy now actionable ("Tor is blocked or slowed by this network. Try Private/Reality or enable a VPN."); `KNOWN_ISSUES` ISSUE-016 documents the upstream TSPU root cause | ✅ merged `41506995` |
+| 11 | [#113](https://github.com/LiudvigVladislav/Phantom/pull/113) | **PR-E:** import Briar's RU-tuned bridge set (4 snowflake `bridges-s-ru` with Google AMP cache fronted on `www.google.com`, 9 non-default obfs4, 1 meek_lite); new `BridgeProfile.KitchenSink` puts ~17 bridges in one `enableBridges()` call (Briar's empirical strategy) and runs first; rotation order: `KitchenSink (600 s)` → `SnowflakeOnly (420 s)` → `Obfs4Only (180 s)` → `MeekLite (60 s)`; explicit privacy properties matrix added to ISSUE-016 + source-level KDoc | ✅ merged `<latest>` |
 
-**State after mini-sprint:**
+**State after mini-sprint (per PR-E + Test #6 confirmation):**
 
 - ✅ Standard works on every tested network (МТС ±VPN, other carriers).
 - ✅ Private without VPN works via Reality (production-quality).
 - ✅ Private under VPN works via Tor (Reality auto-skipped per audit evidence).
-- ✅ Ghost works via Tor; bootstrap rotates through 4 profiles instead of stalling on a bad bridge for 10 minutes.
-- 🟡 Tor cold-start on МТС without VPN still depends on which profile reaches Ready first; obfs4-to-FlokiNET is the primary expected path.
+- ✅ Ghost works via Tor on uncensored / VPN-protected networks (mixed reaches Ready in 2-7 min).
+- ✅ **Ghost on МТС WITHOUT VPN works** (Test #6 confirmed: ~6 min via KitchenSink with Briar's `bridges-s-ru` Google-AMP-cache snowflake). Single-test caveat — worth a few more МТС sessions before claiming production stability — but the architecture-side question is answered.
+
+**Privacy trade-off accepted (Vladislav A+C, 2026-05-12):**
+PR-E's Snowflake-via-Google-AMP fallback routes broker-discovery TLS through Google's AMP cache. Google sees the IP making encrypted TLS to its CDN with a Snowflake-style request pattern; Google does NOT see PHANTOM identity, onion address, contacts, or message content (Tor circuit traffic flows over WebRTC DataChannel directly to a volunteer browser proxy, not through Google). This pattern is the same one Tor Browser ships by default for RU users and that Briar ships in `bridges-s-ru`. Documented in `KNOWN_ISSUES.md` ISSUE-016 with full "what Google sees / does not see" matrix.
 
 **Deferred follow-ups:**
 - Telemetry PR (architect's third recommendation — average bootstrap time, bridge success rate, country/network heuristics) — not blocking for NLnet.
-- Retrospective ADR documenting bridge rotation (after PR-C smoke-test confirmation).
+- Operations work to deploy additional bridges on non-blocked CIDR (snowflake on a non-Hetzner / non-FlokiNET ASN, obfs4 on additional ranges). Tracked separately post-Alpha-2; needs VPS budget.
+- BridgeDB-on-device fetcher (Vladislav's plan Option 3): Briar research showed Briar does not have one either — value is in bridge data freshness, not the fetcher per se. Deferred until bridge-freshness becomes the bottleneck.
+- Cross-operator testing (Beeline / Megafon / Tele2): needs additional SIM cards, deferred until accessible.
+- Retrospective ADR documenting bridge rotation strategy (architect-recommended).
 
 ---
 

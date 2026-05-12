@@ -337,9 +337,29 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 ---
 
-### ISSUE-016: Tor on RU carrier networks without VPN currently does not bootstrap in any bridge profile
+### ISSUE-016: Tor on RU carrier networks without VPN — RESOLVED via PR-E Briar bridge import (Test #6, 2026-05-11)
 
-**Status:** Architecturally bound by upstream censorship (TSPU on Russian carrier networks). Mitigated client-side by retuned [bridge rotation order](shared/core/transport/src/commonMain/kotlin/phantom/core/transport/TransportManager.kt) (PR-D, 2026-05-12) and a Ghost-mode AllFailed copy that explicitly tells the user to switch to Private/Reality or enable a VPN.
+**Status: ✅ RESOLVED (single-test confirmation, awaiting production-stability re-verification).** PR-E (2026-05-12) imported Briar's `bridges-s-ru` snowflake set including the Google-AMP-cache fallback fronted on `www.google.com`. Test #6 (2026-05-11 21:25-21:32 МТС Wi-Fi without VPN, Tecno Spark Go) reached `Online via Tor · Ghost` in ~6 minutes on the very first KitchenSink (1/4) attempt. PR-D's bridge rotation order + the Ghost-mode AllFailed copy ("Tor is blocked or slowed by this network. Try Private/Reality or enable a VPN.") remain in place as the fallback if a future TSPU adaptation breaks the AMP-cache route.
+
+**Test #6 outcome timeline (МТС Wi-Fi, no VPN, 2026-05-11):**
+
+| Time | State |
+|---|---|
+| 21:25:05 | Tor start, KitchenSink (17 bridges in single `enableBridges()`) |
+| 21:25:06 | Bootstrap 0 % → 30 % (1 second) |
+| 21:25:15 | Bootstrap 50 % |
+| 21:30:28 | Bootstrap 51 % (after ~5-min stall while building guard circuits) |
+| 21:30:51 | Bootstrap 95 % |
+| 21:31:00 | Bootstrap 100 %, `Ready socksPort=39050` |
+| 21:31:15 | Probe 200 OK over `relay.phntm.pro/health` through onion |
+| 21:31:15 | Notification: `Online via Tor · Ghost` |
+| 21:32:00 | WebSocket connected through `zmdrxlrkd7iv...onion:80/ws` |
+
+**Compare to pre-PR-E state.** PR-D + the older snowflake bridges (Netlify-hosted, fronted on `vuejs.org`) timed out at 30 % after 12 minutes on the same network in Test #5 the previous day. The new bridge pool reached 100 % in half that time. The Google-AMP-cache snowflake entries from `bridges-s-ru` are the most likely cause — TSPU cannot block `www.google.com` without breaking the local internet, so the broker-discovery TLS request gets through where the older `vuejs.org`-fronted broker was silently dropped.
+
+**Caveat:** single test on a single device on a single МТС session. Worth a few more МТС sessions across different times of day before claiming production stability. The architecture-side question ("can PHANTOM offer Ghost without VPN to RU users at all?") is answered yes; the operational question ("how often does it work in practice?") needs more data.
+
+**Original problem (kept for context).**
 
 **Symptom.** Selecting Ghost privacy mode on МТС Wi-Fi without a VPN: every one of the four bridge profiles in [`BRIDGE_ROTATION_ORDER`] times out without reaching `Ready`. Test #5 (2026-05-11, captured logcat at 11:22-11:34 МТС Wi-Fi):
 
