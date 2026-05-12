@@ -78,8 +78,52 @@ interface TorService {
  * the rotation walker to advance to the next profile.
  */
 enum class BridgeProfile(val displayName: String) {
+    /**
+     * obfs4 bridges (PHANTOM's own FlokiNET bridge + 9 of Briar's
+     * `bridges-n-zz` non-default obfs4 bridges, total 10).
+     * Tor walks the list in order until one negotiates.
+     */
     Obfs4Only("obfs4"),
+
+    /**
+     * WebTunnel bridges (PHANTOM operator-controlled FlokiNET +
+     * Hetzner instances). Empirically stalls at 10 % on TSPU-active
+     * networks; kept available but no longer in the default rotation
+     * order after PR-E.
+     */
     WebtunnelOnly("webtunnel"),
+
+    /**
+     * Snowflake bridges via Briar's RU-tuned `bridges-s-ru` set
+     * (cdn77 + Google AMP cache fronted on www.google.com).
+     */
     SnowflakeOnly("snowflake"),
+
+    /**
+     * meek_lite via the phpmyadmin.net front (PR-E, Briar's
+     * `bridges-m-zz`). Highest-latency transport, used as a
+     * different-wire-signature fallback after obfs4/snowflake.
+     */
+    MeekLite("meek"),
+
+    /**
+     * Pre-PR-E historical "all our PHANTOM-controlled bridges in one
+     * `enableBridges` call" — obfs4 (FlokiNET) + webtunnel (FlokiNET +
+     * Hetzner) + snowflake (PHANTOM's older default set). Tor picks
+     * whichever wins handshake first.
+     */
     Mixed("mixed"),
+
+    /**
+     * PR-E "kitchen-sink" — every bridge entry PHANTOM ships across
+     * every transport: obfs4 (FlokiNET + 9 Briar non-default), all
+     * snowflake variants (RU-tuned + DEFAULT), meek_lite. Mirrors
+     * Briar's empirical strategy of passing the entire bridge pool
+     * to tor in one `enableBridges` call so its own path-selection
+     * logic picks whichever bridge the network does not block.
+     *
+     * This is the FIRST profile attempted in the post-PR-E rotation
+     * — most-likely-to-work-first ordering.
+     */
+    KitchenSink("kitchen-sink"),
 }
