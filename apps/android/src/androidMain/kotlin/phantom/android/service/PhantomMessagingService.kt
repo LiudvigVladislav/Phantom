@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -61,7 +62,22 @@ class PhantomMessagingService : Service() {
     // user has chosen to keep the messenger running.
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    @Volatile private var connectStarted = false
+
+    // PR-F2 (2026-05-12): atomic CAS guard to prevent multiple parallel
+    // onStartCommand callbacks from each spawning their own connect path.
+    // Test #26 relay logs captured 5 simultaneous `event="connect"` events
+    // for the same identity within 30 ms — five parallel coroutines all
+    // raced past the previous `@Volatile var connectStarted = false` guard
+    // (volatile gives visibility but NOT atomic check-then-set), each
+    // opened its own WebSocket, and the relay's `state.clients[identity]`
+    // map ended up with whichever registered last. The other four became
+    // server-side zombies that never got pongs (relay routes pong by
+    // identity → only latest gen) and triggered self-perpetuating
+    // forceReconnect cascades on the client.
+    //
+    // AtomicBoolean.compareAndSet(false, true) gives us the atomic
+    // "first-caller-wins" semantics we need.
+    private val connectStarted = AtomicBoolean(false)
     // ADR Tier-1 (HiOS workaround): MulticastLock changes the Wi-Fi
     // radio idle profile on aggressive OEMs (Tecno HiOS, Infinix XOS,
     // Xiaomi MIUI) where battery management ignores both
@@ -258,13 +274,15 @@ class PhantomMessagingService : Service() {
             // RELAY_ONION_URL is consumed only when the chosen kind is Tor;
             // Direct and Reality both exit via the public WSS endpoint
             // (Reality just tunnels that exit through its outer envelope).
-            // Guard against a second onStartCommand (e.g. AlarmManager wakeup)
-            // arriving while the first connect loop is still establishing.
-            if (connectStarted) {
+            // Guard against a second onStartCommand (e.g. AlarmManager wakeup,
+            // foreground bring-back, ConnectivityChange broadcast) arriving while
+            // the first connect path is still establishing. Uses atomic CAS so
+            // racing coroutines all see consistent state — the first one wins,
+            // every other one bails. PR-F2.
+            if (!connectStarted.compareAndSet(false, true)) {
                 Log.d(TAG, "connect already in progress — duplicate onStartCommand ignored")
                 return@launch
             }
-            connectStarted = true
 
             // F11 + F26: signed-challenge auth requires our Ed25519 signing
             // keypair. Resolve BEFORE asking TransportManager to start an
@@ -276,7 +294,7 @@ class PhantomMessagingService : Service() {
                     TAG,
                     "Cannot connect: Ed25519 signing keypair not provisioned yet (migration pending). Service will exit; foreground restart after onboarding will reconnect.",
                 )
-                connectStarted = false
+                connectStarted.set(false)
                 return@launch
             }
             val signingPubKeyHex = signingPair.publicKey.bytes
@@ -286,11 +304,11 @@ class PhantomMessagingService : Service() {
                 container.transportManager.connect()
             } catch (e: NoTransportReachableException) {
                 Log.e(TAG, "TransportManager: no path reachable — ${e.message}", e)
-                connectStarted = false
+                connectStarted.set(false)
                 return@launch
             } catch (t: Throwable) {
                 Log.e(TAG, "TransportManager.connect threw: ${t::class.simpleName}: ${t.message}", t)
-                connectStarted = false
+                connectStarted.set(false)
                 return@launch
             }
             val socksProxyPort: Int? = connected.socksPort
@@ -328,7 +346,7 @@ class PhantomMessagingService : Service() {
                 Log.e(TAG, "Transport connect loop exited: ${e.message}", e)
                 Log.e("PhantomRelay", "Transport connect loop exited: ${e.message}", e)
             }
-            connectStarted = false
+            connectStarted.set(false)
         }
         return START_STICKY
     }
