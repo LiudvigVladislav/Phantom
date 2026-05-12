@@ -38,6 +38,7 @@ import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.ReactionRepository
 import phantom.core.storage.TrustTier
+import phantom.core.transport.BundleFetchException
 import phantom.core.transport.PreKeyApi
 import phantom.core.transport.RelayMessage
 import phantom.core.transport.RelayTransport
@@ -212,7 +213,13 @@ class DefaultMessagingService(
                 // Fetch their bundle, run 4-DH, ship the bootstrap
                 // header with the first message.
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_path conv=$convTag — no existing session")
-                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE prekey_fetch_start recipient=${recipientPublicKeyHex.take(16)}…")
+                val recipientTag = recipientPublicKeyHex.take(16)
+                val endpointPath =
+                    "/prekeys/bundle/$recipientPublicKeyHex?requester=${identity.publicKeyHex}"
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "SEND_TRACE prekey_fetch_start recipient=$recipientTag… endpoint=$endpointPath",
+                )
                 // PR-G1: hard cap the prekey-bundle HTTP fetch. Without a
                 // ceiling, a slow / dead /prekeys/bundle endpoint blocks
                 // the per-conversation mutex indefinitely, which is what
@@ -224,6 +231,14 @@ class DefaultMessagingService(
                 // (treated as 404 by sendMessage, message lands in
                 // WAITING_FOR_RECIPIENT_BUNDLE, retry hook re-tries on the
                 // next reconnect).
+                //
+                // PR-G3: distinguish the four failure modes — timeout, 404,
+                // 429 (RateLimited), other 5xx (Unexpected) — in the trace,
+                // and always emit elapsedMs so we can tell "fetched fast and
+                // returned 404" (peer never published) apart from "fetch hung
+                // 8s" (relay/network degraded). Behaviour for all four is
+                // unchanged: defer to WAITING + retry on reconnect/sweep.
+                val fetchStartMs = Clock.System.now().toEpochMilliseconds()
                 val wireBundle = try {
                     withTimeout(PREKEY_BUNDLE_FETCH_TIMEOUT_MS) {
                         preKeyApi.fetchBundle(
@@ -232,22 +247,44 @@ class DefaultMessagingService(
                         )
                     }
                 } catch (e: TimeoutCancellationException) {
+                    val elapsed = Clock.System.now().toEpochMilliseconds() - fetchStartMs
                     messagingLog(
                         MessagingLogLevel.WARN,
-                        "SEND_TRACE prekey_fetch_timeout recipient=${recipientPublicKeyHex.take(16)}… " +
-                            "after ${PREKEY_BUNDLE_FETCH_TIMEOUT_MS}ms — treating as 404, message will WAIT for retry",
+                        "SEND_TRACE prekey_fetch_result=timeout recipient=$recipientTag… " +
+                            "elapsedMs=$elapsed budgetMs=$PREKEY_BUNDLE_FETCH_TIMEOUT_MS " +
+                            "endpoint=$endpointPath — message will WAIT for retry",
+                    )
+                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                } catch (e: BundleFetchException.RateLimited) {
+                    val elapsed = Clock.System.now().toEpochMilliseconds() - fetchStartMs
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "SEND_TRACE prekey_fetch_result=429 recipient=$recipientTag… " +
+                            "elapsedMs=$elapsed endpoint=$endpointPath — message will WAIT for retry",
+                    )
+                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                } catch (e: BundleFetchException.Unexpected) {
+                    val elapsed = Clock.System.now().toEpochMilliseconds() - fetchStartMs
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "SEND_TRACE prekey_fetch_result=http${e.httpStatus} recipient=$recipientTag… " +
+                            "elapsedMs=$elapsed endpoint=$endpointPath — message will WAIT for retry",
                     )
                     throw PeerBundleMissingException(recipientPublicKeyHex)
                 } ?: run {
+                    val elapsed = Clock.System.now().toEpochMilliseconds() - fetchStartMs
                     messagingLog(
                         MessagingLogLevel.INFO,
-                        "SEND_TRACE prekey_fetch_404 recipient=${recipientPublicKeyHex.take(16)}…",
+                        "SEND_TRACE prekey_fetch_result=404 recipient=$recipientTag… " +
+                            "elapsedMs=$elapsed endpoint=$endpointPath — peer has not published yet",
                     )
                     throw PeerBundleMissingException(recipientPublicKeyHex)
                 }
+                val elapsedOk = Clock.System.now().toEpochMilliseconds() - fetchStartMs
                 messagingLog(
                     MessagingLogLevel.INFO,
-                    "SEND_TRACE prekey_fetch_ok recipient=${recipientPublicKeyHex.take(16)}…",
+                    "SEND_TRACE prekey_fetch_result=200 recipient=$recipientTag… " +
+                        "elapsedMs=$elapsedOk endpoint=$endpointPath",
                 )
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_init_start conv=$convTag")
                 val pkBundle = PreKeyBundle.fromWire(wireBundle)

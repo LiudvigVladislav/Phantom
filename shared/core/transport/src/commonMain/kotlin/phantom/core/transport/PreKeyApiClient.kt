@@ -15,6 +15,7 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.datetime.Clock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -86,10 +87,33 @@ class PreKeyApiClient(
      */
     override suspend fun publishBundle(request: PublishRequest): PublishResult {
         val body = json.encodeToString(PublishRequest.serializer(), request)
-        val response: HttpResponse = httpClient.post("$relayBaseUrl/prekeys/publish") {
-            contentType(ContentType.Application.Json)
-            setBody(body)
+        val url = "$relayBaseUrl/prekeys/publish"
+        val identityTag = request.identity_pubkey_hex.take(16)
+        relayLog(
+            RelayLogLevel.INFO,
+            "PREKEY_TRACE http_publish_start identity=$identityTag… opks=${request.one_time_pre_keys.size} url=$url",
+        )
+        val startMs = Clock.System.now().toEpochMilliseconds()
+        val response: HttpResponse = try {
+            httpClient.post(url) {
+                contentType(ContentType.Application.Json)
+                setBody(body)
+            }
+        } catch (t: Throwable) {
+            val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+            relayLog(
+                RelayLogLevel.WARN,
+                "PREKEY_TRACE http_publish_fail identity=$identityTag… " +
+                    "type=${t::class.simpleName} elapsedMs=$elapsed message=${t.message ?: "<null>"}",
+                t,
+            )
+            throw t
         }
+        val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+        relayLog(
+            RelayLogLevel.INFO,
+            "PREKEY_TRACE http_publish_done identity=$identityTag… status=${response.status.value} elapsedMs=$elapsed",
+        )
         return when (response.status) {
             HttpStatusCode.Created -> {
                 val parsed = json.decodeFromString(
@@ -142,7 +166,29 @@ class PreKeyApiClient(
                 append(requesterPubkeyHex)
             }
         }
-        val response: HttpResponse = httpClient.get(url)
+        val identityTag = identityPubkeyHex.take(16)
+        relayLog(
+            RelayLogLevel.INFO,
+            "PREKEY_TRACE http_bundle_fetch_start identity=$identityTag… url=$url",
+        )
+        val startMs = Clock.System.now().toEpochMilliseconds()
+        val response: HttpResponse = try {
+            httpClient.get(url)
+        } catch (t: Throwable) {
+            val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+            relayLog(
+                RelayLogLevel.WARN,
+                "PREKEY_TRACE http_bundle_fetch_fail identity=$identityTag… " +
+                    "type=${t::class.simpleName} elapsedMs=$elapsed message=${t.message ?: "<null>"}",
+                t,
+            )
+            throw t
+        }
+        val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+        relayLog(
+            RelayLogLevel.INFO,
+            "PREKEY_TRACE http_bundle_fetch_done identity=$identityTag… status=${response.status.value} elapsedMs=$elapsed",
+        )
         return when (response.status) {
             HttpStatusCode.OK ->
                 json.decodeFromString(PreKeyBundle.serializer(), response.bodyAsText())
@@ -176,7 +222,29 @@ class PreKeyApiClient(
                 append(requesterPubkeyHex)
             }
         }
-        val response: HttpResponse = httpClient.get(url)
+        val identityTag = identityPubkeyHex.take(16)
+        relayLog(
+            RelayLogLevel.INFO,
+            "PREKEY_TRACE http_status_start identity=$identityTag… url=$url",
+        )
+        val startMs = Clock.System.now().toEpochMilliseconds()
+        val response: HttpResponse = try {
+            httpClient.get(url)
+        } catch (t: Throwable) {
+            val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+            relayLog(
+                RelayLogLevel.WARN,
+                "PREKEY_TRACE http_status_fail identity=$identityTag… " +
+                    "type=${t::class.simpleName} elapsedMs=$elapsed message=${t.message ?: "<null>"}",
+                t,
+            )
+            throw t
+        }
+        val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
+        relayLog(
+            RelayLogLevel.INFO,
+            "PREKEY_TRACE http_status_done identity=$identityTag… status=${response.status.value} elapsedMs=$elapsed",
+        )
         return when (response.status) {
             HttpStatusCode.OK ->
                 json.decodeFromString(PreKeyStatus.serializer(), response.bodyAsText())
