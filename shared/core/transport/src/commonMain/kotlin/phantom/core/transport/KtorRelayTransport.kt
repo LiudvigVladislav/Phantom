@@ -396,20 +396,30 @@ class KtorRelayTransport(
                 if (sinceLastPong > RelayTransportConfig.PONG_TIMEOUT_MS) {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Pong timeout (${sinceLastPong}ms without Pong) — shutting down active engine and closing client",
+                        "Pong timeout (${sinceLastPong}ms without Pong) — marking transport disconnected and forcing reconnect",
                     )
-                    // ADR-010 Updated 2026-05-01 (round 2): even
-                    // HttpClient.close() is not enough on Tecno HiOS —
-                    // Ktor's OkHttp close path does
-                    // executor.shutdown() (graceful) which does NOT
-                    // interrupt threads parked in kernel recv() on a
-                    // dead socket. forceShutdownActiveEngine calls
-                    // executor.shutdownNow() which sends
-                    // InterruptedException to those threads and
-                    // unblocks the reader within milliseconds.
-                    forceShutdownActiveEngine()
-                    runCatching { generationClient.close() }
-                    scope.cancel()
+                    // PR-F1.2 (2026-05-12): previously this was
+                    // forceShutdownActiveEngine + close + scope.cancel + break,
+                    // which shut the engine down but did NOT relaunch
+                    // runReconnectLoop. On Tecno HiOS the webSocket{} block
+                    // can stay parked in kernel recv() even after close, so
+                    // the loop's iteration never advances. The result is a
+                    // zombie session: state.value stayed Connected,
+                    // isConnected() returned true, and send() wrote into a
+                    // dead socket with no acks. Test #24 (2026-05-12) on
+                    // Tecno captured this — pong timeout fired at 05:08:24,
+                    // 21 s later the user's envelopes still went into the
+                    // dead session.
+                    //
+                    // Setting state to Disconnected first so any send() that
+                    // races us hits the !isConnected() outbox path instead of
+                    // sending into the dead socket. forceReconnect() then
+                    // does the same shutdown + close + cancel sequence and,
+                    // critically, launches a fresh runReconnectLoop on
+                    // transportScope (the same recovery path the wakeup
+                    // receiver uses).
+                    _state.value = TransportState.Disconnected
+                    forceReconnect()
                     break
                 }
                 sendRaw(RelayMessage.Ping)
@@ -431,7 +441,7 @@ class KtorRelayTransport(
                 if (expired.isEmpty()) continue
                 relayLog(
                     RelayLogLevel.WARN,
-                    "ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and closing generation client. " +
+                    "ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and forcing reconnect. " +
                         "First id=${expired.first().message.messageId.take(12)}…",
                 )
                 // Per-envelope trace so a multi-chunk upload (voice messages,
@@ -445,9 +455,13 @@ class KtorRelayTransport(
                 outboxMutex.withLock {
                     expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
                 }
-                forceShutdownActiveEngine()
-                runCatching { generationClient.close() }
-                scope.cancel()
+                // PR-F1.2 (2026-05-12): same fix as the pong-timeout path —
+                // mark the transport disconnected so racing send() calls hit
+                // the outbox path, then forceReconnect() to launch a fresh
+                // runReconnectLoop. The previous scope.cancel + break left
+                // the session zombied on Tecno HiOS. See startPing() comment.
+                _state.value = TransportState.Disconnected
+                forceReconnect()
                 break
             }
         }
