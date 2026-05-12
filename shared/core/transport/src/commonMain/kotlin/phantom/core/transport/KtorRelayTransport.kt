@@ -434,6 +434,14 @@ class KtorRelayTransport(
                     "ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and closing generation client. " +
                         "First id=${expired.first().message.messageId.take(12)}…",
                 )
+                // Per-envelope trace so a multi-chunk upload (voice messages,
+                // PR-F1 2026-05-12) shows in logs which slices got requeued.
+                expired.forEach {
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "ACK watchdog requeue: id=${it.message.messageId.take(12)}…, pendingOutboxHead=true",
+                    )
+                }
                 outboxMutex.withLock {
                     expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
                 }
@@ -697,6 +705,14 @@ class KtorRelayTransport(
     // a pong should be treated as needing a reconnect, not as healthy.
     override val lastPongElapsedMs: Long
         get() = lastPongMark.elapsedNow().inWholeMilliseconds
+
+    // Lock-free read against pendingAcks. The map is mutated only under
+    // pendingAcksLock, but .size is a single primitive int field on the
+    // backing HashMap and racing the read against put/remove cannot return
+    // a torn value — at worst the count is off by one mid-mutation, which
+    // does not change the wakeup gate decision (the gate trips on > 0).
+    override val pendingAckCount: Int
+        get() = pendingAcks.size
 
     override suspend fun forceReconnect() {
         relayLog(

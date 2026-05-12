@@ -304,6 +304,7 @@ private class FakeRelayTransport : RelayTransport {
     override fun isConnected() = true
     // ADR-011 / ADR-013: stubs satisfying the new RelayTransport contract.
     override val lastPongElapsedMs: Long get() = 0L
+    override val pendingAckCount: Int get() = 0
     override suspend fun forceReconnect() {}
 }
 
@@ -1341,6 +1342,7 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
     override fun isConnected(): Boolean = true
     // ADR-011 / ADR-013: stubs satisfying the new RelayTransport contract.
     override val lastPongElapsedMs: Long get() = 0L
+    override val pendingAckCount: Int get() = 0
     override suspend fun forceReconnect() {}
     suspend fun deliver(d: phantom.core.transport.RelayMessage.Deliver) { _incoming.emit(d) }
 }

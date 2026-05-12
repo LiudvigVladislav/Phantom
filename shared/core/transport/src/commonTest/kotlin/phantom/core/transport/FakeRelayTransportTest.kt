@@ -69,6 +69,8 @@ class FakeRelayTransportTest {
         // values that won't trigger the alarm receiver's stale-pong path.
         override val lastPongElapsedMs: Long get() = 0L
 
+        override val pendingAckCount: Int get() = 0
+
         override suspend fun forceReconnect() {
             _state.value = TransportState.Disconnected
             _state.value = TransportState.Connected
