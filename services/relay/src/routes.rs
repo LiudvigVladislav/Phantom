@@ -297,7 +297,42 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        handle_message(text.as_str(), &identity, &state).await;
+                        // PR-F2-relay (2026-05-12): fast-path application-level
+                        // ping. Send pong directly back on THIS socket — mirror
+                        // what the WS-protocol Message::Ping handler below does
+                        // and bypass `handle_message` entirely for ping frames.
+                        //
+                        // Why: the previous implementation in handle_message's
+                        // `Some("ping")` arm routed the pong via `state
+                        // .clients[identity]` mpsc tx. After a client
+                        // forceReconnect (PR-F1.2 cascade), the relay sees
+                        // multiple WS sessions for the same identity; each
+                        // new connect overwrites the entry, so the latest
+                        // generation's tx is the only one in the map. Pings
+                        // arriving on OLDER sessions then route their pong to
+                        // the LATEST session and never come back to the
+                        // sender — the older sessions starve, hit Pong
+                        // timeout, trigger more forceReconnect, and the
+                        // cascade self-perpetuates. Test #26 captured 5
+                        // simultaneous registrations for the same identity
+                        // within 30 ms, which is what made all transport-
+                        // layer client fixes feel like they did nothing.
+                        //
+                        // Sending pong on the same socket the ping arrived on
+                        // makes ping/pong correctness independent of the
+                        // identity-keyed routing entirely.
+                        let raw = text.as_str();
+                        if raw == r#"{"type":"ping"}"# {
+                            if socket
+                                .send(Message::Text(r#"{"type":"pong"}"#.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else {
+                            handle_message(raw, &identity, &state).await;
+                        }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         // Explicit, immediate PONG — required because we no
@@ -511,11 +546,14 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                 let _ = sender_tx.send(ack);
             }
         }
-        Some("ping") => {
-            if let Some((_, tx)) = state.clients.read().await.get(from_identity) {
-                let _ = tx.send(r#"{"type":"pong"}"#.to_string());
-            }
-        }
+        // PR-F2-relay (2026-05-12): the `Some("ping")` arm was removed.
+        // Application-level ping is now handled inline in handle_socket's
+        // select! loop (see comment there) so the pong goes back on the
+        // same socket the ping arrived on, not via identity-keyed mpsc.
+        // This handler should never run for ping anymore — but if a future
+        // refactor accidentally routes a ping JSON through here, the
+        // catch-all `_ => {}` arm below will silently drop it, which is
+        // safer than the broken mpsc routing path.
         // ── Client → Relay delivery acknowledgement ────────────────────────────
         // The recipient client sends this after it has fully processed an
         // inbound envelope (Sealed-Sender unseal → decrypt → DB insert). The
