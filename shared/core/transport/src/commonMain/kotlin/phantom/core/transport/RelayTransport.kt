@@ -94,6 +94,23 @@ interface RelayTransport {
     val lastPongElapsedMs: Long
 
     /**
+     * Number of envelopes that have been sent on the wire but not yet
+     * acknowledged by the relay. Used by the AlarmManager wakeup receiver
+     * to defer `forceReconnect()` while an upload is in-flight: tearing
+     * down the WebSocket mid-flush loses every queued frame in the OkHttp
+     * dispatcher, and the in-process ACK watchdog
+     * ([RelayTransportConfig.ACK_TIMEOUT_MS]) is the right authority for
+     * declaring those envelopes lost. Real-device test 2026-05-12 (no VPN,
+     * RU carrier) showed wakeup firing every 30 s during a 6-chunk voice
+     * upload, dropping all chunks before the relay could ack them.
+     *
+     * Reading this is lock-free against the in-flight tracker map; the
+     * value may be off-by-one mid-update but that race is harmless because
+     * the gate decision is "> 0", not exact.
+     */
+    val pendingAckCount: Int
+
+    /**
      * Force the current reconnect generation to tear down and start over.
      * ADR-011 — invoked by [phantom.android.service.PhantomWakeupReceiver]
      * (Android only) when AlarmManager fires and detects a stale pong.

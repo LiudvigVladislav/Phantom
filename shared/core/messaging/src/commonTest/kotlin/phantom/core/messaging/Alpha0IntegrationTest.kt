@@ -101,6 +101,7 @@ private class BufferingRelayTransport : RelayTransport {
 
     // ADR-011 / ADR-013: stubs satisfying the new RelayTransport contract.
     override val lastPongElapsedMs: Long get() = 0L
+    override val pendingAckCount: Int get() = 0
     override suspend fun forceReconnect() {}
 
     /** Flush all queued messages into the incoming flow. */

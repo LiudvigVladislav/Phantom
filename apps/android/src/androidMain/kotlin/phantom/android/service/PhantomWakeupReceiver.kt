@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import phantom.android.PhantomApplication
+import phantom.core.transport.RelayTransportConfig
 
 /**
  * AlarmManager-driven network-keepalive receiver. ADR-011.
@@ -177,9 +178,37 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             Log.i(TAG, "pong fresh (${elapsed}ms) — no action")
             return
         }
+
+        // Defer to the in-process ACK watchdog when there are envelopes
+        // mid-flight. Tearing the socket down during a multi-chunk upload
+        // (voice messages on cellular, observed Test #22 2026-05-12) drops
+        // every queued frame the OkHttp dispatcher has not yet flushed —
+        // the ACK watchdog at RelayTransportConfig.ACK_TIMEOUT_MS is the
+        // right authority for declaring those envelopes lost, because it
+        // also re-queues them at the head of pendingOutbox so the next
+        // session re-sends them. The wakeup forceReconnect() bypasses
+        // that requeue path. Skip and let the watchdog handle it.
+        //
+        // NB: this only protects envelopes that have already been entered
+        // into the transport's pendingAcks tracker. A frame that has been
+        // accepted by the OkHttp dispatcher but has not yet returned from
+        // send() (so pendingAcks doesn't know about it) can still be lost
+        // here. Closing that gap is the job of PR-F2 (sequential send +
+        // wait-ACK pipeline) and a durable outbox.
+        val pendingAcks = transport.pendingAckCount
+        if (connected && pendingAcks > 0) {
+            Log.i(
+                TAG,
+                "Wakeup skipped: pendingAckCount=$pendingAcks, deferring to ACK watchdog " +
+                    "(pong elapsed=${elapsed}ms)",
+            )
+            return
+        }
+
         Log.w(
             TAG,
-            "stale pong (${elapsed}ms) or transport not connected (connected=$connected) — forcing reconnect",
+            "stale pong (${elapsed}ms) or transport not connected " +
+                "(connected=$connected, pendingAckCount=$pendingAcks) — forcing reconnect",
         )
         runCatching { transport.forceReconnect() }
             .onFailure { Log.e(TAG, "forceReconnect threw: ${it.message}", it) }
@@ -246,11 +275,31 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
         const val WAKEUP_INTERVAL_MS: Long = 30_000L
 
         /**
-         * Pong staleness above which we force a reconnect. Aligns with
-         * RelayTransportConfig.PONG_TIMEOUT_MS (25 s by default) plus a
-         * small margin so we don't race the in-process pong watchdog.
+         * Pong staleness above which we force a reconnect. Derived from
+         * [RelayTransportConfig.PONG_TIMEOUT_MS] plus a 20 s margin so the
+         * wakeup never races the in-process pong watchdog: when the
+         * transport-level constant moves, this one moves with it. Computed
+         * at compile time because both inputs are `const val`.
+         *
+         * Why 20 s rather than 10 s — on weak devices we have to absorb
+         * GC pauses, AlarmManager dispatch jitter, radio wake delay and
+         * the few-second drift Android adds to broadcast scheduling under
+         * Doze. 10 s left no headroom; 20 s does.
+         *
+         * The previous hard-coded value (25 s) was inherited from when
+         * PONG_TIMEOUT_MS was also 25 s. After PONG_TIMEOUT_MS was bumped
+         * to 60 s for slow-cellular voice upload tolerance, the wakeup
+         * kept the old 25 s threshold and started firing forceReconnect
+         * a full 35 s before the in-process pong watchdog would have. On
+         * TSPU-active carriers (real-device Test #22, 2026-05-12) Pong
+         * RTT routinely spikes into the 25-50 s range — the wakeup was
+         * tearing down healthy WebSockets that the in-process watchdog
+         * would have left alone, observable as 30 s reconnect cascades
+         * that drop every envelope in the OkHttp dispatcher's outbound
+         * buffer.
          */
-        const val PONG_STALE_THRESHOLD_MS: Long = 25_000L
+        const val PONG_STALE_THRESHOLD_MS: Long =
+            RelayTransportConfig.PONG_TIMEOUT_MS + 20_000L
 
         /**
          * WakeLock budget: how long we will hold the CPU awake during
