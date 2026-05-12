@@ -16,8 +16,10 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlinx.datetime.Clock
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.encodeToString
@@ -121,6 +123,20 @@ class DefaultMessagingService(
         // a 64 KB chunk produced 427 KB envelopes that timed out mid-upload (ISSUE-013). Fixing
         // the underlying serialization bloat is tracked as a separate task.
         const val AUDIO_CHUNK_BYTES = 8 * 1024          // 8 KB per chunk before base64 expansion
+
+        // PR-G1 (2026-05-12): hard cap for the prekey-bundle HTTP fetch on
+        // the send-bootstrap path. Without this, a slow / dead
+        // /prekeys/bundle endpoint (server overload, network jitter,
+        // identity-keyed routing race after reconnect, etc.) blocks the
+        // per-conversation mutex indefinitely — Test #27 captured 64 sec
+        // between chat open and first envelope sent. 8 s is generous:
+        // healthy /prekeys/bundle returns in < 200 ms; if it has not
+        // returned by 8 s the relay path is degraded and the right
+        // answer is to fail fast — sendMessage catches the resulting
+        // PeerBundleMissingException and lands the message in
+        // WAITING_FOR_RECIPIENT_BUNDLE so retryWaitingMessages() can
+        // re-try on the next reconnect.
+        const val PREKEY_BUNDLE_FETCH_TIMEOUT_MS: Long = 8_000L
     }
 
     // Buffer for reassembling incoming audio chunks. Key = chunkId.
@@ -164,30 +180,86 @@ class DefaultMessagingService(
         // writes the message stays visible (QUEUED) and the session resets —
         // better than the inverse (lost message, advanced chain).
         afterEncrypt: suspend (WireFrame) -> Unit = {},
-    ): WireFrame =
-        mutexFor(conversationId).withLock {
+    ): WireFrame {
+        // PR-G1 (2026-05-12): trace every stage of the send pipeline so we
+        // can localise where a delayed first-send actually blocks. Test #27
+        // showed 64 sec between ChatScreen subscribed and the first
+        // `Sending envelope` log — without per-stage trace we cannot tell
+        // whether the gap is in mutex acquire, prekey fetch, ratchet init,
+        // or transport.send. Tag every line with `SEND_TRACE` so a
+        // post-mortem grep on the device log gives the timeline directly.
+        val convTag = conversationId.take(12)
+        messagingLog(MessagingLogLevel.INFO, "SEND_TRACE encrypt_lock_wait conv=$convTag")
+        return mutexFor(conversationId).withLock {
+            messagingLog(MessagingLogLevel.INFO, "SEND_TRACE encrypt_lock_acquired conv=$convTag")
+            messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_lookup conv=$convTag")
             val existingState = sessionManager.tryLoadSession(conversationId)
             if (existingState != null) {
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_existing conv=$convTag")
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE ratchet_encrypt_start conv=$convTag plaintextBytes=${plaintext.size}")
                 val (newState, encrypted) = ratchet.encrypt(existingState, plaintext)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE ratchet_encrypt_ok conv=$convTag")
                 val wireFrame = WireFrame(encryptedMessage = encrypted)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE after_encrypt_callback_start conv=$convTag")
                 afterEncrypt(wireFrame)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE after_encrypt_callback_ok conv=$convTag")
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_start conv=$convTag")
                 sessionManager.saveSession(conversationId, newState)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
                 wireFrame
             } else {
                 // Bootstrap path: peer has no session here yet.
                 // Fetch their bundle, run 4-DH, ship the bootstrap
                 // header with the first message.
-                val wireBundle = preKeyApi.fetchBundle(
-                    identityPubkeyHex = recipientPublicKeyHex,
-                    requesterPubkeyHex = identity.publicKeyHex,
-                ) ?: throw PeerBundleMissingException(recipientPublicKeyHex)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_path conv=$convTag — no existing session")
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE prekey_fetch_start recipient=${recipientPublicKeyHex.take(16)}…")
+                // PR-G1: hard cap the prekey-bundle HTTP fetch. Without a
+                // ceiling, a slow / dead /prekeys/bundle endpoint blocks
+                // the per-conversation mutex indefinitely, which is what
+                // Test #27 captured as "64 sec between chat open and first
+                // envelope sent". 8 s is generous: under healthy conditions
+                // /prekeys/bundle returns in < 200 ms; if it has not
+                // returned by 8 s the relay is degraded and the right
+                // answer is to fail fast with PeerBundleMissingException
+                // (treated as 404 by sendMessage, message lands in
+                // WAITING_FOR_RECIPIENT_BUNDLE, retry hook re-tries on the
+                // next reconnect).
+                val wireBundle = try {
+                    withTimeout(PREKEY_BUNDLE_FETCH_TIMEOUT_MS) {
+                        preKeyApi.fetchBundle(
+                            identityPubkeyHex = recipientPublicKeyHex,
+                            requesterPubkeyHex = identity.publicKeyHex,
+                        )
+                    }
+                } catch (e: TimeoutCancellationException) {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "SEND_TRACE prekey_fetch_timeout recipient=${recipientPublicKeyHex.take(16)}… " +
+                            "after ${PREKEY_BUNDLE_FETCH_TIMEOUT_MS}ms — treating as 404, message will WAIT for retry",
+                    )
+                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                } ?: run {
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "SEND_TRACE prekey_fetch_404 recipient=${recipientPublicKeyHex.take(16)}…",
+                    )
+                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                }
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "SEND_TRACE prekey_fetch_ok recipient=${recipientPublicKeyHex.take(16)}…",
+                )
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_init_start conv=$convTag")
                 val pkBundle = PreKeyBundle.fromWire(wireBundle)
                 val bootstrap = sessionManager.initiatorBootstrap(
                     conversationId = conversationId,
                     localIdentityKeyPair = localKeyPair,
                     bundle = pkBundle,
                 )
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_init_ok conv=$convTag")
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE ratchet_encrypt_start conv=$convTag plaintextBytes=${plaintext.size} bootstrap=true")
                 val (newState, encrypted) = ratchet.encrypt(bootstrap.ratchetState, plaintext)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE ratchet_encrypt_ok conv=$convTag")
 
                 // Attach our Ed25519 signing pubkey so the recipient can
                 // cache it under our X25519 identity for verifying our
@@ -205,11 +277,16 @@ class DefaultMessagingService(
                     x3dhInit = bootstrap.x3dhInit,
                     senderSigningPublicKeyHex = ourSigningHex,
                 )
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE after_encrypt_callback_start conv=$convTag bootstrap=true")
                 afterEncrypt(wireFrame)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE after_encrypt_callback_ok conv=$convTag")
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_start conv=$convTag")
                 sessionManager.saveSession(conversationId, newState)
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
                 wireFrame
             }
         }
+    }
 
     /**
      * Platform hook for local push notifications.
@@ -239,6 +316,13 @@ class DefaultMessagingService(
     @Volatile var onCallMessage: ((MessagePayload, String) -> Unit)? = null
 
     override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> = runCatching {
+        // PR-G1 (2026-05-12): trace entry. Pair with `SEND_TRACE` lines in
+        // encryptUnderLock to localise where a delayed first-send blocks.
+        val convTag = message.conversationId.take(12)
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "SEND_TRACE send_start id=${message.id.take(12)}… conv=$convTag textLen=${message.text.length}",
+        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = message.text,
@@ -313,6 +397,7 @@ class DefaultMessagingService(
             return@runCatching Unit
         }
 
+        messagingLog(MessagingLogLevel.INFO, "SEND_TRACE sealed_sender_pack_start conv=$convTag")
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         val sealedSenderB64 = Base64.encode(
             SealedSender.seal(
@@ -320,9 +405,14 @@ class DefaultMessagingService(
                 toPublicKeyBytes = hexToBytes(message.recipientPublicKeyHex),
             )
         )
+        messagingLog(MessagingLogLevel.INFO, "SEND_TRACE sealed_sender_pack_ok conv=$convTag")
 
         val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
 
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "SEND_TRACE relay_send_call id=${message.id.take(12)}… conv=$convTag payloadBytes=${paddedCiphertext.size}",
+        )
         val sent = transport.send(
             RelayMessage.Send(
                 to = message.recipientPublicKeyHex,
@@ -331,6 +421,10 @@ class DefaultMessagingService(
                 payload = paddedCiphertext.encodeBase64(),
                 messageId = message.id,
             )
+        )
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "SEND_TRACE relay_send_return id=${message.id.take(12)}… conv=$convTag ok=$sent",
         )
 
         val newStatus = if (sent) MessageStatus.SENT else MessageStatus.QUEUED
