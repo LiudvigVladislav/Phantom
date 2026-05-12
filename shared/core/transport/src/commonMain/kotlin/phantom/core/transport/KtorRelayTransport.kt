@@ -627,10 +627,28 @@ class KtorRelayTransport(
         var sentCount = 0
         for (msg in toFlush) {
             when (msg) {
-                is RelayMessage.Send -> relayLog(
-                    RelayLogLevel.INFO,
-                    "Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}…",
-                )
+                is RelayMessage.Send -> {
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}…",
+                    )
+                    // PR-F1.1: mirror send() — re-track in pendingAcks BEFORE
+                    // sendRaw so the ACK watchdog and the next reconnect's
+                    // requeueUnackedToOutboxFront() can both see this envelope.
+                    // Without this, flush was fire-and-forget: re-flushed
+                    // envelopes that the relay never acked silently disappeared
+                    // from the tracker on the next reconnect cycle. Test #23
+                    // 2026-05-12 captured 7 voice envelopes lost this way:
+                    // requeue → flush → no acks → next reconnect's requeue
+                    // saw an empty pendingAcks → envelopes dropped.
+                    pendingAcksLock.withLock {
+                        pendingAcks[msg.messageId] = AckPending(msg, timeSource.markNow())
+                    }
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "Flush → tracking pending ACK: id=${msg.messageId.take(12)}…",
+                    )
+                }
                 is RelayMessage.AckDelivery -> relayLog(
                     RelayLogLevel.INFO,
                     "Flush → send delivery ack: id=${msg.messageId.take(12)}…",
@@ -639,6 +657,19 @@ class KtorRelayTransport(
             }
             val ok = sendRaw(msg)
             if (!ok) {
+                // Undo the just-added pendingAcks entry — the envelope is
+                // going back to outbox front, it must live in exactly one
+                // place until the next reconnect re-flushes it. Without this
+                // un-track the next requeueUnackedToOutboxFront() would also
+                // pull it from pendingAcks and we'd have a duplicate in the
+                // outbox.
+                if (msg is RelayMessage.Send) {
+                    pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "Flush failed → returned to outbox head: id=${msg.messageId.take(12)}…",
+                    )
+                }
                 val remaining = toFlush.size - sentCount
                 relayLog(
                     RelayLogLevel.ERROR,
