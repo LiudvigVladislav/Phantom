@@ -79,6 +79,10 @@ class PreKeyLifecycleService(
     suspend fun bootstrapForNewIdentity(): Result<Unit> = runCatching {
         if (signedPreKeyRepository.get() != null) {
             // Already done — onboarding ran on a previous launch.
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "PREKEY_TRACE bootstrap_skip_existing_spk — local SPK already present, no publish",
+            )
             return Result.success(Unit)
         }
         val identity = identityManager.getIdentity()
@@ -86,9 +90,18 @@ class PreKeyLifecycleService(
         val signing = identityManager.loadSigningKeyPair()
             ?: throw MigrationException.NoIdentity
 
+        val identityTag = identity.publicKeyHex.take(16)
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "PREKEY_TRACE bootstrap_start identity=$identityTag…",
+        )
         val spkEntity = generateAndPersistSpk(signing)
         val opks = generateAndPersistOpks(REFILL_BATCH_SIZE, replaceExisting = true)
         publishBundle(identity.publicKeyHex, signing, spkEntity, opks)
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "PREKEY_TRACE bootstrap_done identity=$identityTag…",
+        )
     }
 
     /**
@@ -119,15 +132,31 @@ class PreKeyLifecycleService(
             ?: throw MigrationException.NoIdentity
         val signing = identityManager.loadSigningKeyPair()
             ?: throw MigrationException.NoIdentity
+        val identityTag = identity.publicKeyHex.take(16)
         val spkEntity = signedPreKeyRepository.get()
-            ?: // No local SPK — onboarding has not run yet for this install.
-            // verifyBundleOnRelay is not the right place to drive onboarding;
-            // bootstrapForNewIdentity is. Skip silently.
-            return Result.success(false)
+            ?: run {
+                // No local SPK — onboarding has not run yet for this install.
+                // verifyBundleOnRelay is not the right place to drive onboarding;
+                // bootstrapForNewIdentity is. Skip silently.
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "PREKEY_TRACE verify_skip_no_local_spk identity=$identityTag…",
+                )
+                return Result.success(false)
+            }
 
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "PREKEY_TRACE verify_start identity=$identityTag…",
+        )
         val status = preKeyApi.fetchStatus(
             identityPubkeyHex = identity.publicKeyHex,
             requesterPubkeyHex = identity.publicKeyHex,
+        )
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "PREKEY_TRACE verify_status identity=$identityTag… " +
+                "spk_age_days=${status.signed_prekey_age_days} opks_remaining=${status.remaining_opks}",
         )
         // signed_prekey_age_days == null is the relay's signal that no
         // entry exists for this identity. If an entry exists but the OPK
@@ -143,6 +172,10 @@ class PreKeyLifecycleService(
         // full local state — same wire shape as the onboarding bootstrap
         // and the steady-state replenish, so the relay's atomic publish
         // restores us to a known-good state in one round-trip.
+        messagingLog(
+            MessagingLogLevel.WARN,
+            "PREKEY_TRACE verify_republish_triggered identity=$identityTag… — relay has no record",
+        )
         val allOpks = oneTimePreKeyRepository.getAll()
         publishBundle(identity.publicKeyHex, signing, spkEntity, allOpks)
         true
@@ -292,6 +325,13 @@ class PreKeyLifecycleService(
         // state we can republish from later.
         signedPreKeyRepository.upsert(spk)
 
+        val identityTag = identityX25519Hex.take(16)
+        val opkCount = opks.size
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "PREKEY_TRACE upload_start identity=$identityTag… opks=$opkCount spk_key_id=${spk.keyId}",
+        )
+
         val request = PublishRequest(
             identity_pubkey_hex = identityX25519Hex,
             signing_pubkey_hex = signing.publicKey.bytes.toHex(),
@@ -308,10 +348,41 @@ class PreKeyLifecycleService(
                 )
             },
         )
-        when (val result = preKeyApi.publishBundle(request)) {
-            is PublishResult.Stored -> { /* expected */ }
+        val startMs = nowMsProvider()
+        val result = try {
+            preKeyApi.publishBundle(request)
+        } catch (t: Throwable) {
+            val elapsed = nowMsProvider() - startMs
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "PREKEY_TRACE upload_fail identity=$identityTag… reason=throwable " +
+                    "type=${t::class.simpleName} elapsedMs=$elapsed message=${t.message ?: "<null>"}",
+                t,
+            )
+            throw t
+        }
+        val elapsed = nowMsProvider() - startMs
+        when (result) {
+            is PublishResult.Stored -> {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "PREKEY_TRACE upload_ok identity=$identityTag… " +
+                        "stored_opks=${result.storedOpks} elapsedMs=$elapsed",
+                )
+            }
             is PublishResult.Failure -> {
                 val reason = result.reason
+                val reasonTag = when (reason) {
+                    is PublishResult.Reason.SigningKeyMismatch -> "signing_key_mismatch"
+                    is PublishResult.Reason.RateLimited -> "rate_limited"
+                    is PublishResult.Reason.BadRequest -> "bad_request"
+                    is PublishResult.Reason.Unexpected -> "http${reason.httpStatus}"
+                }
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "PREKEY_TRACE upload_fail identity=$identityTag… reason=$reasonTag " +
+                        "elapsedMs=$elapsed server=\"${result.serverMessage.take(160)}\"",
+                )
                 throw when (reason) {
                     is PublishResult.Reason.SigningKeyMismatch ->
                         MigrationException.SigningKeyMismatch(result.serverMessage)
