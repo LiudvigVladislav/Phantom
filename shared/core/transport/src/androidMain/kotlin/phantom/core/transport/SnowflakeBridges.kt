@@ -67,6 +67,50 @@ internal object SnowflakeBridges {
      * without VPN — the highest single-PT score — and these RU-specific
      * entries have explicitly different fronts/STUN/broker URLs from the
      * generic `bridges-s-zz` list.
+     *
+     * **Privacy properties of the AMP-cache fallback path (entries 3+4)**
+     *
+     * The `ampcache=https://cdn.ampproject.org/ front=www.google.com` lines
+     * route the **broker-discovery TLS request** (the matchmaking step
+     * that finds an available volunteer Snowflake proxy) through Google's
+     * AMP cache CDN. After the broker matches the client to a volunteer,
+     * the actual Tor circuit traffic flows over WebRTC DataChannel
+     * **directly** between the device and that volunteer browser — Google
+     * is NOT on the data path.
+     *
+     * What Google sees:
+     *   - Your IP making TLS connections to a Google CDN endpoint
+     *   - Time / size / frequency pattern of those connections
+     *   - The pattern in principle classifiable as "Snowflake-style
+     *     broker discovery" — same pattern Tor Browser users on RU send
+     *
+     * What Google does NOT see:
+     *   - Your PHANTOM identity / signing key
+     *   - The relay's onion address (`zmdrxlrkd7iv...`)
+     *   - Your contacts or the contact graph
+     *   - Any Tor circuit traffic or message content
+     *
+     * What TSPU / RU carrier sees:
+     *   - Only the TLS connection to `www.google.com` — indistinguishable
+     *     from any of the dozens of legitimate Google services
+     *
+     * What we relied on before importing this set:
+     *   - The previous default (`SnowflakeBridges.DEFAULT` pre-PR-E,
+     *     fronted on `vuejs.org` via Netlify CDN). Netlify saw exactly
+     *     the same pattern Google now sees. Privacy property is unchanged
+     *     in kind; Google's value here is resilience against censorship,
+     *     not a new privacy compromise.
+     *
+     * Entries 1+2 (cdn77 fronts) do not involve Google at all and are
+     * tried first by tor's path-selection — the AMP-cache fallback only
+     * actually fires when cdn77 is unreachable on the local network.
+     *
+     * This pattern is the same one Tor Browser ships by default for RU
+     * users in `tor-browser-build` and that Briar ships in
+     * `bridges-s-ru`. We follow established censorship-circumvention
+     * industry practice rather than inventing our own. See
+     * `KNOWN_ISSUES.md` ISSUE-016 for the full user-facing trust
+     * trade-off discussion.
      */
     val RU_TUNED: List<String> = listOf(
         "Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 " +

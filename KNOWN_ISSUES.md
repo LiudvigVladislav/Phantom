@@ -374,6 +374,21 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 **Cross-reference.** Original transport-investigation work that motivated the Tor track is in [ISSUE-013](#issue-013-stateful-natcgntspu-silent-drops-on-cellular-russia--tor--unifiedpush-hybrid-in-implementation). ISSUE-013 describes the WSS-side TSPU behaviour; ISSUE-016 documents that even the Tor-side fallback we built to get around ISSUE-013 also runs into TSPU at the bridge / circuit layer when used without a VPN on the same network class.
 
+**PR-E (2026-05-12) — bridge data import from Briar onionwrapper.** The single retune above did not move the per-bridge percent stalls; the underlying censorship layer is content-agnostic to which specific bridge IP we ship as long as the bridge's *wire signature* is recognised. PR-E imports the same bridge resource files Briar ships to every Briar user in censorship-active countries (`bridges-s-ru`, `bridges-n-zz`, `bridges-m-zz` from `briar/onionwrapper @ master`, GPL-3 → AGPL-3 compatible) — 4 RU-tuned snowflake entries, 9 non-default obfs4 entries, 1 meek_lite entry. Net pool grows from 5 bridges to ~17, and a new `KitchenSink` profile is placed first in rotation so tor's own path-selection logic gets the entire pool in one `enableBridges()` call (Briar's empirical winning strategy).
+
+**Privacy properties of the Snowflake broker fronting (PR-E).** Two of the four imported `bridges-s-ru` entries route their *broker-discovery* request through Google's AMP cache (`https://cdn.ampproject.org/`) fronted on `www.google.com`. This needs to be honest:
+
+- *What Google sees.* Your IP making TLS connections to a Google CDN endpoint, with `www.google.com` in the SNI field. A frequency / size pattern of these requests can in principle be classified as "this client uses Snowflake-style broker discovery" (this is not PHANTOM-specific — Tor Browser users with Snowflake on RU send the same pattern).
+- *What Google does NOT see.* Your PHANTOM identity, your Ed25519 signing key, the relay's onion address (`zmdrxlrkd7iv...`), your contacts, or any message content. Once the broker matches you to a volunteer browser proxy, the actual Tor circuit traffic flows over WebRTC DataChannel directly between your device and that volunteer — Google is not on that path.
+- *What TSPU sees.* Only the TLS connection to `www.google.com` — indistinguishable from any of the dozens of legitimate Google services Russian carriers route every minute. Blocking `www.google.com` would have catastrophic consequences for the local internet, which is precisely why this fronting domain is resilient.
+- *What we relied on before PR-E.* The previous default Snowflake set fronted on `vuejs.org` via Netlify CDN — Netlify saw exactly the same pattern Google now sees. The privacy property is unchanged in kind, only the CDN identity changes; Google's value here is resilience against censorship, not a new privacy compromise.
+
+The other two `bridges-s-ru` entries front on `cdn.zk.mk, img.icons8.com, cdn.kde.org` via cdn77 — no Google involvement. Tor walks the bridge list internally and uses whichever the network admits first, so on a network that does not block cdn77 the request never reaches the AMP path. The AMP entries are the *resilience fallback*, not the primary path.
+
+This pattern (Snowflake broker fronting via Google AMP cache) is the same one Tor Browser ships by default for RU users in `tor-browser-build` and that Briar ships in `bridges-s-ru`. PHANTOM follows the established censorship-circumvention industry practice rather than inventing its own.
+
+**Trust trade-off documented for the user.** Onboarding / Privacy Policy text should reflect that, when Ghost mode falls back to the Snowflake-via-AMP path, a Google CDN endpoint is on the *broker-discovery* leg of the connection. End-to-end encrypted message content, identity, and contact graph remain protected by the Double Ratchet + Sealed Sender + Tor onion service properties regardless of which bridge profile delivered the circuit. This addition is tracked as a follow-up wording task on the Privacy Policy page; no shipped behaviour change is required.
+
 ---
 
 ## Bugs that have been fixed in Alpha 1 development
