@@ -477,42 +477,53 @@ class TransportManager(
         /**
          * Bridge rotation order for [prepareTorWithRotation].
          *
-         * Order + budgets retuned 2026-05-12 from Test #5 (МТС Wi-Fi
-         * without VPN, see KNOWN_ISSUES ISSUE-016) where we observed
-         * the inverse of the original PR-C ordering's assumption:
+         * Re-tuned 2026-05-12 (PR-E) after the Briar bridge-strategy
+         * audit. The new ordering puts the kitchen-sink profile first
+         * — Briar's empirical winning strategy — followed by the two
+         * single-PT profiles whose bridge pools we just expanded with
+         * Briar's `bridges-s-ru` (snowflake with Google AMP cache
+         * front) and `bridges-n-zz` (9 non-default obfs4 entries).
          *
-         *   obfs4      reached 10%  — TSPU blocks bridge handshake
-         *   webtunnel  reached 10%  — TSPU blocks bridge handshake
-         *   snowflake  reached 50%  — partial circuit build
-         *   mixed      reached 72%  — best result by a wide margin
+         * Why this beats PR-D's order:
          *
-         * Mixed wins because tor selects its first reachable bridge
-         * out of the full obfs4+webtunnel+snowflake pool in parallel,
-         * which gives the underlying PT layer the best chance against
-         * a censorship adversary that only blocks SOME wire signatures.
+         *   - KitchenSink hands tor every bridge entry across every
+         *     transport in one `enableBridges` call. Tor's own
+         *     path-selection logic picks whichever bridge the network
+         *     does not block — strictly better than serializing
+         *     per-PT attempts because a network that allows e.g.
+         *     snowflake-AMP-cache but blocks obfs4 bypasses the wait.
+         *   - Snowflake (now Briar's RU-tuned set) is the second best
+         *     stand-alone shot — the AMP-cache fronts on
+         *     `www.google.com`, which a censor cannot block without
+         *     breaking the local internet.
+         *   - Obfs4 (now PHANTOM FlokiNET + 9 Briar non-default) gets
+         *     a longer 180 s budget because there are now 10 obfs4
+         *     bridges to walk through — empirically each takes ~10 s
+         *     to fail-and-move-on.
+         *   - MeekLite is the wholly-different-wire-signature
+         *     fallback (HTTPS to phpmyadmin.net front via cdn77).
+         *     Slow latency-wise but censors that block all of the
+         *     above sometimes leave HTTPS-to-CDNs alone.
          *
-         * Reordering puts our biggest gun first and gives it a real
-         * 10-minute window to complete — long enough that on healthy
-         * censored networks the rotation walk usually ends after the
-         * first attempt. Single-PT fallbacks stay in the list so a
-         * network that breaks one PT but not another (e.g. obfs4 OK
-         * but snowflake broker fronting blocked) still has a chance.
+         * WebTunnel is dropped from the rotation entirely. Test #5
+         * showed it stalls at 10 % on TSPU-active networks, and
+         * Briar deliberately does not configure it. It remains in the
+         * `BridgeProfile` enum and `bridgesFor()` for future use /
+         * manual testing but is not in the default walk.
          *
-         * Single-PT budgets are short (90 s each) — empirically these
-         * stall at percent=10 on networks where TSPU is active, so a
-         * long budget there only delays the next attempt. Snowflake
-         * keeps a longer 6-minute budget because it's the second-best
-         * standalone transport per Test #5.
+         * Mixed (the pre-PR-E historical "all our PHANTOM-controlled
+         * bridges" profile) is dropped from the default walk in
+         * favour of the strictly larger KitchenSink set.
          *
-         * Total worst-case walk = 600 + 360 + 90 + 90 = 1140 s (19 min).
-         * On uncensored networks the first profile reaches Ready in
-         * 60-180 s and the rotation ends.
+         * Total worst-case walk = 600 + 420 + 180 + 60 = 1260 s
+         * (21 min). On healthy networks the kitchen-sink reaches
+         * Ready in 60-180 s and the rotation ends.
          */
         val BRIDGE_ROTATION_ORDER: List<BridgeRotationAttempt> = listOf(
-            BridgeRotationAttempt(BridgeProfile.Mixed,         budgetMs = 600_000L),
-            BridgeRotationAttempt(BridgeProfile.SnowflakeOnly, budgetMs = 360_000L),
-            BridgeRotationAttempt(BridgeProfile.Obfs4Only,     budgetMs = 90_000L),
-            BridgeRotationAttempt(BridgeProfile.WebtunnelOnly, budgetMs = 90_000L),
+            BridgeRotationAttempt(BridgeProfile.KitchenSink,   budgetMs = 600_000L),
+            BridgeRotationAttempt(BridgeProfile.SnowflakeOnly, budgetMs = 420_000L),
+            BridgeRotationAttempt(BridgeProfile.Obfs4Only,     budgetMs = 180_000L),
+            BridgeRotationAttempt(BridgeProfile.MeekLite,      budgetMs = 60_000L),
         )
     }
 }

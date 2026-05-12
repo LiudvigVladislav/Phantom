@@ -147,11 +147,30 @@ internal class TorServiceAndroid(
      * first within each profile (already the case in the source lists).
      */
     private fun bridgesFor(profile: BridgeProfile): List<String> = when (profile) {
-        BridgeProfile.Obfs4Only -> OperatorBridges.OBFS4
+        // PR-E: obfs4 profile now combines our FlokiNET bridge with
+        // Briar's 9 non-default obfs4 bridges so a censor that has
+        // catalogued our single bridge can still be defeated by any
+        // of the additional 9 reaching tor first.
+        BridgeProfile.Obfs4Only ->
+            OperatorBridges.OBFS4 + OperatorBridges.OBFS4_NON_DEFAULT
         BridgeProfile.WebtunnelOnly -> OperatorBridges.WEBTUNNEL
-        BridgeProfile.SnowflakeOnly -> SnowflakeBridges.DEFAULT
+        // PR-E: snowflake profile is now Briar's RU-tuned set with the
+        // Google AMP cache fallback (`front=www.google.com`). The older
+        // PHANTOM-default set is still available as `SnowflakeBridges.DEFAULT`
+        // for future locale-aware selection.
+        BridgeProfile.SnowflakeOnly -> SnowflakeBridges.RU_TUNED
+        BridgeProfile.MeekLite -> MeekBridges.DEFAULT
         BridgeProfile.Mixed ->
             OperatorBridges.OBFS4 + OperatorBridges.WEBTUNNEL + SnowflakeBridges.DEFAULT
+        // PR-E: every bridge entry across every transport in one call.
+        // Mirrors Briar's empirical strategy — let tor's own path
+        // selection pick whichever bridge the network does not block.
+        BridgeProfile.KitchenSink ->
+            OperatorBridges.OBFS4 +
+                OperatorBridges.OBFS4_NON_DEFAULT +
+                OperatorBridges.WEBTUNNEL +
+                SnowflakeBridges.RU_TUNED +
+                MeekBridges.DEFAULT
     }
 
     override suspend fun stop() {

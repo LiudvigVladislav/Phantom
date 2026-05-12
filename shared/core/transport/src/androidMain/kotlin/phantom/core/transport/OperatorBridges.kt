@@ -123,4 +123,59 @@ internal object OperatorBridges {
             "cert=yU6ljZFFQ49J6VCipe7QBQt38fQ6O3ncJoNzTQzk8tJ/hg9n1GyOKpYF1YSC/OBib4tqVA " +
             "iat-mode=0",
     )
+
+    /**
+     * Briar's "non-default" obfs4 bridge set (PR-E, 2026-05-12).
+     *
+     * Mirrored verbatim from
+     * `briar/onionwrapper @ master, bridges-n-zz` (GPL-3, compatible with
+     * our AGPL-3) which Briar uses for every country it considers
+     * censorship-active — RU, BY, CN, IR, etc. — instead of the public
+     * "default" obfs4 set that DPI vendors enumerate first.
+     *
+     * Source: https://github.com/briar/onionwrapper/blob/master/onionwrapper-core/src/main/resources/bridges-n-zz
+     *
+     * Why we ship these alongside our own [OBFS4] FlokiNET bridge:
+     *   - Test #5 (2026-05-11) showed our single FlokiNET obfs4 bridge
+     *     stalled at 10 % on МТС without VPN. A single bridge is one
+     *     point of failure against an active censor.
+     *   - Briar's 9 non-default obfs4 lines span multiple ASNs and
+     *     `iat-mode` values (0 and 1) — tor will try them in order
+     *     until one negotiates.
+     *   - These are the same bridges Briar ships to every Briar user
+     *     in RU; if Briar works, these are the lines doing the work.
+     *
+     * Maintenance: when Briar updates `bridges-n-zz` (visible at
+     * https://github.com/briar/onionwrapper/commits/master/onionwrapper-core/src/main/resources/bridges-n-zz),
+     * sync the new lines here and ship a patch release.
+     */
+    val OBFS4_NON_DEFAULT: List<String> = listOf(
+        "Bridge obfs4 120.29.217.52:5223 40FE3DB9800272F9CDC76422F8ED7883280EE96D " +
+            "cert=/71PS4l8c/XJ4DIItlH9xMqNvPFg2RUTrHvPlQWh48u5et8h/yyyjCcYphUadDsfBWpaGQ " +
+            "iat-mode=0",
+        "Bridge obfs4 185.177.207.138:8443 53716FE26F23C8C6A71A2BC5D9D8DC64747278C7 " +
+            "cert=6jcYVilMEzxdsWghSrQFpYYJlkkir/GPIXw/EnddUK3S8ToVpMG8u1SwMOEdEs735RrMHw " +
+            "iat-mode=0",
+        "Bridge obfs4 94.142.246.132:8088 135C158527AA9FE9A2F26EC515EB6999D813D347 " +
+            "cert=wTUz0/5FhAZRkitil5MprGbSF3JzjxjxI1kAmxAdSeDy98NgcLr11f/qUXWDC76Y97RiSg " +
+            "iat-mode=0",
+        "Bridge obfs4 185.177.207.132:8443 4FB781F7A9DD39DA53A7996907817FC479874D19 " +
+            "cert=UL2gCAXWW5kEWY4TQ0lNeu6OAmzh40bXYVhMnTWVG8USnyy/zEKGSIPgmwTDMumWr9c1Pg " +
+            "iat-mode=0",
+        "Bridge obfs4 82.64.115.17:990 B08238781C2CD80DBD95AEABEB6F6C75F2E2CEB6 " +
+            "cert=1udeMlFNs3sJ20zwpPE6nShZqqwDb3F1ET4KzfSfD+fktkue9zNx9H3t+yLCPAsg+6UTUA " +
+            "iat-mode=1",
+        "Bridge obfs4 185.177.207.153:8443 6574D4D903FDE714F2759A3B3C31C0363A92DCDC " +
+            "cert=VAZd6bOJ6BKUZLLOYhMuaSPxjf+ZGAspvdQkf8C3naGk8r2b77WXWj9JF8+jLYb8l2fnUw " +
+            "iat-mode=0",
+        "Bridge obfs4 78.159.118.224:19998 9735DAE37918DD9F0BA9CF56D336294BCB4207CC " +
+            "cert=MIBlPdg69nSskD9Id8bLzwQFJ1zICUMwwG9apMlvF35Y6Z9W8AVbSlahxlY17l8zLvwdEA " +
+            "iat-mode=0",
+        "Bridge obfs4 23.94.169.122:63000 1878E0F5DAFFBD4A0F8DC75820ADB9B10E8ABAF0 " +
+            "cert=iESu5/SAcFI8GPUXHaV4Yk1zraP1AjZySYSsKh0lT+Bj0q/pdwa4PjMjsOusMxiOuUQAOA " +
+            "iat-mode=0",
+        "Bridge obfs4 185.177.207.146:8443 4EBA78385FCA62C8A26EDEEC6752068C676287F3 " +
+            "cert=IPU7h22MwNmvCogs3TrR4NO/RcIb9asRU0saVWfAPvBbWc1YALuHxDhOl5Sri2rZ7QhKNg " +
+            "iat-mode=0",
+    )
 }
