@@ -140,6 +140,29 @@ class KtorRelayTransport(
     private val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var reconnectJob: Job? = null
 
+    // PR-F2 (2026-05-12): serialize connect() and forceReconnect() calls
+    // so racing watchdogs / lifecycle callbacks cannot each spawn their own
+    // reconnect loop. Test #26 relay log captured 5 simultaneous
+    // `event="connect"` for the same identity within 30 ms because three
+    // independent paths (in-process pong watchdog, in-process ACK watchdog,
+    // external AlarmManager wakeup) all called forceReconnect concurrently
+    // and each ran a fresh `transportScope.launch { runReconnectLoop() }`
+    // with no synchronization. The result was N parallel WS sessions on
+    // the same identity, all but the latest becoming server-side zombies
+    // that broke pong routing (relay's identity-keyed mpsc only delivers
+    // to the latest registration).
+    //
+    // The mutex is held only during the brief setup phase (cancel old job,
+    // launch new one) — never across the suspending runReconnectLoop body
+    // — so it cannot block the connection itself.
+    //
+    // The generation counter detects "I am the second/third caller in the
+    // same burst" and lets later callers no-op once an earlier caller
+    // already advanced the generation: forceReconnect requested by three
+    // watchdogs in the same 50 ms window collapses to one relaunch.
+    private val connectionLifecycleMutex = Mutex()
+    @Volatile private var connectionGeneration: Long = 0L
+
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
@@ -165,18 +188,41 @@ class KtorRelayTransport(
             RelayLogLevel.INFO,
             "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
         )
-        // Cancel any prior reconnect job (typically a noop on cold start;
-        // matters when connect() is called twice from the service double-
-        // start path). Then launch a fresh loop on transportScope.
-        reconnectJob?.cancel()
-        reconnectJob = transportScope.launch {
-            runReconnectLoop()
+        // PR-F2: serialize lifecycle setup. The lock is held only while
+        // we cancel the prior reconnect loop and launch a new one — never
+        // across the suspending join() below — so racing connect()/
+        // forceReconnect() callers serialize on setup but do not block
+        // the connection itself.
+        val newJob = connectionLifecycleMutex.withLock {
+            // If a reconnect loop is already running, do NOT spawn a second
+            // one. A second connect() in the wild typically comes from a
+            // double-start of the foreground service (AlarmManager wakeup
+            // + lifecycle bring-back firing in the same window). Returning
+            // the existing job preserves the original "suspend until the
+            // loop ends" semantics callers expect.
+            val existing = reconnectJob
+            if (existing != null && existing.isActive && !disconnectRequested) {
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "connect: reconnect loop already active (gen=$connectionGeneration) — joining existing job, no new loop spawned",
+                )
+                existing
+            } else {
+                connectionGeneration += 1
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "connect: launching fresh reconnect loop (gen=$connectionGeneration)",
+                )
+                val launched = transportScope.launch { runReconnectLoop() }
+                reconnectJob = launched
+                launched
+            }
         }
         // Suspend forever (or until disconnectRequested is observed by
         // the loop and runReconnectLoop returns) so existing callers
         // that `await` connect() — PhantomMessagingService — keep their
         // structured-concurrency expectations.
-        reconnectJob?.join()
+        newJob.join()
     }
 
     /**
@@ -760,43 +806,63 @@ class KtorRelayTransport(
         get() = pendingAcks.size
 
     override suspend fun forceReconnect() {
-        relayLog(
-            RelayLogLevel.WARN,
-            "forceReconnect() called — abandoning current reconnect loop and launching a fresh one (ADR-013 hard reset)",
-        )
-        // ADR-013: scope-cancel + close-client does NOT unblock a kernel-
-        // parked WebSocket reader on Tecno HiOS. Confirmed empirically:
-        // forceReconnect() previously logged every 30s with zero progress
-        // for 7+ minutes. The structural fix is to abandon the stuck loop
-        // entirely.
-        //
-        // The old reconnectJob's coroutine is cancelled at the JVM scheduler
-        // level — its current webSocket{} suspension may still be parked in
-        // kernel recv(), but that is a leaked thread, not a blocking
-        // dependency for us. Once we launch a new loop below, all new
-        // outbound traffic uses a fresh OkHttp engine and a fresh socket.
-        //
-        // Belt-and-suspenders: kill the current generation's engine and
-        // client first so the abandoned loop has no resources to use even
-        // if it does eventually unpark.
-        forceShutdownActiveEngine()
-        runCatching { currentGenerationClient?.close() }
-        scope?.cancel()
-        val oldJob = reconnectJob
-        // Launch a brand-new reconnect loop on transportScope. It captures
-        // the same relayUrl/identityHex/signingPubKeyHex/challengeSigner
-        // stored on the instance, fetches a fresh challenge per generation,
-        // and starts its own runReconnectLoop iteration from attempt 0.
-        reconnectJob = transportScope.launch {
-            runReconnectLoop()
+        // PR-F2: capture the generation we observed BEFORE acquiring the
+        // lock. Three watchdogs (in-process pong, in-process ACK, external
+        // AlarmManager wakeup) can all call forceReconnect within the same
+        // 50 ms window — without coalescing, each one launched its own new
+        // reconnect loop and the relay saw N parallel `event="connect"`
+        // for the same identity (Test #26 captured 5 in 30 ms). With the
+        // gen check below, the first caller through the lock advances the
+        // generation; subsequent callers see their entry-gen is now stale
+        // and skip the relaunch — at most one fresh loop per burst.
+        val entryGen = connectionGeneration
+        connectionLifecycleMutex.withLock {
+            if (entryGen != connectionGeneration) {
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "forceReconnect: stale (entry gen=$entryGen, current=$connectionGeneration) — another caller already relaunched, skipping",
+                )
+                return
+            }
+            relayLog(
+                RelayLogLevel.WARN,
+                "forceReconnect() called — abandoning current reconnect loop and launching a fresh one (ADR-013 hard reset, gen=$entryGen→${entryGen + 1})",
+            )
+            // ADR-013: scope-cancel + close-client does NOT unblock a kernel-
+            // parked WebSocket reader on Tecno HiOS. Confirmed empirically:
+            // forceReconnect() previously logged every 30s with zero progress
+            // for 7+ minutes. The structural fix is to abandon the stuck loop
+            // entirely.
+            //
+            // The old reconnectJob's coroutine is cancelled at the JVM scheduler
+            // level — its current webSocket{} suspension may still be parked in
+            // kernel recv(), but that is a leaked thread, not a blocking
+            // dependency for us. Once we launch a new loop below, all new
+            // outbound traffic uses a fresh OkHttp engine and a fresh socket.
+            //
+            // Belt-and-suspenders: kill the current generation's engine and
+            // client first so the abandoned loop has no resources to use even
+            // if it does eventually unpark.
+            forceShutdownActiveEngine()
+            runCatching { currentGenerationClient?.close() }
+            scope?.cancel()
+            val oldJob = reconnectJob
+            // Launch a brand-new reconnect loop on transportScope. It captures
+            // the same relayUrl/identityHex/signingPubKeyHex/challengeSigner
+            // stored on the instance, fetches a fresh challenge per generation,
+            // and starts its own runReconnectLoop iteration from attempt 0.
+            reconnectJob = transportScope.launch {
+                runReconnectLoop()
+            }
+            connectionGeneration += 1
+            // Best-effort: ask the old job to cancel after the new one has
+            // started (so any read-loop epilogue can drain queued frames),
+            // but do not wait for it — it may never complete.
+            oldJob?.cancel()
+            relayLog(
+                RelayLogLevel.INFO,
+                "forceReconnect: new reconnect loop launched (gen=$connectionGeneration); previous loop abandoned (may remain as zombie thread)",
+            )
         }
-        // Best-effort: ask the old job to cancel after the new one has
-        // started (so any read-loop epilogue can drain queued frames),
-        // but do not wait for it — it may never complete.
-        oldJob?.cancel()
-        relayLog(
-            RelayLogLevel.INFO,
-            "forceReconnect: new reconnect loop launched; previous loop abandoned (may remain as zombie thread)",
-        )
     }
 }
