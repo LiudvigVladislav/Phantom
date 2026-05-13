@@ -780,6 +780,16 @@ class KtorRelayTransport(
                     forceReconnect()
                     break
                 }
+                // PR-H1e (2026-05-14): app-level Ping is disabled in prod.
+                // The dead-socket watchdog above still runs every
+                // PING_INTERVAL_MS — its input `lastInboundFrameMark` is
+                // refreshed by ANY inbound frame (Deliver, Ack, OkHttp WS
+                // Pong) so liveness detection remains live without us
+                // emitting our own Ping frames. See RelayTransportConfig
+                // .APP_LEVEL_PING_ENABLED for the run-comparison data.
+                if (!RelayTransportConfig.APP_LEVEL_PING_ENABLED) {
+                    continue
+                }
                 // PR-H1a: explicit log per ping_send so we can see in test
                 // logs whether stale-session pingJobs continue writing after
                 // forceReconnect bumped to a newer session. The expected
