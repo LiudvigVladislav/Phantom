@@ -244,9 +244,10 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             .unwrap_or_default()
             .as_millis();
         tracing::info!(
-            event  = "connect",
-            key    = %&identity[..identity.len().min(16)],
-            ts_ms  = ts,
+            event   = "connect",
+            key     = %&identity[..identity.len().min(16)],
+            conn_id = conn_id,
+            ts_ms   = ts,
             "metadata"
         );
 
@@ -267,7 +268,7 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             queue.clone()
         };
         if !queued.is_empty() {
-            tracing::info!(id = %&identity[..identity.len().min(16)], count = queued.len(), "flushing queued envelopes (retained until ack-deliver)");
+            tracing::info!(id = %&identity[..identity.len().min(16)], conn_id = conn_id, count = queued.len(), "flushing queued envelopes (retained until ack-deliver)");
         }
         for env in queued {
             let deliver = serde_json::json!({
@@ -353,7 +354,7 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                             }
                             tracing::trace!(identity = %identity, "ws ping → pong (inline)");
                         } else {
-                            handle_message(raw, &identity, &state).await;
+                            handle_message(raw, &identity, conn_id, &state).await;
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
@@ -387,15 +388,16 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             .unwrap_or_default()
             .as_millis();
         tracing::info!(
-            event = "disconnect",
-            key   = %&identity[..identity.len().min(16)],
-            ts_ms = ts,
+            event   = "disconnect",
+            key     = %&identity[..identity.len().min(16)],
+            conn_id = conn_id,
+            ts_ms   = ts,
             "metadata"
         );
     }
 }
 
-async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) {
+async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &Arc<AppState>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
@@ -427,11 +429,12 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             // Log only routing metadata — never from/to key prefixes for sealed
             // messages, so the relay holds zero knowledge of who sent to whom.
             tracing::info!(
-                event  = "message",
-                msg_id = %msg_id,
-                size_b = payload.len(),
-                sealed = !sealed_sender.is_empty(),
-                ts_ms  = ts,
+                event   = "message",
+                msg_id  = %msg_id,
+                conn_id = conn_id,
+                size_b  = payload.len(),
+                sealed  = !sealed_sender.is_empty(),
+                ts_ms   = ts,
                 "metadata"
             );
 
@@ -539,7 +542,7 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             };
 
             if delivered {
-                tracing::info!(msg_id = %msg_id, "live delivery dispatched (envelope retained until client ack-deliver)");
+                tracing::info!(msg_id = %msg_id, conn_id = conn_id, "live delivery dispatched (envelope retained until client ack-deliver)");
             } else {
                 let online_count = state.clients.read().await.len();
                 tracing::info!(
@@ -592,6 +595,16 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
             if msg_id.is_empty() {
                 return;
             }
+            // PR-H1a: explicit info-level log on every ack-deliver receive
+            // — counterpart to the client's `ack_deliver_send` trace.
+            // Together they prove (or disprove) that ack frames sent on
+            // session s=N actually arrived at conn_id=M on the relay.
+            tracing::info!(
+                msg_id  = %msg_id,
+                conn_id = conn_id,
+                key     = %&from_identity[..from_identity.len().min(16)],
+                "ack_deliver_received"
+            );
             let removed = {
                 let mut store = state.store.write().await;
                 if let Some(queue) = store.get_mut(from_identity) {
@@ -603,7 +616,9 @@ async fn handle_message(text: &str, from_identity: &str, state: &Arc<AppState>) 
                 }
             };
             if removed {
-                tracing::debug!(msg_id = %msg_id, "client ack-deliver — envelope removed from store");
+                tracing::info!(msg_id = %msg_id, conn_id = conn_id, "ack_deliver_removed_from_store");
+            } else {
+                tracing::info!(msg_id = %msg_id, conn_id = conn_id, "ack_deliver_no_match (envelope already removed or wrong identity)");
             }
         }
         Some("typing") => {

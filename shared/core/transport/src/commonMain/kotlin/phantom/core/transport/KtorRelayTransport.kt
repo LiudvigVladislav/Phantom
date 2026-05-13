@@ -163,6 +163,24 @@ class KtorRelayTransport(
     private val connectionLifecycleMutex = Mutex()
     @Volatile private var connectionGeneration: Long = 0L
 
+    // PR-H1a (2026-05-13): per-WebSocket-session epoch. Bumped every time
+    // runReconnectLoop enters the `webSocket{}` block (a new live socket).
+    // Distinct from `connectionGeneration` which only advances on
+    // forceReconnect()/connect() lifecycle calls — `wsSessionEpoch`
+    // captures every individual WS session, including clean-close +
+    // reconnect cycles within a single connectionGeneration.
+    //
+    // Used as the `s=N` tag in all PhantomRelay logs so we can correlate
+    // which session a Sending/Ack/Pong/Flush event belongs to. When a
+    // pingJob from gen=2 s=5 still writes after forceReconnect bumped to
+    // gen=3 s=7, the log line `[gen=3 s=5]` reveals the zombie precisely.
+    @Volatile private var wsSessionEpoch: Long = 0L
+
+    private fun genTag(): String = "[gen=$connectionGeneration s=$wsSessionEpoch]"
+
+    private fun genTag(mySession: Long): String =
+        "[gen=$connectionGeneration s=$mySession]"
+
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
@@ -186,7 +204,7 @@ class KtorRelayTransport(
         lastPongMark = timeSource.markNow()
         relayLog(
             RelayLogLevel.INFO,
-            "connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
+            "${genTag()} connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
         )
         // PR-F2: serialize lifecycle setup. The lock is held only while
         // we cancel the prior reconnect loop and launch a new one — never
@@ -204,14 +222,14 @@ class KtorRelayTransport(
             if (existing != null && existing.isActive && !disconnectRequested) {
                 relayLog(
                     RelayLogLevel.INFO,
-                    "connect: reconnect loop already active (gen=$connectionGeneration) — joining existing job, no new loop spawned",
+                    "${genTag()} connect: reconnect loop already active — joining existing job, no new loop spawned",
                 )
                 existing
             } else {
                 connectionGeneration += 1
                 relayLog(
                     RelayLogLevel.INFO,
-                    "connect: launching fresh reconnect loop (gen=$connectionGeneration)",
+                    "${genTag()} connect: launching fresh reconnect loop",
                 )
                 val launched = transportScope.launch { runReconnectLoop() }
                 reconnectJob = launched
@@ -252,12 +270,20 @@ class KtorRelayTransport(
             // F11 + F26: every reconnect generation does a fresh signed-challenge
             // handshake. Failing the handshake aborts THIS attempt only — the
             // outer loop backs off and retries.
+            // PR-H1a: bump per-WS-session epoch ONCE per iteration of the
+            // outer while-loop. Captured into a local `mySession` so all
+            // per-session jobs (startPing, startAckWatchdog, readLoop,
+            // flushPendingOutbox, requeueUnackedToOutboxFront) tag their
+            // logs with this same value even after `wsSessionEpoch` advances
+            // again (next iteration / new forceReconnect cycle). That is
+            // exactly how we will spot a zombie writer post-forceReconnect.
+            val mySession = ++wsSessionEpoch
             val authedWsUrl = try {
                 buildAuthedWsUrl(generationClient)
             } catch (t: Throwable) {
                 relayLog(
                     RelayLogLevel.ERROR,
-                    "Auth handshake failed (attempt=$attempt): ${t::class.simpleName} ${t.message}",
+                    "${genTag(mySession)} Auth handshake failed (attempt=$attempt): ${t::class.simpleName} ${t.message}",
                 )
                 runCatching { generationClient.close() }
                 if (disconnectRequested) break
@@ -265,7 +291,7 @@ class KtorRelayTransport(
                     RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
                     RelayTransportConfig.RECONNECT_MAX_DELAY_MS,
                 )
-                relayLog(RelayLogLevel.INFO, "Retry attempt #${attempt + 1} in ${delayMs}ms")
+                relayLog(RelayLogLevel.INFO, "${genTag(mySession)} Retry attempt #${attempt + 1} in ${delayMs}ms")
                 delay(delayMs)
                 attempt++
                 continue
@@ -273,7 +299,7 @@ class KtorRelayTransport(
             if (authedWsUrl == null) {
                 relayLog(
                     RelayLogLevel.WARN,
-                    "Auth handshake aborted (attempt=$attempt) — signing key not ready or relay returned no challenge",
+                    "${genTag(mySession)} Auth handshake aborted (attempt=$attempt) — signing key not ready or relay returned no challenge",
                 )
                 runCatching { generationClient.close() }
                 if (disconnectRequested) break
@@ -292,46 +318,46 @@ class KtorRelayTransport(
                 .replace(Regex("""signature=[^&]+"""),      "signature=<redacted>")
             relayLog(
                 RelayLogLevel.INFO,
-                "Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
+                "${genTag(mySession)} Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
             )
             try {
                 generationClient.webSocket(authedWsUrl) {
                     session = this
                     lastPongMark = timeSource.markNow()
                     _state.value = TransportState.Connected
-                    relayLog(RelayLogLevel.INFO, "WebSocket connected successfully")
+                    relayLog(RelayLogLevel.INFO, "${genTag(mySession)} WebSocket connected successfully")
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
                     generationScope = transportScope
                     scope = transportScope
-                    startPing(transportScope, generationClient)
-                    startAckWatchdog(transportScope, generationClient)
+                    startPing(transportScope, generationClient, mySession)
+                    startAckWatchdog(transportScope, generationClient, mySession)
 
                     // Move every still-unacknowledged envelope back to the
                     // head of the outbox. They were sent on the previous
                     // session and never confirmed — most likely lost in
                     // transit. flushPendingOutbox below will re-send them
                     // before any new outbound traffic.
-                    requeueUnackedToOutboxFront()
+                    requeueUnackedToOutboxFront(mySession)
 
                     // Drain anything the app queued while the socket was down.
-                    flushPendingOutbox()
+                    flushPendingOutbox(mySession)
 
-                    readLoop()
-                    relayLog(RelayLogLevel.WARN, "WebSocket closed by remote (clean)")
+                    readLoop(mySession)
+                    relayLog(RelayLogLevel.WARN, "${genTag(mySession)} WebSocket closed by remote (clean)")
                 }
                 _state.value = TransportState.Disconnected
                 if (disconnectRequested) break
                 delay(RelayTransportConfig.RECONNECT_BASE_DELAY_MS)
-                relayLog(RelayLogLevel.INFO, "Reconnecting after clean close")
+                relayLog(RelayLogLevel.INFO, "${genTag(mySession)} Reconnecting after clean close")
                 // attempt was reset to 0 above; restart backoff from base.
                 continue
             } catch (e: Exception) {
                 _state.value = TransportState.Error(e)
                 relayLog(
                     RelayLogLevel.ERROR,
-                    "WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
+                    "${genTag(mySession)} WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
                     e,
                 )
                 if (disconnectRequested) break
@@ -339,7 +365,7 @@ class KtorRelayTransport(
                     RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
                     RelayTransportConfig.RECONNECT_MAX_DELAY_MS,
                 )
-                relayLog(RelayLogLevel.INFO, "Retry attempt #${attempt + 1} in ${delayMs}ms")
+                relayLog(RelayLogLevel.INFO, "${genTag(mySession)} Retry attempt #${attempt + 1} in ${delayMs}ms")
                 delay(delayMs)
                 attempt++
             } finally {
@@ -350,7 +376,7 @@ class KtorRelayTransport(
                 // parked on. This is what unblocks Tecno HiOS post-radio-park.
                 relayLog(
                     RelayLogLevel.INFO,
-                    "webSocket{} block exited — entering finally block, cancelling scope and closing generation client",
+                    "${genTag(mySession)} webSocket{} block exited — entering finally block, cancelling scope and closing generation client",
                 )
                 val joined = withTimeoutOrNull(5_000) {
                     generationScope?.coroutineContext?.get(Job)?.cancelAndJoin()
@@ -359,14 +385,14 @@ class KtorRelayTransport(
                 if (joined == null) {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Generation scope cancelAndJoin timed out (>5s) — proceeding anyway",
+                        "${genTag(mySession)} Generation scope cancelAndJoin timed out (>5s) — proceeding anyway",
                     )
                 }
                 runCatching { generationClient.close() }
                     .onFailure {
                         relayLog(
                             RelayLogLevel.WARN,
-                            "generationClient.close() threw: ${it::class.simpleName}: ${it.message}",
+                            "${genTag(mySession)} generationClient.close() threw: ${it::class.simpleName}: ${it.message}",
                         )
                     }
                 if (currentGenerationClient === generationClient) {
@@ -374,11 +400,11 @@ class KtorRelayTransport(
                 }
                 relayLog(
                     RelayLogLevel.INFO,
-                    "Generation client closed — looping for next reconnect attempt",
+                    "${genTag(mySession)} Generation client closed — looping for next reconnect attempt",
                 )
             }
         }
-        relayLog(RelayLogLevel.INFO, "Reconnect loop exited (disconnect requested)")
+        relayLog(RelayLogLevel.INFO, "${genTag()} Reconnect loop exited (disconnect requested)")
         _state.value = TransportState.Disconnected
     }
 
@@ -434,7 +460,7 @@ class KtorRelayTransport(
     private fun bytesToHex(bytes: ByteArray): String =
         bytes.joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
 
-    private fun startPing(scope: CoroutineScope, generationClient: HttpClient) {
+    private fun startPing(scope: CoroutineScope, generationClient: HttpClient, mySession: Long) {
         pingJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.PING_INTERVAL_MS)
@@ -442,7 +468,7 @@ class KtorRelayTransport(
                 if (sinceLastPong > RelayTransportConfig.PONG_TIMEOUT_MS) {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Pong timeout (${sinceLastPong}ms without Pong) — marking transport disconnected and forcing reconnect",
+                        "${genTag(mySession)} Pong timeout (${sinceLastPong}ms without Pong) — marking transport disconnected and forcing reconnect",
                     )
                     // PR-F1.2 (2026-05-12): previously this was
                     // forceShutdownActiveEngine + close + scope.cancel + break,
@@ -468,12 +494,27 @@ class KtorRelayTransport(
                     forceReconnect()
                     break
                 }
-                sendRaw(RelayMessage.Ping)
+                // PR-H1a: explicit log per ping_send so we can see in test
+                // logs whether stale-session pingJobs continue writing after
+                // forceReconnect bumped to a newer session. The expected
+                // pattern is `[gen=N s=M] ping_send` only for the latest
+                // (N, M) pair; any older s= here is a zombie writer.
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "${genTag(mySession)} ping_send (sinceLastPong=${sinceLastPong}ms)",
+                )
+                val pingOk = sendRaw(RelayMessage.Ping)
+                if (!pingOk) {
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "${genTag(mySession)} ping_send_failed — sendRaw returned false (session likely dead)",
+                    )
+                }
             }
         }
     }
 
-    private fun startAckWatchdog(scope: CoroutineScope, generationClient: HttpClient) {
+    private fun startAckWatchdog(scope: CoroutineScope, generationClient: HttpClient, mySession: Long) {
         ackWatchdogJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.ACK_WATCHDOG_INTERVAL_MS)
@@ -487,7 +528,7 @@ class KtorRelayTransport(
                 if (expired.isEmpty()) continue
                 relayLog(
                     RelayLogLevel.WARN,
-                    "ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and forcing reconnect. " +
+                    "${genTag(mySession)} ACK timeout: ${expired.size} envelope(s) unacknowledged after ${RelayTransportConfig.ACK_TIMEOUT_MS}ms — requeuing and forcing reconnect. " +
                         "First id=${expired.first().message.messageId.take(12)}…",
                 )
                 // Per-envelope trace so a multi-chunk upload (voice messages,
@@ -495,7 +536,7 @@ class KtorRelayTransport(
                 expired.forEach {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "ACK watchdog requeue: id=${it.message.messageId.take(12)}…, pendingOutboxHead=true",
+                        "${genTag(mySession)} ACK watchdog requeue: id=${it.message.messageId.take(12)}…, pendingOutboxHead=true",
                     )
                 }
                 outboxMutex.withLock {
@@ -513,7 +554,7 @@ class KtorRelayTransport(
         }
     }
 
-    private suspend fun requeueUnackedToOutboxFront() {
+    private suspend fun requeueUnackedToOutboxFront(mySession: Long) {
         val drained = pendingAcksLock.withLock {
             val list = pendingAcks.values.map { it.message }
             pendingAcks.clear()
@@ -522,14 +563,14 @@ class KtorRelayTransport(
         if (drained.isEmpty()) return
         relayLog(
             RelayLogLevel.INFO,
-            "Re-queueing ${drained.size} unacknowledged envelope(s) from previous session",
+            "${genTag(mySession)} Re-queueing ${drained.size} unacknowledged envelope(s) from previous session",
         )
         outboxMutex.withLock {
             drained.asReversed().forEach { pendingOutbox.addFirst(it) }
         }
     }
 
-    private suspend fun WebSocketSession.readLoop() {
+    private suspend fun WebSocketSession.readLoop(mySession: Long) {
         for (frame in incoming) {
             if (frame is Frame.Text) {
                 val text = frame.readText()
@@ -557,7 +598,7 @@ class KtorRelayTransport(
                         is RelayMessage.Deliver -> {
                             relayLog(
                                 RelayLogLevel.INFO,
-                                "Received envelope: id=${msg.messageId.take(12)}… sealed=${msg.sealedSender.isNotEmpty()} payloadBytes=${msg.payload.length}",
+                                "${genTag(mySession)} Received envelope: id=${msg.messageId.take(12)}… sealed=${msg.sealedSender.isNotEmpty()} payloadBytes=${msg.payload.length}",
                             )
                             _incoming.emit(msg)
                         }
@@ -570,12 +611,22 @@ class KtorRelayTransport(
                             pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
                             relayLog(
                                 RelayLogLevel.INFO,
-                                "Ack from relay: id=${msg.messageId.take(12)}… status=${msg.status}",
+                                "${genTag(mySession)} Ack from relay: id=${msg.messageId.take(12)}… status=${msg.status}",
                             )
                             _acks.emit(msg)
                         }
                         is RelayMessage.Pong -> {
+                            // PR-H1a: explicit pong_received log so we can
+                            // confirm in test logs which session the relay
+                            // actually replied to. If [s=N] of pong_received
+                            // does not match [s=N] of the most recent
+                            // ping_send, frames are arriving on a stale
+                            // generation's reader.
                             lastPongMark = timeSource.markNow()
+                            relayLog(
+                                RelayLogLevel.INFO,
+                                "${genTag(mySession)} pong_received",
+                            )
                         }
                         else -> Unit
                     }
@@ -583,12 +634,12 @@ class KtorRelayTransport(
                     // Malformed frame — log but do not crash the read loop.
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Malformed frame dropped (${e::class.simpleName}): ${e.message}",
+                        "${genTag(mySession)} Malformed frame dropped (${e::class.simpleName}): ${e.message}",
                     )
                 }
             }
         }
-        relayLog(RelayLogLevel.WARN, "readLoop exited — connection lost")
+        relayLog(RelayLogLevel.WARN, "${genTag(mySession)} readLoop exited — connection lost")
         _state.value = TransportState.Disconnected
     }
 
@@ -597,7 +648,7 @@ class KtorRelayTransport(
             outboxMutex.withLock { pendingOutbox.addLast(message) }
             relayLog(
                 RelayLogLevel.INFO,
-                "Queued until reconnect: id=${message.messageId.take(12)}… to=${message.to.take(16)}… " +
+                "${genTag()} Queued until reconnect: id=${message.messageId.take(12)}… to=${message.to.take(16)}… " +
                     "state=${_state.value::class.simpleName} outboxSize=${pendingOutbox.size}",
             )
             // Returns false so MessageRepository keeps status = QUEUED and the
@@ -607,7 +658,7 @@ class KtorRelayTransport(
         }
         relayLog(
             RelayLogLevel.INFO,
-            "Sending envelope: to=${message.to.take(16)}… id=${message.messageId.take(12)}… payloadBytes=${message.payload.length} sealed=${message.sealedSender.isNotEmpty()}",
+            "${genTag()} Sending envelope: to=${message.to.take(16)}… id=${message.messageId.take(12)}… payloadBytes=${message.payload.length} sealed=${message.sealedSender.isNotEmpty()}",
         )
         // Track BEFORE the wire write so the ACK watchdog covers the case
         // where sendRaw silently writes into a half-dead socket (no exception
@@ -620,7 +671,7 @@ class KtorRelayTransport(
         }
         val ok = sendRaw(message)
         if (!ok) {
-            relayLog(RelayLogLevel.ERROR, "Envelope send returned false (frame write failed)")
+            relayLog(RelayLogLevel.ERROR, "${genTag()} Envelope send returned false (frame write failed)")
             // sendRaw threw and was logged. The frame did not go out, so the
             // pendingAcks entry is meaningless — drop it and re-enqueue at
             // the front of the outbox.
@@ -640,15 +691,28 @@ class KtorRelayTransport(
             outboxMutex.withLock { pendingOutbox.addLast(msg) }
             relayLog(
                 RelayLogLevel.INFO,
-                "Queued delivery ack until reconnect: messageId=${messageId.take(12)}…",
+                "${genTag()} ack_deliver_send queued until reconnect: messageId=${messageId.take(12)}…",
             )
             return false
         }
+        // PR-H1a: explicit ack_deliver_send tag. If the relay's flushing
+        // count keeps repeating across reconnects (PR-H1 diagnosis), the
+        // ack frames are either not reaching the server, being routed to
+        // a stale session, or being lost mid-flight. Tagging both the
+        // session and the messageId lets us correlate with server-side
+        // ack-deliver removal logs (added in routes.rs in this same PR).
         relayLog(
             RelayLogLevel.INFO,
-            "Sending delivery ack: messageId=${messageId.take(12)}…",
+            "${genTag()} ack_deliver_send messageId=${messageId.take(12)}…",
         )
-        return sendRaw(msg)
+        val ok = sendRaw(msg)
+        if (!ok) {
+            relayLog(
+                RelayLogLevel.WARN,
+                "${genTag()} ack_deliver_send_failed messageId=${messageId.take(12)}… — sendRaw returned false",
+            )
+        }
+        return ok
     }
 
     /**
@@ -673,7 +737,7 @@ class KtorRelayTransport(
      * Stops at the first sendRaw failure and re-enqueues all unsent items at
      * the front so the next reconnect cycle picks them up in order.
      */
-    private suspend fun flushPendingOutbox() {
+    private suspend fun flushPendingOutbox(mySession: Long) {
         val toFlush = outboxMutex.withLock {
             if (pendingOutbox.isEmpty()) return
             val snapshot = pendingOutbox.toList()
@@ -682,7 +746,7 @@ class KtorRelayTransport(
         }
         relayLog(
             RelayLogLevel.INFO,
-            "Flushing ${toFlush.size} queued item(s) after reconnect",
+            "${genTag(mySession)} Flushing ${toFlush.size} queued item(s) after reconnect",
         )
         var sentCount = 0
         for (msg in toFlush) {
@@ -690,7 +754,7 @@ class KtorRelayTransport(
                 is RelayMessage.Send -> {
                     relayLog(
                         RelayLogLevel.INFO,
-                        "Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}…",
+                        "${genTag(mySession)} Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}…",
                     )
                     // PR-F1.1: mirror send() — re-track in pendingAcks BEFORE
                     // sendRaw so the ACK watchdog and the next reconnect's
@@ -706,12 +770,12 @@ class KtorRelayTransport(
                     }
                     relayLog(
                         RelayLogLevel.INFO,
-                        "Flush → tracking pending ACK: id=${msg.messageId.take(12)}…",
+                        "${genTag(mySession)} Flush → tracking pending ACK: id=${msg.messageId.take(12)}…",
                     )
                 }
                 is RelayMessage.AckDelivery -> relayLog(
                     RelayLogLevel.INFO,
-                    "Flush → send delivery ack: id=${msg.messageId.take(12)}…",
+                    "${genTag(mySession)} Flush → ack_deliver_send (replay): messageId=${msg.messageId.take(12)}…",
                 )
                 else -> Unit
             }
@@ -727,13 +791,13 @@ class KtorRelayTransport(
                     pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
                     relayLog(
                         RelayLogLevel.WARN,
-                        "Flush failed → returned to outbox head: id=${msg.messageId.take(12)}…",
+                        "${genTag(mySession)} Flush failed → returned to outbox head: id=${msg.messageId.take(12)}…",
                     )
                 }
                 val remaining = toFlush.size - sentCount
                 relayLog(
                     RelayLogLevel.ERROR,
-                    "Flush failed — re-enqueuing $remaining item(s) for next reconnect",
+                    "${genTag(mySession)} Flush failed — re-enqueuing $remaining item(s) for next reconnect",
                 )
                 // Re-enqueue from the failed item onwards, preserving order.
                 outboxMutex.withLock {
@@ -754,7 +818,7 @@ class KtorRelayTransport(
         } catch (e: Exception) {
             relayLog(
                 RelayLogLevel.ERROR,
-                "sendRaw failed (${e::class.simpleName}): ${e.message}",
+                "${genTag()} sendRaw failed (${e::class.simpleName}): ${e.message}",
                 e,
             )
             false
@@ -762,12 +826,12 @@ class KtorRelayTransport(
     }
 
     override suspend fun disconnect() {
-        relayLog(RelayLogLevel.INFO, "disconnect() called")
+        relayLog(RelayLogLevel.INFO, "${genTag()} disconnect() called")
         disconnectRequested = true
         // Best-effort flush of any pending outbox items before tearing down the
         // scope. Bounded to 3 s so disconnect never blocks indefinitely.
         withTimeoutOrNull(3_000L) {
-            if (session != null) flushPendingOutbox()
+            if (session != null) flushPendingOutbox(wsSessionEpoch)
         }
         pingJob?.cancel()
         ackWatchdogJob?.cancel()
@@ -820,13 +884,13 @@ class KtorRelayTransport(
             if (entryGen != connectionGeneration) {
                 relayLog(
                     RelayLogLevel.INFO,
-                    "forceReconnect: stale (entry gen=$entryGen, current=$connectionGeneration) — another caller already relaunched, skipping",
+                    "${genTag()} forceReconnect: stale (entry gen=$entryGen, current=$connectionGeneration) — another caller already relaunched, skipping",
                 )
                 return
             }
             relayLog(
                 RelayLogLevel.WARN,
-                "forceReconnect() called — abandoning current reconnect loop and launching a fresh one (ADR-013 hard reset, gen=$entryGen→${entryGen + 1})",
+                "${genTag()} forceReconnect() called — abandoning current reconnect loop and launching a fresh one (ADR-013 hard reset, gen=$entryGen→${entryGen + 1})",
             )
             // ADR-013: scope-cancel + close-client does NOT unblock a kernel-
             // parked WebSocket reader on Tecno HiOS. Confirmed empirically:
@@ -861,7 +925,7 @@ class KtorRelayTransport(
             oldJob?.cancel()
             relayLog(
                 RelayLogLevel.INFO,
-                "forceReconnect: new reconnect loop launched (gen=$connectionGeneration); previous loop abandoned (may remain as zombie thread)",
+                "${genTag()} forceReconnect: new reconnect loop launched; previous loop abandoned (may remain as zombie thread)",
             )
         }
     }
