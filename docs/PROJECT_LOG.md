@@ -460,6 +460,90 @@ when an entry mentions a rejected approach.
     is the single source for all in-flight test builds. `Releases/`
     is reserved for signed release builds only.
 
+### 2026-05-13 (tue afternoon) · WS observability PR-H1a + Test #31/#32/#33 + PR-H2a strict FIFO outbox
+
+- **Goal.** Closing PR-G4 fixed first-message yellow-dot, but Test #30
+  exposed a separate WS-side instability: pong-timeout / forceReconnect
+  cycle every ~70 s with envelope reorder symptoms suspected. PR-H1
+  was originally scoped as "WS heartbeat hardening"; before patching
+  blind we shipped PR-H1a (observability-only) and ran three tests to
+  pinpoint the actual failure mode.
+- **PR-H1a (commit `3db97b49`, master `6d7d43aa`)** —
+  per-WS-session epoch tagging client-side + `conn_id` + `ack_deliver_*`
+  trace lines server-side. Every relay log line now carries
+  `[gen=N s=M] / conn_id=K`, letting us correlate which WS session
+  emitted each ping/ack/envelope and whether ack-deliver frames reach
+  the relay on the right `conn_id`. Wire format unchanged; relay
+  required redeploy (done same session).
+- **Test #31 result (PR-H1a client-only).** Tags ruled out the architect's
+  "zombie writer" hypothesis: every client-side `ack_deliver_send` and
+  `ping_send` carried the current `[gen s]`, no stale generation traffic
+  observed. Server log was still in old format → server-side PR-H1a not
+  redeployed yet. Findings ambiguous without server-side `conn_id`.
+- **Test #32 (after VPS redeploy of PR-H1a).** Three text messages
+  delivered + acked end-to-end with `ack_deliver_received` matching the
+  expected `conn_id`. **But two messages MAC-failed on receiver** with
+  `Permanent decrypt failure`, which started looking less like transport
+  and more like Double Ratchet divergence. Initial hypothesis: app-restart
+  race in `save_session`.
+- **Test #33 (clean Test #33 protocol — wipe both DBs, restart relay,
+  10 sequential messages, no app restarts, no voice burst).** Reproduced
+  the MAC-fail cleanly on second exchange. Trace pinpointed the cause:
+  - phone encrypted read receipt at chain pos N (01:45:40)
+  - phone encrypted user message at chain pos N+1 (01:45:43)
+  - both went into a half-dead WS socket (server received neither)
+  - 60 s ACK watchdog fired at 01:46:41 → forceReconnect → flush
+  - flush sent N+1 BEFORE N on the wire
+  - receiver chain key advanced past N+1's MAC key when N+1 arrived
+    first → MAC verification error → `ack-deliver`-and-drop → message
+    silently lost
+  This is a strict-FIFO violation in the outbox/flush path, NOT a
+  ratchet implementation bug.
+- **Architect dialogue (rejected then refined hypotheses).** The
+  architect first proposed `inbound session lookup` (wrong — code
+  reads `senderPubKeyHex` correctly via symmetric `deriveConversationId`)
+  and `H1b generation guard` (wrong — Test #32+#33 ruled out zombie
+  writers). Final agreed cause matched the data: client-side reorder
+  during reconnect flush. Vladislav's instinct to push back
+  ("sначала проверь код") prevented two wasted PRs.
+- **PR-H2a — strict FIFO outbox (this branch, not yet merged).**
+  Two-leg fix to make wire order = encrypt order under all paths:
+  - **Leg 1: per-envelope monotonic `sequenceTs`** claimed once at
+    `send()` entry, preserved through every requeue / re-track
+    transition. Both `mergeUnackedIntoOutboxOrdered` (renamed from
+    `requeueUnackedToOutboxFront`) and `flushPendingOutbox` snapshot
+    sort by `sequenceTs` ASC.
+  - **Leg 2: `outboundSendMutex`** serializes live-send vs flush-write.
+    Without this guard a fresh live `send()` could observe the outbox
+    empty (we just cleared it for the flush snapshot) and race onto the
+    wire with a higher `sequenceTs`. Holding the mutex across the entire
+    flush-Send loop forces concurrent live sends to defer to the outbox.
+    Pings and ack-deliveries deliberately bypass this mutex (orthogonal
+    to per-conversation ratchet ordering).
+  - 5 unit tests in `KtorRelayTransportFifoTest`: Test #33 layout,
+    interleaved sources, no-op-on-empty, adversarial out-of-order
+    insertion, live-send-defers-to-outbox-during-flush.
+  - **Wire format unchanged.** `sequenceTs` is purely client-side.
+    Server requires no redeploy.
+- **Out of scope (deferred to PR-H2b).** Skipped-message-keys in the
+  ratchet + bounded retry on MAC error + dead-letter log. Without
+  skip-keys any network-layer reorder (TCP retransmit pause, multi-path
+  mobile, Tor circuit shifts) would still surface as MAC fail. PR-H2a
+  closes the client-side reorder source; PR-H2b makes the receiver
+  tolerant of any remaining reorder.
+- **Process notes.**
+  - 7-times-measure caught the H2a.1 race after Vladislav's review
+    (architect-style "live send vs flush race" — second mutex layer
+    added before push). The original H2a alone would have shipped a
+    half-fix that broke under voice burst.
+  - PR-H2a code stays solo-author per the durable feedback;
+    `🤖 Generated with [Claude Code]` footer omitted.
+  - Internal-only test accessors (`snapshotOutboxForTest`,
+    `seedPendingAckForTest`, `setStateConnectedForTest`, etc.) added
+    at the bottom of `KtorRelayTransport`. Marked `internal` so
+    sibling modules can't reach them; production callers see no
+    new public surface.
+
 ### 2026-05-12 (mon) · Transport mini-sprint continued — PR-D (rotation reorder) + Briar bridge research + PR-E (RU-tuned bridges with Google AMP fallback)
 
 - **Goal.** Test #5 (МТС Wi-Fi without VPN, 2026-05-11) showed all four
