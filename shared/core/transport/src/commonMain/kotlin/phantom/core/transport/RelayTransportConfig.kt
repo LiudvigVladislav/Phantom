@@ -144,7 +144,7 @@ object RelayTransportConfig {
      * problem domain is "ping cadence vs middlebox idle policy". If the
      * cycle is unchanged, that hypothesis is ruled out.
      */
-    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = null  // Run C (PR-H1e): WS ping back to 15 s default — Run B (5 s) made cycle SHORTER not longer, ruling out idle-NAT.
+    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = 5_000L  // Run B+C (PR-H1e): combine 5 s WS ping with app_ping=false. Hypothesis: 5 s ping itself triggers reconnect-noise. Expect cycle to shorten back vs Run C (~60-80 s); confirms WS ping cadence is the surviving killer.
 
     /**
      * If true, suppress the app-level RelayMessage.Ping/Pong loop in
