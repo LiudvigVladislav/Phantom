@@ -30,6 +30,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.datetime.Clock
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlin.math.min
@@ -101,13 +102,71 @@ class KtorRelayTransport(
     // startPing's pong-timeout branch on the same dispatcher's other workers.
     @Volatile private var currentGenerationClient: HttpClient? = null
 
-    // In-memory outbox for envelopes and read receipts that were enqueued while
-    // the WebSocket was not in the Connected state. Drained in FIFO order when
-    // the session next becomes Connected. Not persisted to disk — on process
-    // restart, MessageRepository (status = QUEUED) is the source of truth and
-    // DefaultMessagingService re-submits via send().
+    // PR-H2a (2026-05-13): strict FIFO outbox via per-envelope monotonic
+    // sequence number. Test #33 captured a Double-Ratchet MAC failure caused
+    // by reorder during reconnect flush — read-receipt encrypted at chain
+    // position N+1 was sent on the wire BEFORE user-message encrypted at
+    // chain position N because the requeue/flush path did not preserve
+    // encrypt-time order across the live-send → ack-pending → requeue
+    // transition. Receiver's chain key advanced past N+1's MAC key before
+    // the late-arriving N could decrypt it, MAC failed, envelope was lost.
+    //
+    // Fix: every envelope gets a `sequenceTs` assigned ONCE on first entry
+    // into outbox or pendingAcks (via [nextSequenceTs]). The value is
+    // preserved across all re-queue / re-track transitions. Both the
+    // ACK-watchdog requeue path and the reconnect requeue path merge
+    // pendingAcks + existing outbox, sort by sequenceTs ASC, and rewrite
+    // the outbox. flushPendingOutbox snapshots and re-sorts as a defence
+    // in depth so any code path that ever inserts out-of-order does not
+    // reach the wire.
+    //
+    // Wire format unchanged — sequenceTs is purely client-side.
+    // Not persisted: on app restart, MessageRepository (status=QUEUED) is
+    // re-submitted by DefaultMessagingService.send(), which assigns a
+    // fresh sequence in the new process; relative order within that
+    // re-submission is preserved by the per-conversation encrypt mutex
+    // already held by encryptUnderLock.
+    internal data class OutboxEntry(
+        val message: RelayMessage,
+        val sequenceTs: Long,
+        val queuedAtMs: Long,
+    )
+
     private val outboxMutex = Mutex()
-    private val pendingOutbox: ArrayDeque<RelayMessage> = ArrayDeque()
+    private val pendingOutbox: ArrayDeque<OutboxEntry> = ArrayDeque()
+
+    // Per-transport monotonic counter. Guarded by [sequenceCounterLock] —
+    // a dedicated mutex (not outboxMutex) so the live-send path can claim
+    // a sequence without taking the outbox lock when the WS is up. Backed
+    // by Mutex+Long because kotlinx.atomicfu is not on this module's
+    // commonMain classpath (KMP common, no Kotlin/Native target here).
+    private val sequenceCounterLock = Mutex()
+    private var sequenceCounter: Long = 0L
+
+    private suspend fun nextSequenceTs(): Long = sequenceCounterLock.withLock {
+        ++sequenceCounter
+    }
+
+    // PR-H2a.1 (2026-05-13): serialize all RelayMessage.Send writes so a
+    // new live send() cannot slip onto the wire between two flush items
+    // mid-drain. Without this guard, the H2a sequenceTs sort would still
+    // hold inside the outbox/pendingAcks data structures, but the wire
+    // itself would interleave (flush sends seq=2, live send fires
+    // seq=10 in parallel, flush sends seq=3 — receiver sees [2, 10, 3]
+    // → MAC fail on the late-3 because chain advanced past it). Holding
+    // the mutex across the entire flush loop means new sends queue
+    // behind it instead.
+    //
+    // Scope: ONLY RelayMessage.Send goes through this mutex. Pings,
+    // pongs, and ack-deliveries pass directly via sendRaw — they are
+    // orthogonal to per-conversation ratchet ordering and must not be
+    // blocked by a long flush (else the heartbeat dies and we trigger
+    // an unnecessary forceReconnect during a normal flush). Ktor's
+    // WebSocketSession.send() serializes wire frames internally, so
+    // pings interleaving with envelope writes does not corrupt frames;
+    // it only affects the encrypt-order vs wire-order invariant, which
+    // pings/acks do not participate in.
+    private val outboundSendMutex = Mutex()
 
     // Pong timestamp tracking — drives the heartbeat / dead-peer detection.
     // Updated every time the relay emits a Pong frame. If the gap exceeds
@@ -120,12 +179,18 @@ class KtorRelayTransport(
     // half-dead socket without throwing — the bytes sit in the OkHttp buffer
     // and never reach the wire. The ACK watchdog promotes that silent loss
     // to an explicit retry: every entry older than ACK_TIMEOUT_MS is moved
-    // back to the front of pendingOutbox and the session is force-closed,
-    // which makes runReconnectLoop open a fresh socket and flushPendingOutbox
-    // re-send the envelope on top of the new session.
-    private data class AckPending(
+    // back into pendingOutbox (sorted by sequenceTs) and the session is
+    // force-closed, which makes runReconnectLoop open a fresh socket and
+    // flushPendingOutbox re-send the envelope on top of the new session.
+    //
+    // sequenceTs is the SAME value the envelope was given on its first
+    // pendingOutbox/pendingAcks insertion; preserved across requeue and
+    // flush re-track so the eventual wire order matches encrypt order.
+    internal data class AckPending(
         val message: RelayMessage.Send,
         val sentAt: TimeSource.Monotonic.ValueTimeMark,
+        val sequenceTs: Long,
+        val queuedAtMs: Long,
     )
     private val pendingAcksLock = Mutex()
     private val pendingAcks = mutableMapOf<String, AckPending>()
@@ -273,7 +338,7 @@ class KtorRelayTransport(
             // PR-H1a: bump per-WS-session epoch ONCE per iteration of the
             // outer while-loop. Captured into a local `mySession` so all
             // per-session jobs (startPing, startAckWatchdog, readLoop,
-            // flushPendingOutbox, requeueUnackedToOutboxFront) tag their
+            // flushPendingOutbox, mergeUnackedIntoOutboxOrdered) tag their
             // logs with this same value even after `wsSessionEpoch` advances
             // again (next iteration / new forceReconnect cycle). That is
             // exactly how we will spot a zombie writer post-forceReconnect.
@@ -334,12 +399,14 @@ class KtorRelayTransport(
                     startPing(transportScope, generationClient, mySession)
                     startAckWatchdog(transportScope, generationClient, mySession)
 
-                    // Move every still-unacknowledged envelope back to the
-                    // head of the outbox. They were sent on the previous
-                    // session and never confirmed — most likely lost in
-                    // transit. flushPendingOutbox below will re-send them
-                    // before any new outbound traffic.
-                    requeueUnackedToOutboxFront(mySession)
+                    // PR-H2a: merge every still-unacknowledged envelope from
+                    // the previous session into the outbox (sorted by
+                    // sequenceTs ASC). They were sent on the previous session
+                    // and never confirmed — most likely lost in transit.
+                    // flushPendingOutbox below will then re-send everything
+                    // in strict encrypt order before any new outbound traffic
+                    // can interleave.
+                    mergeUnackedIntoOutboxOrdered(mySession)
 
                     // Drain anything the app queued while the socket was down.
                     flushPendingOutbox(mySession)
@@ -533,14 +600,29 @@ class KtorRelayTransport(
                 )
                 // Per-envelope trace so a multi-chunk upload (voice messages,
                 // PR-F1 2026-05-12) shows in logs which slices got requeued.
+                // PR-H2a: log the original sequenceTs so we can verify in
+                // post-mortem that the next flush sorted them back into
+                // encrypt order.
                 expired.forEach {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "${genTag(mySession)} ACK watchdog requeue: id=${it.message.messageId.take(12)}…, pendingOutboxHead=true",
+                        "${genTag(mySession)} ACK watchdog requeue: id=${it.message.messageId.take(12)}… seq=${it.sequenceTs}",
                     )
                 }
+                // PR-H2a: merge expired entries with current outbox and
+                // sort by sequenceTs ASC so the next flush sees strict
+                // encrypt order. Replaces the addFirst-asReversed dance
+                // which only worked when no new sends had been queued
+                // during the ACK window.
                 outboxMutex.withLock {
-                    expired.asReversed().forEach { pendingOutbox.addFirst(it.message) }
+                    val merged = ArrayList<OutboxEntry>(pendingOutbox.size + expired.size)
+                    merged.addAll(pendingOutbox)
+                    expired.forEach {
+                        merged.add(OutboxEntry(it.message, it.sequenceTs, it.queuedAtMs))
+                    }
+                    merged.sortBy { it.sequenceTs }
+                    pendingOutbox.clear()
+                    pendingOutbox.addAll(merged)
                 }
                 // PR-F1.2 (2026-05-12): same fix as the pong-timeout path —
                 // mark the transport disconnected so racing send() calls hit
@@ -554,19 +636,40 @@ class KtorRelayTransport(
         }
     }
 
-    private suspend fun requeueUnackedToOutboxFront(mySession: Long) {
+    /**
+     * PR-H2a: drains pendingAcks, merges those entries with whatever is
+     * currently sitting in pendingOutbox, sorts by sequenceTs ASC, and
+     * rewrites the outbox. The next flush will then send everything in
+     * strict encrypt order regardless of which path each envelope took
+     * to get back here (live-send-failed, queued-while-down, ack-watchdog
+     * timeout).
+     *
+     * Replaces the pre-H2a logic which prepended the reversed pendingAcks
+     * to outbox.front and relied on Map iteration order — fragile and
+     * provably broken by Test #33 (read receipt encrypted at chain pos 2
+     * landed on the wire AFTER user message at chain pos 3, MAC-failed
+     * on receiver, message lost).
+     */
+    internal suspend fun mergeUnackedIntoOutboxOrdered(mySession: Long) {
         val drained = pendingAcksLock.withLock {
-            val list = pendingAcks.values.map { it.message }
+            val list = pendingAcks.values.toList()
             pendingAcks.clear()
             list
         }
         if (drained.isEmpty()) return
         relayLog(
             RelayLogLevel.INFO,
-            "${genTag(mySession)} Re-queueing ${drained.size} unacknowledged envelope(s) from previous session",
+            "${genTag(mySession)} Re-queueing ${drained.size} unacknowledged envelope(s) from previous session (merging into outbox by sequenceTs ASC)",
         )
         outboxMutex.withLock {
-            drained.asReversed().forEach { pendingOutbox.addFirst(it) }
+            val merged = ArrayList<OutboxEntry>(pendingOutbox.size + drained.size)
+            merged.addAll(pendingOutbox)
+            drained.forEach {
+                merged.add(OutboxEntry(it.message, it.sequenceTs, it.queuedAtMs))
+            }
+            merged.sortBy { it.sequenceTs }
+            pendingOutbox.clear()
+            pendingOutbox.addAll(merged)
         }
     }
 
@@ -644,54 +747,108 @@ class KtorRelayTransport(
     }
 
     override suspend fun send(message: RelayMessage.Send): Boolean {
+        // PR-H2a: claim sequenceTs ONCE here, before any branch. The same
+        // value flows into pendingAcks (live-send path) or pendingOutbox
+        // (queued path). On any later requeue/flush the value is preserved,
+        // so wire order = encrypt order regardless of how many disconnect /
+        // reconnect cycles the envelope survives. The per-conversation
+        // encrypt mutex in DefaultMessagingService.encryptUnderLock ensures
+        // sequenceTs is monotonic per-conversation: two encrypts on the
+        // same conversation cannot interleave with each other's send().
+        val seq = nextSequenceTs()
+        val nowMs = Clock.System.now().toEpochMilliseconds()
         if (!isConnected()) {
-            outboxMutex.withLock { pendingOutbox.addLast(message) }
+            outboxMutex.withLock {
+                pendingOutbox.addLast(OutboxEntry(message, seq, nowMs))
+            }
             relayLog(
                 RelayLogLevel.INFO,
                 "${genTag()} Queued until reconnect: id=${message.messageId.take(12)}… to=${message.to.take(16)}… " +
-                    "state=${_state.value::class.simpleName} outboxSize=${pendingOutbox.size}",
+                    "seq=$seq state=${_state.value::class.simpleName} outboxSize=${pendingOutbox.size}",
             )
             // Returns false so MessageRepository keeps status = QUEUED and the
             // UI can render a pending indicator. The relay's Ack will promote
             // status to RELAYED once the envelope actually reaches the server.
             return false
         }
-        relayLog(
-            RelayLogLevel.INFO,
-            "${genTag()} Sending envelope: to=${message.to.take(16)}… id=${message.messageId.take(12)}… payloadBytes=${message.payload.length} sealed=${message.sealedSender.isNotEmpty()}",
-        )
-        // Track BEFORE the wire write so the ACK watchdog covers the case
-        // where sendRaw silently writes into a half-dead socket (no exception
-        // on the local buffer, no frame on the wire). The relay will
-        // eventually emit its own Ack frame when the envelope reaches it; if
-        // that Ack does not arrive within ACK_TIMEOUT_MS the watchdog
-        // requeues this entry on a fresh socket.
-        pendingAcksLock.withLock {
-            pendingAcks[message.messageId] = AckPending(message, timeSource.markNow())
+        // PR-H2a.1: serialize against flushPendingOutbox. Holding the
+        // outbound mutex here means a flush in progress finishes its
+        // entire ordered drain before any new live send hits the wire.
+        // Inside the lock we also re-check pendingOutbox: if anything
+        // is still queued (flush has not yet started for the current
+        // generation, or the outbox accumulated entries during a brief
+        // reconnect), we MUST queue rather than live-send — otherwise
+        // the new envelope (higher sequenceTs) overtakes older queued
+        // entries on the wire. This is the second leg of the H2a fix:
+        // the in-memory sort is necessary but not sufficient; the wire
+        // itself must also see strict order, which requires that no live
+        // send fires while the outbox holds anything older.
+        return outboundSendMutex.withLock {
+            val outboxNotEmpty = outboxMutex.withLock { pendingOutbox.isNotEmpty() }
+            if (outboxNotEmpty) {
+                outboxMutex.withLock {
+                    pendingOutbox.addLast(OutboxEntry(message, seq, nowMs))
+                    // Re-sort defensively — addLast keeps insertion order, but
+                    // a future code path that adds entries with smaller
+                    // sequenceTs (e.g. a watchdog that re-queues an expired
+                    // entry concurrently) would otherwise leave the outbox
+                    // unsorted until the next merge. Cheap on small queues.
+                    val sorted = pendingOutbox.sortedBy { it.sequenceTs }
+                    pendingOutbox.clear()
+                    pendingOutbox.addAll(sorted)
+                }
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "${genTag()} Deferred to outbox (flush in progress / outbox not drained): id=${message.messageId.take(12)}… seq=$seq",
+                )
+                return@withLock false
+            }
+            relayLog(
+                RelayLogLevel.INFO,
+                "${genTag()} Sending envelope: to=${message.to.take(16)}… id=${message.messageId.take(12)}… seq=$seq payloadBytes=${message.payload.length} sealed=${message.sealedSender.isNotEmpty()}",
+            )
+            // Track BEFORE the wire write so the ACK watchdog covers the case
+            // where sendRaw silently writes into a half-dead socket (no exception
+            // on the local buffer, no frame on the wire). The relay will
+            // eventually emit its own Ack frame when the envelope reaches it; if
+            // that Ack does not arrive within ACK_TIMEOUT_MS the watchdog
+            // requeues this entry on a fresh socket. sequenceTs preserved.
+            pendingAcksLock.withLock {
+                pendingAcks[message.messageId] = AckPending(message, timeSource.markNow(), seq, nowMs)
+            }
+            val ok = sendRaw(message)
+            if (!ok) {
+                relayLog(RelayLogLevel.ERROR, "${genTag()} Envelope send returned false (frame write failed) seq=$seq")
+                // sendRaw threw and was logged. The frame did not go out, so the
+                // pendingAcks entry is meaningless — drop it and re-enqueue in
+                // the outbox with its original sequenceTs (the next reconnect
+                // flush will sort it back into encrypt order).
+                pendingAcksLock.withLock { pendingAcks.remove(message.messageId) }
+                outboxMutex.withLock {
+                    pendingOutbox.addLast(OutboxEntry(message, seq, nowMs))
+                }
+            }
+            ok
         }
-        val ok = sendRaw(message)
-        if (!ok) {
-            relayLog(RelayLogLevel.ERROR, "${genTag()} Envelope send returned false (frame write failed)")
-            // sendRaw threw and was logged. The frame did not go out, so the
-            // pendingAcks entry is meaningless — drop it and re-enqueue at
-            // the front of the outbox.
-            pendingAcksLock.withLock { pendingAcks.remove(message.messageId) }
-            outboxMutex.withLock { pendingOutbox.addLast(message) }
-        }
-        return ok
     }
 
     override suspend fun sendDeliveryAck(messageId: String): Boolean {
         val msg = RelayMessage.AckDelivery(messageId = messageId)
         if (!isConnected()) {
             // Queue the ack: it MUST eventually reach the relay or the envelope
-            // will be redelivered forever. The outbox is FIFO, so by the time
-            // the next connect drains it the relay will see this ack right
-            // after the envelope it concerns.
-            outboxMutex.withLock { pendingOutbox.addLast(msg) }
+            // will be redelivered forever. PR-H2a: ack-delivers also get a
+            // sequenceTs so they sort into the outbox at the correct position
+            // relative to user-message Sends queued in the same window.
+            // The outbox is FIFO by sequenceTs, so the next connect drains
+            // the ack at its right place in chronological order.
+            val seq = nextSequenceTs()
+            val nowMs = Clock.System.now().toEpochMilliseconds()
+            outboxMutex.withLock {
+                pendingOutbox.addLast(OutboxEntry(msg, seq, nowMs))
+            }
             relayLog(
                 RelayLogLevel.INFO,
-                "${genTag()} ack_deliver_send queued until reconnect: messageId=${messageId.take(12)}…",
+                "${genTag()} ack_deliver_send queued until reconnect: messageId=${messageId.take(12)}… seq=$seq",
             )
             return false
         }
@@ -733,81 +890,124 @@ class KtorRelayTransport(
     }
 
     /**
-     * Drains the in-memory outbox in FIFO order after a successful reconnect.
-     * Stops at the first sendRaw failure and re-enqueues all unsent items at
-     * the front so the next reconnect cycle picks them up in order.
+     * Drains the in-memory outbox in strict sequenceTs ASC order after a
+     * successful reconnect. Stops at the first sendRaw failure and re-enqueues
+     * all unsent items (still preserving sequenceTs) so the next reconnect
+     * cycle picks them up in encrypt order.
+     *
+     * PR-H2a: snapshot is sorted by sequenceTs ASC even though
+     * mergeUnackedIntoOutboxOrdered already does this on insert. The
+     * defence-in-depth sort here covers any code path that might in the
+     * future addLast/addFirst out of order — e.g. a future stage transport
+     * (Tor/Reality) that fans an envelope back into the outbox after a
+     * route switch. Cheap (O(n log n) on a list that is usually < 50
+     * items, run only on reconnect not per-frame).
      */
     private suspend fun flushPendingOutbox(mySession: Long) {
         val toFlush = outboxMutex.withLock {
             if (pendingOutbox.isEmpty()) return
-            val snapshot = pendingOutbox.toList()
+            val snapshot = pendingOutbox.toMutableList()
+            snapshot.sortBy { it.sequenceTs }
             pendingOutbox.clear()
-            snapshot
+            snapshot.toList()
         }
         relayLog(
             RelayLogLevel.INFO,
-            "${genTag(mySession)} Flushing ${toFlush.size} queued item(s) after reconnect",
+            "${genTag(mySession)} Flushing ${toFlush.size} queued item(s) after reconnect (sorted by sequenceTs ASC)",
         )
+        // PR-H2a.1: hold outboundSendMutex across the entire Send-write
+        // loop so any concurrent live send() blocks behind us. Without
+        // this guard, send() could observe pendingOutbox empty (we just
+        // cleared it for the snapshot above) and race onto the wire
+        // between two flush items with a fresher sequenceTs — exactly
+        // the H2a-incomplete scenario Vladislav flagged in review. The
+        // snapshot+clear above stays OUTSIDE the mutex (cheap, doesn't
+        // need wire access); the wire writes stay INSIDE.
         var sentCount = 0
-        for (msg in toFlush) {
-            when (msg) {
-                is RelayMessage.Send -> {
-                    relayLog(
-                        RelayLogLevel.INFO,
-                        "${genTag(mySession)} Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}…",
-                    )
-                    // PR-F1.1: mirror send() — re-track in pendingAcks BEFORE
-                    // sendRaw so the ACK watchdog and the next reconnect's
-                    // requeueUnackedToOutboxFront() can both see this envelope.
-                    // Without this, flush was fire-and-forget: re-flushed
-                    // envelopes that the relay never acked silently disappeared
-                    // from the tracker on the next reconnect cycle. Test #23
-                    // 2026-05-12 captured 7 voice envelopes lost this way:
-                    // requeue → flush → no acks → next reconnect's requeue
-                    // saw an empty pendingAcks → envelopes dropped.
-                    pendingAcksLock.withLock {
-                        pendingAcks[msg.messageId] = AckPending(msg, timeSource.markNow())
+        outboundSendMutex.withLock {
+            for (entry in toFlush) {
+                val msg = entry.message
+                when (msg) {
+                    is RelayMessage.Send -> {
+                        relayLog(
+                            RelayLogLevel.INFO,
+                            "${genTag(mySession)} Flush → send envelope: id=${msg.messageId.take(12)}… to=${msg.to.take(16)}… seq=${entry.sequenceTs}",
+                        )
+                        // PR-F1.1: mirror send() — re-track in pendingAcks BEFORE
+                        // sendRaw so the ACK watchdog and the next reconnect's
+                        // mergeUnackedIntoOutboxOrdered() can both see this
+                        // envelope. Without this, flush was fire-and-forget:
+                        // re-flushed envelopes that the relay never acked
+                        // silently disappeared from the tracker on the next
+                        // reconnect cycle. Test #23 2026-05-12 captured 7 voice
+                        // envelopes lost this way.
+                        // PR-H2a: preserve sequenceTs across the re-track so a
+                        // subsequent merge sorts this envelope back to its
+                        // original encrypt-order slot, not after fresh sends.
+                        pendingAcksLock.withLock {
+                            pendingAcks[msg.messageId] = AckPending(
+                                message = msg,
+                                sentAt = timeSource.markNow(),
+                                sequenceTs = entry.sequenceTs,
+                                queuedAtMs = entry.queuedAtMs,
+                            )
+                        }
+                        relayLog(
+                            RelayLogLevel.INFO,
+                            "${genTag(mySession)} Flush → tracking pending ACK: id=${msg.messageId.take(12)}… seq=${entry.sequenceTs}",
+                        )
                     }
-                    relayLog(
+                    is RelayMessage.AckDelivery -> relayLog(
                         RelayLogLevel.INFO,
-                        "${genTag(mySession)} Flush → tracking pending ACK: id=${msg.messageId.take(12)}…",
+                        "${genTag(mySession)} Flush → ack_deliver_send (replay): messageId=${msg.messageId.take(12)}… seq=${entry.sequenceTs}",
                     )
+                    else -> Unit
                 }
-                is RelayMessage.AckDelivery -> relayLog(
-                    RelayLogLevel.INFO,
-                    "${genTag(mySession)} Flush → ack_deliver_send (replay): messageId=${msg.messageId.take(12)}…",
-                )
-                else -> Unit
-            }
-            val ok = sendRaw(msg)
-            if (!ok) {
-                // Undo the just-added pendingAcks entry — the envelope is
-                // going back to outbox front, it must live in exactly one
-                // place until the next reconnect re-flushes it. Without this
-                // un-track the next requeueUnackedToOutboxFront() would also
-                // pull it from pendingAcks and we'd have a duplicate in the
-                // outbox.
-                if (msg is RelayMessage.Send) {
-                    pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
+                val ok = sendRaw(msg)
+                if (!ok) {
+                    // Undo the just-added pendingAcks entry — the envelope is
+                    // going back to the outbox, it must live in exactly one
+                    // place until the next reconnect re-flushes it. Without
+                    // this un-track the next mergeUnackedIntoOutboxOrdered()
+                    // would also pull it from pendingAcks and we'd have a
+                    // duplicate in the outbox (with the same sequenceTs
+                    // collision).
+                    if (msg is RelayMessage.Send) {
+                        pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
+                        relayLog(
+                            RelayLogLevel.WARN,
+                            "${genTag(mySession)} Flush failed → returned to outbox: id=${msg.messageId.take(12)}… seq=${entry.sequenceTs}",
+                        )
+                    }
+                    val remaining = toFlush.size - sentCount
                     relayLog(
-                        RelayLogLevel.WARN,
-                        "${genTag(mySession)} Flush failed → returned to outbox head: id=${msg.messageId.take(12)}…",
+                        RelayLogLevel.ERROR,
+                        "${genTag(mySession)} Flush failed — re-enqueuing $remaining item(s) for next reconnect (preserving sequenceTs)",
                     )
+                    // PR-H2a: re-merge from the failed entry onwards with
+                    // whatever already sits in pendingOutbox (a concurrent
+                    // send() may have added new entries while we were
+                    // flushing), then sort. Don't assume the partial flush
+                    // prefix is still correct — the next
+                    // mergeUnackedIntoOutboxOrdered on reconnect will
+                    // re-merge pendingAcks (the prefix we already moved
+                    // there) anyway. The non-local `return` here exits
+                    // flushPendingOutbox; outboundSendMutex is released by
+                    // the inline withLock's finally.
+                    outboxMutex.withLock {
+                        val merged = ArrayList<OutboxEntry>(
+                            pendingOutbox.size + (toFlush.size - sentCount),
+                        )
+                        merged.addAll(pendingOutbox)
+                        merged.addAll(toFlush.subList(sentCount, toFlush.size))
+                        merged.sortBy { it.sequenceTs }
+                        pendingOutbox.clear()
+                        pendingOutbox.addAll(merged)
+                    }
+                    return
                 }
-                val remaining = toFlush.size - sentCount
-                relayLog(
-                    RelayLogLevel.ERROR,
-                    "${genTag(mySession)} Flush failed — re-enqueuing $remaining item(s) for next reconnect",
-                )
-                // Re-enqueue from the failed item onwards, preserving order.
-                outboxMutex.withLock {
-                    toFlush.subList(sentCount, toFlush.size)
-                        .asReversed()
-                        .forEach { pendingOutbox.addFirst(it) }
-                }
-                return
+                sentCount++
             }
-            sentCount++
         }
     }
 
@@ -928,5 +1128,41 @@ class KtorRelayTransport(
                 "${genTag()} forceReconnect: new reconnect loop launched; previous loop abandoned (may remain as zombie thread)",
             )
         }
+    }
+
+    // ─── PR-H2a test-only hooks ───────────────────────────────────────────
+    // These accessors exist solely to let KtorRelayTransportFifoTest verify
+    // that the strict-FIFO outbox guarantees actually hold under simulated
+    // disconnect/reconnect. They are `internal` so production code in
+    // sibling modules cannot reach them, and they only expose snapshots /
+    // controlled mutations — the underlying mutable collections are never
+    // returned. Removing these is safe; only the test will fail to build.
+
+    internal suspend fun snapshotOutboxForTest(): List<OutboxEntry> =
+        outboxMutex.withLock { pendingOutbox.toList() }
+
+    internal suspend fun snapshotPendingAcksForTest(): List<AckPending> =
+        pendingAcksLock.withLock { pendingAcks.values.toList() }
+
+    internal suspend fun seedPendingAckForTest(entry: AckPending) {
+        pendingAcksLock.withLock { pendingAcks[entry.message.messageId] = entry }
+    }
+
+    internal suspend fun seedOutboxForTest(entry: OutboxEntry) {
+        outboxMutex.withLock { pendingOutbox.addLast(entry) }
+    }
+
+    internal suspend fun nextSequenceTsForTest(): Long = nextSequenceTs()
+
+    /**
+     * PR-H2a.1 test hook. Lets KtorRelayTransportFifoTest exercise the
+     * live-send path (the one that races flushes) without standing up a
+     * Ktor MockEngine WebSocket. Real production code never sets state
+     * to Connected without going through connect()'s WS handshake; this
+     * method is `internal` so production callers in sibling modules
+     * cannot reach it.
+     */
+    internal fun setStateConnectedForTest() {
+        _state.value = TransportState.Connected
     }
 }
