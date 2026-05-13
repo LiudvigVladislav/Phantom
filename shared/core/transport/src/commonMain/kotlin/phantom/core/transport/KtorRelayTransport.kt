@@ -177,6 +177,26 @@ class KtorRelayTransport(
     private val timeSource = TimeSource.Monotonic
     @Volatile private var lastPongMark: TimeSource.Monotonic.ValueTimeMark = timeSource.markNow()
 
+    // PR-H1c (2026-05-13): liveness based on ANY inbound WS frame, not just
+    // Pong. Refreshed in readLoop on every successfully-decoded frame
+    // (Deliver, Ack, Pong) AND inside the Frame.Text branch before parsing
+    // (so even malformed frames count as proof the wire is alive). The
+    // pong-timeout check in startPing now triggers on this mark — a healthy
+    // session with envelope traffic but pong-routing weirdness no longer
+    // false-positive-reconnects.
+    //
+    // Test #35 motivation: server session_summary showed pings_received=2
+    // and pongs_sent=2 for a 178 s session, while client sent 11 pings and
+    // got 5 pongs back. Half-open TCP socket. Until the socket is genuinely
+    // dead the receiver keeps observing other inbound activity, and any of
+    // it should reset the watchdog.
+    //
+    // Also exposed to AlarmManagerKeepalive on Android (via the public
+    // [millisSinceLastInboundFrame] accessor below) so the alarm path can
+    // make the proactive-reconnect decision without app-level Pong gating.
+    @Volatile private var lastInboundFrameMark: TimeSource.Monotonic.ValueTimeMark =
+        timeSource.markNow()
+
     // Sent-but-unacknowledged envelopes. Frame.send() can succeed against a
     // half-dead socket without throwing — the bytes sit in the OkHttp buffer
     // and never reach the wire. The ACK watchdog promotes that silent loss
@@ -370,6 +390,10 @@ class KtorRelayTransport(
         // first alarm and trigger forceReconnect that tears down the
         // in-flight handshake — observed cross-device test 2026-05-10).
         lastPongMark = timeSource.markNow()
+        // PR-H1c: same rationale for the inbound-frame liveness mark, which
+        // now drives both the in-process pong-timeout watchdog and the
+        // AlarmManager proactive reconnect.
+        lastInboundFrameMark = timeSource.markNow()
         relayLog(
             RelayLogLevel.INFO,
             "${genTag()} connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
@@ -501,6 +525,7 @@ class KtorRelayTransport(
                 generationClient.webSocket(authedWsUrl) {
                     session = this
                     lastPongMark = timeSource.markNow()
+                    lastInboundFrameMark = timeSource.markNow()
                     // PR-H1b: stats holder for this WS session. Stored in
                     // `currentSessionStats` so startPing's pingJob and
                     // readLoop can mutate counters without an extra
@@ -703,24 +728,27 @@ class KtorRelayTransport(
         pingJob = scope.launch {
             while (isActive) {
                 delay(RelayTransportConfig.PING_INTERVAL_MS)
+                // PR-H1c: liveness check now uses ANY inbound frame, not just
+                // Pong. A session with healthy envelope traffic but pong-
+                // routing weirdness no longer false-positive-reconnects.
+                // Test #35 confirmed the existing `sinceLastPong` check fired
+                // ~70 s after radio park while regular delivers/acks may have
+                // still been observable on healthier networks; this rename
+                // generalises the predicate to "did the wire show ANY signs
+                // of life within DEAD_SOCKET_TIMEOUT_MS" — see ADR-013.
+                val sinceLastInbound = lastInboundFrameMark.elapsedNow().inWholeMilliseconds
                 val sinceLastPong = lastPongMark.elapsedNow().inWholeMilliseconds
-                if (sinceLastPong > RelayTransportConfig.PONG_TIMEOUT_MS) {
-                    // PR-H1b: include lastInboundFrameMs so a post-mortem can
-                    // distinguish "peer is fully dead (nothing inbound for
-                    // Xms)" from "peer alive but pong-routing broken (frames
-                    // arriving but pongs not)". Without this we reflexively
-                    // blamed the wrong layer when the relay's pong inline-
-                    // route bug shipped (Test #27).
-                    val nowMs = Clock.System.now().toEpochMilliseconds()
-                    val sinceLastInboundMs = currentSessionStats
-                        ?.lastInboundFrameAtMs
-                        ?.takeIf { it > 0 }
-                        ?.let { nowMs - it }
-                        ?: -1L
+                if (sinceLastInbound > RelayTransportConfig.DEAD_SOCKET_TIMEOUT_MS) {
+                    // Both deltas in the WARN line: post-mortem can still
+                    // distinguish "fully dead vs pong-routing-only-broken"
+                    // by comparing them. Equal → fully dead. Pong much
+                    // larger than inbound → pong-routing class bug, not
+                    // network — different fix domain.
                     relayLog(
                         RelayLogLevel.WARN,
-                        "${genTag(mySession)} Pong timeout (${sinceLastPong}ms without Pong, " +
-                            "lastInboundFrameMs=$sinceLastInboundMs) — marking transport disconnected and forcing reconnect",
+                        "${genTag(mySession)} Dead-socket timeout " +
+                            "(sinceLastInbound=${sinceLastInbound}ms, sinceLastPong=${sinceLastPong}ms) " +
+                            "— marking transport disconnected and forcing reconnect",
                     )
                     // PR-F1.2 (2026-05-12): previously this was
                     // forceShutdownActiveEngine + close + scope.cancel + break,
@@ -742,7 +770,13 @@ class KtorRelayTransport(
                     // critically, launches a fresh runReconnectLoop on
                     // transportScope (the same recovery path the wakeup
                     // receiver uses).
-                    _state.value = TransportState.Disconnected
+                    //
+                    // PR-H1c: emit Reconnecting (not Disconnected) so the
+                    // UI shows a soft "Reconnecting…" indicator instead of
+                    // a "no connection" warning. The transport is self-
+                    // healing — outbound sends queue and flush; nothing is
+                    // lost. The state is purely a UX cue.
+                    _state.value = TransportState.Reconnecting
                     forceReconnect()
                     break
                 }
@@ -773,8 +807,22 @@ class KtorRelayTransport(
                 if (!pingOk) {
                     relayLog(
                         RelayLogLevel.WARN,
-                        "${genTag(mySession)} ping_send_failed — sendRaw returned false (session likely dead)",
+                        "${genTag(mySession)} ping_send_failed — sendRaw returned false (session likely dead) — forcing reconnect",
                     )
+                    // PR-H1c: don't wait for the next watchdog tick to notice
+                    // the dead socket. sendRaw=false means OkHttp/Ktor's
+                    // outbound write surfaced an exception (SocketException
+                    // "Connection reset", "Broken pipe", etc.) — the socket
+                    // is provably dead RIGHT NOW. Test #35 emu pattern
+                    // showed up to 60 s wasted between ping_send_failed and
+                    // the existing pong-timeout watchdog catching up; cut
+                    // that to ~0 s. Ordering matches the pong-timeout path
+                    // above: state→Reconnecting→forceReconnect, then break
+                    // out of the pingJob loop because the next iteration
+                    // would write into the same dead session.
+                    _state.value = TransportState.Reconnecting
+                    forceReconnect()
+                    break
                 }
             }
         }
@@ -828,7 +876,12 @@ class KtorRelayTransport(
                 // the outbox path, then forceReconnect() to launch a fresh
                 // runReconnectLoop. The previous scope.cancel + break left
                 // the session zombied on Tecno HiOS. See startPing() comment.
-                _state.value = TransportState.Disconnected
+                //
+                // PR-H1c: Reconnecting (not Disconnected) for the same UX
+                // reason as the pong-timeout path — outbox sends still
+                // queue and flush after recovery; the cue communicates
+                // "in-flight, not failed".
+                _state.value = TransportState.Reconnecting
                 forceReconnect()
                 break
             }
@@ -885,6 +938,14 @@ class KtorRelayTransport(
                     stats.inboundFrames += 1
                     stats.lastInboundFrameAtMs = Clock.System.now().toEpochMilliseconds()
                 }
+                // PR-H1c: refresh the instance-level liveness mark consumed
+                // by both the in-process pong watchdog (startPing) and the
+                // AlarmManager proactive reconnect path (Android wake-up).
+                // Done unconditionally — even malformed frames count as
+                // proof the wire is alive; what matters for the watchdog
+                // is "did anything come back from the relay", not whether
+                // it parsed cleanly.
+                lastInboundFrameMark = timeSource.markNow()
                 val text = frame.readText()
                 try {
                     // Typing events are ephemeral and are NOT part of the RelayMessage sealed
@@ -1289,6 +1350,13 @@ class KtorRelayTransport(
     // a pong should be treated as needing a reconnect, not as healthy.
     override val lastPongElapsedMs: Long
         get() = lastPongMark.elapsedNow().inWholeMilliseconds
+
+    // PR-H1c: ANY inbound frame counts. Updated in readLoop (instance-level
+    // @Volatile field, distinct from the per-session SessionStats counter).
+    // Driven by the AlarmManager proactive reconnect path; see
+    // RelayTransportConfig.ALARM_STALE_RECONNECT_MS.
+    override val lastInboundFrameElapsedMs: Long
+        get() = lastInboundFrameMark.elapsedNow().inWholeMilliseconds
 
     // Lock-free read against pendingAcks. The map is mutated only under
     // pendingAcksLock, but .size is a single primitive int field on the

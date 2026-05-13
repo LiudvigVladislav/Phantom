@@ -94,6 +94,24 @@ interface RelayTransport {
     val lastPongElapsedMs: Long
 
     /**
+     * PR-H1c (2026-05-13): milliseconds since ANY inbound WebSocket frame
+     * was observed (Deliver, Ack, Pong, malformed text — anything). The
+     * AlarmManager wakeup receiver uses this in preference to
+     * [lastPongElapsedMs] for proactive-reconnect decisions (see
+     * [RelayTransportConfig.ALARM_STALE_RECONNECT_MS]).
+     *
+     * Why: under Tor / Reality and on networks with weird middleboxes the
+     * Pong-routing path may be selectively dropped while normal envelope
+     * traffic still flows. `lastPongElapsedMs` would false-positive in
+     * those scenarios; this metric does not.
+     *
+     * Initial value before the first connect is conventionally large so
+     * the first scheduled alarm after cold start sees a stale connection
+     * and triggers a reconnect attempt.
+     */
+    val lastInboundFrameElapsedMs: Long
+
+    /**
      * Number of envelopes that have been sent on the wire but not yet
      * acknowledged by the relay. Used by the AlarmManager wakeup receiver
      * to defer `forceReconnect()` while an upload is in-flight: tearing

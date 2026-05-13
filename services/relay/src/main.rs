@@ -28,6 +28,47 @@ async fn main() {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
+    // PR-H1c (2026-05-13): aggressive TCP keepalive on the listener so each
+    // accepted client connection picks up SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/
+    // CNT inherited from the listening socket. On Linux these options ARE
+    // inherited at accept() time (per socket(7)).
+    //
+    // Test #35 motivation: server-side conn_id=5 sat in a half-open state
+    // for 178 s after the client side noticed the socket was dead and
+    // forceReconnect()'d. Default Linux tcp_keepalive_time is 7200 s — far
+    // too long for a mobile messenger. With these values the relay surfaces
+    // half-open sockets in ~30 s (15 s idle + 3 × 5 s probes), matching
+    // the client's PR-H1c proactive-reconnect window. The two sides become
+    // symmetric: neither holds a zombie session for minutes.
+    //
+    // `#[cfg(unix)]` because socket2's `TcpKeepalive::with_retries(...)`
+    // (which sets TCP_KEEPCNT) is unavailable on Windows. The relay
+    // ships in a Linux container in production (deploy/docker-compose.yml);
+    // Windows builds are local dev only and run without the tuned
+    // keepalive — the kernel's default applies, which is acceptable for
+    // dev where mobile NAT eviction is not in scope.
+    #[cfg(unix)]
+    {
+        use socket2::{SockRef, TcpKeepalive};
+        use std::time::Duration;
+        let sock_ref = SockRef::from(&listener);
+        let keepalive = TcpKeepalive::new()
+            .with_time(Duration::from_secs(15))
+            .with_interval(Duration::from_secs(5))
+            .with_retries(3);
+        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+            tracing::warn!(
+                error = %e,
+                "TCP keepalive setup failed on listener — accepted sockets will use kernel defaults",
+            );
+        } else {
+            tracing::info!(
+                idle_s = 15, interval_s = 5, retries = 3,
+                "TCP keepalive configured on listener (PR-H1c)",
+            );
+        }
+    }
+
     // Startup banner — key operational parameters logged once at boot.
     // Trust boundary: only operational metadata, never secrets.
     tracing::info!(

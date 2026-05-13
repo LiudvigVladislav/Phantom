@@ -20,6 +20,13 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
+# PR-H1c (2026-05-13): TCP keepalive on the relay's listening socket so
+# accepted client connections inherit aggressive keepalive timers (15s
+# idle, 5s probe interval, 3 fails before RST). On Linux, SO_KEEPALIVE
+# and the TCP_KEEPIDLE/INTVL/CNT options on a listening socket are
+# inherited by accept()ed sockets — this gives us per-connection TCP-
+# level dead-peer detection without restructuring the axum serve loop.
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
