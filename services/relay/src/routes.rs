@@ -237,6 +237,46 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
     // Register client — mint a unique connection ID so the cleanup path can
     // distinguish this session from a later reconnect that races with our exit.
     let conn_id = state.conn_counter.fetch_add(1, Ordering::Relaxed);
+
+    // PR-H1b (2026-05-13): per-WS-session counters & close-cause tracking.
+    // Logged once at session end as `session_summary` so a post-mortem can
+    // answer "this conn_id sent 47 pongs over 612 s" vs "got 0 pings, died
+    // at 71 s" without correlating dozens of intermediate log lines.
+    //
+    // Naming uses the SERVER perspective: `pings_received` means client→
+    // server pings, `pongs_sent` means server→client pongs. The client's
+    // `session_summary` mirrors with `pings_sent` / `pongs_received` —
+    // grepping both sides on the same conn_id should show matched counts
+    // when the heartbeat path is healthy.
+    let session_start = std::time::Instant::now();
+    let mut pings_received: u64 = 0;
+    let mut pongs_sent: u64 = 0;
+    let mut inbound_frames: u64 = 0;
+    let mut outbound_frames: u64 = 0;
+    let mut last_ping_at_ms: u128 = 0;
+    let mut last_pong_at_ms: u128 = 0;
+    let mut last_inbound_at_ms: u128 = 0;
+    // close_origin classifies *who* terminated the session:
+    //   "client"  — Message::Close received from peer (clean WS close)
+    //   "error"   — Some(Err(_)) from socket.next() OR socket.send err
+    //   "none"    — None from socket.next() (stream end, no close frame)
+    //   "server"  — currently no path; reserved for future server-initiated
+    //               close. The client mirrors this enum.
+    let mut close_origin: &'static str = "none";
+    let mut close_code: Option<u16> = None;
+    let mut close_reason_str: Option<String> = None;
+    let mut close_error_str: Option<String> = None;
+
+    // Helper to compute UNIX-epoch ms at the moment a frame is observed.
+    // Cheaper than `Instant::now()` for the "wall-clock per-frame timestamp"
+    // use case because we only call it on event-loop wakeups, not in any
+    // hot inner loop.
+    let now_ms = || -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    };
     if !identity.is_empty() {
         state.clients.write().await.insert(identity.clone(), (conn_id, tx.clone()));
         let ts = std::time::SystemTime::now()
@@ -290,14 +330,33 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             // Outbound: forward whatever the relay queued for this client.
             outbound = rx.recv() => {
                 let Some(text) = outbound else { break };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                // PR-H1b: classify outbound send failure so session_summary
+                // can attribute the close to "we couldn't write to the
+                // socket" vs "client read end died". Capturing the error
+                // string here means we no longer have to grep for a
+                // disconnect followed by a missing client.
+                if let Err(e) = socket.send(Message::Text(text.into())).await {
+                    close_origin = "error";
+                    close_error_str = Some(format!("outbound_send: {}", e));
+                    tracing::warn!(
+                        conn_id = conn_id,
+                        error   = %e,
+                        "ws outbound send failed — closing session"
+                    );
                     break;
                 }
+                outbound_frames += 1;
             }
             // Inbound: process frames from the client.
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
+                        // PR-H1b: any text frame counts as inbound activity,
+                        // tracked separately from pings so session_summary
+                        // can spot "frames arrived but no pings" (broken
+                        // client heartbeat path).
+                        inbound_frames += 1;
+                        last_inbound_at_ms = now_ms();
                         // PR-F2-relay (2026-05-12): fast-path application-level
                         // ping. Send pong directly back on THIS socket — mirror
                         // what the WS-protocol Message::Ping handler below does
@@ -345,13 +404,26 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                                 .map(|s| s == "ping"))
                             .unwrap_or(false);
                         if is_ping {
-                            if socket
+                            // PR-H1b: count inbound application-level pings
+                            // (the path the Kotlin client uses; protocol-
+                            // level Message::Ping below is rare in practice).
+                            pings_received += 1;
+                            last_ping_at_ms = last_inbound_at_ms;
+                            if let Err(e) = socket
                                 .send(Message::Text(r#"{"type":"pong"}"#.to_string().into()))
                                 .await
-                                .is_err()
                             {
+                                close_origin = "error";
+                                close_error_str = Some(format!("pong_send: {}", e));
+                                tracing::warn!(
+                                    conn_id = conn_id,
+                                    error   = %e,
+                                    "ws pong send failed — closing session"
+                                );
                                 break;
                             }
+                            pongs_sent += 1;
+                            last_pong_at_ms = now_ms();
                             tracing::trace!(identity = %identity, "ws ping → pong (inline)");
                         } else {
                             handle_message(raw, &identity, conn_id, &state).await;
@@ -361,13 +433,75 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                         // Explicit, immediate PONG — required because we no
                         // longer rely on tungstenite's queued auto-PONG (see
                         // top-of-fn comment).
-                        if socket.send(Message::Pong(payload)).await.is_err() {
+                        // PR-H1b: same accounting as the application-level
+                        // ping path so session_summary captures both.
+                        inbound_frames += 1;
+                        last_inbound_at_ms = now_ms();
+                        pings_received += 1;
+                        last_ping_at_ms = last_inbound_at_ms;
+                        if let Err(e) = socket.send(Message::Pong(payload)).await {
+                            close_origin = "error";
+                            close_error_str = Some(format!("ws_pong_send: {}", e));
+                            tracing::warn!(
+                                conn_id = conn_id,
+                                error   = %e,
+                                "ws-protocol pong send failed — closing session"
+                            );
                             break;
                         }
+                        pongs_sent += 1;
+                        last_pong_at_ms = now_ms();
                     }
-                    Some(Ok(Message::Close(_))) => break,
-                    Some(Ok(_)) => {}             // Pong/Binary: ignored.
-                    Some(Err(_)) | None => break, // Read error or stream end.
+                    Some(Ok(Message::Close(c))) => {
+                        // PR-H1b: extract close code + reason from the
+                        // CloseFrame the peer sent. Lets session_summary
+                        // distinguish 1000 (normal), 1001 (going away),
+                        // 1006 (no close received — TCP RST), etc., which
+                        // turn out to map to very different network paths.
+                        inbound_frames += 1;
+                        last_inbound_at_ms = now_ms();
+                        close_origin = "client";
+                        if let Some(cf) = c {
+                            close_code = Some(cf.code);
+                            // Truncate to 120 chars to keep one-line log
+                            // sane even if a misbehaving client stuffs
+                            // the reason field.
+                            let r = cf.reason.to_string();
+                            close_reason_str = Some(r.chars().take(120).collect());
+                        }
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        // Pong/Binary: ignored payload-wise but still
+                        // counts as inbound activity.
+                        inbound_frames += 1;
+                        last_inbound_at_ms = now_ms();
+                    }
+                    Some(Err(e)) => {
+                        // PR-H1b: capture the underlying read error before
+                        // breaking. Previously this was a silent break;
+                        // the error type (often `Protocol`, `Io`, or
+                        // `Capacity`) is critical for diagnosing whether
+                        // the client misbehaved or the network dropped.
+                        close_origin = "error";
+                        close_error_str = Some(format!("ws_read: {}", e));
+                        tracing::warn!(
+                            conn_id = conn_id,
+                            error   = %e,
+                            "ws read error — closing session"
+                        );
+                        break;
+                    }
+                    None => {
+                        // PR-H1b: stream end without a close frame — TCP
+                        // half-close or RST. Distinct from the explicit
+                        // `client` close above so post-mortem can spot
+                        // "Tecno radio dropped the socket without a
+                        // graceful WS close" (the common Test #24 pattern)
+                        // vs "client sent Close cleanly".
+                        close_origin = "none";
+                        break;
+                    }
                 }
             }
         }
@@ -393,6 +527,40 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             conn_id = conn_id,
             ts_ms   = ts,
             "metadata"
+        );
+
+        // PR-H1b (2026-05-13): single `session_summary` line aggregating
+        // every per-frame counter the loop maintained. The client emits a
+        // mirror line on its side (with `pings_sent` / `pongs_received`
+        // swapped); grepping both on the same conn_id should show
+        // matched counts when heartbeat is healthy. Any drift between
+        // server `pings_received` and client `pings_sent` for the same
+        // session means pings were dropped between client write and
+        // server read — a different failure class than pongs being
+        // dropped on the way back.
+        let duration_ms = session_start.elapsed().as_millis();
+        let now = now_ms();
+        let since_last_ping_ms: i64 = if last_ping_at_ms == 0 { -1 } else { (now - last_ping_at_ms) as i64 };
+        let since_last_pong_ms: i64 = if last_pong_at_ms == 0 { -1 } else { (now - last_pong_at_ms) as i64 };
+        let since_last_inbound_ms: i64 =
+            if last_inbound_at_ms == 0 { -1 } else { (now - last_inbound_at_ms) as i64 };
+        tracing::info!(
+            event                  = "session_summary",
+            key                    = %&identity[..identity.len().min(16)],
+            conn_id                = conn_id,
+            duration_ms            = duration_ms as u64,
+            close_origin           = close_origin,
+            close_code             = close_code.map(|c| c as u64).unwrap_or(0),
+            close_reason           = close_reason_str.as_deref().unwrap_or(""),
+            close_error            = close_error_str.as_deref().unwrap_or(""),
+            pings_received         = pings_received,
+            pongs_sent             = pongs_sent,
+            inbound_frames         = inbound_frames,
+            outbound_frames        = outbound_frames,
+            since_last_ping_ms     = since_last_ping_ms,
+            since_last_pong_ms     = since_last_pong_ms,
+            since_last_inbound_ms  = since_last_inbound_ms,
+            "ws session ended"
         );
     }
 }

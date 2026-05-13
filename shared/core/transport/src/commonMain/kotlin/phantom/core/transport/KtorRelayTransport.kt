@@ -4,6 +4,7 @@
 package phantom.core.transport
 
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.websocket.DefaultClientWebSocketSession
 import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
@@ -11,6 +12,7 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -246,6 +248,107 @@ class KtorRelayTransport(
     private fun genTag(mySession: Long): String =
         "[gen=$connectionGeneration s=$mySession]"
 
+    // PR-H1b (2026-05-13): per-WebSocket-session counters captured during
+    // the lifetime of one `webSocket{}` block and logged as a single
+    // `session_summary` line in the finally clause. Lets a post-mortem
+    // answer "this session sent 47 pings, got 47 pongs over 612 s" vs
+    // "sent 12 pings, got 0 pongs and died at 71 s" without grepping all
+    // intermediate log lines and counting by hand.
+    //
+    // Mutated only from coroutines that belong to the same session
+    // (`startPing`, `readLoop`); read once at session-end. No locking —
+    // the writer set is single-coroutine per field.
+    private class SessionStats(
+        val sessionEpoch: Long,
+        val startedAtMs: Long,
+        var pingsSent: Long = 0,
+        var pingSendFailures: Long = 0,
+        var pongsReceived: Long = 0,
+        var inboundFrames: Long = 0,
+        var deliversReceived: Long = 0,
+        var acksReceived: Long = 0,
+        var lastPingAtMs: Long = 0,
+        var lastPongAtMs: Long = 0,
+        var lastInboundFrameAtMs: Long = 0,
+    )
+
+    @Volatile private var currentSessionStats: SessionStats? = null
+
+    /**
+     * PR-H1b: classification of *who* terminated a WebSocket session, used
+     * by the client-side `session_summary` log line. Mirrors the relay-
+     * side `close_origin` enum so post-mortem grep can correlate close-
+     * reason and close-origin from both sides of the wire on the same
+     * session.
+     *
+     * - [Remote]: peer-initiated clean close, identified by a non-null
+     *   `closeReason` await result.
+     * - [Local]: client-initiated close — `disconnect()` or
+     *   `forceReconnect()` requested by a watchdog. Detected via
+     *   `disconnectRequested` flag at the time `webSocket{}` exited, or
+     *   by a `CancellationException` whose root cause is our cancel.
+     * - [Error]: thrown exception from the `webSocket{}` block (transport
+     *   I/O failure, parse failure that escaped the read-loop's catch).
+     * - [Unknown]: webSocket{} returned without a close reason and no
+     *   exception — kernel detected a half-open socket (TCP RST), or
+     *   readLoop completed without an explicit close frame.
+     */
+    private enum class CloseOrigin { Remote, Local, Error, Unknown }
+
+    /**
+     * PR-H1b: emit a single `session_summary` log line summarising the
+     * lifetime of one WebSocket session. Called once from the finally
+     * block of `runReconnectLoop`. Aggregates the per-session counters
+     * collected by `startPing` / `readLoop`, computes durations, and
+     * tags the close cause so we can answer "did this session die from
+     * pong timeout, peer close, or client-side cancel" without
+     * stitching together separate log lines.
+     */
+    private fun emitSessionSummary(
+        stats: SessionStats?,
+        origin: CloseOrigin,
+        closeCode: Short?,
+        closeMessage: String?,
+        thrown: Throwable?,
+    ) {
+        if (stats == null) {
+            relayLog(
+                RelayLogLevel.WARN,
+                "${genTag()} session_summary missing — webSocket{} block ended before stats were initialised (origin=$origin)",
+            )
+            return
+        }
+        val nowMs = Clock.System.now().toEpochMilliseconds()
+        val durationMs = (nowMs - stats.startedAtMs).coerceAtLeast(0)
+        val sinceLastPongMs = if (stats.lastPongAtMs == 0L) -1L else nowMs - stats.lastPongAtMs
+        val sinceLastPingMs = if (stats.lastPingAtMs == 0L) -1L else nowMs - stats.lastPingAtMs
+        val sinceLastInboundMs =
+            if (stats.lastInboundFrameAtMs == 0L) -1L else nowMs - stats.lastInboundFrameAtMs
+        val missedPongs = (stats.pingsSent - stats.pongsReceived).coerceAtLeast(0)
+        val codeStr = closeCode?.toString() ?: "none"
+        val reasonStr = closeMessage?.take(120) ?: ""
+        val thrownStr = thrown?.let { "${it::class.simpleName}: ${it.message}" } ?: ""
+        relayLog(
+            RelayLogLevel.INFO,
+            "${genTag(stats.sessionEpoch)} session_summary " +
+                "duration_ms=$durationMs " +
+                "close_origin=${origin.name.lowercase()} " +
+                "close_code=$codeStr " +
+                "close_reason='$reasonStr' " +
+                "thrown='$thrownStr' " +
+                "pings_sent=${stats.pingsSent} " +
+                "pongs_received=${stats.pongsReceived} " +
+                "missed_pongs=$missedPongs " +
+                "ping_send_failures=${stats.pingSendFailures} " +
+                "inbound_frames=${stats.inboundFrames} " +
+                "delivers_received=${stats.deliversReceived} " +
+                "acks_received=${stats.acksReceived} " +
+                "since_last_ping_ms=$sinceLastPingMs " +
+                "since_last_pong_ms=$sinceLastPongMs " +
+                "since_last_inbound_ms=$sinceLastInboundMs",
+        )
+    }
+
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
@@ -385,10 +488,31 @@ class KtorRelayTransport(
                 RelayLogLevel.INFO,
                 "${genTag(mySession)} Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
             )
+            // PR-H1b: capture-on-exit fields populated inside try/catch and
+            // read once from the finally block for `session_summary`. Local
+            // vars (not @Volatile fields) because only this coroutine reads
+            // and writes them within the iteration.
+            var sessionStats: SessionStats? = null
+            var closeCode: Short? = null
+            var closeMessage: String? = null
+            var caughtThrowable: Throwable? = null
+            var closeOriginOverride: CloseOrigin? = null
             try {
                 generationClient.webSocket(authedWsUrl) {
                     session = this
                     lastPongMark = timeSource.markNow()
+                    // PR-H1b: stats holder for this WS session. Stored in
+                    // `currentSessionStats` so startPing's pingJob and
+                    // readLoop can mutate counters without an extra
+                    // parameter. Captured locally as `sessionStats` so the
+                    // finally block can emit `session_summary` regardless
+                    // of how `webSocket{}` exited.
+                    val stats = SessionStats(
+                        sessionEpoch = mySession,
+                        startedAtMs = Clock.System.now().toEpochMilliseconds(),
+                    )
+                    currentSessionStats = stats
+                    sessionStats = stats
                     _state.value = TransportState.Connected
                     relayLog(RelayLogLevel.INFO, "${genTag(mySession)} WebSocket connected successfully")
                     attempt = 0 // reset backoff on successful connect
@@ -412,7 +536,21 @@ class KtorRelayTransport(
                     flushPendingOutbox(mySession)
 
                     readLoop(mySession)
-                    relayLog(RelayLogLevel.WARN, "${genTag(mySession)} WebSocket closed by remote (clean)")
+                    // PR-H1b: extract close code + reason from the close
+                    // frame the peer sent. `closeReason` is a Deferred
+                    // completed by Ktor when the WS handshake teardown
+                    // observed a Close frame. await() with a short timeout
+                    // because some abnormal closes (kernel TCP RST) leave
+                    // closeReason uncompleted forever.
+                    val cr = withTimeoutOrNull(500) {
+                        runCatching { closeReason.await() }.getOrNull()
+                    }
+                    closeCode = cr?.code
+                    closeMessage = cr?.message
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "${genTag(mySession)} WebSocket closed by remote (clean): code=${closeCode ?: "none"} reason='${closeMessage ?: ""}'",
+                    )
                 }
                 _state.value = TransportState.Disconnected
                 if (disconnectRequested) break
@@ -420,7 +558,18 @@ class KtorRelayTransport(
                 relayLog(RelayLogLevel.INFO, "${genTag(mySession)} Reconnecting after clean close")
                 // attempt was reset to 0 above; restart backoff from base.
                 continue
+            } catch (e: CancellationException) {
+                // PR-H1b: separate from generic Exception so session_summary
+                // can tag close_origin=local. CancellationException here
+                // means our own scope was cancelled (forceReconnect or
+                // disconnect) — semantically a *local* close, not a
+                // network failure. Re-thrown so coroutine teardown still
+                // happens normally; the finally block runs first.
+                caughtThrowable = e
+                closeOriginOverride = CloseOrigin.Local
+                throw e
             } catch (e: Exception) {
+                caughtThrowable = e
                 _state.value = TransportState.Error(e)
                 relayLog(
                     RelayLogLevel.ERROR,
@@ -436,6 +585,29 @@ class KtorRelayTransport(
                 delay(delayMs)
                 attempt++
             } finally {
+                // PR-H1b: classify close cause, then emit the single
+                // `session_summary` line summarising the lifetime of this
+                // WS session. Done before the scope-cancel below so the
+                // counters reflect whatever startPing/readLoop observed
+                // (the scope cancel will also stop those coroutines, but
+                // they don't update stats after the readLoop exits).
+                val origin = closeOriginOverride ?: when {
+                    caughtThrowable is CancellationException -> CloseOrigin.Local
+                    caughtThrowable != null -> CloseOrigin.Error
+                    disconnectRequested -> CloseOrigin.Local
+                    closeCode != null -> CloseOrigin.Remote
+                    else -> CloseOrigin.Unknown
+                }
+                emitSessionSummary(
+                    stats = sessionStats,
+                    origin = origin,
+                    closeCode = closeCode,
+                    closeMessage = closeMessage,
+                    thrown = caughtThrowable,
+                )
+                if (currentSessionStats === sessionStats) {
+                    currentSessionStats = null
+                }
                 // Cancel the previous generation's coroutines and close its
                 // HttpClient. ADR-010 (Updated 2026-05-01) — closing the
                 // HttpClient destroys the OkHttp dispatcher and connection
@@ -533,9 +705,22 @@ class KtorRelayTransport(
                 delay(RelayTransportConfig.PING_INTERVAL_MS)
                 val sinceLastPong = lastPongMark.elapsedNow().inWholeMilliseconds
                 if (sinceLastPong > RelayTransportConfig.PONG_TIMEOUT_MS) {
+                    // PR-H1b: include lastInboundFrameMs so a post-mortem can
+                    // distinguish "peer is fully dead (nothing inbound for
+                    // Xms)" from "peer alive but pong-routing broken (frames
+                    // arriving but pongs not)". Without this we reflexively
+                    // blamed the wrong layer when the relay's pong inline-
+                    // route bug shipped (Test #27).
+                    val nowMs = Clock.System.now().toEpochMilliseconds()
+                    val sinceLastInboundMs = currentSessionStats
+                        ?.lastInboundFrameAtMs
+                        ?.takeIf { it > 0 }
+                        ?.let { nowMs - it }
+                        ?: -1L
                     relayLog(
                         RelayLogLevel.WARN,
-                        "${genTag(mySession)} Pong timeout (${sinceLastPong}ms without Pong) — marking transport disconnected and forcing reconnect",
+                        "${genTag(mySession)} Pong timeout (${sinceLastPong}ms without Pong, " +
+                            "lastInboundFrameMs=$sinceLastInboundMs) — marking transport disconnected and forcing reconnect",
                     )
                     // PR-F1.2 (2026-05-12): previously this was
                     // forceShutdownActiveEngine + close + scope.cancel + break,
@@ -571,6 +756,20 @@ class KtorRelayTransport(
                     "${genTag(mySession)} ping_send (sinceLastPong=${sinceLastPong}ms)",
                 )
                 val pingOk = sendRaw(RelayMessage.Ping)
+                // PR-H1b: increment per-session counter only for the
+                // session this pingJob belongs to. Defensive equality
+                // check guards against zombie pingJobs from a previous
+                // session writing into the current session's stats
+                // after forceReconnect (the same class of bug PR-H1a
+                // tags hunt).
+                currentSessionStats?.takeIf { it.sessionEpoch == mySession }?.let { stats ->
+                    if (pingOk) {
+                        stats.pingsSent += 1
+                        stats.lastPingAtMs = Clock.System.now().toEpochMilliseconds()
+                    } else {
+                        stats.pingSendFailures += 1
+                    }
+                }
                 if (!pingOk) {
                     relayLog(
                         RelayLogLevel.WARN,
@@ -676,6 +875,16 @@ class KtorRelayTransport(
     private suspend fun WebSocketSession.readLoop(mySession: Long) {
         for (frame in incoming) {
             if (frame is Frame.Text) {
+                // PR-H1b: any text frame counts as inbound activity. Tracked
+                // separately from `pongsReceived` so a post-mortem can spot
+                // "frames arrived but not pongs" (relay pong-routing bug
+                // class) vs "nothing arrived at all" (peer dead / radio
+                // parked). Stats stay scoped to this session via the
+                // sessionEpoch equality check.
+                currentSessionStats?.takeIf { it.sessionEpoch == mySession }?.let { stats ->
+                    stats.inboundFrames += 1
+                    stats.lastInboundFrameAtMs = Clock.System.now().toEpochMilliseconds()
+                }
                 val text = frame.readText()
                 try {
                     // Typing events are ephemeral and are NOT part of the RelayMessage sealed
@@ -699,6 +908,8 @@ class KtorRelayTransport(
 
                     when (val msg = json.decodeFromString<RelayMessage>(text)) {
                         is RelayMessage.Deliver -> {
+                            currentSessionStats?.takeIf { it.sessionEpoch == mySession }
+                                ?.let { it.deliversReceived += 1 }
                             relayLog(
                                 RelayLogLevel.INFO,
                                 "${genTag(mySession)} Received envelope: id=${msg.messageId.take(12)}… sealed=${msg.sealedSender.isNotEmpty()} payloadBytes=${msg.payload.length}",
@@ -712,6 +923,8 @@ class KtorRelayTransport(
                             // purposes any Ack tells us the wire roundtrip
                             // worked.
                             pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
+                            currentSessionStats?.takeIf { it.sessionEpoch == mySession }
+                                ?.let { it.acksReceived += 1 }
                             relayLog(
                                 RelayLogLevel.INFO,
                                 "${genTag(mySession)} Ack from relay: id=${msg.messageId.take(12)}… status=${msg.status}",
@@ -726,6 +939,10 @@ class KtorRelayTransport(
                             // ping_send, frames are arriving on a stale
                             // generation's reader.
                             lastPongMark = timeSource.markNow()
+                            currentSessionStats?.takeIf { it.sessionEpoch == mySession }?.let { stats ->
+                                stats.pongsReceived += 1
+                                stats.lastPongAtMs = Clock.System.now().toEpochMilliseconds()
+                            }
                             relayLog(
                                 RelayLogLevel.INFO,
                                 "${genTag(mySession)} pong_received",
