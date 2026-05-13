@@ -398,6 +398,18 @@ class KtorRelayTransport(
             RelayLogLevel.INFO,
             "${genTag()} connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
         )
+        // PR-H1e: emit one transport_diag line per connect() so logs from
+        // experimental APK builds are attributable. Reads the live values
+        // of every flag introduced in RelayTransportConfig so a flipped
+        // toggle is impossible to miss in retrospective analysis.
+        relayLog(
+            RelayLogLevel.INFO,
+            "${genTag()} transport_diag " +
+                "ws_ping=${RelayTransportConfig.EXPERIMENTAL_WS_PING_INTERVAL_MS ?: 15000} " +
+                "app_ping=${!RelayTransportConfig.EXPERIMENTAL_DISABLE_APP_PING} " +
+                "alarm_reconnect=${!RelayTransportConfig.EXPERIMENTAL_DISABLE_ALARM_RECONNECT} " +
+                "protocol=http1",
+        )
         // PR-F2: serialize lifecycle setup. The lock is held only while
         // we cancel the prior reconnect loop and launch a new one — never
         // across the suspending join() below — so racing connect()/
@@ -779,6 +791,16 @@ class KtorRelayTransport(
                     _state.value = TransportState.Reconnecting
                     forceReconnect()
                     break
+                }
+                // PR-H1e: app-level ping send is skippable for diagnostic
+                // builds. Dead-socket watchdog above continues to run — its
+                // input `lastInboundFrameMark` is refreshed by ANY inbound
+                // frame (Deliver, Ack, OkHttp WS Pong), so the watchdog
+                // remains live even when app pings are off. This isolates
+                // "does the app-level Ping/Pong layer cause the death cycle"
+                // from "is the WS-level Ping enough to keep things alive".
+                if (RelayTransportConfig.EXPERIMENTAL_DISABLE_APP_PING) {
+                    continue
                 }
                 // PR-H1a: explicit log per ping_send so we can see in test
                 // logs whether stale-session pingJobs continue writing after

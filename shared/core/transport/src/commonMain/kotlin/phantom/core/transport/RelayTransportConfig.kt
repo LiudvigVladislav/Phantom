@@ -115,4 +115,53 @@ object RelayTransportConfig {
     const val TCP_KEEPALIVE_IDLE_SECONDS = 15
     const val TCP_KEEPALIVE_INTERVAL_SECONDS = 5
     const val TCP_KEEPALIVE_COUNT = 3
+
+    // ── PR-H1e diagnostic flags (2026-05-13 night) ────────────────────────
+    //
+    // Test #37 confirmed PR-H1c reduced detection 155 s → 30–46 s and
+    // recovery 5 s → ~1 s with zero loss. But the underlying WS dies on
+    // BOTH МТС cellular AND emulator-on-dev-Wi-Fi every 30–60 s — same
+    // cycle on environments that share no carrier path. That points at
+    // something inside our stack rather than pure middlebox behaviour.
+    //
+    // PR-H1e is a diagnostic sprint, not a fix. These flags isolate one
+    // heartbeat layer at a time so a real-device test can attribute the
+    // cycle of death to a specific subsystem. Defaults preserve current
+    // behaviour — flipping any of them changes only diagnostic output and
+    // experimental wire timing, never user-facing logic.
+    //
+    // Each session start logs one `transport_diag` line (see
+    // KtorRelayTransport.connect) listing the live values, so logs from
+    // different APK builds remain attributable after the fact.
+
+    /**
+     * Override OkHttp WebSocket-protocol Ping interval (milliseconds).
+     * `null` = use the production default of 15 000 (set in
+     * `RelayTransportFactory`). Set to e.g. 5_000 to test architect's
+     * hypothesis that 15 s falls inside the middlebox's idle-eviction
+     * window. If the cycle of death extends past 5 s × N when this is
+     * lowered, the middlebox treats short bursts as activity and the
+     * problem domain is "ping cadence vs middlebox idle policy". If the
+     * cycle is unchanged, that hypothesis is ruled out.
+     */
+    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = null
+
+    /**
+     * If true, suppress the app-level RelayMessage.Ping/Pong loop in
+     * `KtorRelayTransport.startPing`. The dead-socket watchdog inside
+     * the same loop still runs (it ticks off `lastInboundFrameMark`,
+     * which OkHttp WS Pong frames refresh independently). Architect's
+     * hypothesis: four parallel heartbeat layers (app Ping, OkHttp WS
+     * Ping, AlarmManager keepalive, TCP keepalive) may trip carrier DPI
+     * or anomaly detection. Removing the noisiest layer tests this.
+     */
+    val EXPERIMENTAL_DISABLE_APP_PING: Boolean = false
+
+    /**
+     * If true, `PhantomWakeupReceiver` skips its proactive
+     * `forceReconnect()` decision — useful in combination with the two
+     * flags above to isolate which subsystem actually closes the dying
+     * socket. Defaults remain the production-validated PR-H1c behaviour.
+     */
+    val EXPERIMENTAL_DISABLE_ALARM_RECONNECT: Boolean = false
 }

@@ -51,7 +51,14 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // do not double-up Pong handling — only OkHttp engine emits Ping.
         // The relay's Message::Ping arm in routes.rs (PR-F2-relay) already
         // handles WS-protocol Ping correctly: pong on the same socket.
-        .pingInterval(15, TimeUnit.SECONDS)
+        //
+        // PR-H1e diagnostic override: if EXPERIMENTAL_WS_PING_INTERVAL_MS
+        // is non-null, use it instead of the 15 s default. See the flag's
+        // docstring in RelayTransportConfig.
+        .pingInterval(
+            RelayTransportConfig.EXPERIMENTAL_WS_PING_INTERVAL_MS ?: 15_000L,
+            TimeUnit.MILLISECONDS,
+        )
         // readTimeout is the OS-level backstop only. After ADR-010
         // "Updated 2026-05-01" the primary teardown path on pong/ack
         // timeout is `generationClient.close()` which destroys the
