@@ -524,6 +524,15 @@ class KtorRelayTransport(
                 RelayLogLevel.INFO,
                 "${genTag(mySession)} Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
             )
+            // PR-H1e timeline marker. The `t=` field is wall-clock epoch
+            // ms — directly comparable with tcpdump pcap timestamps after
+            // converting via `editcap -t`. Distinct `H1E_MARK` prefix so a
+            // single grep over logcat extracts the reconnect-loop story
+            // independent of every other log line.
+            relayLog(
+                RelayLogLevel.INFO,
+                "H1E_MARK reconnect_start t=${Clock.System.now().toEpochMilliseconds()} attempt=$attempt session=$mySession",
+            )
             // PR-H1b: capture-on-exit fields populated inside try/catch and
             // read once from the finally block for `session_summary`. Local
             // vars (not @Volatile fields) because only this coroutine reads
@@ -552,6 +561,11 @@ class KtorRelayTransport(
                     sessionStats = stats
                     _state.value = TransportState.Connected
                     relayLog(RelayLogLevel.INFO, "${genTag(mySession)} WebSocket connected successfully")
+                    // PR-H1e timeline marker (paired with reconnect_start above).
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "H1E_MARK reconnect_success t=${Clock.System.now().toEpochMilliseconds()} session=$mySession",
+                    )
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -612,6 +626,16 @@ class KtorRelayTransport(
                     RelayLogLevel.ERROR,
                     "${genTag(mySession)} WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
                     e,
+                )
+                // PR-H1e timeline marker. SocketTimeoutException("sent ping
+                // but didn't receive pong within Nms") is the OkHttp WS-
+                // protocol Ping path — the principal death-detection route
+                // since PR-H1c. Tagging it lets pcap analysis pinpoint the
+                // exact moment OkHttp gave up so we can correlate with what
+                // was on the wire 0–15 s prior.
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "H1E_MARK ws_ping_timeout t=${Clock.System.now().toEpochMilliseconds()} type=${e::class.simpleName} session=$mySession",
                 )
                 if (disconnectRequested) break
                 val delayMs = min(
