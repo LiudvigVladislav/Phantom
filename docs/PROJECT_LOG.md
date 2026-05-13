@@ -361,6 +361,105 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-13 (tue) · First-message yellow-dot hunt — PR-G3 prekey tracing + PR-G4 REST forced HTTP/1.1
+
+- **Goal.** Test #28 (2026-05-12) reproduced the recurring "yellow dot
+  for two minutes on first message to a fresh contact" symptom.
+  Earlier hypotheses (timing race during peer onboarding, retry
+  cadence too slow, prekey lifecycle never publishing) were all
+  rejected once PR-G3 telemetry landed and gave us a clean signal.
+- **PR #123 `fix/prekey-publish-tracing-pr-g3`** — observability-only
+  diagnostic patch (no behaviour change). Added structured
+  `PREKEY_TRACE` logs at every stage of the prekey lifecycle:
+  - `PreKeyLifecycleService` — `bootstrap_start/skip/done`,
+    `upload_start/ok/fail` with elapsed-ms and reason tag,
+    `verify_start/status/republish_triggered`.
+  - `PreKeyApiClient` — `http_publish_start/done/fail`,
+    `http_bundle_fetch_start/done/fail`, `http_status_start/done/fail`
+    with the actual URL and HTTP status code.
+  - `DefaultMessagingService` — bundle-fetch path now distinguishes
+    `prekey_fetch_result=200|404|timeout|429|http<code>` with
+    elapsed-ms; the previous WARN collapsed every failure mode into
+    "treated as 404".
+- **What the new traces revealed in Test #29.** With a clean wipe and
+  emu started before phone, the phone's bundle fetch for the emu
+  identity timed out at exactly 8009 ms × 4 in a row; emu's own
+  publish hung 20.7 s then 39.5 s before `SocketException: Connection
+  reset` from `Http2Reader.readConnectionPreface`. **Yet** the relay
+  side's `verify_status` returned `opks_remaining=100` for the same
+  identity within 17 s, and a `curl` from the VPS itself fetched the
+  bundle in 242 ms (HTTP 200, 634 bytes). Server was healthy
+  (`docker stats`: 0.01 % CPU, 2.1 MiB RAM). Caddy access log showed
+  the phone's failed bundle GETs **not arriving at Caddy at all** —
+  the requests died inside OkHttp before any bytes hit the wire.
+  Failed POST publishes from emu were logged with `bytes_read: 0`
+  after 30 s and `408 Request Timeout`: client opened the H2 stream,
+  sent headers (`Content-Length: 13903`), then never delivered the
+  body. **Root cause: OkHttp's HTTP/2 implementation gets stuck on
+  REST requests** — both on stream upload (server sees no body) and
+  on stale-connection reuse from the pool (request never sent).
+- **PR #124 `fix/rest-http1-only-pr-g4`** — one-line behavioural fix:
+  pin the REST `OkHttpClient` to `Protocol.HTTP_1_1` only. The WS
+  factory was already pinned to H1.1 (Upgrade requires it). iOS uses
+  Darwin (URLSession), JVM uses Ktor defaults, both unaffected. Caddy
+  speaks both H1.1 and H2; access logs show many H1.1 REST clients
+  completing in <2 ms — there is no throughput cost at our request
+  volume. Trades H2 multiplexing we do not need for reliability we
+  do; if/when we revisit H2 the fix is upstream in OkHttp / Ktor's
+  okhttp engine, not patchable from app code.
+- **Test #30 (post-PR-G4 retest).**
+  - Emu publish bootstrap: **829 ms → 201** (Test #29: 20.7 s + 39.5 s
+    timeouts).
+  - Phone publish bootstrap: **541 ms → 201** (was already fine on H2,
+    still fine on H1.1).
+  - Phone fetch emu bundle on first message: **151 ms → 200 OK on the
+    first try** (Test #29: 8009 ms timeout × 4, then a sweep eventually
+    succeeded ~3 minutes later).
+  - First message envelope sent within **484 ms of `send_start`**, no
+    DEFERRED, no WAITING. Yellow-dot reproduction step is gone.
+- **What is left as tech debt** (not blockers, scoped out of PR-G4):
+  - **WS pong timeout cycle every 60–110 s** on both devices. Pong
+    drift escalates only after the first envelope is sent (`pong fresh
+    9962 ms` → user sends → `pong fresh 40288 ms` → `Pong timeout
+    69914 ms`), then `forceReconnect`. Auto-recovery works (re-queue
+    + flush + ACK ~200 ms post-reconnect), so messages still arrive,
+    but the user sees momentary "lagging" UI. Open as PR-H1
+    (WebSocket heartbeat hardening).
+  - **One stale-H1.1 case on `verify_status`** (30 053 ms
+    `SocketTimeoutException` from `Http1ExchangeCodec`,
+    `Caused by: SocketException: Socket closed`). Background path,
+    happened once per six-minute test, recovers on next reconnect.
+    Low priority — connection-pool tuning, not a behavioural bug.
+  - **PR-G5 (UX text + bootstrap gate + fast retry)** proposed by the
+    architect earlier — now genuinely cosmetic since PR-G4 fixed the
+    underlying race. Deferred until WS stability lands.
+- **Process notes.**
+  - The architect initially attributed the failure to a peer-publish
+    timing race ("recipient publishes ~10 s after sender fetches,
+    retry sweep delivers later") and recommended PR-G4 as a fast-retry
+    cadence (5 → 10 → 20 → 40 → 60 s). The PR-G3 traces and Caddy
+    access logs disproved this: bundle was on the relay before the
+    phone's first send, and the relay never saw the failed fetches.
+    Recorded as a confirmation of the durable feedback rule
+    "diagnose first, do not fix from architectural intuition alone."
+  - PR-G3 originally pushed with two files instead of the three
+    promised; user caught it, fix-up commit added the third file
+    (`PreKeyApiClient.kt`) before the PR went out.
+  - PR-G3 first push was stacked on a stale local PR-G1 commit
+    (`f373bf44`); GitHub had already squash-merged G1 under a new SHA.
+    Rebased `--onto origin/master` to drop the duplicate before PR
+    review.
+- **Memory + plan implications.**
+  - `feedback_seven_times_measure.md` reinforced — PR-G4 flagged a
+    diagnose-only retro for one missed pre-push check (PR base
+    branch). The 7-point ritual stays mandatory.
+  - NLnet is still off the table (decided 2026-05-12); these PRs are
+    pure reliability work for other grants and the eventual public
+    release.
+  - APK output path standardised: `apps/android/build/outputs/apk/debug/`
+    is the single source for all in-flight test builds. `Releases/`
+    is reserved for signed release builds only.
+
 ### 2026-05-12 (mon) · Transport mini-sprint continued — PR-D (rotation reorder) + Briar bridge research + PR-E (RU-tuned bridges with Google AMP fallback)
 
 - **Goal.** Test #5 (МТС Wi-Fi without VPN, 2026-05-11) showed all four
