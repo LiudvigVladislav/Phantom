@@ -2,8 +2,8 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-05-12  
-**Master HEAD:** Track A complete (5 PRs ✅). Track B items 1–8 ALL merged — **Kickstarter security blockers closed**. F11+F26 signed-challenge auth production-validated on Tecno МТС + emulator with the new APK 2026-05-09. **Transport reliability mini-sprint extended to 11 PRs (#103–#113) merged 2026-05-10/12 — closed-success 2026-05-11 21:32 МТС.** Reality+VPN audited and gated, Tor staged-UX shipped, bridge profile rotation live and re-tuned per МТС data, Briar's RU-tuned bridge set imported (Snowflake-via-Google-AMP fallback). **🎉 Test #6 confirms Ghost on МТС WITHOUT VPN works** — `Online via Tor · Ghost` in ~6 minutes via KitchenSink (1/4) on the very first attempt; bootstrap reached 100 %, probe 200 OK, WS handshake successful through onion. First captured logcat proof of Ghost-without-VPN on a Russian carrier network in PHANTOM's history.  
+**Last updated:** 2026-05-13  
+**Master HEAD:** Track A complete (5 PRs ✅). Track B items 1–8 ALL merged — **Kickstarter security blockers closed**. F11+F26 signed-challenge auth production-validated on Tecno МТС + emulator with the new APK 2026-05-09. **Transport reliability mini-sprint extended to 11 PRs (#103–#113) merged 2026-05-10/12 — closed-success 2026-05-11 21:32 МТС.** Reality+VPN audited and gated, Tor staged-UX shipped, bridge profile rotation live and re-tuned per МТС data, Briar's RU-tuned bridge set imported (Snowflake-via-Google-AMP fallback). **🎉 Test #6 confirms Ghost on МТС WITHOUT VPN works** — `Online via Tor · Ghost` in ~6 minutes via KitchenSink (1/4) on the very first attempt; bootstrap reached 100 %, probe 200 OK, WS handshake successful through onion. First captured logcat proof of Ghost-without-VPN on a Russian carrier network in PHANTOM's history. **🎉 First-message reliability sprint — PR-G3 (#123) + PR-G4 (#124) merged 2026-05-13, root cause "yellow dot for two minutes on first message to a new contact" closed.** Test #30 confirms: Phone bundle-fetch went from 8009 ms × 4 timeouts to **151 ms × 1 OK**; emu publish went from 20.7 s + 39.5 s `Connection reset` to **829 ms → 201**. WS pong-timeout cycle remains as tech debt — open as PR-H1 (heartbeat hardening).  
 **Ближайший release window:** 2026-06-01 (20 days); council-revised plan targets submit on day 15 = 2026-05-22 with a 10-day buffer.
 
 ---
@@ -90,6 +90,28 @@ PR-E's Snowflake-via-Google-AMP fallback routes broker-discovery TLS through Goo
 - BridgeDB-on-device fetcher (Vladislav's plan Option 3): Briar research showed Briar does not have one either — value is in bridge data freshness, not the fetcher per se. Deferred until bridge-freshness becomes the bottleneck.
 - Cross-operator testing (Beeline / Megafon / Tele2): needs additional SIM cards, deferred until accessible.
 - Retrospective ADR documenting bridge rotation strategy (architect-recommended).
+
+### First-message reliability sprint (2026-05-13) — PR-G3 + PR-G4 merged ✅
+
+Triggered by Test #28 (2026-05-12) which reproduced the recurring "yellow dot for two minutes on first message to a new contact" symptom. PR-G3 (observability) and PR-G4 (REST forced HTTP/1.1) closed the root cause within one session.
+
+| # | PR | Задача | Статус |
+|---|----|--------|--------|
+| 1 | [#123](https://github.com/LiudvigVladislav/Phantom/pull/123) | **PR-G3 (diag):** structured `PREKEY_TRACE` logs across `PreKeyLifecycleService`, `PreKeyApiClient`, and `DefaultMessagingService` — bootstrap/upload/verify lifecycle, HTTP-level URL+status+elapsed-ms, distinguish bundle-fetch result `200|404|timeout|429|http<code>` (was previously collapsed to "treated as 404") | ✅ merged `f90ac90c` |
+| 2 | [#124](https://github.com/LiudvigVladislav/Phantom/pull/124) | **PR-G4:** pin REST `OkHttpClient` to `Protocol.HTTP_1_1` only (WS already pinned to H1.1, iOS uses Darwin, JVM uses Ktor defaults — all unchanged) | ✅ merged `245c6f09` |
+
+**What the new traces revealed in Test #29.** With a clean wipe and emu started before phone, phone's bundle fetch for the emu identity timed out at exactly **8009 ms × 4 in a row**; emu's own publish hung **20.7 s then 39.5 s** before `SocketException: Connection reset` from `Http2Reader.readConnectionPreface`. Yet `verify_status` returned `opks_remaining=100` for the same identity within 17 s, and a `curl` from the relay VPS itself fetched the bundle in **242 ms** (HTTP 200, 634 bytes). Caddy access log showed phone's failed bundle GETs **not arriving at Caddy at all** — requests died inside OkHttp before any bytes hit the wire. Failed POSTs from emu logged with `bytes_read: 0` after 30 s and `408 Request Timeout`: client opened the H2 stream, sent headers (`Content-Length: 13903`), then never delivered the body. **Root cause: OkHttp's HTTP/2 implementation gets stuck on REST requests** — both on stream upload and on stale-connection reuse from the pool.
+
+**Test #30 (post-PR-G4 retest):**
+- Emu publish bootstrap: **829 ms → 201** (was: 20.7 s + 39.5 s timeouts).
+- Phone publish bootstrap: **541 ms → 201**.
+- Phone fetch emu bundle on first message: **151 ms → 200 OK on the first try** (was: 8009 ms timeout × 4, then sweep eventually succeeded ~3 minutes later).
+- First message envelope sent within **484 ms of `send_start`**, no DEFERRED, no WAITING. **Yellow-dot reproduction step is gone.**
+
+**Deferred follow-ups (open as PR-H1):**
+- WS pong timeout cycle every 60–110 s on both devices. Pong drift escalates only after the first envelope is sent (`pong fresh 9962 ms` → user sends → `pong fresh 40288 ms` → `Pong timeout 69914 ms`), then `forceReconnect`. Auto-recovery works (re-queue + flush + ACK ~200 ms post-reconnect), so messages still arrive but the user sees momentary "lagging" UI.
+- One stale-H1.1 case on `verify_status` (30 053 ms `SocketTimeoutException` from `Http1ExchangeCodec`). Background path, low priority — connection-pool tuning.
+- PR-G5 (UX text + bootstrap gate + fast retry) proposed by the architect — now genuinely cosmetic since PR-G4 fixed the underlying race. Deferred until WS stability lands.
 
 ---
 
