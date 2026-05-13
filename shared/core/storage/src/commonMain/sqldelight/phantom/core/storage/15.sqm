@@ -1,0 +1,17 @@
+-- 15.sqm — processed_envelopes ledger for idempotent receive (PR-H2b).
+--
+-- Adds a single new table with no foreign-key references, no impact on
+-- existing rows. Forward-only: every Alpha 2 install upgrades cleanly
+-- without a `pm clear`. The table starts empty; first envelope received
+-- after the upgrade populates the first row.
+--
+-- See ProcessedEnvelope.sq for full rationale, columns, and queries.
+
+CREATE TABLE processed_envelopes (
+    envelope_id       TEXT NOT NULL PRIMARY KEY,
+    conversation_id   TEXT NOT NULL,
+    sender_pubkey_hex TEXT NOT NULL,
+    payload_type      TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    created_at_ms     INTEGER NOT NULL
+);

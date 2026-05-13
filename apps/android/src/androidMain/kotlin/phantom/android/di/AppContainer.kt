@@ -42,6 +42,7 @@ import phantom.core.storage.SqlDelightConversationRepository
 import phantom.core.storage.SqlDelightGroupRepository
 import phantom.core.storage.SqlDelightIdentityRepository
 import phantom.core.storage.SqlDelightMessageRepository
+import phantom.core.storage.SqlDelightProcessedEnvelopeRepository
 import phantom.core.storage.SqlDelightRatchetStateRepository
 import phantom.core.storage.SqlDelightReactionRepository
 import phantom.core.storage.SqlDelightSenderKeyRepository
@@ -106,6 +107,11 @@ class AppContainer(private val context: Context) {
     val reactionRepo     = SqlDelightReactionRepository(dbHolder.database)
     val groupRepo        = SqlDelightGroupRepository(dbHolder.database)
     val senderKeyRepo    = SqlDelightSenderKeyRepository(dbHolder.database)
+    // PR-H2b (2026-05-13): idempotent envelope ledger. See
+    // ProcessedEnvelope.sq for full rationale; in short, it stops the
+    // relay's at-least-once delivery from MAC-failing the ratchet on
+    // the second decrypt of a re-delivered envelope after a lost ack.
+    val processedEnvelopeRepo = SqlDelightProcessedEnvelopeRepository(dbHolder.database)
 
     // Starts immediately — deletes expired messages while the app is alive.
     private val disappearingMessageScheduler = DisappearingMessageScheduler(messageRepo, appScope)
@@ -411,6 +417,13 @@ class AppContainer(private val context: Context) {
         // (continues in background as long as the process is alive;
         // a foreground service or WorkManager job would harden this
         // against process death — flagged for future work).
+        //
+        // PR-H2b (2026-05-13): also runs the processed-envelopes ledger
+        // TTL sweep (8 days, one day longer than the relay's 7-day
+        // envelope TTL) so the table cannot grow unbounded. Piggybacks
+        // on the existing ticker rather than launching a second one —
+        // process resources are scarce on low-end Tecno hardware and
+        // a separate scheduler buys nothing.
         appScope.launch {
             while (true) {
                 kotlinx.coroutines.delay(24 * 60 * 60 * 1000L)
@@ -418,6 +431,12 @@ class AppContainer(private val context: Context) {
                     .onFailure {
                         android.util.Log.w("PreKeyLifecycle", "Replenish failed: ${it.message}")
                     }
+                runCatching {
+                    val cutoff = System.currentTimeMillis() - 8L * 24 * 60 * 60 * 1000L
+                    processedEnvelopeRepo.deleteOlderThan(cutoff)
+                }.onFailure {
+                    android.util.Log.w("ProcessedEnvelopes", "TTL sweep failed: ${it.message}")
+                }
                 runCatching { lifecycleService.maybeRotateSignedPreKey() }
                     .onFailure {
                         android.util.Log.w("PreKeyLifecycle", "Rotate failed: ${it.message}")
@@ -433,6 +452,7 @@ class AppContainer(private val context: Context) {
             transport = transport,
             messageRepository = messageRepo,
             conversationRepository = conversationRepo,
+            processedEnvelopeRepository = processedEnvelopeRepo,
             scope = appScope,
             json = json,
             reactionRepository = reactionRepo,

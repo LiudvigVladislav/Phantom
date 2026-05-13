@@ -1,0 +1,115 @@
+-- ProcessedEnvelope.sq — idempotent receive ledger (PR-H2b, 2026-05-13).
+--
+-- WHY THIS EXISTS
+--
+-- The relay holds every undelivered envelope until the recipient sends an
+-- explicit `ack-deliver` frame. If the WebSocket dies between the receiver's
+-- successful decrypt and the wire-write of that ack, the relay assumes the
+-- envelope was lost and re-delivers on the next connect. The receiver then
+-- runs decrypt a SECOND time on the same ciphertext — but the Double Ratchet
+-- chain key advanced on the first call, so the second decrypt fails MAC
+-- verification. The envelope is dropped, the user sees "message disappeared",
+-- and crypto invariants make recovery impossible.
+--
+-- This was reproduced in Test #34 (2026-05-13) on both phone and emu after
+-- PR-H2a closed sender-side reorder. Two distinct envelopes (one
+-- read_receipt per device) hit the second decrypt path with chain
+-- already advanced and silently MAC-failed.
+--
+-- FIX
+--
+-- Remember every envelope id we have ever fed to ratchet.decrypt, regardless
+-- of payload type (user message, read receipt, control frame, voice chunk,
+-- delivery receipt — all of them). On the next handleDeliver, check this
+-- table FIRST: if the id is here, send ack-deliver and return without
+-- touching the ratchet. The relay's redelivery is a no-op for the receiver.
+--
+-- The pre-existing `alreadyProcessed` guard via `messages.id` only caught
+-- user-message envelopes (those that get inserted into the messages table).
+-- Read receipts, reactions, and other non-message payloads were not
+-- protected because they are not stored as DB rows.
+--
+-- TTL
+--
+-- 8 days, intentionally one day longer than the relay's 7-day envelope TTL.
+-- After 8 days the relay has dropped the envelope from its store, so the
+-- receiver will never see it again, and the ledger row is safe to evict.
+
+CREATE TABLE processed_envelopes (
+    -- The envelope's wire id (RelayMessage.Send.messageId / Deliver.messageId).
+    -- Same identifier across send / receive / re-deliver, so it uniquely
+    -- pins a ciphertext to a single ratchet position.
+    envelope_id TEXT NOT NULL PRIMARY KEY,
+
+    -- Conversation this envelope belongs to (deriveConversationId of
+    -- sender + local identity). Kept for diagnostics + future per-conv
+    -- audit / cleanup queries; not part of the lookup key because
+    -- envelope_id is already globally unique.
+    conversation_id TEXT NOT NULL,
+
+    -- Sender's identity public key hex (recovered from sealed sender on
+    -- the receive path). Kept for forensics — when MAC errors cluster
+    -- around one peer we want to grep this column without re-parsing
+    -- sealed envelopes.
+    sender_pubkey_hex TEXT NOT NULL,
+
+    -- One of: 'message', 'read_receipt', 'reaction', 'control',
+    -- 'group_message', 'unknown'. Free-form TEXT (not an enum) so a
+    -- future payload type doesn't require a migration to log it. Used
+    -- for diagnostics — knowing whether MAC failures hit message vs
+    -- read_receipt streams tells us where the duplicate came from.
+    payload_type TEXT NOT NULL,
+
+    -- 'processed' = decrypt succeeded, payload acted on, ack sent.
+    -- 'failed_mac' = decrypt failed MAC verification on FIRST try
+    -- (chain divergence — pre-migration envelope, future skip-key gap,
+    -- or the duplicate-after-ack case this whole table is fixing).
+    -- Logged for post-mortem but treated identically by the dedupe
+    -- check: both block re-entry into ratchet.decrypt on retry.
+    status TEXT NOT NULL,
+
+    -- Wall-clock (epoch ms) when this row was written. Drives the 8-day
+    -- TTL sweep and lets the dev-time log show "this envelope was first
+    -- seen N hours ago, still being redelivered".
+    created_at_ms INTEGER NOT NULL
+);
+
+-- Hot path query — every incoming envelope hits this once before
+-- ratchet.decrypt. Indexed via PRIMARY KEY (envelope_id), so this is
+-- an O(log n) point lookup on a table that stays under ~1k rows even
+-- under aggressive TTL settings (the relay TTL caps total live envelope
+-- count per peer at the network's send rate × 7 days).
+exists:
+SELECT EXISTS (
+    SELECT 1 FROM processed_envelopes WHERE envelope_id = ?
+);
+
+-- Recorded after a successful (or MAC-failed) decrypt. INSERT OR IGNORE
+-- because in the rare race where two coroutines reach handleDeliver for
+-- the same envelope id before either completes, both will try to insert
+-- — the second one no-ops cleanly without raising a constraint error
+-- that would propagate up the runCatching block.
+markProcessed:
+INSERT OR IGNORE INTO processed_envelopes(
+    envelope_id,
+    conversation_id,
+    sender_pubkey_hex,
+    payload_type,
+    status,
+    created_at_ms
+)
+VALUES (?, ?, ?, ?, ?, ?);
+
+-- TTL sweep — runs periodically (see MessageMaintenanceService).
+-- The cutoff_ms parameter is `Clock.System.now() - 8.days`.
+deleteOlderThan:
+DELETE FROM processed_envelopes WHERE created_at_ms < ?;
+
+-- Diagnostic — lets QA / on-device debug log show how many recent MAC
+-- failures the user is hitting. Not used in any production hot path.
+countByStatus:
+SELECT status, COUNT(*) AS cnt FROM processed_envelopes GROUP BY status;
+
+-- Wipe (used by the same migration / test-reset paths as the other repos).
+deleteAll:
+DELETE FROM processed_envelopes;

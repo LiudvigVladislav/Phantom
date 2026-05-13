@@ -36,6 +36,7 @@ import phantom.core.storage.ConversationRepository
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
+import phantom.core.storage.ProcessedEnvelopeRepository
 import phantom.core.storage.ReactionRepository
 import phantom.core.storage.TrustTier
 import phantom.core.transport.BundleFetchException
@@ -51,6 +52,18 @@ class DefaultMessagingService(
     private val transport: RelayTransport,
     private val messageRepository: MessageRepository,
     private val conversationRepository: ConversationRepository,
+    /**
+     * Idempotent receive ledger (PR-H2b, 2026-05-13). Every envelope id
+     * fed to `ratchet.decrypt` is recorded here regardless of payload
+     * type, so a relay-side redelivery (after a lost ack-deliver frame)
+     * cannot trigger a second decrypt attempt that would MAC-fail on
+     * the now-advanced chain key.
+     *
+     * Nullable + default null to keep call-site compatibility for
+     * existing tests that construct DMS without storage. Production
+     * always wires the real SQLDelight repository through AppContainer.
+     */
+    private val processedEnvelopeRepository: ProcessedEnvelopeRepository? = null,
     private val scope: CoroutineScope,
     private val json: Json = Json { ignoreUnknownKeys = true },
     private val reactionRepository: ReactionRepository? = null,
@@ -649,17 +662,44 @@ class DefaultMessagingService(
                 "Sender identified: ${senderPubKeyHex.take(16)}…",
             )
 
-            // Idempotent receive. The relay re-delivers every still-stored
-            // envelope on reconnect; without this guard a duplicate would
-            // fall into ratchet.decrypt with a chain key that has already
-            // advanced past it (MAC failure) and the message would never get
-            // ack-deliver'd, so the relay would replay it forever.
-            // Sending ack-deliver here breaks the loop cleanly.
+            // PR-H2b (2026-05-13): idempotent envelope ledger guard.
+            // Runs BEFORE ratchet.decrypt so a duplicate redelivery cannot
+            // advance the chain key a second time and MAC-fail.
+            //
+            // Test #34 (2026-05-13) reproduced exactly this: phone read-
+            // receipt 5b5c4faa decrypted successfully on first delivery,
+            // its ack-deliver was lost when the WS reconnected mid-write,
+            // the relay re-delivered, the second decrypt MAC-failed
+            // because the ratchet chain had already advanced. The
+            // pre-existing `messages.id` check below only caught
+            // user-message envelopes (read_receipts and other control
+            // payloads were never inserted into the messages table).
+            // The new ledger covers ALL payload types.
+            //
+            // Backward compat: when `processedEnvelopeRepository == null`
+            // (older test setups, no SQLDelight) we fall through to the
+            // legacy `messages.id` check below. Production always wires
+            // the real repository.
+            if (processedEnvelopeRepository?.exists(deliver.messageId) == true) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "Duplicate envelope (already in ledger): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping decrypt",
+                )
+                transport.sendDeliveryAck(deliver.messageId)
+                return@runCatching
+            }
+
+            // Pre-PR-H2b legacy guard kept as defence-in-depth: catches
+            // duplicates among ledger-less envelopes that happen to be
+            // stored as messages (the common case before this PR landed).
+            // Once every install has run for >8 days the ledger TTL will
+            // hold all live ids and this branch becomes unreachable, but
+            // there's no rush to remove it.
             val alreadyProcessed = messageRepository.getMessageById(deliver.messageId) != null
             if (alreadyProcessed) {
                 messagingLog(
                     MessagingLogLevel.INFO,
-                    "Duplicate envelope (already in DB): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping",
+                    "Duplicate envelope (already in messages DB): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping",
                 )
                 transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
@@ -737,6 +777,23 @@ class DefaultMessagingService(
                             MessagingLogLevel.INFO,
                             "Decrypt OK: plaintextBytes=${decrypted.size}",
                         )
+                        // PR-H2b: record the envelope id BEFORE we leave
+                        // the per-conversation mutex so a concurrent
+                        // redelivery cannot squeak through the ledger
+                        // check and re-enter ratchet.decrypt. payload_type
+                        // is only known after JSON-parsing the plaintext
+                        // below; we record "unknown" here and rely on the
+                        // markProcessed INSERT OR IGNORE semantics if a
+                        // second markProcessed call later wants to refine
+                        // it (it won't — there's no such call path).
+                        processedEnvelopeRepository?.markProcessed(
+                            envelopeId = deliver.messageId,
+                            conversationId = conversationId,
+                            senderPubKeyHex = senderPubKeyHex,
+                            payloadType = "unknown",
+                            status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                            nowMs = Clock.System.now().toEpochMilliseconds(),
+                        )
                         decrypted
                     } catch (e: IllegalArgumentException) {
                         // ADR-012 / 2026-05-01 audit finding: a MAC
@@ -759,6 +816,20 @@ class DefaultMessagingService(
                                 "Permanent decrypt failure (MAC error) — ack-deliver'ing to clear " +
                                     "relay store. id=${deliver.messageId.take(12)}… " +
                                     "conv=${conversationId.take(16)}… err=${e.message}",
+                            )
+                            // PR-H2b: pin this envelope id with FAILED_MAC
+                            // so a future redelivery sees the ledger hit
+                            // and skips the (already-doomed) decrypt
+                            // attempt. The ledger row's diagnostic value
+                            // also helps QA grep for crypto-divergence
+                            // patterns per peer.
+                            processedEnvelopeRepository?.markProcessed(
+                                envelopeId = deliver.messageId,
+                                conversationId = conversationId,
+                                senderPubKeyHex = senderPubKeyHex,
+                                payloadType = "unknown",
+                                status = ProcessedEnvelopeRepository.Status.FAILED_MAC,
+                                nowMs = Clock.System.now().toEpochMilliseconds(),
                             )
                             transport.sendDeliveryAck(deliver.messageId)
                             return@withLock null
@@ -784,6 +855,16 @@ class DefaultMessagingService(
                             "Legacy envelope: no session for conv=${conversationId.take(16)}… " +
                                 "and no x3dhInit header — ack-deliver'ing to clear relay store: " +
                                 "id=${deliver.messageId.take(12)}…",
+                        )
+                        // PR-H2b: same as the MAC-fail path above —
+                        // record so a future redelivery skips immediately.
+                        processedEnvelopeRepository?.markProcessed(
+                            envelopeId = deliver.messageId,
+                            conversationId = conversationId,
+                            senderPubKeyHex = senderPubKeyHex,
+                            payloadType = "unknown",
+                            status = ProcessedEnvelopeRepository.Status.FAILED_MAC,
+                            nowMs = Clock.System.now().toEpochMilliseconds(),
                         )
                         transport.sendDeliveryAck(deliver.messageId)
                         return@withLock null
@@ -812,6 +893,18 @@ class DefaultMessagingService(
                     messagingLog(
                         MessagingLogLevel.INFO,
                         "Decrypt OK after bootstrap: plaintextBytes=${decrypted.size}",
+                    )
+                    // PR-H2b: same ledger insert as the existing-session
+                    // branch above. Bootstrap path lands here once per
+                    // conversation; subsequent messages take the existing
+                    // branch.
+                    processedEnvelopeRepository?.markProcessed(
+                        envelopeId = deliver.messageId,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = "unknown",
+                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                        nowMs = Clock.System.now().toEpochMilliseconds(),
                     )
                     decrypted
                 }
