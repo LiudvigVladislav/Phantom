@@ -398,18 +398,6 @@ class KtorRelayTransport(
             RelayLogLevel.INFO,
             "${genTag()} connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
         )
-        // PR-H1e: emit one transport_diag line per connect() so logs from
-        // experimental APK builds are attributable. Reads the live values
-        // of every flag introduced in RelayTransportConfig so a flipped
-        // toggle is impossible to miss in retrospective analysis.
-        relayLog(
-            RelayLogLevel.INFO,
-            "${genTag()} transport_diag " +
-                "ws_ping=${RelayTransportConfig.EXPERIMENTAL_WS_PING_INTERVAL_MS ?: 15000} " +
-                "app_ping=${!RelayTransportConfig.EXPERIMENTAL_DISABLE_APP_PING} " +
-                "alarm_reconnect=${!RelayTransportConfig.EXPERIMENTAL_DISABLE_ALARM_RECONNECT} " +
-                "protocol=http1",
-        )
         // PR-F2: serialize lifecycle setup. The lock is held only while
         // we cancel the prior reconnect loop and launch a new one — never
         // across the suspending join() below — so racing connect()/
@@ -524,15 +512,6 @@ class KtorRelayTransport(
                 RelayLogLevel.INFO,
                 "${genTag(mySession)} Attempting WebSocket connect (attempt=$attempt): $redactedUrl",
             )
-            // PR-H1e timeline marker. The `t=` field is wall-clock epoch
-            // ms — directly comparable with tcpdump pcap timestamps after
-            // converting via `editcap -t`. Distinct `H1E_MARK` prefix so a
-            // single grep over logcat extracts the reconnect-loop story
-            // independent of every other log line.
-            relayLog(
-                RelayLogLevel.INFO,
-                "H1E_MARK reconnect_start t=${Clock.System.now().toEpochMilliseconds()} attempt=$attempt session=$mySession",
-            )
             // PR-H1b: capture-on-exit fields populated inside try/catch and
             // read once from the finally block for `session_summary`. Local
             // vars (not @Volatile fields) because only this coroutine reads
@@ -561,11 +540,6 @@ class KtorRelayTransport(
                     sessionStats = stats
                     _state.value = TransportState.Connected
                     relayLog(RelayLogLevel.INFO, "${genTag(mySession)} WebSocket connected successfully")
-                    // PR-H1e timeline marker (paired with reconnect_start above).
-                    relayLog(
-                        RelayLogLevel.INFO,
-                        "H1E_MARK reconnect_success t=${Clock.System.now().toEpochMilliseconds()} session=$mySession",
-                    )
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -626,16 +600,6 @@ class KtorRelayTransport(
                     RelayLogLevel.ERROR,
                     "${genTag(mySession)} WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
                     e,
-                )
-                // PR-H1e timeline marker. SocketTimeoutException("sent ping
-                // but didn't receive pong within Nms") is the OkHttp WS-
-                // protocol Ping path — the principal death-detection route
-                // since PR-H1c. Tagging it lets pcap analysis pinpoint the
-                // exact moment OkHttp gave up so we can correlate with what
-                // was on the wire 0–15 s prior.
-                relayLog(
-                    RelayLogLevel.INFO,
-                    "H1E_MARK ws_ping_timeout t=${Clock.System.now().toEpochMilliseconds()} type=${e::class.simpleName} session=$mySession",
                 )
                 if (disconnectRequested) break
                 val delayMs = min(
@@ -816,14 +780,14 @@ class KtorRelayTransport(
                     forceReconnect()
                     break
                 }
-                // PR-H1e: app-level ping send is skippable for diagnostic
-                // builds. Dead-socket watchdog above continues to run — its
-                // input `lastInboundFrameMark` is refreshed by ANY inbound
-                // frame (Deliver, Ack, OkHttp WS Pong), so the watchdog
-                // remains live even when app pings are off. This isolates
-                // "does the app-level Ping/Pong layer cause the death cycle"
-                // from "is the WS-level Ping enough to keep things alive".
-                if (RelayTransportConfig.EXPERIMENTAL_DISABLE_APP_PING) {
+                // PR-H1e (2026-05-14): app-level Ping is disabled in prod.
+                // The dead-socket watchdog above still runs every
+                // PING_INTERVAL_MS — its input `lastInboundFrameMark` is
+                // refreshed by ANY inbound frame (Deliver, Ack, OkHttp WS
+                // Pong) so liveness detection remains live without us
+                // emitting our own Ping frames. See RelayTransportConfig
+                // .APP_LEVEL_PING_ENABLED for the run-comparison data.
+                if (!RelayTransportConfig.APP_LEVEL_PING_ENABLED) {
                     continue
                 }
                 // PR-H1a: explicit log per ping_send so we can see in test

@@ -230,21 +230,6 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             return
         }
 
-        // PR-H1e diagnostic: skip the proactive reconnect entirely so a
-        // test build can observe whether the in-process pong-watchdog
-        // alone (or pure middlebox-driven RST) is what closes the
-        // dying session. Logs a distinct line so the skip is visible.
-        if (RelayTransportConfig.EXPERIMENTAL_DISABLE_ALARM_RECONNECT) {
-            Log.w(
-                TAG,
-                "PR-H1e: stale wire detected " +
-                    "(lastInbound=${inboundElapsed}ms, lastPong=${pongElapsed}ms, " +
-                    "connected=$connected, pendingAckCount=$pendingAcks) " +
-                    "— alarm-driven forceReconnect SKIPPED via EXPERIMENTAL_DISABLE_ALARM_RECONNECT",
-            )
-            return
-        }
-
         Log.w(
             TAG,
             "PR-H1c proactive reconnect: stale wire " +

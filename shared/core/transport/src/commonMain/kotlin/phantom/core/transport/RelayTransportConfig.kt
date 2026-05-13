@@ -4,18 +4,21 @@
 package phantom.core.transport
 
 object RelayTransportConfig {
-    // Application-level heartbeat: client sends RelayMessage.Ping on this cadence.
-    // Aggressive interval so a half-dead socket (TCP write buffer accepts the
-    // frame but the wire is broken) is detected within ~25 s instead of the
-    // 60-70 s the previous 20 s/50 s pair gave us.
+    // Tick cadence for the in-process dead-socket watchdog in
+    // KtorRelayTransport.startPing. Each tick checks `lastInboundFrameMark`
+    // against DEAD_SOCKET_TIMEOUT_MS so a wire that has gone silent is
+    // detected within roughly this interval. Since PR-H1e the same loop
+    // no longer emits app-level RelayMessage.Ping frames
+    // (APP_LEVEL_PING_ENABLED = false); 10 s is kept because it gives a
+    // responsive watchdog without measurable CPU/wakeup overhead.
     const val PING_INTERVAL_MS = 10_000L
 
-    // If the relay has not emitted a Pong for this long, declare the connection
-    // dead and force a reconnect. Bumped from 25 s to 60 s so a slow uplink
-    // saturated by a large envelope (e.g. an 80 KB voice note over cellular on
-    // an aggressive-OEM device that parks the radio) does not get torn down
-    // mid-upload. App-level Ping frames are still sent every 10 s; this only
-    // controls how long we tolerate silence before force-reconnecting.
+    // If no inbound frame has arrived from the relay for this long, declare
+    // the connection dead and force a reconnect (see DEAD_SOCKET_TIMEOUT_MS
+    // alias below — same value, distinct name used by the watchdog). 60 s
+    // chosen so a slow uplink saturated by a large envelope (e.g. an 80 KB
+    // voice note over cellular on an aggressive-OEM device that parks the
+    // radio) does not get torn down mid-upload.
     const val PONG_TIMEOUT_MS = 60_000L
 
     // How long a sent envelope may sit unacknowledged before it is treated as
@@ -116,52 +119,28 @@ object RelayTransportConfig {
     const val TCP_KEEPALIVE_INTERVAL_SECONDS = 5
     const val TCP_KEEPALIVE_COUNT = 3
 
-    // ── PR-H1e diagnostic flags (2026-05-13 night) ────────────────────────
+    // PR-H1e (2026-05-14) — app-level Ping disabled in production.
     //
-    // Test #37 confirmed PR-H1c reduced detection 155 s → 30–46 s and
-    // recovery 5 s → ~1 s with zero loss. But the underlying WS dies on
-    // BOTH МТС cellular AND emulator-on-dev-Wi-Fi every 30–60 s — same
-    // cycle on environments that share no carrier path. That points at
-    // something inside our stack rather than pure middlebox behaviour.
+    // The diagnostic sprint isolated each heartbeat layer (app Ping,
+    // OkHttp WS-protocol Ping, AlarmManager keepalive, TCP keepalive)
+    // across four runs on Tecno МТС cellular + emulator-on-dev-Wi-Fi:
     //
-    // PR-H1e is a diagnostic sprint, not a fix. These flags isolate one
-    // heartbeat layer at a time so a real-device test can attribute the
-    // cycle of death to a specific subsystem. Defaults preserve current
-    // behaviour — flipping any of them changes only diagnostic output and
-    // experimental wire timing, never user-facing logic.
+    //   Run 0  ws_ping=15s app_ping=on  → Phone 46.5s / Emu 39.5s
+    //   Run B  ws_ping= 5s app_ping=on  → Phone 21.8s / Emu 29.5s
+    //   Run C  ws_ping=15s app_ping=off → Phone 72.0s / Emu 56.4s   ← winner
+    //   Run BC ws_ping= 5s app_ping=off → Phone 30.9s / Emu 29.6s
     //
-    // Each session start logs one `transport_diag` line (see
-    // KtorRelayTransport.connect) listing the live values, so logs from
-    // different APK builds remain attributable after the fact.
-
-    /**
-     * Override OkHttp WebSocket-protocol Ping interval (milliseconds).
-     * `null` = use the production default of 15 000 (set in
-     * `RelayTransportFactory`). Set to e.g. 5_000 to test architect's
-     * hypothesis that 15 s falls inside the middlebox's idle-eviction
-     * window. If the cycle of death extends past 5 s × N when this is
-     * lowered, the middlebox treats short bursts as activity and the
-     * problem domain is "ping cadence vs middlebox idle policy". If the
-     * cycle is unchanged, that hypothesis is ruled out.
-     */
-    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = 5_000L  // Run B+C (PR-H1e): combine 5 s WS ping with app_ping=false. Hypothesis: 5 s ping itself triggers reconnect-noise. Expect cycle to shorten back vs Run C (~60-80 s); confirms WS ping cadence is the surviving killer.
-
-    /**
-     * If true, suppress the app-level RelayMessage.Ping/Pong loop in
-     * `KtorRelayTransport.startPing`. The dead-socket watchdog inside
-     * the same loop still runs (it ticks off `lastInboundFrameMark`,
-     * which OkHttp WS Pong frames refresh independently). Architect's
-     * hypothesis: four parallel heartbeat layers (app Ping, OkHttp WS
-     * Ping, AlarmManager keepalive, TCP keepalive) may trip carrier DPI
-     * or anomaly detection. Removing the noisiest layer tests this.
-     */
-    val EXPERIMENTAL_DISABLE_APP_PING: Boolean = true  // Run C (PR-H1e): suppress app-level RelayMessage.Ping to test whether it triggers DPI/middlebox/server kill path.
-
-    /**
-     * If true, `PhantomWakeupReceiver` skips its proactive
-     * `forceReconnect()` decision — useful in combination with the two
-     * flags above to isolate which subsystem actually closes the dying
-     * socket. Defaults remain the production-validated PR-H1c behaviour.
-     */
-    val EXPERIMENTAL_DISABLE_ALARM_RECONNECT: Boolean = false
+    // Two independent findings (both with paired controls):
+    //   1. Suppressing the app-level Ping/Pong loop ≈ doubles WS lifetime.
+    //   2. A 5-second OkHttp WS Ping is itself a kill trigger — its 5 s
+    //      pong-window is too tight and the cadence overrides the gain
+    //      from (1). 15 s is the safer cadence.
+    //
+    // OkHttp WS Ping stays at the production default 15 000 ms (set in
+    // `RelayTransportFactory`). AlarmManager-driven proactive reconnect
+    // stays enabled (Test #41 showed zero MAC errors / ledger dedup /
+    // FIFO flush issues with the alarm path live). Only the app-level
+    // Ping loop is disabled — its watchdog half (dead-socket detection
+    // on `lastInboundFrameMark`) continues to tick on PING_INTERVAL_MS.
+    const val APP_LEVEL_PING_ENABLED = false
 }
