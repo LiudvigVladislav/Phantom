@@ -144,7 +144,7 @@ object RelayTransportConfig {
      * problem domain is "ping cadence vs middlebox idle policy". If the
      * cycle is unchanged, that hypothesis is ruled out.
      */
-    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = null
+    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = 5_000L  // Run B (PR-H1e): test 5 s vs default 15 s — does middlebox count 15 s as idle?
 
     /**
      * If true, suppress the app-level RelayMessage.Ping/Pong loop in
