@@ -68,6 +68,9 @@ class FakeRelayTransportTest {
         // a real reconnect machinery for unit-test purposes; expose stable
         // values that won't trigger the alarm receiver's stale-pong path.
         override val lastPongElapsedMs: Long get() = 0L
+        // PR-H1c: same fixed-fresh value as lastPongElapsedMs so unit tests
+        // never trigger the alarm receiver's proactive-reconnect path.
+        override val lastInboundFrameElapsedMs: Long get() = 0L
 
         override val pendingAckCount: Int get() = 0
 

@@ -96,6 +96,17 @@ fun ConnectionBanner(
             label = "Connecting…"
             dotColor = Warning  // canonical amber from the design palette
         }
+        is TransportState.Reconnecting -> {
+            // PR-H1c (2026-05-13): emitted when the in-process pong watchdog
+            // / ack watchdog / sendRaw failure path notices the WS is stale
+            // and forceReconnect() is in flight. Distinct from Disconnected
+            // (no socket at all, possibly cold-start) and Error (terminal).
+            // Outbound sends still queue and flush once the new session
+            // lands — nothing is lost. Soft amber + "in flight" wording so
+            // the user does not think the app is broken.
+            label = "Reconnecting…"
+            dotColor = Warning
+        }
         is TransportState.Disconnected -> {
             label = "Offline — messages queued"
             dotColor = Danger

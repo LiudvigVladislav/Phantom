@@ -172,10 +172,35 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             return
         }
 
-        val elapsed = transport.lastPongElapsedMs
+        // PR-H1c (2026-05-13): proactive reconnect path uses lastInboundFrame,
+        // not lastPong. Test #35 confirmed the residual ~120 s pong-timeout
+        // cycle on Tecno HiOS is half-open TCP — radio park silently drops
+        // outbound packets while the OS still considers the socket healthy.
+        // The in-process pong watchdog catches it after DEAD_SOCKET_TIMEOUT_MS
+        // (60 s); this alarm catches it after ALARM_STALE_RECONNECT_MS (45 s)
+        // so on Tecno where alarm-driven wake actually surfaces the dead
+        // socket BEFORE app-level watchdog ticks, recovery shaves ~25-40 s
+        // off the visible cycle.
+        //
+        // The two thresholds are deliberately staggered (45 < 60) so the
+        // paths are non-racing: alarm fires first (proactive), pong watchdog
+        // only fires if the alarm was missed (e.g. AlarmManager throttled
+        // by Doze). 15 s of headroom prevents accidental double-trigger.
+        //
+        // Switched from `lastPongElapsedMs` to `lastInboundFrameElapsedMs`
+        // because under Tor / Reality and on networks with weird middleboxes
+        // the Pong-routing path may be selectively dropped while normal
+        // envelope traffic still flows — pong-only check would false-
+        // positive in those scenarios. Any inbound frame (Deliver, Ack,
+        // Pong, even malformed text) refreshes the mark.
+        val inboundElapsed = transport.lastInboundFrameElapsedMs
+        val pongElapsed = transport.lastPongElapsedMs
         val connected = transport.isConnected()
-        if (connected && elapsed < PONG_STALE_THRESHOLD_MS) {
-            Log.i(TAG, "pong fresh (${elapsed}ms) — no action")
+        if (connected && inboundElapsed < RelayTransportConfig.ALARM_STALE_RECONNECT_MS) {
+            Log.i(
+                TAG,
+                "wire fresh (lastInbound=${inboundElapsed}ms, lastPong=${pongElapsed}ms) — no action",
+            )
             return
         }
 
@@ -200,15 +225,16 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             Log.i(
                 TAG,
                 "Wakeup skipped: pendingAckCount=$pendingAcks, deferring to ACK watchdog " +
-                    "(pong elapsed=${elapsed}ms)",
+                    "(lastInbound=${inboundElapsed}ms, lastPong=${pongElapsed}ms)",
             )
             return
         }
 
         Log.w(
             TAG,
-            "stale pong (${elapsed}ms) or transport not connected " +
-                "(connected=$connected, pendingAckCount=$pendingAcks) — forcing reconnect",
+            "PR-H1c proactive reconnect: stale wire " +
+                "(lastInbound=${inboundElapsed}ms, lastPong=${pongElapsed}ms, " +
+                "connected=$connected, pendingAckCount=$pendingAcks) — forcing reconnect",
         )
         runCatching { transport.forceReconnect() }
             .onFailure { Log.e(TAG, "forceReconnect threw: ${it.message}", it) }
