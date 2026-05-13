@@ -144,7 +144,7 @@ object RelayTransportConfig {
      * problem domain is "ping cadence vs middlebox idle policy". If the
      * cycle is unchanged, that hypothesis is ruled out.
      */
-    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = 5_000L  // Run B (PR-H1e): test 5 s vs default 15 s — does middlebox count 15 s as idle?
+    val EXPERIMENTAL_WS_PING_INTERVAL_MS: Long? = null  // Run C (PR-H1e): WS ping back to 15 s default — Run B (5 s) made cycle SHORTER not longer, ruling out idle-NAT.
 
     /**
      * If true, suppress the app-level RelayMessage.Ping/Pong loop in
@@ -155,7 +155,7 @@ object RelayTransportConfig {
      * Ping, AlarmManager keepalive, TCP keepalive) may trip carrier DPI
      * or anomaly detection. Removing the noisiest layer tests this.
      */
-    val EXPERIMENTAL_DISABLE_APP_PING: Boolean = false
+    val EXPERIMENTAL_DISABLE_APP_PING: Boolean = true  // Run C (PR-H1e): suppress app-level RelayMessage.Ping to test whether it triggers DPI/middlebox/server kill path.
 
     /**
      * If true, `PhantomWakeupReceiver` skips its proactive
