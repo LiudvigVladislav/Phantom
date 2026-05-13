@@ -904,27 +904,39 @@ class KtorRelayTransport(
      * items, run only on reconnect not per-frame).
      */
     private suspend fun flushPendingOutbox(mySession: Long) {
-        val toFlush = outboxMutex.withLock {
-            if (pendingOutbox.isEmpty()) return
-            val snapshot = pendingOutbox.toMutableList()
-            snapshot.sortBy { it.sequenceTs }
-            pendingOutbox.clear()
-            snapshot.toList()
-        }
-        relayLog(
-            RelayLogLevel.INFO,
-            "${genTag(mySession)} Flushing ${toFlush.size} queued item(s) after reconnect (sorted by sequenceTs ASC)",
-        )
-        // PR-H2a.1: hold outboundSendMutex across the entire Send-write
-        // loop so any concurrent live send() blocks behind us. Without
-        // this guard, send() could observe pendingOutbox empty (we just
-        // cleared it for the snapshot above) and race onto the wire
-        // between two flush items with a fresher sequenceTs — exactly
-        // the H2a-incomplete scenario Vladislav flagged in review. The
-        // snapshot+clear above stays OUTSIDE the mutex (cheap, doesn't
-        // need wire access); the wire writes stay INSIDE.
-        var sentCount = 0
+        // PR-H2a.2 (2026-05-13, hotfix on top of merged PR-H2a):
+        // outboundSendMutex MUST be held across snapshot+clear AND the
+        // entire wire-write loop, as a single critical section. The
+        // PR-H2a version held the mutex only across the loop, leaving a
+        // window between `pendingOutbox.clear()` (inside outboxMutex)
+        // and the subsequent `outboundSendMutex.withLock` entry. During
+        // that window:
+        //   1. flush has already drained the outbox into `toFlush`
+        //   2. live send() can run, see pendingOutbox.isEmpty() == true
+        //      under outboxMutex, take outboundSendMutex (it is FREE
+        //      because flush has not entered withLock yet), and sendRaw
+        //      a fresher sequenceTs straight to the wire
+        //   3. flush finally enters its withLock and writes the older
+        //      entries — now AFTER the live send on the wire
+        // Result: receiver sees [new, old] → MAC fail on old, message
+        // lost. Exactly the Test #33 bug, just shifted from the
+        // reconnect/merge path to the live-during-flush path.
+        // Fix: snapshot+clear inside outboundSendMutex so live send()
+        // observes pendingOutbox.isEmpty() == false the whole time
+        // flush owns the wire.
         outboundSendMutex.withLock {
+            val toFlush = outboxMutex.withLock {
+                if (pendingOutbox.isEmpty()) return
+                val snapshot = pendingOutbox.toMutableList()
+                snapshot.sortBy { it.sequenceTs }
+                pendingOutbox.clear()
+                snapshot.toList()
+            }
+            relayLog(
+                RelayLogLevel.INFO,
+                "${genTag(mySession)} Flushing ${toFlush.size} queued item(s) after reconnect (sorted by sequenceTs ASC)",
+            )
+            var sentCount = 0
             for (entry in toFlush) {
                 val msg = entry.message
                 when (msg) {
