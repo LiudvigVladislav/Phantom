@@ -201,17 +201,14 @@ This section documents intentional design decisions with known trade-offs. These
 
 **Status:** Documented architectural choice, sufficient for Alpha 2 — Beta 1.
 
-**Background:** PreKey storage on relay uses `RwLock<HashMap>` + JSONL append (consistent with existing patterns for envelopes, reports, blocklist). SQL backend deferred — see future ADR-018 for SQL migration plan when:
-- Multi-instance relay deployment needed
-- Memory volume becomes bottleneck
-- ACID compliance required
+**Background:** PreKey storage on relay uses `RwLock<HashMap>` + JSONL append (consistent with existing patterns for envelopes, reports, blocklist). SQL backend deferred — see [ADR-021](docs/adr/ADR-021-relay-prekey-sql-migration.md) (Reserved — content pending) for the SQL migration slot.
 
 For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recovery + automatic client re-publish flow handles all expected operational scenarios (relay restart, deploy update, brief outages). Replay is best-effort and idempotent: on startup the relay reads `prekeys.jsonl` line-by-line; the most recent line per identity wins, which is consistent with the publish endpoint's "replace OPK pool wholesale" semantics. A relay restart that drops the file entirely is recoverable — clients re-publish on next online session via the existing background lifecycle task.
 
-**Trigger conditions for ADR-018 (SQL migration):**
-- Relay handles >50k identities and JSONL replay exceeds 5 s on cold start
-- Operational need for transactional OPK consumption guarantees across multi-instance HA
-- Audit requirement for ACID-compliant prekey storage
+**Trigger conditions for ADR-021 (SQL migration):**
+- Single-relay identity count crosses ~10 000 (HashMap + JSONL becomes memory-pressure-relevant on the 4 GB VPS that currently hosts the relay)
+- JSONL replay-on-restart becomes user-visible during operator-driven redeploys (current baseline not measured; revisit when the first complaint arrives or the first measured restart crosses ~5 s)
+- Multi-relay federation lands on the roadmap (HashMap cannot be shared across relay instances)
 
 **Why this isn't a P3 bug:** the Signal protocol's prekey contract makes the storage replaceable — clients tolerate (and recover from) a server that "forgot" their prekeys by re-publishing. Loss of prekey state degrades to a 3-DH handshake (no OPK round) for at most one window, then fully restores after replenish. This is by design.
 
