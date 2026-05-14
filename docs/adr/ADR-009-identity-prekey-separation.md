@@ -203,7 +203,7 @@ All prekey operations travel as authenticated `RelayMessage` types over
 the existing WebSocket session. The session itself authenticates the
 sender via the connection identity (already known to the relay from
 the `?id=` parameter and, post Phase 1 P2 batch, from the signed
-challenge of ADR-018). This means **rate limits apply to authenticated
+challenge of ADR-027). This means **rate limits apply to authenticated
 requesting identities, not source IPs** — VPN rotation cannot bypass
 them. There is no anonymous HTTP endpoint that an unauthenticated
 attacker can hit to drain a target's OPK pool.
@@ -831,7 +831,8 @@ The security improvement is in separation, not in regeneration.
   identity, this ADR preserves it)
 - ADR-008 — Verification authority (depends on stable Ed25519 identity)
 - ADR-017 — SenderKey signing key removal (orthogonal; lands same Phase 1)
-- ADR-018 — Per-user signed challenge auth on relay (Phase 1 P2 batch,
-  closes F11)
+- ADR-027 — Per-user signed challenge auth on relay (Phase 1 P2 batch,
+  closes F11; this ADR was originally numbered as a placeholder
+  ADR-018 in 2026 Q1 drafts and was published as ADR-027 when written)
 - KNOWN_ISSUES.md ISSUE-011 — current crypto stack limitations
 - Security audit 2026-04-29 — findings F12, F15

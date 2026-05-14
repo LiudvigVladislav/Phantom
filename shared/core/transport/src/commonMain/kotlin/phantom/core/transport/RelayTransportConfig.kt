@@ -52,11 +52,6 @@ object RelayTransportConfig {
     // seen in QA on 2026-04-24.
     const val RECONNECT_INFINITE = true
 
-    // Legacy constant — kept so any downstream caller that still references it
-    // compiles. The reconnect loop no longer respects this value.
-    @Deprecated("Use RECONNECT_INFINITE. Reconnect loop never gives up.")
-    const val RECONNECT_MAX_ATTEMPTS = Int.MAX_VALUE
-
     // PR-H1c (2026-05-13) — proactive AlarmManager-driven reconnect.
     //
     // Test #35 confirmed the residual ~120 s pong-timeout cycle is NOT a relay
@@ -105,16 +100,23 @@ object RelayTransportConfig {
     // class from the future transport modes.
     const val DEAD_SOCKET_TIMEOUT_MS = PONG_TIMEOUT_MS
 
-    // PR-H1c: TCP keepalive parameters applied to the WebSocket socket via a
-    // custom SocketFactory on Android (extended socket options API 29+). On
-    // older Android API levels we fall back to plain SO_KEEPALIVE=true with
-    // OS defaults — better than nothing, much weaker than the tuned values.
+    // PR-H1c (2026-05-13) — TCP keepalive constants declared for future
+    // client-side wiring. **Currently NOT applied on client side** — client
+    // liveness relies on OkHttp WS Ping (15 s), the dead-socket watchdog
+    // (DEAD_SOCKET_TIMEOUT_MS above), and AlarmManager proactive reconnect
+    // (ALARM_STALE_RECONNECT_MS above). Server side
+    // (`services/relay/src/main.rs`) does apply socket2 keepalive as
+    // defence-in-depth.
     //
-    // Values chosen to surface a half-open socket in ~30 s wall-clock:
-    //   idle 15 s + 3 probes × 5 s = 30 s
-    // Aggressive enough for mobile networks where NAT/middlebox typically
-    // evict idle entries within 60-120 s. Mirrored on the relay (socket2
-    // TcpKeepalive in axum bind chain).
+    // Whether to plug these constants into the client OkHttp socket via a
+    // SocketFactory is an open question — the branch
+    // `fix/transport-tcp-keepalive` holds a 153-line KeepAliveSocketFactory
+    // candidate; the decision is deferred to Phase 1 connectivity testing
+    // (if WS lifetime regresses under conditions OkHttp WS Ping + AlarmManager
+    // don't cover, wire it in; otherwise drop the branch).
+    //
+    // Values chosen to surface a half-open socket in ~30 s wall-clock if and
+    // when applied: idle 15 s + 3 probes × 5 s = 30 s.
     const val TCP_KEEPALIVE_IDLE_SECONDS = 15
     const val TCP_KEEPALIVE_INTERVAL_SECONDS = 5
     const val TCP_KEEPALIVE_COUNT = 3

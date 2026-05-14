@@ -156,7 +156,7 @@ migration is cleanly isolated.
 
 ### Threat model consequences
 
-Documented in detail in ADR-017 (Threat Model v0.1 revision).
+Documented in detail in ADR-018 (Threat Model v0.1 revision).
 Summary:
 
 - **Removed** "VPN required for cellular Russia" caveat from
@@ -271,6 +271,6 @@ escalate.
   with hardened config
 - ADR-014 — TCP keepalive (kept as defense-in-depth on direct WSS)
 - ADR-001 — System Boundaries (extended; updated for Tor + UP)
-- ADR-017 — Threat Model v0.1 revision (companion ADR)
+- ADR-018 — Threat Model v0.1 revision (companion ADR; renumbered from ADR-017 in 2026-05-14 cleanup)
 - KNOWN_ISSUES.md ISSUE-013 — reclassified to "resolved by ADR-016
   pending Beta validation"

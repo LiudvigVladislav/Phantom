@@ -1,4 +1,4 @@
-# ADR-017: Threat Model v0.1 revision (Tor + UnifiedPush)
+# ADR-018: Threat Model v0.1 revision (Tor + UnifiedPush)
 
 Status: accepted (2026-05-04, feat/tor-unified-push-transport)
 Layer: docs/threat-model
@@ -7,6 +7,25 @@ Supersedes (in part): Threat Model v0 sections on transport metadata,
 "VPN required for cellular Russia" caveat, ADR-013 firmware-radio-
 parking diagnosis
 Related: ADR-001 (System Boundaries — extended)
+
+> **Renumbered from ADR-017 on 2026-05-14** due to a number collision
+> with `ADR-017-senderkey-signing-removal.md`. The SenderKey ADR is the
+> load-bearing ADR-017; this document is its companion-by-coincidence and
+> moves to ADR-018. No content changed.
+>
+> **Looking for a different "ADR-018"?** During 2026 Q1 the number
+> ADR-018 was reserved (in scattered planning docs and a few code
+> comments) for several aspirational ADRs that were never written under
+> that number. If a reference led you here looking for one of the
+> following topics, see the actual document instead:
+>
+> - **Per-User Signed Challenge Auth** — see [ADR-027](ADR-027-Per-User-Signed-Challenge-Auth.md).
+> - **Briar Tor stack rationale / kmp-tor pluggable-transport gap** — see [ADR-016](ADR-016-tor-unified-push-hybrid-transport.md) §"Why kmp-tor 2.6.0" plus `docs/research/tor-feasibility-2026-05-04/no-go-checks/01-kmp-tor-arm32.md`.
+> - **Tor stage progression / Stage 5E REALITY** — see [ADR-019](ADR-019-Xray-REALITY-Outer-Transport.md).
+> - **Onionwrapper migration / why we run our own bridge** — see [ADR-016](ADR-016-tor-unified-push-hybrid-transport.md) + `docs/operations/TOR_STACK_MAINTENANCE.md`.
+>
+> Stray dangling references to "ADR-018" elsewhere in the repo are
+> pre-existing and will be cleaned up in a later doc-housekeeping pass.
 
 ## Context
 
