@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * JVM (desktop) stub of [TorService] (ADR-016 + ADR-018).
+ * JVM (desktop) stub of [TorService] (ADR-016).
  *
  * The desktop client does not yet bundle Briar's tor stack — desktop is a
  * post-Alpha-2 product line — so for now the JVM target compiles a no-op

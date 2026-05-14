@@ -9,7 +9,7 @@
 #   - ntfy             : Self-hosted UnifiedPush distributor (ADR-016
 #                        wake-up plane).
 #   - webtunnel-bridge : Operator-controlled Tor entry bridge with
-#                        WebTunnel pluggable transport (ADR-018 Stage 5C —
+#                        WebTunnel pluggable transport (ADR-016 Stage 5C —
 #                        censorship resistance for users in RU / IR / CN
 #                        whose ISP blocks public Snowflake brokers).
 #   - xray             : Xray-core VLESS+REALITY listener on :8443
@@ -140,7 +140,7 @@ services:
 
   # ──────────────────────────────────────────────────────────────────────
   # Operator-controlled WebTunnel bridge for the embedded Tor client
-  # (ADR-018 Stage 5C — censorship-resistance).
+  # (ADR-016 Stage 5C — censorship-resistance).
   #
   # Why we run our own bridge: public Snowflake brokers (Netlify-hosted)
   # are blocked on Russian carrier networks (Test 10, 2026-05-05). Our
@@ -155,7 +155,7 @@ services:
   #       webtunnel-bridge:15000 ──Tor protocol──▶
   #         Tor entry/middle/exit relays ──▶ phantom-tor (our onion) ──▶ relay
   #
-  # Caveat (ADR-018 Alpha 2 acceptable risk): bridge + relay onion
+  # Caveat (ADR-016 Alpha 2 acceptable risk): bridge + relay onion
   # currently live on the same VPS IP. A network-observing adversary
   # capable of enumerating both endpoints can correlate "user enters
   # PHANTOM bridge" with "PHANTOM client connects to relay onion".

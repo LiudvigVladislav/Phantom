@@ -18,15 +18,15 @@ import org.briarproject.onionwrapper.TorWrapper
 import org.briarproject.onionwrapper.TorWrapper.Observer
 
 /**
- * Android implementation of [TorService] (ADR-018, replacing ADR-016 Stage 2's
- * kmp-tor implementation).
+ * Android implementation of [TorService] (ADR-016, replacing the original
+ * ADR-016 Stage 2 kmp-tor implementation with Briar's stack).
  *
  * Wraps Briar's `AndroidTorWrapper` (org.briarproject:onionwrapper-android),
  * which bundles `tor-android` (the tor binary) plus `lyrebird-android`
  * (`libLyrebird.so` containing Snowflake / WebTunnel / obfs4 / meek
  * pluggable transports). Briar's stack has been production-tested for ten
- * years against the same hostile networks PHANTOM targets — see ADR-018
- * for the migration rationale.
+ * years against the same hostile networks PHANTOM targets — see ADR-016
+ * §"Why kmp-tor 2.6.0" and `docs/research/tor-feasibility-2026-05-04/no-go-checks/01-kmp-tor-arm32.md` for the migration rationale.
  *
  * State derivation (mapping Briar's [TorWrapper.TorState] to ours):
  *  - `NOT_STARTED`, `STOPPED`, `STOPPING`, `DISABLED` → [TorState.Off]
@@ -93,7 +93,7 @@ internal class TorServiceAndroid(
             withContext(Dispatchers.IO) {
                 Log.i(LOG_TAG, "wrapper.start() bridgeProfile=${bridgeProfile.displayName}")
                 wrapper.start()
-                // ADR-018 Stage 5B: configure bridges BEFORE enableNetwork.
+                // ADR-016 Stage 5B: configure bridges BEFORE enableNetwork.
                 // Once the network goes up, tor picks its first guard —
                 // if bridges were not configured yet it would attempt a
                 // vanilla TLS handshake to a hardcoded directory authority,

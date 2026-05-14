@@ -5,7 +5,7 @@ package phantom.core.xray
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * Lifecycle facade for an embedded Xray-core client (ADR-018 Stage 5E).
+ * Lifecycle facade for an embedded Xray-core client (ADR-019 Stage 5E).
  *
  * Why Xray at all: Russian DPI (TSPU) silently throttles direct TLS streams
  * larger than ~16 KB to flagged datacenter IPs (Hetzner, FlokiNET, …) — the

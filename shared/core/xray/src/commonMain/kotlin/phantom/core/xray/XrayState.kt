@@ -3,7 +3,7 @@
 package phantom.core.xray
 
 /**
- * Observable lifecycle state of an [XrayService] (ADR-018 Stage 5E).
+ * Observable lifecycle state of an [XrayService] (ADR-019 Stage 5E).
  *
  * Transition graph:
  *

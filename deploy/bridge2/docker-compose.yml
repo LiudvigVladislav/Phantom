@@ -4,7 +4,7 @@
 # The relay, onion service, and ntfy distributor stay on the primary
 # Hetzner host (deploy/docker-compose.yml). Bridge2 exists ONLY to give
 # Russian-carrier users an entry point that escapes Hetzner's TSPU
-# 16-KB-curtain flagging — see ADR-018 + research/bridge-host-verification-2026-05-06/.
+# 16-KB-curtain flagging — see ADR-016 (Tor + UnifiedPush hybrid) Stage 5C/5D + research/bridge-host-verification-2026-05-06/. ADR-019 (Xray REALITY) supersedes this approach for Russian carrier traffic via Stage 5E.
 #
 # Hostname:    bridge2.phntm.pro  (DNS A + AAAA pointing at FlokiNET IP)
 # Architecture footprint: 2 containers, ~200 MB RAM total.

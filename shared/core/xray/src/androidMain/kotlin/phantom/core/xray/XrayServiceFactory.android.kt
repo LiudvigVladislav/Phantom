@@ -15,7 +15,7 @@ import libXray.LibXray
 import java.io.File
 
 /**
- * Android implementation of [XrayService] (ADR-018 Stage 5E.B).
+ * Android implementation of [XrayService] (ADR-019 Stage 5E.B).
  *
  * Wraps libXray's gomobile JNI bridge. Xray-core runs *inside* our JVM via
  * `libgojni.so`; there is no child process and no IPC hop. Lifecycle is
