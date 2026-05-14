@@ -6,29 +6,6 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
-    // google-services plugin declared but not applied here — see the
-    // conditional `apply(...)` below. We need this `apply false` so the
-    // plugin's classpath is resolved but its tasks don't run unless the
-    // optional google-services.json is present.
-    id("com.google.gms.google-services") apply false
-}
-
-// Optional Firebase wiring. The google-services Gradle plugin requires
-// a real `google-services.json` at build time. We don't ship that file
-// (it carries a project-specific API key — see .gitignore), so a clean
-// clone won't have it. Apply the plugin only when the file is present;
-// in its absence, the FCM dependency remains on the classpath but the
-// runtime registration is skipped (push notifications stay silent until
-// the contributor sets up their own Firebase project and drops their
-// own google-services.json into apps/android/).
-if (rootProject.file("apps/android/google-services.json").exists()) {
-    apply(plugin = "com.google.gms.google-services")
-} else {
-    logger.lifecycle(
-        "apps/android/google-services.json not found — skipping google-services plugin. " +
-            "FCM push notifications will not register in this build. " +
-            "See README §Firebase setup (optional) to enable push.",
-    )
 }
 
 // Load release signing credentials from keystores/signing.properties (gitignored)
@@ -90,9 +67,6 @@ kotlin {
             // stream/webrtc-android wraps Google's pre-built libwebrtc .aar so we avoid
             // compiling WebRTC from source (which requires depot_tools + Linux host).
             implementation("io.getstream:stream-webrtc-android:1.1.1")
-            // FCM — silent push wakes the device so the WebSocket drains queued messages.
-            // Requires google-services.json in apps/android/ and the plugin uncommented above.
-            implementation("com.google.firebase:firebase-messaging-ktx:23.4.1")
             implementation(project(":shared:core:identity"))
             implementation(project(":shared:core:crypto"))
             implementation(project(":shared:core:storage"))

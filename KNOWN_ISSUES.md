@@ -63,7 +63,7 @@ These bring the affected configuration from "messages stuck for 60 s" down to "1
 3. *Settings → Battery → Battery saver* → off during use
 4. If "Power Marathon" / "Smart Power" / "Phone Master" exists in the OEM apps, add PHANTOM to the whitelist
 
-**Long-term fix (Alpha 2).** Push-on-disconnect via Unified Push (FOSS protocol, no Google dependency). PHANTOM intentionally does **not** add Firebase Cloud Messaging as a hard dependency: FCM would put a Google trackable identifier on every install and break the zero-third-party-metadata posture documented in [ADR-001](docs/adr/ADR-001-System-Boundaries.md) and [Threat Model v0](docs/threat-model/Threat_Model_v0.md).
+**Long-term fix (Alpha 2).** Push-on-disconnect via Unified Push (FOSS protocol, no Google dependency). PHANTOM intentionally does **not** integrate Firebase Cloud Messaging: FCM would put a Google trackable identifier on every install and break the zero-third-party-metadata posture documented in [ADR-001](docs/adr/ADR-001-System-Boundaries.md) and [Threat Model v0](docs/threat-model/Threat_Model_v0.md). The Firebase Messaging service scaffolding was present in earlier builds as opt-in (gated on a missing `google-services.json`) and was removed entirely on 2026-05-14 to align the code with this stance.
 
 ---
 

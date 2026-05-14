@@ -94,19 +94,6 @@
             android:foregroundServiceType="dataSync"
             android:exported="false" />
 
-        <!--
-            FCM messaging service — wakes the WebSocket when a message arrives offline.
-            android:exported="false": only the Firebase SDK may start this service.
-            Requires google-services.json + plugin to be active (see build.gradle.kts TODO).
-        -->
-        <service
-            android:name=".notifications.PhantomFirebaseMessagingService"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.google.firebase.MESSAGING_EVENT" />
-            </intent-filter>
-        </service>
-
         <receiver
             android:name=".notifications.QuickReplyReceiver"
             android:exported="false" />

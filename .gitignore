@@ -23,9 +23,11 @@ local.properties
 apps/android/local.properties
 *.apk
 *.aab
-# Firebase config — regenerate locally per Firebase project. Live API
-# key was tracked publicly until 2026-05-08; key rotation in Firebase
-# Console is a separate operator action documented in PROJECT_LOG.
+# Firebase config — defensive ignore. PHANTOM does not use Firebase
+# (FCM was removed 2026-05-14 to align the code with the "no Big Tech
+# metadata" stance documented in KNOWN_ISSUES § ISSUE-001 and ADR-001).
+# This entry prevents accidental commit of credentials if anyone ever
+# experiments with Firebase tooling locally.
 apps/android/google-services.json
 
 # Briar tor + lyrebird native binaries — extracted at build time from
