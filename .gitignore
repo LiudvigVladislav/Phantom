@@ -1,3 +1,10 @@
+# Internal sprint-planning docs — local-only working area for the
+# solo maintainer's day-to-day execution notes. The public face of the
+# project (formal milestones, roadmap, decisions log, architecture
+# specs) lives in `docs/project/` and is tracked. See
+# `docs/project/README.md` for the split convention.
+docs/internal/
+
 # Claude Code
 .claude/settings.local.json
 # Local Claude Code skills / plugins (per-user dev tooling — not part of the
