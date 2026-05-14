@@ -188,7 +188,7 @@ Triggered by Test #28 (2026-05-12) which reproduced the recurring "yellow dot fo
 
 **Цель:** PHANTOM работает в RU без VPN, без Orbot, без сторонних приложений. Censorship resistance — central pitch проекта.
 
-**ADR-018** (Tor + Bridges + Xray REALITY hybrid). Основные коммиты на ветке `feat/tor-stage5-bridges-via-onionwrapper` (5 stage-5 коммитов запушены, PR в master не открыт).
+Track E architecture is split across two formal ADRs: [`ADR-016`](../adr/ADR-016-tor-unified-push-hybrid-transport.md) (Tor + UnifiedPush hybrid; Stages 5A–5D bridge progression) and [`ADR-019`](../adr/ADR-019-Xray-REALITY-Outer-Transport.md) (Xray VLESS+REALITY as outer transport; Stage 5E, supersedes 5C/5D for RU carrier traffic). All Stage 5 commits have landed on master via numbered PRs; no separate sprint branch remains open.
 
 | Stage | Что | Статус | Доказательство |
 |-------|-----|--------|----------------|

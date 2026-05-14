@@ -9,8 +9,8 @@ Copyright (c) 2026 Willen LLC
 **Scope:** How PHANTOM keeps its bundled Tor + pluggable transports current. Security advisories on the Tor network move fast; circumvention transports (Snowflake / WebTunnel) are an active arms race against TSPU and similar systems. Falling behind by even one or two releases is a real risk to users in censored networks.
 
 **Companion docs:**
-- `docs/adr/ADR-018-onionwrapper-migration.md` — why we use Briar's stack
-- `docs/spec/PRIVACY_MODE_BEHAVIOR.md` — what depends on this stack working
+- [`docs/adr/ADR-016-tor-unified-push-hybrid-transport.md`](../adr/ADR-016-tor-unified-push-hybrid-transport.md) — Tor + UnifiedPush architecture, including the §"Why kmp-tor 2.6.0" rationale for choosing Briar's Tor stack over kmp-tor and the `no-go-checks/01-kmp-tor-arm32.md` research note
+- [`docs/spec/PRIVACY_MODE_BEHAVIOR.md`](../spec/PRIVACY_MODE_BEHAVIOR.md) — what depends on this stack working
 - `.github/dependabot.yml` — automation that creates the update PRs
 
 ---
