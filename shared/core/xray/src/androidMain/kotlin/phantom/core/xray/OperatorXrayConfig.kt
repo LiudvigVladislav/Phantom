@@ -4,7 +4,7 @@ package phantom.core.xray
 
 /**
  * Production endpoint for the operator-controlled Xray VLESS+REALITY service
- * (ADR-018 Stage 5E.A — Hetzner FSN1).
+ * (ADR-019 Stage 5E.A — Hetzner FSN1).
  *
  * Why pinned in source rather than fetched at runtime: the whole point of
  * REALITY is to authenticate the server with a key the client already trusts

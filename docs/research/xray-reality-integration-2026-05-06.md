@@ -1,9 +1,9 @@
 # Xray-core + VLESS+REALITY integration — engineering research
 
-- Author: Phantom transport research, ADR-018 follow-up
+- Author: Phantom transport research, ADR-016 Stage 5E follow-up
 - Date: 2026-05-06
-- Status: Research / pre-decision; reference for Stage 5E planning
-- Replaces / supplements: ADR-018 (Stage 5 bridges via OnionWrapper)
+- Status: Research / pre-decision; reference for Stage 5E planning. Became ADR-019 (Xray VLESS+REALITY as outer transport).
+- Replaces / supplements: ADR-016 Stages 5C-5D (bridges via OnionWrapper) for Russian carrier traffic
 - Reader: an engineer about to scope the first implementation PR
 
 ---
@@ -322,7 +322,7 @@ PhantomMessagingService.onCreate
                     → KtorRelayTransport(socksPort = xraySocks)
     → Private / RU detected:
         startXray() → wait Ready
-                    → startTor()        ← ADR-018 Stage 5C path (still useful as fallback)
+                    → startTor()        ← ADR-016 Stage 5C path (still useful as fallback)
                     → connect WSS via xraySocks
     → Ghost:
         startXray() → wait Ready

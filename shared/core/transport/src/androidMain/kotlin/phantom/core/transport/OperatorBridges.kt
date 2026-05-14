@@ -3,7 +3,7 @@
 package phantom.core.transport
 
 /**
- * Operator-controlled WebTunnel bridge entries (ADR-018 Stage 5C).
+ * Operator-controlled WebTunnel bridge entries (ADR-016 Stage 5C).
  *
  * Where these come from:
  *   We run our own WebTunnel bridge on the same VPS that hosts the relay

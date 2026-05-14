@@ -3,7 +3,7 @@
 package phantom.core.xray
 
 /**
- * Platform factory for [XrayService] (ADR-018 Stage 5E).
+ * Platform factory for [XrayService] (ADR-019 Stage 5E).
  *
  * Each platform supplies its own actual:
  *  - **androidMain** wraps libXray's gomobile AAR (Xray-core compiled to a

@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * JVM (desktop) stub of [XrayService] (ADR-018 Stage 5E).
+ * JVM (desktop) stub of [XrayService] (ADR-019 Stage 5E).
  *
  * The desktop client does not bundle libXray — Stage 5E targets Android RU
  * mobile carriers (TSPU 16-KB curtain), and Windows/Linux/macOS desktops

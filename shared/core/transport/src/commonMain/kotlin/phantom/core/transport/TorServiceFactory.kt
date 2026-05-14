@@ -3,7 +3,7 @@
 package phantom.core.transport
 
 /**
- * Platform factory for [TorService] (ADR-016 + ADR-018).
+ * Platform factory for [TorService] (ADR-016).
  *
  * Each platform supplies its own actual:
  *  - **androidMain** wraps Briar's `AndroidTorWrapper` (org.briarproject:

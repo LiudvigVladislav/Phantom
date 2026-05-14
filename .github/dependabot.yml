@@ -1,4 +1,4 @@
-# Dependabot configuration for PHANTOM (ADR-018 + tor-stack maintenance).
+# Dependabot configuration for PHANTOM (tor-stack maintenance — see ADR-016 + docs/operations/TOR_STACK_MAINTENANCE.md).
 #
 # Two update streams:
 #   1. Tor stack (org.briarproject:* — onionwrapper, tor-android, lyrebird-android,

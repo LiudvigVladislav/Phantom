@@ -9,7 +9,7 @@
 package phantom.core.transport
 
 /**
- * Built-in Snowflake bridge lines for the embedded tor (ADR-018, Stage 5B).
+ * Built-in Snowflake bridge lines for the embedded tor (ADR-016, Stage 5B).
  *
  * Snowflake is a Tor pluggable transport that disguises Tor circuit traffic
  * as WebRTC DataChannel traffic to a volunteer browser-based proxy, which
