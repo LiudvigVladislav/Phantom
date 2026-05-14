@@ -23,9 +23,13 @@ Related: ADR-001 (System Boundaries — extended)
 > - **Briar Tor stack rationale / kmp-tor pluggable-transport gap** — see [ADR-016](ADR-016-tor-unified-push-hybrid-transport.md) §"Why kmp-tor 2.6.0" plus `docs/research/tor-feasibility-2026-05-04/no-go-checks/01-kmp-tor-arm32.md`.
 > - **Tor stage progression / Stage 5E REALITY** — see [ADR-019](ADR-019-Xray-REALITY-Outer-Transport.md).
 > - **Onionwrapper migration / why we run our own bridge** — see [ADR-016](ADR-016-tor-unified-push-hybrid-transport.md) + `docs/operations/TOR_STACK_MAINTENANCE.md`.
+> - **Relay PreKey storage SQL migration** — see [ADR-021](ADR-021-relay-prekey-sql-migration.md) (Reserved slot, content pending).
 >
-> Stray dangling references to "ADR-018" elsewhere in the repo are
-> pre-existing and will be cleaned up in a later doc-housekeeping pass.
+> The dangling code-level and config-level references that pointed
+> here were cleaned up across PRs #139 and #140 (2026-05-14); a few
+> historical refs are deliberately left intact in append-only artefacts
+> (`docs/PROJECT_LOG.md` session journal, `docs/project/PROJECT_STATUS
+> _SNAPSHOT_2026_05_09.md`) per the immutable-journal protocol.
 
 ## Context
 
