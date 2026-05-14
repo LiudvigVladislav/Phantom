@@ -292,19 +292,6 @@ class AppContainer(private val context: Context) {
     var callManager: CallManager? = null
         private set
 
-    // ── FCM token (read-only reference — registration is a TODO) ─────────────
-    // Once google-services.json is added and the plugin is active, the token is
-    // stored by PhantomFirebaseMessagingService.onNewToken under "fcm_token".
-    // Wire relay registration here after initMessaging() completes:
-    //
-    //   val fcmToken = context
-    //       .getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
-    //       .getString("fcm_token", null)
-    //   if (fcmToken != null) {
-    //       TODO: POST fcmToken to relay /register-fcm so offline pushes are addressed
-    //             to this device. Requires: authenticated relay session (token + identity).
-    //   }
-
     fun initMessaging(
         identity: phantom.core.identity.IdentityRecord,
         localKeyPair: phantom.core.crypto.DhKeyPair,
