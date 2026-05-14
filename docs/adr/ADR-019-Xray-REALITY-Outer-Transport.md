@@ -2,9 +2,11 @@
 
 Status: accepted (2026-05-07, production-validated on Tecno МТС without VPN)
 Layer: shared/core/xray (KMP, new module), apps/android, deploy/xray
-Extends: ADR-016 (Tor + UnifiedPush hybrid transport),
-ADR-018 (Tor stage progression — Stage 5E supersedes the Stage 5C/5D
-bridge approach for Russian carrier traffic)
+Extends: ADR-016 (Tor + UnifiedPush hybrid transport)
+
+> Note: Stages 5A–5D Tor-bridge progression is documented directly in
+> the Context section below (no separate ADR). Stage 5E supersedes the
+> 5C/5D bridge approach for Russian carrier traffic.
 
 ## Context
 

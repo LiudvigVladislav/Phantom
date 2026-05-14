@@ -7,8 +7,8 @@ Copyright (c) 2026 Willen LLC
 
 This document walks the operator through bringing up the operator-controlled WebTunnel bridge that PHANTOM clients fall back to when public Snowflake brokers are blocked. Companion to:
 
-- `docs/adr/ADR-018-onionwrapper-migration.md` — why we run our own bridge
-- `docs/operations/TOR_STACK_MAINTENANCE.md` — release-monitoring protocol
+- [`docs/adr/ADR-016-tor-unified-push-hybrid-transport.md`](../docs/adr/ADR-016-tor-unified-push-hybrid-transport.md) — Tor + UnifiedPush hybrid architecture (operator-controlled bridge is part of Stage 5C)
+- [`docs/operations/TOR_STACK_MAINTENANCE.md`](../docs/operations/TOR_STACK_MAINTENANCE.md) — release-monitoring protocol
 - `deploy/docker-compose.yml` § `webtunnel-bridge` — the service definition
 - `deploy/Caddyfile` § `bridge.phntm.pro` — the reverse-proxy vhost
 
