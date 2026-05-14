@@ -1,8 +1,22 @@
 # ADR-010: Transport Reconnect Deadlock — Diagnosis and Structural Fix
 
-Status: proposed
+Status: Superseded by PR-H1c (#132) + PR-H1e (#134) — 2026-05-14
 Date: 2026-05-01
 Layer: core/transport (shared), app/service (android)
+
+> **Note (2026-05-14).** This ADR correctly diagnosed the WebSocket-reader
+> deadlock on aggressive-OEM Android (`SSLSocket.read()` parked in kernel
+> `recv()` after `dispatcher.cancelAll()`). The remedy ultimately taken
+> was **not** the proposed `connectionPool.evictAll()` path. Instead,
+> PR-H1c (`e946caba`) and PR-H1e (`bcc501be`) shipped an alternative
+> implementation: inbound-frame liveness (any frame refreshes the
+> watchdog), TCP `SO_KEEPALIVE` on the relay socket, AlarmManager-driven
+> proactive reconnect at 45 s, and OkHttp WS-protocol Ping locked at
+> 15 s with app-level Ping disabled. Test #37 (PR-H1c) and Test #41
+> (PR-H1e) verified end-to-end: detection 155 s → 30–46 s, recovery
+> 5 s → ~1 s, zero message loss. The diagnosis below remains accurate;
+> the "Decision" section is preserved as the proposal that was
+> considered and superseded.
 
 ---
 

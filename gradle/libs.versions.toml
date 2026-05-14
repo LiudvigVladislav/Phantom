@@ -10,16 +10,16 @@ serialization = "1.7.3"
 datetime = "0.6.1"
 uuid = "0.8.4"
 
-# Crypto (audited libraries only — no custom crypto)
+# Crypto
 #
-# libsignal-client (signalapp/libsignal) — AGPL-3.0 LICENSE
-#   ⚠️  REQUIRES LEGAL REVIEW before integration.
-#   AGPL-3.0 may impose copyleft obligations on the entire product.
-#   Consult a lawyer before activating. Left commented out until decision is made.
+# PHANTOM uses custom X3DH / Double Ratchet / SenderKey on
+# libsodium-bindings. See `shared/core/crypto/` for the implementation.
+# libsignal-client is intentionally NOT integrated — keeping custom
+# crypto on libsodium is a deliberate differentiation choice and a
+# permanent stance, not a placeholder pending a future review.
 #
-# libsodium (ISC license — safe to use commercially)
-#   Multiplatform bindings via com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings
-#   Can serve as crypto primitive layer if libsignal licensing is a blocker.
+# libsodium (ISC license) — multiplatform bindings via
+# com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings
 libsodium-bindings = "0.9.2"
 
 # SQLCipher — BSD-3-Clause, safe for commercial use
@@ -29,12 +29,14 @@ libsodium-bindings = "0.9.2"
 # iOS: pod 'SQLCipher'
 sqlcipher-android = "4.5.7"
 
-# Tor + pluggable transports for Android (ADR-016, ADR-018).
+# Tor + pluggable transports for Android (ADR-016).
 #
 # We use the Briar Project's Tor stack rather than kmp-tor 2.6.0 because:
 #   1. kmp-tor does not bundle pluggable transport binaries (Snowflake,
 #      WebTunnel, obfs4) and the maintainer has stated bridges support
-#      "will never be supported" via raw torrc — see ADR-018.
+#      "will never be supported" via raw torrc — see ADR-016 §"Why kmp-tor
+#      2.6.0" + `docs/research/tor-feasibility-2026-05-04/no-go-checks/
+#      01-kmp-tor-arm32.md`.
 #   2. Briar's stack ships a single libLyrebird.so containing obfs4 +
 #      meek + Snowflake + WebTunnel — exactly the pluggable transports
 #      we need to bypass TSPU-style censorship in Russia / Iran / China.
@@ -111,8 +113,8 @@ libsodium-bindings = { module = "com.ionspin.kotlin:multiplatform-crypto-libsodi
 # SQLCipher at-rest encryption (activate in core:storage implementation)
 sqlcipher-android = { module = "net.zetetic:sqlcipher-android", version.ref = "sqlcipher-android" }
 
-# Briar Tor stack (ADR-016 Stage 2 + ADR-018 migration). See version
-# comment above. All three artifacts are GPL-3.0-or-later, AGPL-compatible.
+# Briar Tor stack (ADR-016 Stage 2). See version comment above.
+# All three artifacts are GPL-3.0-or-later, AGPL-compatible.
 briar-tor-android = { module = "org.briarproject:tor-android", version.ref = "briar-tor" }
 briar-lyrebird-android = { module = "org.briarproject:lyrebird-android", version.ref = "briar-lyrebird" }
 briar-onionwrapper-android = { module = "org.briarproject:onionwrapper-android", version.ref = "briar-onionwrapper" }

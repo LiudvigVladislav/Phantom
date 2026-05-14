@@ -1,8 +1,21 @@
 # ADR-013: Revised Transport Diagnosis — 2026-05-02
 
-Status: proposed
+Status: Superseded by PR-H1c (#132) + PR-H1e (#134) — 2026-05-14
 Date: 2026-05-02
 Layer: core/transport (shared), app/service (android), services/relay
+
+> **Note (2026-05-14).** This ADR correctly diagnosed the stale-socket
+> behaviour on Tecno HiOS + МТС cellular (forceReconnect cycling while
+> the reconnect loop stayed parked, and the relay's one-active-connection
+> rule contributing to the failure mode). The remedy ultimately taken
+> was **not** an architectural restructure of the reconnect path.
+> Instead, PR-H1c and PR-H1e closed the issue through six lower-level
+> fixes: inbound-frame liveness, OkHttp WS-protocol Ping at 15 s,
+> `ping_send_failed → forceReconnect + break`, `TransportState
+> .Reconnecting` for soft UX, AlarmManager proactive reconnect at 45 s,
+> and server-side TCP `SO_KEEPALIVE`. The diagnosis below remains
+> accurate; the proposed structural remedies were superseded by this
+> lighter-touch alternative path.
 
 ---
 

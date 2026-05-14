@@ -219,7 +219,7 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 
 ### ISSUE-013: Stateful NAT/CGN/TSPU silent drops on cellular Russia — Tor + UnifiedPush hybrid in implementation
 
-**Status:** Diagnosis revised 2026-05-04 (ADR-013 was wrong about firmware-radio-parking). ADR-014 TCP keepalive applied as Layer 2 — partial improvement (50 s → 120 s) but did not solve. Real fix is in implementation in `feat/tor-unified-push-transport` per **ADR-016 (Tor + UnifiedPush hybrid transport architecture)** and **ADR-017 (Threat Model v0.1 revision)**. Will move to "resolved" once ADR-016 ships and Beta validation passes.
+**Status:** Diagnosis revised 2026-05-04 (ADR-013 was wrong about firmware-radio-parking). ADR-014 TCP keepalive applied as Layer 2 — partial improvement (50 s → 120 s) but did not solve. Real fix is in implementation in `feat/tor-unified-push-transport` per **ADR-016 (Tor + UnifiedPush hybrid transport architecture)** and **ADR-018 (Threat Model v0.1 revision)**. Will move to "resolved" once ADR-016 ships and Beta validation passes.
 
 **Revised root cause.** The 4-test matrix on 2026-05-04 (Tecno Spark Go + Pixel 8 Pro emulator on the same МТС WiFi, identical network path) demonstrated that the "WebSocket dropped silently every 50-60 s" symptom appears on the **Pixel emulator running on a stable Windows PC** as well — invalidating the Tecno-firmware-radio-parking explanation. Both devices stay perfectly stable behind any VPN. The actual root cause is a **stateful network element along the path between Russian carrier WiFi and Hetinki relay**: Carrier-Grade NAT, transit border filtering (TSPU), or both. VPN tunnels emit their own keepalives at 10-25 s and refresh the NAT entry; bare WSS without TCP keepalive does not.
 
@@ -250,7 +250,7 @@ The combination delivers metadata-privacy + battery efficiency simultaneously �
 
 **Implementation tracking:** `feat/tor-unified-push-transport` branch.
 - ADR-016 (architecture decision)
-- ADR-017 (Threat Model v0.1 revision — honest about Tor-mode-no-calls, UnifiedPush distributor metadata, global-passive-adversary out of scope, Vanguards-Lite as built-in default rather than full Vanguards)
+- ADR-018 (Threat Model v0.1 revision — honest about Tor-mode-no-calls, UnifiedPush distributor metadata, global-passive-adversary out of scope, Vanguards-Lite as built-in default rather than full Vanguards; renumbered from ADR-017 in 2026-05-14 cleanup)
 - `docs/research/tor-feasibility-2026-05-04/` — full feasibility research (10 docs + 3 NO-GO checks all passed)
 
 **Why this is now classified as "in implementation", not "limitation":**

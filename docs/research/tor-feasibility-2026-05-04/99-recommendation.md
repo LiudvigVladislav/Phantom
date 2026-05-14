@@ -156,9 +156,10 @@ implementation branch is created.
    embedded; recommend installing standalone ntfy app for power
    users; document in onboarding. Confirm.
 7. **Threat Model + ADR scope.** Recommend: ADR-016 (Tor + UP hybrid
-   architecture), ADR-017 (revised Threat Model: vanguards, padding,
-   correlation honesty), KNOWN_ISSUES.md ISSUE-013 reclassified to
-   "resolved by ADR-016 pending Beta validation". Confirm.
+   architecture), ADR-018 (revised Threat Model: vanguards, padding,
+   correlation honesty; renumbered from ADR-017 in 2026-05-14 cleanup),
+   KNOWN_ISSUES.md ISSUE-013 reclassified to "resolved by ADR-016
+   pending Beta validation". Confirm.
 
 ## NO-GO scenarios (if any of these surface during kickoff)
 
