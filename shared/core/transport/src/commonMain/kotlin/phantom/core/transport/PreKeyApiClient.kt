@@ -175,6 +175,12 @@ class PreKeyApiClient(
                 "Pass createPreKeyPublishHttpTransport() from AppContainer.")
 
         for (attempt in 1..PUBLISH_MAX_ATTEMPTS) {
+            if (bodyBytes.size >= 7800) {
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "PREKEY_TRACE prekey_publish_body_near_carrier_limit bodyBytes=${bodyBytes.size} threshold=7800 attempt=$attempt note=may_hit_tele2_8192_byte_cut",
+                )
+            }
             relayLog(
                 RelayLogLevel.INFO,
                 "PREKEY_TRACE prekey_publish_start native=true identity=$identityTag… " +

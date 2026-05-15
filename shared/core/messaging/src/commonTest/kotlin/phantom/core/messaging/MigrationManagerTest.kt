@@ -312,16 +312,16 @@ class MigrationManagerTest {
         assertEquals(64, updatedIdentity.signingPublicKeyHex!!.length)
         assertEquals(128, updatedIdentity.signingPrivateKeyHex!!.length)
 
-        // Local prekey state populated with 100 OPKs + a current SPK.
+        // Local prekey state populated with OPK_BATCH_SIZE OPKs + a current SPK.
         assertNotNull(rig.spkRepo.get())
-        assertEquals(100, rig.opkRepo.count())
+        assertEquals(MigrationManager.OPK_BATCH_SIZE, rig.opkRepo.count())
 
         // Bundle published exactly once.
         assertEquals(1, rig.preKeyApi.publishCount)
         val req = rig.preKeyApi.lastRequest!!
         assertEquals(updatedIdentity.publicKeyHex, req.identity_pubkey_hex)
         assertEquals(updatedIdentity.signingPublicKeyHex, req.signing_pubkey_hex)
-        assertEquals(100, req.one_time_pre_keys.size)
+        assertEquals(MigrationManager.OPK_BATCH_SIZE, req.one_time_pre_keys.size)
 
         // Wipe + flag completed.
         assertEquals(1, rig.ratchetRepo.deleteAllCalls)
@@ -349,13 +349,13 @@ class MigrationManagerTest {
         val secondSigningPub = rig.identityRepo.loadIdentity()!!.signingPublicKeyHex
         assertEquals(firstSigningPub, secondSigningPub, "Ed25519 keypair must be stable on retry")
 
-        // SPK must be the SAME row (we have 100 OPKs already; resume path
+        // SPK must be the SAME row (we have OPK_BATCH_SIZE OPKs already; resume path
         // should re-publish without regenerating).
         val secondSpk = rig.spkRepo.get()!!
         assertEquals(firstSpk.keyId, secondSpk.keyId)
         assertEquals(firstSpk.publicKeyHex, secondSpk.publicKeyHex)
         // Two upserts total (run 1 generated, run 2 was a no-op
-        // because count >= 100); confirm via insertAll which only fires
+        // because count >= OPK_BATCH_SIZE); confirm via insertAll which only fires
         // on regeneration.
         assertEquals(1, rig.opkRepo.insertAllCalls, "Second run must NOT regenerate OPKs")
 

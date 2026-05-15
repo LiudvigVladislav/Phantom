@@ -408,10 +408,18 @@ class PreKeyLifecycleService(
         const val REPLENISH_THRESHOLD: Int = 20
 
         /**
-         * Number of OPKs generated per refill. Matches the relay's
-         * `MAX_OPKS_PER_PUBLISH` cap.
+         * Number of OPKs generated per refill. Sized to keep
+         * `POST /prekeys/publish` body well under the 8192-byte
+         * middlebox cut observed on Tele2 LTE Иркутская (2026-05-15
+         * Test #44 — see docs/PROJECT_LOG.md). With ~135 bytes per
+         * OPK JSON-encoded plus SPK/identity overhead, 40 OPKs
+         * produces a body of ~5.5–6.5 KB, with comfortable headroom.
+         * The relay's `MAX_OPKS_PER_PUBLISH = 100` server-side cap
+         * is unchanged; 40 still fits inside it. If we later need
+         * larger batches, we either route the publish through SOCKS
+         * (Tor/Reality) or add a server-side append/batch endpoint.
          */
-        const val REFILL_BATCH_SIZE: Int = 100
+        const val REFILL_BATCH_SIZE: Int = 40
 
         /**
          * SignedPreKey rotation cadence (per ADR-009: weekly).
