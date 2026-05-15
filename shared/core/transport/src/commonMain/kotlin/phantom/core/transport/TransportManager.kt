@@ -83,36 +83,68 @@ class TransportManager(
             "connect: mode=${preferences.privacyMode} strategy=$strategy " +
                 "ordered=$orderedChain vpnActive=$vpnActive realityFiltered=$realityFiltered",
         )
+        log.info(
+            "PROBE_TRACE chain_start strategy=$strategy ordered=$orderedChain " +
+                "vpnActive=$vpnActive realityFiltered=$realityFiltered",
+        )
         _state.value = ManagerState.Probing(orderedChain.first())
 
         val failures = mutableListOf<TransportAttemptFailure>()
         for (kind in orderedChain) {
             _state.value = ManagerState.Probing(kind)
+            val prepareStartMs = nowMs()
+            log.info("PROBE_TRACE prepare_start kind=$kind")
             val socksPort = try {
-                prepareTransport(kind)
+                val port = prepareTransport(kind)
+                val elapsedMs = nowMs() - prepareStartMs
+                log.info("PROBE_TRACE prepare_done kind=$kind socksPort=$port elapsedMs=$elapsedMs")
+                port
             } catch (t: Throwable) {
+                val elapsedMs = nowMs() - prepareStartMs
                 val reason = "${t::class.simpleName}: ${t.message ?: "<no message>"}"
+                log.warn(
+                    "PROBE_TRACE prepare_fail kind=$kind exception=${t::class.simpleName} " +
+                        "message=${t.message ?: "<no message>"} elapsedMs=$elapsedMs",
+                )
                 log.warn("$kind subsystem prepare failed: $reason")
                 failures += TransportAttemptFailure(kind, reason)
                 continue
             }
+            val outerTimeoutMs = probeTimeoutFor(kind)
+            log.info("PROBE_TRACE probe_called kind=$kind socksPort=$socksPort outerTimeoutMs=$outerTimeoutMs")
+            val probeStartMs = nowMs()
             val probeOk = try {
-                withTimeout(probeTimeoutFor(kind)) { probe.reachable(kind, socksPort) }
+                val ok = withTimeout(outerTimeoutMs) { probe.reachable(kind, socksPort) }
+                val elapsedMs = nowMs() - probeStartMs
+                log.info("PROBE_TRACE probe_returned kind=$kind ok=$ok elapsedMs=$elapsedMs")
+                ok
             } catch (_: TimeoutCancellationException) {
+                val elapsedMs = nowMs() - probeStartMs
+                log.warn("PROBE_TRACE probe_outer_timeout kind=$kind outerTimeoutMs=$outerTimeoutMs elapsedMs=$elapsedMs")
                 false
             } catch (t: Throwable) {
+                val elapsedMs = nowMs() - probeStartMs
+                log.warn(
+                    "PROBE_TRACE probe_threw kind=$kind exception=${t::class.simpleName} " +
+                        "message=${t.message} elapsedMs=$elapsedMs",
+                )
                 log.warn("$kind probe threw: ${t::class.simpleName}: ${t.message}")
                 false
             }
             if (probeOk) {
+                val totalMs = nowMs() - prepareStartMs
                 onSuccess(kind)
                 _state.value = ManagerState.Connected(kind)
+                log.info("PROBE_TRACE chain_attempt_success kind=$kind socksPort=$socksPort totalMs=$totalMs")
                 return ConnectedTransport(kind, socksPort)
             }
             log.warn("$kind probe returned false")
+            log.warn("PROBE_TRACE chain_attempt_failed kind=$kind reason=probe_failed")
             failures += TransportAttemptFailure(kind, "probe failed")
         }
 
+        val failureSummary = failures.joinToString(",") { "${it.kind}:${it.reason.substringBefore(':')}" }
+        log.warn("PROBE_TRACE chain_all_failed attempts=${failures.size} failures=[$failureSummary]")
         onAllFailed()
         _state.value = ManagerState.AllFailed(failures.toList())
         throw NoTransportReachableException(failures)
@@ -173,14 +205,61 @@ class TransportManager(
         TransportKind.Tor -> prepareTorWithRotation()
         TransportKind.Reality -> {
             val xray = xrayServiceProvider()
+            val xrayStartMs = nowMs()
+            log.info("PROBE_TRACE xray_prepare_start")
             xray.start()
-            val terminal = withTimeout(REALITY_PREPARE_TIMEOUT_MS) {
-                xray.state.first { it is XrayState.Ready || it is XrayState.Failed }
+            log.info(
+                "PROBE_TRACE xray_state state=Starting elapsedMs=${nowMs() - xrayStartMs}",
+            )
+            val terminal = try {
+                withTimeout(REALITY_PREPARE_TIMEOUT_MS) {
+                    xray.state.first { st ->
+                        when (st) {
+                            is XrayState.Starting -> {
+                                // Emit state transitions as they arrive so we can see
+                                // how long the native init phase takes.
+                                log.info(
+                                    "PROBE_TRACE xray_state state=Initialising " +
+                                        "elapsedMs=${nowMs() - xrayStartMs}",
+                                )
+                                false
+                            }
+                            is XrayState.Ready, is XrayState.Failed -> true
+                            else -> false
+                        }
+                    }
+                }
+            } catch (t: TimeoutCancellationException) {
+                val elapsedMs = nowMs() - xrayStartMs
+                log.warn(
+                    "PROBE_TRACE xray_prepare_done ok=false reason=timeout totalMs=$elapsedMs",
+                )
+                throw t
             }
             when (terminal) {
-                is XrayState.Ready -> terminal.socksPort
-                is XrayState.Failed ->
+                is XrayState.Ready -> {
+                    val elapsedMs = nowMs() - xrayStartMs
+                    log.info(
+                        "PROBE_TRACE xray_state state=Ready socksPort=${terminal.socksPort} " +
+                            "elapsedMs=$elapsedMs",
+                    )
+                    log.info(
+                        "PROBE_TRACE xray_prepare_done ok=true socksPort=${terminal.socksPort} " +
+                            "totalMs=$elapsedMs",
+                    )
+                    terminal.socksPort
+                }
+                is XrayState.Failed -> {
+                    val elapsedMs = nowMs() - xrayStartMs
+                    log.warn(
+                        "PROBE_TRACE xray_state state=Failed message=${terminal.message} " +
+                            "elapsedMs=$elapsedMs",
+                    )
+                    log.warn(
+                        "PROBE_TRACE xray_prepare_done ok=false reason=failed totalMs=$elapsedMs",
+                    )
                     error("Xray Failed: ${terminal.message}")
+                }
                 else -> error("Xray returned unexpected state: $terminal")
             }
         }
@@ -225,6 +304,10 @@ class TransportManager(
                 "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
                     "budgetMs=${attempt.budgetMs}",
             )
+            log.info(
+                "PROBE_TRACE tor_rotation_start attempt=$attemptNum/$total " +
+                    "profile=${attempt.profile.displayName} budgetMs=${attempt.budgetMs}",
+            )
             // Defensive: ensure no leftover tor from a previous profile.
             // First iteration the service is already Off (chain walker
             // calls release() between connect generations); later
@@ -246,6 +329,10 @@ class TransportManager(
                     "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
                         "raised ${t::class.simpleName}: ${t.message}",
                 )
+                log.warn(
+                    "PROBE_TRACE tor_rotation_done attempt=$attemptNum " +
+                        "profile=${attempt.profile.displayName} ok=false reason=${t::class.simpleName}",
+                )
                 lastError = t
                 runCatching { tor.stop() }
                 null
@@ -255,11 +342,19 @@ class TransportManager(
                     "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
                         "READY socksPort=$socksPort",
                 )
+                log.info(
+                    "PROBE_TRACE tor_rotation_done attempt=$attemptNum " +
+                        "profile=${attempt.profile.displayName} ok=true socksPort=$socksPort",
+                )
                 return socksPort
             }
             log.warn(
                 "Tor rotation: attempt=$attemptNum/$total profile=${attempt.profile.displayName} " +
                     "did not reach Ready in ${attempt.budgetMs} ms",
+            )
+            log.warn(
+                "PROBE_TRACE tor_rotation_done attempt=$attemptNum " +
+                    "profile=${attempt.profile.displayName} ok=false reason=budget_exhausted",
             )
         }
         // All profiles exhausted — surface a diagnostic error so the
@@ -293,6 +388,9 @@ class TransportManager(
         log.info("Tor: start(profile=${profile.displayName})")
         tor.start(profile)
         val torStartMs = nowMs()
+        log.info(
+            "PROBE_TRACE tor_state profile=${profile.displayName} state=Starting elapsedMs=0",
+        )
         val terminal: TorState = try {
             coroutineScope {
                 var lastPercent = 0
@@ -314,8 +412,13 @@ class TransportManager(
                             when (st) {
                                 is TorState.Bootstrapping -> {
                                     if (st.percent != lastPercent) {
+                                        val elapsedMs = nowMs() - torStartMs
                                         log.info(
                                             "Tor bootstrap: profile=${profile.displayName} percent=${st.percent}",
+                                        )
+                                        log.info(
+                                            "PROBE_TRACE tor_state profile=${profile.displayName} " +
+                                                "state=Bootstrap percent=${st.percent} elapsedMs=$elapsedMs",
                                         )
                                         lastPercent = st.percent
                                         publishTorProbing(
@@ -329,16 +432,26 @@ class TransportManager(
                                     false
                                 }
                                 is TorState.Ready -> {
+                                    val elapsedMs = nowMs() - torStartMs
                                     log.info(
                                         "Tor bootstrap: profile=${profile.displayName} Ready " +
                                             "socksPort=${st.socksPort}",
                                     )
+                                    log.info(
+                                        "PROBE_TRACE tor_state profile=${profile.displayName} " +
+                                            "state=Ready socksPort=${st.socksPort} elapsedMs=$elapsedMs",
+                                    )
                                     true
                                 }
                                 is TorState.Failed -> {
+                                    val elapsedMs = nowMs() - torStartMs
                                     log.warn(
                                         "Tor bootstrap: profile=${profile.displayName} Failed " +
                                             "message=${st.message}",
+                                    )
+                                    log.warn(
+                                        "PROBE_TRACE tor_state profile=${profile.displayName} " +
+                                            "state=Failed message=${st.message} elapsedMs=$elapsedMs",
                                     )
                                     true
                                 }
@@ -354,8 +467,13 @@ class TransportManager(
             // Per-profile budget elapsed. Not an error — caller advances
             // to the next profile. Defensive stop() so the next profile
             // does not inherit a half-bootstrapped wrapper.
+            val elapsedMs = nowMs() - torStartMs
             log.warn(
                 "Tor: profile=${profile.displayName} budget elapsed (${perProfileBudgetMs} ms)",
+            )
+            log.warn(
+                "PROBE_TRACE tor_state profile=${profile.displayName} " +
+                    "state=BudgetElapsed elapsedMs=$elapsedMs",
             )
             runCatching { tor.stop() }
             return null
