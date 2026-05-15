@@ -931,13 +931,50 @@ class DefaultMessagingService(
             // Ack-deliver each chunk immediately so the relay stops redelivering it
             // while reassembly accumulates the remaining chunks.
             if (payload.type == MessagePayload.TYPE_AUDIO_CHUNK) {
-                val chunkId    = payload.audioChunkId    ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
-                val chunkIndex = payload.audioChunkIndex ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
-                val chunkTotal = payload.audioChunkTotal ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
-                val chunkB64   = payload.audioChunkB64   ?: run { transport.sendDeliveryAck(deliver.messageId); return@runCatching }
+                val chunkId = payload.audioChunkId ?: run {
+                    messagingLog(MessagingLogLevel.WARN, "VOICE_RX chunk_invalid_missing_field field=audioChunkId envelopeId=${deliver.messageId.take(8)}")
+                    transport.sendDeliveryAck(deliver.messageId); return@runCatching
+                }
+                val chunkIndex = payload.audioChunkIndex ?: run {
+                    messagingLog(MessagingLogLevel.WARN, "VOICE_RX chunk_invalid_missing_field field=audioChunkIndex envelopeId=${deliver.messageId.take(8)} chunkId=${chunkId.take(8)}")
+                    transport.sendDeliveryAck(deliver.messageId); return@runCatching
+                }
+                val chunkTotal = payload.audioChunkTotal ?: run {
+                    messagingLog(MessagingLogLevel.WARN, "VOICE_RX chunk_invalid_missing_field field=audioChunkTotal envelopeId=${deliver.messageId.take(8)} chunkId=${chunkId.take(8)}")
+                    transport.sendDeliveryAck(deliver.messageId); return@runCatching
+                }
+                val chunkB64 = payload.audioChunkB64 ?: run {
+                    messagingLog(MessagingLogLevel.WARN, "VOICE_RX chunk_invalid_missing_field field=audioChunkB64 envelopeId=${deliver.messageId.take(8)} chunkId=${chunkId.take(8)}")
+                    transport.sendDeliveryAck(deliver.messageId); return@runCatching
+                }
 
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_RX chunk_received envelopeId=${deliver.messageId.take(8)} chunkId=${chunkId.take(8)} index=$chunkIndex total=$chunkTotal payloadBytes=${plainBytes!!.size}",
+                )
+
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_RX chunk_decode_start chunkId=${chunkId.take(8)} index=$chunkIndex b64Len=${chunkB64.length}",
+                )
                 @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
-                val chunkBytes = Base64.decode(chunkB64)
+                val chunkBytes = runCatching { Base64.decode(chunkB64) }.fold(
+                    onSuccess = { bytes ->
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX chunk_decode_ok chunkId=${chunkId.take(8)} index=$chunkIndex decodedBytes=${bytes.size}",
+                        )
+                        bytes
+                    },
+                    onFailure = { ex ->
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "VOICE_RX chunk_decode_fail chunkId=${chunkId.take(8)} index=$chunkIndex error=${ex::class.simpleName} message=${ex.message?.take(120) ?: ""}",
+                        )
+                        transport.sendDeliveryAck(deliver.messageId)
+                        return@runCatching
+                    },
+                )
 
                 val nowMs = Clock.System.now().toEpochMilliseconds()
                 val staleCutoff = nowMs - 5 * 60 * 1_000L
@@ -951,21 +988,46 @@ class DefaultMessagingService(
                         .map { (id, _) -> id }
                     staleIds.forEach { audioReassemblyBuffer.remove(it) }
 
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "VOICE_RX buffer_before chunkId=${chunkId.take(8)} bufferCountBefore=${audioReassemblyBuffer.size} staleSwept=${staleIds.size}",
+                    )
                     val buf = audioReassemblyBuffer.getOrPut(chunkId) { ChunkBuffer() }
                     buf.chunks[chunkIndex] = chunkBytes
                     buf.lastUpdatedMs = nowMs
 
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "VOICE_RX buffer_added chunkId=${chunkId.take(8)} index=$chunkIndex received=${buf.chunks.size} total=$chunkTotal",
+                    )
+
                     if (buf.chunks.size == chunkTotal) {
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX assembly_started chunkId=${chunkId.take(8)} received=${buf.chunks.size} total=$chunkTotal",
+                        )
                         val assembled = (0 until chunkTotal)
                             .flatMap { idx -> buf.chunks[idx]!!.toList() }
                             .toByteArray()
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX assembly_complete chunkId=${chunkId.take(8)} assembledBytes=${assembled.size}",
+                        )
                         audioReassemblyBuffer.remove(chunkId)
                         assembled
                     } else {
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX assembly_waiting chunkId=${chunkId.take(8)} received=${buf.chunks.size} total=$chunkTotal",
+                        )
                         null
                     }
                 }
 
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_RX ack_send_after_handler envelopeId=${deliver.messageId.take(8)} chunkId=${chunkId.take(8)} index=$chunkIndex total=$chunkTotal assembled=${complete != null}",
+                )
                 transport.sendDeliveryAck(deliver.messageId)
 
                 if (complete != null) {
@@ -973,6 +1035,10 @@ class DefaultMessagingService(
                     val assembledB64 = Base64.encode(complete)
                     val groupId = payload.groupId
                     if (groupId != null) {
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX group_dispatch_start chunkId=${chunkId.take(8)} groupId=${groupId.take(8)}",
+                        )
                         groupMessagingService?.handleIncoming(
                             payload.copy(
                                 type = MessagePayload.TYPE_GROUP_MESSAGE,
@@ -984,24 +1050,51 @@ class DefaultMessagingService(
                             ),
                             senderPubKeyHex,
                         )
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX group_dispatch_ok chunkId=${chunkId.take(8)} groupId=${groupId.take(8)}",
+                        )
                     } else {
                         val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
                         val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
-                        messageRepository.insertMessage(
-                            MessageEntity(
-                                id = deliver.messageId,
-                                conversationId = conversationId,
-                                ciphertext = ByteArray(0),
-                                plaintextCache = "[AUDIO:$assembledB64]",
-                                sent = false,
-                                status = MessageStatus.DELIVERED,
-                                createdAt = nowMs,
-                                expiresAtMs = expiresAtMs,
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX message_insert_start chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)} bytes=${complete.size}",
+                        )
+                        runCatching {
+                            messageRepository.insertMessage(
+                                MessageEntity(
+                                    id = deliver.messageId,
+                                    conversationId = conversationId,
+                                    ciphertext = ByteArray(0),
+                                    plaintextCache = "[AUDIO:$assembledB64]",
+                                    sent = false,
+                                    status = MessageStatus.DELIVERED,
+                                    createdAt = nowMs,
+                                    expiresAtMs = expiresAtMs,
+                                )
                             )
+                        }.fold(
+                            onSuccess = {
+                                messagingLog(
+                                    MessagingLogLevel.INFO,
+                                    "VOICE_RX message_insert_ok chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
+                                )
+                            },
+                            onFailure = { ex ->
+                                messagingLog(
+                                    MessagingLogLevel.WARN,
+                                    "VOICE_RX message_insert_fail chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)} error=${ex::class.simpleName} message=${ex.message?.take(120) ?: ""}",
+                                )
+                            },
                         )
                         val existing = conversationRepository.getConversation(conversationId)
                         val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
                         if (existing == null) {
+                            messagingLog(
+                                MessagingLogLevel.INFO,
+                                "VOICE_RX conversation_upsert_start chunkId=${chunkId.take(8)} convId=${conversationId.take(8)} existing=false",
+                            )
                             conversationRepository.upsertConversation(
                                 ConversationEntity(
                                     id = conversationId,
@@ -1014,7 +1107,15 @@ class DefaultMessagingService(
                                     blocked = false,
                                 )
                             )
+                            messagingLog(
+                                MessagingLogLevel.INFO,
+                                "VOICE_RX conversation_upsert_ok chunkId=${chunkId.take(8)} convId=${conversationId.take(8)}",
+                            )
                         } else {
+                            messagingLog(
+                                MessagingLogLevel.INFO,
+                                "VOICE_RX conversation_upsert_start chunkId=${chunkId.take(8)} convId=${conversationId.take(8)} existing=true",
+                            )
                             conversationRepository.upsertConversation(
                                 existing.copy(
                                     lastMessagePreview = "🎤 Voice message",
@@ -1022,7 +1123,15 @@ class DefaultMessagingService(
                                     unreadCount = existing.unreadCount + 1,
                                 )
                             )
+                            messagingLog(
+                                MessagingLogLevel.INFO,
+                                "VOICE_RX conversation_upsert_ok chunkId=${chunkId.take(8)} convId=${conversationId.take(8)}",
+                            )
                         }
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX emit_incoming_start chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
+                        )
                         _incomingMessages.emit(
                             IncomingMessage(
                                 id = deliver.messageId,
@@ -1032,10 +1141,31 @@ class DefaultMessagingService(
                                 receivedAt = nowMs,
                             )
                         )
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX emit_incoming_ok chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
+                        )
                         runCatching {
+                            messagingLog(
+                                MessagingLogLevel.INFO,
+                                "VOICE_RX notification_start chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
+                            )
                             onNewMessageNotification?.invoke(conversationId, senderName, "🎤 Voice message", senderPubKeyHex)
+                            messagingLog(
+                                MessagingLogLevel.INFO,
+                                "VOICE_RX notification_ok chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
+                            )
                         }
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX handler_complete chunkId=${chunkId.take(8)} result=assembled",
+                        )
                     }
+                } else {
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "VOICE_RX handler_complete chunkId=${chunkId.take(8)} result=waiting",
+                    )
                 }
                 return@runCatching
             }
