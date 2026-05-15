@@ -18,6 +18,10 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { _
 
 actual fun createRestHttpClient(): HttpClient = HttpClient(OkHttp)
 
+// JVM stub — desktop / test target. No OkHttp connection-pool tuning needed
+// here; the Android actual carries the production behaviour. PR-R0.
+actual fun createPreKeyPublishHttpClient(): HttpClient = HttpClient(OkHttp)
+
 actual fun forceShutdownActiveEngine() {
     // No-op on JVM placeholder — used only for tests/desktop.
 }

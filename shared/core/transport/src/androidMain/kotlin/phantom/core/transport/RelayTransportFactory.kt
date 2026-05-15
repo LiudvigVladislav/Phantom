@@ -169,3 +169,60 @@ actual fun createRestHttpClient(): HttpClient {
         }
     }
 }
+
+actual fun createPreKeyPublishHttpClient(): HttpClient {
+    // Dedicated client for POST /prekeys/publish only.
+    //
+    // WHY: Tele2 LTE Иркутская 2026-05-14 Test #42 showed POST /prekeys/publish
+    // consistently reaching Caddy with bytes_read=0, status=408, duration=30s.
+    // Client-side: SocketTimeoutException from Http1ExchangeCodec.readResponseHeaders
+    // after 30 s. The 13.9 KB request body never reached the wire despite
+    // createRestHttpClient() already being pinned to HTTP/1.1 (PR-G4).
+    //
+    // Root cause: OkHttp connection pool reuses a TCP connection that was
+    // silently half-closed by a carrier-side NAT or transparent proxy between
+    // requests. The server receives headers but no body bytes and times out.
+    // This is the same class of bug PR-G4 fixed for H2, now manifesting in
+    // HTTP/1.1 pool reuse under mobile carrier conditions.
+    //
+    // Fix:
+    //   ConnectionPool(0) — no pooling; every publish gets a fresh TCP+TLS
+    //   handshake, so a stale pool entry cannot be the failure path.
+    //
+    //   Connection: close interceptor — tells the server and any proxy to tear
+    //   down the TCP connection after the response. Belt-and-suspenders: the
+    //   server cannot keep-alive back into a broken state.
+    //
+    //   writeTimeout=60s — the 13.9 KB body upload needs a fair per-byte budget
+    //   on a lossy mobile connection (30s default was co-expiring with the server
+    //   timeout, leaving no margin). readTimeout=60s for symmetry.
+    //
+    //   callTimeout=120s — outer ceiling prevents an indefinitely-stalled
+    //   coroutine if both writeTimeout and readTimeout are somehow bypassed.
+    //
+    //   connectTimeout=15s — generous for the fresh-handshake cost on mobile;
+    //   tight enough to not hold a coroutine too long if the relay is down.
+    //
+    // PR-R0, 2026-05-15.
+    val okHttp = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .connectionPool(okhttp3.ConnectionPool(0, 1, TimeUnit.SECONDS))
+        .addInterceptor { chain ->
+            chain.proceed(
+                chain.request().newBuilder()
+                    .header("Connection", "close")
+                    .build(),
+            )
+        }
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+    return HttpClient(OkHttp) {
+        engine {
+            preconfigured = okHttp
+        }
+    }
+}

@@ -56,6 +56,7 @@ import phantom.core.transport.TransportManagerLog
 import phantom.core.transport.TransportPreferences
 import phantom.core.transport.TransportPreferencesAndroid
 import phantom.core.transport.createHttpClientFactory
+import phantom.core.transport.createPreKeyPublishHttpClient
 import phantom.core.transport.createRestHttpClient
 import phantom.core.transport.createTorService
 import phantom.core.xray.OperatorXrayConfig
@@ -338,9 +339,16 @@ class AppContainer(private val context: Context) {
             .replace("ws://", "http://")
             .removeSuffix("/ws")
             .removeSuffix("/")
+        // PR-R0 (2026-05-15): pass a dedicated publish client alongside the
+        // shared REST client. The dedicated client uses ConnectionPool(0) +
+        // Connection: close to avoid the OkHttp HTTP/1.1 body-stuck-on-stale-
+        // TCP-connection bug seen on Tele2 LTE Иркутская Test #42. Only the
+        // POST /prekeys/publish path uses it; GET /status and GET /bundle
+        // continue to use the shared REST client (small GETs, pool reuse OK).
         val preKeyApi = phantom.core.transport.PreKeyApiClient(
             httpClient = createRestHttpClient(),
             relayBaseUrl = relayHttpBase,
+            publishHttpClient = createPreKeyPublishHttpClient(),
         )
 
         // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2
