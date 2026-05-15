@@ -44,6 +44,37 @@ expect fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient
 expect fun createRestHttpClient(): HttpClient
 
 /**
+ * Returns a dedicated [HttpClient] for POST /prekeys/publish only.
+ *
+ * WHY A SEPARATE CLIENT: Tele2 LTE Иркутская 2026-05-14 Test #42 showed
+ * POST /prekeys/publish consistently failing with Caddy `bytes_read=0`,
+ * `status=408`, `duration=30s` and client-side `SocketTimeoutException`
+ * from `Http1ExchangeCodec.readResponseHeaders`. The 13.9 KB request body
+ * never reached the wire despite the shared `createRestHttpClient()` already
+ * being pinned to HTTP/1.1 (PR-G4). Root cause: OkHttp's connection pool
+ * reuses an existing TCP connection that a carrier-side NAT or transparent
+ * proxy silently half-closed. The server sees no body bytes and times out
+ * after 30 s. The fix is to give publish its own client with:
+ *
+ *   * `ConnectionPool(0)` — no pooling; every publish gets a fresh
+ *     TCP+TLS handshake to rule out reuse of a half-closed connection.
+ *   * `Connection: close` interceptor — instructs the server (and any
+ *     transparent proxy) to tear down the TCP connection after the
+ *     response, preventing silent reuse further down the chain.
+ *   * Large `writeTimeout` (60 s) — the 13.9 KB body upload needs a
+ *     fair per-byte budget on a lossy mobile connection.
+ *   * Large `callTimeout` (120 s) — outer ceiling; prevents a stall from
+ *     consuming a coroutine slot indefinitely.
+ *
+ * Only POST /prekeys/publish uses this client. GET /prekeys/status and
+ * GET /prekeys/bundle/{peer} keep the shared `createRestHttpClient()`
+ * client (small GETs, connection reuse is fine for them).
+ *
+ * PR-R0, 2026-05-15.
+ */
+expect fun createPreKeyPublishHttpClient(): HttpClient
+
+/**
  * Force-interrupts every thread in the active WebSocket engine's pool.
  *
  * Why this exists: Ktor's `HttpClient.close()` for the OkHttp engine

@@ -19,6 +19,11 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { _
 
 actual fun createRestHttpClient(): HttpClient = HttpClient(Darwin)
 
+// iOS stub — Darwin engine does not have the OkHttp connection-pool half-close
+// problem. When iOS is wired up (Beta), Darwin-specific tuning can be added here.
+// PR-R0.
+actual fun createPreKeyPublishHttpClient(): HttpClient = HttpClient(Darwin)
+
 actual fun forceShutdownActiveEngine() {
     // No-op on iOS — Darwin engine doesn't have the
     // OkHttp shutdownNow / kernel-recv-blocking problem.
