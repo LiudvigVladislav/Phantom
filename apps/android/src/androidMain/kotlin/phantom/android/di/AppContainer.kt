@@ -56,7 +56,7 @@ import phantom.core.transport.TransportManagerLog
 import phantom.core.transport.TransportPreferences
 import phantom.core.transport.TransportPreferencesAndroid
 import phantom.core.transport.createHttpClientFactory
-import phantom.core.transport.createPreKeyPublishHttpClient
+import phantom.core.transport.createPreKeyPublishHttpTransport
 import phantom.core.transport.createRestHttpClient
 import phantom.core.transport.createTorService
 import phantom.core.xray.OperatorXrayConfig
@@ -339,16 +339,16 @@ class AppContainer(private val context: Context) {
             .replace("ws://", "http://")
             .removeSuffix("/ws")
             .removeSuffix("/")
-        // PR-R0 (2026-05-15): pass a dedicated publish client alongside the
-        // shared REST client. The dedicated client uses ConnectionPool(0) +
-        // Connection: close to avoid the OkHttp HTTP/1.1 body-stuck-on-stale-
-        // TCP-connection bug seen on Tele2 LTE Иркутская Test #42. Only the
-        // POST /prekeys/publish path uses it; GET /status and GET /bundle
-        // continue to use the shared REST client (small GETs, pool reuse OK).
+        // PR-R0.1 (2026-05-15): use native OkHttp transport for POST /prekeys/publish.
+        // Test #43 showed the Ktor→OkHttp body-streaming adapter stalls at 8192 bytes
+        // deterministically on Android (both Tele2 LTE and emulator Direct). The native
+        // transport bypasses Ktor and writes a pre-built ByteArray in one shot.
+        // GET /prekeys/status and GET /prekeys/bundle continue using the shared REST
+        // client (small GETs; connection reuse fine for them).
         val preKeyApi = phantom.core.transport.PreKeyApiClient(
             httpClient = createRestHttpClient(),
             relayBaseUrl = relayHttpBase,
-            publishHttpClient = createPreKeyPublishHttpClient(),
+            publishTransport = createPreKeyPublishHttpTransport(),
         )
 
         // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2

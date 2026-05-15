@@ -70,9 +70,43 @@ expect fun createRestHttpClient(): HttpClient
  * GET /prekeys/bundle/{peer} keep the shared `createRestHttpClient()`
  * client (small GETs, connection reuse is fine for them).
  *
+ * @deprecated Replaced by [createPreKeyPublishHttpTransport] in PR-R0.1.
+ *             This Ktor-based path hangs at 8192 bytes on body upload due
+ *             to a Ktor→OkHttp ByteChannel streaming bug (Test #43, 2026-05-15).
+ *             The function is kept to avoid breaking the public expect/actual
+ *             surface; production DI no longer calls it.
+ *
  * PR-R0, 2026-05-15.
  */
+@Deprecated(
+    message = "Replaced by createPreKeyPublishHttpTransport (PR-R0.1). " +
+        "This Ktor-based path stalls at 8192 bytes on Android body upload. " +
+        "Production DI uses createPreKeyPublishHttpTransport instead.",
+    replaceWith = ReplaceWith("createPreKeyPublishHttpTransport()"),
+)
 expect fun createPreKeyPublishHttpClient(): HttpClient
+
+/**
+ * Returns a [PreKeyPublishHttpTransport] for POST /prekeys/publish.
+ *
+ * PR-R0.1 (2026-05-15): replaces [createPreKeyPublishHttpClient].
+ *
+ * Test #43 on real device showed that the Ktor→OkHttp engine adapter stalls
+ * the request body deterministically at exactly 8192 bytes — matching the
+ * JVM ByteChannel default write-buffer size — on both Tele2 LTE Иркутская
+ * and emulator Direct. After 30 s Caddy returns HTTP 408. The bug is in
+ * the Ktor body streaming path, not in network filtering.
+ *
+ * The Android actual bypasses Ktor entirely and uses native OkHttp with a
+ * pre-built ByteArray body, which OkHttp writes in one shot via
+ * okio.Buffer.writeAll() without any streaming. All PR-R0 reliability
+ * machinery (mutex, retry, backoff, PREKEY_TRACE logging) is preserved
+ * in [PreKeyApiClient]; this factory only supplies the transport.
+ *
+ * Non-Android actuals (iOS, JVM) throw [NotImplementedError] because the
+ * streaming bug is Android-only and iOS/desktop are not production paths.
+ */
+expect fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport
 
 /**
  * Force-interrupts every thread in the active WebSocket engine's pool.

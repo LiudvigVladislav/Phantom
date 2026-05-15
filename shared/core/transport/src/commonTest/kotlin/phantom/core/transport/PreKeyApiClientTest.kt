@@ -22,6 +22,24 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
+ * Minimal fake [PreKeyPublishHttpTransport] for [PreKeyApiClientTest].
+ *
+ * Returns a fixed status and body on every call, with zero delay.
+ * Tests that need more complex scripting (retry, backoff, throw) use
+ * the richer fakes in [PreKeyPublishReliabilityTest].
+ */
+private class StaticFakePublishTransport(
+    private val statusCode: Int,
+    private val body: String,
+) : PreKeyPublishHttpTransport {
+    override suspend fun publish(
+        url: String,
+        bodyBytes: ByteArray,
+        contentType: String,
+    ): PreKeyPublishHttpResponse = PreKeyPublishHttpResponse(statusCode, body, elapsedMs = 0L)
+}
+
+/**
  * Drives [PreKeyApiClient] against a Ktor [MockEngine] so request shape
  * and response handling are exercised without a running relay. Each
  * test wires its own engine handler so capture state doesn't leak.
@@ -69,16 +87,18 @@ class PreKeyApiClientTest {
         one_time_pre_keys = emptyList(),
     )
 
+    // ── Publish tests use StaticFakePublishTransport (native transport path) ────
+    // The publish path no longer goes through Ktor (PR-R0.1); use the fake
+    // transport instead of a MockEngine for the POST /prekeys/publish tests.
+    // Retry/backoff/mutex tests live in PreKeyPublishReliabilityTest.
+
     @Test
     fun publishBundle_201_returnsStored() = runTest {
-        val client = clientThatReturns(
-            HttpStatusCode.Created,
-            """{"stored_opks":2}""",
-            urlAssert = { url ->
-                assertEquals("https://relay.test/prekeys/publish", url)
-            },
+        val api = PreKeyApiClient(
+            httpClient = clientThatReturns(HttpStatusCode.OK, ""),
+            relayBaseUrl = baseUrl,
+            publishTransport = StaticFakePublishTransport(201, """{"stored_opks":2}"""),
         )
-        val api = PreKeyApiClient(client, baseUrl)
 
         val result = api.publishBundle(samplePublishRequest())
         when (result) {
@@ -89,11 +109,11 @@ class PreKeyApiClientTest {
 
     @Test
     fun publishBundle_409_returnsSigningKeyMismatch() = runTest {
-        val client = clientThatReturns(
-            HttpStatusCode.Conflict,
-            """{"error":"signing_pubkey_hex does not match"}""",
+        val api = PreKeyApiClient(
+            httpClient = clientThatReturns(HttpStatusCode.OK, ""),
+            relayBaseUrl = baseUrl,
+            publishTransport = StaticFakePublishTransport(409, """{"error":"signing_pubkey_hex does not match"}"""),
         )
-        val api = PreKeyApiClient(client, baseUrl)
 
         val result = api.publishBundle(samplePublishRequest())
         assertTrue(result is PublishResult.Failure)
@@ -102,11 +122,11 @@ class PreKeyApiClientTest {
 
     @Test
     fun publishBundle_429_returnsRateLimited() = runTest {
-        val client = clientThatReturns(
-            HttpStatusCode.TooManyRequests,
-            """{"error":"publish rate limit exceeded"}""",
+        val api = PreKeyApiClient(
+            httpClient = clientThatReturns(HttpStatusCode.OK, ""),
+            relayBaseUrl = baseUrl,
+            publishTransport = StaticFakePublishTransport(429, """{"error":"publish rate limit exceeded"}"""),
         )
-        val api = PreKeyApiClient(client, baseUrl)
 
         val result = api.publishBundle(samplePublishRequest())
         assertTrue(result is PublishResult.Failure)
@@ -115,11 +135,11 @@ class PreKeyApiClientTest {
 
     @Test
     fun publishBundle_400_returnsBadRequest() = runTest {
-        val client = clientThatReturns(
-            HttpStatusCode.BadRequest,
-            """{"error":"signing_pubkey_hex must be 64 hex chars"}""",
+        val api = PreKeyApiClient(
+            httpClient = clientThatReturns(HttpStatusCode.OK, ""),
+            relayBaseUrl = baseUrl,
+            publishTransport = StaticFakePublishTransport(400, """{"error":"signing_pubkey_hex must be 64 hex chars"}"""),
         )
-        val api = PreKeyApiClient(client, baseUrl)
 
         val result = api.publishBundle(samplePublishRequest())
         assertTrue(result is PublishResult.Failure)
