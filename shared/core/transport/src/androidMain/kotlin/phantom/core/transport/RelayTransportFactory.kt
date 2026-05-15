@@ -9,8 +9,14 @@ import io.ktor.client.plugins.websocket.WebSockets
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 
 // ADR-010 (Updated 2026-05-01): WebSocket clients are NO LONGER singletons.
 // Each reconnect generation in KtorRelayTransport allocates its own
@@ -170,43 +176,25 @@ actual fun createRestHttpClient(): HttpClient {
     }
 }
 
+@Suppress("DEPRECATION")
 actual fun createPreKeyPublishHttpClient(): HttpClient {
     // Dedicated client for POST /prekeys/publish only.
     //
-    // WHY: Tele2 LTE Иркутская 2026-05-14 Test #42 showed POST /prekeys/publish
-    // consistently reaching Caddy with bytes_read=0, status=408, duration=30s.
-    // Client-side: SocketTimeoutException from Http1ExchangeCodec.readResponseHeaders
-    // after 30 s. The 13.9 KB request body never reached the wire despite
-    // createRestHttpClient() already being pinned to HTTP/1.1 (PR-G4).
+    // DEPRECATED in PR-R0.1: production DI now calls createPreKeyPublishHttpTransport()
+    // instead. This Ktor-based path stalls at 8192 bytes (Test #43, 2026-05-15)
+    // due to a Ktor→OkHttp ByteChannel streaming bug. Kept for surface compatibility.
     //
-    // Root cause: OkHttp connection pool reuses a TCP connection that was
-    // silently half-closed by a carrier-side NAT or transparent proxy between
-    // requests. The server receives headers but no body bytes and times out.
-    // This is the same class of bug PR-G4 fixed for H2, now manifesting in
-    // HTTP/1.1 pool reuse under mobile carrier conditions.
-    //
-    // Fix:
+    // Original PR-R0 rationale:
     //   ConnectionPool(0) — no pooling; every publish gets a fresh TCP+TLS
     //   handshake, so a stale pool entry cannot be the failure path.
-    //
     //   Connection: close interceptor — tells the server and any proxy to tear
-    //   down the TCP connection after the response. Belt-and-suspenders: the
-    //   server cannot keep-alive back into a broken state.
-    //
-    //   writeTimeout=60s — the 13.9 KB body upload needs a fair per-byte budget
-    //   on a lossy mobile connection (30s default was co-expiring with the server
-    //   timeout, leaving no margin). readTimeout=60s for symmetry.
-    //
-    //   callTimeout=120s — outer ceiling prevents an indefinitely-stalled
-    //   coroutine if both writeTimeout and readTimeout are somehow bypassed.
-    //
-    //   connectTimeout=15s — generous for the fresh-handshake cost on mobile;
-    //   tight enough to not hold a coroutine too long if the relay is down.
-    //
-    // PR-R0, 2026-05-15.
+    //   down the TCP connection after the response.
+    //   writeTimeout=60s / readTimeout=60s / callTimeout=120s — generous budgets
+    //   for the 13.9 KB body upload on a lossy mobile connection.
+    //   connectTimeout=15s — fresh-handshake cost on mobile.
     val okHttp = OkHttpClient.Builder()
         .protocols(listOf(Protocol.HTTP_1_1))
-        .connectionPool(okhttp3.ConnectionPool(0, 1, TimeUnit.SECONDS))
+        .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS))
         .addInterceptor { chain ->
             chain.proceed(
                 chain.request().newBuilder()
@@ -226,3 +214,57 @@ actual fun createPreKeyPublishHttpClient(): HttpClient {
         }
     }
 }
+
+/**
+ * Android production implementation of [PreKeyPublishHttpTransport].
+ *
+ * PR-R0.1 (2026-05-15): bypasses Ktor entirely for POST /prekeys/publish.
+ *
+ * WHY FRESH CLIENT PER CALL: the 8192-byte stall (Test #43) is deterministic
+ * and appears on both Tele2 LTE and emulator Direct, pointing at the Ktor→OkHttp
+ * ByteChannel adapter rather than a network condition. By constructing a brand-new
+ * OkHttpClient for every call we eliminate any adapter state carry-over and
+ * guarantee the body is written in one shot via okio.Buffer without streaming.
+ *
+ * The cost (TLS handshake per call) is acceptable: publish runs at most 3 times
+ * per onboarding/rotation event, never per message.
+ */
+private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTransport {
+    override suspend fun publish(
+        url: String,
+        bodyBytes: ByteArray,
+        contentType: String,
+    ): PreKeyPublishHttpResponse = withContext(Dispatchers.IO) {
+        // Fresh OkHttpClient per call — no pool state, no adapter state.
+        val client = OkHttpClient.Builder()
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS))
+            .retryOnConnectionFailure(false) // retry logic lives in PreKeyApiClient
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(90, TimeUnit.SECONDS)
+            .build()
+
+        val requestBody = bodyBytes.toRequestBody(contentType.toMediaType())
+        val request = Request.Builder()
+            .url(url)
+            .header("Connection", "close")
+            .post(requestBody)
+            .build()
+
+        val startMs = System.currentTimeMillis()
+        client.newCall(request).execute().use { response ->
+            val body = response.body?.string() ?: ""
+            val elapsedMs = System.currentTimeMillis() - startMs
+            PreKeyPublishHttpResponse(
+                statusCode = response.code,
+                bodyText = body,
+                elapsedMs = elapsedMs,
+            )
+        }
+    }
+}
+
+actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
+    AndroidNativeOkHttpPreKeyPublishTransport()

@@ -6,13 +6,9 @@ package phantom.core.transport
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
-import io.ktor.client.request.post
-import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
-import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
-import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
@@ -72,26 +68,22 @@ class PreKeyApiClient(
         encodeDefaults = true
     },
     /**
-     * Dedicated HTTP client for POST /prekeys/publish. When non-null this
-     * client is used exclusively for the publish call; all other endpoints
-     * keep using [httpClient].
+     * Native transport for POST /prekeys/publish. When non-null this
+     * transport is used exclusively for the publish call; all other
+     * endpoints keep using [httpClient].
      *
-     * Production code passes [createPreKeyPublishHttpClient()] here —
-     * a client with ConnectionPool(0) and Connection: close to avoid the
-     * OkHttp HTTP/1.1 body-stuck-on-pool-reuse bug observed on Tele2 LTE
-     * Иркутская 2026-05-14 Test #42 (PR-R0). Null falls back to [httpClient]
-     * so existing tests that do not care about the dedicated client continue
-     * to pass without change.
+     * Production code passes [createPreKeyPublishHttpTransport()] here
+     * (PR-R0.1). The native transport bypasses Ktor's body-streaming path
+     * (which stalls at 8192 bytes on Android — Test #43, 2026-05-15) and
+     * hands a pre-built ByteArray to OkHttp for a single-shot write.
+     *
+     * Null causes publishWithRetry() to throw — production code must always
+     * supply a transport. Tests inject a fake implementation.
+     *
+     * @see createPreKeyPublishHttpTransport
      */
-    publishHttpClient: HttpClient? = null,
+    private val publishTransport: PreKeyPublishHttpTransport? = null,
 ) : PreKeyApi {
-
-    // Falls back to the shared client when no dedicated client was injected.
-    // This keeps the existing test harness working: PreKeyApiClientTest
-    // constructs PreKeyApiClient with a single MockEngine client and does not
-    // pass a publishHttpClient; those tests exercise HTTP-semantics, not
-    // transport-layer reliability.
-    private val _publishHttpClient: HttpClient = publishHttpClient ?: httpClient
 
     // One in-flight publish per PreKeyApiClient instance at a time.
     //
@@ -120,9 +112,9 @@ class PreKeyApiClient(
      * wants them all to remain available — the lifecycle service already
      * does this on every publish.
      *
-     * PR-R0 additions:
-     *  - Uses [_publishHttpClient] (ConnectionPool(0) + Connection: close)
-     *    to avoid the OkHttp body-stuck-on-stale-TCP-connection bug.
+     * PR-R0 / PR-R0.1 additions:
+     *  - PR-R0.1: uses [publishTransport] (native OkHttp, pre-built ByteArray)
+     *    to bypass the Ktor body-streaming 8192-byte stall (Test #43).
      *  - Mutex-guarded: at most one in-flight publish per client instance.
      *    Duplicate concurrent calls are debounced (logged + skipped).
      *  - Retry with exponential backoff on transient failures: up to
@@ -168,27 +160,32 @@ class PreKeyApiClient(
         request: PublishRequest,
         identityTag: String,
     ): PublishResult {
-        val body = json.encodeToString(PublishRequest.serializer(), request)
+        val bodyJson = json.encodeToString(PublishRequest.serializer(), request)
+        // Pre-build the byte array so OkHttp can write it in one shot.
+        // This is the PR-R0.1 fix: Ktor streams the body through a ByteWriteChannel
+        // that stalls at 8192 bytes on Android; native OkHttp writes the full
+        // ByteArray via okio.Buffer.writeAll() without any streaming.
+        val bodyBytes = bodyJson.encodeToByteArray()
         val url = "$relayBaseUrl/prekeys/publish"
-        val bodyBytes = body.length // UTF-8 byte count approximation; close enough for logging
         val totalStartMs = Clock.System.now().toEpochMilliseconds()
         var lastException: Throwable? = null
+
+        val transport = publishTransport
+            ?: error("PreKeyApiClient requires a publishTransport (PR-R0.1). " +
+                "Pass createPreKeyPublishHttpTransport() from AppContainer.")
 
         for (attempt in 1..PUBLISH_MAX_ATTEMPTS) {
             relayLog(
                 RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_start identity=$identityTag… " +
+                "PREKEY_TRACE prekey_publish_start native=true identity=$identityTag… " +
                     "opks=${request.one_time_pre_keys.size} " +
                     "spk_key_id=${request.signed_pre_key.key_id} " +
-                    "body_bytes=$bodyBytes attempt=$attempt/${PUBLISH_MAX_ATTEMPTS}",
+                    "bodyBytes=${bodyBytes.size} attempt=$attempt/${PUBLISH_MAX_ATTEMPTS}",
             )
             val attemptStartMs = Clock.System.now().toEpochMilliseconds()
 
-            val response: HttpResponse = try {
-                _publishHttpClient.post(url) {
-                    contentType(ContentType.Application.Json)
-                    setBody(body)
-                }
+            val nativeResp: PreKeyPublishHttpResponse = try {
+                transport.publish(url, bodyBytes)
             } catch (t: Throwable) {
                 val elapsed = Clock.System.now().toEpochMilliseconds() - attemptStartMs
                 lastException = t
@@ -218,7 +215,7 @@ class PreKeyApiClient(
 
             // We have a response — check if it warrants a retry.
             val elapsed = Clock.System.now().toEpochMilliseconds() - attemptStartMs
-            val statusValue = response.status.value
+            val statusValue = nativeResp.statusCode
 
             // HTTP 408 or 5xx: server-side transient. Retry if budget remains.
             if ((statusValue == 408 || statusValue in 500..599) &&
@@ -238,36 +235,36 @@ class PreKeyApiClient(
             // Non-retryable or final attempt — process the result.
             relayLog(
                 RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_ok identity=$identityTag… " +
-                    "status=$statusValue elapsedMs=$elapsed attempt=$attempt",
+                "PREKEY_TRACE prekey_publish_ok native=true identity=$identityTag… " +
+                    "status=$statusValue elapsedMs=${nativeResp.elapsedMs} attempt=$attempt",
             )
-            return when (response.status) {
-                HttpStatusCode.Created -> {
+            return when (statusValue) {
+                201 -> {
                     val parsed = json.decodeFromString(
                         PublishResponse.serializer(),
-                        response.bodyAsText(),
+                        nativeResp.bodyText,
                     )
                     PublishResult.Stored(parsed.storedOpks)
                 }
-                HttpStatusCode.Conflict ->
+                409 ->
                     PublishResult.Failure(
                         PublishResult.Reason.SigningKeyMismatch,
-                        response.bodyAsText(),
+                        nativeResp.bodyText,
                     )
-                HttpStatusCode.TooManyRequests ->
+                429 ->
                     PublishResult.Failure(
                         PublishResult.Reason.RateLimited,
-                        response.bodyAsText(),
+                        nativeResp.bodyText,
                     )
-                HttpStatusCode.BadRequest, HttpStatusCode.PayloadTooLarge ->
+                400, 413 ->
                     PublishResult.Failure(
                         PublishResult.Reason.BadRequest,
-                        response.bodyAsText(),
+                        nativeResp.bodyText,
                     )
                 else ->
                     PublishResult.Failure(
-                        PublishResult.Reason.Unexpected(response.status.value),
-                        response.bodyAsText(),
+                        PublishResult.Reason.Unexpected(statusValue),
+                        nativeResp.bodyText,
                     )
             }
         }
