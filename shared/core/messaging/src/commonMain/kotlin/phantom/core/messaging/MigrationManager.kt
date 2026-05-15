@@ -136,7 +136,7 @@ class MigrationManager(
             val opkEntities = oneTimePreKeyRepository.getAll().take(OPK_BATCH_SIZE)
             existingSpk to opkEntities
         } else {
-            // Fresh generation. Mint SPK + 100 OPKs in one shot, sign
+            // Fresh generation. Mint SPK + OPK_BATCH_SIZE OPKs in one shot, sign
             // SPK with the just-backfilled Ed25519 secret, persist
             // private halves locally before attempting publish (so a
             // mid-publish crash doesn't lose the keypairs we'd have to
@@ -233,12 +233,16 @@ class MigrationManager(
 
     companion object {
         /**
-         * OPK batch size — matches the relay's `MAX_OPKS_PER_PUBLISH`
-         * cap. Drained naturally by incoming first-contacts; the
-         * lifecycle service in PR C commit 13 refills when remaining
-         * drops below 20.
+         * OPK batch size for initial publish. Sized to keep
+         * `POST /prekeys/publish` body well under the 8192-byte
+         * middlebox cut observed on Tele2 LTE Иркутская (2026-05-15
+         * Test #44 — see docs/PROJECT_LOG.md). The relay's
+         * `MAX_OPKS_PER_PUBLISH = 100` server-side cap is unchanged;
+         * 40 fits inside it. Drained naturally by incoming
+         * first-contacts; the lifecycle service refills when remaining
+         * drops below [phantom.core.messaging.PreKeyLifecycleService.Companion.REPLENISH_THRESHOLD].
          */
-        const val OPK_BATCH_SIZE: Int = 100
+        const val OPK_BATCH_SIZE: Int = 40
     }
 }
 

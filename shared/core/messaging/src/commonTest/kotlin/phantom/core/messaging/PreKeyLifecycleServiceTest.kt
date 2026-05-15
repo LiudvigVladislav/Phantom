@@ -146,16 +146,16 @@ class PreKeyLifecycleServiceTest {
         val result = rig.service.bootstrapForNewIdentity()
         assertTrue(result.isSuccess, "happy path should succeed; got $result")
 
-        // Post-state: SPK row populated, 100 OPKs locally, one publish.
+        // Post-state: SPK row populated, REFILL_BATCH_SIZE OPKs locally, one publish.
         assertNotNull(rig.spkRepo.get())
-        assertEquals(100, rig.opkRepo.count())
+        assertEquals(PreKeyLifecycleService.REFILL_BATCH_SIZE, rig.opkRepo.count())
         assertEquals(1, rig.api.publishCount)
 
         // Published bundle has both X25519 + Ed25519 fields.
         val req = rig.api.lastRequest!!
         assertEquals(64, req.identity_pubkey_hex.length)
         assertEquals(64, req.signing_pubkey_hex.length)
-        assertEquals(100, req.one_time_pre_keys.size)
+        assertEquals(PreKeyLifecycleService.REFILL_BATCH_SIZE, req.one_time_pre_keys.size)
     }
 
     @Test
@@ -199,8 +199,8 @@ class PreKeyLifecycleServiceTest {
         assertEquals(1, rig.api.statusCount, "exactly one status probe")
         assertEquals(1, rig.api.publishCount, "exactly one republish")
         // The republished bundle is the existing local pool, not a fresh
-        // generation: 100 OPKs from bootstrap, no new OPK creation.
-        assertEquals(100, rig.api.lastRequest!!.one_time_pre_keys.size)
+        // generation: REFILL_BATCH_SIZE OPKs from bootstrap, no new OPK creation.
+        assertEquals(PreKeyLifecycleService.REFILL_BATCH_SIZE, rig.api.lastRequest!!.one_time_pre_keys.size)
     }
 
     @Test
@@ -248,7 +248,7 @@ class PreKeyLifecycleServiceTest {
         val (identityManager, _, _) = makeAlpha2Identity()
         val rig = makeService(identityManager)
 
-        // Bootstrap puts 100 OPKs in the pool (>= REPLENISH_THRESHOLD 20).
+        // Bootstrap puts REFILL_BATCH_SIZE OPKs in the pool (>= REPLENISH_THRESHOLD 20).
         rig.service.bootstrapForNewIdentity().getOrThrow()
         val publishCountBefore = rig.api.publishCount
 
@@ -266,8 +266,8 @@ class PreKeyLifecycleServiceTest {
 
         rig.service.bootstrapForNewIdentity().getOrThrow()
         // Drain the pool down to 5 (below REPLENISH_THRESHOLD 20). Use
-        // the repo directly — equivalent to 95 successful first contacts.
-        val toDelete = rig.opkRepo.getAll().take(95)
+        // the repo directly — equivalent to (REFILL_BATCH_SIZE - 5) successful first contacts.
+        val toDelete = rig.opkRepo.getAll().take(PreKeyLifecycleService.REFILL_BATCH_SIZE - 5)
         toDelete.forEach { rig.opkRepo.deleteByKeyId(it.keyIdHex) }
         assertEquals(5, rig.opkRepo.count())
 
@@ -275,11 +275,12 @@ class PreKeyLifecycleServiceTest {
         assertTrue(refillResult.isSuccess)
         assertTrue(refillResult.getOrNull()!!, "refill must run when count < threshold")
 
-        // After refill: 5 (existing) + 100 (new) = 105 in local pool.
-        assertEquals(105, rig.opkRepo.count())
-        // Published bundle ships ALL 105 — relay replaces wholesale.
+        // After refill: 5 (existing) + REFILL_BATCH_SIZE (new) in local pool.
+        val expectedPool = 5 + PreKeyLifecycleService.REFILL_BATCH_SIZE
+        assertEquals(expectedPool, rig.opkRepo.count())
+        // Published bundle ships ALL keys — relay replaces wholesale.
         val req = rig.api.lastRequest!!
-        assertEquals(105, req.one_time_pre_keys.size)
+        assertEquals(expectedPool, req.one_time_pre_keys.size)
     }
 
     // ── SPK rotation ────────────────────────────────────────────────────────
