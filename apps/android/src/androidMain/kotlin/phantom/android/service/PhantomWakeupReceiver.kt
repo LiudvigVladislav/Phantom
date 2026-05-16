@@ -28,13 +28,11 @@ import phantom.core.transport.RelayTransportConfig
  *
  * Wakes the device every [WAKEUP_INTERVAL_MS] (nominally 30 s; Android Doze
  * floors `setExactAndAllowWhileIdle()` to 60 s, so during deep idle we get
- * ~60 s spacing whether we ask for less or not). On each fire we check
- * whether the WebSocket transport is healthy by reading
- * [phantom.core.transport.RelayTransport.lastPongElapsedMs]. If the pong is
- * stale (>= [PONG_STALE_THRESHOLD_MS]) we call `forceReconnect()` — this is
- * the only known way to recover a parked-radio dead WebSocket on aggressive-
- * battery OEMs like Tecno HiOS. See ADR-010 + ADR-011 for the chain of
- * reasoning behind why no user-space-only solution worked.
+ * ~60 s spacing whether we ask for less or not). On each fire we call
+ * [pokeConnectivity] to nudge the radio on aggressive-OEM builds, and start
+ * the messaging service if the process was killed by the OS. Dead-socket
+ * detection is owned by OkHttp WS Ping (15 s interval) and the in-process
+ * dead-socket watchdog (DEAD_SOCKET_TIMEOUT_MS = 60 s). See ADR-010 + ADR-011.
  */
 class PhantomWakeupReceiver : BroadcastReceiver() {
 
@@ -172,72 +170,23 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             return
         }
 
-        // PR-H1c (2026-05-13): proactive reconnect path uses lastInboundFrame,
-        // not lastPong. Test #35 confirmed the residual ~120 s pong-timeout
-        // cycle on Tecno HiOS is half-open TCP — radio park silently drops
-        // outbound packets while the OS still considers the socket healthy.
-        // The in-process pong watchdog catches it after DEAD_SOCKET_TIMEOUT_MS
-        // (60 s); this alarm catches it after ALARM_STALE_RECONNECT_MS (45 s)
-        // so on Tecno where alarm-driven wake actually surfaces the dead
-        // socket BEFORE app-level watchdog ticks, recovery shaves ~25-40 s
-        // off the visible cycle.
-        //
-        // The two thresholds are deliberately staggered (45 < 60) so the
-        // paths are non-racing: alarm fires first (proactive), pong watchdog
-        // only fires if the alarm was missed (e.g. AlarmManager throttled
-        // by Doze). 15 s of headroom prevents accidental double-trigger.
-        //
-        // Switched from `lastPongElapsedMs` to `lastInboundFrameElapsedMs`
-        // because under Tor / Reality and on networks with weird middleboxes
-        // the Pong-routing path may be selectively dropped while normal
-        // envelope traffic still flows — pong-only check would false-
-        // positive in those scenarios. Any inbound frame (Deliver, Ack,
-        // Pong, even malformed text) refreshes the mark.
+        // PR-R0.4a: removed stale-inbound proactive forceReconnect.
+        // Idle 1:1 chat with no messages produces zero inbound frames indefinitely —
+        // that is not a dead socket. OkHttp WS Ping (15 s interval) and the
+        // in-process dead-socket watchdog (DEAD_SOCKET_TIMEOUT_MS = 60 s) are the
+        // correct authorities for declaring the socket dead.
+        // Allowed reconnect triggers: OkHttp onFailure, sendRaw failure,
+        // explicit IOException, ACK watchdog timeout (when pendingAcks > 0),
+        // manual user action, ConnectivityManager network-change broadcast.
         val inboundElapsed = transport.lastInboundFrameElapsedMs
         val pongElapsed = transport.lastPongElapsedMs
         val connected = transport.isConnected()
-        if (connected && inboundElapsed < RelayTransportConfig.ALARM_STALE_RECONNECT_MS) {
-            Log.i(
-                TAG,
-                "wire fresh (lastInbound=${inboundElapsed}ms, lastPong=${pongElapsed}ms) — no action",
-            )
-            return
-        }
-
-        // Defer to the in-process ACK watchdog when there are envelopes
-        // mid-flight. Tearing the socket down during a multi-chunk upload
-        // (voice messages on cellular, observed Test #22 2026-05-12) drops
-        // every queued frame the OkHttp dispatcher has not yet flushed —
-        // the ACK watchdog at RelayTransportConfig.ACK_TIMEOUT_MS is the
-        // right authority for declaring those envelopes lost, because it
-        // also re-queues them at the head of pendingOutbox so the next
-        // session re-sends them. The wakeup forceReconnect() bypasses
-        // that requeue path. Skip and let the watchdog handle it.
-        //
-        // NB: this only protects envelopes that have already been entered
-        // into the transport's pendingAcks tracker. A frame that has been
-        // accepted by the OkHttp dispatcher but has not yet returned from
-        // send() (so pendingAcks doesn't know about it) can still be lost
-        // here. Closing that gap is the job of PR-F2 (sequential send +
-        // wait-ACK pipeline) and a durable outbox.
         val pendingAcks = transport.pendingAckCount
-        if (connected && pendingAcks > 0) {
-            Log.i(
-                TAG,
-                "Wakeup skipped: pendingAckCount=$pendingAcks, deferring to ACK watchdog " +
-                    "(lastInbound=${inboundElapsed}ms, lastPong=${pongElapsed}ms)",
-            )
-            return
-        }
-
-        Log.w(
+        Log.i(
             TAG,
-            "PR-H1c proactive reconnect: stale wire " +
-                "(lastInbound=${inboundElapsed}ms, lastPong=${pongElapsed}ms, " +
-                "connected=$connected, pendingAckCount=$pendingAcks) — forcing reconnect",
+            "Wakeup: connected=$connected lastInboundMs=$inboundElapsed " +
+                "lastPongMs=$pongElapsed pendingAcks=$pendingAcks — no reconnect action (R0.4a)",
         )
-        runCatching { transport.forceReconnect() }
-            .onFailure { Log.e(TAG, "forceReconnect threw: ${it.message}", it) }
     }
 
     /**
@@ -299,33 +248,6 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
          * the requested 30 s.
          */
         const val WAKEUP_INTERVAL_MS: Long = 30_000L
-
-        /**
-         * Pong staleness above which we force a reconnect. Derived from
-         * [RelayTransportConfig.PONG_TIMEOUT_MS] plus a 20 s margin so the
-         * wakeup never races the in-process pong watchdog: when the
-         * transport-level constant moves, this one moves with it. Computed
-         * at compile time because both inputs are `const val`.
-         *
-         * Why 20 s rather than 10 s — on weak devices we have to absorb
-         * GC pauses, AlarmManager dispatch jitter, radio wake delay and
-         * the few-second drift Android adds to broadcast scheduling under
-         * Doze. 10 s left no headroom; 20 s does.
-         *
-         * The previous hard-coded value (25 s) was inherited from when
-         * PONG_TIMEOUT_MS was also 25 s. After PONG_TIMEOUT_MS was bumped
-         * to 60 s for slow-cellular voice upload tolerance, the wakeup
-         * kept the old 25 s threshold and started firing forceReconnect
-         * a full 35 s before the in-process pong watchdog would have. On
-         * TSPU-active carriers (real-device Test #22, 2026-05-12) Pong
-         * RTT routinely spikes into the 25-50 s range — the wakeup was
-         * tearing down healthy WebSockets that the in-process watchdog
-         * would have left alone, observable as 30 s reconnect cascades
-         * that drop every envelope in the OkHttp dispatcher's outbound
-         * buffer.
-         */
-        const val PONG_STALE_THRESHOLD_MS: Long =
-            RelayTransportConfig.PONG_TIMEOUT_MS + 20_000L
 
         /**
          * WakeLock budget: how long we will hold the CPU awake during

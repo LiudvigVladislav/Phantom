@@ -52,45 +52,6 @@ object RelayTransportConfig {
     // seen in QA on 2026-04-24.
     const val RECONNECT_INFINITE = true
 
-    // PR-H1c (2026-05-13) — proactive AlarmManager-driven reconnect.
-    //
-    // Test #35 confirmed the residual ~120 s pong-timeout cycle is NOT a relay
-    // ping-handler bug (server pings_received and pongs_sent counters match
-    // 2/2, 3/3, 5/5 across 4 sessions). Each session_summary on the server
-    // shows since_last_ping_ms ≈ 155-160 s and close_origin=error with
-    // "Connection reset without closing handshake". The client side
-    // session_summary shows pings_sent=11 vs pongs_received=5 for the same
-    // window — i.e. ~6 of 11 application-level pings never reached the
-    // server. Combined with `lastInboundFrameMs` ≈ 70 000 in the client's
-    // pong-timeout WARN, the picture is a half-open TCP socket: aggressive-
-    // OEM radio park (Tecno HiOS) or NAT idle eviction (МТС carrier middlebox)
-    // silently drops outbound packets while the OS still considers the socket
-    // healthy. The relay's read-side stays parked in `recv()` for ~3 minutes
-    // until kernel TCP keepalive eventually surfaces the RST.
-    //
-    // PR-H1c attacks this with three layers:
-    //   1. TCP-level SO_KEEPALIVE with aggressive timer (15 s idle, 5 s probe,
-    //      3 fail) so the OS detects dead sockets in ~30 s instead of the
-    //      kernel default 2 hours. Both client and relay opt in.
-    //   2. Liveness based on ANY inbound frame, not just Pong (see
-    //      DEAD_SOCKET_TIMEOUT_MS below).
-    //   3. PROACTIVE alarm-driven reconnect (this constant). The
-    //      AlarmManager keepalive on Android wakes the radio every 30 s and
-    //      currently only logs "pong fresh — no action". With ALARM_STALE_
-    //      RECONNECT_MS the alarm becomes an EARLY recovery path: if no
-    //      inbound frame has arrived for 45 s the alarm forces a reconnect
-    //      BEFORE the in-process pong watchdog (DEAD_SOCKET_TIMEOUT_MS = 70 s)
-    //      would notice. This shaves 25-40 s off recovery on Tecno HiOS where
-    //      the radio-park scenario specifically delays our app-level
-    //      detection.
-    //
-    // The 45 s threshold is deliberately well below DEAD_SOCKET_TIMEOUT_MS
-    // (70 s) so the two paths are non-racing: alarm fires first (proactive),
-    // pong watchdog only fires if the alarm was missed (e.g. AlarmManager
-    // throttled by Doze on a never-tested OEM). 25 s of headroom prevents
-    // accidental double-trigger.
-    const val ALARM_STALE_RECONNECT_MS = 45_000L
-
     // PR-H1c: alias for PONG_TIMEOUT_MS used by the new liveness check, which
     // accepts ANY inbound frame as proof of life (not just Pong). Same value;
     // distinct name so the call sites read clearly. When the wire is healthy
@@ -102,9 +63,8 @@ object RelayTransportConfig {
 
     // PR-H1c (2026-05-13) — TCP keepalive constants declared for future
     // client-side wiring. **Currently NOT applied on client side** — client
-    // liveness relies on OkHttp WS Ping (15 s), the dead-socket watchdog
-    // (DEAD_SOCKET_TIMEOUT_MS above), and AlarmManager proactive reconnect
-    // (ALARM_STALE_RECONNECT_MS above). Server side
+    // liveness relies on OkHttp WS Ping (15 s) and the dead-socket watchdog
+    // (DEAD_SOCKET_TIMEOUT_MS above). Server side
     // (`services/relay/src/main.rs`) does apply socket2 keepalive as
     // defence-in-depth.
     //

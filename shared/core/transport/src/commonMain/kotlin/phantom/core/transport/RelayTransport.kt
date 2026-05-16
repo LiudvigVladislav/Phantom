@@ -95,10 +95,9 @@ interface RelayTransport {
 
     /**
      * PR-H1c (2026-05-13): milliseconds since ANY inbound WebSocket frame
-     * was observed (Deliver, Ack, Pong, malformed text — anything). The
-     * AlarmManager wakeup receiver uses this in preference to
-     * [lastPongElapsedMs] for proactive-reconnect decisions (see
-     * [RelayTransportConfig.ALARM_STALE_RECONNECT_MS]).
+     * was observed (Deliver, Ack, Pong, malformed text — anything). Used
+     * by the in-process dead-socket watchdog (DEAD_SOCKET_TIMEOUT_MS) and
+     * the AlarmManager diagnostic log in PhantomWakeupReceiver (PR-R0.4a).
      *
      * Why: under Tor / Reality and on networks with weird middleboxes the
      * Pong-routing path may be selectively dropped while normal envelope

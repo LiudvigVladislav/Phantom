@@ -1363,8 +1363,8 @@ class KtorRelayTransport(
 
     // PR-H1c: ANY inbound frame counts. Updated in readLoop (instance-level
     // @Volatile field, distinct from the per-session SessionStats counter).
-    // Driven by the AlarmManager proactive reconnect path; see
-    // RelayTransportConfig.ALARM_STALE_RECONNECT_MS.
+    // Used by the diagnostic log in PhantomWakeupReceiver (PR-R0.4a) and the
+    // in-process dead-socket watchdog (DEAD_SOCKET_TIMEOUT_MS).
     override val lastInboundFrameElapsedMs: Long
         get() = lastInboundFrameMark.elapsedNow().inWholeMilliseconds
 
