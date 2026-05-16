@@ -553,12 +553,12 @@ class TransportManager(
      * budget plus a small grace window for response decode + flow
      * resumption.
      *
-     *   Direct  inner=4 s  outer=5 s
-     *   Reality inner=20 s outer=30 s
-     *   Tor     inner=60 s outer=90 s
+     *   Direct  inner=10 s × 2 attempts + 400ms backoff  outer=25 s
+     *   Reality inner=20 s  outer=30 s
+     *   Tor     inner=60 s  outer=90 s
      */
     private fun probeTimeoutFor(kind: TransportKind): Long = when (kind) {
-        TransportKind.Direct  -> 5_000L
+        TransportKind.Direct  -> 25_000L
         TransportKind.Reality -> 30_000L
         TransportKind.Tor     -> 90_000L
     }

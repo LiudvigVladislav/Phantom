@@ -53,6 +53,12 @@ class KtorTransportProbe(
 ) : TransportProbe {
 
     override suspend fun reachable(kind: TransportKind, socksPort: Int?): Boolean {
+        // PR-R0.3: Direct clearnet probe uses native OkHttp to avoid
+        // Ktor engine false-negatives on LTE cold-radio (Test #47).
+        if (kind == TransportKind.Direct && socksPort == null) {
+            return AndroidNativeOkHttpDirectProbe(healthUrl).run()
+        }
+
         val callTimeoutMs = callTimeoutFor(kind)
         val startMs = System.currentTimeMillis()
         Log.i(
