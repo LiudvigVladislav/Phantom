@@ -5,6 +5,7 @@ package phantom.android.transport
 
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -20,6 +21,7 @@ import phantom.core.transport.PollEnvelope
 import phantom.core.transport.RelayMessage
 import phantom.core.transport.RelayTransport
 import phantom.core.transport.RestFallbackOrchestrator
+import phantom.core.transport.RestInboundDeduplicator
 import phantom.core.transport.RestMode
 import phantom.core.transport.RestStateMachine
 import phantom.core.transport.SendOutcome
@@ -37,52 +39,69 @@ import phantom.core.transport.TransportState
  * existing module graph (transport currently does not know about storage).
  * Keeping the wrapper at the app layer preserves the boundary.
  *
- * **Routing rules** (locked 2026-05-16):
+ * **Routing rules** (locked 2026-05-16, contract-reviewed by Vladislav):
+ *
  * - Outbound `send(...)`:
  *     - [RestMode.WsActive] → delegate to `wsTransport.send(...)` (WS path
- *       unchanged from pre-D1b behaviour)
+ *       unchanged from pre-D1b behaviour).
  *     - [RestMode.RestActive] OR [RestMode.WsCandidate] → route via
- *       `orchestrator.sendEnvelope(...)` (REST POST `/relay/send`)
+ *       `orchestrator.sendEnvelope(...)` (REST POST `/relay/send`).
  *   On `SendOutcome.DisabledByCapability` (relay does not advertise
  *   `rest_fallback=true`) we fall back to `wsTransport.send(...)` — that is
  *   the inert-passthrough mode that keeps the app behaving exactly like
  *   pre-D1b against old relays.
- * - Inbound `incoming` flow:
- *     - Frame.Text from WS → forwarded verbatim into the merged flow and
- *       fed into the state machine as `WsFrameTextReceived`.
- *     - `PollEnvelope` from REST poll → dedup-checked against (1) the
- *       persistent `ProcessedEnvelopeRepository` ledger (a WS-then-REST
- *       race where DMS already processed the envelope) and (2) an
- *       in-memory short-TTL set (a REST-then-REST replay because the
- *       previous ack failed). On dedup hit, the envelope is silently
- *       re-acked via the orchestrator and NOT re-emitted. On miss, it is
- *       translated 1:1 into a [RelayMessage.Deliver] and emitted.
+ *
+ * - Inbound `incoming` flow (WS passthrough is ALWAYS active, regardless of
+ *   REST capability — DMS must keep receiving WS frames even when bootstrap
+ *   failed or the relay is on an old build):
+ *     - Frame.Text from WS → forwarded verbatim into the merged flow and,
+ *       if REST capability is on, fed into the state machine as
+ *       `WsFrameTextReceived`.
+ *     - `PollEnvelope` from REST poll → 3-layer dedup check:
+ *         1. **Persistent ledger** ([ProcessedEnvelopeRepository]) — WS-then-REST
+ *            race where DMS already processed the envelope. On hit, ack and drop.
+ *         2. **In-memory tracker** ([RestInboundDeduplicator]) returns one of:
+ *             - [RestInboundDeduplicator.Action.Emit] — first time we've seen this id;
+ *               translate to [RelayMessage.Deliver] and emit, mark `pendingAck`.
+ *             - [RestInboundDeduplicator.Action.SkipNoAck] — duplicate while DMS is
+ *               still processing the previous emission. Do NOT emit and do NOT
+ *               ack — the envelope may not yet be persisted, and acking now
+ *               would let the relay drop it before DMS commits to storage.
+ *             - [RestInboundDeduplicator.Action.ReAck] — duplicate after DMS already
+ *               called `sendDeliveryAck` (i.e. envelope is durably stored, but
+ *               the relay never observed the ack). Safe to re-ack and drop.
+ *   This is the ACK-after-persistence discipline locked in the
+ *   2026-05-16 contract review.
+ *
  * - `sendDeliveryAck(messageId)`:
- *     - If the id is currently tracked in `restPendingAck` (i.e. we just
- *       emitted it via the REST path), route the ack to
- *       `orchestrator.ackInbound(...)`. This is the ACK-after-persistence
- *       path locked by Vladislav 2026-05-16 — DMS only calls
- *       `sendDeliveryAck` after successful decrypt + DB insert, which
- *       guarantees the relay only sees the ack once durable storage
- *       owns the message.
+ *     - If the id is currently tracked in the REST dedup tracker, route the
+ *       ack to `orchestrator.ackInbound(...)` AND call `markAcknowledged()`
+ *       on the tracker so subsequent duplicates flip to `ReAck`.
  *     - Else delegate to `wsTransport.sendDeliveryAck(messageId)`.
  *
- * **State-machine feeds** wired by [bootstrapAndStart]:
+ * **State-machine feeds** wired by [startWsCollectors] (always) and
+ * [startRestCollectors] (only after a successful bootstrap):
  * - `wsTransport.wsSessionEnded` → [RestStateMachine.Event.WsSessionEnded]
- * - every `wsTransport.incoming` emission → `WsFrameTextReceived`
- * - every `wsTransport.acks` emission → `WsFrameTextReceived` AND
- *   `WsOutboundAckReceived` (the strongest "WS is bidirectional"
- *   signal — commits a candidate session into `WsActive` immediately)
+ *   (REST-only — drives WsCandidate → RestActive degrade).
+ * - every `wsTransport.incoming` emission → forward to `_incoming`
+ *   (ALWAYS), and if REST is up, also `WsFrameTextReceived`.
+ * - every `wsTransport.acks` emission → forward acks via Flow chain
+ *   (ALWAYS — `acks` is just the upstream Flow reference) and, if REST is
+ *   up, also `WsFrameTextReceived` AND `WsOutboundAckReceived`
+ *   (commits a candidate session into `WsActive` immediately).
  *
  * `NetworkChanged` events are deliberately NOT wired in D1b
  * (deferred to PR-D1c).
  *
- * **Capability gate.** [bootstrapAndStart] returns early without starting
- * the orchestrator's poll loop or state-observer if the relay does not
- * advertise `rest_fallback=true`. The wrapper then behaves as a thin
- * passthrough: all `send` calls go to `wsTransport`, no REST traffic ever
- * fires. This preserves the locked rule that pre-D0r relays remain
- * functionally identical to today.
+ * **Capability gate.** [bootstrapAndStart] starts WS-passthrough collectors
+ * unconditionally so DMS still sees inbound messages even when the REST
+ * capability is unavailable. If the relay does not advertise
+ * `rest_fallback=true`, no REST traffic ever fires; on every subsequent
+ * `WsSessionEnded` event the bootstrap is retried (rate-limited) so a
+ * transient session-failure does not permanently disable REST fallback.
+ *
+ * **Thread safety.** [RestStateMachine] is NOT thread-safe; every event
+ * submission goes through [submitStateEvent] which takes [stateMachineLock].
  */
 class HybridRelayTransport(
     private val wsTransport: KtorRelayTransport,
@@ -135,21 +154,52 @@ class HybridRelayTransport(
     // ── REST routing bookkeeping ─────────────────────────────────────────────
 
     /**
-     * IDs of envelopes that arrived via REST poll and were emitted into
-     * [_incoming]. When DMS later calls [sendDeliveryAck] with one of these
-     * ids, we route the ACK to [RestFallbackOrchestrator.ackInbound]
-     * instead of the WS path. Mutated under [restLock].
+     * Tracks envelope ids that arrived via REST poll and were emitted into
+     * [_incoming]. The tracker distinguishes three states per id (Emit /
+     * SkipNoAck / ReAck) so we never ack an envelope DMS is still in the
+     * middle of decrypt-and-persisting (see class kdoc).
      */
-    private val restPendingAck = mutableSetOf<String>()
+    private val restDedup = RestInboundDeduplicator(nowMs = nowMs)
 
     /**
-     * Recently-emitted REST envelope IDs with timestamps, for second-line
-     * dedup against orchestrator re-emissions when an ack failed. Capped at
-     * [DEDUP_CAPACITY] entries with FIFO eviction. Mutated under [restLock].
+     * Lock serialising all writes to [RestStateMachine] via
+     * [RestFallbackOrchestrator.submitEvent]. Without it, three independent
+     * collectors (WS session-end, WS frames, WS acks) can race and corrupt
+     * the state machine's transition counters.
      */
-    private val restDeliveredIds = LinkedHashMap<String, Long>()
+    private val stateMachineLock = Mutex()
 
-    private val restLock = Mutex()
+    // ── REST capability + retry ──────────────────────────────────────────────
+
+    /**
+     * `true` once [bootstrapAndStart] sees `rest_fallback=true` from the
+     * relay and starts the REST collectors + orchestrator. Stays `false`
+     * against pre-D0r relays or while bootstrap is still being retried.
+     */
+    @Volatile private var restCapabilityActive: Boolean = false
+
+    /**
+     * Guards [maybeRetryBootstrap] so only one retry runs at a time.
+     */
+    private val bootstrapRetryLock = Mutex()
+
+    /**
+     * Wall-clock ms of the last bootstrap attempt (success or fail). Used by
+     * [maybeRetryBootstrap] for rate-limiting — we do not want to slam the
+     * relay with `/auth/session` POSTs every time a WS session flaps on
+     * Tele2 LTE.
+     */
+    @Volatile private var lastBootstrapAttemptMs: Long = 0L
+
+    /**
+     * Tracking handles for the REST-specific collectors so a future retry
+     * can avoid starting duplicates. WS-passthrough collectors are started
+     * once at [bootstrapAndStart] entry and never replaced.
+     */
+    private var wsSessionEndedJob: Job? = null
+    private var wsFramesStateJob: Job? = null
+    private var wsAcksStateJob: Job? = null
+    private var restInboundJob: Job? = null
 
     // ── State machine accessor ───────────────────────────────────────────────
 
@@ -173,68 +223,161 @@ class HybridRelayTransport(
      * the WS path from functioning.
      *
      * Sequence:
-     *  1. Call `orchestrator.bootstrap()` — this attempts `POST /auth/session`
+     *  1. Start WS-passthrough collectors UNCONDITIONALLY. These forward
+     *     `wsTransport.incoming` into `_incoming` so DMS keeps receiving
+     *     messages even if REST fallback never activates. They also feed the
+     *     state machine, but the [submitStateEvent] helper short-circuits
+     *     when REST is inactive so we don't churn the machine for nothing.
+     *  2. Call `orchestrator.bootstrap()` — attempts `POST /auth/session`
      *     against the relay and reads the capability fields.
-     *  2. Log the outcome (`bootstrap_ok capability=true|false`).
      *  3. If `restFallback == false` (old relay, or auth-session failed),
-     *     return without starting any of the observation jobs. The wrapper
-     *     then behaves as a transparent WS passthrough.
-     *  4. Otherwise start the orchestrator (poll loop is armed but gated
-     *     on state-machine mode), and launch background collectors that
-     *     forward WS events into the state machine and REST inbound into
-     *     the merged flow.
+     *     keep the WS-passthrough collectors running but do not start the
+     *     orchestrator's poll loop or any REST-specific observers.
+     *  4. Otherwise start the orchestrator + REST collectors.
      */
     suspend fun bootstrapAndStart() {
+        // (1) WS passthrough — ALWAYS, regardless of REST capability.
+        startWsPassthroughCollectors()
+
+        // (2) Attempt bootstrap.
         val caps = orchestrator.bootstrap()
+        lastBootstrapAttemptMs = nowMs()
         Log.i(TAG, "REST_TRACE bootstrap_ok capability=${caps.restFallback}")
         if (!caps.restFallback) {
-            // Capability disabled — wrapper stays in passthrough mode.
-            // No background jobs, no behaviour change vs pre-D1b.
+            // (3) Stay in WS-passthrough mode. A future WsSessionEnded
+            // event may trigger maybeRetryBootstrap.
+            return
+        }
+        // (4) REST is available — start orchestrator + REST-specific
+        // observers + state-machine feeds.
+        activateRestCollectors()
+    }
+
+    /**
+     * WS-passthrough collectors. Started once at [bootstrapAndStart] entry
+     * and never stopped. Forward inbound WS frames into [_incoming] so DMS
+     * keeps receiving messages independently of REST capability.
+     *
+     * State-machine event submission via [submitStateEvent] is a no-op when
+     * [restCapabilityActive] is false (see [submitStateEvent] for rationale).
+     */
+    private fun startWsPassthroughCollectors() {
+        scope.launch {
+            wsTransport.incoming.collect { deliver ->
+                _incoming.emit(deliver)
+                submitStateEvent(RestStateMachine.Event.WsFrameTextReceived)
+            }
+        }
+        scope.launch {
+            wsTransport.acks.collect {
+                // ack flow is exposed verbatim via the `acks` override, so
+                // we don't need to re-emit here; just feed the state machine.
+                submitStateEvent(RestStateMachine.Event.WsFrameTextReceived)
+                submitStateEvent(RestStateMachine.Event.WsOutboundAckReceived)
+            }
+        }
+        // wsSessionEnded drives BOTH (a) the state machine when REST is
+        // active and (b) the bootstrap-retry loop when REST is not. Wire it
+        // here so the retry mechanism works even if the very first
+        // bootstrap returned capability=false.
+        scope.launch {
+            wsTransport.wsSessionEnded.collect { event ->
+                if (restCapabilityActive) {
+                    submitStateEvent(
+                        RestStateMachine.Event.WsSessionEnded(
+                            durationMs = event.durationMs,
+                            inboundFrames = event.inboundFrames,
+                            pendingAcksAtClose = event.pendingAcksAtClose,
+                        )
+                    )
+                } else {
+                    maybeRetryBootstrap()
+                }
+            }
+        }
+    }
+
+    /**
+     * Switch the wrapper into REST-fallback-aware mode. Idempotent — safe
+     * to call from a retry path.
+     */
+    private fun activateRestCollectors() {
+        if (restCapabilityActive) {
             return
         }
         orchestrator.start()
-
-        // WS session-end events → state machine.
-        scope.launch {
-            wsTransport.wsSessionEnded.collect { event ->
-                orchestrator.submitEvent(
-                    RestStateMachine.Event.WsSessionEnded(
-                        durationMs = event.durationMs,
-                        inboundFrames = event.inboundFrames,
-                        pendingAcksAtClose = event.pendingAcksAtClose,
-                    )
-                )
-            }
-        }
-
-        // WS Frame.Text → state machine + merged inbound.
-        scope.launch {
-            wsTransport.incoming.collect { deliver ->
-                orchestrator.submitEvent(RestStateMachine.Event.WsFrameTextReceived)
-                _incoming.emit(deliver)
-            }
-        }
-
-        // WS ACK → state machine (strongest "WS bidirectional" signal).
-        // We forward both WsFrameTextReceived and WsOutboundAckReceived so
-        // a WS_CANDIDATE session commits to WS_ACTIVE on the first
-        // round-trip rather than waiting the 60 s alive timer.
-        scope.launch {
-            wsTransport.acks.collect {
-                orchestrator.submitEvent(RestStateMachine.Event.WsFrameTextReceived)
-                orchestrator.submitEvent(RestStateMachine.Event.WsOutboundAckReceived)
-            }
-        }
-
         // REST poll inbound → dedup → translate → merged inbound.
-        scope.launch {
+        restInboundJob = scope.launch {
             orchestrator.inbound.collect { handleRestInbound(it) }
+        }
+        // Flip flag AFTER the inbound collector is registered so any event
+        // already in flight is processed correctly.
+        restCapabilityActive = true
+    }
+
+    /**
+     * Re-attempt `orchestrator.bootstrap()` after a WS session terminates.
+     * Rate-limited to [BOOTSTRAP_RETRY_MIN_INTERVAL_MS] between attempts so a
+     * pathological flap-loop on Tele2 LTE does not hammer `/auth/session`.
+     *
+     * If the retry succeeds with `restFallback=true`, REST collectors are
+     * started immediately (the existing WS-passthrough collectors keep
+     * running unchanged).
+     */
+    private suspend fun maybeRetryBootstrap() {
+        if (restCapabilityActive) return
+        val now = nowMs()
+        if (now - lastBootstrapAttemptMs < BOOTSTRAP_RETRY_MIN_INTERVAL_MS) {
+            return
+        }
+        if (!bootstrapRetryLock.tryLock()) {
+            // Another retry already in flight; let it finish.
+            return
+        }
+        try {
+            // Re-check under the lock to avoid duplicate attempts that raced
+            // to acquire it.
+            if (restCapabilityActive) return
+            if (nowMs() - lastBootstrapAttemptMs < BOOTSTRAP_RETRY_MIN_INTERVAL_MS) {
+                return
+            }
+            lastBootstrapAttemptMs = nowMs()
+            val caps = runCatching { orchestrator.bootstrap() }.getOrNull()
+            Log.i(
+                TAG,
+                "REST_TRACE bootstrap_retry capability=${caps?.restFallback ?: "fail"}",
+            )
+            if (caps != null && caps.restFallback) {
+                activateRestCollectors()
+            }
+        } finally {
+            bootstrapRetryLock.unlock()
+        }
+    }
+
+    /**
+     * Funnel every [RestStateMachine] event through one mutex so the
+     * machine's internal counters stay consistent under concurrent emit /
+     * ack / session-end signals. Short-circuits when REST has not been
+     * activated — feeding events into an unstarted machine has no useful
+     * effect and we don't want to churn it.
+     */
+    private suspend fun submitStateEvent(event: RestStateMachine.Event) {
+        if (!restCapabilityActive) return
+        stateMachineLock.withLock {
+            orchestrator.submitEvent(event)
         }
     }
 
     // ── Outbound routing ─────────────────────────────────────────────────────
 
     override suspend fun send(message: RelayMessage.Send): Boolean {
+        // While REST is not active, every send goes through WS — this is the
+        // pre-D1b path. As soon as REST capability is on, the state machine
+        // owns the routing decision.
+        if (!restCapabilityActive) {
+            return wsTransport.send(message)
+        }
         val mode = stateMachine.current
         return when (mode) {
             RestMode.WsActive -> wsTransport.send(message)
@@ -314,66 +457,57 @@ class HybridRelayTransport(
             return
         }
 
-        // Layer 2: in-memory short-TTL dedup against orchestrator re-emit.
-        // The orchestrator does NOT remember what it already emitted — if
-        // its ack call fails, the server keeps redelivering on the next
-        // poll. The state goes "emit → ack fail → server returns same id
-        // on next poll → emit again". We absorb the re-emission here so
-        // DMS does not see the same envelope twice in quick succession.
-        val nowMillis = nowMs()
-        var shouldEmit = false
-        restLock.withLock {
-            val seenAt = restDeliveredIds[env.id]
-            if (seenAt != null && (nowMillis - seenAt) < DEDUP_TTL_MS) {
-                // Recent re-emit; re-ack and skip.
-            } else {
-                restDeliveredIds[env.id] = nowMillis
-                // Capacity-cap with FIFO eviction.
-                while (restDeliveredIds.size > DEDUP_CAPACITY) {
-                    val oldest = restDeliveredIds.keys.iterator().next()
-                    restDeliveredIds.remove(oldest)
-                }
-                restPendingAck.add(env.id)
-                shouldEmit = true
+        // Layer 2: in-memory tracker distinguishing pending-vs-completed.
+        // The tracker enforces the ACK-after-persistence invariant: a
+        // duplicate while DMS is still processing returns SkipNoAck (must
+        // NOT ack), a duplicate after sendDeliveryAck returns ReAck (safe).
+        when (val action = restDedup.resolve(env.id)) {
+            RestInboundDeduplicator.Action.Emit -> {
+                Log.i(
+                    TAG,
+                    "REST_TRACE inbound_deliver id=${env.id.take(8)} " +
+                        "from=${env.fromHex.take(8)} source=REST",
+                )
+                _incoming.emit(
+                    RelayMessage.Deliver(
+                        from = env.fromHex,
+                        sealedSender = env.sealedSenderBase64,
+                        payload = env.payloadBase64,
+                        messageId = env.id,
+                    )
+                )
+            }
+            RestInboundDeduplicator.Action.SkipNoAck -> {
+                // DMS is still mid-decrypt of this id; another emission
+                // would be redundant and acking now would let the relay
+                // drop the envelope before DMS commits to storage.
+                Log.i(
+                    TAG,
+                    "REST_TRACE inbound_skip_pending id=${env.id.take(8)}",
+                )
+            }
+            RestInboundDeduplicator.Action.ReAck -> {
+                // DMS has already called sendDeliveryAck → the envelope is
+                // durably stored. The previous /relay/ack-deliver request
+                // must have failed at the network layer. Safe to re-ack.
+                Log.i(
+                    TAG,
+                    "REST_TRACE inbound_reack_after_ack id=${env.id.take(8)}",
+                )
+                runCatching { orchestrator.ackInbound(env.id) }
             }
         }
-
-        if (!shouldEmit) {
-            Log.i(
-                TAG,
-                "REST_TRACE inbound_skip_recent_dedup id=${env.id.take(8)}",
-            )
-            runCatching { orchestrator.ackInbound(env.id) }
-            return
-        }
-
-        Log.i(
-            TAG,
-            "REST_TRACE inbound_deliver id=${env.id.take(8)} " +
-                "from=${env.fromHex.take(8)} source=REST",
-        )
-        _incoming.emit(
-            RelayMessage.Deliver(
-                from = env.fromHex,
-                sealedSender = env.sealedSenderBase64,
-                payload = env.payloadBase64,
-                messageId = env.id,
-            )
-        )
     }
 
     // ── ACK routing ──────────────────────────────────────────────────────────
 
     override suspend fun sendDeliveryAck(messageId: String): Boolean {
-        val viaRest = restLock.withLock {
-            if (messageId in restPendingAck) {
-                restPendingAck.remove(messageId)
-                true
-            } else {
-                false
-            }
-        }
-        if (!viaRest) {
+        // The dedup tracker is the authoritative source of "is this a REST
+        // id?". We optimistically check before WS-delegation so a missing
+        // entry (e.g. an id that was never emitted via REST) falls through
+        // to the WS path with no extra round-trip.
+        val isRestId = restDedup.isPending(messageId)
+        if (!isRestId) {
             return wsTransport.sendDeliveryAck(messageId)
         }
         // DMS only calls sendDeliveryAck AFTER markProcessed + insertMessage,
@@ -382,13 +516,14 @@ class HybridRelayTransport(
         Log.i(TAG, "REST_TRACE ack_after_save id=${messageId.take(8)}")
         val outcome = runCatching { orchestrator.ackInbound(messageId) }
             .getOrElse { AckOutcome.Failed(statusCode = null, reason = it::class.simpleName ?: "Throwable") }
+        // Mark acknowledged regardless of network outcome — DMS has
+        // persisted the envelope. If the relay re-delivers because our ack
+        // never reached it, the tracker correctly returns ReAck on the
+        // next handleRestInbound and we'll try ackInbound again.
+        restDedup.markAcknowledged(messageId)
         return when (outcome) {
             is AckOutcome.Acked -> true
             is AckOutcome.DisabledByCapability -> {
-                // Capability flipped — DMS won't retry, and the relay never
-                // saw this REST envelope acked. On next reconnect/poll the
-                // relay will redeliver, and our [restDeliveredIds] dedup
-                // will catch the re-emit and try ackInbound again. Safe.
                 Log.w(
                     TAG,
                     "REST_TRACE ack_disabled_by_capability id=${messageId.take(8)}",
@@ -410,22 +545,12 @@ class HybridRelayTransport(
         private const val TAG = "PhantomHybrid"
 
         /**
-         * Maximum number of recently-emitted REST envelope IDs we remember
-         * for in-memory dedup against orchestrator re-emissions. FIFO
-         * eviction beyond this cap. 256 covers a long worst-case poll
-         * burst (server retains up to ~7 days; 256 entries × ~64 b id =
-         * 16 KB, negligible).
+         * Minimum interval between bootstrap retry attempts. A WS session
+         * that ends within this window after the previous bootstrap try
+         * does not trigger a new `/auth/session` POST. Set to 60 s so a
+         * Tele2 LTE reconnect storm cannot DoS our own relay.
          */
-        const val DEDUP_CAPACITY: Int = 256
-
-        /**
-         * After this many ms a REST inbound id falls out of the dedup
-         * window. The relay's poll-retention is 7 days, but a recipient
-         * client that survived a poll-and-ack failure should not still
-         * be deduping the same id 5 minutes later — by then the
-         * persistent ledger guard catches it.
-         */
-        const val DEDUP_TTL_MS: Long = 5 * 60_000L
+        const val BOOTSTRAP_RETRY_MIN_INTERVAL_MS: Long = 60_000L
 
         /**
          * Rough overhead approximating JSON keys + Idempotency-Key header

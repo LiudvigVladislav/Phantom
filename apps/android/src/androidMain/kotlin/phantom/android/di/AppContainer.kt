@@ -387,61 +387,73 @@ class AppContainer(private val context: Context) {
         // wrapper stays in transparent WS passthrough mode unless the relay's
         // `/auth/session` response advertises `rest_fallback=true`, so against
         // old relays the behaviour is identical to pre-D1b.
+        //
+        // Graceful degrade: if the identity has no signing public key (Alpha 1
+        // record mid-migration, or a corrupted record), we leave hybridTransport
+        // null and the app uses the bare WS transport. The MigrationManager
+        // path eventually backfills the signing key; on the next app start the
+        // hybrid will construct normally. Crashing here would brick the app
+        // for the entire migration window.
         val signingPubHexForRest = identity.signingPublicKeyHex
-            ?: error(
-                "PR-D1b: identity.signingPublicKeyHex is null at initMessaging — " +
-                    "this should never happen on Alpha-2 schema. Migration bug.",
+        if (signingPubHexForRest == null) {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "PR-D1b: identity.signingPublicKeyHex is null — skipping hybrid " +
+                    "construction, falling back to WS-only transport. Migration " +
+                    "will populate it on a later app start.",
             )
-        val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
-            baseUrl = relayHttpBase,
-            identityHex = identity.publicKeyHex,
-            signingPubkeyHex = signingPubHexForRest,
-            getChallenge = { identityHex ->
-                // Re-use the long-lived Ktor REST client (HTTP/1.1 pinned by
-                // PR-G4). The relay returns `{"nonce_hex":"<64 hex>"}` on
-                // success. We throw on IOException or non-2xx so the
-                // orchestrator's runCatching surfaces it as
-                // `session_challenge_fail` and the next bootstrap attempt
-                // tries again.
-                val resp = restHttpClient.get(
-                    "$relayHttpBase/auth/challenge?identity=$identityHex"
-                )
-                val text = resp.bodyAsText()
-                if (!resp.status.isSuccess()) {
-                    error(
-                        "auth/challenge non-2xx: ${resp.status.value} body=${text.take(120)}"
+        } else {
+            val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
+                baseUrl = relayHttpBase,
+                identityHex = identity.publicKeyHex,
+                signingPubkeyHex = signingPubHexForRest,
+                getChallenge = { identityHex ->
+                    // Re-use the long-lived Ktor REST client (HTTP/1.1 pinned by
+                    // PR-G4). The relay returns `{"nonce_hex":"<64 hex>"}` on
+                    // success. We throw on IOException or non-2xx so the
+                    // orchestrator's runCatching surfaces it as
+                    // `session_challenge_fail` and the next bootstrap attempt
+                    // tries again.
+                    val resp = restHttpClient.get(
+                        "$relayHttpBase/auth/challenge?identity=$identityHex"
                     )
-                }
-                val nonceMatch = Regex("\"nonce_hex\"\\s*:\\s*\"([a-fA-F0-9]+)\"")
-                    .find(text)
-                    ?: error("auth/challenge response missing nonce_hex: ${text.take(120)}")
-                nonceMatch.groupValues[1]
-            },
-            signChallenge = { nonceBytes ->
-                identityManager.signRelayChallenge(nonceBytes)
-                    ?: error("signing key not provisioned")
-            },
-            transport = phantom.core.transport.createRestFallbackTransport(),
-            log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
-        )
-        val hybrid = phantom.android.transport.HybridRelayTransport(
-            wsTransport = wsTransport,
-            orchestrator = restOrchestrator,
-            processedEnvelopeRepository = processedEnvelopeRepo,
-            scope = appScope,
-        )
-        hybridTransport = hybrid
-        // Async REST bootstrap — never blocks AppContainer init. On failure
-        // (relay unreachable at app start, network down, etc.) the hybrid
-        // stays in passthrough mode and the WS path continues to function.
-        appScope.launch {
-            runCatching { hybrid.bootstrapAndStart() }
-                .onFailure { e ->
-                    android.util.Log.w(
-                        "PhantomHybrid",
-                        "bootstrapAndStart failed: ${e::class.simpleName}: ${e.message}",
-                    )
-                }
+                    val text = resp.bodyAsText()
+                    if (!resp.status.isSuccess()) {
+                        error(
+                            "auth/challenge non-2xx: ${resp.status.value} body=${text.take(120)}"
+                        )
+                    }
+                    val nonceMatch = Regex("\"nonce_hex\"\\s*:\\s*\"([a-fA-F0-9]+)\"")
+                        .find(text)
+                        ?: error("auth/challenge response missing nonce_hex: ${text.take(120)}")
+                    nonceMatch.groupValues[1]
+                },
+                signChallenge = { nonceBytes ->
+                    identityManager.signRelayChallenge(nonceBytes)
+                        ?: error("signing key not provisioned")
+                },
+                transport = phantom.core.transport.createRestFallbackTransport(),
+                log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
+            )
+            val hybrid = phantom.android.transport.HybridRelayTransport(
+                wsTransport = wsTransport,
+                orchestrator = restOrchestrator,
+                processedEnvelopeRepository = processedEnvelopeRepo,
+                scope = appScope,
+            )
+            hybridTransport = hybrid
+            // Async REST bootstrap — never blocks AppContainer init. On failure
+            // (relay unreachable at app start, network down, etc.) the hybrid
+            // stays in passthrough mode and the WS path continues to function.
+            appScope.launch {
+                runCatching { hybrid.bootstrapAndStart() }
+                    .onFailure { e ->
+                        android.util.Log.w(
+                            "PhantomHybrid",
+                            "bootstrapAndStart failed: ${e::class.simpleName}: ${e.message}",
+                        )
+                    }
+            }
         }
 
         // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2
