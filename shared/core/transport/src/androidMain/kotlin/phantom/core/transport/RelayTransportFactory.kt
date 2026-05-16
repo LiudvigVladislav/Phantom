@@ -40,8 +40,8 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // client. OkHttp closes the WebSocket with SocketTimeoutException
         // if no Pong arrives within `pingInterval` ms — that path is what
         // the in-process dead-socket watchdog (DEAD_SOCKET_TIMEOUT_MS,
-        // ~60 s) and the AlarmManager keepalive (ALARM_STALE_RECONNECT_MS,
-        // 45 s) recover from.
+        // ~60 s) recovers from. (PR-R0.4a: AlarmManager no longer calls
+        // forceReconnect; it pokes connectivity only.)
         //
         // 15 s is deliberate: PR-H1e Run B tested 5 s and saw WS lifetime
         // *halve* (Phone 21.8 s vs 46.5 s baseline) — the tighter pong
