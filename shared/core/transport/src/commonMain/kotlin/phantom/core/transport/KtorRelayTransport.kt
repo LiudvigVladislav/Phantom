@@ -1493,39 +1493,53 @@ class KtorRelayTransport(
      * flush/merge paths can briefly produce while moving an entry across)
      * it is included once.
      *
-     * Lock order: [pendingAcksLock] → [outboxMutex]. Matches every other
-     * path (ACK watchdog, [mergeUnackedIntoOutboxOrdered],
-     * [flushPendingOutbox]) so no deadlock with the live-send path.
+     * Atomicity (PR-D1c review round 2 fix): both maps are read under a
+     * NESTED lock acquisition `pendingAcksLock` → `outboxMutex`. Two
+     * separate critical sections would let an entry that is moving across
+     * (e.g. [flushPendingOutbox] removed it from `pendingOutbox` and is
+     * about to insert it into `pendingAcks`) disappear from the snapshot
+     * — and that envelope would never be migrated to REST. Nested locking
+     * matches the order used by [mergeUnackedIntoOutboxOrdered] and the
+     * ACK watchdog, so no inversion deadlock is possible.
      */
     suspend fun snapshotPendingOutbound(): List<PendingOutboundEnvelope> {
-        val fromAcks: List<PendingOutboundEnvelope> = pendingAcksLock.withLock {
-            pendingAcks.values.map { entry ->
-                PendingOutboundEnvelope(
-                    id = entry.message.messageId,
-                    to = entry.message.to,
-                    payloadBase64 = entry.message.payload,
-                    sealedSenderBase64 = entry.message.sealedSender,
-                    sequenceTs = entry.sequenceTs,
+        return pendingAcksLock.withLock {
+            outboxMutex.withLock {
+                val seen = HashSet<String>(pendingAcks.size + pendingOutbox.size)
+                val merged = ArrayList<PendingOutboundEnvelope>(
+                    pendingAcks.size + pendingOutbox.size
                 )
+                for (entry in pendingAcks.values) {
+                    val msg = entry.message
+                    if (seen.add(msg.messageId)) {
+                        merged.add(
+                            PendingOutboundEnvelope(
+                                id = msg.messageId,
+                                to = msg.to,
+                                payloadBase64 = msg.payload,
+                                sealedSenderBase64 = msg.sealedSender,
+                                sequenceTs = entry.sequenceTs,
+                            )
+                        )
+                    }
+                }
+                for (entry in pendingOutbox) {
+                    val send = entry.message as? RelayMessage.Send ?: continue
+                    if (seen.add(send.messageId)) {
+                        merged.add(
+                            PendingOutboundEnvelope(
+                                id = send.messageId,
+                                to = send.to,
+                                payloadBase64 = send.payload,
+                                sealedSenderBase64 = send.sealedSender,
+                                sequenceTs = entry.sequenceTs,
+                            )
+                        )
+                    }
+                }
+                merged.sortedBy { it.sequenceTs }
             }
         }
-        val fromOutbox: List<PendingOutboundEnvelope> = outboxMutex.withLock {
-            pendingOutbox.mapNotNull { entry ->
-                val send = entry.message as? RelayMessage.Send ?: return@mapNotNull null
-                PendingOutboundEnvelope(
-                    id = send.messageId,
-                    to = send.to,
-                    payloadBase64 = send.payload,
-                    sealedSenderBase64 = send.sealedSender,
-                    sequenceTs = entry.sequenceTs,
-                )
-            }
-        }
-        val seen = HashSet<String>(fromAcks.size + fromOutbox.size)
-        val merged = ArrayList<PendingOutboundEnvelope>(fromAcks.size + fromOutbox.size)
-        for (e in fromAcks) if (seen.add(e.id)) merged.add(e)
-        for (e in fromOutbox) if (seen.add(e.id)) merged.add(e)
-        return merged.sortedBy { it.sequenceTs }
     }
 
     /**

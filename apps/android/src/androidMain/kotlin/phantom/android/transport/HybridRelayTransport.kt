@@ -5,6 +5,7 @@ package phantom.android.transport
 
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -480,24 +481,35 @@ class HybridRelayTransport(
      * MUST be called while holding [stateMachineLock]. If the state
      * machine just transitioned out of any non-RestActive mode into
      * RestActive, arm the pending-outbox migration:
-     *  1. Launch a coroutine that will [runMigration] under
-     *     [restOutboundOrderMutex] (the launch itself is non-blocking).
-     *  2. Mark [pendingMigration] = true.
+     *  1. Allocate a LAZY-started migration coroutine (it cannot run yet).
+     *  2. Assign [migrationJob] and set [pendingMigration] = true while
+     *     the coroutine is still suspended in its NEW state.
+     *  3. Call `job.start()` — only now can the coroutine begin running
+     *     (and, eventually, set [pendingMigration] = false in its finally).
      *
-     * Write order is critical: [migrationJob] FIRST, [pendingMigration]
-     * SECOND. A concurrent [send] caller that volatile-reads
-     * [pendingMigration] = true is guaranteed to see the new job ref in
-     * the subsequent volatile read of [migrationJob] (JMM happens-before
-     * on @Volatile writes). Reversing the order opens a window where a
-     * waiter sees [pendingMigration] = true but [migrationJob] = null and
-     * breaks out of [awaitPendingMigrationIfNeeded] without waiting.
+     * Why LAZY (PR-D1c review round 2 fix). With a default-start `launch`
+     * the dispatcher can pick up the coroutine on another worker thread
+     * immediately, run [runMigration] to completion (including its
+     * `finally { pendingMigration = false }`), and return — all before
+     * the calling thread reaches `pendingMigration = true` below. That
+     * race would leave [pendingMigration] permanently true with a Job
+     * that is already completed; [awaitPendingMigrationIfNeeded] would
+     * spin forever on `job.join()` returning instantly. LAZY closes the
+     * window because no coroutine code runs until explicit `start()`.
+     *
+     * Write order under the lock is still: [migrationJob] FIRST,
+     * [pendingMigration] SECOND, [job.start] LAST — so the @Volatile
+     * happens-before for a concurrent reader of [pendingMigration]
+     * still gives them the new ref.
      */
     private fun maybeArmMigrationLocked(before: RestMode, after: RestMode) {
         if (after != RestMode.RestActive) return
         if (before == RestMode.RestActive) return
         Log.i(TAG, "REST_TRACE migrate_pending_arm from=$before to=$after")
-        migrationJob = scope.launch { runMigration() }
+        val job = scope.launch(start = CoroutineStart.LAZY) { runMigration() }
+        migrationJob = job
         pendingMigration = true
+        job.start()
     }
 
     /**
