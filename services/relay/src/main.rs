@@ -105,8 +105,26 @@ async fn main() {
                 .unwrap_or(0);
             cleanup_state.prekeys.purge_expired_previous_spks(now_ms).await;
             cleanup_state.auth_challenges.purge_expired(now_ms).await;
+            // PR-D0r: purge expired REST fallback state.
+            cleanup_state.rest_tokens.purge_expired().await;
+            cleanup_state.rest_session_cache.purge_expired().await;
+            cleanup_state.rest_idempotency.purge_expired().await;
+            {
+                let mut rest_store = cleanup_state.rest_store.write().await;
+                rest_store.retain(|_, queue| {
+                    queue.retain(|e| {
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        now < e.expires_at
+                    });
+                    !queue.is_empty()
+                });
+            }
             tracing::debug!(
-                "Cleanup: purged expired envelopes + previous SPKs + auth challenges"
+                "Cleanup: purged expired envelopes + previous SPKs + auth challenges + REST state"
             );
         }
     });

@@ -48,5 +48,16 @@ hex = "0.4"
 # no cookies, no compression, no proxy autodetection.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
+# LRU cache for per-identity idempotency key tracking (REST fallback PR-D0r).
+# Bounded eviction prevents unbounded growth when a single sender issues
+# many unique Idempotency-Key values over 24 hours.
+lru = "0.12"
+
+# SHA-256 for idempotency body-hash (REST fallback PR-D0r). Cryptographic
+# digest is required at the idempotency boundary so 200-replay vs 409-conflict
+# decisions cannot be flipped by a hash collision. ed25519-dalek already pulls
+# sha2 transitively; declaring it explicitly here keeps the dep audit honest.
+sha2 = "0.10"
+
 # Testing
 tokio-test = "0.4"
