@@ -267,6 +267,69 @@ async fn auth_session_retry_safe_same_token() {
     }
 }
 
+// ── Test 1b: /auth/session capability contract ───────────────────────────────
+
+/// Focused capability-contract assertion: a successful `/auth/session`
+/// response MUST advertise:
+///
+///   - `rest_fallback`        == true
+///   - `max_send_body_bytes`  == 4096   (locked 2026-05-16; client soft-target
+///                                       is ≤ 2000 but server hard cap is 4096)
+///   - `poll_max_envelopes`   == 1      (locked 2026-05-16)
+///   - `token`                non-empty string
+///   - `expires_at`           positive integer (unix_ms)
+///
+/// Why a dedicated test (separate from the retry-safety test): the D1/D1b
+/// client side decides whether to enable REST fallback purely by reading
+/// these fields from the very first auth/session response. If a future
+/// refactor accidentally removes a field or flips `rest_fallback` to
+/// false-by-default, the client will silently stay WS-only and the bug
+/// would only surface during a Tele2-LTE-style outage when the fallback
+/// is actually needed. This assertion pins the wire contract.
+#[tokio::test]
+async fn auth_session_returns_rest_fallback_capabilities() {
+    let app = build_app();
+    let identity = identity_hex(40);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+
+    let (_app, token) = obtain_token(app, &identity, &signing_kp).await;
+    assert!(!token.is_empty(), "token must be a non-empty string");
+
+    // Re-fetch the full response to assert all capability fields explicitly
+    // (obtain_token only returns the token string).
+    let app = build_app();
+    let identity = identity_hex(41);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let (app, nonce_hex) = fetch_challenge(app, &identity).await;
+    let (_app, status, v) =
+        call_session(app, &identity, &signing_kp, &nonce_hex).await;
+
+    assert_eq!(status, StatusCode::OK, "/auth/session must succeed");
+
+    // Required capability fields — locked 2026-05-16.
+    assert_eq!(
+        v["rest_fallback"], true,
+        "rest_fallback MUST be true so the client's capability gate enables REST mode",
+    );
+    assert_eq!(
+        v["max_send_body_bytes"], 4096,
+        "max_send_body_bytes locked at 4096 (hard cap; client soft-target ≤ 2000)",
+    );
+    assert_eq!(
+        v["poll_max_envelopes"], 1,
+        "poll_max_envelopes locked at 1 (single envelope per /relay/poll call)",
+    );
+
+    // Token + expiry sanity.
+    let token = v["token"].as_str().expect("token field must be a string");
+    assert!(!token.is_empty(), "token must be a non-empty string");
+
+    let expires_at = v["expires_at"]
+        .as_u64()
+        .expect("expires_at must be a positive integer (unix_ms)");
+    assert!(expires_at > 0, "expires_at must be > 0");
+}
+
 // ── Test 2: /relay/send idempotency, same body ────────────────────────────────
 
 /// 3 calls with same Idempotency-Key + same body → all return same response,
