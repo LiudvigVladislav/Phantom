@@ -782,9 +782,11 @@ pub async fn rest_send(
                 envelope_id = %idem_key,
                 reason      = "idempotency_cache_hit",
             );
-            let status =
-                StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
-            return (status, Json(cached.response_json)).into_response();
+            // Locked spec (2026-05-16): 201 on first delivery, 200 on
+            // duplicate replay. The cached status is the original 201;
+            // override to 200 here so the client can distinguish a fresh
+            // accept from a server-deduped replay.
+            return (StatusCode::OK, Json(cached.response_json)).into_response();
         } else {
             tracing::warn!(
                 event       = "rest_send_dedup_conflict",
