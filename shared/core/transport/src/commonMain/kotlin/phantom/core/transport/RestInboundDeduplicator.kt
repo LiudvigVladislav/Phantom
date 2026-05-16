@@ -67,6 +67,20 @@ class RestInboundDeduplicator(
 
     /**
      * Resolve what to do with an incoming REST poll envelope id.
+     *
+     * **Precedence rule (locked in 2026-05-16 follow-up review):**
+     * `pendingAck` is checked FIRST, before `recentlyEmitted`. A pending id
+     * that has been evicted from `recentlyEmitted` (by TTL or capacity)
+     * still must NOT re-emit — DMS is in the middle of decrypt + persist
+     * and a second emission would attempt the same MAC verification on the
+     * now-advanced ratchet, guaranteed to fail. Only after
+     * [markAcknowledged] flips the id out of `pendingAck` can a subsequent
+     * duplicate be ack'd or treated as fresh.
+     *
+     * Because `pendingAck` follows DMS's lifecycle (not the recent window),
+     * an id may stay pending longer than [ttlMs]; that is intentional. The
+     * persistent [phantom.core.storage.ProcessedEnvelopeRepository] ledger
+     * guard catches the cross-horizon case at the caller level.
      */
     suspend fun resolve(envelopeId: String): Action = lock.withLock {
         val now = nowMs()
@@ -77,8 +91,10 @@ class RestInboundDeduplicator(
         val isPending = envelopeId in pendingAck
 
         when {
-            isRecent && isPending -> Action.SkipNoAck
-            isRecent && !isPending -> Action.ReAck
+            // PRIORITY: pending overrides recent-window state. A pending id
+            // that aged out of recentlyEmitted is STILL not safe to re-emit.
+            isPending -> Action.SkipNoAck
+            isRecent -> Action.ReAck
             else -> {
                 // First time (or far enough past TTL to count as fresh).
                 recentlyEmitted[envelopeId] = now

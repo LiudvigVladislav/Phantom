@@ -72,6 +72,46 @@ class RestInboundDeduplicatorTest {
     }
 
     @Test
+    fun pending_id_after_ttl_still_skip_no_ack() = runTest {
+        // Pending overrides TTL: even after the recent-window entry has been
+        // evicted by TTL, a still-pending id must NOT be re-emitted.
+        val clock = FakeClock()
+        val dedup = deduplicator(clock = clock, ttlMs = 1_000L)
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("env-1"))
+        // Do NOT call markAcknowledged — DMS is still processing.
+        clock.advance(1_500L) // past TTL
+        // recentlyEmitted entry has expired, but pendingAck still contains
+        // "env-1" because DMS never finished. Must NOT be Emit.
+        assertEquals(
+            RestInboundDeduplicator.Action.SkipNoAck,
+            dedup.resolve("env-1"),
+        )
+        // Once DMS finally persists and acks, behaviour flips to fresh
+        // because the TTL eviction also wiped the recent entry.
+        dedup.markAcknowledged("env-1")
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("env-1"))
+    }
+
+    @Test
+    fun pending_id_evicted_by_capacity_still_skip_no_ack() = runTest {
+        // Pending overrides capacity eviction: even after the FIFO cap has
+        // pushed the recentlyEmitted entry out, a still-pending id must NOT
+        // be re-emitted while DMS is still mid-processing.
+        val dedup = deduplicator(capacity = 2)
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("env-1"))
+        // Fill the recent window past capacity without acking "env-1".
+        // "env-1" is still pendingAck.
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("env-2"))
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("env-3"))
+        // "env-1" was FIFO-evicted from recentlyEmitted, but pendingAck
+        // still holds it. Re-emission would race DMS — must be SkipNoAck.
+        assertEquals(
+            RestInboundDeduplicator.Action.SkipNoAck,
+            dedup.resolve("env-1"),
+        )
+    }
+
+    @Test
     fun fifo_eviction_at_capacity() = runTest {
         val dedup = deduplicator(capacity = 3)
         dedup.resolve("a")

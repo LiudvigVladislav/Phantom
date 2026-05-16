@@ -201,6 +201,15 @@ class HybridRelayTransport(
     private var wsAcksStateJob: Job? = null
     private var restInboundJob: Job? = null
 
+    /**
+     * Idempotence guard for [startWsPassthroughCollectors]. The current
+     * caller ([bootstrapAndStart]) only fires once, but the comment-level
+     * contract claims idempotency and a future retry/refactor must not
+     * accidentally spawn a second WS inbound collector — that would cause
+     * duplicate delivery into `_incoming` and double-feed the state machine.
+     */
+    @Volatile private var wsPassthroughStarted: Boolean = false
+
     // ── State machine accessor ───────────────────────────────────────────────
 
     /**
@@ -260,8 +269,14 @@ class HybridRelayTransport(
      *
      * State-machine event submission via [submitStateEvent] is a no-op when
      * [restCapabilityActive] is false (see [submitStateEvent] for rationale).
+     *
+     * Idempotent: a second call is a no-op. Guarded by [wsPassthroughStarted]
+     * so a future retry path cannot accidentally spawn a second WS inbound
+     * collector and cause duplicate delivery into [_incoming].
      */
     private fun startWsPassthroughCollectors() {
+        if (wsPassthroughStarted) return
+        wsPassthroughStarted = true
         scope.launch {
             wsTransport.incoming.collect { deliver ->
                 _incoming.emit(deliver)
@@ -270,10 +285,15 @@ class HybridRelayTransport(
         }
         scope.launch {
             wsTransport.acks.collect {
-                // ack flow is exposed verbatim via the `acks` override, so
-                // we don't need to re-emit here; just feed the state machine.
-                submitStateEvent(RestStateMachine.Event.WsFrameTextReceived)
-                submitStateEvent(RestStateMachine.Event.WsOutboundAckReceived)
+                // WS ACK = strongest "bidirectional WS" signal — must commit
+                // a WsCandidate session into WsActive atomically. Feeding
+                // both events under one lock acquisition prevents a
+                // WsSessionEnded from racing in between and reverting the
+                // mode before the ack's commit lands.
+                submitStateEvents(
+                    RestStateMachine.Event.WsFrameTextReceived,
+                    RestStateMachine.Event.WsOutboundAckReceived,
+                )
             }
         }
         // wsSessionEnded drives BOTH (a) the state machine when REST is
@@ -366,6 +386,23 @@ class HybridRelayTransport(
         if (!restCapabilityActive) return
         stateMachineLock.withLock {
             orchestrator.submitEvent(event)
+        }
+    }
+
+    /**
+     * Atomic batch variant: submits the given events under a SINGLE
+     * acquisition of [stateMachineLock] so they are applied as one
+     * indivisible step relative to other collectors. Use this for event
+     * pairs that must observe each other's effect — e.g. WS ACK = (frame
+     * received + outbound ack), where a WsSessionEnded racing between them
+     * would let WsCandidate revert before commit.
+     */
+    private suspend fun submitStateEvents(vararg events: RestStateMachine.Event) {
+        if (!restCapabilityActive) return
+        stateMachineLock.withLock {
+            for (event in events) {
+                orchestrator.submitEvent(event)
+            }
         }
     }
 
