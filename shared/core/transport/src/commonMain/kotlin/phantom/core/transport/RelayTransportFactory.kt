@@ -109,6 +109,25 @@ expect fun createPreKeyPublishHttpClient(): HttpClient
 expect fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport
 
 /**
+ * Returns a [RestFallbackTransport] for the new REST short-poll fallback
+ * endpoints (`/auth/session`, `/relay/send`, `/relay/poll`, `/relay/ack-deliver`)
+ * introduced in PR-D0r / PR-D1.
+ *
+ * PR-D1 (2026-05-16): the Android actual is the native-OkHttp transport
+ * mirroring [createPreKeyPublishHttpTransport]'s design — fresh client per
+ * call, HTTP/1.1 pinned, `Connection: close`, no connection pool sharing,
+ * client-owned retry semantics. Non-Android actuals throw
+ * [NotImplementedError] because REST fallback is currently an
+ * Android-only production path (parity with PR-R0.1's posture).
+ *
+ * The orchestrator ([RestFallbackOrchestrator]) is the higher-level
+ * consumer of this transport — it adds token management, capability
+ * gating, retry loop, and the adaptive poll loop on top of the bare
+ * I/O surface this factory exposes.
+ */
+expect fun createRestFallbackTransport(): RestFallbackTransport
+
+/**
  * Force-interrupts every thread in the active WebSocket engine's pool.
  *
  * Why this exists: Ktor's `HttpClient.close()` for the OkHttp engine

@@ -268,3 +268,14 @@ private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTrans
 
 actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
     AndroidNativeOkHttpPreKeyPublishTransport()
+
+/**
+ * Android production [RestFallbackTransport] — PR-D1.
+ *
+ * Returns a fresh [AndroidNativeOkHttpRestFallbackTransport] each call. The
+ * orchestrator typically caches one instance per app lifetime; the transport
+ * itself is stateless (no shared OkHttpClient — every method allocates its
+ * own per the locked native-OkHttp pattern).
+ */
+actual fun createRestFallbackTransport(): RestFallbackTransport =
+    AndroidNativeOkHttpRestFallbackTransport()

@@ -38,3 +38,11 @@ actual fun forceShutdownActiveEngine() {
     // No-op on iOS — Darwin engine doesn't have the
     // OkHttp shutdownNow / kernel-recv-blocking problem.
 }
+
+// iOS stub — PR-D1. REST fallback is currently Android-only production
+// path; iOS wiring is planned for Beta (PR-D3 parity track).
+actual fun createRestFallbackTransport(): RestFallbackTransport =
+    throw NotImplementedError(
+        "Native REST fallback transport is not implemented for iOS. " +
+            "iOS production wiring is planned for Beta.",
+    )
