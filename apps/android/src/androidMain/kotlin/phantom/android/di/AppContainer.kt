@@ -56,6 +56,9 @@ import phantom.core.transport.TransportManagerLog
 import phantom.core.transport.TransportPreferences
 import phantom.core.transport.TransportPreferencesAndroid
 import phantom.core.transport.createHttpClientFactory
+import io.ktor.client.request.get
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.isSuccess
 import phantom.core.transport.createPreKeyPublishHttpTransport
 import phantom.core.transport.createRestHttpClient
 import phantom.core.transport.createTorService
@@ -160,7 +163,33 @@ class AppContainer(private val context: Context) {
     }
 
     // ── Transport ─────────────────────────────────────────────────────────────
-    val transport = KtorRelayTransport(createHttpClientFactory())
+    // PR-D1b (2026-05-16): wsTransport is the bare WS implementation that has
+    // always lived behind the public `transport` field. Pre-initMessaging the
+    // getter returns this directly (callers see a regular WS transport, just
+    // like before). After initMessaging it returns a [HybridRelayTransport]
+    // wrapper that adds the REST fallback path on top of the same WS transport.
+    private val wsTransport = KtorRelayTransport(createHttpClientFactory())
+
+    /**
+     * The [HybridRelayTransport] wrapper constructed inside [initMessaging]
+     * once identity + signing pair are known. Null until then. Exposed for
+     * the [phantom.android.service.PhantomMessagingService] notification
+     * observer to read [HybridRelayTransport.stateMachine] for honest UI
+     * labels (e.g. "Online via Direct · Limited realtime" when REST_ACTIVE).
+     */
+    var hybridTransport: phantom.android.transport.HybridRelayTransport? = null
+        private set
+
+    /**
+     * Public transport accessor used by every caller (DMS, CallManager,
+     * service status observers, etc.). Returns the [HybridRelayTransport]
+     * after initMessaging completes, falling back to the bare WS transport
+     * before that. The wrapper is a transparent passthrough whenever the
+     * relay does not advertise `rest_fallback=true` capability — so against
+     * old relays the behaviour is exactly identical to pre-D1b.
+     */
+    val transport: phantom.core.transport.RelayTransport
+        get() = hybridTransport ?: wsTransport
 
     // ADR-020 Phase 2: outer-transport subsystems are always-on at construction.
     // The runtime [transportManager] decides which to start (or both, in the
@@ -345,11 +374,75 @@ class AppContainer(private val context: Context) {
         // transport bypasses Ktor and writes a pre-built ByteArray in one shot.
         // GET /prekeys/status and GET /prekeys/bundle continue using the shared REST
         // client (small GETs; connection reuse fine for them).
+        val restHttpClient = createRestHttpClient()
         val preKeyApi = phantom.core.transport.PreKeyApiClient(
-            httpClient = createRestHttpClient(),
+            httpClient = restHttpClient,
             relayBaseUrl = relayHttpBase,
             publishTransport = createPreKeyPublishHttpTransport(),
         )
+
+        // PR-D1b (2026-05-16): construct the REST fallback orchestrator using
+        // the same long-lived Ktor REST client. Wire it into the HybridRelayTransport
+        // wrapper that DMS will see as its `transport` argument below. The
+        // wrapper stays in transparent WS passthrough mode unless the relay's
+        // `/auth/session` response advertises `rest_fallback=true`, so against
+        // old relays the behaviour is identical to pre-D1b.
+        val signingPubHexForRest = identity.signingPublicKeyHex
+            ?: error(
+                "PR-D1b: identity.signingPublicKeyHex is null at initMessaging — " +
+                    "this should never happen on Alpha-2 schema. Migration bug.",
+            )
+        val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
+            baseUrl = relayHttpBase,
+            identityHex = identity.publicKeyHex,
+            signingPubkeyHex = signingPubHexForRest,
+            getChallenge = { identityHex ->
+                // Re-use the long-lived Ktor REST client (HTTP/1.1 pinned by
+                // PR-G4). The relay returns `{"nonce_hex":"<64 hex>"}` on
+                // success. We throw on IOException or non-2xx so the
+                // orchestrator's runCatching surfaces it as
+                // `session_challenge_fail` and the next bootstrap attempt
+                // tries again.
+                val resp = restHttpClient.get(
+                    "$relayHttpBase/auth/challenge?identity=$identityHex"
+                )
+                val text = resp.bodyAsText()
+                if (!resp.status.isSuccess()) {
+                    error(
+                        "auth/challenge non-2xx: ${resp.status.value} body=${text.take(120)}"
+                    )
+                }
+                val nonceMatch = Regex("\"nonce_hex\"\\s*:\\s*\"([a-fA-F0-9]+)\"")
+                    .find(text)
+                    ?: error("auth/challenge response missing nonce_hex: ${text.take(120)}")
+                nonceMatch.groupValues[1]
+            },
+            signChallenge = { nonceBytes ->
+                identityManager.signRelayChallenge(nonceBytes)
+                    ?: error("signing key not provisioned")
+            },
+            transport = phantom.core.transport.createRestFallbackTransport(),
+            log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
+        )
+        val hybrid = phantom.android.transport.HybridRelayTransport(
+            wsTransport = wsTransport,
+            orchestrator = restOrchestrator,
+            processedEnvelopeRepository = processedEnvelopeRepo,
+            scope = appScope,
+        )
+        hybridTransport = hybrid
+        // Async REST bootstrap — never blocks AppContainer init. On failure
+        // (relay unreachable at app start, network down, etc.) the hybrid
+        // stays in passthrough mode and the WS path continues to function.
+        appScope.launch {
+            runCatching { hybrid.bootstrapAndStart() }
+                .onFailure { e ->
+                    android.util.Log.w(
+                        "PhantomHybrid",
+                        "bootstrapAndStart failed: ${e::class.simpleName}: ${e.message}",
+                    )
+                }
+        }
 
         // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2
         // upgrade. Inspected by the launch path (`needsMigration()`);

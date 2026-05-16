@@ -110,6 +110,12 @@ class PhantomMessagingService : Service() {
         // updater (one branch per Tor / Xray / direct) — the manager surfaces
         // a single ManagerState that already abstracts the chain walk.
         startTransportNotificationUpdater()
+        // PR-D1b (2026-05-16): also observe the REST fallback state machine
+        // so an honest "Online via Direct · Limited realtime" label appears
+        // when the WS frame layer has degraded and we're polling REST. Pure
+        // overlay — on recovery to WS_ACTIVE the next TransportManager state
+        // emission resets the notification to its normal label.
+        startRestFallbackNotificationOverlay()
     }
 
     private fun startTransportNotificationUpdater() {
@@ -176,6 +182,30 @@ class PhantomMessagingService : Service() {
                     "TransportManager state → ${state::class.simpleName} mode=$mode text=\"$text\"",
                 )
                 pushNotificationText(text)
+            }
+        }
+    }
+
+    private fun startRestFallbackNotificationOverlay() {
+        serviceScope.launch {
+            val app = application as PhantomApplication
+            runCatching { app.ready.await() }
+            val hybrid = app.container.hybridTransport ?: return@launch
+            val prefs = app.container.transportPreferences
+            hybrid.stateMachine.state.collect { mode ->
+                val modeLabel = prefs.privacyMode.name
+                val text = when (mode) {
+                    phantom.core.transport.RestMode.RestActive ->
+                        "Online via Direct · Limited realtime · $modeLabel"
+                    phantom.core.transport.RestMode.WsCandidate ->
+                        "Online via Direct · Recovering · $modeLabel"
+                    phantom.core.transport.RestMode.WsActive ->
+                        null // Let the TransportManager state collector reassert
+                }
+                if (text != null) {
+                    Log.i(TAG, "REST_TRACE notification_overlay mode=$mode text=\"$text\"")
+                    pushNotificationText(text)
+                }
             }
         }
     }
