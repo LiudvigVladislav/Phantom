@@ -174,15 +174,44 @@ impl RestTokenStore {
 // ── Challenge-replay cache for /auth/session retry-safety ────────────────────
 
 /// Entry in the per-session challenge cache.
-/// Caches the issued token so the same (identity, challenge) within 5 minutes
-/// always returns the same token — makes POST /auth/session retry-safe.
+///
+/// PR-D0r review fix (2026-05-16): the original cache was keyed only by
+/// `(identity, challenge)` and returned the cached token on hit without
+/// re-verifying the signature. That allowed an adversary who observed
+/// an in-flight `(identity, challenge)` pair to mint a request with an
+/// arbitrary signature and receive the legitimate client's token from
+/// the cache. The fix is to bind the cache value to the exact
+/// `(signing_pubkey, signature)` that earned the first issuance, and to
+/// refuse replays where either differs.
 #[derive(Clone)]
 struct SessionCacheEntry {
     token: String,
+    /// The `signing_pubkey` hex string the cache value was bound to.
+    signing_pubkey: String,
+    /// The `signature` hex string the cache value was bound to.
+    signature: String,
     issued_at: Instant,
 }
 
-/// Maps (identity, challenge_hex) → cached token.
+/// Outcome of a [`SessionChallengeCache::get`] lookup.
+///
+/// Three distinct cases so the handler can return the correct HTTP status:
+///
+///   - `Hit(token)`         → replay; safe to return the cached token.
+///   - `SignatureMismatch`  → `(identity, challenge)` is in cache but the
+///                            supplied signature does not match the one
+///                            that earned the original token. Handler MUST
+///                            return 401 Unauthorized.
+///   - `Miss`               → no cached entry for this tuple; handler
+///                            proceeds with the normal verify+consume path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CacheLookup {
+    Hit(String),
+    SignatureMismatch,
+    Miss,
+}
+
+/// Maps (identity, challenge_hex) → cached (token, signing_pubkey, signature).
 #[derive(Default)]
 pub struct SessionChallengeCache {
     inner: RwLock<HashMap<(String, String), SessionCacheEntry>>,
@@ -193,27 +222,58 @@ impl SessionChallengeCache {
         Self::default()
     }
 
-    /// Look up a cached token for (identity, challenge). Returns the token
-    /// if the cache entry is still within the 5-minute window.
-    pub async fn get(&self, identity: &str, challenge: &str) -> Option<String> {
+    /// Look up a cached token for `(identity, challenge)` and compare the
+    /// supplied `signing_pubkey` + `signature` against the bound value.
+    ///
+    /// Returns:
+    ///   - [`CacheLookup::Hit`] when a live cache entry exists AND both
+    ///     `signing_pubkey` and `signature` match the bound originals.
+    ///   - [`CacheLookup::SignatureMismatch`] when a live cache entry exists
+    ///     but at least one of `signing_pubkey` / `signature` differs.
+    ///   - [`CacheLookup::Miss`] when no entry exists or the entry is past
+    ///     [`SESSION_CHALLENGE_TTL`].
+    pub async fn get(
+        &self,
+        identity: &str,
+        challenge: &str,
+        signing_pubkey: &str,
+        signature: &str,
+    ) -> CacheLookup {
         let map = self.inner.read().await;
-        let entry = map.get(&(identity.to_string(), challenge.to_string()))?;
+        let Some(entry) = map.get(&(identity.to_string(), challenge.to_string())) else {
+            return CacheLookup::Miss;
+        };
         if entry.issued_at.elapsed() > SESSION_CHALLENGE_TTL {
-            return None;
+            return CacheLookup::Miss;
         }
-        Some(entry.token.clone())
+        if entry.signing_pubkey != signing_pubkey || entry.signature != signature {
+            return CacheLookup::SignatureMismatch;
+        }
+        CacheLookup::Hit(entry.token.clone())
     }
 
-    /// Store (identity, challenge) → token. Overwrites any existing entry.
+    /// Store `(identity, challenge) → (token, signing_pubkey, signature)`.
+    /// Overwrites any existing entry.
+    ///
     /// `_expires_at_ms` is accepted for API symmetry with the token store
     /// but purge is driven by `issued_at` elapsed time, not a wall-clock
     /// comparison, so the field is not stored.
-    pub async fn put(&self, identity: &str, challenge: &str, token: &str, _expires_at_ms: u64) {
+    pub async fn put(
+        &self,
+        identity: &str,
+        challenge: &str,
+        token: &str,
+        signing_pubkey: &str,
+        signature: &str,
+        _expires_at_ms: u64,
+    ) {
         let mut map = self.inner.write().await;
         map.insert(
             (identity.to_string(), challenge.to_string()),
             SessionCacheEntry {
                 token: token.to_string(),
+                signing_pubkey: signing_pubkey.to_string(),
+                signature: signature.to_string(),
                 issued_at: Instant::now(),
             },
         );
@@ -367,6 +427,83 @@ impl RestEnvelope {
     }
 }
 
+// ── Store-mirror helpers (used by BOTH WS and REST send/ack paths) ───────────
+//
+// PR-D0r review fix (2026-05-16): originally `rest_send` wrote to both
+// `state.store` and `state.rest_store`, but `state.store` writes from the
+// WS send path did NOT mirror into `rest_store`. That meant a recipient
+// on REST polling would silently miss messages sent by a WS sender.
+// Similarly, WS ack-deliver removed from `state.store` but not from
+// `rest_store`, so an envelope acked over WS would be re-delivered on
+// the next REST poll. Both directions are now mirrored via these two
+// helpers, called from both `rest_send` / `rest_ack_deliver` and the
+// WS `Send` / `ack-deliver` arms in `routes.rs`.
+
+/// Mirror an envelope into the REST poll store so a recipient on REST
+/// polling sees envelopes regardless of which sender path (WS or REST)
+/// originated them. Assigns the next monotonic `seq` for `to` and
+/// returns it so the caller can attach the value to its own tracing logs.
+///
+/// Caller has already written the envelope into the primary `state.store`
+/// (WS store). This function ONLY touches `state.rest_store`.
+///
+/// Per-recipient capacity is enforced exactly the same way as the inline
+/// write in `rest_send` previously did: a dedup retain on `envelope_id`
+/// followed by a length check against `config.max_envelopes_per_recipient`.
+pub async fn mirror_envelope_to_rest_store(
+    state: &AppState,
+    to: &str,
+    envelope_id: &str,
+    sealed_sender: &str,
+    payload: &str,
+    sequence_ts: u64,
+    expires_at: u64,
+) -> u64 {
+    let seq = state.rest_seq.next(to).await;
+    let rest_env = RestEnvelope {
+        id: envelope_id.to_string(),
+        from: String::new(),
+        sealed_sender: sealed_sender.to_string(),
+        payload: payload.to_string(),
+        sequence_ts,
+        seq,
+        expires_at,
+    };
+    let mut rest_store = state.rest_store.write().await;
+    let queue = rest_store.entry(to.to_string()).or_default();
+    // Dedup by envelope id (idempotency at the mirror layer too).
+    queue.retain(|e: &RestEnvelope| !e.is_expired() && e.id != envelope_id);
+    if queue.len() < state.config.max_envelopes_per_recipient {
+        queue.push(rest_env);
+    } else {
+        tracing::warn!(
+            envelope_id = %envelope_id,
+            cap         = state.config.max_envelopes_per_recipient,
+            "rest_store at capacity — mirror dropped"
+        );
+    }
+    seq
+}
+
+/// Remove an envelope from `state.rest_store` for `recipient` — the
+/// counterpart to [`mirror_envelope_to_rest_store`]. Called when an ACK
+/// arrives over EITHER transport so the recipient's REST poll does not
+/// re-deliver an already-processed envelope. Idempotent (removing a
+/// non-existent entry is a no-op).
+pub async fn remove_envelope_from_rest_store(
+    state: &AppState,
+    recipient: &str,
+    envelope_id: &str,
+) -> bool {
+    let mut rest_store = state.rest_store.write().await;
+    let Some(queue) = rest_store.get_mut(recipient) else {
+        return false;
+    };
+    let before = queue.len();
+    queue.retain(|e| e.id != envelope_id);
+    before != queue.len()
+}
+
 // ── AppState extension ────────────────────────────────────────────────────────
 //
 // New fields are added to AppState in state.rs. This module provides the
@@ -382,24 +519,20 @@ pub fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Hash a request body with SHA-256 for idempotency body-match checks.
-/// Returns hex-encoded digest.
+/// Returns the hex-encoded 32-byte digest.
+///
+/// PR-D0r review fix (2026-05-16): originally used `DefaultHasher` (SipHash
+/// 1-3) which is not collision-resistant. The idempotency boundary decides
+/// between 200-replay and 409-conflict — flipping that decision via a
+/// crafted hash collision would let a client overwrite a previously
+/// stored response under the same Idempotency-Key with a different body
+/// and have the server silently treat it as a replay. SHA-256 closes that
+/// gap; the cost is one transitive `sha2` dep that ed25519-dalek already
+/// pulls in.
 fn sha256_hex(data: &[u8]) -> String {
-    use std::hash::Hasher;
-    // std doesn't have SHA-256. Use a simple deterministic hash as a proxy
-    // for Alpha-grade body equality (not security-critical — attacker who can
-    // supply two different bodies that collide here can trigger 200 instead of
-    // 409, which is a minor annoyance not a security issue).
-    //
-    // Full SHA-256 could be added via `sha2` crate, but that adds a dep.
-    // Using DefaultHasher seeded deterministically produces a unique fingerprint
-    // for distinct byte sequences with negligible collision probability in
-    // practice (bodies differ in at least one envelope_id UUID byte).
-    //
-    // TODO(Beta): replace with sha2::Sha256 for cryptographic strength.
-    use std::collections::hash_map::DefaultHasher;
-    let mut h = DefaultHasher::new();
-    h.write(data);
-    format!("{:016x}", h.finish())
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    hex::encode(digest)
 }
 
 // ── Request / response types ──────────────────────────────────────────────────
@@ -425,6 +558,15 @@ pub struct SessionResponse {
 pub struct RestSendRequest {
     pub envelope_id: String,
     pub to: String,
+    /// Sealed-sender envelope (base64 of `eph_pub || nonce || ct`). Optional
+    /// for plain-from sends; required by the recipient to unseal the
+    /// sender's identity. Mirrors the WS-side `Send.sealedSender` field —
+    /// PR-D0r review fix (2026-05-16): the original `RestSendRequest`
+    /// silently dropped this field, breaking sealed-message decrypt
+    /// semantics for clients that use the REST fallback path. Defaults to
+    /// empty when absent so existing/old clients still parse.
+    #[serde(default)]
+    pub sealed_sender: String,
     pub payload: String,
     pub sequence_ts: u64,
 }
@@ -513,43 +655,76 @@ pub async fn rest_session(
             .into_response();
     }
 
-    // Challenge-replay cache: same (identity, challenge) within 5 min → replay.
-    // The nonce was already one-shot consumed on the first successful call;
-    // all subsequent calls with the same (identity, challenge) key skip the
-    // signature-verify + consume path entirely.
-    if state
+    // Challenge-replay cache: same (identity, challenge, signing_pubkey,
+    // signature) within 5 min → return the same token. The nonce was already
+    // one-shot consumed on the first successful call; all subsequent calls
+    // with the same full tuple skip the signature-verify + consume path
+    // entirely. A replay with the same (identity, challenge) but a different
+    // signature is treated as an attempt to mint a token under someone
+    // else's challenge and rejected with 401.
+    match state
         .rest_session_cache
-        .get(&req.identity, &req.challenge)
+        .get(&req.identity, &req.challenge, &req.signing_pubkey, &req.signature)
         .await
-        .is_some()
     {
-        // Return the live token if still valid; re-issue if it just expired.
-        let (token, expires_at) = match state.rest_tokens.refresh_if_live(&req.identity).await {
-            Some((t, exp)) => (t, exp),
-            None => state.rest_tokens.issue(&req.identity).await,
-        };
-        tracing::info!(
-            event        = "rest_session_replay",
-            identity     = %&req.identity[..8],
-            token_prefix = %&token[..8],
-            reason       = "challenge_cache_hit",
-        );
-        // Refresh the session-cache entry TTL with the (possibly new) token.
-        state
-            .rest_session_cache
-            .put(&req.identity, &req.challenge, &token, expires_at)
-            .await;
-        return (
-            StatusCode::OK,
-            Json(SessionResponse {
-                token,
-                expires_at,
-                rest_fallback: true,
-                max_send_body_bytes: REST_MAX_BODY_BYTES,
-                poll_max_envelopes: POLL_MAX_ENVELOPES,
-            }),
-        )
-            .into_response();
+        CacheLookup::Hit(_cached_token) => {
+            // Return the live token if still valid; re-issue if it just
+            // expired. The cached_token from the challenge cache is a
+            // pointer to the original issuance; the token store is the
+            // source of truth for current validity.
+            let (token, expires_at) = match state.rest_tokens.refresh_if_live(&req.identity).await {
+                Some((t, exp)) => (t, exp),
+                None => state.rest_tokens.issue(&req.identity).await,
+            };
+            tracing::info!(
+                event        = "rest_session_replay",
+                identity     = %&req.identity[..8],
+                token_prefix = %&token[..8],
+                reason       = "challenge_cache_hit",
+            );
+            // Refresh the session-cache entry TTL, re-binding to the same
+            // (signing_pubkey, signature) tuple so future replays continue
+            // to match.
+            state
+                .rest_session_cache
+                .put(
+                    &req.identity,
+                    &req.challenge,
+                    &token,
+                    &req.signing_pubkey,
+                    &req.signature,
+                    expires_at,
+                )
+                .await;
+            return (
+                StatusCode::OK,
+                Json(SessionResponse {
+                    token,
+                    expires_at,
+                    rest_fallback: true,
+                    max_send_body_bytes: REST_MAX_BODY_BYTES,
+                    poll_max_envelopes: POLL_MAX_ENVELOPES,
+                }),
+            )
+                .into_response();
+        }
+        CacheLookup::SignatureMismatch => {
+            tracing::warn!(
+                event    = "rest_session_replay_rejected",
+                identity = %&req.identity[..8],
+                reason   = "signature_mismatch_on_cached_challenge",
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "(identity, challenge) replay must use the original signature",
+                })),
+            )
+                .into_response();
+        }
+        CacheLookup::Miss => {
+            // Fall through to the normal verify + consume path.
+        }
     }
 
     // Decode and verify Ed25519 signature.
@@ -680,10 +855,20 @@ pub async fn rest_session(
     // Issue token.
     let (token, expires_at) = state.rest_tokens.issue(&req.identity).await;
 
-    // Cache (identity, challenge) → token for retry-safe replay.
+    // Cache (identity, challenge) → (token, signing_pubkey, signature) for
+    // retry-safe replay. A subsequent call with the same full tuple replays
+    // the same token; a call with a different signature is rejected (see
+    // CacheLookup::SignatureMismatch above).
     state
         .rest_session_cache
-        .put(&req.identity, &req.challenge, &token, expires_at)
+        .put(
+            &req.identity,
+            &req.challenge,
+            &token,
+            &req.signing_pubkey,
+            &req.signature,
+            expires_at,
+        )
         .await;
 
     tracing::info!(
@@ -865,46 +1050,37 @@ pub async fn rest_send(
             .into_response();
     }
 
-    // Assign monotonic seq.
-    let seq = state.rest_seq.next(&req.to).await;
-
     // Persist to the shared envelope store (extend existing in-memory store).
+    // The `from` field stays empty because the relay never inspects sender
+    // identity; the `sealed_sender` blob is what the recipient unseals to
+    // recover it. PR-D0r review fix (2026-05-16): `sealed_sender` from the
+    // request body is now propagated end-to-end through both stores and the
+    // live-delivery JSON so sealed-mode messages decrypt correctly on the
+    // recipient.
     let envelope = Envelope::new(
         req.envelope_id.clone(),
         req.to.clone(),
-        String::new(), // from — sealed-sender semantics: relay does not store sender
-        String::new(), // sealed_sender — REST path always treats payload as opaque
+        String::new(),
+        req.sealed_sender.clone(),
         req.payload.clone(),
         state.config.envelope_ttl_secs,
     );
-    // Store the REST-specific seq alongside the envelope in the rest_store.
-    {
-        let rest_env = RestEnvelope {
-            id: req.envelope_id.clone(),
-            from: String::new(),
-            sealed_sender: String::new(),
-            payload: req.payload.clone(),
-            sequence_ts: req.sequence_ts,
-            seq,
-            expires_at: envelope.expires_at,
-        };
-        let mut rest_store = state.rest_store.write().await;
-        let queue = rest_store.entry(req.to.clone()).or_default();
-        // Dedup by envelope id (idempotency).
-        queue.retain(|e: &RestEnvelope| !e.is_expired() && e.id != req.envelope_id);
-        if queue.len() < state.config.max_envelopes_per_recipient {
-            queue.push(rest_env);
-        } else {
-            tracing::warn!(
-                envelope_id = %req.envelope_id,
-                cap = state.config.max_envelopes_per_recipient,
-                "rest_store at capacity — envelope dropped"
-            );
-        }
-    }
 
-    // Also persist in the shared WS store so /ws reconnects and /relay/poll
-    // both see the same envelope.
+    // Mirror into the REST poll store via the shared helper so a recipient
+    // on REST polling always sees the same envelope as a WS-reconnect client.
+    let seq = mirror_envelope_to_rest_store(
+        &state,
+        &req.to,
+        &req.envelope_id,
+        &req.sealed_sender,
+        &req.payload,
+        req.sequence_ts,
+        envelope.expires_at,
+    )
+    .await;
+
+    // Also persist in the shared WS store so /ws reconnects see the same
+    // envelope as a REST poller.
     {
         let mut store = state.store.write().await;
         let queue = store.entry(req.to.clone()).or_default();
@@ -914,13 +1090,14 @@ pub async fn rest_send(
         }
     }
 
-    // Live delivery via WS if recipient is currently online.
+    // Live delivery via WS if recipient is currently online. The WS client
+    // expects `sealedSender` in the deliver frame for sealed-mode messages.
     let deliver = serde_json::json!({
-        "type":      "deliver",
-        "from":      "",
-        "sealedSender": "",
-        "payload":   req.payload,
-        "messageId": req.envelope_id,
+        "type":         "deliver",
+        "from":         "",
+        "sealedSender": req.sealed_sender,
+        "payload":      req.payload,
+        "messageId":    req.envelope_id,
     })
     .to_string();
     let delivered = {

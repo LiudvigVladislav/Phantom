@@ -695,6 +695,7 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 payload.clone(),
                 state.config.envelope_ttl_secs,
             );
+            let expires_at = envelope.expires_at;
             {
                 let mut store = state.store.write().await;
                 let queue = store.entry(to.clone()).or_default();
@@ -709,6 +710,26 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                     );
                 }
             }
+
+            // PR-D0r review fix (2026-05-16): also mirror this WS-sent
+            // envelope into the REST poll store so a recipient on REST
+            // fallback sees messages from WS senders. Without this mirror,
+            // a Tele2-style client that fell back to REST would silently
+            // miss every message routed via the legacy WS path.
+            let sequence_ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let _ws_sent_seq = crate::rest_fallback::mirror_envelope_to_rest_store(
+                &state,
+                &to,
+                &msg_id,
+                &sealed_sender,
+                &payload,
+                sequence_ts_ms,
+                expires_at,
+            )
+            .await;
 
             // Attempt live delivery — best-effort.
             let delivered = {
@@ -794,6 +815,15 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                     false
                 }
             };
+            // PR-D0r review fix (2026-05-16): also clear the REST poll
+            // store so a subsequent /relay/poll from the SAME recipient
+            // does not re-deliver an envelope already acked over WS.
+            let _rest_removed = crate::rest_fallback::remove_envelope_from_rest_store(
+                &state,
+                from_identity,
+                &msg_id,
+            )
+            .await;
             if removed {
                 tracing::info!(msg_id = %msg_id, conn_id = conn_id, "ack_deliver_removed_from_store");
             } else {

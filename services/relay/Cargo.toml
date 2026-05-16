@@ -21,6 +21,7 @@ rand = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 lru = { workspace = true }
+sha2 = { workspace = true }
 # PR-H1c (2026-05-13): TCP keepalive on the relay's listening socket so
 # accepted client connections inherit aggressive keepalive timers (15s
 # idle, 5s probe interval, 3 fails before RST). On Linux, SO_KEEPALIVE

@@ -520,3 +520,218 @@ async fn relay_ack_deliver_idempotent() {
         "envelope should be absent after ack"
     );
 }
+
+// ── Test 6: /auth/session replay with different signature → 401 ──────────────
+//
+// PR-D0r review-fix coverage: the locked spec says same
+// `(identity, challenge, signing_pubkey, signature)` within 5 min → same
+// token. A replay with the same `(identity, challenge)` but a different
+// signature must be rejected with 401 — otherwise an attacker who observed
+// an in-flight `(identity, challenge)` pair could mint a request with an
+// arbitrary signature and receive the legitimate client's token from the
+// cache.
+#[tokio::test]
+async fn session_replay_with_different_signature_returns_401() {
+    let app = build_app();
+    let identity = identity_hex(90);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+
+    let (app, nonce_hex) = fetch_challenge(app, &identity).await;
+
+    // Call 1: real signature → 200, token issued, cache entry created.
+    let (app, status1, v1) = call_session(app, &identity, &signing_kp, &nonce_hex).await;
+    assert_eq!(status1, StatusCode::OK, "call 1 must succeed: {:?}", v1);
+    let token1 = v1["token"].as_str().unwrap().to_string();
+    assert!(!token1.is_empty());
+
+    // Call 2: same identity, same signing_pubkey, same challenge,
+    // BOGUS signature → must be rejected with 401, not return cached token.
+    let bogus_sig = "ff".repeat(64); // 128 hex chars, syntactically valid
+    let body = serde_json::json!({
+        "identity":       identity,
+        "signing_pubkey": signing_hex,
+        "challenge":      nonce_hex,
+        "signature":      bogus_sig,
+    })
+    .to_string();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/session")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 4096).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "replay with different signature must be 401, got {:?}",
+        v,
+    );
+    // Token MUST NOT be present in the response.
+    assert!(
+        v.get("token").is_none(),
+        "401 response must not leak the legitimate token: {:?}",
+        v,
+    );
+}
+
+// ── Test 7: /relay/send preserves sealed_sender end-to-end ───────────────────
+//
+// PR-D0r review-fix coverage: the original `RestSendRequest` silently
+// dropped the sealed_sender field, breaking sealed-mode decrypt semantics
+// for clients that use the REST fallback path. The field is now
+// propagated into both stores and surfaced back on /relay/poll.
+#[tokio::test]
+async fn rest_send_preserves_sealed_sender() {
+    let app = build_app();
+    let sender_id = identity_hex(100);
+    let recipient_id = identity_hex(101);
+    let sender_kp = SigningKey::generate(&mut OsRng);
+    let recipient_kp = SigningKey::generate(&mut OsRng);
+
+    let (app, sender_token) = obtain_token(app, &sender_id, &sender_kp).await;
+    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    // 32-byte sealed_sender blob (64 hex chars) — opaque to the relay.
+    let sealed_blob = "deadbeefcafebabe".repeat(4);
+    let envelope_id = "sealed-test-001";
+    let send_body = serde_json::json!({
+        "envelope_id":   envelope_id,
+        "to":            recipient_id,
+        "sealed_sender": sealed_blob,
+        "payload":       "PAYLOAD_BLOB_BASE64",
+        "sequence_ts":   1_700_000_000_000_u64,
+    })
+    .to_string();
+
+    let (app, send_status, send_v) =
+        call_send_raw(app, &sender_token, envelope_id, send_body.as_bytes()).await;
+    assert_eq!(send_status, StatusCode::CREATED, "send: {:?}", send_v);
+
+    // Recipient polls and should see sealed_sender preserved verbatim.
+    let (_app, poll_status, poll_v) = call_poll(app, &recipient_token, None).await;
+    assert_eq!(poll_status, StatusCode::OK, "poll: {:?}", poll_v);
+    let envs = poll_v["envelopes"].as_array().unwrap();
+    assert_eq!(envs.len(), 1, "expected exactly one polled envelope");
+    assert_eq!(
+        envs[0]["sealed_sender"].as_str().unwrap(),
+        sealed_blob,
+        "sealed_sender must survive the /relay/send → /relay/poll round-trip",
+    );
+    assert_eq!(envs[0]["id"].as_str().unwrap(), envelope_id);
+    assert_eq!(envs[0]["payload"].as_str().unwrap(), "PAYLOAD_BLOB_BASE64");
+}
+
+// ── Test 8: WS-simulated send mirrors into REST poll store ───────────────────
+//
+// PR-D0r review-fix coverage: `mirror_envelope_to_rest_store` is the
+// helper the WS path calls after writing to `state.store`. Calling it
+// directly (as if a WS send had just landed) and then polling via REST
+// proves that a Tele2-style client on REST fallback sees envelopes from
+// WS senders.
+#[tokio::test]
+async fn ws_simulated_send_mirrors_into_rest_poll() {
+    let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    let state = std::sync::Arc::new(phantom_relay::state::AppState::new(cfg));
+    let app = phantom_relay::routes::router(std::sync::Arc::clone(&state));
+
+    let recipient_id = identity_hex(110);
+    let recipient_kp = SigningKey::generate(&mut OsRng);
+    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    // Simulate the WS handler having just written an envelope by calling
+    // the mirror helper directly. In production this happens in routes.rs
+    // immediately after the inline `state.store` write.
+    let envelope_id = "ws-mirror-001";
+    let sealed_blob = "abcd1234".repeat(8);
+    let payload = "WS_PAYLOAD_BASE64";
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 86_400;
+    let _seq = phantom_relay::rest_fallback::mirror_envelope_to_rest_store(
+        &state,
+        &recipient_id,
+        envelope_id,
+        &sealed_blob,
+        payload,
+        1_700_000_000_000_u64,
+        expires_at,
+    )
+    .await;
+
+    // Recipient on REST polling sees it.
+    let (_app, poll_status, poll_v) = call_poll(app, &recipient_token, None).await;
+    assert_eq!(poll_status, StatusCode::OK);
+    let envs = poll_v["envelopes"].as_array().unwrap();
+    assert_eq!(envs.len(), 1, "REST poll must see WS-mirrored envelope");
+    assert_eq!(envs[0]["id"].as_str().unwrap(), envelope_id);
+    assert_eq!(envs[0]["sealed_sender"].as_str().unwrap(), sealed_blob);
+    assert_eq!(envs[0]["payload"].as_str().unwrap(), payload);
+}
+
+// ── Test 9: WS-simulated ack clears REST poll store ──────────────────────────
+//
+// PR-D0r review-fix coverage: WS ack-deliver removes from `state.store`
+// AND from `state.rest_store` via `remove_envelope_from_rest_store`. A
+// subsequent /relay/poll from the same recipient must not re-deliver the
+// already-acked envelope.
+#[tokio::test]
+async fn ws_simulated_ack_clears_rest_poll() {
+    let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    let state = std::sync::Arc::new(phantom_relay::state::AppState::new(cfg));
+    let app = phantom_relay::routes::router(std::sync::Arc::clone(&state));
+
+    let sender_id = identity_hex(120);
+    let recipient_id = identity_hex(121);
+    let sender_kp = SigningKey::generate(&mut OsRng);
+    let recipient_kp = SigningKey::generate(&mut OsRng);
+    let (app, sender_token) = obtain_token(app, &sender_id, &sender_kp).await;
+    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    // REST send populates both stores.
+    let envelope_id = "ws-ack-cleanup-001";
+    let send_body = serde_json::json!({
+        "envelope_id": envelope_id,
+        "to":          recipient_id,
+        "payload":     "P",
+        "sequence_ts": 1_700_000_000_000_u64,
+    })
+    .to_string();
+    let (app, send_status, _) =
+        call_send_raw(app, &sender_token, envelope_id, send_body.as_bytes()).await;
+    assert_eq!(send_status, StatusCode::CREATED);
+
+    // Verify recipient sees it.
+    let (app, _, poll_v) = call_poll(app, &recipient_token, None).await;
+    assert_eq!(poll_v["envelopes"].as_array().unwrap().len(), 1);
+
+    // Simulate WS ack-deliver by calling the remove helper directly. In
+    // production this happens in routes.rs immediately after the inline
+    // `state.store` removal in the ack-deliver arm.
+    let removed = phantom_relay::rest_fallback::remove_envelope_from_rest_store(
+        &state,
+        &recipient_id,
+        envelope_id,
+    )
+    .await;
+    assert!(removed, "helper should report it removed an entry");
+
+    // Subsequent REST poll must be empty.
+    let (_app, _, poll_v2) = call_poll(app, &recipient_token, None).await;
+    assert_eq!(
+        poll_v2["envelopes"].as_array().unwrap().len(),
+        0,
+        "REST poll must be empty after WS-simulated ack cleared the store",
+    );
+}
