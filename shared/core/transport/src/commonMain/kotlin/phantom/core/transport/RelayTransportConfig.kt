@@ -4,21 +4,20 @@
 package phantom.core.transport
 
 object RelayTransportConfig {
-    // Tick cadence for the in-process dead-socket watchdog in
-    // KtorRelayTransport.startPing. Each tick checks `lastInboundFrameMark`
-    // against DEAD_SOCKET_TIMEOUT_MS so a wire that has gone silent is
-    // detected within roughly this interval. Since PR-H1e the same loop
-    // no longer emits app-level RelayMessage.Ping frames
-    // (APP_LEVEL_PING_ENABLED = false); 10 s is kept because it gives a
-    // responsive watchdog without measurable CPU/wakeup overhead.
+    // Poll cadence for the in-process idle watchdog in
+    // KtorRelayTransport.startIdleWatchdog. Since PR-H1e the loop no longer
+    // emits app-level RelayMessage.Ping frames (APP_LEVEL_PING_ENABLED = false)
+    // and since PR-R0.4b it no longer triggers forceReconnect — it only logs
+    // a passive idle_watchdog diagnostic line at ~60 s intervals. 10 s is
+    // kept so the 60 s log cadence can be achieved via a simple modulo on
+    // the local lastLoggedAt mark without measurable CPU/wakeup overhead.
     const val PING_INTERVAL_MS = 10_000L
 
-    // If no inbound frame has arrived from the relay for this long, declare
-    // the connection dead and force a reconnect (see DEAD_SOCKET_TIMEOUT_MS
-    // alias below — same value, distinct name used by the watchdog). 60 s
-    // chosen so a slow uplink saturated by a large envelope (e.g. an 80 KB
-    // voice note over cellular on an aggressive-OEM device that parks the
-    // radio) does not get torn down mid-upload.
+    // If no Pong reply arrives within this window after an OkHttp WS Ping, OkHttp
+    // closes the socket and fires onFailure — the legitimate dead-socket trigger.
+    // 60 s is intentionally generous: a slow uplink saturated by a large envelope
+    // (e.g. an 80 KB voice note over cellular on an aggressive-OEM device that
+    // parks the radio) must not be torn down mid-upload.
     const val PONG_TIMEOUT_MS = 60_000L
 
     // How long a sent envelope may sit unacknowledged before it is treated as
@@ -52,19 +51,10 @@ object RelayTransportConfig {
     // seen in QA on 2026-04-24.
     const val RECONNECT_INFINITE = true
 
-    // PR-H1c: alias for PONG_TIMEOUT_MS used by the new liveness check, which
-    // accepts ANY inbound frame as proof of life (not just Pong). Same value;
-    // distinct name so the call sites read clearly. When the wire is healthy
-    // every Deliver / Ack / Pong refreshes liveness; under Tor / Reality where
-    // Pong frames may be re-routed but envelope traffic still flows the
-    // existing watchdog would false-positive — this rename removes that risk
-    // class from the future transport modes.
-    const val DEAD_SOCKET_TIMEOUT_MS = PONG_TIMEOUT_MS
-
     // PR-H1c (2026-05-13) — TCP keepalive constants declared for future
     // client-side wiring. **Currently NOT applied on client side** — client
-    // liveness relies on OkHttp WS Ping (15 s) and the dead-socket watchdog
-    // (DEAD_SOCKET_TIMEOUT_MS above). Server side
+    // liveness relies on OkHttp WS Ping (15 s) and its onFailure callback.
+    // Server side
     // (`services/relay/src/main.rs`) does apply socket2 keepalive as
     // defence-in-depth.
     //
@@ -101,8 +91,9 @@ object RelayTransportConfig {
     // OkHttp WS Ping stays at the production default 15 000 ms (set in
     // `RelayTransportFactory`). AlarmManager-driven proactive reconnect
     // stays enabled (Test #41 showed zero MAC errors / ledger dedup /
-    // FIFO flush issues with the alarm path live). Only the app-level
-    // Ping loop is disabled — its watchdog half (dead-socket detection
-    // on `lastInboundFrameMark`) continues to tick on PING_INTERVAL_MS.
+    // FIFO flush issues with the alarm path live). The app-level Ping
+    // loop is disabled; the renamed startIdleWatchdog loop continues to
+    // tick on PING_INTERVAL_MS emitting passive diagnostic logs only
+    // (PR-R0.4b — no forceReconnect from the idle watchdog).
     const val APP_LEVEL_PING_ENABLED = false
 }

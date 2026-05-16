@@ -96,8 +96,8 @@ interface RelayTransport {
     /**
      * PR-H1c (2026-05-13): milliseconds since ANY inbound WebSocket frame
      * was observed (Deliver, Ack, Pong, malformed text — anything). Used
-     * by the in-process dead-socket watchdog (DEAD_SOCKET_TIMEOUT_MS) and
-     * the AlarmManager diagnostic log in PhantomWakeupReceiver (PR-R0.4a).
+     * by the AlarmManager diagnostic log in PhantomWakeupReceiver (PR-R0.4a)
+     * and the passive idle_watchdog log in KtorRelayTransport (PR-R0.4b).
      *
      * Why: under Tor / Reality and on networks with weird middleboxes the
      * Pong-routing path may be selectively dropped while normal envelope
