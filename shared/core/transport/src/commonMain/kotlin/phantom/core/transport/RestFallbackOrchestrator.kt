@@ -1,0 +1,671 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
+package phantom.core.transport
+
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlin.coroutines.CoroutineContext
+
+/**
+ * High-level lifecycle owner for the REST short-poll fallback transport — PR-D1.
+ *
+ * Responsibilities:
+ *   1. Bootstrap a bearer token via `POST /auth/session` (one round-trip on
+ *      cold start; subsequent refreshes near token expiry).
+ *   2. Surface server-advertised [RelayCapabilities]. Stay completely dormant
+ *      when the relay does not advertise REST support — the existing WS-only
+ *      mode is unchanged.
+ *   3. Own the [RestStateMachine] and forward orchestrator-level events
+ *      (mode transitions, alive-tick) into it.
+ *   4. Run an adaptive poll loop (`GET /relay/poll`) only while the state
+ *      machine is in [RestMode.RestActive] or [RestMode.WsCandidate]. Stop
+ *      polling immediately on [RestMode.WsActive].
+ *   5. Provide a retry-safe [sendEnvelope] for outbound traffic in REST
+ *      mode (5 attempts, backoff `1/3/8/20/60 s`, same Idempotency-Key
+ *      across all retries — the server dedupes on the relay side per
+ *      PR-D0r design).
+ *   6. Provide [ackInbound] for the recipient client to confirm a polled
+ *      envelope has been decrypted AND saved locally (same discipline
+ *      as the PR-V0b voice ACK).
+ *
+ * Threading: all coroutine work runs on the provided [dispatcher] (default
+ * [Dispatchers.Default]). The state machine itself is single-threaded; the
+ * orchestrator serialises event submission onto the same context.
+ *
+ * Wire-up (PR-D1b, follow-up): a thin layer above the orchestrator will
+ * subscribe to [state], translate poll-derived [PollEnvelope]s into the
+ * messaging service's existing inbound pipeline, and forward
+ * [RestStateMachine.Event]s from the WS layer. This PR ships the
+ * orchestrator code; the wire-up arrives separately so PR-D1's diff
+ * stays focused.
+ */
+class RestFallbackOrchestrator(
+    private val baseUrl: String,
+    private val identityHex: String,
+    private val signingPubkeyHex: String,
+    private val getChallenge: suspend (identityHex: String) -> String,
+    private val signChallenge: suspend (challengeBytes: ByteArray) -> ByteArray,
+    private val transport: RestFallbackTransport,
+    private val now: () -> Long = { defaultNowMs() },
+    private val log: (String) -> Unit = {},
+    dispatcher: CoroutineContext = Dispatchers.Default,
+) {
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
+
+    /** Pure state machine. Public so the wire-up layer can observe + submit events. */
+    val stateMachine: RestStateMachine = RestStateMachine(now = now, log = log)
+
+    /** Convenience flow proxying [stateMachine.state]. */
+    val state: StateFlow<RestMode> get() = stateMachine.state
+
+    private val _capabilities = MutableStateFlow(RelayCapabilities.SAFE_DEFAULTS)
+
+    /**
+     * Server-advertised capabilities snapshot. Defaults to
+     * [RelayCapabilities.SAFE_DEFAULTS] (`restFallback=false`) until
+     * [bootstrap] succeeds and the relay advertises REST support.
+     */
+    val capabilities: StateFlow<RelayCapabilities> = _capabilities.asStateFlow()
+
+    private val _inbound = MutableSharedFlow<PollEnvelope>(extraBufferCapacity = 32)
+
+    /**
+     * Inbound envelopes received via `/relay/poll`. Wire-up should collect
+     * this flow and translate each envelope into the existing messaging
+     * pipeline (Deliver → decrypt → persist → [ackInbound]).
+     */
+    val inbound: SharedFlow<PollEnvelope> = _inbound.asSharedFlow()
+
+    private val tokenLock = Any()
+
+    private var sessionToken: String? = null
+    private var tokenExpiresAt: Long = 0L
+
+    private var pollJob: Job? = null
+    private var aliveTickJob: Job? = null
+    private var stateObserverJob: Job? = null
+
+    private var lastInboundOrSendAtMs: Long = 0L
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /**
+     * One-shot bootstrap: obtain a bearer token from `POST /auth/session`
+     * and read advertised capabilities. Safe to call multiple times — each
+     * call refreshes the token and re-reads capabilities.
+     *
+     * Returns the freshly-read [RelayCapabilities]. The caller decides
+     * whether to subsequently invoke [start] (only meaningful when
+     * `restFallback=true`).
+     */
+    suspend fun bootstrap(): RelayCapabilities {
+        val response = authSessionOnce()
+        if (response == null) {
+            log("REST_TRACE capability_disabled reason=auth_session_failed")
+            _capabilities.value = RelayCapabilities.SAFE_DEFAULTS
+            return RelayCapabilities.SAFE_DEFAULTS
+        }
+        val caps = response.toCapabilities()
+        _capabilities.value = caps
+        if (caps.restFallback) {
+            log(
+                "REST_TRACE capability_enabled max_body=${caps.maxSendBodyBytes} " +
+                    "poll_max_envelopes=${caps.pollMaxEnvelopes}",
+            )
+        } else {
+            log("REST_TRACE capability_disabled reason=server_field_false_or_absent")
+        }
+        return caps
+    }
+
+    /**
+     * Arm the orchestrator: start observing state-machine transitions and
+     * react by starting/stopping the poll loop and alive-tick timer.
+     * No-op when capabilities advertise `restFallback=false` — keeps the
+     * orchestrator dormant under old relays.
+     *
+     * Safe to call multiple times; existing observers are cancelled and
+     * re-created.
+     */
+    fun start() {
+        if (!_capabilities.value.restFallback) {
+            log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
+            return
+        }
+        stop()
+        stateObserverJob = scope.launch {
+            stateMachine.state.collect { mode -> onModeChanged(mode) }
+        }
+        log("REST_TRACE orchestrator_started")
+    }
+
+    /**
+     * Cancel all background jobs (poll loop, alive tick, state observer).
+     * Idempotent. The orchestrator can be re-armed by another [start] call.
+     */
+    fun stop() {
+        pollJob?.cancel(); pollJob = null
+        aliveTickJob?.cancel(); aliveTickJob = null
+        stateObserverJob?.cancel(); stateObserverJob = null
+    }
+
+    /**
+     * Fully tear down. After this the orchestrator is dead — construct a
+     * fresh instance to re-arm.
+     */
+    fun close() {
+        stop()
+        scope.cancel()
+    }
+
+    /** Forward an event into the state machine. */
+    fun submitEvent(event: RestStateMachine.Event) {
+        stateMachine.onEvent(event)
+    }
+
+    /**
+     * Send one envelope via REST. Used by the caller (typically a
+     * HybridRelayTransport wrapper or the messaging service) when the
+     * state machine is in [RestMode.RestActive].
+     *
+     * Behavior:
+     *   - Refuses (`SendOutcome.DisabledByCapability`) if capability is off.
+     *   - Refuses (`SendOutcome.OversizeBody`) if `payloadBase64` would
+     *     produce a request larger than the relay's advertised
+     *     `max_send_body_bytes`.
+     *   - Uses [envelopeId] as the `Idempotency-Key`, stable across retries.
+     *   - Retries up to [SEND_MAX_ATTEMPTS] times with backoff
+     *     [SEND_RETRY_DELAYS_MS] on transient failures (SocketTimeout,
+     *     status 5xx, status 408/429).
+     *   - Returns `Accepted` on 201, `Duplicate` on 200 (server replay),
+     *     `Failed` on hard failure.
+     */
+    suspend fun sendEnvelope(
+        envelopeId: String,
+        toHex: String,
+        payloadBase64: String,
+        sequenceTs: Long,
+    ): SendOutcome {
+        if (!_capabilities.value.restFallback) {
+            return SendOutcome.DisabledByCapability
+        }
+        val token = ensureToken() ?: return SendOutcome.Failed(
+            statusCode = null,
+            reason = "auth_session_failed",
+        )
+
+        val body = SendRequest(
+            envelopeId = envelopeId,
+            toHex = toHex,
+            payloadBase64 = payloadBase64,
+            sequenceTs = sequenceTs,
+        )
+
+        // Soft pre-check — capability cap might be 0 (old relay default)
+        // so we only enforce when the relay advertised a positive cap.
+        val maxBody = _capabilities.value.maxSendBodyBytes
+        if (maxBody > 0) {
+            val approxBody = payloadBase64.length + APPROX_SEND_BODY_OVERHEAD_BYTES
+            if (approxBody > maxBody) {
+                log(
+                    "REST_TRACE send_oversize id=${envelopeId.take(8)} " +
+                        "bodyBytes=$approxBody max=$maxBody",
+                )
+                return SendOutcome.OversizeBody(bodyBytes = approxBody, maxBytes = maxBody)
+            }
+        }
+
+        val url = "$baseUrl/relay/send"
+        val totalStart = now()
+        var lastStatus: Int? = null
+        var lastReason: String = "unknown"
+        for (attempt in 1..SEND_MAX_ATTEMPTS) {
+            val approxBody = payloadBase64.length + APPROX_SEND_BODY_OVERHEAD_BYTES
+            log(
+                "REST_TRACE send_start id=${envelopeId.take(8)} bodyBytes=$approxBody " +
+                    "attempt=$attempt/$SEND_MAX_ATTEMPTS",
+            )
+            val attemptStart = now()
+            val outcome = runCatching {
+                transport.send(url = url, token = token, idempotencyKey = envelopeId, body = body)
+            }
+            val attemptElapsed = now() - attemptStart
+
+            if (outcome.isFailure) {
+                val ex = outcome.exceptionOrNull()!!
+                lastStatus = null
+                lastReason = ex::class.simpleName ?: "Exception"
+                log(
+                    "REST_TRACE send_retry id=${envelopeId.take(8)} reason=$lastReason " +
+                        "attempt=$attempt next_delay_ms=${delayForRetry(attempt)} " +
+                        "elapsedMs=$attemptElapsed",
+                )
+                if (attempt < SEND_MAX_ATTEMPTS) {
+                    delay(delayForRetry(attempt))
+                    continue
+                }
+                break
+            }
+
+            val response = outcome.getOrThrow()
+            lastStatus = response.statusCode
+            log(
+                "REST_TRACE send_response id=${envelopeId.take(8)} status=${response.statusCode} " +
+                    "elapsedMs=${response.elapsedMs}",
+            )
+
+            when (response.statusCode) {
+                201 -> {
+                    lastInboundOrSendAtMs = now()
+                    return SendOutcome.Accepted
+                }
+                200 -> {
+                    log("REST_TRACE send_success_dedup id=${envelopeId.take(8)}")
+                    lastInboundOrSendAtMs = now()
+                    return SendOutcome.Duplicate
+                }
+                401 -> {
+                    // Token expired or revoked: clear cache, force refresh,
+                    // burn one more attempt on the refreshed token.
+                    sessionToken = null
+                    tokenExpiresAt = 0L
+                    val refreshed = ensureToken()
+                    if (refreshed == null) {
+                        lastReason = "auth_refresh_failed"
+                        break
+                    }
+                    log(
+                        "REST_TRACE send_retry id=${envelopeId.take(8)} reason=401_token_refresh " +
+                            "attempt=$attempt",
+                    )
+                    if (attempt < SEND_MAX_ATTEMPTS) continue else break
+                }
+                400, 403, 409, 413 -> {
+                    lastReason = "non_retryable_status_${response.statusCode}"
+                    return SendOutcome.Failed(statusCode = response.statusCode, reason = lastReason)
+                }
+                in 500..599, 408, 429 -> {
+                    lastReason = "retryable_status_${response.statusCode}"
+                    if (attempt < SEND_MAX_ATTEMPTS) {
+                        delay(delayForRetry(attempt))
+                        continue
+                    }
+                    break
+                }
+                else -> {
+                    lastReason = "unexpected_status_${response.statusCode}"
+                    if (attempt < SEND_MAX_ATTEMPTS) {
+                        delay(delayForRetry(attempt))
+                        continue
+                    }
+                    break
+                }
+            }
+        }
+        val total = now() - totalStart
+        log(
+            "REST_TRACE send_fail_giving_up id=${envelopeId.take(8)} " +
+                "total_elapsedMs=$total attempts=$SEND_MAX_ATTEMPTS reason=$lastReason",
+        )
+        return SendOutcome.Failed(statusCode = lastStatus, reason = lastReason)
+    }
+
+    /**
+     * Confirm an inbound envelope has been fully processed (decrypted +
+     * persisted). MUST be called by the wire-up layer ONLY after local
+     * persistence succeeds — same pattern as PR-V0b voice ACK.
+     */
+    suspend fun ackInbound(envelopeId: String): AckOutcome {
+        if (!_capabilities.value.restFallback) {
+            return AckOutcome.DisabledByCapability
+        }
+        val token = ensureToken() ?: return AckOutcome.Failed(
+            statusCode = null,
+            reason = "auth_session_failed",
+        )
+        val url = "$baseUrl/relay/ack-deliver"
+        val body = AckDeliverRequest(id = envelopeId)
+        val response = runCatching { transport.ackDeliver(url, token, body) }
+        if (response.isFailure) {
+            val ex = response.exceptionOrNull()!!
+            log("REST_TRACE ack_fail id=${envelopeId.take(8)} reason=${ex::class.simpleName}")
+            return AckOutcome.Failed(statusCode = null, reason = ex::class.simpleName ?: "Exception")
+        }
+        val r = response.getOrThrow()
+        log("REST_TRACE ack_sent id=${envelopeId.take(8)} status=${r.statusCode} elapsedMs=${r.elapsedMs}")
+        return if (r.statusCode in 200..299) {
+            AckOutcome.Acked
+        } else {
+            AckOutcome.Failed(statusCode = r.statusCode, reason = "status_${r.statusCode}")
+        }
+    }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    private fun onModeChanged(mode: RestMode) {
+        when (mode) {
+            RestMode.WsActive -> {
+                // Stop polling + alive tick. Token refresh stays cached
+                // for next time the orchestrator needs it.
+                pollJob?.cancel(); pollJob = null
+                aliveTickJob?.cancel(); aliveTickJob = null
+                log("REST_TRACE poll_stopped reason=ws_active")
+            }
+            RestMode.RestActive, RestMode.WsCandidate -> {
+                if (pollJob == null || pollJob?.isActive != true) {
+                    pollJob = scope.launch { pollLoop() }
+                    log("REST_TRACE poll_started mode=$mode")
+                }
+                if (mode == RestMode.WsCandidate && (aliveTickJob == null || aliveTickJob?.isActive != true)) {
+                    aliveTickJob = scope.launch { aliveTickLoop() }
+                }
+                if (mode == RestMode.RestActive) {
+                    aliveTickJob?.cancel(); aliveTickJob = null
+                }
+            }
+        }
+    }
+
+    private suspend fun pollLoop() {
+        var lastSeenSeq: Long? = null
+        while (scope.isActive) {
+            val mode = stateMachine.state.value
+            if (mode == RestMode.WsActive) break
+
+            val token = ensureToken()
+            if (token == null) {
+                log("REST_TRACE poll_call_skipped reason=no_token")
+                delay(POLL_BACKOFF_NO_TOKEN_MS)
+                continue
+            }
+
+            val intervalMs = pollIntervalMs()
+            val pollMode = pollMode()
+            log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
+            val startMs = now()
+            val outcome = runCatching {
+                transport.poll(url = "$baseUrl/relay/poll", token = token, sinceSeq = lastSeenSeq)
+            }
+            val elapsed = now() - startMs
+
+            if (outcome.isFailure) {
+                val ex = outcome.exceptionOrNull()!!
+                log(
+                    "REST_TRACE poll_fail reason=${ex::class.simpleName} elapsedMs=$elapsed " +
+                        "next_delay_ms=${intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)}",
+                )
+                delay(intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS))
+                continue
+            }
+
+            val response = outcome.getOrThrow()
+            when (response.statusCode) {
+                401 -> {
+                    sessionToken = null
+                    tokenExpiresAt = 0L
+                    log("REST_TRACE poll_401_retry_after_refresh")
+                    delay(POLL_FAIL_BACKOFF_MS)
+                    continue
+                }
+                in 200..299 -> {
+                    val parsed = response.bodyParsed
+                    if (parsed == null || parsed.envelopes.isEmpty()) {
+                        log("REST_TRACE poll_empty elapsedMs=$elapsed")
+                        delay(intervalMs)
+                        continue
+                    }
+                    for (env in parsed.envelopes) {
+                        log(
+                            "REST_TRACE poll_received id=${env.id.take(8)} " +
+                                "from=${env.fromHex.take(8)} elapsedMs=$elapsed more=${parsed.more}",
+                        )
+                        lastInboundOrSendAtMs = now()
+                        lastSeenSeq = env.seq
+                        _inbound.emit(env)
+                    }
+                    // Drain immediately if server says there's more.
+                    if (parsed.more) {
+                        delay(POLL_DRAIN_IMMEDIATE_MS)
+                        continue
+                    }
+                    delay(intervalMs)
+                }
+                else -> {
+                    log(
+                        "REST_TRACE poll_unexpected_status status=${response.statusCode} " +
+                            "elapsedMs=$elapsed",
+                    )
+                    delay(intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS))
+                }
+            }
+        }
+    }
+
+    private suspend fun aliveTickLoop() {
+        while (scope.isActive) {
+            delay(CANDIDATE_TICK_MS)
+            stateMachine.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+            if (stateMachine.state.value != RestMode.WsCandidate) break
+        }
+    }
+
+    /**
+     * Polling cadence based on recent traffic activity.
+     */
+    private fun pollIntervalMs(): Long {
+        val sinceLastTraffic = now() - lastInboundOrSendAtMs
+        return when {
+            sinceLastTraffic < POLL_ACTIVE_WINDOW_MS -> POLL_ACTIVE_MS
+            sinceLastTraffic < POLL_IDLE_WINDOW_MS -> POLL_IDLE_MS
+            else -> POLL_LONG_IDLE_MS
+        }
+    }
+
+    private fun pollMode(): String {
+        val sinceLastTraffic = now() - lastInboundOrSendAtMs
+        return when {
+            sinceLastTraffic < POLL_ACTIVE_WINDOW_MS -> "active"
+            sinceLastTraffic < POLL_IDLE_WINDOW_MS -> "idle"
+            else -> "longidle"
+        }
+    }
+
+    private fun delayForRetry(attemptIndex: Int): Long {
+        // attemptIndex is 1-based. We use [attemptIndex - 1] into the
+        // delay table for "wait BEFORE the next attempt".
+        val idx = (attemptIndex - 1).coerceIn(0, SEND_RETRY_DELAYS_MS.lastIndex)
+        return SEND_RETRY_DELAYS_MS[idx]
+    }
+
+    private suspend fun ensureToken(): String? {
+        val cached = sessionToken
+        if (cached != null && now() < tokenExpiresAt - TOKEN_REFRESH_LEAD_MS) {
+            return cached
+        }
+        val response = authSessionOnce() ?: return null
+        sessionToken = response.token
+        tokenExpiresAt = response.expiresAt
+        return response.token
+    }
+
+    private suspend fun authSessionOnce(): AuthSessionResponse? {
+        log("REST_TRACE session_request identity=${identityHex.take(8)}")
+        val challengeHex = runCatching { getChallenge(identityHex) }
+            .onFailure { ex ->
+                log("REST_TRACE session_challenge_fail reason=${ex::class.simpleName}")
+            }
+            .getOrNull() ?: return null
+
+        val signatureHex = runCatching {
+            val challengeBytes = hexToBytes(challengeHex)
+            val sigBytes = signChallenge(challengeBytes)
+            bytesToHex(sigBytes)
+        }
+            .onFailure { ex ->
+                log("REST_TRACE session_sign_fail reason=${ex::class.simpleName}")
+            }
+            .getOrNull() ?: return null
+
+        val body = AuthSessionRequest(
+            identityHex = identityHex,
+            signingPubkeyHex = signingPubkeyHex,
+            challengeHex = challengeHex,
+            signatureHex = signatureHex,
+        )
+
+        val startMs = now()
+        val outcome = runCatching {
+            transport.authSession(url = "$baseUrl/auth/session", body = body)
+        }
+        val elapsed = now() - startMs
+
+        if (outcome.isFailure) {
+            val ex = outcome.exceptionOrNull()!!
+            log("REST_TRACE session_fail reason=${ex::class.simpleName} elapsedMs=$elapsed")
+            return null
+        }
+        val response = outcome.getOrThrow()
+        if (response.statusCode !in 200..299 || response.bodyParsed == null) {
+            log("REST_TRACE session_fail status=${response.statusCode} elapsedMs=$elapsed")
+            return null
+        }
+        val parsed = response.bodyParsed
+        log(
+            "REST_TRACE session_response status=${response.statusCode} elapsedMs=$elapsed " +
+                "rest_fallback=${parsed.restFallback} max_body=${parsed.maxSendBodyBytes}",
+        )
+        return parsed
+    }
+
+    companion object {
+        /**
+         * Max attempts for a single [sendEnvelope] call. Five gives the
+         * Tele2 middlebox five randomly-distributed windows to let a POST
+         * succeed before we surface failure.
+         */
+        const val SEND_MAX_ATTEMPTS: Int = 5
+
+        /**
+         * Backoff between retry attempts. Indexed by (attempt - 1) so the
+         * delay BEFORE the 2nd attempt is `[0] = 1s`, etc. Total worst-case
+         * elapsed across all 5 attempts ≈ 92 s.
+         */
+        val SEND_RETRY_DELAYS_MS: LongArray = longArrayOf(
+            1_000L, 3_000L, 8_000L, 20_000L, 60_000L,
+        )
+
+        /**
+         * After this many ms of recent inbound or outbound traffic we
+         * regard the orchestrator as "active" and poll aggressively.
+         */
+        const val POLL_ACTIVE_WINDOW_MS: Long = 30_000L
+
+        /**
+         * After this many ms with no traffic we shift to long-idle polling.
+         */
+        const val POLL_IDLE_WINDOW_MS: Long = 5 * 60_000L
+
+        /** Poll interval when "active" (recent traffic). */
+        const val POLL_ACTIVE_MS: Long = 2_000L
+
+        /** Poll interval when "idle" (no traffic 30 s–5 min). */
+        const val POLL_IDLE_MS: Long = 5_000L
+
+        /** Poll interval when "long-idle" (no traffic >5 min). */
+        const val POLL_LONG_IDLE_MS: Long = 15_000L
+
+        /** Linear backoff on poll error. Coerce-at-least applied to active mode. */
+        const val POLL_FAIL_BACKOFF_MS: Long = 5_000L
+
+        /** Tiny delay between drain polls when server says `more:true`. */
+        const val POLL_DRAIN_IMMEDIATE_MS: Long = 100L
+
+        /** Backoff when we cannot get a token at all. */
+        const val POLL_BACKOFF_NO_TOKEN_MS: Long = 5_000L
+
+        /**
+         * Refresh the session token this many ms before its hard expiry to
+         * avoid a 401 during a critical send.
+         */
+        const val TOKEN_REFRESH_LEAD_MS: Long = 5 * 60_000L
+
+        /**
+         * Tick interval for the [RestMode.WsCandidate] alive timer. Faster
+         * than 60 s so we converge to the commit threshold near 60 s, not
+         * "at most 60 + tick" s.
+         */
+        const val CANDIDATE_TICK_MS: Long = 5_000L
+
+        /**
+         * Rough overhead added to `payloadBase64.length` to approximate
+         * total wire body size (JSON keys + envelope_id + to + sequence_ts
+         * + commas/quotes). Used only for the pre-flight oversize check;
+         * the actual wire size is computed at the transport layer.
+         */
+        const val APPROX_SEND_BODY_OVERHEAD_BYTES: Int = 256
+
+        private fun defaultNowMs(): Long =
+            kotlinx.datetime.Clock.System.now().toEpochMilliseconds()
+
+        private val HEX_CHARS = "0123456789abcdef".toCharArray()
+
+        private fun bytesToHex(bytes: ByteArray): String {
+            val out = CharArray(bytes.size * 2)
+            for (i in bytes.indices) {
+                val v = bytes[i].toInt() and 0xFF
+                out[i * 2] = HEX_CHARS[v ushr 4]
+                out[i * 2 + 1] = HEX_CHARS[v and 0x0F]
+            }
+            return out.concatToString()
+        }
+
+        private fun hexToBytes(hex: String): ByteArray {
+            require(hex.length % 2 == 0) { "odd-length hex" }
+            val out = ByteArray(hex.length / 2)
+            for (i in out.indices) {
+                val hi = hex[i * 2].digitToInt(16)
+                val lo = hex[i * 2 + 1].digitToInt(16)
+                out[i] = ((hi shl 4) or lo).toByte()
+            }
+            return out
+        }
+    }
+}
+
+// ── Outcome types ────────────────────────────────────────────────────────────
+
+sealed class SendOutcome {
+    /** Status 201 — first delivery, server accepted and queued. */
+    object Accepted : SendOutcome()
+
+    /** Status 200 — duplicate idempotency key, server confirms previous delivery. */
+    object Duplicate : SendOutcome()
+
+    /** Capability flag is false (old relay) — REST send not attempted. */
+    object DisabledByCapability : SendOutcome()
+
+    /** Caller's payload exceeds the relay-advertised body cap. No retry helps. */
+    data class OversizeBody(val bodyBytes: Int, val maxBytes: Int) : SendOutcome()
+
+    /** Hard failure after all retries (or non-retryable status). */
+    data class Failed(val statusCode: Int?, val reason: String) : SendOutcome()
+}
+
+sealed class AckOutcome {
+    object Acked : AckOutcome()
+    object DisabledByCapability : AckOutcome()
+    data class Failed(val statusCode: Int?, val reason: String) : AckOutcome()
+}

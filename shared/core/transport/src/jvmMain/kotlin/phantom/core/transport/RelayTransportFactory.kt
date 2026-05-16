@@ -37,3 +37,14 @@ actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
 actual fun forceShutdownActiveEngine() {
     // No-op on JVM placeholder — used only for tests/desktop.
 }
+
+// JVM stub — PR-D1. The REST fallback transport is currently Android-only
+// (production path). JVM tests inject a fake RestFallbackTransport directly
+// into RestFallbackOrchestrator rather than calling this factory, so this
+// function need not produce a working implementation. Throwing makes
+// accidental invocation visible at test time.
+actual fun createRestFallbackTransport(): RestFallbackTransport =
+    throw NotImplementedError(
+        "Native REST fallback transport is Android-only. " +
+            "Inject a fake RestFallbackTransport in tests.",
+    )
