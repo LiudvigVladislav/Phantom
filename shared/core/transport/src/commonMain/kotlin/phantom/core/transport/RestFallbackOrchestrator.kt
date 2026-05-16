@@ -17,6 +17,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.CoroutineContext
 
 /**
@@ -89,7 +91,15 @@ class RestFallbackOrchestrator(
      */
     val inbound: SharedFlow<PollEnvelope> = _inbound.asSharedFlow()
 
-    private val tokenLock = Any()
+    /**
+     * Serialises all reads/writes to [sessionToken] and [tokenExpiresAt]
+     * across concurrent callers (poll-loop, send retries, migration,
+     * ackInbound). Without this, two callers could enter
+     * [authSessionOnce] simultaneously, and the server would replace the
+     * first-issued token with the second — invalidating the first.
+     * Locked PR-D1c.1 (2026-05-17) after Test #50 reproduced this race.
+     */
+    private val tokenMutex = Mutex()
 
     private var sessionToken: String? = null
     private var tokenExpiresAt: Long = 0L
@@ -112,14 +122,13 @@ class RestFallbackOrchestrator(
      * `restFallback=true`).
      */
     suspend fun bootstrap(): RelayCapabilities {
-        val response = authSessionOnce()
-        if (response == null) {
+        val token = acquireOrRefreshToken(reason = "bootstrap", forceRefresh = true)
+        if (token == null) {
             log("REST_TRACE capability_disabled reason=auth_session_failed")
             _capabilities.value = RelayCapabilities.SAFE_DEFAULTS
             return RelayCapabilities.SAFE_DEFAULTS
         }
-        val caps = response.toCapabilities()
-        _capabilities.value = caps
+        val caps = _capabilities.value
         if (caps.restFallback) {
             log(
                 "REST_TRACE capability_enabled max_body=${caps.maxSendBodyBytes} " +
@@ -203,10 +212,6 @@ class RestFallbackOrchestrator(
         if (!_capabilities.value.restFallback) {
             return SendOutcome.DisabledByCapability
         }
-        val token = ensureToken() ?: return SendOutcome.Failed(
-            statusCode = null,
-            reason = "auth_session_failed",
-        )
 
         val body = SendRequest(
             envelopeId = envelopeId,
@@ -234,7 +239,24 @@ class RestFallbackOrchestrator(
         val totalStart = now()
         var lastStatus: Int? = null
         var lastReason: String = "unknown"
+        // PR-D1c.1: acquire the token *inside* the retry loop. Previously
+        // it was captured once before the loop, so even when a 401 forced
+        // a refresh, subsequent attempts kept using the stale token.
+        // Carrying [staleToken] across iterations lets [acquireOrRefreshToken]
+        // distinguish "my token went bad, please refresh" from "first attempt"
+        // and lets the CAS path re-use a token that a concurrent caller
+        // already refreshed.
+        var staleToken: String? = null
         for (attempt in 1..SEND_MAX_ATTEMPTS) {
+            val token = acquireOrRefreshToken(
+                reason = if (staleToken != null) "send_401" else "send",
+                staleToken = staleToken,
+            ) ?: return SendOutcome.Failed(
+                statusCode = null,
+                reason = "auth_session_failed",
+            )
+            staleToken = null
+
             val approxBody = payloadBase64.length + APPROX_SEND_BODY_OVERHEAD_BYTES
             log(
                 "REST_TRACE send_start id=${envelopeId.take(8)} bodyBytes=$approxBody " +
@@ -280,17 +302,14 @@ class RestFallbackOrchestrator(
                     return SendOutcome.Duplicate
                 }
                 401 -> {
-                    // Token expired or revoked: clear cache, force refresh,
-                    // burn one more attempt on the refreshed token.
-                    sessionToken = null
-                    tokenExpiresAt = 0L
-                    val refreshed = ensureToken()
-                    if (refreshed == null) {
-                        lastReason = "auth_refresh_failed"
-                        break
-                    }
+                    // Token rejected by relay. Remember which one was stale
+                    // and let acquireOrRefreshToken() decide on the next
+                    // iteration: refresh, or CAS-reuse if a concurrent
+                    // caller already refreshed.
+                    staleToken = token
+                    lastReason = "401_token_stale"
                     log(
-                        "REST_TRACE send_retry id=${envelopeId.take(8)} reason=401_token_refresh " +
+                        "REST_TRACE send_401_token_stale id=${envelopeId.take(8)} " +
                             "attempt=$attempt",
                     )
                     if (attempt < SEND_MAX_ATTEMPTS) continue else break
@@ -334,7 +353,12 @@ class RestFallbackOrchestrator(
         if (!_capabilities.value.restFallback) {
             return AckOutcome.DisabledByCapability
         }
-        val token = ensureToken() ?: return AckOutcome.Failed(
+        // PR-D1c.1: deliberately no 401-retry here. If relay rejects the
+        // token, the next poll iteration will refresh it via CAS; the
+        // server stores the inbound envelope until a successful ack, so
+        // re-delivery on the next poll is the self-healing path. A real
+        // ack-401-retry can land in PR-D1d if traces show it matters.
+        val token = acquireOrRefreshToken(reason = "ack") ?: return AckOutcome.Failed(
             statusCode = null,
             reason = "auth_session_failed",
         )
@@ -383,16 +407,25 @@ class RestFallbackOrchestrator(
 
     private suspend fun pollLoop() {
         var lastSeenSeq: Long? = null
+        // PR-D1c.1: same CAS discipline as sendEnvelope — remember the
+        // token that just got 401'd, and let acquireOrRefreshToken either
+        // refresh it or CAS-reuse what a concurrent caller already
+        // refreshed. No more direct writes to sessionToken from here.
+        var staleToken: String? = null
         while (scope.isActive) {
             val mode = stateMachine.state.value
             if (mode == RestMode.WsActive) break
 
-            val token = ensureToken()
+            val token = acquireOrRefreshToken(
+                reason = if (staleToken != null) "poll_401" else "poll",
+                staleToken = staleToken,
+            )
             if (token == null) {
                 log("REST_TRACE poll_call_skipped reason=no_token")
                 delay(POLL_BACKOFF_NO_TOKEN_MS)
                 continue
             }
+            staleToken = null
 
             val intervalMs = pollIntervalMs()
             val pollMode = pollMode()
@@ -416,9 +449,8 @@ class RestFallbackOrchestrator(
             val response = outcome.getOrThrow()
             when (response.statusCode) {
                 401 -> {
-                    sessionToken = null
-                    tokenExpiresAt = 0L
-                    log("REST_TRACE poll_401_retry_after_refresh")
+                    staleToken = token
+                    log("REST_TRACE poll_401_token_stale elapsedMs=$elapsed")
                     delay(POLL_FAIL_BACKOFF_MS)
                     continue
                 }
@@ -492,15 +524,74 @@ class RestFallbackOrchestrator(
         return SEND_RETRY_DELAYS_MS[idx]
     }
 
-    private suspend fun ensureToken(): String? {
+    /**
+     * Acquire a session bearer token under [tokenMutex], so concurrent
+     * callers (poll, send retries, migration, ack) never race to call
+     * [authSessionOnce] in parallel.
+     *
+     * Three paths:
+     *   1. **CAS reuse** — caller passed a [staleToken] (their previous
+     *      attempt got 401). If `cached != null && cached != staleToken`,
+     *      another coroutine already refreshed while this one waited on
+     *      the mutex. Return the fresh `cached` token without issuing a
+     *      new `/auth/session`. Closes the concurrent-401 pinball:
+     *      otherwise two coroutines each forced a refresh, the second
+     *      invalidating the first.
+     *   2. **Cache hit** — no [staleToken], cached token still valid
+     *      (>[TOKEN_REFRESH_LEAD_MS] before expiry). Return it.
+     *   3. **Refresh** — cache empty, expired, [forceRefresh] true, or
+     *      [staleToken] equals current cached. Call [authSessionOnce]
+     *      and update both token + [_capabilities]. Locked PR-D1c.1: also
+     *      pushes refreshed capabilities through, so a server-side
+     *      runtime change (e.g. relay flipping `restFallback=false`) is
+     *      observable at the orchestrator boundary.
+     *
+     * Visibility: `internal` for unit tests in `commonTest`. Not part of
+     * the public KMP transport API.
+     */
+    internal suspend fun acquireOrRefreshToken(
+        reason: String,
+        staleToken: String? = null,
+        forceRefresh: Boolean = false,
+    ): String? = tokenMutex.withLock {
         val cached = sessionToken
-        if (cached != null && now() < tokenExpiresAt - TOKEN_REFRESH_LEAD_MS) {
-            return cached
+        val expiresInMs = tokenExpiresAt - now()
+
+        if (!forceRefresh && staleToken != null && cached != null && cached != staleToken) {
+            log("REST_TRACE token_reused reason=${reason}_cas expiresInMs=$expiresInMs")
+            return@withLock cached
         }
-        val response = authSessionOnce() ?: return null
+        if (!forceRefresh && staleToken == null && cached != null && expiresInMs > TOKEN_REFRESH_LEAD_MS) {
+            log("REST_TRACE token_reused reason=$reason expiresInMs=$expiresInMs")
+            return@withLock cached
+        }
+
+        log(
+            "REST_TRACE token_refresh_start reason=$reason force=$forceRefresh " +
+                "stale=${staleToken != null}",
+        )
+        val response = authSessionOnce()
+        if (response == null) {
+            // PR-D1c.1: never leave a known-bad token in cache after a
+            // refresh attempt fails. We reach this line only when caller
+            // signalled the cached token is no longer trustworthy (force,
+            // stale, expired, or empty cache). Keeping the stale entry
+            // would let the next caller re-serve a revoked token and
+            // produce an infinite 401 loop.
+            sessionToken = null
+            tokenExpiresAt = 0L
+            log("REST_TRACE token_invalidated_after_failed_refresh reason=$reason")
+            return@withLock null
+        }
         sessionToken = response.token
         tokenExpiresAt = response.expiresAt
-        return response.token
+        _capabilities.value = response.toCapabilities()
+        log(
+            "REST_TRACE token_cached reason=$reason " +
+                "expiresInMs=${response.expiresAt - now()} " +
+                "rest_fallback=${response.restFallback}",
+        )
+        response.token
     }
 
     private suspend fun authSessionOnce(): AuthSessionResponse? {
