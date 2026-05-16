@@ -48,5 +48,10 @@ hex = "0.4"
 # no cookies, no compression, no proxy autodetection.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
+# LRU cache for per-identity idempotency key tracking (REST fallback PR-D0r).
+# Bounded eviction prevents unbounded growth when a single sender issues
+# many unique Idempotency-Key values over 24 hours.
+lru = "0.12"
+
 # Testing
 tokio-test = "0.4"

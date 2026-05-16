@@ -5,6 +5,7 @@ use crate::auth::{ChallengeStore, SigningKeyBindings};
 use crate::config::RelayConfig;
 use crate::envelope::Envelope;
 use crate::prekeys::PreKeyStore;
+use crate::rest_fallback::{IdempotencyCache, RestEnvelope, RestTokenStore, SeqCounter, SessionChallengeCache};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -82,6 +83,26 @@ pub struct AppState {
     /// signature verify. Populated by both `publish_prekeys` (long-term
     /// binding) and the WS handshake itself (TOFU first connect).
     pub signing_keys: SigningKeyBindings,
+
+    // ── REST fallback transport (PR-D0r) ──────────────────────────────────────
+
+    /// Opaque bearer tokens issued by POST /auth/session.
+    /// In-memory, Alpha-grade. Token TTL: 1 hour.
+    pub rest_tokens: RestTokenStore,
+    /// Replay-safety cache for /auth/session: same (identity, challenge)
+    /// within 5 minutes returns the same token without re-verifying
+    /// the signature (the challenge was already consumed one-shot).
+    pub rest_session_cache: SessionChallengeCache,
+    /// Per-identity LRU idempotency cache for /relay/send.
+    /// Bounded at 10K entries per identity; 24-hour TTL per entry.
+    pub rest_idempotency: IdempotencyCache,
+    /// REST-specific per-recipient envelope queue.
+    /// Carries the monotonic `seq` counter that /relay/poll uses for
+    /// resume (?since_seq=). Shares envelope IDs with `store` so
+    /// /relay/ack-deliver removes from both simultaneously.
+    pub rest_store: RwLock<HashMap<String, Vec<RestEnvelope>>>,
+    /// Monotonic per-recipient sequence counter for REST poll resume.
+    pub rest_seq: SeqCounter,
 }
 
 impl AppState {
@@ -114,6 +135,12 @@ impl AppState {
             http,
             auth_challenges: ChallengeStore::new(),
             signing_keys: SigningKeyBindings::new(),
+            // REST fallback (PR-D0r)
+            rest_tokens: RestTokenStore::new(),
+            rest_session_cache: SessionChallengeCache::new(),
+            rest_idempotency: IdempotencyCache::new(),
+            rest_store: RwLock::new(HashMap::new()),
+            rest_seq: SeqCounter::new(),
         }
     }
 

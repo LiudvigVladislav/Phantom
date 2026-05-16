@@ -10,6 +10,7 @@ use crate::{
         SignedPreKeyPublicBundle,
     },
     push::wake_offline_recipient,
+    rest_fallback::{rest_ack_deliver, rest_poll, rest_send, rest_session},
     state::{
         append_block_to_disk, append_push_token_to_disk, append_report_to_disk,
         AbuseReport, AppState, PushTokenRecord, RateEntry,
@@ -69,6 +70,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         // is offline. The relay never inspects or retains push payloads;
         // the topic URL is the only thing stored.
         .route("/push/register", post(register_push_token))
+        // ── REST fallback transport (PR-D0r) ────────────────────────────
+        // Pure HTTP/1.1 polling path for middlebox environments that pass
+        // the WS Upgrade handshake but silently drop WS frames (Test #48:
+        // Tele2 LTE Иркутск). All four endpoints require an opaque bearer
+        // token obtained from POST /auth/session (except /auth/challenge
+        // which is already mounted above and shared with the WS path).
+        .route("/auth/session",      post(rest_session))
+        .route("/relay/send",        post(rest_send))
+        .route("/relay/poll",        get(rest_poll))
+        .route("/relay/ack-deliver", post(rest_ack_deliver))
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
