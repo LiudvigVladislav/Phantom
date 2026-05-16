@@ -196,6 +196,19 @@ data class PollResponse(
 data class PollEnvelope(
     @SerialName("id") val id: String,
     @SerialName("from") val fromHex: String,
+    /**
+     * Sealed-sender envelope (base64) — relay-opaque. Mirrors the WS-side
+     * `RelayMessage.Deliver.sealedSender` field. The server omits this in
+     * the JSON when empty (`skip_serializing_if = "String::is_empty"`),
+     * so the default `""` keeps the wire model backwards-compatible with
+     * older relays that never set it.
+     *
+     * PR-D1 follow-up (2026-05-16): without this field on the client side,
+     * D1b wire-up would silently drop `sealed_sender` when translating a
+     * polled envelope into the existing `Deliver` pipeline — same class of
+     * bug PR-D0r blocker 3 addressed on the server.
+     */
+    @SerialName("sealed_sender") val sealedSenderBase64: String = "",
     @SerialName("payload") val payloadBase64: String,
     @SerialName("sequence_ts") val sequenceTs: Long,
     @SerialName("seq") val seq: Long,
