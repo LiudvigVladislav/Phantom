@@ -38,6 +38,36 @@ import kotlinx.serialization.json.Json
 import kotlin.math.min
 import kotlin.time.TimeSource
 
+/**
+ * PR-D1b (2026-05-16): per-WS-session post-mortem record emitted on
+ * [KtorRelayTransport.wsSessionEnded] exactly once per session close.
+ *
+ * Observation-only. The REST fallback state machine (in
+ * `HybridRelayTransport` at the Android app layer) consumes this to feed
+ * [RestStateMachine.Event.WsSessionEnded] and decide whether to leave
+ * `WS_ACTIVE` for `REST_ACTIVE`. The WS path itself takes no action
+ * based on this event and continues reconnecting as before.
+ *
+ * Field semantics match the existing `session_summary` log line:
+ *   - [durationMs]          — wall-clock lifetime of the session, ms
+ *   - [inboundFrames]       — count of Frame.Text observed
+ *   - [pendingAcksAtClose]  — outbound envelopes awaiting ACK at the moment
+ *                              the session ended (the state machine uses
+ *                              this to pick the 2-fail "active" trigger vs
+ *                              the 3-fail "idle" trigger)
+ *   - [closeOrigin]         — `"local" | "remote" | "error" | "unknown"`
+ *                              (lowercased name of internal `CloseOrigin`)
+ *   - [closeError]          — exception message if the session ended on a
+ *                              throwable, else null
+ */
+data class WsSessionEndedEvent(
+    val durationMs: Long,
+    val inboundFrames: Int,
+    val pendingAcksAtClose: Int,
+    val closeOrigin: String,
+    val closeError: String?,
+)
+
 class KtorRelayTransport(
     /**
      * Factory that builds a fresh [HttpClient] each call, optionally
@@ -75,6 +105,22 @@ class KtorRelayTransport(
 
     // Typing events are ephemeral and never stored or encrypted.
     // extraBufferCapacity = 10 ensures rapid keystrokes never block the read loop.
+    // PR-D1b (2026-05-16): per-session-end event exposed for the REST
+    // fallback state machine. Emitted exactly once per session, in the
+    // `finally` block of `runReconnectLoop`, AFTER `emitSessionSummary`.
+    // Listeners (notably `HybridRelayTransport` in the Android app layer)
+    // forward this into `RestStateMachine.Event.WsSessionEnded` to feed
+    // the 2-active-fail / 3-idle-fail trigger logic. The transport itself
+    // makes no decisions based on this flow — it is a pure observation.
+    //
+    // `tryEmit` cannot block or throw with a non-zero `extraBufferCapacity`,
+    // so adding this never affects the reconnect path's correctness.
+    private val _wsSessionEnded = MutableSharedFlow<WsSessionEndedEvent>(
+        replay = 0,
+        extraBufferCapacity = 8,
+    )
+    val wsSessionEnded: SharedFlow<WsSessionEndedEvent> = _wsSessionEnded.asSharedFlow()
+
     private val _typingEvents = MutableSharedFlow<String>(
         replay = 0,
         extraBufferCapacity = 10,
@@ -628,6 +674,24 @@ class KtorRelayTransport(
                     closeCode = closeCode,
                     closeMessage = closeMessage,
                     thrown = caughtThrowable,
+                )
+                // PR-D1b (2026-05-16): also emit a structured
+                // [WsSessionEndedEvent] for the REST fallback state machine.
+                // This is observation-only; no reconnect/recovery logic
+                // depends on it firing. `tryEmit` is non-blocking with the
+                // buffered SharedFlow, so this cannot wedge the finally
+                // path even if no one is listening.
+                _wsSessionEnded.tryEmit(
+                    WsSessionEndedEvent(
+                        durationMs = sessionStats?.let {
+                            (Clock.System.now().toEpochMilliseconds() - it.startedAtMs)
+                                .coerceAtLeast(0)
+                        } ?: 0L,
+                        inboundFrames = sessionStats?.inboundFrames?.toInt() ?: 0,
+                        pendingAcksAtClose = pendingAckCount,
+                        closeOrigin = origin.name.lowercase(),
+                        closeError = caughtThrowable?.message,
+                    )
                 )
                 if (currentSessionStats === sessionStats) {
                     currentSessionStats = null
