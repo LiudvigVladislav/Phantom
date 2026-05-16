@@ -163,6 +163,18 @@ data class AuthSessionResponse(
 data class SendRequest(
     @SerialName("envelope_id") val envelopeId: String,
     @SerialName("to") val toHex: String,
+    /**
+     * Sealed-sender envelope (base64 of `eph_pub || nonce || ct`). Optional.
+     * When non-empty, the recipient uses it to unseal the sender's identity;
+     * the relay treats the value as opaque.
+     *
+     * PR-D0r review fix (2026-05-16): the original `SendRequest` omitted
+     * this field, which would have broken sealed-mode message decrypt for
+     * any client routing through the REST fallback. Mirrors the WS-side
+     * `RelayMessage.Send.sealedSender` field. Defaults to empty so plain
+     * messages do not pay the byte cost.
+     */
+    @SerialName("sealed_sender") val sealedSenderBase64: String = "",
     @SerialName("payload") val payloadBase64: String,
     @SerialName("sequence_ts") val sequenceTs: Long,
 )

@@ -198,6 +198,7 @@ class RestFallbackOrchestrator(
         toHex: String,
         payloadBase64: String,
         sequenceTs: Long,
+        sealedSenderBase64: String = "",
     ): SendOutcome {
         if (!_capabilities.value.restFallback) {
             return SendOutcome.DisabledByCapability
@@ -210,6 +211,7 @@ class RestFallbackOrchestrator(
         val body = SendRequest(
             envelopeId = envelopeId,
             toHex = toHex,
+            sealedSenderBase64 = sealedSenderBase64,
             payloadBase64 = payloadBase64,
             sequenceTs = sequenceTs,
         )
