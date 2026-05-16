@@ -1493,51 +1493,59 @@ class KtorRelayTransport(
      * flush/merge paths can briefly produce while moving an entry across)
      * it is included once.
      *
-     * Atomicity (PR-D1c review round 2 fix): both maps are read under a
-     * NESTED lock acquisition `pendingAcksLock` → `outboxMutex`. Two
-     * separate critical sections would let an entry that is moving across
-     * (e.g. [flushPendingOutbox] removed it from `pendingOutbox` and is
-     * about to insert it into `pendingAcks`) disappear from the snapshot
-     * — and that envelope would never be migrated to REST. Nested locking
-     * matches the order used by [mergeUnackedIntoOutboxOrdered] and the
-     * ACK watchdog, so no inversion deadlock is possible.
+     * Atomicity (PR-D1c review round 3 fix): three nested locks —
+     * `outboundSendMutex` → `pendingAcksLock` → `outboxMutex`. The
+     * outermost `outboundSendMutex` is the key fix: without it,
+     * [flushPendingOutbox] has a window where it has cleared
+     * `pendingOutbox` and put envelopes into a local `toFlush` list, but
+     * has not yet inserted them into `pendingAcks`. During that window a
+     * snapshot that only takes the two inner locks would see those
+     * envelopes nowhere and silently drop them from migration. Since
+     * [flushPendingOutbox] holds `outboundSendMutex` for its entire
+     * snapshot+clear+wire-write+re-track cycle (PR-H2a.2), taking
+     * `outboundSendMutex` here makes the snapshot wait for the flush to
+     * settle before reading. The two inner lock acquisitions match the
+     * order used by [mergeUnackedIntoOutboxOrdered] and the ACK
+     * watchdog, so no inversion deadlock is possible.
      */
     suspend fun snapshotPendingOutbound(): List<PendingOutboundEnvelope> {
-        return pendingAcksLock.withLock {
-            outboxMutex.withLock {
-                val seen = HashSet<String>(pendingAcks.size + pendingOutbox.size)
-                val merged = ArrayList<PendingOutboundEnvelope>(
-                    pendingAcks.size + pendingOutbox.size
-                )
-                for (entry in pendingAcks.values) {
-                    val msg = entry.message
-                    if (seen.add(msg.messageId)) {
-                        merged.add(
-                            PendingOutboundEnvelope(
-                                id = msg.messageId,
-                                to = msg.to,
-                                payloadBase64 = msg.payload,
-                                sealedSenderBase64 = msg.sealedSender,
-                                sequenceTs = entry.sequenceTs,
+        return outboundSendMutex.withLock {
+            pendingAcksLock.withLock {
+                outboxMutex.withLock {
+                    val seen = HashSet<String>(pendingAcks.size + pendingOutbox.size)
+                    val merged = ArrayList<PendingOutboundEnvelope>(
+                        pendingAcks.size + pendingOutbox.size
+                    )
+                    for (entry in pendingAcks.values) {
+                        val msg = entry.message
+                        if (seen.add(msg.messageId)) {
+                            merged.add(
+                                PendingOutboundEnvelope(
+                                    id = msg.messageId,
+                                    to = msg.to,
+                                    payloadBase64 = msg.payload,
+                                    sealedSenderBase64 = msg.sealedSender,
+                                    sequenceTs = entry.sequenceTs,
+                                )
                             )
-                        )
+                        }
                     }
-                }
-                for (entry in pendingOutbox) {
-                    val send = entry.message as? RelayMessage.Send ?: continue
-                    if (seen.add(send.messageId)) {
-                        merged.add(
-                            PendingOutboundEnvelope(
-                                id = send.messageId,
-                                to = send.to,
-                                payloadBase64 = send.payload,
-                                sealedSenderBase64 = send.sealedSender,
-                                sequenceTs = entry.sequenceTs,
+                    for (entry in pendingOutbox) {
+                        val send = entry.message as? RelayMessage.Send ?: continue
+                        if (seen.add(send.messageId)) {
+                            merged.add(
+                                PendingOutboundEnvelope(
+                                    id = send.messageId,
+                                    to = send.to,
+                                    payloadBase64 = send.payload,
+                                    sealedSenderBase64 = send.sealedSender,
+                                    sequenceTs = entry.sequenceTs,
+                                )
                             )
-                        )
+                        }
                     }
+                    merged.sortedBy { it.sequenceTs }
                 }
-                merged.sortedBy { it.sequenceTs }
             }
         }
     }
@@ -1547,23 +1555,31 @@ class KtorRelayTransport(
      * [pendingOutbox]. Called by [HybridRelayTransport] AFTER the REST
      * orchestrator confirms the envelope was accepted (status 201 or 200).
      *
-     * Atomicity across both maps under the standard lock order is
-     * load-bearing: without it, a WS reconnect that runs between the two
-     * removals would re-flush the envelope via WS and the relay would see
-     * (and live-deliver) a duplicate of an envelope the recipient has
-     * already received via REST.
+     * Atomicity across both maps AND across an in-progress
+     * [flushPendingOutbox] is load-bearing. Without [outboundSendMutex]
+     * the flush window (envelope in local `toFlush`, not in any map) would
+     * let mark return as a no-op while the flush then inserts the envelope
+     * into `pendingAcks`. A subsequent WS reconnect would re-flush via
+     * `sendRaw` and the relay would live-deliver a duplicate of an
+     * envelope the recipient has already received via REST.
+     *
+     * Lock order (PR-D1c review round 3 fix): `outboundSendMutex` →
+     * `pendingAcksLock` → `outboxMutex`. Matches [snapshotPendingOutbound]
+     * and the rest of the file.
      *
      * Safe to call when [id] is in neither map — no-op in that case.
      */
     suspend fun markPendingOutboundAcceptedByFallback(id: String) {
-        pendingAcksLock.withLock {
-            pendingAcks.remove(id)
-            outboxMutex.withLock {
-                val it = pendingOutbox.iterator()
-                while (it.hasNext()) {
-                    val entry = it.next()
-                    val send = entry.message as? RelayMessage.Send ?: continue
-                    if (send.messageId == id) it.remove()
+        outboundSendMutex.withLock {
+            pendingAcksLock.withLock {
+                pendingAcks.remove(id)
+                outboxMutex.withLock {
+                    val it = pendingOutbox.iterator()
+                    while (it.hasNext()) {
+                        val entry = it.next()
+                        val send = entry.message as? RelayMessage.Send ?: continue
+                        if (send.messageId == id) it.remove()
+                    }
                 }
             }
         }
