@@ -1443,6 +1443,118 @@ class KtorRelayTransport(
     // controlled mutations — the underlying mutable collections are never
     // returned. Removing these is safe; only the test will fail to build.
 
+    // ── PR-D1c: REST fallback migration of pending WS outbound ──────────────
+    //
+    // Test #49 (2026-05-16, Tele2 LTE Иркутская) reproduced an X3DH bootstrap
+    // ordering bug: the very first outbound envelope after onboarding is a
+    // bootstrap message carrying the x3dhInit header. If WS delivers the
+    // frame on the wire but the relay's Ack never makes it back, that
+    // envelope sits in [pendingAcks]. The state machine then switches into
+    // RestActive and the NEXT send() routes through REST. Receiver sees the
+    // second envelope without ever having seen the bootstrap, drops it as a
+    // "legacy envelope: no session and no x3dhInit", and decrypt fails for
+    // good. The fix lives one layer up: [HybridRelayTransport] snapshots
+    // every pending outbound here and re-sends it over REST in sequenceTs
+    // order BEFORE any new REST send is allowed through. The two methods
+    // below are the read-side and remove-side of that contract — both
+    // public because the wrapper lives in a different Gradle module
+    // (`apps/android`, not `shared/core/transport`), so `internal` is
+    // unreachable.
+
+    /**
+     * Immutable snapshot of one outbound envelope that has not yet been
+     * confirmed ACK'd by the relay over WS. Returned by
+     * [snapshotPendingOutbound] for [HybridRelayTransport] to re-send over
+     * REST when the state machine switches WS → REST. `payloadBase64` and
+     * `sealedSenderBase64` are the original WS ciphertext blobs — re-sending
+     * requires no re-encrypt and no ratchet advance.
+     *
+     * `sequenceTs` is the per-transport monotone counter (NOT wall-clock).
+     * It exists only to define a stable sort order for the migration; the
+     * REST orchestrator passes its own wall-clock `sequence_ts` to the relay.
+     */
+    data class PendingOutboundEnvelope(
+        val id: String,
+        val to: String,
+        val payloadBase64: String,
+        val sealedSenderBase64: String,
+        val sequenceTs: Long,
+    )
+
+    /**
+     * Snapshot of all outbound envelopes that are either (a) on the wire
+     * awaiting an ACK ([pendingAcks]) or (b) queued for the next live WS
+     * session ([pendingOutbox]). Returned as an immutable list sorted by
+     * [PendingOutboundEnvelope.sequenceTs] ASC so the caller re-sends in the
+     * exact order the application originally produced — critical for X3DH
+     * bootstrap to land before any session-existing follow-up.
+     *
+     * If the same id appears in both maps (a transient state the
+     * flush/merge paths can briefly produce while moving an entry across)
+     * it is included once.
+     *
+     * Lock order: [pendingAcksLock] → [outboxMutex]. Matches every other
+     * path (ACK watchdog, [mergeUnackedIntoOutboxOrdered],
+     * [flushPendingOutbox]) so no deadlock with the live-send path.
+     */
+    suspend fun snapshotPendingOutbound(): List<PendingOutboundEnvelope> {
+        val fromAcks: List<PendingOutboundEnvelope> = pendingAcksLock.withLock {
+            pendingAcks.values.map { entry ->
+                PendingOutboundEnvelope(
+                    id = entry.message.messageId,
+                    to = entry.message.to,
+                    payloadBase64 = entry.message.payload,
+                    sealedSenderBase64 = entry.message.sealedSender,
+                    sequenceTs = entry.sequenceTs,
+                )
+            }
+        }
+        val fromOutbox: List<PendingOutboundEnvelope> = outboxMutex.withLock {
+            pendingOutbox.mapNotNull { entry ->
+                val send = entry.message as? RelayMessage.Send ?: return@mapNotNull null
+                PendingOutboundEnvelope(
+                    id = send.messageId,
+                    to = send.to,
+                    payloadBase64 = send.payload,
+                    sealedSenderBase64 = send.sealedSender,
+                    sequenceTs = entry.sequenceTs,
+                )
+            }
+        }
+        val seen = HashSet<String>(fromAcks.size + fromOutbox.size)
+        val merged = ArrayList<PendingOutboundEnvelope>(fromAcks.size + fromOutbox.size)
+        for (e in fromAcks) if (seen.add(e.id)) merged.add(e)
+        for (e in fromOutbox) if (seen.add(e.id)) merged.add(e)
+        return merged.sortedBy { it.sequenceTs }
+    }
+
+    /**
+     * Atomically remove an envelope from BOTH [pendingAcks] and
+     * [pendingOutbox]. Called by [HybridRelayTransport] AFTER the REST
+     * orchestrator confirms the envelope was accepted (status 201 or 200).
+     *
+     * Atomicity across both maps under the standard lock order is
+     * load-bearing: without it, a WS reconnect that runs between the two
+     * removals would re-flush the envelope via WS and the relay would see
+     * (and live-deliver) a duplicate of an envelope the recipient has
+     * already received via REST.
+     *
+     * Safe to call when [id] is in neither map — no-op in that case.
+     */
+    suspend fun markPendingOutboundAcceptedByFallback(id: String) {
+        pendingAcksLock.withLock {
+            pendingAcks.remove(id)
+            outboxMutex.withLock {
+                val it = pendingOutbox.iterator()
+                while (it.hasNext()) {
+                    val entry = it.next()
+                    val send = entry.message as? RelayMessage.Send ?: continue
+                    if (send.messageId == id) it.remove()
+                }
+            }
+        }
+    }
+
     internal suspend fun snapshotOutboxForTest(): List<OutboxEntry> =
         outboxMutex.withLock { pendingOutbox.toList() }
 

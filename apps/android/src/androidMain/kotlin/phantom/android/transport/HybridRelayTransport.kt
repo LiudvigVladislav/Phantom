@@ -91,7 +91,7 @@ import phantom.core.transport.TransportState
  *   (commits a candidate session into `WsActive` immediately).
  *
  * `NetworkChanged` events are deliberately NOT wired in D1b
- * (deferred to PR-D1c).
+ * (deferred to PR-D1d).
  *
  * **Capability gate.** [bootstrapAndStart] starts WS-passthrough collectors
  * unconditionally so DMS still sees inbound messages even when the REST
@@ -100,8 +100,28 @@ import phantom.core.transport.TransportState
  * `WsSessionEnded` event the bootstrap is retried (rate-limited) so a
  * transient session-failure does not permanently disable REST fallback.
  *
+ * **PR-D1c (2026-05-16) pending WS outbox migration.** Test #49 on Tele2
+ * LTE Иркутская reproduced an X3DH ordering bug: the first envelope was a
+ * bootstrap (with x3dhInit) put on the WS wire; the relay's Ack got
+ * silently dropped by the Tele2 middlebox; the state machine switched
+ * WS → REST; the NEXT send (`session_existing`, no x3dhInit) went via
+ * REST 201; the recipient dropped it as a "legacy envelope: no session".
+ * The fix: every WS → RestActive transition arms a migration job that
+ * snapshots [KtorRelayTransport.snapshotPendingOutbound], re-sends every
+ * pending envelope via [orchestrator.sendEnvelope] (server is idempotent
+ * by `Idempotency-Key = envelope_id` since PR-D0r), and calls
+ * [KtorRelayTransport.markPendingOutboundAcceptedByFallback] on success.
+ * New REST sends suspend on [restOutboundOrderMutex] AND
+ * [pendingMigration] until the migration completes, so bootstrap-first
+ * encrypt-time order is preserved.
+ *
  * **Thread safety.** [RestStateMachine] is NOT thread-safe; every event
  * submission goes through [submitStateEvent] which takes [stateMachineLock].
+ * The WS → REST transition is detected synchronously inside that lock,
+ * and migration is armed (both [migrationJob] and [pendingMigration]
+ * written in that order) under the same lock so a concurrent
+ * [send] that sees the new mode is guaranteed to see the migration in
+ * flight and suspend on [awaitPendingMigrationIfNeeded].
  */
 class HybridRelayTransport(
     private val wsTransport: KtorRelayTransport,
@@ -209,6 +229,44 @@ class HybridRelayTransport(
      * duplicate delivery into `_incoming` and double-feed the state machine.
      */
     @Volatile private var wsPassthroughStarted: Boolean = false
+
+    // ── PR-D1c: pending WS outbox migration to REST ──────────────────────────
+
+    /**
+     * Serialises outbound REST traffic around a WS → REST mode switch. The
+     * migration coroutine holds this mutex while it re-sends every pending
+     * envelope via REST; new [sendViaRest] calls suspend on the same mutex
+     * so the migration's bootstrap-first ordering is preserved. Without
+     * this gate, a fresh send issued the instant the mode flips could jump
+     * ahead of an unmigrated X3DH bootstrap envelope and the receiver
+     * would decrypt a `session_existing` ciphertext without ever seeing
+     * the bootstrap (Test #49 root cause).
+     */
+    private val restOutboundOrderMutex = Mutex()
+
+    /**
+     * Set TRUE the instant a WS → RestActive transition is detected
+     * (synchronously inside [stateMachineLock]) and cleared FALSE after
+     * [migratePendingWsToRest] returns. Used by
+     * [awaitPendingMigrationIfNeeded] in [send] so a new outbound that
+     * raced the mode switch suspends on the migration job BEFORE entering
+     * [restOutboundOrderMutex].
+     *
+     * Write order under [stateMachineLock] is load-bearing:
+     * [migrationJob] is assigned FIRST, [pendingMigration] is set true
+     * SECOND. A reader that volatile-reads [pendingMigration] = true is
+     * therefore guaranteed (via JMM happens-before on volatile writes) to
+     * see [migrationJob] as non-null in the subsequent read.
+     */
+    @Volatile private var pendingMigration: Boolean = false
+
+    /**
+     * Handle to the migration coroutine. Assigned inside the same
+     * [stateMachineLock] critical section that flips [pendingMigration]
+     * true, so a concurrent [send] caller that observes
+     * [pendingMigration] = true is guaranteed to see a non-null ref here.
+     */
+    @Volatile private var migrationJob: Job? = null
 
     // ── State machine accessor ───────────────────────────────────────────────
 
@@ -381,11 +439,17 @@ class HybridRelayTransport(
      * ack / session-end signals. Short-circuits when REST has not been
      * activated — feeding events into an unstarted machine has no useful
      * effect and we don't want to churn it.
+     *
+     * Also detects WS → RestActive transitions synchronously and arms the
+     * pending-outbox migration under the same critical section (see
+     * [maybeArmMigrationLocked]).
      */
     private suspend fun submitStateEvent(event: RestStateMachine.Event) {
         if (!restCapabilityActive) return
         stateMachineLock.withLock {
+            val before = stateMachine.current
             orchestrator.submitEvent(event)
+            maybeArmMigrationLocked(before, stateMachine.current)
         }
     }
 
@@ -396,13 +460,203 @@ class HybridRelayTransport(
      * pairs that must observe each other's effect — e.g. WS ACK = (frame
      * received + outbound ack), where a WsSessionEnded racing between them
      * would let WsCandidate revert before commit.
+     *
+     * Detects WS → RestActive transitions on the COMPOSITE before/after
+     * mode pair — if any of the events in the batch produces the
+     * transition, migration is armed once at the end.
      */
     private suspend fun submitStateEvents(vararg events: RestStateMachine.Event) {
         if (!restCapabilityActive) return
         stateMachineLock.withLock {
+            val before = stateMachine.current
             for (event in events) {
                 orchestrator.submitEvent(event)
             }
+            maybeArmMigrationLocked(before, stateMachine.current)
+        }
+    }
+
+    /**
+     * MUST be called while holding [stateMachineLock]. If the state
+     * machine just transitioned out of any non-RestActive mode into
+     * RestActive, arm the pending-outbox migration:
+     *  1. Launch a coroutine that will [runMigration] under
+     *     [restOutboundOrderMutex] (the launch itself is non-blocking).
+     *  2. Mark [pendingMigration] = true.
+     *
+     * Write order is critical: [migrationJob] FIRST, [pendingMigration]
+     * SECOND. A concurrent [send] caller that volatile-reads
+     * [pendingMigration] = true is guaranteed to see the new job ref in
+     * the subsequent volatile read of [migrationJob] (JMM happens-before
+     * on @Volatile writes). Reversing the order opens a window where a
+     * waiter sees [pendingMigration] = true but [migrationJob] = null and
+     * breaks out of [awaitPendingMigrationIfNeeded] without waiting.
+     */
+    private fun maybeArmMigrationLocked(before: RestMode, after: RestMode) {
+        if (after != RestMode.RestActive) return
+        if (before == RestMode.RestActive) return
+        Log.i(TAG, "REST_TRACE migrate_pending_arm from=$before to=$after")
+        migrationJob = scope.launch { runMigration() }
+        pendingMigration = true
+    }
+
+    /**
+     * Wraps [migratePendingWsToRest] in a try/finally that always clears
+     * [pendingMigration] when the migration coroutine exits — success,
+     * failure, or cancellation. Without the finally clause an exception
+     * thrown mid-migration would leave new sends suspended forever on
+     * [awaitPendingMigrationIfNeeded].
+     */
+    private suspend fun runMigration() {
+        try {
+            restOutboundOrderMutex.withLock {
+                migratePendingWsToRest()
+            }
+        } finally {
+            pendingMigration = false
+        }
+    }
+
+    /**
+     * Re-send every pending WS outbound envelope via REST in encrypt-time
+     * order, then mark each successfully delivered envelope as accepted on
+     * the WS side so a future reconnect does not re-flush a duplicate.
+     *
+     * Guardrails:
+     *  - Skip oversize envelopes (body > `max_send_body_bytes` capability).
+     *    Voice chunks > 4096 B currently fall through here; PR-D2 will
+     *    introduce a chunking strategy for voice over REST.
+     *  - Treat `SendOutcome.Accepted` (201) and `SendOutcome.Duplicate`
+     *    (200, server replay) as success — both mean the relay durably
+     *    holds the envelope, so we can safely remove from WS pending.
+     *  - 409 Conflict is logged separately as `migrate_pending_conflict`
+     *    — this is the signal that the server saw the same envelope_id
+     *    with a DIFFERENT body. That would be a serious bug and we want
+     *    it to be loud in logs. Leave the envelope in WS pending in that
+     *    case so the existing WS retry path handles it.
+     *  - Any other failure (network, 5xx, 408, 429, exhaustion) — leave
+     *    in WS pending. The next WS reconnect re-flushes it.
+     *  - If state flips BACK to WsActive mid-migration (WS unexpectedly
+     *    recovered), abort the loop. Remaining envelopes stay in WS
+     *    pending; the WS path now owns them again.
+     */
+    private suspend fun migratePendingWsToRest() {
+        val pending = wsTransport.snapshotPendingOutbound()
+        if (pending.isEmpty()) {
+            Log.i(TAG, "REST_TRACE migrate_pending_skip_empty")
+            return
+        }
+        Log.i(TAG, "REST_TRACE migrate_pending_start count=${pending.size}")
+        val maxBody = orchestrator.capabilities.value.maxSendBodyBytes
+        var ok = 0
+        var failed = 0
+        var aborted = false
+        for (env in pending) {
+            if (stateMachine.current == RestMode.WsActive) {
+                Log.i(
+                    TAG,
+                    "REST_TRACE migrate_pending_aborted_state_changed " +
+                        "remaining=${pending.size - ok - failed}",
+                )
+                aborted = true
+                break
+            }
+            val approxBody = env.payloadBase64.length + env.sealedSenderBase64.length +
+                APPROX_REST_BODY_OVERHEAD_BYTES
+            if (maxBody > 0 && approxBody > maxBody) {
+                Log.w(
+                    TAG,
+                    "REST_TRACE migrate_pending_skip_oversize id=${env.id.take(8)} " +
+                        "bodyBytes=$approxBody max=$maxBody",
+                )
+                failed++
+                continue
+            }
+            Log.i(
+                TAG,
+                "REST_TRACE migrate_pending_send id=${env.id.take(8)} " +
+                    "seq=${env.sequenceTs} bodyBytes=$approxBody",
+            )
+            val outcome = orchestrator.sendEnvelope(
+                envelopeId = env.id,
+                toHex = env.to,
+                payloadBase64 = env.payloadBase64,
+                // Wall-clock for the server's `since_seq` ordering — NOT the
+                // internal sequenceTs counter (different namespace; see
+                // KtorRelayTransport.PendingOutboundEnvelope kdoc).
+                sequenceTs = nowMs(),
+                sealedSenderBase64 = env.sealedSenderBase64,
+            )
+            when (outcome) {
+                is SendOutcome.Accepted -> {
+                    Log.i(
+                        TAG,
+                        "REST_TRACE migrate_pending_ok id=${env.id.take(8)} status=201",
+                    )
+                    wsTransport.markPendingOutboundAcceptedByFallback(env.id)
+                    ok++
+                }
+                is SendOutcome.Duplicate -> {
+                    Log.i(
+                        TAG,
+                        "REST_TRACE migrate_pending_ok id=${env.id.take(8)} status=200",
+                    )
+                    wsTransport.markPendingOutboundAcceptedByFallback(env.id)
+                    ok++
+                }
+                is SendOutcome.OversizeBody -> {
+                    Log.w(
+                        TAG,
+                        "REST_TRACE migrate_pending_skip_oversize id=${env.id.take(8)} " +
+                            "bodyBytes=${outcome.bodyBytes} max=${outcome.maxBytes}",
+                    )
+                    failed++
+                }
+                is SendOutcome.Failed -> {
+                    if (outcome.statusCode == 409) {
+                        Log.w(
+                            TAG,
+                            "REST_TRACE migrate_pending_conflict id=${env.id.take(8)} " +
+                                "reason=${outcome.reason}",
+                        )
+                    } else {
+                        Log.w(
+                            TAG,
+                            "REST_TRACE migrate_pending_fail id=${env.id.take(8)} " +
+                                "status=${outcome.statusCode} reason=${outcome.reason}",
+                        )
+                    }
+                    failed++
+                }
+                is SendOutcome.DisabledByCapability -> {
+                    Log.w(
+                        TAG,
+                        "REST_TRACE migrate_pending_fail id=${env.id.take(8)} " +
+                            "reason=disabled_by_capability",
+                    )
+                    failed++
+                }
+            }
+        }
+        if (!aborted) {
+            Log.i(TAG, "REST_TRACE migrate_pending_done ok=$ok failed=$failed")
+        }
+    }
+
+    /**
+     * Suspend the current coroutine until any in-flight pending-outbox
+     * migration completes. Polls [pendingMigration] and joins the latest
+     * [migrationJob] each iteration so a back-to-back transition (REST →
+     * WS → REST) that re-arms migration before the previous waiter
+     * resumes is also waited on.
+     *
+     * Idempotent and cheap when no migration is in flight: a single
+     * volatile read of [pendingMigration] returning false and we exit.
+     */
+    private suspend fun awaitPendingMigrationIfNeeded() {
+        while (pendingMigration) {
+            val job = migrationJob ?: break
+            job.join()
         }
     }
 
@@ -418,7 +672,21 @@ class HybridRelayTransport(
         val mode = stateMachine.current
         return when (mode) {
             RestMode.WsActive -> wsTransport.send(message)
-            RestMode.RestActive, RestMode.WsCandidate -> sendViaRest(message, mode)
+            RestMode.RestActive, RestMode.WsCandidate -> {
+                // PR-D1c: wait for the WS-pending → REST migration before
+                // routing any new envelope. Without this gate a fresh send
+                // issued right after the mode switch jumps ahead of an
+                // unmigrated bootstrap envelope and the receiver decrypts a
+                // session-existing ciphertext without ever seeing the
+                // bootstrap (Test #49 root cause). Once migration completes
+                // (or the flag was already false), the lock additionally
+                // serialises this send against any future migration that
+                // might arm while we're in flight.
+                awaitPendingMigrationIfNeeded()
+                restOutboundOrderMutex.withLock {
+                    sendViaRest(message, mode)
+                }
+            }
         }
     }
 
