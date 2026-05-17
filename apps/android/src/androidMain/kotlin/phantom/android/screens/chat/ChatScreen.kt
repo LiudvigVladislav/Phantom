@@ -95,6 +95,19 @@ import phantom.core.transport.TransportState
 private const val PROFILE_MSG_PREFIX = "\u200B__PHANTOM_PROFILE__\u200B"
 private const val PREFS_NAME = "phantom_prefs"
 
+// PR-D2b.2 (2026-05-17): hard cap on a single voice recording.
+// Limited realtime networks (REST short-poll) carry voice as 3 KB
+// chunks (see `DefaultMessagingService.AUDIO_CHUNK_BYTES`), so a
+// 60-second recording would produce 30-40 chunks that each have to
+// poll-trip through Tele2 LTE's middlebox. Capping at 15 seconds
+// for the Alpha keeps the chunk count under ~10 per voice, which
+// the REST orchestrator drains quickly via `POLL_DRAIN_IMMEDIATE_MS`.
+// The cap applies in every transport mode (single Alpha UX state,
+// no "long on Wi-Fi, short on cell" split) \u2014 bump it once real-
+// device data shows a longer recording reliably round-trips on
+// the worst mobile carrier we target.
+private const val VOICE_RECORDER_MAX_DURATION_MS: Long = 15_000L
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -117,6 +130,10 @@ fun ChatScreen(
     var recordingDurationMs by remember { mutableStateOf(0L) }
     var audioFile by remember { mutableStateOf<java.io.File?>(null) }
     var mediaRecorder by remember { mutableStateOf<android.media.MediaRecorder?>(null) }
+    // PR-D2b.2 (2026-05-17): 15-sec recorder cap for the durable
+    // voice-over-REST path. Tracks the auto-stop coroutine so the
+    // manual-release path can cancel it before the timer fires.
+    var voiceAutoStopJob by remember { mutableStateOf<Job?>(null) }
 
     // Release recorder on screen dispose
     DisposableEffect(Unit) {
@@ -648,43 +665,33 @@ fun ChatScreen(
                         audioFile = null
                     },
                     onMicClick = {
-                        // PR-D2a — UI guard for voice on Limited realtime
-                        // transports. Refused at the start of the gesture so the
-                        // user never sees the recorder fire and then "disappear"
-                        // — REST short-poll caps body at 4096 bytes and we have
-                        // no chunked-voice path yet (that lands in PR-D2b). The
-                        // send-layer guard in DefaultMessagingService.sendAudio
-                        // is the second layer for any path that bypasses this UI.
-                        val mode = container.hybridTransport?.stateMachine?.state?.value
-                        val voiceAllowed = mode == null ||
-                            mode == phantom.core.transport.RestMode.WsActive
-                        if (!voiceAllowed) {
-                            Log.w(
-                                "PhantomHybrid",
-                                "MEDIA_CAPABILITY blocked feature=voice mode=$mode source=ui recording_in_progress=$isRecording",
-                            )
-                            // If we were already recording when the mode degraded,
-                            // tear the recorder down cleanly — we will not be able
-                            // to send the file. User sees the snackbar instead of
-                            // a silent failure.
-                            if (isRecording) {
-                                mediaRecorder?.stop()
-                                mediaRecorder?.release()
-                                mediaRecorder = null
-                                isRecording = false
-                                audioFile?.delete()
-                                audioFile = null
-                            }
-                            scope.launch {
-                                snackbarHostState.showSnackbar(
-                                    context.getString(R.string.d2a_voice_blocked_limited_realtime),
-                                    duration = androidx.compose.material3.SnackbarDuration.Short,
-                                )
-                            }
-                            return@InputBar
-                        }
-                        if (isRecording) {
-                            // Stop recording and send audio as chunks
+                        // PR-D2b.2 (2026-05-17): the D2a voice UI guard is
+                        // gone — `canSendVoice` in AppContainer now allows
+                        // RestActive / WsCandidate too, and the durable
+                        // chunk receiver (PR-D2b.1) makes voice on Limited
+                        // realtime a real delivery path. The send-layer
+                        // guard in `DefaultMessagingService.sendAudio`
+                        // stays as the last line of defence: it still
+                        // logs `VOICE_TX blocked_limited_realtime` and
+                        // returns `Result.failure` if `canSendVoice()`
+                        // returns false for any reason (orchestrator not
+                        // bootstrapped yet, future capability refinement,
+                        // etc.). The call button keeps its UI guard in
+                        // `onVoiceCall` below — REST cannot carry WebRTC
+                        // realtime.
+                        //
+                        // Recording lifecycle:
+                        //
+                        // - First click: start the recorder + arm a
+                        //   15-sec auto-stop timer that reuses the
+                        //   manual-stop path so the encode + send
+                        //   pipeline is identical.
+                        // - Second click (user release): cancel the
+                        //   timer and run the stop-and-send path.
+                        // - Timer fires while still recording: log
+                        //   `VOICE_TX recorder_auto_stop` and run the
+                        //   same stop-and-send path.
+                        val stopAndSendRecording: () -> Unit = {
                             mediaRecorder?.stop()
                             mediaRecorder?.release()
                             mediaRecorder = null
@@ -713,6 +720,14 @@ fun ChatScreen(
                                 }
                             }
                             audioFile = null
+                        }
+                        if (isRecording) {
+                            // Manual stop — cancel the auto-stop timer
+                            // first so the helper doesn't race with the
+                            // 15-sec fire.
+                            voiceAutoStopJob?.cancel()
+                            voiceAutoStopJob = null
+                            stopAndSendRecording()
                         } else {
                             val hasPermission = ContextCompat.checkSelfPermission(
                                 context, android.Manifest.permission.RECORD_AUDIO
@@ -722,6 +737,19 @@ fun ChatScreen(
                                 audioFile = result.first
                                 mediaRecorder = result.second
                                 isRecording = true
+                                // Arm the 15-sec hard cap. If the user
+                                // releases the mic before this fires the
+                                // manual branch above cancels the job.
+                                voiceAutoStopJob = scope.launch {
+                                    delay(VOICE_RECORDER_MAX_DURATION_MS)
+                                    if (isRecording) {
+                                        Log.w(
+                                            "PhantomHybrid",
+                                            "VOICE_TX recorder_auto_stop reason=max_duration durationMs=$VOICE_RECORDER_MAX_DURATION_MS",
+                                        )
+                                        stopAndSendRecording()
+                                    }
+                                }
                             } else {
                                 permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
                             }

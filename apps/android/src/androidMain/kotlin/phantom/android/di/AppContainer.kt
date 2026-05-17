@@ -572,16 +572,24 @@ class AppContainer(private val context: Context) {
             // (PR C commit 12). DMS surfaces null as a hard send error.
             signingKeyProvider = { identityManager.loadSigningKeyPair() },
             // PR-D2a (2026-05-17): voice send guard for Limited realtime
-            // mode. Reads `hybridTransport.stateMachine` lazily so the
-            // result reflects whichever generation the orchestrator is in
-            // right now. When `hybridTransport` is null (Alpha 1 record
-            // without a signing key, or before bootstrap), we allow voice
-            // — there's no degraded REST path running yet, so this is the
-            // bare-WS world where current voice behaviour was already
-            // shipping. Real fix for voice on REST lands in PR-D2b.
+            // mode. PR-D2b.2 (2026-05-17) widened the gate now that the
+            // durable chunk core (PR-D2b.1, master `9f1f346b`) is on
+            // master: voice is allowed whenever the hybrid orchestrator
+            // has a state — `WsActive`, `RestActive`, or `WsCandidate` —
+            // because all three paths route chunks through the same
+            // 3 KB → encrypted-envelope → durable receiver pipeline.
+            // `null` still allows voice for Alpha 1 records that don't
+            // have a hybrid transport object yet (bare-WS world where
+            // pre-D2 voice already shipped). Calls remain gated below
+            // — REST short-poll cannot carry WebRTC realtime, and the
+            // gate flip for calls waits on the C-track (Reality endpoint
+            // pool + realistic WS-handshake probe).
             canSendVoice = {
                 val mode = hybridTransport?.stateMachine?.state?.value
-                mode == null || mode == phantom.core.transport.RestMode.WsActive
+                mode == null ||
+                    mode == phantom.core.transport.RestMode.WsActive ||
+                    mode == phantom.core.transport.RestMode.RestActive ||
+                    mode == phantom.core.transport.RestMode.WsCandidate
             },
             // PR-D2b.1 (2026-05-17): durable reassembly. Keeps the 1:1
             // voice receive path crash-safe — chunks are saved to
