@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="d2a_voice_blocked_limited_realtime">Голосовые временно недоступны в режиме Limited realtime. Текстовые сообщения доставляются через резервный канал.</string>
-    <string name="d2a_call_blocked_limited_realtime">Звонки временно недоступны в режиме Limited realtime. Попробуйте позже при стабильном realtime-подключении.</string>
-</resources>
