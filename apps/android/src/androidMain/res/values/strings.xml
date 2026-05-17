@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PR-D2a (2026-05-17): user-facing snackbar copy for the voice / call
+  guards that fire when the hybrid transport is on a Limited realtime
+  path (REST short-poll). Lives in Android string resources so the UI
+  language follows the device / app locale instead of being hardcoded
+  Russian — Vladislav 2026-05-17 explicit after Test #53.
+
+  Default (this file) is English so apps running on EN devices see
+  the right language. Russian copy lives in values-ru/strings.xml.
+-->
+<resources>
+    <string name="d2a_voice_blocked_limited_realtime">Voice messages are temporarily unavailable in Limited realtime mode. Text messages are still delivered through the fallback channel.</string>
+    <string name="d2a_call_blocked_limited_realtime">Calls are temporarily unavailable in Limited realtime mode. Try again later on a stable realtime connection.</string>
+</resources>

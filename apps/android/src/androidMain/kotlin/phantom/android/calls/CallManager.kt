@@ -120,7 +120,7 @@ class CallManager(
         if (!canStartCalls()) {
             android.util.Log.w(
                 "CallManager",
-                "CALL_TX blocked_limited_realtime to=${toPubKeyHex.take(12)}",
+                "CALL_TX blocked_limited_realtime to=${toPubKeyHex.take(12)} source=call_manager",
             )
             return
         }

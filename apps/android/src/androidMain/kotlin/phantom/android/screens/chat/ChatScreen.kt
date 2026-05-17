@@ -58,6 +58,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import phantom.android.R
 import androidx.compose.foundation.border
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.text.font.FontFamily
@@ -513,10 +514,13 @@ fun ChatScreen(
                         val callsAllowed = mode == null ||
                             mode == phantom.core.transport.RestMode.WsActive
                         if (!callsAllowed) {
+                            Log.w(
+                                "PhantomHybrid",
+                                "MEDIA_CAPABILITY blocked feature=call mode=$mode source=ui",
+                            )
                             scope.launch {
                                 snackbarHostState.showSnackbar(
-                                    "Звонки временно недоступны в режиме Limited realtime. " +
-                                        "Попробуйте позже при стабильном realtime-подключении.",
+                                    context.getString(R.string.d2a_call_blocked_limited_realtime),
                                     duration = androidx.compose.material3.SnackbarDuration.Short,
                                 )
                             }
@@ -655,6 +659,10 @@ fun ChatScreen(
                         val voiceAllowed = mode == null ||
                             mode == phantom.core.transport.RestMode.WsActive
                         if (!voiceAllowed) {
+                            Log.w(
+                                "PhantomHybrid",
+                                "MEDIA_CAPABILITY blocked feature=voice mode=$mode source=ui recording_in_progress=$isRecording",
+                            )
                             // If we were already recording when the mode degraded,
                             // tear the recorder down cleanly — we will not be able
                             // to send the file. User sees the snackbar instead of
@@ -669,8 +677,7 @@ fun ChatScreen(
                             }
                             scope.launch {
                                 snackbarHostState.showSnackbar(
-                                    "Голосовые временно недоступны в режиме Limited realtime. " +
-                                        "Текстовые сообщения доставляются через резервный канал.",
+                                    context.getString(R.string.d2a_voice_blocked_limited_realtime),
                                     duration = androidx.compose.material3.SnackbarDuration.Short,
                                 )
                             }

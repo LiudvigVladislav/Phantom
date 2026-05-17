@@ -547,7 +547,7 @@ class DefaultMessagingService(
         if (!canSendVoice()) {
             messagingLog(
                 MessagingLogLevel.WARN,
-                "VOICE_TX blocked_limited_realtime conv=${conversationId.take(12)} audioBytes=${audioBytes.size}",
+                "VOICE_TX blocked_limited_realtime conv=${conversationId.take(12)} audioBytes=${audioBytes.size} source=send_layer",
             )
             return Result.failure(IllegalStateException(
                 "Voice messages are temporarily unavailable in Limited realtime mode."
