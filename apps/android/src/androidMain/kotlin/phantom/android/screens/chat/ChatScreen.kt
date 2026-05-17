@@ -714,9 +714,20 @@ fun ChatScreen(
                                         mimeType = mimeType,
                                     )
                                     if (result != null && result.isFailure) {
+                                        // PR-M1w: distinguish in-progress guard from other failures.
+                                        // IllegalStateException("A voice message is still uploading…")
+                                        // comes from sendAudioV2's voiceSendInProgress guard.
+                                        val ex = result.exceptionOrNull()
+                                        val msg = if (ex is IllegalStateException &&
+                                            ex.message?.contains("still uploading") == true
+                                        ) {
+                                            context.getString(R.string.m1w_voice_still_uploading)
+                                        } else {
+                                            "Голосовое сообщение слишком длинное"
+                                        }
                                         android.widget.Toast.makeText(
                                             context,
-                                            "Голосовое сообщение слишком длинное",
+                                            msg,
                                             android.widget.Toast.LENGTH_SHORT,
                                         ).show()
                                     } else {
@@ -1496,12 +1507,14 @@ private fun MessageBubble(
                     Spacer(Modifier.height(6.dp))
                 }
 
-                // Audio bubble — detected by [AUDIO:...] prefix in plaintext cache
+                // Audio bubble — detected by [AUDIO:…] / [AUDIO_LOCAL:…] / [AUDIO_DOWNLOADING] / [AUDIO_FAILED:…]
                 val isAudio = rawText.startsWith("[AUDIO:")
+                    || rawText.startsWith("[AUDIO_LOCAL:")
+                    || rawText.startsWith("[AUDIO_DOWNLOADING]")
+                    || rawText.startsWith("[AUDIO_FAILED:")
                 if (isAudio) {
-                    val base64Data = rawText.removePrefix("[AUDIO:").removeSuffix("]")
                     AudioBubble(
-                        base64Data = base64Data,
+                        plaintextCache = rawText,
                         isSent = isSent,
                         timeStr = timeStr,
                         status = entity.status,
@@ -1907,6 +1920,39 @@ private fun StatusIcon(status: MessageStatus) {
                 )
             }
         }
+        MessageStatus.UPLOADING -> {
+            // Spinning arc — voice/media upload in progress (PR-M1w).
+            // Infinite rotation via animate*AsState is available but heavy;
+            // a static arc conveys "in-progress" without an animation loop
+            // until the design system adds a proper spinner token.
+            Canvas(modifier = Modifier.size(14.dp)) {
+                drawArc(
+                    color = Color.White.copy(alpha = 0.60f),
+                    startAngle = -90f,
+                    sweepAngle = 270f,
+                    useCenter = false,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = 1.5.dp.toPx(),
+                        cap = StrokeCap.Round,
+                    ),
+                )
+            }
+        }
+        MessageStatus.DOWNLOADING -> {
+            // Downward-arc — voice/media download in progress (PR-M1w).
+            Canvas(modifier = Modifier.size(14.dp)) {
+                drawArc(
+                    color = CyanAccent.copy(alpha = 0.70f),
+                    startAngle = 90f,
+                    sweepAngle = 270f,
+                    useCenter = false,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(
+                        width = 1.5.dp.toPx(),
+                        cap = StrokeCap.Round,
+                    ),
+                )
+            }
+        }
         MessageStatus.FAILED -> {
             // Red dot — non-retryable encryption failure. Tap-to-retry
             // hook is a future polish item; for now the indicator just
@@ -1941,14 +1987,153 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCheckmark(
 
 // ── Audio message bubble ──────────────────────────────────────────────────────
 
+/**
+ * Renders a voice message bubble for all four plaintext-cache prefixes (PR-M1w):
+ *
+ *   [AUDIO:<base64>]          — legacy chunked-ratchet path; sender self-playback (Q1).
+ *   [AUDIO_LOCAL:<path>]      — PR-M1w received + decrypted; file on local FS.
+ *   [AUDIO_DOWNLOADING]       — PR-M1w manifest received but download not yet complete.
+ *   [AUDIO_FAILED:<reason>]   — permanent failure (404 / sha256_mismatch / decrypt_failed).
+ *
+ * The DOWNLOADING and FAILED states do not attempt MediaPlayer construction.
+ * AUDIO_LOCAL reads the file at [path] into a temp cache file on first play —
+ * same lazy-load pattern as the legacy Base64 path, no Okio dependency.
+ */
 @Composable
 private fun AudioBubble(
-    base64Data: String,
+    plaintextCache: String,
     isSent: Boolean,
     timeStr: String,
     status: MessageStatus,
     context: android.content.Context,
 ) {
+    // ── Resolve audio source ──────────────────────────────────────────────────
+    val isDownloading = plaintextCache == "[AUDIO_DOWNLOADING]"
+    val isFailed = plaintextCache.startsWith("[AUDIO_FAILED:")
+    val isLocalFile = plaintextCache.startsWith("[AUDIO_LOCAL:")
+    // Legacy sender self-playback: [AUDIO:<base64>]
+    val isLegacyBase64 = plaintextCache.startsWith("[AUDIO:") && !isLocalFile
+
+    // Path for AUDIO_LOCAL: strip prefix and trailing ']'
+    val localFilePath: String? = if (isLocalFile) {
+        plaintextCache.removePrefix("[AUDIO_LOCAL:").trimEnd(']')
+    } else null
+
+    // Base64 payload for legacy AUDIO path: strip prefix and trailing ']'
+    val base64Payload: String? = if (isLegacyBase64) {
+        plaintextCache.removePrefix("[AUDIO:").trimEnd(']')
+    } else null
+
+    // ── Downloading state: spinner + label ────────────────────────────────────
+    if (isDownloading) {
+        Row(
+            modifier = Modifier.width(220.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(CyanAccent.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                // Static downward-arc to indicate downloading (no extra animation dep)
+                Canvas(modifier = Modifier.size(18.dp)) {
+                    drawArc(
+                        color = CyanAccent.copy(alpha = 0.7f),
+                        startAngle = 60f,
+                        sweepAngle = 240f,
+                        useCenter = false,
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(
+                            width = 2.dp.toPx(),
+                            cap = StrokeCap.Round,
+                        ),
+                    )
+                }
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                    color = CyanAccent.copy(alpha = 0.5f),
+                    trackColor = Surface,
+                )
+                Spacer(Modifier.height(5.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Downloading…",
+                        color = TextDim,
+                        fontSize = 10.sp,
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    ) {
+                        Text(text = timeStr, color = TextDim, fontSize = 10.sp)
+                        if (isSent) StatusIcon(status = status)
+                    }
+                }
+            }
+        }
+        return
+    }
+
+    // ── Failed state: error icon + reason label ───────────────────────────────
+    if (isFailed) {
+        val reason = plaintextCache.removePrefix("[AUDIO_FAILED:").trimEnd(']')
+        Row(
+            modifier = Modifier.width(220.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Color(0xFFEF4444).copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                // X-mark icon
+                Canvas(modifier = Modifier.size(16.dp)) {
+                    val sw = 2.dp.toPx()
+                    val col = Color(0xFFEF4444)
+                    drawLine(col, Offset(size.width * 0.2f, size.height * 0.2f), Offset(size.width * 0.8f, size.height * 0.8f), sw, StrokeCap.Round)
+                    drawLine(col, Offset(size.width * 0.8f, size.height * 0.2f), Offset(size.width * 0.2f, size.height * 0.8f), sw, StrokeCap.Round)
+                }
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Voice unavailable",
+                    color = Color(0xFFEF4444).copy(alpha = 0.85f),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = reason,
+                    color = TextDim,
+                    fontSize = 9.sp,
+                    maxLines = 1,
+                )
+                Spacer(Modifier.height(3.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(text = timeStr, color = TextDim, fontSize = 10.sp)
+                    if (isSent) StatusIcon(status = status)
+                }
+            }
+        }
+        return
+    }
+
+    // ── Playable state: legacy Base64 or AUDIO_LOCAL file ─────────────────────
     val scope = rememberCoroutineScope()
     var isPlaying by remember { mutableStateOf(false) }
     var progress by remember { mutableStateOf(0f) }
@@ -1972,6 +2157,15 @@ private fun AudioBubble(
         return "%d:%02d".format(s / 60, s % 60)
     }
 
+    /** Resolves playable bytes: either from local FS path (AUDIO_LOCAL) or Base64 (legacy). */
+    fun resolveAudioBytes(): ByteArray? = when {
+        localFilePath != null -> runCatching { java.io.File(localFilePath).readBytes() }.getOrNull()
+        base64Payload != null -> runCatching {
+            android.util.Base64.decode(base64Payload, android.util.Base64.NO_WRAP)
+        }.getOrNull()
+        else -> null
+    }
+
     Row(
         modifier = Modifier.width(220.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -1993,8 +2187,11 @@ private fun AudioBubble(
                     } else {
                         if (mediaPlayer == null) {
                             try {
-                                val bytes = android.util.Base64.decode(base64Data, android.util.Base64.NO_WRAP)
-                                val file = java.io.File(context.cacheDir, "play_${System.currentTimeMillis()}.3gp")
+                                val bytes = resolveAudioBytes() ?: return@clickable
+                                // Infer extension: AUDIO_LOCAL path has a real ext;
+                                // legacy Base64 is always the 3gp recorder format.
+                                val ext = localFilePath?.substringAfterLast('.', "audio") ?: "3gp"
+                                val file = java.io.File(context.cacheDir, "play_${System.currentTimeMillis()}.$ext")
                                 file.writeBytes(bytes)
                                 val mp = android.media.MediaPlayer().apply {
                                     setDataSource(file.absolutePath)
