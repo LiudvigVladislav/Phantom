@@ -90,9 +90,9 @@ class MediaCrypto {
         ciphertext: ByteArray,
     ): ByteArray {
         return try {
-            AuthenticatedEncryptionWithAssociatedData.xchacha20Poly1305IetfDecrypt(
-                ciphertext = ciphertext.toUByteArray(),
-                additionalData = mediaId.encodeToByteArray().toUByteArray(),
+            AuthenticatedEncryptionWithAssociatedData.xChaCha20Poly1305IetfDecrypt(
+                ciphertextAndTag = ciphertext.toUByteArray(),
+                associatedData = mediaId.encodeToByteArray().toUByteArray(),
                 nonce = nonce.toUByteArray(),
                 key = mediaKey.toUByteArray(),
             ).toByteArray()
@@ -109,9 +109,9 @@ class MediaCrypto {
         nonce: ByteArray,
         aad: ByteArray,
     ): ByteArray {
-        return AuthenticatedEncryptionWithAssociatedData.xchacha20Poly1305IetfEncrypt(
+        return AuthenticatedEncryptionWithAssociatedData.xChaCha20Poly1305IetfEncrypt(
             message = plaintext.toUByteArray(),
-            additionalData = aad.toUByteArray(),
+            associatedData = aad.toUByteArray(),
             nonce = nonce.toUByteArray(),
             key = key.toUByteArray(),
         ).toByteArray()

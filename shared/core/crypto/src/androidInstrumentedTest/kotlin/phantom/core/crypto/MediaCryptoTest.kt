@@ -3,36 +3,29 @@
 
 package phantom.core.crypto
 
+import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import com.ionspin.kotlin.crypto.hash.Hash
-import kotlin.test.BeforeTest
+import kotlinx.coroutines.test.runTest
+import org.junit.runner.RunWith
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * Unit tests for [MediaCrypto].
- *
- * All tests call [LibsodiumInitializer.initialize] in [setup] — the JVM
- * target resolves this to the JNA-backed native libsodium, which runs in
- * commonTest without needing an Android device. Android instrumented tests
- * would also call initialize() but on the JNI-backed path.
+ * Instrumented tests for [MediaCrypto]. Runs on a connected Android device or
+ * emulator — libsodium native binding ships in the test APK and the
+ * `LibsodiumInitializer` suspend init loads it. Invoke with:
+ *   ./gradlew :shared:core:crypto:connectedDebugAndroidTest
  */
 @OptIn(ExperimentalUnsignedTypes::class)
+@RunWith(AndroidJUnit4::class)
 class MediaCryptoTest {
 
-    private lateinit var crypto: MediaCrypto
-
-    @BeforeTest
-    fun setup() {
-        LibsodiumInitializer.initialize()
-        crypto = MediaCrypto()
-    }
-
-    // ── round-trip ─────────────────────────────────────────────────────────────
-
     @Test
-    fun encryptThenDecrypt_returnOriginalBytes() {
+    fun encryptThenDecrypt_returnOriginalBytes() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = "hello phantom voice".encodeToByteArray()
 
         val result = crypto.encryptVoice(plainAudio)
@@ -47,7 +40,9 @@ class MediaCryptoTest {
     }
 
     @Test
-    fun encryptThenDecrypt_largerBlob_roundTrips() {
+    fun encryptThenDecrypt_largerBlob_roundTrips() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = ByteArray(22_000) { (it % 256).toByte() }
 
         val result = crypto.encryptVoice(plainAudio)
@@ -61,37 +56,37 @@ class MediaCryptoTest {
         assertTrue(plainAudio.contentEquals(recovered))
     }
 
-    // ── ciphertext size ────────────────────────────────────────────────────────
-
     @Test
-    fun ciphertext_isPlainSizePlusTagBytes() {
+    fun ciphertext_isPlainSizePlusTagBytes() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = ByteArray(1684) { 0x42 }
         val result = crypto.encryptVoice(plainAudio)
         val expectedCiphertextSize = plainAudio.size + MediaCrypto.TAG_BYTES
         assertTrue(
             result.ciphertext.size == expectedCiphertextSize,
-            "ciphertext size ${result.ciphertext.size} != expected $expectedCiphertextSize"
+            "ciphertext size ${result.ciphertext.size} != expected $expectedCiphertextSize",
         )
     }
 
-    // ── sha256 ─────────────────────────────────────────────────────────────────
-
     @Test
-    fun sha256InResult_matchesSha256OfInput() {
+    fun sha256InResult_matchesSha256OfInput() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = "voice note content for sha test".encodeToByteArray()
         val result = crypto.encryptVoice(plainAudio)
 
         val expected = Hash.sha256(plainAudio.toUByteArray()).toByteArray()
         assertTrue(
             result.plaintextSha256.contentEquals(expected),
-            "sha256 mismatch in EncryptResult"
+            "sha256 mismatch in EncryptResult",
         )
     }
 
-    // ── AAD binding — wrong mediaId fails authentication ───────────────────────
-
     @Test
-    fun decryptWithWrongMediaId_throwsIllegalStateException() {
+    fun decryptWithWrongMediaId_throwsIllegalStateException() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = "aad binding test".encodeToByteArray()
         val result = crypto.encryptVoice(plainAudio)
 
@@ -105,10 +100,10 @@ class MediaCryptoTest {
         }
     }
 
-    // ── wrong key fails authentication ─────────────────────────────────────────
-
     @Test
-    fun decryptWithWrongKey_throwsIllegalStateException() {
+    fun decryptWithWrongKey_throwsIllegalStateException() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = "wrong key test".encodeToByteArray()
         val result = crypto.encryptVoice(plainAudio)
 
@@ -124,10 +119,10 @@ class MediaCryptoTest {
         }
     }
 
-    // ── corrupted ciphertext fails authentication ──────────────────────────────
-
     @Test
-    fun decryptWithCorruptedCiphertext_throwsIllegalStateException() {
+    fun decryptWithCorruptedCiphertext_throwsIllegalStateException() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = "corrupted ciphertext test".encodeToByteArray()
         val result = crypto.encryptVoice(plainAudio)
 
@@ -144,10 +139,10 @@ class MediaCryptoTest {
         }
     }
 
-    // ── mediaId uniqueness ────────────────────────────────────────────────────
-
     @Test
-    fun twoEncryptCalls_produceDistinctMediaIds() {
+    fun twoEncryptCalls_produceDistinctMediaIds() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = "uniqueness test".encodeToByteArray()
         val a = crypto.encryptVoice(plainAudio)
         val b = crypto.encryptVoice(plainAudio)
@@ -156,12 +151,13 @@ class MediaCryptoTest {
     }
 
     @Test
-    fun twoEncryptCalls_produceDistinctCiphertexts() {
+    fun twoEncryptCalls_produceDistinctCiphertexts() = runTest {
+        LibsodiumInitializer.initialize()
+        val crypto = MediaCrypto()
         val plainAudio = "determinism test".encodeToByteArray()
         val a = crypto.encryptVoice(plainAudio)
         val b = crypto.encryptVoice(plainAudio)
 
-        // Different nonces → different ciphertexts, even for the same plaintext
         assertTrue(!a.ciphertext.contentEquals(b.ciphertext), "ciphertext must not be deterministic")
     }
 }

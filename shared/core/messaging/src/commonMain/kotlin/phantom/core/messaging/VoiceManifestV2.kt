@@ -9,7 +9,7 @@ import kotlinx.serialization.Serializable
 /**
  * Manifest embedded in a TYPE_VOICE_V2 envelope. The receiver uses this to
  * fetch and decrypt the encrypted voice note stored at the relay's
- * /media/chunk/* endpoints (PR-M1r).
+ * /media/chunk/{idx} endpoints (PR-M1r).
  *
  * Wire field names are camelCase to stay consistent with the existing
  * MessagePayload fields. The manifest is serialized to JSON, encrypted
