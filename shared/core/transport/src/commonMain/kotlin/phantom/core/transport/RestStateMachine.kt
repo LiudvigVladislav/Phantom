@@ -83,6 +83,7 @@ class RestStateMachine(
             is Event.NetworkChanged -> onNetworkChanged()
             is Event.WsOutboundAckReceived -> onWsOutboundAck()
             is Event.WsAliveTickElapsed -> onAliveTick()
+            is Event.ActiveOutboundAckTimeout -> onActiveOutboundAckTimeout(event)
         }
     }
 
@@ -176,6 +177,27 @@ class RestStateMachine(
         }
     }
 
+    /**
+     * PR-D1d: a per-envelope ACK deadline expired — the relay did not
+     * AckDeliver within [RelayTransportConfig.ACK_DEADLINE_MS] (10 s).
+     *
+     * - In [RestMode.WsActive]: immediate mode switch to REST. This is the
+     *   fast-path that avoids waiting for two full session deaths
+     *   (~60 s each) as the existing [ACTIVE_FAIL_THRESHOLD] requires.
+     * - In [RestMode.RestActive] or [RestMode.WsCandidate]: no-op. The mode
+     *   has already been switched or is in a transitional state; the timer
+     *   event is stale and would add no information.
+     */
+    private fun onActiveOutboundAckTimeout(event: Event.ActiveOutboundAckTimeout) {
+        when (_state.value) {
+            RestMode.WsActive -> transitionToRest("active_outbound_ack_timeout")
+            RestMode.RestActive, RestMode.WsCandidate -> {
+                // Already migrated or in candidate — timer is stale. No-op,
+                // no log (the spec says do NOT log in these states).
+            }
+        }
+    }
+
     // ── Transition helpers ───────────────────────────────────────────────────
 
     private fun transitionToRest(reason: String) {
@@ -256,6 +278,21 @@ class RestStateMachine(
          * uptime without a session close.
          */
         object WsAliveTickElapsed : Event()
+
+        /**
+         * PR-D1d: a per-envelope ACK deadline expired. [msgId] is the
+         * messageId of the envelope that was not acknowledged by the relay
+         * within [RelayTransportConfig.ACK_DEADLINE_MS] (10 s). [ageMs] is
+         * the actual elapsed time at expiry (always >= ACK_DEADLINE_MS).
+         *
+         * Emitted by [KtorRelayTransport.outboundAckDeadlineExpired] and
+         * forwarded here by [HybridRelayTransport]. Triggers an immediate
+         * [RestMode.WsActive] → [RestMode.RestActive] transition, bypassing
+         * the two-session-death requirement of the existing
+         * [ACTIVE_FAIL_THRESHOLD] counter. The threshold counter continues
+         * accumulating independently as a safety net.
+         */
+        data class ActiveOutboundAckTimeout(val msgId: String, val ageMs: Long) : Event()
     }
 
     companion object {
