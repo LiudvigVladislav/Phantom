@@ -57,6 +57,20 @@ class CallManager(
     private val context: Context,
     private val messagingService: MessagingService,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    /**
+     * PR-D2a (2026-05-17): guard for outbound call start on Limited
+     * realtime transports. WebRTC needs a stable realtime channel; REST
+     * short-poll fallback cannot carry SDP/ICE/audio at the latency
+     * a call requires. When `false`, [startCall] returns early and
+     * logs `CALL_TX blocked_limited_realtime` so the user-visible
+     * "ringing but never connects" failure mode never happens.
+     *
+     * Default `{ true }` keeps existing tests + tooling untouched.
+     * The Android DI wires this to the same source as `canSendVoice`
+     * (`hybridTransport.stateMachine.state.value == RestMode.WsActive`).
+     * A richer `TransportCapabilities` type lands in C-track PR-C1.
+     */
+    private val canStartCalls: () -> Boolean = { true },
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -97,6 +111,19 @@ class CallManager(
 
     suspend fun startCall(toPubKeyHex: String, toUsername: String) {
         if (_activeCall.value != null) return
+        // PR-D2a — call-layer guard. UI button is gated separately; this
+        // second layer catches programmatic / retry / deep-link paths that
+        // do not flow through the chat top-bar. No state mutation here —
+        // we never enter CALLING, never light up the UI, never touch
+        // AudioManager. The user sees the snackbar from the UI guard;
+        // this path keeps internal state clean if UI somehow let through.
+        if (!canStartCalls()) {
+            android.util.Log.w(
+                "CallManager",
+                "CALL_TX blocked_limited_realtime to=${toPubKeyHex.take(12)}",
+            )
+            return
+        }
         val callId = uuid4().toString()
         pendingIceCandidates.clear()
         _activeCall.value = ActiveCall(callId, toPubKeyHex, toUsername, CallState.CALLING)

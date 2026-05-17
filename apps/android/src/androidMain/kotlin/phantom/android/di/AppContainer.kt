@@ -562,6 +562,18 @@ class AppContainer(private val context: Context) {
             // haven't yet been backfilled by the migration flow
             // (PR C commit 12). DMS surfaces null as a hard send error.
             signingKeyProvider = { identityManager.loadSigningKeyPair() },
+            // PR-D2a (2026-05-17): voice send guard for Limited realtime
+            // mode. Reads `hybridTransport.stateMachine` lazily so the
+            // result reflects whichever generation the orchestrator is in
+            // right now. When `hybridTransport` is null (Alpha 1 record
+            // without a signing key, or before bootstrap), we allow voice
+            // — there's no degraded REST path running yet, so this is the
+            // bare-WS world where current voice behaviour was already
+            // shipping. Real fix for voice on REST lands in PR-D2b.
+            canSendVoice = {
+                val mode = hybridTransport?.stateMachine?.state?.value
+                mode == null || mode == phantom.core.transport.RestMode.WsActive
+            },
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.
@@ -688,6 +700,15 @@ class AppContainer(private val context: Context) {
         val cm = CallManager(
             context = context,
             messagingService = service,
+            // PR-D2a — calls guard. Same source as canSendVoice above;
+            // both gates flip together because both fail in the same
+            // way on a degraded transport (REST short-poll cannot carry
+            // realtime WebRTC). A richer per-capability type lands in
+            // C-track PR-C1.
+            canStartCalls = {
+                val mode = hybridTransport?.stateMachine?.state?.value
+                mode == null || mode == phantom.core.transport.RestMode.WsActive
+            },
         )
         cm.initialize()
         callManager = cm
