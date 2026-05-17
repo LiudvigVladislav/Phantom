@@ -31,6 +31,9 @@ interface MediaUploadTransport {
      * before calling this function. The implementation performs the same
      * check and throws [IllegalArgumentException] if it fails.
      *
+     * @param token      Bearer session token. Passed in `Authorization: Bearer <token>`.
+     *                   Callers refresh externally on [MediaAuthException] and retry
+     *                   the same call with the new token (mirrors RestFallbackOrchestrator).
      * @param mediaId    Unique media identifier (base64url, 32 random bytes).
      * @param idx        0-based chunk index.
      * @param total      Total chunk count for this media item.
@@ -41,6 +44,7 @@ interface MediaUploadTransport {
      *   [MediaAuthException], or [IllegalArgumentException] on error responses.
      */
     suspend fun uploadChunk(
+        token: String,
         mediaId: String,
         idx: Int,
         total: Int,
@@ -50,12 +54,14 @@ interface MediaUploadTransport {
     /**
      * Downloads one ciphertext chunk from `GET /media/chunk/{mediaId}/{idx}`.
      *
+     * @param token      Bearer session token. See [uploadChunk] for refresh semantics.
      * @return [Result.success] with [DownloadResult] containing the chunk
      *   ciphertext and the relay's declared total chunk count.
      * @return [Result.failure] with [NotFoundException], [MediaAuthException],
-     *   or [java.io.IOException] on error.
+     *   or [MediaTransportException] on error.
      */
     suspend fun downloadChunk(
+        token: String,
         mediaId: String,
         idx: Int,
     ): Result<DownloadResult>

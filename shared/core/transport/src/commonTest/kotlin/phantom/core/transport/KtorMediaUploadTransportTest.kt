@@ -14,26 +14,26 @@ import io.ktor.http.headersOf
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
-import kotlin.test.fail
-import kotlin.io.encoding.Base64
-import kotlin.io.encoding.ExperimentalEncodingApi
 
 /**
  * Unit tests for [KtorMediaUploadTransport] using Ktor's [MockEngine].
  *
  * Each test builds its own engine so no state leaks between tests.
- * Token injection is exercised via [AuthenticatedMediaUploadTransport] where
- * bearer-auth is tested.
+ * The bearer token is passed explicitly per call; tests verify the
+ * `Authorization: Bearer <token>` header reaches the relay.
  */
 @OptIn(ExperimentalEncodingApi::class)
 class KtorMediaUploadTransportTest {
 
     private val baseUrl = "https://relay.test"
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private val testToken = "test-bearer-token-abc123"
 
     private fun client(
         status: HttpStatusCode,
@@ -67,6 +67,7 @@ class KtorMediaUploadTransportTest {
             relayBaseUrl = baseUrl,
         )
         val result = transport.uploadChunk(
+            token = testToken,
             mediaId = "testmediaid",
             idx = 0,
             total = 5,
@@ -83,6 +84,7 @@ class KtorMediaUploadTransportTest {
             relayBaseUrl = baseUrl,
         )
         val result = transport.uploadChunk(
+            token = testToken,
             mediaId = "testmediaid",
             idx = 0,
             total = 5,
@@ -100,7 +102,7 @@ class KtorMediaUploadTransportTest {
             httpClient = client(HttpStatusCode.Conflict, """{"error":"ciphertext_mismatch"}"""),
             relayBaseUrl = baseUrl,
         )
-        val result = transport.uploadChunk("id", 0, 1, smallCiphertext())
+        val result = transport.uploadChunk(testToken, "id", 0, 1, smallCiphertext())
         assertTrue(result.isFailure)
         val ex = result.exceptionOrNull()
         assertTrue(ex is MediaConflictException, "expected MediaConflictException, got $ex")
@@ -113,7 +115,7 @@ class KtorMediaUploadTransportTest {
             httpClient = client(HttpStatusCode.Conflict, """{"error":"total_mismatch"}"""),
             relayBaseUrl = baseUrl,
         )
-        val result = transport.uploadChunk("id", 0, 1, smallCiphertext())
+        val result = transport.uploadChunk(testToken, "id", 0, 1, smallCiphertext())
         assertTrue(result.isFailure)
         val ex = result.exceptionOrNull()
         assertTrue(ex is MediaConflictException)
@@ -126,7 +128,7 @@ class KtorMediaUploadTransportTest {
             httpClient = client(HttpStatusCode.PayloadTooLarge, """{"error":"body_too_large"}"""),
             relayBaseUrl = baseUrl,
         )
-        val result = transport.uploadChunk("id", 0, 1, smallCiphertext())
+        val result = transport.uploadChunk(testToken, "id", 0, 1, smallCiphertext())
         assertTrue(result.isFailure)
         val ex = result.exceptionOrNull()
         assertTrue(ex is MediaQuotaException, "expected MediaQuotaException, got $ex")
@@ -139,7 +141,7 @@ class KtorMediaUploadTransportTest {
             httpClient = client(HttpStatusCode.Unauthorized, """{"error":"unauthorized"}"""),
             relayBaseUrl = baseUrl,
         )
-        val result = transport.uploadChunk("id", 0, 1, smallCiphertext())
+        val result = transport.uploadChunk(testToken, "id", 0, 1, smallCiphertext())
         assertTrue(result.isFailure)
         assertTrue(result.exceptionOrNull() === MediaAuthException)
     }
@@ -157,7 +159,7 @@ class KtorMediaUploadTransportTest {
             ),
             relayBaseUrl = baseUrl,
         )
-        val result = transport.downloadChunk("mediaId", 0)
+        val result = transport.downloadChunk(testToken, "mediaId", 0)
         assertTrue(result.isSuccess)
         val dl = result.getOrThrow()
         assertEquals(7, dl.total)
@@ -172,7 +174,7 @@ class KtorMediaUploadTransportTest {
             httpClient = client(HttpStatusCode.NotFound, """{"error":"not_found"}"""),
             relayBaseUrl = baseUrl,
         )
-        val result = transport.downloadChunk("missing", 0)
+        val result = transport.downloadChunk(testToken, "missing", 0)
         assertTrue(result.isFailure)
         assertTrue(result.exceptionOrNull() === NotFoundException)
     }
@@ -183,7 +185,7 @@ class KtorMediaUploadTransportTest {
             httpClient = client(HttpStatusCode.Unauthorized, """{"error":"unauthorized"}"""),
             relayBaseUrl = baseUrl,
         )
-        val result = transport.downloadChunk("id", 0)
+        val result = transport.downloadChunk(testToken, "id", 0)
         assertTrue(result.isFailure)
         assertTrue(result.exceptionOrNull() === MediaAuthException)
     }
@@ -204,7 +206,7 @@ class KtorMediaUploadTransportTest {
 
         // A ciphertext of 1900 bytes encodes to ~2534 base64 chars + 120 overhead = ~2654 > 2600
         val oversizeCiphertext = ByteArray(1900) { 0x42 }
-        val result = transport.uploadChunk("id", 0, 1, oversizeCiphertext)
+        val result = transport.uploadChunk(testToken, "id", 0, 1, oversizeCiphertext)
 
         assertFalse(httpCallMade, "HTTP call should not be made for oversized chunk")
         assertTrue(result.isFailure)
@@ -212,7 +214,7 @@ class KtorMediaUploadTransportTest {
         assertTrue(ex is IllegalArgumentException, "expected IllegalArgumentException, got $ex")
         assertTrue(
             ex.message?.contains("ciphertext_too_large_for_chunk") == true,
-            "message should contain ciphertext_too_large_for_chunk: ${ex.message}"
+            "message should contain ciphertext_too_large_for_chunk: ${ex.message}",
         )
     }
 
@@ -229,11 +231,11 @@ class KtorMediaUploadTransportTest {
             ),
             relayBaseUrl = baseUrl,
         )
-        transport.downloadChunk("mymediaid", 3)
+        transport.downloadChunk(testToken, "mymediaid", 3)
         assertEquals(1, capturedUrl.size)
         assertTrue(
             capturedUrl.first().endsWith("/media/chunk/mymediaid/3"),
-            "URL shape mismatch: ${capturedUrl.first()}"
+            "URL shape mismatch: ${capturedUrl.first()}",
         )
     }
 
@@ -248,11 +250,43 @@ class KtorMediaUploadTransportTest {
             ),
             relayBaseUrl = baseUrl,
         )
-        transport.uploadChunk("id", 0, 1, smallCiphertext())
+        transport.uploadChunk(testToken, "id", 0, 1, smallCiphertext())
         assertEquals(1, capturedUrl.size)
         assertTrue(
             capturedUrl.first().endsWith("/media/upload-chunk"),
-            "URL shape mismatch: ${capturedUrl.first()}"
+            "URL shape mismatch: ${capturedUrl.first()}",
         )
+    }
+
+    // ── Authorization header is sent ───────────────────────────────────────────
+
+    @Test
+    fun uploadChunk_sendsBearerAuthorizationHeader() = runTest {
+        var observedAuth: String? = null
+        val transport = KtorMediaUploadTransport(
+            httpClient = client(
+                HttpStatusCode.Created,
+                """{"status":"stored"}""",
+                headerAssert = { headers -> observedAuth = headers[HttpHeaders.Authorization]?.firstOrNull() },
+            ),
+            relayBaseUrl = baseUrl,
+        )
+        transport.uploadChunk(testToken, "id", 0, 1, smallCiphertext())
+        assertEquals("Bearer $testToken", observedAuth)
+    }
+
+    @Test
+    fun downloadChunk_sendsBearerAuthorizationHeader() = runTest {
+        var observedAuth: String? = null
+        val transport = KtorMediaUploadTransport(
+            httpClient = client(
+                HttpStatusCode.NotFound,
+                """{"error":"not_found"}""",
+                headerAssert = { headers -> observedAuth = headers[HttpHeaders.Authorization]?.firstOrNull() },
+            ),
+            relayBaseUrl = baseUrl,
+        )
+        transport.downloadChunk(testToken, "id", 0)
+        assertEquals("Bearer $testToken", observedAuth)
     }
 }

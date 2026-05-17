@@ -5,10 +5,12 @@ package phantom.core.transport
 
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import kotlinx.serialization.SerialName
@@ -79,6 +81,7 @@ class KtorMediaUploadTransport(
 ) : MediaUploadTransport {
 
     override suspend fun uploadChunk(
+        token: String,
         mediaId: String,
         idx: Int,
         total: Int,
@@ -112,6 +115,7 @@ class KtorMediaUploadTransport(
 
         return runCatching {
             val response = httpClient.post("$relayBaseUrl${MediaRelayEndpoints.UPLOAD_CHUNK}") {
+                header(HttpHeaders.Authorization, "Bearer $token")
                 contentType(ContentType.Application.Json)
                 setBody(requestBody)
             }
@@ -121,12 +125,15 @@ class KtorMediaUploadTransport(
     }
 
     override suspend fun downloadChunk(
+        token: String,
         mediaId: String,
         idx: Int,
     ): Result<MediaUploadTransport.DownloadResult> {
         return runCatching {
             val url = "$relayBaseUrl${MediaRelayEndpoints.DOWNLOAD_CHUNK_PREFIX}/$mediaId/$idx"
-            val response = httpClient.get(url)
+            val response = httpClient.get(url) {
+                header(HttpHeaders.Authorization, "Bearer $token")
+            }
             val rawBody = response.bodyAsText()
             mapDownloadResponse(response.status, rawBody)
         }.getOrElse { e -> Result.failure(e) }
