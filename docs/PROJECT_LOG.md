@@ -382,17 +382,41 @@ on advice that references prior commits — even from another LLM.
   Test #53 → #53.1 → #53.2. Voice on REST **is still not delivered**
   by D2a — it is refused politely instead of silently failing. The
   real fix is PR-D2b.
-- **PR-D2b — Voice-over-REST chunking.** Real fix. Pre-encrypt chunking
-  targeting body 2500–3000 b (hard cap 4096 b). `audio_chunk` envelope
-  with `voiceId / index / total`. Receiver assembles by voiceId; ACK
-  fires only after chunk persisted. Final DB insert is a single voice
-  message after `assembly_complete`. Required logs:
-  `VOICE_TX chunk_prepare / chunk_send_rest`,
-  `VOICE_RX chunk_received / chunk_saved / assembly_complete /
-  message_insert_ok`, `REST_TRACE ack_after_save id=...`.
-  Acceptance: voice 5–10 s round-trips on Tele2 in both directions,
-  zero `send_oversize`, no duplicate processing in relay, ACK strictly
-  after save.
+- **✅ PR-D2b.1 — Durable voice chunk core + sender hardening.**
+  Merged 2026-05-17 night as PR #164 (master `9f1f346b`). Foundation
+  layer for voice over REST: `AUDIO_CHUNK_BYTES = 8 KB → 3 KB`,
+  per-chunk `transport.send()` result check (failed chunks throw,
+  local row stays `QUEUED`), new `voice_chunks` SQLDelight table +
+  migration `16.sqm` (v16 → v17), durable 1:1 receive path (save
+  chunk BEFORE ack-deliver, assemble + insert keyed on `voiceId`,
+  delete chunks on success, keep on insert failure), startup
+  finalizer that resumes voices interrupted by process death, 24 h
+  TTL with per-voice `VOICE_RX partial_expired` log, already-inserted
+  pre-check in the helper so the finalizer cannot double-emit /
+  double-notify / double-bump unread after a crash between live
+  insert and previous cleanup, `deleteOlderThan` whole-voice
+  semantics matching `findExpiredSummaries`, and a range guard
+  rejecting malformed `chunkIndex >= chunkTotal` payloads. 10 storage
+  contract tests + 5 messaging tests cover the new behaviour. Group
+  voice intentionally stays on the in-memory path (no `groupId`
+  column in `voice_chunks`); group durability is queued separately.
+  Voice on Limited realtime is **still gated closed** by D2a — the
+  durable path is wired but not yet exercised. Architect re-review
+  on round 2 cleared.
+- **PR-D2b.2 (next, after D2b.1).** Flip `canSendVoice` lambda to
+  allow `RestActive` / `WsCandidate` so voice goes through the
+  durable path on Tele2-style transports. Keep `canStartCalls`
+  `WsActive`-only (REST cannot carry WebRTC realtime). Drop the
+  voice UI guard in `ChatScreen.onMicClick` (`onVoiceCall` keeps
+  its guard — calls remain blocked). Add 15-sec recorder cap +
+  `VOICE_TX recorder_auto_stop reason=max_duration durationMs=15000`
+  log. Build APK + ship Test #54 install commands. Acceptance: phone
+  → emu and emu → phone 5–10 sec voice arrives on Tele2 LTE; every
+  chunk `envelopeBytes <= 4096`; `VOICE_RX chunk_saved` precedes
+  `ack_send_after_handler`; `assembly_complete` fires exactly once
+  per `voiceId`; one voice message in UI (not N chunk messages);
+  killing receiver mid-transfer doesn't corrupt chat; calls remain
+  blocked.
 - **PR-R0.5 / PR-PK1 — Prekey upload response-drop fallback.**
   `/prekeys/publish` POST body lands server-side (Caddy shows 201 ~3 ms)
   but the 18-byte response is dropped downstream on Tele2 ~30 s of the
@@ -464,6 +488,58 @@ latency.
 ## Session journal
 
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
+follow-ups** in compact form. Cross-reference the Decision log above
+when an entry mentions a rejected approach.
+
+### 2026-05-17 (sat late night) · PR-D2b.1 merged — durable voice chunk core + sender hardening (still gated by D2a)
+
+**Goal.** Once PR-D2a closed the UX gap on voice/calls in Limited realtime (Test #53 → #53.2 PASS), the next layer is the real fix for voice over REST short-poll: keep the existing chunk-first/encrypt-each architecture from PR #32 (2026-05-04), but make it production-ready on Tele2 LTE. Split D2b into two PRs per architect review: **D2b.1** = durable chunk core + sender hardening; voice on Limited realtime stays gated by D2a until **D2b.2** flips the gate.
+
+**Scope locked with Vladislav + architect 2026-05-17.** Chunk first → encrypt each chunk separately. Each chunk is a stable-envelope-id send. Receiver saves chunk to SQLDelight BEFORE ack-deliver. ACK only after `chunk_saved`. UI inserts exactly one voice message after assembly_complete (no partial placeholder for v1). Partial chunks TTL = 24 h. No partial-placeholder UI. Group voice stays on the in-memory path because the durable schema has no `groupId` column — group durability queued as a separate follow-up PR.
+
+**Implementation (PR #164 → squash `9f1f346b`).** Round 1 (foundation) + round 2 (architect blocker fixes) squashed together:
+
+- **Sender hardening.** `AUDIO_CHUNK_BYTES = 8 KB → 3 KB` so every envelope passes the REST `max_send_body=4096` cap (Test #53.1 emulator log captured the real oversize case `migrate_pending_skip_oversize bodyBytes=7608`). Per-chunk `transport.send()` result check + `VOICE_TX chunk_prepare voiceId=… idx=K/N rawBytes=… envelopeBytes=… envelopeId=…` log + `VOICE_TX chunk_send_fail` + `VOICE_TX chunk_send_ok` instrumentation; on `false` the loop throws so the local message stays `MessageStatus.QUEUED` instead of falsely flipping to `SENT`. Group voice gets the smaller chunks too (accepted side effect — `DefaultGroupMessagingService` references the same constant).
+- **Durable receive (new `voice_chunks` table).** Schema migration `16.sqm` (v16 → v17): `PRIMARY KEY (voice_id, idx)` + chunk_bytes blob + total + conversation_id + sender_pubkey_hex + mime_type + duration_ms + updated_at_ms. `VoiceChunkRepository` interface + `SqlDelightVoiceChunkRepository` production impl + `Dispatchers.IO` per call. The 1:1 chunk handler saves chunk → `chunk_saved` → ack-deliver → `countChunks` → if `== total` → `assembleAndDispatch1to1Voice(origin = "live")`. `assembleAndDispatch1to1Voice` concatenates `findOrderedChunks` into one blob, inserts a message keyed on `voiceId` (so live + finalizer paths converge — `INSERT OR IGNORE` makes them idempotent), upserts conversation, emits `_incomingMessages`, fires notification, then `deleteByVoiceId`. If `insertMessage` itself fails, chunks are NOT deleted; finalizer retries on next startup.
+- **Startup finalizer.** New pass at the top of `startReceiving` runs `findVoicesReadyToAssemble` and resumes voices whose chunks landed before the previous process death. Same `assembleAndDispatch1to1Voice` helper, `origin = "finalizer"`. Idempotent across both paths via `messages.id = voiceId` + `INSERT OR IGNORE`.
+- **24 h TTL with observable eviction.** `VOICE_CHUNK_TTL_MS = 24 h`. Sweep runs opportunistically on every chunk insert AND at `startReceiving`. Each evicted voice emits one `VOICE_RX partial_expired voiceId=… received=K/N ageMs=…` WARN log so the eviction is observable in logcat.
+- **Round-2 fix — Blocker 1: already-inserted skip.** Pre-check at the very top of `assembleAndDispatch1to1Voice` calls `messageRepository.getMessageById(voiceId)` and short-circuits to `deleteByVoiceId` with a `VOICE_RX already_inserted_cleanup` log when the row exists. Closes the crash window between live insert and previous `deleteByVoiceId`: pre-fix the finalizer would treat the `INSERT OR IGNORE` no-op as success and proceed to re-bump unread, re-emit `_incomingMessages`, re-fire the notification.
+- **Round-2 fix — Blocker 2: `deleteOlderThan` whole-voice semantics.** SQL rewritten to drop every chunk of any voice whose `MIN(updated_at_ms) < cutoff_ms`, matching the `findExpiredSummaries` predicate exactly. Pre-fix row-level `WHERE updated_at_ms < cutoff` left mixed-age voices in a permanently-unassemblable state — fresh chunks at some indices, expired chunks at others, count never reaches total. Both `FakeVoiceChunkRepository` (storage contract test) and `FakeVoiceChunkLedger` (messaging test) updated to mirror the SQL.
+- **Round-2 hardening — range guard.** Lives before the durable/in-memory branch: `if (chunkTotal <= 0 || chunkIndex !in 0 until chunkTotal)` → `VOICE_RX chunk_invalid_range` WARN + ack-deliver + return. Rejects payloads where `audioChunkIndex >= audioChunkTotal` so they cannot pollute reassembly state on either path.
+- **Backward compat.** Constructor param `voiceChunkRepository: VoiceChunkRepository? = null` defaults to null so existing tests that didn't wire storage fall through to the legacy in-memory path unchanged. Group voice always stays on the in-memory path (no durable `groupId` column yet). Outdated comments in `DefaultMessagingService.kt` ("8 KB → ~53 KB on wire") and `MessagePayload.kt` ("64 KB slices") rewritten to match the actual constants + current semantics.
+
+**Tests (10 storage + 5 messaging).**
+
+- `VoiceChunkRepositoryContractTest` (storage): insert, count, ordered, INSERT OR REPLACE idempotency, find-ready-set, find-expired-summaries, **delete-older-than expired-voices (single-chunk)**, **delete-older-than whole-voice-when-any-chunk-expired (round 2, mixed-age regression)**, delete-by-voice-id, delete-all, ready-voice metadata roundtrip.
+- `DefaultMessagingServiceTest` (messaging): `sendAudio_returnsFailureAndKeepsMessageQueued_whenChunkSendRejected` (per-chunk send-result check propagates failure, row stays QUEUED, `transport.send` aborted on first false); `startReceiving_finalizer_assemblesReadyVoice_andDeletesChunks` (2/2 saved chunks become one assembled `[AUDIO:base64]` row); `startReceiving_finalizer_leavesIncompleteVoiceUntouched` (1/3 partial chunks stay in repo, no message row); `startReceiving_finalizer_evictsChunksOlderThanTtl` (25-hour-old voice dropped without insert); **`startReceiving_finalizer_skipsAlreadyInsertedVoice_andCleansUpChunks` (round 2, crash-window regression: pre-seeded msg row + complete chunks → finalizer dedupes via getMessageById, single row, no double-bump, partial freed)**.
+
+**Status after merge.**
+
+- ✅ Voice chunks now survive process death between save and assembly.
+- ✅ `transport.send` rejection on any chunk no longer hides behind a falsely-SENT local message.
+- ✅ Receiver path emits `VOICE_RX chunk_saved` BEFORE `ack_send_after_handler` on the durable branch — observable order matches the contract.
+- ✅ 24 h TTL with per-voice `partial_expired` log; whole-voice eviction guarantees no orphan rows.
+- ✅ Finalizer is idempotent across crash + restart; already-inserted voices are cleanly cleaned up without UX duplication.
+- ⛔️ Voice on Limited realtime is **still gated closed by D2a's `canSendVoice` lambda** (`mode == WsActive`). The durable path is wired but never exercised in production until D2b.2 flips the gate. This is intentional — the gate flip ships with the recorder cap + real-device acceptance test in one PR so we don't widen the surface area while still validating it.
+
+**What this does NOT do.**
+
+- Does **not** flip `canSendVoice` or remove the `onMicClick` UI guard. That's D2b.2.
+- Does **not** add the 15-sec recorder cap. D2b.2.
+- Does **not** make group voice durable. Group voice keeps the in-memory 5-minute buffer until a separate PR adds `groupId` to `voice_chunks`.
+- Does **not** address the H2b residual risk window between `processedEnvelopeRepository.markProcessed` (inside decrypt mutex) and `voiceChunkRepository.insertChunk`. A crash in that window lets the ledger skip the relay's redelivery and the chunk is lost. Closing it requires receive-pipeline transaction redesign (separate "decrypt ledger" state from "payload persisted" state) — queued as a future PR. The commit + PR body deliberately phrase D2b.1's guarantee as "chunks durable BEFORE ack-deliver after the handler starts to persist them", not "zero-loss between decrypt and save".
+
+**Key commits / PRs.**
+
+- PR #164 (squash-merged as `9f1f346b`) — `feat(media): PR-D2b.1 — durable voice chunk core + sender hardening`. Folds round-1 (`06531596`) + round-2 (`a8849260`).
+- 9 files changed, 1612 insertions / 24 deletions. New files: `VoiceChunk.sq`, `16.sqm`, `VoiceChunkRepository.kt`, `SqlDelightVoiceChunkRepository.kt`, `VoiceChunkRepositoryContractTest.kt`. Modified: `DefaultMessagingService.kt`, `MessagePayload.kt`, `DefaultMessagingServiceTest.kt`, `AppContainer.kt`.
+
+**Next.**
+
+- **PR-D2b.2 (next session).** Flip `canSendVoice` to allow `RestActive` / `WsCandidate`. Keep `canStartCalls` `WsActive`-only (REST cannot carry WebRTC). Drop voice UI guard in `ChatScreen.onMicClick`, keep call UI guard in `onVoiceCall`. Add 15-sec recorder cap + `VOICE_TX recorder_auto_stop reason=max_duration durationMs=15000` log. Build APK + deliver Test #54 install commands.
+- **Test #54.** Tecno `103603734A004351` on Tele2 LTE Иркутская + emulator-5554. Verify: phone → emu and emu → phone 5–10 sec voice arrives; every chunk `envelopeBytes <= 4096`; `VOICE_RX chunk_saved` precedes `ack_send_after_handler`; `assembly_complete` fires exactly once per voiceId; one voice message in UI (not N chunk messages); killing receiver mid-transfer doesn't corrupt chat (chunks resume on restart or expire silently at 24 h); calls remain blocked.
+
+### 2026-05-17 (sat) · Test #52 PASS — PR-D1d merged, fast active-outbound ACK deadline closes the ~40 s WS→REST latency gap on Tele2 LTE
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
