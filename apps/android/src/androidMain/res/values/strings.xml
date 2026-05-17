@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PR-D2a (2026-05-17): user-facing snackbar copy for the voice / call
+  guards that fire when the hybrid transport is on a Limited realtime
+  path (REST short-poll). Lives in Android string resources rather
+  than hardcoded in Kotlin so a future centralised localisation pass
+  can flip these without touching ChatScreen.
+
+  Defaults (this file) are English to match the rest of the app UI,
+  which is currently English-only — there is no `values-ru/` yet on
+  purpose: Test #53.1 (Vladislav 2026-05-17) showed that adding a
+  Russian translation just for D2a made the snackbar disagree with
+  the rest of the EN UI on RU-locale devices. When the project does
+  a proper localisation pass (full UI string extraction + a real RU
+  copy), the Russian translation lands here as `values-ru/strings.xml`
+  alongside every other RU string.
+-->
+<resources>
+    <string name="d2a_voice_blocked_limited_realtime">Voice messages are temporarily unavailable in Limited realtime mode. Text messages are still delivered through the fallback channel.</string>
+    <string name="d2a_call_blocked_limited_realtime">Calls are temporarily unavailable in Limited realtime mode. Try again later on a stable realtime connection.</string>
+</resources>

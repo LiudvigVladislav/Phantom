@@ -58,6 +58,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import phantom.android.R
 import androidx.compose.foundation.border
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.text.font.FontFamily
@@ -501,6 +502,30 @@ fun ChatScreen(
                 onContactProfile = onContactProfile,
                 onVoiceCall = {
                     if (theirPublicKeyHex.isNotEmpty()) {
+                        // PR-D2a — UI guard for calls on Limited realtime
+                        // transports. Source of truth: hybridTransport.stateMachine.
+                        // When the orchestrator is in REST_ACTIVE / WS_CANDIDATE we
+                        // do not even open the call screen — WebRTC cannot work over
+                        // REST short-poll, and a "ringing but never connects" failure
+                        // mode is worse than an honest snackbar. CallManager.startCall
+                        // has the same gate as a second layer (programmatic / deep-link
+                        // / retry paths).
+                        val mode = container.hybridTransport?.stateMachine?.state?.value
+                        val callsAllowed = mode == null ||
+                            mode == phantom.core.transport.RestMode.WsActive
+                        if (!callsAllowed) {
+                            Log.w(
+                                "PhantomHybrid",
+                                "MEDIA_CAPABILITY blocked feature=call mode=$mode source=ui",
+                            )
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    context.getString(R.string.d2a_call_blocked_limited_realtime),
+                                    duration = androidx.compose.material3.SnackbarDuration.Short,
+                                )
+                            }
+                            return@ChatTopBar
+                        }
                         scope.launch {
                             container.callManager?.startCall(theirPublicKeyHex, theirUsername)
                         }
@@ -623,6 +648,41 @@ fun ChatScreen(
                         audioFile = null
                     },
                     onMicClick = {
+                        // PR-D2a — UI guard for voice on Limited realtime
+                        // transports. Refused at the start of the gesture so the
+                        // user never sees the recorder fire and then "disappear"
+                        // — REST short-poll caps body at 4096 bytes and we have
+                        // no chunked-voice path yet (that lands in PR-D2b). The
+                        // send-layer guard in DefaultMessagingService.sendAudio
+                        // is the second layer for any path that bypasses this UI.
+                        val mode = container.hybridTransport?.stateMachine?.state?.value
+                        val voiceAllowed = mode == null ||
+                            mode == phantom.core.transport.RestMode.WsActive
+                        if (!voiceAllowed) {
+                            Log.w(
+                                "PhantomHybrid",
+                                "MEDIA_CAPABILITY blocked feature=voice mode=$mode source=ui recording_in_progress=$isRecording",
+                            )
+                            // If we were already recording when the mode degraded,
+                            // tear the recorder down cleanly — we will not be able
+                            // to send the file. User sees the snackbar instead of
+                            // a silent failure.
+                            if (isRecording) {
+                                mediaRecorder?.stop()
+                                mediaRecorder?.release()
+                                mediaRecorder = null
+                                isRecording = false
+                                audioFile?.delete()
+                                audioFile = null
+                            }
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    context.getString(R.string.d2a_voice_blocked_limited_realtime),
+                                    duration = androidx.compose.material3.SnackbarDuration.Short,
+                                )
+                            }
+                            return@InputBar
+                        }
                         if (isRecording) {
                             // Stop recording and send audio as chunks
                             mediaRecorder?.stop()

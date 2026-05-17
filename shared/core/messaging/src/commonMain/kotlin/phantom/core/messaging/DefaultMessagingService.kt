@@ -85,6 +85,24 @@ class DefaultMessagingService(
      * receiving send calls, migration must have completed.
      */
     private val signingKeyProvider: suspend () -> IdentitySigningKeyPair?,
+    /**
+     * PR-D2a (2026-05-17): guard for voice send on Limited realtime
+     * transports. Returns `true` when voice may be sent, `false` when
+     * the current transport state cannot carry an audio_chunk envelope
+     * within the contract this PR is designed around (REST short-poll
+     * fallback caps `max_send_body=4096` and is not realtime, so voice
+     * recorded in `Limited realtime` would silently fail in the relay
+     * or be rejected by the receiver assembly window).
+     *
+     * The lambda is read on every `sendAudio` entry — implementers
+     * decide how fresh the answer must be. The Android DI wires this
+     * to `hybridTransport.stateMachine.state.value == RestMode.WsActive`.
+     *
+     * Default `{ true }` keeps existing tests + non-Android callers
+     * working unchanged. The real chunked-voice path lands in PR-D2b;
+     * this PR is a guard, not a delivery path.
+     */
+    private val canSendVoice: () -> Boolean = { true },
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -517,6 +535,22 @@ class DefaultMessagingService(
             return Result.failure(IllegalArgumentException(
                 "Audio payload ${audioBytes.size} bytes exceeds MAX_AUDIO_BYTES cap ($MAX_AUDIO_BYTES). " +
                     "Recording must be shorter."
+            ))
+        }
+
+        // PR-D2a — send-layer guard. UI button is gated separately, but a
+        // gesture / callback / retry path can still call here; this guard
+        // makes "recorded but disappeared" impossible. Voice-over-REST
+        // chunking lands in PR-D2b; until then the only honest answer on a
+        // degraded transport is to fail loudly so the caller can show the
+        // user what happened.
+        if (!canSendVoice()) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "VOICE_TX blocked_limited_realtime conv=${conversationId.take(12)} audioBytes=${audioBytes.size} source=send_layer",
+            )
+            return Result.failure(IllegalStateException(
+                "Voice messages are temporarily unavailable in Limited realtime mode."
             ))
         }
 
