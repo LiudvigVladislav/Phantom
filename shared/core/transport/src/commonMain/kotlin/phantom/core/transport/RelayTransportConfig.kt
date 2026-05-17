@@ -71,6 +71,25 @@ object RelayTransportConfig {
     const val TCP_KEEPALIVE_INTERVAL_SECONDS = 5
     const val TCP_KEEPALIVE_COUNT = 3
 
+    /**
+     * PR-D1d (2026-05-17): per-envelope ACK deadline measured from enqueue
+     * into pendingAcks. If the relay does not send back AckDeliver for the
+     * envelope before this elapses, the WS data plane is treated as failed
+     * and the orchestrator switches WS_ACTIVE → REST_ACTIVE.
+     *
+     * 10 s is deliberately shorter than [ACK_TIMEOUT_MS] (60 s). The ACK
+     * watchdog is a session-level safety net that force-reconnects; this
+     * deadline is the fast first-attempt signal that catches a bad envelope
+     * on the very first WS send and hands off to REST without waiting for
+     * two full session deaths (~60 s each) as required by the existing
+     * active_outbound_threshold mechanism.
+     *
+     * The two mechanisms are orthogonal and additive — if the deadline fires,
+     * the state machine switches; the existing watchdog continues its own
+     * slower job independently.
+     */
+    const val ACK_DEADLINE_MS = 10_000L
+
     // PR-H1e (2026-05-14) — app-level Ping disabled in production.
     //
     // The diagnostic sprint isolated each heartbeat layer (app Ping,

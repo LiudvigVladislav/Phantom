@@ -68,6 +68,24 @@ data class WsSessionEndedEvent(
     val closeError: String?,
 )
 
+/**
+ * PR-D1d (2026-05-17): emitted when a sent envelope's per-envelope ACK
+ * deadline elapses without a relay AckDeliver being received.
+ *
+ * [msgId] is the envelope's messageId (first 12 chars are logged;
+ * the full value is carried here so the orchestrator can correlate
+ * without truncation). [ageMs] is the elapsed time since the envelope
+ * was inserted into pendingAcks (i.e. since it was handed to the WS
+ * layer) — always >= [RelayTransportConfig.ACK_DEADLINE_MS].
+ *
+ * The transport emits this at most once per envelope. It does NOT
+ * remove the envelope from pendingAcks — removal is still owned by
+ * the regular ACK path (on relay AckDeliver) and session-end cleanup,
+ * so the existing ACK watchdog / reconnect retry continues working
+ * in parallel. This event is a pure signal to the REST state machine.
+ */
+data class OutboundAckDeadlineExpiredEvent(val msgId: String, val ageMs: Long)
+
 class KtorRelayTransport(
     /**
      * Factory that builds a fresh [HttpClient] each call, optionally
@@ -120,6 +138,29 @@ class KtorRelayTransport(
         extraBufferCapacity = 8,
     )
     val wsSessionEnded: SharedFlow<WsSessionEndedEvent> = _wsSessionEnded.asSharedFlow()
+
+    // PR-D1d (2026-05-17): fast per-envelope ACK deadline. Emitted on
+    // [transportScope] after [RelayTransportConfig.ACK_DEADLINE_MS] elapses
+    // without the relay confirming AckDeliver for a sent envelope. The
+    // orchestrator ([HybridRelayTransport]) feeds this into
+    // [RestStateMachine.Event.ActiveOutboundAckTimeout] which immediately
+    // switches WS_ACTIVE → REST_ACTIVE on the first bad send — without
+    // waiting for two full WS session deaths as the existing
+    // active_outbound_threshold requires.
+    //
+    // replay = 0: stale deadline events after a mode switch must not be
+    //   replayed to a new subscriber (the state machine is already in
+    //   RestActive at that point and would no-op them, but skipping the
+    //   replay makes the intent explicit).
+    // extraBufferCapacity = 16: typical burst is one expired timer per
+    //   concurrent outbound envelope; 16 is ample headroom.
+    private val _outboundAckDeadlineExpired =
+        MutableSharedFlow<OutboundAckDeadlineExpiredEvent>(
+            replay = 0,
+            extraBufferCapacity = 16,
+        )
+    val outboundAckDeadlineExpired: SharedFlow<OutboundAckDeadlineExpiredEvent> =
+        _outboundAckDeadlineExpired.asSharedFlow()
 
     private val _typingEvents = MutableSharedFlow<String>(
         replay = 0,
@@ -261,6 +302,107 @@ class KtorRelayTransport(
     )
     private val pendingAcksLock = Mutex()
     private val pendingAcks = mutableMapOf<String, AckPending>()
+
+    // PR-D1d: one deadline Job per in-flight envelope, guarded by the
+    // same [pendingAcksLock] so insert / cancel / clear are atomic with
+    // the corresponding pendingAcks operations. A Job in this map means
+    // the envelope's 10 s deadline timer is either running or has already
+    // fired; removal (via ACK, session-end, or migration) cancels the timer.
+    private val ackDeadlineJobs = mutableMapOf<String, Job>()
+
+    // PR-D1d test-only override: when set to a TestScope, deadline Jobs
+    // are launched on that scope (which runs on a virtual-time scheduler)
+    // instead of [transportScope]. Production code never sets this.
+    internal var ackDeadlineScopeOverride: CoroutineScope? = null
+
+    // PR-D1d (refactor): single helper for `pendingAcks.remove + cancel timer`.
+    // Caller MUST hold [pendingAcksLock]. Centralising this here makes it
+    // structurally impossible to remove an envelope from pendingAcks without
+    // also cancelling its 10 s deadline job — the original spread-across-4-sites
+    // implementation relied on every caller remembering to do both.
+    //
+    // [reason] becomes the `reason=…` tag in the `outbound_ack_deadline_cancelled`
+    // log line. Returns the removed [AckPending] (or null if there was none) so
+    // callers that need the entry (e.g. the failed-send re-queue path) get it.
+    private fun removePendingAckLocked(msgId: String, reason: String): AckPending? {
+        val pending = pendingAcks.remove(msgId)
+        ackDeadlineJobs.remove(msgId)?.also { job ->
+            job.cancel()
+            relayLog(
+                RelayLogLevel.INFO,
+                "${genTag()} outbound_ack_deadline_cancelled id=${msgId.take(12)}… reason=$reason",
+            )
+        }
+        return pending
+    }
+
+    // PR-D1d (refactor): arm a per-envelope ACK deadline timer. Caller MUST
+    // hold [pendingAcksLock] AND must have inserted (or be about to insert)
+    // [entry] into pendingAcks in the same critical section. Centralised so
+    // every new Send insertion site (currently the live-send path and the
+    // reconnect-flush replay path) gets identical timer behaviour and identical
+    // log format — no risk of one site missing the arm or arming with different
+    // timeout values.
+    //
+    // [logPrefix] is the gen/session tag computed by the caller (`genTag()` or
+    // `genTag(mySession)`), passed in so this helper does not need to know
+    // about session context.
+    private fun armAckDeadlineLocked(entry: AckPending, logPrefix: String) {
+        val msgId = entry.message.messageId
+        val sentMark = entry.sentAt
+        val deadlineScope = ackDeadlineScopeOverride ?: transportScope
+        ackDeadlineJobs[msgId] = deadlineScope.launch {
+            delay(RelayTransportConfig.ACK_DEADLINE_MS)
+            // Acquire the lock ONCE for the post-delay check + map cleanup +
+            // event emission so they happen atomically w.r.t. any concurrent
+            // ACK/migration/session-end path that might be racing.
+            val shouldEmit = pendingAcksLock.withLock {
+                val stillPending = pendingAcks.containsKey(msgId)
+                // Remove the completed Job from the map regardless of whether
+                // we emit the event — once we are past the delay, this Job is
+                // done and should not occupy a map slot until session-end. The
+                // pendingAcks entry itself stays put per the design contract:
+                // removal is owned by the regular ACK path, session-end
+                // cleanup, send-failed path, and REST migration so the existing
+                // ACK watchdog / retry path keeps working in parallel.
+                ackDeadlineJobs.remove(msgId)
+                stillPending
+            }
+            if (shouldEmit) {
+                val ageMs = sentMark.elapsedNow().inWholeMilliseconds
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "$logPrefix outbound_ack_deadline_expired id=${msgId.take(12)}… ageMs=$ageMs",
+                )
+                _outboundAckDeadlineExpired.tryEmit(
+                    OutboundAckDeadlineExpiredEvent(msgId = msgId, ageMs = ageMs)
+                )
+            }
+        }
+        relayLog(
+            RelayLogLevel.INFO,
+            "$logPrefix outbound_ack_deadline_armed id=${msgId.take(12)}… timeoutMs=${RelayTransportConfig.ACK_DEADLINE_MS}",
+        )
+    }
+
+    // PR-D1d (refactor): bulk version for session-end cleanup. Caller MUST
+    // hold [pendingAcksLock]. Returns the drained list so callers can re-queue
+    // into outbox; cancels every in-flight deadline timer with a single summary
+    // log line (per-entry logs would be too noisy on session end).
+    private fun clearAllPendingAcksLocked(reason: String, sessionEpoch: Long): List<AckPending> {
+        val drained = pendingAcks.values.toList()
+        pendingAcks.clear()
+        val cancelledCount = ackDeadlineJobs.size
+        ackDeadlineJobs.values.forEach { it.cancel() }
+        ackDeadlineJobs.clear()
+        if (cancelledCount > 0) {
+            relayLog(
+                RelayLogLevel.INFO,
+                "${genTag(sessionEpoch)} outbound_ack_deadline_cancelled count=$cancelledCount reason=$reason",
+            )
+        }
+        return drained
+    }
 
     // ADR-013: scope owning the runReconnectLoop coroutine. Distinct
     // from the per-generation scope (which is reset every reconnect).
@@ -844,7 +986,13 @@ class KtorRelayTransport(
                     val toExpire = pendingAcks.values.filter {
                         it.sentAt.elapsedNow().inWholeMilliseconds > RelayTransportConfig.ACK_TIMEOUT_MS
                     }
-                    toExpire.forEach { pendingAcks.remove(it.message.messageId) }
+                    // PR-D1d: route via helper so a long-pending envelope that
+                    // also had its D1d deadline timer fired (or is still arming)
+                    // has its Job entry cleared from `ackDeadlineJobs` here too.
+                    // Without this the cancelled Job stays in the map until
+                    // session end — not a correctness bug (cancelled Jobs are
+                    // inert) but a per-envelope leak.
+                    toExpire.forEach { removePendingAckLocked(it.message.messageId, reason = "ack_watchdog_timeout") }
                     toExpire
                 }
                 if (expired.isEmpty()) continue
@@ -912,9 +1060,12 @@ class KtorRelayTransport(
      */
     internal suspend fun mergeUnackedIntoOutboxOrdered(mySession: Long) {
         val drained = pendingAcksLock.withLock {
-            val list = pendingAcks.values.toList()
-            pendingAcks.clear()
-            list
+            // PR-D1d: bulk helper drains pendingAcks AND cancels every in-flight
+            // deadline timer atomically. The envelopes are about to be re-queued
+            // into the outbox for the next session; their old timers (armed
+            // against the just-ended session) are stale and would fire spuriously.
+            // Each re-send via send() will arm a fresh 10 s deadline if needed.
+            clearAllPendingAcksLocked(reason = "session_ended", sessionEpoch = mySession)
         }
         if (drained.isEmpty()) return
         relayLog(
@@ -991,7 +1142,11 @@ class KtorRelayTransport(
                             // or queued is an upper-layer concern; for our
                             // purposes any Ack tells us the wire roundtrip
                             // worked.
-                            pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
+                            // PR-D1d: helper guarantees the deadline timer is
+                            // cancelled atomically with the pendingAcks removal.
+                            pendingAcksLock.withLock {
+                                removePendingAckLocked(msg.messageId, reason = "ack_received")
+                            }
                             currentSessionStats?.takeIf { it.sessionEpoch == mySession }
                                 ?.let { it.acksReceived += 1 }
                             relayLog(
@@ -1099,17 +1254,32 @@ class KtorRelayTransport(
             // eventually emit its own Ack frame when the envelope reaches it; if
             // that Ack does not arrive within ACK_TIMEOUT_MS the watchdog
             // requeues this entry on a fresh socket. sequenceTs preserved.
+            //
+            // PR-D1d: arm the per-envelope deadline timer under the same lock
+            // so the arm and pendingAcks insertion are atomic. If the relay
+            // does not AckDeliver within ACK_DEADLINE_MS the timer emits
+            // [outboundAckDeadlineExpired], which the orchestrator forwards to
+            // the state machine as Event.ActiveOutboundAckTimeout. This fires
+            // on the first bad send, orthogonal to the existing
+            // active_outbound_threshold (which requires two session deaths).
+            val sentMark = timeSource.markNow()
+            val msgId = message.messageId
+            val entry = AckPending(message, sentMark, seq, nowMs)
             pendingAcksLock.withLock {
-                pendingAcks[message.messageId] = AckPending(message, timeSource.markNow(), seq, nowMs)
+                pendingAcks[msgId] = entry
+                armAckDeadlineLocked(entry, logPrefix = genTag())
             }
             val ok = sendRaw(message)
             if (!ok) {
                 relayLog(RelayLogLevel.ERROR, "${genTag()} Envelope send returned false (frame write failed) seq=$seq")
                 // sendRaw threw and was logged. The frame did not go out, so the
-                // pendingAcks entry is meaningless — drop it and re-enqueue in
-                // the outbox with its original sequenceTs (the next reconnect
-                // flush will sort it back into encrypt order).
-                pendingAcksLock.withLock { pendingAcks.remove(message.messageId) }
+                // pendingAcks entry is meaningless — drop it (helper cancels the
+                // deadline timer atomically) and re-enqueue in the outbox with
+                // its original sequenceTs (the next reconnect flush will sort it
+                // back into encrypt order).
+                pendingAcksLock.withLock {
+                    removePendingAckLocked(msgId, reason = "send_failed")
+                }
                 outboxMutex.withLock {
                     pendingOutbox.addLast(OutboxEntry(message, seq, nowMs))
                 }
@@ -1242,13 +1412,22 @@ class KtorRelayTransport(
                         // PR-H2a: preserve sequenceTs across the re-track so a
                         // subsequent merge sorts this envelope back to its
                         // original encrypt-order slot, not after fresh sends.
+                        // PR-D1d: arm the deadline timer here too — a flushed
+                        // envelope is no different from a fresh send from the
+                        // relay's perspective, and Tele2 / similar broken networks
+                        // can drop the re-sent frame as easily as the original.
+                        // Without arming here, only first-time-send envelopes got
+                        // the 10 s deadline benefit; re-sends would silently wait
+                        // for the legacy active_outbound_threshold (~40 s) again.
+                        val rearmedEntry = AckPending(
+                            message = msg,
+                            sentAt = timeSource.markNow(),
+                            sequenceTs = entry.sequenceTs,
+                            queuedAtMs = entry.queuedAtMs,
+                        )
                         pendingAcksLock.withLock {
-                            pendingAcks[msg.messageId] = AckPending(
-                                message = msg,
-                                sentAt = timeSource.markNow(),
-                                sequenceTs = entry.sequenceTs,
-                                queuedAtMs = entry.queuedAtMs,
-                            )
+                            pendingAcks[msg.messageId] = rearmedEntry
+                            armAckDeadlineLocked(rearmedEntry, logPrefix = genTag(mySession))
                         }
                         relayLog(
                             RelayLogLevel.INFO,
@@ -1271,7 +1450,13 @@ class KtorRelayTransport(
                     // duplicate in the outbox (with the same sequenceTs
                     // collision).
                     if (msg is RelayMessage.Send) {
-                        pendingAcksLock.withLock { pendingAcks.remove(msg.messageId) }
+                        // PR-D1d: helper cancels the deadline timer atomically
+                        // with the un-track. The flush armed a timer above; if
+                        // the wire write failed, the envelope is now going back
+                        // to the outbox and its stale timer must not fire.
+                        pendingAcksLock.withLock {
+                            removePendingAckLocked(msg.messageId, reason = "flush_send_failed")
+                        }
                         relayLog(
                             RelayLogLevel.WARN,
                             "${genTag(mySession)} Flush failed → returned to outbox: id=${msg.messageId.take(12)}… seq=${entry.sequenceTs}",
@@ -1572,7 +1757,10 @@ class KtorRelayTransport(
     suspend fun markPendingOutboundAcceptedByFallback(id: String) {
         outboundSendMutex.withLock {
             pendingAcksLock.withLock {
-                pendingAcks.remove(id)
+                // PR-D1d: helper drops the envelope AND cancels its deadline
+                // timer atomically. The envelope is now owned by REST; the
+                // WS-plane timer is moot.
+                removePendingAckLocked(id, reason = "migrated_to_rest")
                 outboxMutex.withLock {
                     val it = pendingOutbox.iterator()
                     while (it.hasNext()) {
@@ -1611,5 +1799,33 @@ class KtorRelayTransport(
      */
     internal fun setStateConnectedForTest() {
         _state.value = TransportState.Connected
+    }
+
+    /**
+     * PR-D1d test hook: arm an ACK deadline timer for [entry] using whatever
+     * scope is in [ackDeadlineScopeOverride] (set to a TestScope by the test
+     * before calling this). This lets deadline tests seed both pendingAcks and
+     * the corresponding timer without going through the real send() path (which
+     * requires a live WebSocket session).
+     *
+     * Must only be called from tests. Production code uses [send] which arms
+     * the timer under the lock atomically with the pendingAcks insertion.
+     */
+    internal suspend fun armAckDeadlineForTest(entry: AckPending) {
+        pendingAcksLock.withLock {
+            pendingAcks[entry.message.messageId] = entry
+            armAckDeadlineLocked(entry, logPrefix = "[test]")
+        }
+    }
+
+    /**
+     * PR-D1d test hook: simulate relay AckDeliver for [msgId], removing the
+     * entry from pendingAcks and cancelling the deadline timer. Mirrors the
+     * production ACK path in readLoop without requiring a live connection.
+     */
+    internal suspend fun simulateAckReceivedForTest(msgId: String) {
+        pendingAcksLock.withLock {
+            removePendingAckLocked(msgId, reason = "ack_received")
+        }
     }
 }
