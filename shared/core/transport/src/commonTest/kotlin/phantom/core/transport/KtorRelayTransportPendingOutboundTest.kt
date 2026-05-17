@@ -3,6 +3,9 @@
 
 package phantom.core.transport
 
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -280,6 +283,120 @@ class KtorRelayTransportPendingOutboundTest {
      * an AckDelivery into the outbox alongside a Send and verifying the
      * snapshot returns only the Send.
      */
+    // ── PR-D1d: per-envelope ACK deadline timer tests ─────────────────────────
+
+    /**
+     * Arms a deadline for an envelope and advances virtual time past
+     * ACK_DEADLINE_MS (10 s) without delivering an ACK.
+     * [KtorRelayTransport.outboundAckDeadlineExpired] must emit exactly one
+     * event with the correct msgId, and pendingAcks must still hold the entry
+     * (the timer must NOT remove it — removal is owned by the ACK/session-end
+     * paths, not the timer itself).
+     *
+     * Pattern: subscribe first (replay=0 → must subscribe before emission),
+     * then arm, then advance virtual time, then cancel the collector and
+     * inspect the captured list.
+     */
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun outbound_ack_deadline_arms_and_expires_when_no_ack() = runTest {
+        val transport = newTransport()
+        // Redirect launched delay() Jobs onto the TestScope's virtual-time
+        // scheduler so advanceTimeBy() controls them.
+        transport.ackDeadlineScopeOverride = this
+
+        val msgId = "expire-test-id"
+        val sentMark = TimeSource.Monotonic.markNow()
+        val seq = transport.nextSequenceTsForTest()
+        val entry = KtorRelayTransport.AckPending(
+            message = fakeSendMessage(msgId),
+            sentAt = sentMark,
+            sequenceTs = seq,
+            queuedAtMs = 0L,
+        )
+
+        // Subscribe BEFORE arming (replay=0).
+        val emitted = mutableListOf<OutboundAckDeadlineExpiredEvent>()
+        val collectJob: Job = launch {
+            transport.outboundAckDeadlineExpired.collect { emitted += it }
+        }
+
+        // Arm the deadline (seeds pendingAcks + launches timer on TestScope).
+        transport.armAckDeadlineForTest(entry)
+
+        // Advance virtual time past the deadline.
+        advanceTimeBy(RelayTransportConfig.ACK_DEADLINE_MS + 1L)
+
+        // Cancel the collection coroutine — we have seen all events emitted
+        // up to this virtual-time point.
+        collectJob.cancel()
+
+        assertEquals(1, emitted.size, "Exactly one deadline event must be emitted")
+        assertEquals(msgId, emitted.single().msgId)
+        // ageMs is measured against TimeSource.Monotonic (real clock), so in a
+        // virtual-time test the elapsed real duration is near-zero. We cannot
+        // assert ageMs >= ACK_DEADLINE_MS here — just verify the field is
+        // non-negative (the event was emitted with a coherent timestamp).
+        assertTrue(emitted.single().ageMs >= 0L,
+            "ageMs must be non-negative; got ${emitted.single().ageMs}")
+
+        // The timer must NOT have removed the entry from pendingAcks.
+        val remaining = transport.snapshotPendingAcksForTest()
+        assertEquals(1, remaining.size, "pendingAcks must retain the entry after deadline (removal belongs to ACK/session-end path)")
+        assertEquals(msgId, (remaining.single().message as RelayMessage.Send).messageId)
+    }
+
+    /**
+     * Arms a deadline for an envelope, simulates an ACK arriving at 5 s
+     * (before the 10 s deadline), then advances virtual time past the
+     * deadline. No event must be emitted on
+     * [KtorRelayTransport.outboundAckDeadlineExpired] because the ACK
+     * cancels the timer Job before it fires.
+     */
+    @Test
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun outbound_ack_deadline_cancelled_by_ack_received() = runTest {
+        val transport = newTransport()
+        transport.ackDeadlineScopeOverride = this
+
+        val msgId = "cancel-test-id"
+        val sentMark = TimeSource.Monotonic.markNow()
+        val seq = transport.nextSequenceTsForTest()
+        val entry = KtorRelayTransport.AckPending(
+            message = fakeSendMessage(msgId),
+            sentAt = sentMark,
+            sequenceTs = seq,
+            queuedAtMs = 0L,
+        )
+
+        // Subscribe before arming.
+        val emitted = mutableListOf<OutboundAckDeadlineExpiredEvent>()
+        val collectJob: Job = launch {
+            transport.outboundAckDeadlineExpired.collect { emitted += it }
+        }
+
+        // Arm the deadline timer.
+        transport.armAckDeadlineForTest(entry)
+
+        // ACK arrives at 5 s — before the 10 s deadline.
+        advanceTimeBy(5_000L)
+        transport.simulateAckReceivedForTest(msgId)
+
+        // Advance well past the original 10 s mark. The cancelled Job
+        // must not emit anything.
+        advanceTimeBy(RelayTransportConfig.ACK_DEADLINE_MS + 1_000L)
+
+        collectJob.cancel()
+
+        assertTrue(emitted.isEmpty(), "No deadline event must fire when ACK arrived before deadline; got: $emitted")
+
+        // ACK must have removed the entry from pendingAcks.
+        assertTrue(transport.snapshotPendingAcksForTest().isEmpty(),
+            "pendingAcks must be empty after ACK received")
+    }
+
+    // ── end PR-D1d tests ──────────────────────────────────────────────────────
+
     @Test
     fun snapshot_ignores_non_send_outbox_entries() = runTest {
         val transport = newTransport()

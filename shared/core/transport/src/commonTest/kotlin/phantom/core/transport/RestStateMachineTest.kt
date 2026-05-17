@@ -5,6 +5,7 @@ package phantom.core.transport
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -229,6 +230,89 @@ class RestStateMachineTest {
         sm.onEvent(idleFail())
         assertEquals(RestMode.RestActive, sm.current)
     }
+
+    // ── PR-D1d: ActiveOutboundAckTimeout tests ────────────────────────────────
+
+    @Test
+    fun ack_timeout_in_ws_active_transitions_to_rest_active() {
+        val logs = mutableListOf<String>()
+        val sm = RestStateMachine(now = { 0L }, log = { logs += it })
+
+        assertEquals(RestMode.WsActive, sm.current)
+        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id1", 10_000L))
+        assertEquals(RestMode.RestActive, sm.current)
+        assertTrue(
+            logs.any { it.contains("mode_switched") && it.contains("reason=active_outbound_ack_timeout") },
+            "Expected a mode_switched … reason=active_outbound_ack_timeout log line; got: $logs",
+        )
+    }
+
+    @Test
+    fun ack_timeout_in_rest_active_is_noop() {
+        val logs = mutableListOf<String>()
+        val sm = RestStateMachine(now = { 0L }, log = { logs += it })
+        // Drive to RestActive via the threshold path.
+        sm.onEvent(activeFail()); sm.onEvent(activeFail())
+        assertEquals(RestMode.RestActive, sm.current)
+        logs.clear()
+
+        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id2", 10_000L))
+        assertEquals(RestMode.RestActive, sm.current, "RestActive state must not change")
+        assertFalse(
+            logs.any { it.contains("mode_switched") },
+            "No mode_switched log expected when already in RestActive; got: $logs",
+        )
+    }
+
+    @Test
+    fun ack_timeout_in_ws_candidate_is_noop() {
+        val logs = mutableListOf<String>()
+        val sm = RestStateMachine(now = { 0L }, log = { logs += it })
+        // Drive to RestActive then to WsCandidate.
+        sm.onEvent(activeFail()); sm.onEvent(activeFail())
+        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        assertEquals(RestMode.WsCandidate, sm.current)
+        logs.clear()
+
+        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id3", 10_000L))
+        assertEquals(RestMode.WsCandidate, sm.current, "WsCandidate state must not change")
+        assertFalse(
+            logs.any { it.contains("mode_switched") },
+            "No mode_switched log expected when in WsCandidate; got: $logs",
+        )
+    }
+
+    @Test
+    fun multiple_ack_timeouts_only_first_switches_once() {
+        val logs = mutableListOf<String>()
+        val sm = RestStateMachine(now = { 0L }, log = { logs += it })
+        assertEquals(RestMode.WsActive, sm.current)
+
+        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("msg-a", 10_000L))
+        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("msg-b", 11_000L))
+
+        assertEquals(RestMode.RestActive, sm.current)
+        val switchCount = logs.count { it.contains("mode_switched") && it.contains("reason=active_outbound_ack_timeout") }
+        assertEquals(1, switchCount, "Expected exactly one mode_switched for two timeouts; got $switchCount in: $logs")
+    }
+
+    @Test
+    fun network_changed_after_ack_timeout_resets_counters_but_transitions_to_ws_candidate() {
+        val sm = build()
+        // Trigger REST via deadline.
+        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id-x", 10_000L))
+        assertEquals(RestMode.RestActive, sm.current)
+
+        // NetworkChanged must lift to WsCandidate — same as if we'd arrived
+        // via the threshold mechanism. Existing behaviour must not break.
+        sm.onEvent(RestStateMachine.Event.NetworkChanged)
+        assertEquals(
+            RestMode.WsCandidate, sm.current,
+            "NetworkChanged after RestActive must transition to WsCandidate",
+        )
+    }
+
+    // ── end PR-D1d tests ──────────────────────────────────────────────────────
 
     @Test
     fun thresholds_are_locked_constants() {
