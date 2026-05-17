@@ -436,6 +436,22 @@ These are documented for transparency about what we resolved during the developm
 
 ---
 
+---
+
+## Relay limitations
+
+### ISSUE-017: M1r media chunks are in-memory only
+
+- **M1r media chunks are in-memory only.** Uploaded voice media may be
+  lost on relay restart before the receiver downloads them. Persistent
+  media storage is deferred to a follow-up PR (M1r.1 / M2).
+
+**Impact.** If the relay process restarts while a voice message's chunks have been uploaded but not yet downloaded by the recipient, those chunks are lost. The sender has no way to detect this without re-sending. This affects voice messages only; text envelopes have the same semantics (also in-memory), which is documented in ISSUE-012.
+
+**Planned fix.** M1r.1 will introduce SQLite or Sled-backed persistent chunk storage on the relay.
+
+---
+
 ## Tracking
 
 This list is maintained as a living document. Issues are tracked in GitHub Issues at:
