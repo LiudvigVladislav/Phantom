@@ -374,6 +374,36 @@ class HybridRelayTransport(
                 }
             }
         }
+        // PR-D1d: per-envelope ACK deadline. Parallel to wsSessionEnded.
+        // Fires when a sent envelope is not acknowledged by the relay within
+        // 10 s, triggering an immediate WS_ACTIVE → REST_ACTIVE switch on
+        // the first bad send — without waiting for two full session deaths as
+        // the active_outbound_threshold mechanism requires.
+        //
+        // Short-circuits when REST is not active (same pattern as the acks
+        // and incoming collectors above): if the relay bootstrap has not yet
+        // returned restFallback=true, feeding deadline events into an
+        // uninitialised state machine is a no-op and we avoid the overhead.
+        scope.launch {
+            wsTransport.outboundAckDeadlineExpired.collect { event ->
+                if (!restCapabilityActive) return@collect
+                // PR-D1d defence-in-depth: also filter on current mode here.
+                // [RestStateMachine.onActiveOutboundAckTimeout] no-ops the event
+                // when state != WsActive (so a duplicate timeout firing after
+                // we've already flipped to RestActive is correctly ignored),
+                // but doing the cheap fast-path read here avoids acquiring
+                // [stateMachineLock] in [submitStateEvent] just to no-op.
+                // [stateMachine.current] is a MutableStateFlow.value read —
+                // thread-safe atomic, no lock required for the snapshot.
+                if (stateMachine.current != RestMode.WsActive) return@collect
+                submitStateEvent(
+                    RestStateMachine.Event.ActiveOutboundAckTimeout(
+                        msgId = event.msgId,
+                        ageMs = event.ageMs,
+                    )
+                )
+            }
+        }
     }
 
     /**
