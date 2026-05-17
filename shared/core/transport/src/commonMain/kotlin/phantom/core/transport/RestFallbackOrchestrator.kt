@@ -594,6 +594,21 @@ class RestFallbackOrchestrator(
         response.token
     }
 
+    /**
+     * Public CAS facade for media token acquisition (PR-M1w).
+     *
+     * Delegates to [acquireOrRefreshToken] with the same CAS semantics:
+     * - [staleToken] == null → return cached token if still fresh, else refresh.
+     * - [staleToken] != null → if cached != staleToken, another caller already
+     *   refreshed; return cached (CAS reuse). Otherwise call /auth/session.
+     *
+     * Called only by [RestMediaAuthTokenProvider]. Kept as a thin public facade
+     * so the internal [acquireOrRefreshToken] method (and the tokenMutex it
+     * holds) does not leak across module boundaries.
+     */
+    suspend fun acquireOrRefreshMediaToken(reason: String, staleToken: String?): String? =
+        acquireOrRefreshToken(reason = reason, staleToken = staleToken)
+
     private suspend fun authSessionOnce(): AuthSessionResponse? {
         log("REST_TRACE session_request identity=${identityHex.take(8)}")
         val challengeHex = runCatching { getChallenge(identityHex) }

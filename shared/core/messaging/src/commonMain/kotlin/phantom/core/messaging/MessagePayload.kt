@@ -76,6 +76,8 @@ data class MessagePayload(
         // Media types (new)
         const val TYPE_AUDIO = "audio"
         const val TYPE_AUDIO_CHUNK = "audio_chunk"
+        /** Encrypted-media voice manifest (PR-M1w). Replaces audio_chunk for 1:1 voice. */
+        const val TYPE_VOICE_V2 = "voice_v2"
 
         // Key rotation — sender announces a new identity key
         const val TYPE_KEY_ROTATION = "key_rotation"
