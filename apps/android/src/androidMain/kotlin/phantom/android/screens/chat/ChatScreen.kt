@@ -664,10 +664,13 @@ fun ChatScreen(
                     onMicClick = {
                         // PR-C1 (2026-05-17) — UI guard for voice via TransportCapabilities.
                         // Source of truth: container.transportCapabilities.canSendVoice.
-                        // Voice is allowed on WsActive / WsCandidate / RestActive when NOT
-                        // on Tor (per D2b.2 intent). Tor and no-transport block voice.
-                        // The send-layer guard in DefaultMessagingService.sendAudio is the
-                        // second layer for any path that bypasses this UI.
+                        // Voice is allowed only when capabilities.canSendVoice is true.
+                        // In C1 this means WsActive without Tor. Limited realtime
+                        // (RestActive / WsCandidate), Tor, and no-transport all block;
+                        // voice in Limited realtime re-opens in PR-M1w via the new
+                        // encrypted media-upload path. The send-layer guard in
+                        // DefaultMessagingService.sendAudio is the second layer for any
+                        // path that bypasses this UI.
                         if (!capabilities.canSendVoice) {
                             Log.w(
                                 "PhantomTransport",
