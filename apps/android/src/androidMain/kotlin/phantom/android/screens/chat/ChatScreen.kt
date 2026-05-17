@@ -90,6 +90,7 @@ import phantom.core.messaging.SafetyReportCategory
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.ReactionEntry
+import phantom.core.transport.CallDisabledReason
 import phantom.core.transport.TransportState
 
 private const val PROFILE_MSG_PREFIX = "\u200B__PHANTOM_PROFILE__\u200B"
@@ -149,6 +150,11 @@ fun ChatScreen(
             }
         }
     }
+
+    // PR-C1 (2026-05-17): capability snapshot — single source of truth for
+    // call / voice gating. Replaces the inline `hybridTransport?.stateMachine`
+    // reads that were scattered across onVoiceCall and onMicClick handlers.
+    val capabilities by container.transportCapabilities.collectAsState()
 
     var showMenu by remember { mutableStateOf(false) }
     var showBlockDialog by remember { mutableStateOf(false) }
@@ -502,25 +508,33 @@ fun ChatScreen(
                 onContactProfile = onContactProfile,
                 onVoiceCall = {
                     if (theirPublicKeyHex.isNotEmpty()) {
-                        // PR-D2a — UI guard for calls on Limited realtime
-                        // transports. Source of truth: hybridTransport.stateMachine.
-                        // When the orchestrator is in REST_ACTIVE / WS_CANDIDATE we
-                        // do not even open the call screen — WebRTC cannot work over
-                        // REST short-poll, and a "ringing but never connects" failure
-                        // mode is worse than an honest snackbar. CallManager.startCall
-                        // has the same gate as a second layer (programmatic / deep-link
-                        // / retry paths).
-                        val mode = container.hybridTransport?.stateMachine?.state?.value
-                        val callsAllowed = mode == null ||
-                            mode == phantom.core.transport.RestMode.WsActive
-                        if (!callsAllowed) {
+                        // PR-C1 (2026-05-17) — UI guard for calls via TransportCapabilities.
+                        // Source of truth: container.transportCapabilities (StateFlow).
+                        // The reason field drives per-reason snackbar copy so the user
+                        // gets an honest, actionable message rather than the single
+                        // "Limited realtime" string used in PR-D2a.
+                        // CallManager.startCall has the same gate as a second layer.
+                        if (!capabilities.canStartCalls) {
                             Log.w(
-                                "PhantomHybrid",
-                                "MEDIA_CAPABILITY blocked feature=call mode=$mode source=ui",
+                                "PhantomTransport",
+                                "CALL_CAPABILITY disabled " +
+                                    "reason=${capabilities.callDisabledReason?.name?.lowercase()} " +
+                                    "source=ui",
                             )
+                            val msg = when (capabilities.callDisabledReason) {
+                                CallDisabledReason.LIMITED_REALTIME ->
+                                    context.getString(R.string.c1_call_blocked_limited_realtime)
+                                CallDisabledReason.TOR_TRANSPORT ->
+                                    context.getString(R.string.c1_call_blocked_tor_transport)
+                                CallDisabledReason.REALITY_UNPROBED ->
+                                    context.getString(R.string.c1_call_blocked_reality_unprobed)
+                                CallDisabledReason.NO_TRANSPORT ->
+                                    context.getString(R.string.c1_call_blocked_no_transport)
+                                null -> context.getString(R.string.d2a_call_blocked_limited_realtime)
+                            }
                             scope.launch {
                                 snackbarHostState.showSnackbar(
-                                    context.getString(R.string.d2a_call_blocked_limited_realtime),
+                                    msg,
                                     duration = androidx.compose.material3.SnackbarDuration.Short,
                                 )
                             }
@@ -648,25 +662,21 @@ fun ChatScreen(
                         audioFile = null
                     },
                     onMicClick = {
-                        // PR-D2a — UI guard for voice on Limited realtime
-                        // transports. Refused at the start of the gesture so the
-                        // user never sees the recorder fire and then "disappear"
-                        // — REST short-poll caps body at 4096 bytes and we have
-                        // no chunked-voice path yet (that lands in PR-D2b). The
-                        // send-layer guard in DefaultMessagingService.sendAudio
-                        // is the second layer for any path that bypasses this UI.
-                        val mode = container.hybridTransport?.stateMachine?.state?.value
-                        val voiceAllowed = mode == null ||
-                            mode == phantom.core.transport.RestMode.WsActive
-                        if (!voiceAllowed) {
+                        // PR-C1 (2026-05-17) — UI guard for voice via TransportCapabilities.
+                        // Source of truth: container.transportCapabilities.canSendVoice.
+                        // Voice is allowed on WsActive / WsCandidate / RestActive when NOT
+                        // on Tor (per D2b.2 intent). Tor and no-transport block voice.
+                        // The send-layer guard in DefaultMessagingService.sendAudio is the
+                        // second layer for any path that bypasses this UI.
+                        if (!capabilities.canSendVoice) {
                             Log.w(
-                                "PhantomHybrid",
-                                "MEDIA_CAPABILITY blocked feature=voice mode=$mode source=ui recording_in_progress=$isRecording",
+                                "PhantomTransport",
+                                "VOICE_CAPABILITY disabled " +
+                                    "reason=${capabilities.callDisabledReason?.name?.lowercase()} " +
+                                    "source=ui recording_in_progress=$isRecording",
                             )
-                            // If we were already recording when the mode degraded,
-                            // tear the recorder down cleanly — we will not be able
-                            // to send the file. User sees the snackbar instead of
-                            // a silent failure.
+                            // If we were already recording when the mode degraded (e.g. Tor
+                            // activated mid-recording), tear the recorder down cleanly.
                             if (isRecording) {
                                 mediaRecorder?.stop()
                                 mediaRecorder?.release()
@@ -2645,6 +2655,9 @@ private fun ChatTopBar(
                     )
                 }
             }
+            // TODO(C1.1): disable button visually when capabilities.canStartCalls == false
+            //   ChatTopBar needs a `callsEnabled: Boolean` param and the icon tinted
+            //   with TextDisabled colour + pointer-events blocked when false.
             IconButton(onClick = onVoiceCall, modifier = Modifier.size(40.dp)) {
                 PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
             }

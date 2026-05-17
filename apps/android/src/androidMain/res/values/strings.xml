@@ -18,4 +18,13 @@
 <resources>
     <string name="d2a_voice_blocked_limited_realtime">Voice messages are temporarily unavailable in Limited realtime mode. Text messages are still delivered through the fallback channel.</string>
     <string name="d2a_call_blocked_limited_realtime">Calls are temporarily unavailable in Limited realtime mode. Try again later on a stable realtime connection.</string>
+
+    <!--
+      PR-C1 (2026-05-17): per-reason call-blocked strings.
+      Mapped from CallDisabledReason in ChatScreen.onVoiceCall handler.
+    -->
+    <string name="c1_call_blocked_limited_realtime">Calls require a stable realtime connection. Try again on Wi-Fi or stable cellular.</string>
+    <string name="c1_call_blocked_tor_transport">Calls are not available over Tor.</string>
+    <string name="c1_call_blocked_reality_unprobed">Calls require a stable connection.</string>
+    <string name="c1_call_blocked_no_transport">Connecting…</string>
 </resources>

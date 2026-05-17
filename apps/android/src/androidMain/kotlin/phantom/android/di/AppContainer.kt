@@ -52,6 +52,9 @@ import phantom.core.transport.KtorTransportProbe
 import phantom.core.transport.PrivacyMode
 import phantom.core.transport.TorService
 import phantom.core.transport.TorServiceConfig
+import phantom.core.transport.TorState
+import phantom.core.transport.TransportCapabilities
+import phantom.core.transport.TransportCapabilitiesResolver
 import phantom.core.transport.TransportManager
 import phantom.core.transport.TransportManagerLog
 import phantom.core.transport.TransportPreferences
@@ -188,6 +191,58 @@ class AppContainer(private val context: Context) {
      */
     var hybridTransport: phantom.android.transport.HybridRelayTransport? = null
         private set
+
+    /**
+     * PR-C1 (2026-05-17): current transport capability snapshot.
+     *
+     * Derived from [hybridTransport]'s [RestStateMachine] and [torService]
+     * state. Emits [TransportCapabilities] using [TransportCapabilitiesResolver]
+     * — the single source of truth for whether calls and voice are allowed.
+     *
+     * Starts in the NO_TRANSPORT state (no signing key / before initMessaging).
+     * After [initMessaging] completes, two coroutines update it in response to:
+     *   1. RestMode transitions from [HybridRelayTransport.stateMachine.state].
+     *   2. TorState changes from [torService.state] (only if Tor is lazy-started).
+     *
+     * UI collectors: ChatScreen uses `.collectAsState()` to drive snackbar copy
+     * and call-button gating. CallManager's lambda reads `.value` for the
+     * synchronous second-layer guard.
+     */
+    private val _transportCapabilities = MutableStateFlow(
+        TransportCapabilitiesResolver.resolve(restMode = null, torActive = false)
+    )
+    val transportCapabilities: StateFlow<TransportCapabilities> =
+        _transportCapabilities.asStateFlow()
+
+    /** Recomputes and emits a new [TransportCapabilities] snapshot.
+     *
+     * Called from coroutines tracking RestMode and TorState changes.
+     * Thread-safe: MutableStateFlow is thread-safe by contract.
+     *
+     * [torActiveOverride]: pass the just-observed [TorState] to avoid
+     * re-reading the lazy field if Tor has not been initialised. When
+     * null, reads [_torStarted] as the guard before touching the lazy.
+     */
+    private fun recomputeCapabilities(torActiveOverride: Boolean? = null) {
+        val restMode = hybridTransport?.stateMachine?.current
+        val torActive = torActiveOverride
+            ?: (_torStarted && torService.state.value is TorState.Ready)
+        _transportCapabilities.value = TransportCapabilitiesResolver.resolve(
+            restMode = restMode,
+            torActive = torActive,
+        )
+    }
+
+    /**
+     * Becomes true the first time [torService] is accessed inside
+     * [initMessaging]'s Tor-tracking coroutine. Guards against
+     * force-initialising the 25 MB libtor native library for Standard-mode
+     * users who never use Tor. Set to true ONLY when `transportManager`
+     * has already accessed [torService] (i.e. Ghost mode is in use), OR
+     * when [initMessaging] decides to start observing Tor state because the
+     * current [TransportPreferences.privacyMode] requires Tor.
+     */
+    @Volatile private var _torStarted: Boolean = false
 
     /**
      * Public transport accessor used by every caller (DMS, CallManager,
@@ -463,6 +518,33 @@ class AppContainer(private val context: Context) {
                         )
                     }
             }
+
+            // PR-C1 (2026-05-17): keep transportCapabilities in sync with
+            // RestMode transitions. Emits immediately with the current mode,
+            // then updates on every subsequent transition so UI observers
+            // (ChatScreen) see real-time capability changes without polling.
+            appScope.launch {
+                hybrid.stateMachine.state.collect {
+                    recomputeCapabilities()
+                }
+            }
+        }
+
+        // PR-C1: track TorState so Tor-active flips canSendVoice/canStartCalls.
+        // Only start observing Tor state when the current privacy mode requires
+        // Tor (Ghost = Tor-first strategy). Standard/Direct-mode users never
+        // trigger the torService lazy, so libtor is not loaded unnecessarily.
+        // If the user later switches to Ghost mode, setPrivacyMode() calls
+        // transportManager.release() and then a new foreground service start
+        // re-calls initMessaging — at that point privacyMode == Ghost and the
+        // coroutine is started.
+        if (transportPreferences.privacyMode == PrivacyMode.Ghost) {
+            _torStarted = true
+            appScope.launch {
+                torService.state.collect { torState ->
+                    recomputeCapabilities(torActiveOverride = torState is TorState.Ready)
+                }
+            }
         }
 
         // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2
@@ -571,17 +653,25 @@ class AppContainer(private val context: Context) {
             // haven't yet been backfilled by the migration flow
             // (PR C commit 12). DMS surfaces null as a hard send error.
             signingKeyProvider = { identityManager.loadSigningKeyPair() },
-            // PR-D2a (2026-05-17): voice send guard for Limited realtime
-            // mode. Reads `hybridTransport.stateMachine` lazily so the
-            // result reflects whichever generation the orchestrator is in
-            // right now. When `hybridTransport` is null (Alpha 1 record
-            // without a signing key, or before bootstrap), we allow voice
-            // — there's no degraded REST path running yet, so this is the
-            // bare-WS world where current voice behaviour was already
-            // shipping. Real fix for voice on REST lands in PR-D2b.
+            // PR-C1 (2026-05-17): voice send guard via TransportCapabilities.
+            // Single source of truth: transportCapabilities.value.canSendVoice.
+            // Covers Tor (blocked) + Limited realtime (allowed per D2b.2 intent)
+            // + no-transport (blocked). When hybridTransport is null (Alpha 1
+            // record without a signing key), canSendVoice defaults to false
+            // (NO_TRANSPORT reason) — safe conservative fallback.
             canSendVoice = {
-                val mode = hybridTransport?.stateMachine?.state?.value
-                mode == null || mode == phantom.core.transport.RestMode.WsActive
+                val caps = _transportCapabilities.value
+                val allowed = caps.canSendVoice
+                if (!allowed) {
+                    android.util.Log.i(
+                        "PhantomTransport",
+                        "VOICE_CAPABILITY disabled " +
+                            "reason=${caps.callDisabledReason?.name?.lowercase() ?: "unknown"} " +
+                            "rest_mode=${hybridTransport?.stateMachine?.current} " +
+                            "tor_active=${_torStarted && torService.state.value is TorState.Ready}",
+                    )
+                }
+                allowed
             },
             // PR-D2b.1 (2026-05-17): durable reassembly. Keeps the 1:1
             // voice receive path crash-safe — chunks are saved to
@@ -715,14 +805,22 @@ class AppContainer(private val context: Context) {
         val cm = CallManager(
             context = context,
             messagingService = service,
-            // PR-D2a — calls guard. Same source as canSendVoice above;
-            // both gates flip together because both fail in the same
-            // way on a degraded transport (REST short-poll cannot carry
-            // realtime WebRTC). A richer per-capability type lands in
-            // C-track PR-C1.
+            // PR-C1 (2026-05-17): calls guard via TransportCapabilities.
+            // Single source of truth: transportCapabilities.value.canStartCalls.
+            // Allowed only on WsActive without Tor (realtimeStable = true).
             canStartCalls = {
-                val mode = hybridTransport?.stateMachine?.state?.value
-                mode == null || mode == phantom.core.transport.RestMode.WsActive
+                val caps = _transportCapabilities.value
+                val allowed = caps.canStartCalls
+                if (!allowed) {
+                    android.util.Log.i(
+                        "PhantomTransport",
+                        "CALL_CAPABILITY disabled " +
+                            "reason=${caps.callDisabledReason?.name?.lowercase() ?: "unknown"} " +
+                            "rest_mode=${hybridTransport?.stateMachine?.current} " +
+                            "tor_active=${_torStarted && torService.state.value is TorState.Ready}",
+                    )
+                }
+                allowed
             },
         )
         cm.initialize()
