@@ -1,0 +1,188 @@
+-- VoiceChunk.sq — durable receive-side reassembly buffer for chunked voice
+-- messages (PR-D2b.1, 2026-05-17).
+--
+-- WHY THIS EXISTS
+--
+-- Before D2b.1, the receive path buffered chunks in
+-- `DefaultMessagingService.audioReassemblyBuffer` — an in-memory
+-- `mutableMapOf<String, ChunkBuffer>`. That worked when voice always
+-- arrived over WebSocket within a few seconds, because the receiving
+-- process stayed alive long enough to receive all chunks and run
+-- assembly. PR-D1c / D1d turned REST short-poll into a first-class
+-- transport for text on Tele2 LTE; PR-D2b is doing the same for voice.
+-- On REST the chunks can arrive over many minutes (poll interval +
+-- migrate_pending bursts + tower handoffs), the app may be killed by
+-- Doze or by the user mid-stream, and on next startup we still need
+-- to finish assembling a voice that was 28/30 chunks complete when we
+-- went down. An in-memory map cannot survive a process death.
+--
+-- This table stores one row per (voice_id, idx) chunk as it arrives,
+-- in already-decoded plaintext form (chunk bytes after Base64 decode).
+-- Assembly is a single ordered SELECT, run when COUNT(idx) WHERE
+-- voice_id = ? reaches `total`. After a successful `insertMessage`
+-- for the reassembled voice, the per-voice rows are deleted in one
+-- statement.
+--
+-- CRASH SAFETY
+--
+-- The receive path performs `INSERT OR REPLACE` BEFORE sending the
+-- ack-deliver to the relay. If we crash between save and ack, the
+-- relay will redeliver the chunk on next connect; the second `INSERT
+-- OR REPLACE` is a no-op for that chunk because its bytes are
+-- identical. If we crash between save and assembly+insert, the next
+-- `startReceiving` runs `findCompleteVoices()` and finishes assembly
+-- for every voice_id whose chunk count matches `total`.
+--
+-- If `messageRepository.insertMessage` itself fails after a successful
+-- assembly, the chunks are intentionally NOT deleted. The finalizer
+-- will retry on next startup. This matches the architect's review
+-- 2026-05-17: "lose-zero-data" preference over "clean up on best
+-- effort".
+--
+-- TTL
+--
+-- 24 hours, intentionally generous so a phone that loses connectivity
+-- overnight on Tele2 can still finish receiving a voice in the morning
+-- (the relay's per-envelope TTL is 7 days; the bottleneck is the local
+-- partial-assembly table, not the network). The sweep runs on every
+-- chunk insert (cheap — single DELETE with WHERE clause on indexed
+-- column) and again at `startReceiving` so a long-idle reinstall does
+-- not start by carrying state from before the previous Doze window.
+
+CREATE TABLE voice_chunks (
+    -- Stable identifier for the voice as a whole. Matches
+    -- `MessagePayload.audioChunkId` set by the sender. Two chunks
+    -- from the same voice share this value; chunks from different
+    -- voices never collide because the sender generates a fresh
+    -- UUIDv4 per `sendAudio` call.
+    voice_id TEXT NOT NULL,
+
+    -- 0-based chunk index. The sender splits raw audio sequentially
+    -- and tags each chunk with its `audioChunkIndex` so the receiver
+    -- can reassemble in order regardless of relay redelivery order.
+    idx INTEGER NOT NULL,
+
+    -- Total number of chunks the sender split this voice into. Stable
+    -- across every chunk of the same voice — receiver uses it for the
+    -- "have we got them all?" check via `findVoicesReadyToAssemble`.
+    total INTEGER NOT NULL,
+
+    -- Conversation this voice belongs to. Recovered on every chunk
+    -- via `sessionManager.deriveConversationId(sender)` and stored
+    -- redundantly so the finalizer can drive the insertMessage call
+    -- without re-decrypting any ciphertext.
+    conversation_id TEXT NOT NULL,
+
+    -- Sender's identity public key hex (recovered from sealed
+    -- sender on the receive path of the first chunk; same value
+    -- on every subsequent chunk because they all carry the same
+    -- conversation). Diagnostics + future per-peer audit.
+    sender_pubkey_hex TEXT NOT NULL,
+
+    -- Audio MIME type ("audio/ogg" on API 29+, "audio/m4a" on older).
+    -- Carried on every chunk by the payload schema and stored once per
+    -- (voice_id, idx) for finalizer self-sufficiency.
+    mime_type TEXT NOT NULL,
+
+    -- Total recorded duration in milliseconds, set by the sender from
+    -- the original `MediaRecorder` session. Same value on every chunk.
+    duration_ms INTEGER NOT NULL,
+
+    -- Plaintext chunk bytes — the Base64-decoded slice of the original
+    -- audio that this index represents. Storing decoded bytes (not the
+    -- base64 string) saves ~33 % per row and lets `findOrderedChunks`
+    -- return a stream of ready-to-concat BLOBs.
+    chunk_bytes BLOB NOT NULL,
+
+    -- Wall-clock (epoch ms) when this row was last written. Updated on
+    -- every `INSERT OR REPLACE`. Drives the 24 h TTL sweep
+    -- (`deleteOlderThan`) and surfaces in the `VOICE_RX partial_expired`
+    -- log so a stuck voice's age is visible without a separate join.
+    updated_at_ms INTEGER NOT NULL,
+
+    -- A single voice's chunks form a tight set keyed by (voice_id, idx).
+    -- PK enforces both the natural uniqueness ("two arrivals of chunk K
+    -- are the same chunk, not two distinct rows") and the lookup index
+    -- used by `findOrderedChunks` / `countChunks` / `deleteByVoiceId`.
+    PRIMARY KEY (voice_id, idx)
+);
+
+-- Diagnostic / sweep helper — finds every distinct voice_id with the
+-- oldest update timestamp older than `cutoff_ms`. Used by
+-- `VOICE_RX partial_expired` logging before the bulk delete so a log
+-- reader can see exactly which voices, with what chunk count, are
+-- being dropped and how old they were.
+findExpiredSummaries:
+SELECT voice_id, total, COUNT(idx) AS received, MIN(updated_at_ms) AS oldest_ms
+FROM voice_chunks
+GROUP BY voice_id
+HAVING MIN(updated_at_ms) < :cutoff_ms;
+
+-- Sweep — drops every chunk for any voice that has at least one chunk
+-- older than the cutoff. Run after `findExpiredSummaries` returns the
+-- summaries we want to log. Mirrors the `findExpiredSummaries` predicate
+-- (MIN(updated_at_ms) < cutoff per voice) so the two queries always
+-- agree: if a voice is reported expired, ALL of its chunks are then
+-- dropped, not just the rows whose individual `updated_at_ms` is below
+-- the cutoff. The naive `WHERE updated_at_ms < cutoff` would leave a
+-- voice in a permanently-unassemblable "fresh chunks for half the
+-- indices, expired chunks for the other half — count never reaches
+-- total" state. PR-D2b.1 review round 2 (2026-05-17).
+--
+-- Cheap because the table is expected to stay under a few hundred rows
+-- even under worst-case "user records voice every minute for a day"
+-- usage — the GROUP BY + HAVING walks the same row set we already touch
+-- on each chunk insert.
+deleteOlderThan:
+DELETE FROM voice_chunks
+WHERE voice_id IN (
+    SELECT voice_id
+    FROM voice_chunks
+    GROUP BY voice_id
+    HAVING MIN(updated_at_ms) < :cutoff_ms
+);
+
+-- Hot path — save a chunk as it arrives. `INSERT OR REPLACE` makes
+-- relay redelivery of the same (voice_id, idx) idempotent: bytes are
+-- identical so the row is overwritten with itself.
+insertChunk:
+INSERT OR REPLACE INTO voice_chunks(
+    voice_id, idx, total, conversation_id, sender_pubkey_hex,
+    mime_type, duration_ms, chunk_bytes, updated_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- Used after every chunk insert to decide whether assembly should run
+-- now. Returns the count of distinct indices stored for the given
+-- voice_id. Receiver compares against the `total` that was carried on
+-- the payload.
+countChunks:
+SELECT COUNT(idx) AS cnt FROM voice_chunks WHERE voice_id = :voice_id;
+
+-- Finalizer — at `startReceiving` we scan for voices whose chunk count
+-- has already reached `total` (i.e. the previous run got to "all chunks
+-- saved" but crashed before assembly + insertMessage). Returns one row
+-- per ready voice with the metadata needed to drive insertion without
+-- decoding any payload.
+findVoicesReadyToAssemble:
+SELECT voice_id, total, conversation_id, sender_pubkey_hex, mime_type, duration_ms
+FROM voice_chunks
+GROUP BY voice_id, total, conversation_id, sender_pubkey_hex, mime_type, duration_ms
+HAVING COUNT(idx) = total;
+
+-- Returns chunk_bytes ordered by idx so the receiver can concat
+-- straight into the assembled blob without an intermediate sort.
+findOrderedChunks:
+SELECT idx, chunk_bytes
+FROM voice_chunks
+WHERE voice_id = :voice_id
+ORDER BY idx ASC;
+
+-- Called after `insertMessage` for the assembled voice succeeds. The
+-- per-voice rows are dropped in one statement; no need to delete by
+-- (voice_id, idx) one at a time.
+deleteByVoiceId:
+DELETE FROM voice_chunks WHERE voice_id = :voice_id;
+
+-- Wipe (used by reset / pm-clear-free instrumented tests).
+deleteAll:
+DELETE FROM voice_chunks;

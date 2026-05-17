@@ -46,6 +46,7 @@ import phantom.core.storage.SqlDelightProcessedEnvelopeRepository
 import phantom.core.storage.SqlDelightRatchetStateRepository
 import phantom.core.storage.SqlDelightReactionRepository
 import phantom.core.storage.SqlDelightSenderKeyRepository
+import phantom.core.storage.SqlDelightVoiceChunkRepository
 import phantom.core.transport.KtorRelayTransport
 import phantom.core.transport.KtorTransportProbe
 import phantom.core.transport.PrivacyMode
@@ -116,6 +117,14 @@ class AppContainer(private val context: Context) {
     // relay's at-least-once delivery from MAC-failing the ratchet on
     // the second decrypt of a re-delivered envelope after a lost ack.
     val processedEnvelopeRepo = SqlDelightProcessedEnvelopeRepository(dbHolder.database)
+
+    // PR-D2b.1 (2026-05-17): durable partial-assembly buffer for chunked
+    // voice receive. Backs `DefaultMessagingService` so 1:1 voices that
+    // start arriving over REST short-poll (or any path) survive a process
+    // death between chunk save and final assembly. See VoiceChunk.sq for
+    // the schema and `assembleAndDispatch1to1Voice` for the helper that
+    // both the live chunk handler and the startReceiving finalizer call.
+    val voiceChunkRepo = SqlDelightVoiceChunkRepository(dbHolder.database)
 
     // Starts immediately — deletes expired messages while the app is alive.
     private val disappearingMessageScheduler = DisappearingMessageScheduler(messageRepo, appScope)
@@ -574,6 +583,12 @@ class AppContainer(private val context: Context) {
                 val mode = hybridTransport?.stateMachine?.state?.value
                 mode == null || mode == phantom.core.transport.RestMode.WsActive
             },
+            // PR-D2b.1 (2026-05-17): durable reassembly. Keeps the 1:1
+            // voice receive path crash-safe — chunks are saved to
+            // SQLDelight before ack-deliver and the startReceiving
+            // finalizer resumes any voice whose chunks all landed before
+            // the previous process death.
+            voiceChunkRepository = voiceChunkRepo,
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.

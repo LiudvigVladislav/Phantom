@@ -39,6 +39,7 @@ import phantom.core.storage.MessageStatus
 import phantom.core.storage.ProcessedEnvelopeRepository
 import phantom.core.storage.ReactionRepository
 import phantom.core.storage.TrustTier
+import phantom.core.storage.VoiceChunkRepository
 import phantom.core.transport.BundleFetchException
 import phantom.core.transport.PreKeyApi
 import phantom.core.transport.RelayMessage
@@ -103,6 +104,23 @@ class DefaultMessagingService(
      * this PR is a guard, not a delivery path.
      */
     private val canSendVoice: () -> Boolean = { true },
+    /**
+     * Durable receive-side reassembly buffer for chunked voice
+     * (PR-D2b.1, 2026-05-17). When present, the 1:1 voice receive
+     * path saves each incoming chunk to SQLDelight BEFORE sending
+     * ack-deliver, so a process death between chunk save and
+     * assembly does not lose the partial voice — the next
+     * `startReceiving` finalizer scans for `findVoicesReadyToAssemble`
+     * and finishes the work. Group voice (`payload.groupId != null`)
+     * intentionally stays on the in-memory path because the durable
+     * row schema does not carry `groupId` — group durability is queued
+     * for a later PR per the D2b architect review (2026-05-17).
+     *
+     * Nullable + default `null` to keep call-site compatibility for
+     * existing tests that construct DMS without storage. Production
+     * always wires the real SQLDelight repository through AppContainer.
+     */
+    private val voiceChunkRepository: VoiceChunkRepository? = null,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -149,12 +167,23 @@ class DefaultMessagingService(
 
     companion object {
         const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
-        // 8 KB raw → ~53 KB on the wire after JSON+ratchet+padding+base64 expansion (~6.5x bloat
-        // because EncryptedMessage's ByteArray fields serialize to JSON int-arrays). At 53 KB
-        // per envelope each chunk uploads in well under the 30 s Tecno HiOS reconnect window;
-        // a 64 KB chunk produced 427 KB envelopes that timed out mid-upload (ISSUE-013). Fixing
-        // the underlying serialization bloat is tracked as a separate task.
-        const val AUDIO_CHUNK_BYTES = 8 * 1024          // 8 KB per chunk before base64 expansion
+        // PR-D2b.1 (2026-05-17): shrunk from 8 KB → 3 KB so envelopes pass
+        // the REST short-poll body cap. Background: D1c+D1d turned REST
+        // into a first-class transport for text on Tele2 LTE; D2a closed
+        // voice on that path as a temporary guard after Test #53.1 showed
+        // a real envelope `bodyBytes=7608 > max=4096` on the migrate path
+        // for the old 8 KB chunk. D2b is doing voice over REST properly,
+        // so every chunk envelope must stay under `max_send_body_bytes`
+        // (server-side cap = 4096; client-side target ≈ 2.5–3 KB ciphertext
+        // for headroom). 3 KB raw input + Ratchet + JSON wrap + Base64 +
+        // padding empirically lands around 3.5–4 KB on the wire. If real
+        // device logs show `chunk_prepare` envelopeBytes > 4096 even at
+        // 3 KB, shrink further to 2 KB — the `VOICE_TX chunk_prepare`
+        // log line carries the exact `envelopeBytes` so this is empirical,
+        // not theoretical. Group voice (`DefaultGroupMessagingService`)
+        // references this same constant, so group voice gets the smaller
+        // chunks too — accepted side effect documented in the PR body.
+        const val AUDIO_CHUNK_BYTES = 3 * 1024          // 3 KB plaintext per chunk; tuned for REST fallback envelope cap
 
         // PR-G1 (2026-05-12): hard cap for the prekey-bundle HTTP fetch on
         // the send-bootstrap path. Without this, a slow / dead
@@ -169,6 +198,19 @@ class DefaultMessagingService(
         // WAITING_FOR_RECIPIENT_BUNDLE so retryWaitingMessages() can
         // re-try on the next reconnect.
         const val PREKEY_BUNDLE_FETCH_TIMEOUT_MS: Long = 8_000L
+
+        // PR-D2b.1 (2026-05-17): TTL for partial voice reassembly state in
+        // the durable `voice_chunks` table. 24 h is intentionally generous
+        // so a phone that loses connectivity overnight on Tele2 can still
+        // finish receiving the voice in the morning (the relay envelope
+        // TTL is 7 d; the bottleneck is the local partial buffer, not
+        // the network). The sweep runs (a) opportunistically on every
+        // inbound chunk so the table cannot grow unbounded, and (b) at
+        // `startReceiving` so a long-idle restart does not start by
+        // carrying state from before the previous Doze window. Each
+        // sweep emits a `VOICE_RX partial_expired` log line per voice
+        // dropped so the eviction is observable.
+        const val VOICE_CHUNK_TTL_MS: Long = 24L * 60L * 60L * 1_000L
     }
 
     // Buffer for reassembling incoming audio chunks. Key = chunkId.
@@ -518,11 +560,21 @@ class DefaultMessagingService(
     }
 
     /**
-     * Split [audioBytes] into 64 KB chunks (AUDIO_CHUNK_BYTES) and send each as a
-     * separate TYPE_AUDIO_CHUNK envelope so every individual envelope finishes
-     * uploading + getting acked within the ~30 s Tecno HiOS reconnect window (ISSUE-013).
-     * The sender's own DB row uses the full reassembled base64 so AudioBubble renders
-     * immediately without waiting for chunk acknowledgements.
+     * Split [audioBytes] into [AUDIO_CHUNK_BYTES]-sized plaintext chunks, encrypt
+     * each chunk independently as its own [MessagePayload.TYPE_AUDIO_CHUNK] envelope,
+     * and send each envelope via [transport.send]. The chunk size is tuned (PR-D2b.1)
+     * so every individual envelope stays under the REST short-poll body cap.
+     *
+     * Per-chunk failure handling: [transport.send] returns `false` when the
+     * relay rejected the envelope (offline / handshake mid-flight / over cap).
+     * We log `VOICE_TX chunk_send_fail` and throw out of the loop so
+     * `runCatching` catches the failure and the local message stays
+     * `MessageStatus.QUEUED` — the user sees the voice in the chat as
+     * "not yet delivered" instead of as "sent" while half the chunks
+     * silently never reached the relay.
+     *
+     * The sender's own DB row uses the full reassembled base64 so AudioBubble
+     * renders immediately without waiting for chunk acknowledgements.
      */
     @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
     override suspend fun sendAudio(
@@ -560,7 +612,7 @@ class DefaultMessagingService(
             ))
         val recipientPublicKeyHex = conv.theirPublicKeyHex
 
-        val chunkId = uuid4().toString()
+        val voiceId = uuid4().toString()
         val total = kotlin.math.ceil(audioBytes.size.toDouble() / AUDIO_CHUNK_BYTES).toInt()
             .coerceAtLeast(1)
 
@@ -583,6 +635,11 @@ class DefaultMessagingService(
             )
         )
 
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "VOICE_TX send_start voiceId=${voiceId.take(8)} totalChunks=$total rawBytes=${audioBytes.size} chunkSizeBytes=$AUDIO_CHUNK_BYTES",
+        )
+
         return runCatching {
             for (i in 0 until total) {
                 val start = i * AUDIO_CHUNK_BYTES
@@ -595,7 +652,7 @@ class DefaultMessagingService(
                         type = MessagePayload.TYPE_AUDIO_CHUNK,
                         sentAt = Clock.System.now().toEpochMilliseconds(),
                         senderUsername = identity.username,
-                        audioChunkId = chunkId,
+                        audioChunkId = voiceId,
                         audioChunkIndex = i,
                         audioChunkTotal = total,
                         audioChunkB64 = chunkBase64,
@@ -611,8 +668,14 @@ class DefaultMessagingService(
                 )
                 val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
                 val paddedCiphertext = MessagePadding.pad(ciphertext)
+                val envelopeId = uuid4().toString()
 
-                transport.send(
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_TX chunk_prepare voiceId=${voiceId.take(8)} idx=$i/$total rawBytes=${slice.size} envelopeBytes=${paddedCiphertext.size} envelopeId=${envelopeId.take(8)}",
+                )
+
+                val sent = transport.send(
                     RelayMessage.Send(
                         to = recipientPublicKeyHex,
                         from = "",
@@ -620,8 +683,23 @@ class DefaultMessagingService(
                             SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
                         ),
                         payload = paddedCiphertext.encodeBase64(),
-                        messageId = uuid4().toString(),
+                        messageId = envelopeId,
                     )
+                )
+
+                if (!sent) {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "VOICE_TX chunk_send_fail voiceId=${voiceId.take(8)} idx=$i/$total envelopeId=${envelopeId.take(8)}",
+                    )
+                    throw IllegalStateException(
+                        "sendAudio: transport.send rejected chunk $i/$total for voiceId=${voiceId.take(8)}"
+                    )
+                }
+
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_TX chunk_send_ok voiceId=${voiceId.take(8)} idx=$i/$total envelopeId=${envelopeId.take(8)}",
                 )
             }
 
@@ -632,6 +710,11 @@ class DefaultMessagingService(
                 )
             )
             messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
+
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "VOICE_TX send_complete voiceId=${voiceId.take(8)} totalChunks=$total",
+            )
         }
     }
 
@@ -642,6 +725,50 @@ class DefaultMessagingService(
             if (receiving) true else { receiving = true; false }
         }
         if (alreadyStarted) return
+
+        // PR-D2b.1 (2026-05-17): durable voice finalizer. Runs once per
+        // startReceiving, before the live chunk subscription, so any voice
+        // whose chunks all landed before the previous process death gets
+        // assembled + inserted on restart. Also sweeps anything older than
+        // VOICE_CHUNK_TTL_MS so a long-idle restart does not start with
+        // stale partial state. `messageRepository.insertMessage` is
+        // INSERT OR IGNORE (see Message.sq), so a finalizer run after a
+        // live insert that succeeded but failed to deleteByVoiceId is a
+        // silent no-op for the messages table and just cleans up the
+        // orphaned chunks. Group voice is intentionally skipped here
+        // because the durable row schema does not carry `groupId`.
+        voiceChunkRepository?.let { repo ->
+            val nowMs = Clock.System.now().toEpochMilliseconds()
+            val cutoffMs = nowMs - VOICE_CHUNK_TTL_MS
+            sweepExpiredVoiceChunks(repo, cutoffMs, nowMs)
+            val ready = repo.findVoicesReadyToAssemble()
+            if (ready.isNotEmpty()) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_RX finalizer_start voiceCount=${ready.size}",
+                )
+                ready.forEach { rv ->
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "VOICE_RX finalizer_resume voiceId=${rv.voiceId.take(8)} total=${rv.total}",
+                    )
+                    assembleAndDispatch1to1Voice(
+                        voiceId = rv.voiceId,
+                        conversationId = rv.conversationId,
+                        senderPubKeyHex = rv.senderPubKeyHex,
+                        senderUsername = "",
+                        mimeType = rv.mimeType,
+                        durationMs = rv.durationMs,
+                        nowMs = nowMs,
+                        origin = "finalizer",
+                    )
+                }
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_RX finalizer_done voiceCount=${ready.size}",
+                )
+            }
+        }
 
         transport.incoming
             .onEach { deliver -> handleDeliver(deliver) }
@@ -656,6 +783,201 @@ class DefaultMessagingService(
                 messageRepository.updateStatus(ack.messageId, newStatus)
             }
             .launchIn(scope)
+    }
+
+    /**
+     * Drops every chunk row older than [cutoffMs] (PR-D2b.1).
+     *
+     * Logs one `VOICE_RX partial_expired` line per voice that will be
+     * swept BEFORE the bulk delete so a log reader can see which voice,
+     * with what chunk count, was dropped and how old it was. Safe to
+     * call on a hot path — when nothing is stale the function returns
+     * after a single empty `findExpiredSummaries` SELECT.
+     */
+    private suspend fun sweepExpiredVoiceChunks(
+        repo: VoiceChunkRepository,
+        cutoffMs: Long,
+        nowMs: Long,
+    ) {
+        val expired = repo.findExpiredSummaries(cutoffMs)
+        if (expired.isEmpty()) return
+        expired.forEach { s ->
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "VOICE_RX partial_expired voiceId=${s.voiceId.take(8)} received=${s.receivedChunks}/${s.total} ageMs=${nowMs - s.oldestUpdatedMs}",
+            )
+        }
+        repo.deleteOlderThan(cutoffMs)
+    }
+
+    /**
+     * Concat every saved chunk for [voiceId] (in idx order), insert one
+     * `[AUDIO:<base64>]` message into the message store, upsert the
+     * conversation, emit `_incomingMessages`, fire the new-message
+     * notification, and finally delete the chunks (PR-D2b.1).
+     *
+     * Called from two places:
+     *
+     * - Live chunk handler when `countChunks(voiceId) == total` for the
+     *   just-saved chunk. `origin = "live"`.
+     * - `startReceiving` finalizer for voices whose chunk count was
+     *   already complete before the previous process died.
+     *   `origin = "finalizer"`.
+     *
+     * Crash-safety contract:
+     *
+     * - `messageRepository.insertMessage` is `INSERT OR IGNORE` on `id`,
+     *   so a finalizer run after a previous successful insert is a
+     *   silent no-op for the message store. We still proceed to delete
+     *   chunks at the end so the partial buffer doesn't grow forever.
+     * - If `insertMessage` itself throws, chunks are NOT deleted. The
+     *   finalizer will retry on next `startReceiving`.
+     * - `messages.id` deliberately uses [voiceId] rather than the
+     *   triggering `deliver.messageId` so the live and finalizer paths
+     *   converge on the same primary key — INSERT OR IGNORE turns the
+     *   rare double-call into a safe no-op rather than a duplicate row.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    private suspend fun assembleAndDispatch1to1Voice(
+        voiceId: String,
+        conversationId: String,
+        senderPubKeyHex: String,
+        senderUsername: String,
+        mimeType: String,
+        durationMs: Long,
+        nowMs: Long,
+        origin: String,
+    ) {
+        val repo = voiceChunkRepository ?: return
+
+        // PR-D2b.1 review round 2 (2026-05-17): pre-check for an already
+        // inserted voice message keyed on this `voiceId`. INSERT OR IGNORE
+        // makes the actual SQL insert a silent no-op when the row exists,
+        // but every downstream side effect (conversation unread bump,
+        // `_incomingMessages.emit`, `onNewMessageNotification`) would
+        // still fire — so a crash between live insert and `deleteByVoiceId`
+        // would let the finalizer double-emit + double-notify + double-
+        // unread the same voice. The check happens BEFORE reading and
+        // concatenating chunk bytes so the wasted blob allocation is
+        // skipped on the recovery path too.
+        val existingRow = runCatching { messageRepository.getMessageById(voiceId) }.getOrNull()
+        if (existingRow != null) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "VOICE_RX already_inserted_cleanup voiceId=${voiceId.take(8)} source=$origin",
+            )
+            repo.deleteByVoiceId(voiceId)
+            return
+        }
+
+        val ordered = repo.findOrderedChunks(voiceId)
+        if (ordered.isEmpty()) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "VOICE_RX assembly_no_chunks voiceId=${voiceId.take(8)} source=$origin",
+            )
+            return
+        }
+        val assembledSize = ordered.sumOf { it.size }
+        val assembled = ByteArray(assembledSize)
+        var offset = 0
+        for (chunk in ordered) {
+            chunk.copyInto(assembled, destinationOffset = offset)
+            offset += chunk.size
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "VOICE_RX assembly_complete voiceId=${voiceId.take(8)} assembledBytes=${assembled.size} source=$origin",
+        )
+
+        val assembledB64 = Base64.encode(assembled)
+        val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
+        val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
+
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "VOICE_RX message_insert_start voiceId=${voiceId.take(8)} bytes=${assembled.size} source=$origin",
+        )
+        val inserted = runCatching {
+            messageRepository.insertMessage(
+                MessageEntity(
+                    id = voiceId,
+                    conversationId = conversationId,
+                    ciphertext = ByteArray(0),
+                    plaintextCache = "[AUDIO:$assembledB64]",
+                    sent = false,
+                    status = MessageStatus.DELIVERED,
+                    createdAt = nowMs,
+                    expiresAtMs = expiresAtMs,
+                )
+            )
+        }.fold(
+            onSuccess = {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_RX message_insert_ok voiceId=${voiceId.take(8)} source=$origin",
+                )
+                true
+            },
+            onFailure = { ex ->
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "VOICE_RX message_insert_fail voiceId=${voiceId.take(8)} error=${ex::class.simpleName} message=${ex.message?.take(120) ?: ""} chunks_preserved=true source=$origin",
+                )
+                false
+            },
+        )
+        if (!inserted) {
+            // Chunks intentionally NOT deleted — finalizer retries on
+            // next startReceiving.
+            return
+        }
+
+        val existing = conversationRepository.getConversation(conversationId)
+        val senderName = senderUsername.ifBlank { senderPubKeyHex.take(8) }
+        if (existing == null) {
+            conversationRepository.upsertConversation(
+                ConversationEntity(
+                    id = conversationId,
+                    theirUsername = senderName,
+                    theirPublicKeyHex = senderPubKeyHex,
+                    lastMessagePreview = "🎤 Voice message",
+                    lastMessageAt = nowMs,
+                    unreadCount = 1,
+                    trustTier = TrustTier.REQUEST,
+                    blocked = false,
+                )
+            )
+        } else {
+            conversationRepository.upsertConversation(
+                existing.copy(
+                    lastMessagePreview = "🎤 Voice message",
+                    lastMessageAt = nowMs,
+                    unreadCount = existing.unreadCount + 1,
+                )
+            )
+        }
+
+        _incomingMessages.emit(
+            IncomingMessage(
+                id = voiceId,
+                conversationId = conversationId,
+                senderPublicKeyHex = senderPubKeyHex,
+                text = "[AUDIO:$assembledB64]",
+                receivedAt = nowMs,
+            )
+        )
+
+        runCatching {
+            onNewMessageNotification?.invoke(conversationId, senderName, "🎤 Voice message", senderPubKeyHex)
+        }
+
+        // Successful end-to-end durable receive: free the partial state.
+        repo.deleteByVoiceId(voiceId)
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "VOICE_RX handler_complete voiceId=${voiceId.take(8)} result=assembled source=$origin",
+        )
     }
 
     private suspend fun handleDeliver(deliver: RelayMessage.Deliver) {
@@ -1010,7 +1332,103 @@ class DefaultMessagingService(
                     },
                 )
 
+                // PR-D2b.1 review round 2 (2026-05-17): validate
+                // `chunkIndex` is inside `[0, chunkTotal)` before saving.
+                // A malformed payload (`audioChunkIndex >= audioChunkTotal`
+                // or `audioChunkTotal <= 0`) would otherwise be stored
+                // either as an out-of-range row that never participates
+                // in `findOrderedChunks` correctly, or as an extra slot
+                // that pushes `countChunks` past `total` without filling
+                // every index 0..N-1. Both states leave reassembly broken
+                // in subtle ways; the cheap fix is to reject the chunk
+                // up front and let the relay drop it (ack-deliver).
+                if (chunkTotal <= 0 || chunkIndex !in 0 until chunkTotal) {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "VOICE_RX chunk_invalid_range voiceId=${chunkId.take(8)} idx=$chunkIndex total=$chunkTotal envelopeId=${deliver.messageId.take(8)}",
+                    )
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@runCatching
+                }
+
                 val nowMs = Clock.System.now().toEpochMilliseconds()
+                val groupId = payload.groupId
+                val isGroupAudio = groupId != null
+                val useDurable = !isGroupAudio && voiceChunkRepository != null
+
+                if (useDurable) {
+                    // === DURABLE PATH (PR-D2b.1) — 1:1 voice over REST/WS ===
+                    //
+                    // Save chunk → ACK → check count → assemble + insert + delete.
+                    // The save happens BEFORE ack-deliver so a relay redelivery
+                    // after a lost ack runs `INSERT OR REPLACE` over identical
+                    // bytes (no-op) and the count is unchanged. A process death
+                    // anywhere between save and assembly is recovered by the
+                    // `startReceiving` finalizer.
+                    val repo = voiceChunkRepository!!
+                    val cutoffMs = nowMs - VOICE_CHUNK_TTL_MS
+                    sweepExpiredVoiceChunks(repo, cutoffMs, nowMs)
+
+                    repo.insertChunk(
+                        voiceId = chunkId,
+                        idx = chunkIndex,
+                        total = chunkTotal,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        mimeType = payload.audioMimeType ?: "audio/m4a",
+                        durationMs = payload.audioDurationMs ?: 0L,
+                        chunkBytes = chunkBytes,
+                        nowMs = nowMs,
+                    )
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "VOICE_RX chunk_saved voiceId=${chunkId.take(8)} idx=$chunkIndex total=$chunkTotal source=durable",
+                    )
+
+                    transport.sendDeliveryAck(deliver.messageId)
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "VOICE_RX ack_send_after_handler envelopeId=${deliver.messageId.take(8)} voiceId=${chunkId.take(8)} idx=$chunkIndex total=$chunkTotal source=durable",
+                    )
+
+                    val received = repo.countChunks(chunkId)
+                    if (received == chunkTotal) {
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX assembly_started voiceId=${chunkId.take(8)} received=$received total=$chunkTotal source=live",
+                        )
+                        assembleAndDispatch1to1Voice(
+                            voiceId = chunkId,
+                            conversationId = conversationId,
+                            senderPubKeyHex = senderPubKeyHex,
+                            senderUsername = payload.senderUsername,
+                            mimeType = payload.audioMimeType ?: "audio/m4a",
+                            durationMs = payload.audioDurationMs ?: 0L,
+                            nowMs = nowMs,
+                            origin = "live",
+                        )
+                    } else {
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX assembly_waiting voiceId=${chunkId.take(8)} received=$received total=$chunkTotal source=durable",
+                        )
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX handler_complete voiceId=${chunkId.take(8)} result=waiting source=durable",
+                        )
+                    }
+                    return@runCatching
+                }
+
+                // === LEGACY IN-MEMORY PATH ===
+                //
+                // Reached for: group audio (groupId != null — durable schema
+                // does not carry groupId so we keep group reassembly in the
+                // process-local buffer until a follow-up PR adds groupId to
+                // voice_chunks); and tests / Alpha 1 call sites that
+                // construct DMS without a `voiceChunkRepository` injection.
+                // The buffer's 5-minute TTL is intentionally short for the
+                // in-memory case because there is no crash safety anyway.
                 val staleCutoff = nowMs - 5 * 60 * 1_000L
 
                 val complete: ByteArray? = reassemblyMutex.withLock {
@@ -1024,7 +1442,7 @@ class DefaultMessagingService(
 
                     messagingLog(
                         MessagingLogLevel.INFO,
-                        "VOICE_RX buffer_before chunkId=${chunkId.take(8)} bufferCountBefore=${audioReassemblyBuffer.size} staleSwept=${staleIds.size}",
+                        "VOICE_RX buffer_before chunkId=${chunkId.take(8)} bufferCountBefore=${audioReassemblyBuffer.size} staleSwept=${staleIds.size} source=memory",
                     )
                     val buf = audioReassemblyBuffer.getOrPut(chunkId) { ChunkBuffer() }
                     buf.chunks[chunkIndex] = chunkBytes
@@ -1032,27 +1450,27 @@ class DefaultMessagingService(
 
                     messagingLog(
                         MessagingLogLevel.INFO,
-                        "VOICE_RX buffer_added chunkId=${chunkId.take(8)} index=$chunkIndex received=${buf.chunks.size} total=$chunkTotal",
+                        "VOICE_RX buffer_added chunkId=${chunkId.take(8)} index=$chunkIndex received=${buf.chunks.size} total=$chunkTotal source=memory",
                     )
 
                     if (buf.chunks.size == chunkTotal) {
                         messagingLog(
                             MessagingLogLevel.INFO,
-                            "VOICE_RX assembly_started chunkId=${chunkId.take(8)} received=${buf.chunks.size} total=$chunkTotal",
+                            "VOICE_RX assembly_started chunkId=${chunkId.take(8)} received=${buf.chunks.size} total=$chunkTotal source=memory",
                         )
                         val assembled = (0 until chunkTotal)
                             .flatMap { idx -> buf.chunks[idx]!!.toList() }
                             .toByteArray()
                         messagingLog(
                             MessagingLogLevel.INFO,
-                            "VOICE_RX assembly_complete chunkId=${chunkId.take(8)} assembledBytes=${assembled.size}",
+                            "VOICE_RX assembly_complete chunkId=${chunkId.take(8)} assembledBytes=${assembled.size} source=memory",
                         )
                         audioReassemblyBuffer.remove(chunkId)
                         assembled
                     } else {
                         messagingLog(
                             MessagingLogLevel.INFO,
-                            "VOICE_RX assembly_waiting chunkId=${chunkId.take(8)} received=${buf.chunks.size} total=$chunkTotal",
+                            "VOICE_RX assembly_waiting chunkId=${chunkId.take(8)} received=${buf.chunks.size} total=$chunkTotal source=memory",
                         )
                         null
                     }
@@ -1060,7 +1478,7 @@ class DefaultMessagingService(
 
                 messagingLog(
                     MessagingLogLevel.INFO,
-                    "VOICE_RX ack_send_after_handler envelopeId=${deliver.messageId.take(8)} chunkId=${chunkId.take(8)} index=$chunkIndex total=$chunkTotal assembled=${complete != null}",
+                    "VOICE_RX ack_send_after_handler envelopeId=${deliver.messageId.take(8)} chunkId=${chunkId.take(8)} index=$chunkIndex total=$chunkTotal assembled=${complete != null} source=memory",
                 )
                 transport.sendDeliveryAck(deliver.messageId)
 

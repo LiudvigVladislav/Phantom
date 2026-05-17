@@ -298,6 +298,21 @@ private class FakeRelayTransport : RelayTransport {
     val sent = mutableListOf<RelayMessage.Send>()
     /** PR-H2b: records every ack-deliver so idempotency tests can assert duplicate-ack semantics. */
     val ackedDelivers = mutableListOf<String>()
+    /**
+     * PR-D2b.1: gate to simulate `transport.send` rejecting an envelope
+     * (offline / handshake mid-flight / over cap). Default `true` keeps
+     * every existing test happy-path. Voice send-fail tests flip this to
+     * `false` (optionally after the first K successful sends) to assert
+     * the sender's per-chunk failure handling.
+     */
+    var sendShouldSucceed: Boolean = true
+    /**
+     * PR-D2b.1: when > 0 the first N `send()` calls return `true`, then
+     * subsequent calls honour [sendShouldSucceed]. Lets a test fire two
+     * chunks successfully then reject the third without flipping the
+     * gate manually in between coroutine resumes.
+     */
+    var sendSuccessLimit: Int = Int.MAX_VALUE
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
@@ -306,7 +321,11 @@ private class FakeRelayTransport : RelayTransport {
         socksProxyPort: Int?,
     ) {}
     override suspend fun disconnect() {}
-    override suspend fun send(message: RelayMessage.Send): Boolean { sent += message; return true }
+    override suspend fun send(message: RelayMessage.Send): Boolean {
+        sent += message
+        if (sent.size <= sendSuccessLimit) return true
+        return sendShouldSucceed
+    }
     override suspend fun sendDeliveryAck(messageId: String): Boolean {
         ackedDelivers += messageId
         return true
@@ -417,6 +436,11 @@ class DefaultMessagingServiceTest {
         // body returns; tests that only call sendMessage() can use the
         // default testScope without leaking jobs.
         scope: kotlinx.coroutines.CoroutineScope = testScope,
+        // PR-D2b.1: optional durable voice-chunks repo. When non-null,
+        // the 1:1 voice receive path uses durable assembly + startReceiving
+        // finalizer. When null, the legacy in-memory path is used (same
+        // behaviour every voice test before D2b.1 saw).
+        voiceChunkRepo: phantom.core.storage.VoiceChunkRepository? = null,
     ): DefaultMessagingService {
         // sendMessage paths reach SealedSender.seal which uses libsodium.
         // On JVM the lib is loaded via JNA; calling Box.keypair() before
@@ -471,6 +495,7 @@ class DefaultMessagingServiceTest {
             // assert if called rather than returning anything plausible.
             preKeyApi = ThrowingPreKeyApi,
             signingKeyProvider = { ThrowingSigningKey },
+            voiceChunkRepository = voiceChunkRepo,
         )
     }
 
@@ -1383,6 +1408,296 @@ class DefaultMessagingServiceTest {
         testScheduler.runCurrent()
         assertEquals(false, processedRepo.exists("fresh-envelope-id"))
     }
+
+    // ── PR-D2b.1: sender per-chunk send-result check ─────────────────────
+    //
+    // The pre-D2b.1 sendAudio ignored `transport.send(...)` return value, so
+    // the local message could be flipped to SENT even though half the
+    // chunks were rejected on the wire. D2b.1 checks the boolean per chunk
+    // and throws out of the runCatching loop on `false`.
+
+    @Test
+    fun sendAudio_returnsFailureAndKeepsMessageQueued_whenChunkSendRejected() = runTest {
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        // First send succeeds, every subsequent send returns false to model
+        // a transport that lost the WS or hit the REST body cap between
+        // chunks. With AUDIO_CHUNK_BYTES + 1 raw bytes the total is 2,
+        // so chunk 0 sends OK and chunk 1 is rejected.
+        transport.sendSuccessLimit = 1
+        transport.sendShouldSucceed = false
+
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["conv-1"] = ConversationEntity(
+            id = "conv-1",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = "",
+            lastMessageAt = 0L,
+            unreadCount = 0,
+            trustTier = phantom.core.storage.TrustTier.TRUSTED,
+            blocked = false,
+        )
+        val service = buildService(
+            testScope = this,
+            transport = transport,
+            msgRepo = msgRepo,
+            convRepo = convRepo,
+        )
+
+        val audio = ByteArray(DefaultMessagingService.AUDIO_CHUNK_BYTES + 1)
+        val result = service.sendAudio(
+            conversationId = "conv-1",
+            audioBytes = audio,
+            durationMs = 1_000L,
+            mimeType = "audio/m4a",
+        )
+
+        assertEquals(true, result.isFailure,
+            "sendAudio must surface failure when transport.send rejects a chunk")
+        // The local DB row was inserted before the loop, so it MUST stay
+        // visible to the UI — but at status QUEUED, never flipped to SENT,
+        // so the user sees "not yet delivered" instead of "sent" while
+        // half the chunks silently never reached the relay.
+        val audioRow = msgRepo.messages.single { it.plaintextCache?.startsWith("[AUDIO:") == true }
+        assertEquals(MessageStatus.QUEUED, audioRow.status)
+        // No success-side updateStatus(localMsgId, SENT) ever fired.
+        assertEquals(null, msgRepo.statusUpdates[audioRow.id])
+        // Exactly two `transport.send` calls — chunk 0 succeeded, chunk 1
+        // was rejected and threw out of the loop before chunk 2 would have
+        // been tried (there is no chunk 2 here — total = 2 — but the
+        // assertion documents the "abort on first false" contract).
+        assertEquals(2, transport.sent.size)
+    }
+
+    // ── PR-D2b.1: receiver finalizer ──────────────────────────────────
+    //
+    // After process death between chunk save and assembly + insertMessage,
+    // chunks still live in voice_chunks. On next startReceiving the
+    // finalizer scans `findVoicesReadyToAssemble` and resumes any voice
+    // whose count has reached `total`.
+
+    @Test
+    fun startReceiving_finalizer_assemblesReadyVoice_andDeletesChunks() = runTest {
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        // Seed an existing conversation so the upsert path takes the
+        // "bump unread + lastMessagePreview" branch, not the REQUEST
+        // bootstrap branch (irrelevant for this assertion).
+        convRepo.store["conv-finalize"] = ConversationEntity(
+            id = "conv-finalize",
+            theirUsername = "peer",
+            theirPublicKeyHex = "deadbeef",
+            lastMessagePreview = "",
+            lastMessageAt = 0L,
+            unreadCount = 0,
+            trustTier = phantom.core.storage.TrustTier.TRUSTED,
+            blocked = false,
+        )
+        val voiceRepo = FakeVoiceChunkLedger()
+        // Pre-populate a complete voice (2/2 chunks).
+        val nowMs = System.currentTimeMillis()
+        voiceRepo.insertChunk(
+            voiceId = "v-ready",
+            idx = 0,
+            total = 2,
+            conversationId = "conv-finalize",
+            senderPubKeyHex = "deadbeef",
+            mimeType = "audio/m4a",
+            durationMs = 5_000L,
+            chunkBytes = byteArrayOf(0x10, 0x20),
+            nowMs = nowMs,
+        )
+        voiceRepo.insertChunk(
+            voiceId = "v-ready",
+            idx = 1,
+            total = 2,
+            conversationId = "conv-finalize",
+            senderPubKeyHex = "deadbeef",
+            mimeType = "audio/m4a",
+            durationMs = 5_000L,
+            chunkBytes = byteArrayOf(0x30, 0x40),
+            nowMs = nowMs,
+        )
+
+        val service = buildService(
+            testScope = this,
+            msgRepo = msgRepo,
+            convRepo = convRepo,
+            voiceChunkRepo = voiceRepo,
+            scope = backgroundScope,
+        )
+
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // The finalizer assembled the voice and inserted ONE [AUDIO:...]
+        // row into the message store, keyed on voiceId.
+        val audioRow = msgRepo.messages.singleOrNull { it.id == "v-ready" }
+            ?: error("finalizer must have inserted exactly one row for voiceId=v-ready")
+        assertEquals("conv-finalize", audioRow.conversationId)
+        val pc = audioRow.plaintextCache ?: error("audio row must have plaintextCache")
+        assertEquals(true, pc.startsWith("[AUDIO:"))
+        // Bytes were concatenated in idx order: 0x10 0x20 0x30 0x40.
+        val assembledB64 = pc.removePrefix("[AUDIO:").removeSuffix("]")
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val assembled = kotlin.io.encoding.Base64.decode(assembledB64)
+        assertEquals(listOf(0x10.toByte(), 0x20.toByte(), 0x30.toByte(), 0x40.toByte()),
+            assembled.toList())
+        // And the partial-state was freed.
+        assertEquals(0, voiceRepo.countChunks("v-ready"))
+    }
+
+    @Test
+    fun startReceiving_finalizer_skipsAlreadyInsertedVoice_andCleansUpChunks() = runTest {
+        // PR-D2b.1 review round 2 regression test.
+        //
+        // Crash window: live receive path inserted the assembled message
+        // into the message store but the process died before
+        // `deleteByVoiceId` ran. On restart the finalizer sees a complete
+        // partial buffer and would, pre-fix, re-emit `_incomingMessages`,
+        // re-bump unread, and fire a second notification — even though
+        // `messageRepository.insertMessage` is INSERT OR IGNORE and the
+        // actual row write was a silent no-op. Post-fix: pre-check
+        // `getMessageById(voiceId)` and short-circuit straight to
+        // `deleteByVoiceId` with no UX side effects.
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["conv-restart"] = ConversationEntity(
+            id = "conv-restart",
+            theirUsername = "peer",
+            theirPublicKeyHex = "deadbeef",
+            lastMessagePreview = "🎤 Voice message",
+            lastMessageAt = 0L,
+            unreadCount = 1,  // already bumped by live path before crash
+            trustTier = phantom.core.storage.TrustTier.TRUSTED,
+            blocked = false,
+        )
+        // Voice message already exists in DB (live path inserted it
+        // before crash). Use the same `voiceId` we'll seed the chunks
+        // with — finalizer uses id = voiceId.
+        msgRepo.messages += MessageEntity(
+            id = "v-already-inserted",
+            conversationId = "conv-restart",
+            ciphertext = ByteArray(0),
+            plaintextCache = "[AUDIO:cHJlLWluc2VydGVk]",  // arbitrary, the row's existence is what matters
+            sent = false,
+            status = MessageStatus.DELIVERED,
+            createdAt = 100L,
+            expiresAtMs = null,
+        )
+        val voiceRepo = FakeVoiceChunkLedger()
+        // Complete chunks survived the crash.
+        val now = System.currentTimeMillis()
+        voiceRepo.insertChunk(
+            voiceId = "v-already-inserted", idx = 0, total = 2,
+            conversationId = "conv-restart", senderPubKeyHex = "deadbeef",
+            mimeType = "audio/m4a", durationMs = 5_000L,
+            chunkBytes = byteArrayOf(1), nowMs = now,
+        )
+        voiceRepo.insertChunk(
+            voiceId = "v-already-inserted", idx = 1, total = 2,
+            conversationId = "conv-restart", senderPubKeyHex = "deadbeef",
+            mimeType = "audio/m4a", durationMs = 5_000L,
+            chunkBytes = byteArrayOf(2), nowMs = now,
+        )
+
+        val service = buildService(
+            testScope = this,
+            msgRepo = msgRepo,
+            convRepo = convRepo,
+            voiceChunkRepo = voiceRepo,
+            scope = backgroundScope,
+        )
+
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Exactly one message row exists (the pre-seeded one). Finalizer
+        // did NOT add a duplicate, did NOT overwrite the plaintextCache.
+        val rows = msgRepo.messages.filter { it.id == "v-already-inserted" }
+        assertEquals(1, rows.size)
+        assertEquals("[AUDIO:cHJlLWluc2VydGVk]", rows.single().plaintextCache)
+        // Conversation unread stayed at the pre-crash value — finalizer
+        // did NOT double-bump.
+        assertEquals(1, convRepo.store.getValue("conv-restart").unreadCount)
+        // Partial state freed despite the no-op insert path.
+        assertEquals(0, voiceRepo.countChunks("v-already-inserted"))
+    }
+
+    @Test
+    fun startReceiving_finalizer_leavesIncompleteVoiceUntouched() = runTest {
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val voiceRepo = FakeVoiceChunkLedger()
+        // Only 1 of 3 chunks — finalizer must NOT assemble.
+        voiceRepo.insertChunk(
+            voiceId = "v-partial",
+            idx = 0,
+            total = 3,
+            conversationId = "conv-A",
+            senderPubKeyHex = "abc",
+            mimeType = "audio/m4a",
+            durationMs = 5_000L,
+            chunkBytes = byteArrayOf(0x99.toByte()),
+            nowMs = System.currentTimeMillis(),
+        )
+
+        val service = buildService(
+            testScope = this,
+            msgRepo = msgRepo,
+            voiceChunkRepo = voiceRepo,
+            scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // No message row was created for the partial voice.
+        assertEquals(0, msgRepo.messages.count { it.plaintextCache?.startsWith("[AUDIO:") == true })
+        // Chunk is still there — finalizer left it for a future arrival
+        // of the remaining 2 chunks (or for the 24 h TTL sweep).
+        assertEquals(1, voiceRepo.countChunks("v-partial"))
+    }
+
+    @Test
+    fun startReceiving_finalizer_evictsChunksOlderThanTtl() = runTest {
+        LibsodiumInitializer.initialize()
+        val voiceRepo = FakeVoiceChunkLedger()
+        // Two chunks both older than VOICE_CHUNK_TTL_MS (24 h). The
+        // sweep runs inside startReceiving before findVoicesReadyToAssemble,
+        // so even though COUNT == total the sweep wins first.
+        val veryOldMs = System.currentTimeMillis() -
+            (DefaultMessagingService.VOICE_CHUNK_TTL_MS + 60_000L)
+        voiceRepo.insertChunk(
+            voiceId = "v-stale", idx = 0, total = 2,
+            conversationId = "conv-A", senderPubKeyHex = "abc",
+            mimeType = "audio/m4a", durationMs = 1_000L,
+            chunkBytes = byteArrayOf(0xAA.toByte()), nowMs = veryOldMs,
+        )
+        voiceRepo.insertChunk(
+            voiceId = "v-stale", idx = 1, total = 2,
+            conversationId = "conv-A", senderPubKeyHex = "abc",
+            mimeType = "audio/m4a", durationMs = 1_000L,
+            chunkBytes = byteArrayOf(0xBB.toByte()), nowMs = veryOldMs,
+        )
+
+        val msgRepo = FakeMessageRepository()
+        val service = buildService(
+            testScope = this,
+            msgRepo = msgRepo,
+            voiceChunkRepo = voiceRepo,
+            scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Expired chunks dropped, no message inserted from stale data.
+        assertEquals(0, voiceRepo.countChunks("v-stale"))
+        assertEquals(0, msgRepo.messages.count { it.plaintextCache?.startsWith("[AUDIO:") == true })
+    }
 }
 
 /**
@@ -1518,3 +1833,110 @@ private val ThrowingSigningKey: phantom.core.identity.IdentitySigningKeyPair =
         publicKey = phantom.core.identity.SigningPublicKey(ByteArray(32)),
         privateKey = phantom.core.identity.SigningPrivateKey(ByteArray(64)),
     )
+
+/**
+ * In-memory copy of `VoiceChunkRepository` for PR-D2b.1 tests. Separate
+ * from the same-named fake in the storage module's commonTest because
+ * cross-module test-fixtures sharing isn't set up in this repo (same
+ * rationale as `FakeProcessedEnvelopeLedger` above). Mirrors
+ * `SqlDelightVoiceChunkRepository` semantics:
+ *
+ * - PRIMARY KEY (voice_id, idx) via Map<Pair<String, Int>, Row>
+ * - INSERT OR REPLACE on insertChunk
+ * - TTL sweep by `updated_at_ms` cutoff
+ * - findVoicesReadyToAssemble groups by voice_id and filters
+ *   COUNT(idx) == total
+ */
+private class FakeVoiceChunkLedger : phantom.core.storage.VoiceChunkRepository {
+    private data class Row(
+        val voiceId: String,
+        val idx: Int,
+        val total: Int,
+        val conversationId: String,
+        val senderPubKeyHex: String,
+        val mimeType: String,
+        val durationMs: Long,
+        val chunkBytes: ByteArray,
+        val updatedAtMs: Long,
+    )
+
+    private val store = mutableMapOf<Pair<String, Int>, Row>()
+
+    override suspend fun insertChunk(
+        voiceId: String,
+        idx: Int,
+        total: Int,
+        conversationId: String,
+        senderPubKeyHex: String,
+        mimeType: String,
+        durationMs: Long,
+        chunkBytes: ByteArray,
+        nowMs: Long,
+    ) {
+        store[voiceId to idx] = Row(
+            voiceId, idx, total, conversationId, senderPubKeyHex,
+            mimeType, durationMs, chunkBytes, nowMs,
+        )
+    }
+
+    override suspend fun countChunks(voiceId: String): Int =
+        store.values.count { it.voiceId == voiceId }
+
+    override suspend fun findOrderedChunks(voiceId: String): List<ByteArray> =
+        store.values.filter { it.voiceId == voiceId }
+            .sortedBy { it.idx }
+            .map { it.chunkBytes }
+
+    override suspend fun findVoicesReadyToAssemble(): List<phantom.core.storage.VoiceChunkRepository.ReadyVoice> {
+        val byVoice = store.values.groupBy { it.voiceId }
+        return byVoice.mapNotNull { (vid, rows) ->
+            val total = rows.first().total
+            if (rows.size != total) return@mapNotNull null
+            val head = rows.first()
+            phantom.core.storage.VoiceChunkRepository.ReadyVoice(
+                voiceId = vid,
+                total = total,
+                conversationId = head.conversationId,
+                senderPubKeyHex = head.senderPubKeyHex,
+                mimeType = head.mimeType,
+                durationMs = head.durationMs,
+            )
+        }
+    }
+
+    override suspend fun findExpiredSummaries(
+        cutoffMs: Long,
+    ): List<phantom.core.storage.VoiceChunkRepository.ExpiredSummary> {
+        val byVoice = store.values.groupBy { it.voiceId }
+        return byVoice.mapNotNull { (vid, rows) ->
+            val oldest = rows.minOf { it.updatedAtMs }
+            if (oldest >= cutoffMs) return@mapNotNull null
+            phantom.core.storage.VoiceChunkRepository.ExpiredSummary(
+                voiceId = vid,
+                total = rows.first().total,
+                receivedChunks = rows.size,
+                oldestUpdatedMs = oldest,
+            )
+        }
+    }
+
+    override suspend fun deleteOlderThan(cutoffMs: Long) {
+        // PR-D2b.1 review round 2: mirror `VoiceChunk.sq deleteOlderThan` —
+        // drop every chunk for any voice whose oldest chunk is older than
+        // the cutoff, not just the individual old rows. Anything else
+        // leaves voices in a permanently-unassemblable mixed-age state.
+        val expiredVoiceIds = store.values
+            .groupBy { it.voiceId }
+            .filterValues { rows -> rows.minOf { it.updatedAtMs } < cutoffMs }
+            .keys
+        store.entries.removeAll { it.value.voiceId in expiredVoiceIds }
+    }
+
+    override suspend fun deleteByVoiceId(voiceId: String) {
+        store.entries.removeAll { it.value.voiceId == voiceId }
+    }
+
+    override suspend fun deleteAll() {
+        store.clear()
+    }
+}

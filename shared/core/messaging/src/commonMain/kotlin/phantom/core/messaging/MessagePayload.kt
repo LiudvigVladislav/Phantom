@@ -35,8 +35,13 @@ data class MessagePayload(
     val audioDurationMs: Long? = null,
 
     // ── Chunked audio (TYPE_AUDIO_CHUNK) ──────────────────────────────────────
-    // Voice notes are split into 64 KB slices so each envelope finishes
-    // uploading within the ~30 s Tecno HiOS reconnect window (ISSUE-013).
+    // Voice notes are split into small plaintext slices (PR-D2b.1, 2026-05-17:
+    // currently `DefaultMessagingService.AUDIO_CHUNK_BYTES = 3 KB`) so every
+    // encrypted envelope stays under the REST short-poll body cap of 4096 b
+    // and never needs to fall back to oversized-on-WS-only behaviour.
+    // Each slice is encrypted independently as its own envelope, ACKed by
+    // the receiver after durable save into `voice_chunks`, and reassembled
+    // by `audioChunkId` once all `audioChunkTotal` slices arrive.
     val audioChunkId: String? = null,       // UUID grouping all chunks of one voice note
     val audioChunkIndex: Int? = null,       // 0-based position of this slice
     val audioChunkTotal: Int? = null,       // total number of slices for this note
