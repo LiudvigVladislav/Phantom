@@ -1,0 +1,30 @@
+-- VoiceV2Download.sq — queries for the voice_v2_downloads durable task table (PR-M1w).
+--
+-- Table created in migration 17.sqm. One row per received voice_v2 manifest;
+-- the row survives process death so the download orchestrator can resume on
+-- the next startReceiving call. Completed tasks are deleted immediately;
+-- failed tasks are kept for UI surfacing.
+
+insert:
+INSERT OR IGNORE INTO voice_v2_downloads(
+    media_id, conversation_id, sender_pubkey_hex, manifest_json,
+    status, chunk_count, last_attempt_at_ms, failure_reason, created_at_ms
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+find:
+SELECT * FROM voice_v2_downloads WHERE media_id = ?;
+
+findPending:
+SELECT * FROM voice_v2_downloads WHERE status = 'pending' ORDER BY created_at_ms ASC;
+
+update:
+UPDATE voice_v2_downloads
+SET status = ?, failure_reason = ?, last_attempt_at_ms = ?
+WHERE media_id = ?;
+
+delete:
+DELETE FROM voice_v2_downloads WHERE media_id = ?;
+
+deleteAll:
+DELETE FROM voice_v2_downloads;
