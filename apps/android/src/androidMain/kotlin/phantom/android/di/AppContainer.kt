@@ -805,23 +805,12 @@ class AppContainer(private val context: Context) {
         val cm = CallManager(
             context = context,
             messagingService = service,
-            // PR-C1 (2026-05-17): calls guard via TransportCapabilities.
-            // Single source of truth: transportCapabilities.value.canStartCalls.
-            // Allowed only on WsActive without Tor (realtimeStable = true).
-            canStartCalls = {
-                val caps = _transportCapabilities.value
-                val allowed = caps.canStartCalls
-                if (!allowed) {
-                    android.util.Log.i(
-                        "PhantomTransport",
-                        "CALL_CAPABILITY disabled " +
-                            "reason=${caps.callDisabledReason?.name?.lowercase() ?: "unknown"} " +
-                            "rest_mode=${hybridTransport?.stateMachine?.current} " +
-                            "tor_active=${_torStarted && torService.state.value is TorState.Ready}",
-                    )
-                }
-                allowed
-            },
+            // PR-C1 (2026-05-17): defence-in-depth calls guard via TransportCapabilities.
+            // The full snapshot is passed so CallManager.checkCallCapability can log
+            // reason + restModeLabel without a second injected dependency.
+            // Single source of truth: _transportCapabilities StateFlow — same StateFlow
+            // that drives the UI CALL_CAPABILITY guard in ChatScreen.
+            transportCapabilitiesProvider = { _transportCapabilities.value },
         )
         cm.initialize()
         callManager = cm

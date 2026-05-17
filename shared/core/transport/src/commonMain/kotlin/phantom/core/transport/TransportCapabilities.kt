@@ -32,6 +32,18 @@ data class TransportCapabilities(
      * Null when [canStartCalls] is true.
      */
     val callDisabledReason: CallDisabledReason?,
+    /**
+     * Debug label for the [RestMode] that was active when this snapshot
+     * was produced — e.g. `"WsActive"`, `"RestActive"`, or `null` when
+     * [restMode] was null (pre-bootstrap / no transport). Used only in
+     * structured log lines (`CALL_TX blocked_* mode=<label>`); never
+     * shown in the UI. Set by [TransportCapabilitiesResolver] from
+     * [RestMode.name].
+     *
+     * PR-C1 (2026-05-17): added so [CallManager]'s guard log can render
+     * `mode=<state>` faithfully without a second injected dependency.
+     */
+    val restModeLabel: String?,
 )
 
 /**
@@ -110,6 +122,7 @@ object TransportCapabilitiesResolver {
                 canStartCalls = false,
                 realtimeStable = false,
                 callDisabledReason = CallDisabledReason.TOR_TRANSPORT,
+                restModeLabel = restMode?.name,
             )
         }
 
@@ -120,6 +133,7 @@ object TransportCapabilitiesResolver {
                 canStartCalls = false,
                 realtimeStable = false,
                 callDisabledReason = CallDisabledReason.NO_TRANSPORT,
+                restModeLabel = null,
             )
 
             RestMode.WsActive -> TransportCapabilities(
@@ -128,6 +142,7 @@ object TransportCapabilitiesResolver {
                 canStartCalls = true,
                 realtimeStable = true,
                 callDisabledReason = null,
+                restModeLabel = RestMode.WsActive.name,
             )
 
             RestMode.WsCandidate,
@@ -137,6 +152,7 @@ object TransportCapabilitiesResolver {
                 canStartCalls = false,
                 realtimeStable = false,
                 callDisabledReason = CallDisabledReason.LIMITED_REALTIME,
+                restModeLabel = restMode.name,
             )
         }
     }

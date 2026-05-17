@@ -22,9 +22,14 @@
     <!--
       PR-C1 (2026-05-17): per-reason call-blocked strings.
       Mapped from CallDisabledReason in ChatScreen.onVoiceCall handler.
+      Copy locked by architect (PR-C1 brief, 2026-05-17).
+      REALITY_UNPROBED reuses the LIMITED_REALTIME string until PR-C2
+      ships a Reality endpoint pool + probe; the user-visible text is
+      intentionally identical for now.
+      TODO(i18n): mirror these in values-ru/strings.xml
     -->
-    <string name="c1_call_blocked_limited_realtime">Calls require a stable realtime connection. Try again on Wi-Fi or stable cellular.</string>
+    <string name="c1_call_blocked_limited_realtime">Calls are temporarily unavailable in Limited realtime mode. Try again later on a stable realtime connection.</string>
     <string name="c1_call_blocked_tor_transport">Calls are not available over Tor.</string>
-    <string name="c1_call_blocked_reality_unprobed">Calls require a stable connection.</string>
-    <string name="c1_call_blocked_no_transport">Connecting…</string>
+    <string name="c1_call_blocked_reality_unprobed">Calls are temporarily unavailable in Limited realtime mode. Try again later on a stable realtime connection.</string>
+    <string name="c1_call_blocked_no_transport">Calls are not available until a stable connection is established.</string>
 </resources>

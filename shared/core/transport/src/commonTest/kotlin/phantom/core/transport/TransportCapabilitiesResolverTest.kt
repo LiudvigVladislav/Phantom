@@ -205,4 +205,41 @@ class TransportCapabilitiesResolverTest {
         assertFalse(caps.canStartCalls)
         assertTrue(caps.callDisabledReason != null)
     }
+
+    // ── PR-C1: restModeLabel field — one assertion per distinct resolve path ──
+    // restModeLabel is used by CallManager's CALL_TX guard log (mode=<label>).
+    // It must faithfully echo RestMode.name so the log is machine-parseable.
+
+    @Test
+    fun wsActive_noTor_restModeLabel_isWsActive() {
+        val caps = TransportCapabilitiesResolver.resolve(RestMode.WsActive, torActive = false)
+        assertEquals("WsActive", caps.restModeLabel)
+    }
+
+    @Test
+    fun wsCandidate_noTor_restModeLabel_isWsCandidate() {
+        val caps = TransportCapabilitiesResolver.resolve(RestMode.WsCandidate, torActive = false)
+        assertEquals("WsCandidate", caps.restModeLabel)
+    }
+
+    @Test
+    fun restActive_noTor_restModeLabel_isRestActive() {
+        val caps = TransportCapabilitiesResolver.resolve(RestMode.RestActive, torActive = false)
+        assertEquals("RestActive", caps.restModeLabel)
+    }
+
+    @Test
+    fun nullMode_noTor_restModeLabel_isNull() {
+        val caps = TransportCapabilitiesResolver.resolve(restMode = null, torActive = false)
+        assertNull(caps.restModeLabel)
+    }
+
+    @Test
+    fun torActive_restModeLabel_echoesRestMode() {
+        // Tor path: restModeLabel still echoes the restMode argument (may be null or a mode name).
+        val capsWithMode = TransportCapabilitiesResolver.resolve(RestMode.WsActive, torActive = true)
+        assertEquals("WsActive", capsWithMode.restModeLabel)
+        val capsNullMode = TransportCapabilitiesResolver.resolve(restMode = null, torActive = true)
+        assertNull(capsNullMode.restModeLabel)
+    }
 }
