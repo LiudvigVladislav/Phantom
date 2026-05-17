@@ -13,8 +13,13 @@ package phantom.core.transport
  *
  * PR-C1 (2026-05-17): initial capability model.
  *  - [canStartCalls] true only on [RestMode.WsActive] without Tor.
- *  - [canSendVoice] true on [RestMode.WsActive], [RestMode.WsCandidate],
- *    [RestMode.RestActive] when NOT on Tor (per D2b.2 intent).
+ *  - [canSendVoice] true ONLY on [RestMode.WsActive] without Tor in C1.
+ *    Voice in Limited realtime ([RestMode.WsCandidate], [RestMode.RestActive])
+ *    remains gated until PR-M1w wires the encrypted-media-upload path. The
+ *    old `audio_chunk`-over-`/relay/send` route was parked as
+ *    proof-of-concept (D2b.2/D2b.3a, PR #166) after Test #55 showed it
+ *    takes ~2 min for a 5-sec voice on Tele2 LTE. Re-opening voice on
+ *    Limited realtime before M1w would regress UX without a working path.
  *  - [realtimeStable] is a separate field: effectively `canStartCalls` for
  *    now, but intentionally decoupled so C2 can add a Reality-probe-pass
  *    dimension without changing this interface.
@@ -94,8 +99,8 @@ enum class CallDisabledReason {
  * | restMode          | torActive | canSendText | canSendVoice | canStartCalls | realtimeStable | callDisabledReason |
  * |-------------------|-----------|-------------|--------------|---------------|----------------|--------------------|
  * | WsActive          | false     | true        | true         | true          | true           | null               |
- * | WsCandidate       | false     | true        | true         | false         | false          | LIMITED_REALTIME   |
- * | RestActive        | false     | true        | true         | false         | false          | LIMITED_REALTIME   |
+ * | WsCandidate       | false     | true        | false        | false         | false          | LIMITED_REALTIME   |
+ * | RestActive        | false     | true        | false        | false         | false          | LIMITED_REALTIME   |
  * | any               | true      | true        | false        | false         | false          | TOR_TRANSPORT      |
  * | null              | false     | true        | false        | false         | false          | NO_TRANSPORT       |
  *
@@ -148,7 +153,12 @@ object TransportCapabilitiesResolver {
             RestMode.WsCandidate,
             RestMode.RestActive -> TransportCapabilities(
                 canSendText = true,
-                canSendVoice = true,
+                // Voice gated in Limited realtime until PR-M1w wires the new
+                // encrypted-media-upload path. D2b voice-over-/relay/send was
+                // parked as proof-of-concept (Test #55 showed ~2 min upload
+                // for a 5-sec voice on Tele2). Re-opening it here would
+                // regress UX without a working backend path.
+                canSendVoice = false,
                 canStartCalls = false,
                 realtimeStable = false,
                 callDisabledReason = CallDisabledReason.LIMITED_REALTIME,

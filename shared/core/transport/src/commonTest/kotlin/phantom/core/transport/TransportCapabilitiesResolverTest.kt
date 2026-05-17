@@ -63,9 +63,11 @@ class TransportCapabilitiesResolverTest {
     }
 
     @Test
-    fun wsCandidate_noTor_canSendVoice_true() {
+    fun wsCandidate_noTor_canSendVoice_false_untilM1w() {
+        // Voice gated in Limited realtime until PR-M1w wires encrypted media
+        // upload. D2b voice-over-/relay/send path is parked.
         val caps = TransportCapabilitiesResolver.resolve(RestMode.WsCandidate, torActive = false)
-        assertTrue(caps.canSendVoice)
+        assertFalse(caps.canSendVoice)
     }
 
     @Test
@@ -89,9 +91,11 @@ class TransportCapabilitiesResolverTest {
     }
 
     @Test
-    fun restActive_noTor_canSendVoice_true() {
+    fun restActive_noTor_canSendVoice_false_untilM1w() {
+        // Voice gated in Limited realtime until PR-M1w wires encrypted media
+        // upload. D2b voice-over-/relay/send path is parked.
         val caps = TransportCapabilitiesResolver.resolve(RestMode.RestActive, torActive = false)
-        assertTrue(caps.canSendVoice)
+        assertFalse(caps.canSendVoice)
     }
 
     @Test
