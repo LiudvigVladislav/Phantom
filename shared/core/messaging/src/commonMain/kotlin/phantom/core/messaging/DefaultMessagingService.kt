@@ -849,6 +849,27 @@ class DefaultMessagingService(
         origin: String,
     ) {
         val repo = voiceChunkRepository ?: return
+
+        // PR-D2b.1 review round 2 (2026-05-17): pre-check for an already
+        // inserted voice message keyed on this `voiceId`. INSERT OR IGNORE
+        // makes the actual SQL insert a silent no-op when the row exists,
+        // but every downstream side effect (conversation unread bump,
+        // `_incomingMessages.emit`, `onNewMessageNotification`) would
+        // still fire — so a crash between live insert and `deleteByVoiceId`
+        // would let the finalizer double-emit + double-notify + double-
+        // unread the same voice. The check happens BEFORE reading and
+        // concatenating chunk bytes so the wasted blob allocation is
+        // skipped on the recovery path too.
+        val existingRow = runCatching { messageRepository.getMessageById(voiceId) }.getOrNull()
+        if (existingRow != null) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "VOICE_RX already_inserted_cleanup voiceId=${voiceId.take(8)} source=$origin",
+            )
+            repo.deleteByVoiceId(voiceId)
+            return
+        }
+
         val ordered = repo.findOrderedChunks(voiceId)
         if (ordered.isEmpty()) {
             messagingLog(
@@ -1310,6 +1331,25 @@ class DefaultMessagingService(
                         return@runCatching
                     },
                 )
+
+                // PR-D2b.1 review round 2 (2026-05-17): validate
+                // `chunkIndex` is inside `[0, chunkTotal)` before saving.
+                // A malformed payload (`audioChunkIndex >= audioChunkTotal`
+                // or `audioChunkTotal <= 0`) would otherwise be stored
+                // either as an out-of-range row that never participates
+                // in `findOrderedChunks` correctly, or as an extra slot
+                // that pushes `countChunks` past `total` without filling
+                // every index 0..N-1. Both states leave reassembly broken
+                // in subtle ways; the cheap fix is to reject the chunk
+                // up front and let the relay drop it (ack-deliver).
+                if (chunkTotal <= 0 || chunkIndex !in 0 until chunkTotal) {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "VOICE_RX chunk_invalid_range voiceId=${chunkId.take(8)} idx=$chunkIndex total=$chunkTotal envelopeId=${deliver.messageId.take(8)}",
+                    )
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@runCatching
+                }
 
                 val nowMs = Clock.System.now().toEpochMilliseconds()
                 val groupId = payload.groupId

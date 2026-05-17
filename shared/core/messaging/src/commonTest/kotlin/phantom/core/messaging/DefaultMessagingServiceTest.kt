@@ -1551,6 +1551,84 @@ class DefaultMessagingServiceTest {
     }
 
     @Test
+    fun startReceiving_finalizer_skipsAlreadyInsertedVoice_andCleansUpChunks() = runTest {
+        // PR-D2b.1 review round 2 regression test.
+        //
+        // Crash window: live receive path inserted the assembled message
+        // into the message store but the process died before
+        // `deleteByVoiceId` ran. On restart the finalizer sees a complete
+        // partial buffer and would, pre-fix, re-emit `_incomingMessages`,
+        // re-bump unread, and fire a second notification — even though
+        // `messageRepository.insertMessage` is INSERT OR IGNORE and the
+        // actual row write was a silent no-op. Post-fix: pre-check
+        // `getMessageById(voiceId)` and short-circuit straight to
+        // `deleteByVoiceId` with no UX side effects.
+        LibsodiumInitializer.initialize()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["conv-restart"] = ConversationEntity(
+            id = "conv-restart",
+            theirUsername = "peer",
+            theirPublicKeyHex = "deadbeef",
+            lastMessagePreview = "🎤 Voice message",
+            lastMessageAt = 0L,
+            unreadCount = 1,  // already bumped by live path before crash
+            trustTier = phantom.core.storage.TrustTier.TRUSTED,
+            blocked = false,
+        )
+        // Voice message already exists in DB (live path inserted it
+        // before crash). Use the same `voiceId` we'll seed the chunks
+        // with — finalizer uses id = voiceId.
+        msgRepo.messages += MessageEntity(
+            id = "v-already-inserted",
+            conversationId = "conv-restart",
+            ciphertext = ByteArray(0),
+            plaintextCache = "[AUDIO:cHJlLWluc2VydGVk]",  // arbitrary, the row's existence is what matters
+            sent = false,
+            status = MessageStatus.DELIVERED,
+            createdAt = 100L,
+            expiresAtMs = null,
+        )
+        val voiceRepo = FakeVoiceChunkLedger()
+        // Complete chunks survived the crash.
+        val now = System.currentTimeMillis()
+        voiceRepo.insertChunk(
+            voiceId = "v-already-inserted", idx = 0, total = 2,
+            conversationId = "conv-restart", senderPubKeyHex = "deadbeef",
+            mimeType = "audio/m4a", durationMs = 5_000L,
+            chunkBytes = byteArrayOf(1), nowMs = now,
+        )
+        voiceRepo.insertChunk(
+            voiceId = "v-already-inserted", idx = 1, total = 2,
+            conversationId = "conv-restart", senderPubKeyHex = "deadbeef",
+            mimeType = "audio/m4a", durationMs = 5_000L,
+            chunkBytes = byteArrayOf(2), nowMs = now,
+        )
+
+        val service = buildService(
+            testScope = this,
+            msgRepo = msgRepo,
+            convRepo = convRepo,
+            voiceChunkRepo = voiceRepo,
+            scope = backgroundScope,
+        )
+
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Exactly one message row exists (the pre-seeded one). Finalizer
+        // did NOT add a duplicate, did NOT overwrite the plaintextCache.
+        val rows = msgRepo.messages.filter { it.id == "v-already-inserted" }
+        assertEquals(1, rows.size)
+        assertEquals("[AUDIO:cHJlLWluc2VydGVk]", rows.single().plaintextCache)
+        // Conversation unread stayed at the pre-crash value — finalizer
+        // did NOT double-bump.
+        assertEquals(1, convRepo.store.getValue("conv-restart").unreadCount)
+        // Partial state freed despite the no-op insert path.
+        assertEquals(0, voiceRepo.countChunks("v-already-inserted"))
+    }
+
+    @Test
     fun startReceiving_finalizer_leavesIncompleteVoiceUntouched() = runTest {
         LibsodiumInitializer.initialize()
         val msgRepo = FakeMessageRepository()
@@ -1843,7 +1921,15 @@ private class FakeVoiceChunkLedger : phantom.core.storage.VoiceChunkRepository {
     }
 
     override suspend fun deleteOlderThan(cutoffMs: Long) {
-        store.entries.removeAll { it.value.updatedAtMs < cutoffMs }
+        // PR-D2b.1 review round 2: mirror `VoiceChunk.sq deleteOlderThan` —
+        // drop every chunk for any voice whose oldest chunk is older than
+        // the cutoff, not just the individual old rows. Anything else
+        // leaves voices in a permanently-unassemblable mixed-age state.
+        val expiredVoiceIds = store.values
+            .groupBy { it.voiceId }
+            .filterValues { rows -> rows.minOf { it.updatedAtMs } < cutoffMs }
+            .keys
+        store.entries.removeAll { it.value.voiceId in expiredVoiceIds }
     }
 
     override suspend fun deleteByVoiceId(voiceId: String) {

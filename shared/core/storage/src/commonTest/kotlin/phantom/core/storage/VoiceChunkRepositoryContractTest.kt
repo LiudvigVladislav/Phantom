@@ -125,6 +125,34 @@ class VoiceChunkRepositoryContractTest {
     }
 
     @Test
+    fun deleteOlderThan_dropsEntireVoice_whenAnyChunkExpired() = runTest {
+        // PR-D2b.1 review round 2 regression test.
+        //
+        // Pre-fix `deleteOlderThan` was a row-level
+        // `DELETE WHERE updated_at_ms < cutoff`. That left a voice in a
+        // permanently-broken mixed-age state: some indices old → swept,
+        // some indices fresh → still there, `countChunks` never reaches
+        // `total`. The post-fix query drops the WHOLE voice (every idx
+        // row, fresh or stale) the moment any single chunk crosses the
+        // cutoff — matching `findExpiredSummaries`'s
+        // `HAVING MIN(updated_at_ms) < cutoff` semantic.
+        val repo = newRepo()
+        // v1 has chunks at 100ms (old) and 5_000ms (fresh).
+        repo.insert("v1", idx = 0, total = 2, bytes = byteArrayOf(0xAA.toByte()), nowMs = 100L)
+        repo.insert("v1", idx = 1, total = 2, bytes = byteArrayOf(0xBB.toByte()), nowMs = 5_000L)
+        // v2 is fully fresh.
+        repo.insert("v2", idx = 0, total = 1, bytes = byteArrayOf(0xCC.toByte()), nowMs = 5_000L)
+
+        repo.deleteOlderThan(cutoffMs = 1_000L)
+
+        // v1 is entirely gone — including the fresh idx=1 — because at
+        // least one of its chunks crossed the cutoff.
+        assertEquals(0, repo.countChunks("v1"))
+        // v2 untouched.
+        assertEquals(1, repo.countChunks("v2"))
+    }
+
+    @Test
     fun deleteByVoiceId_dropsOnlyThatVoice() = runTest {
         val repo = newRepo()
         repo.insert("v1", idx = 0, total = 1, bytes = byteArrayOf(1))
@@ -253,7 +281,15 @@ class FakeVoiceChunkRepository : VoiceChunkRepository {
     }
 
     override suspend fun deleteOlderThan(cutoffMs: Long) {
-        store.entries.removeAll { it.value.updatedAtMs < cutoffMs }
+        // PR-D2b.1 review round 2: mirror `VoiceChunk.sq deleteOlderThan` —
+        // drop every chunk for any voice whose oldest chunk is older than
+        // the cutoff, not just the individual old rows. Anything else
+        // leaves voices in a permanently-unassemblable mixed-age state.
+        val expiredVoiceIds = store.values
+            .groupBy { it.voiceId }
+            .filterValues { rows -> rows.minOf { it.updatedAtMs } < cutoffMs }
+            .keys
+        store.entries.removeAll { it.value.voiceId in expiredVoiceIds }
     }
 
     override suspend fun deleteByVoiceId(voiceId: String) {

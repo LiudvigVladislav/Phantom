@@ -118,14 +118,29 @@ FROM voice_chunks
 GROUP BY voice_id
 HAVING MIN(updated_at_ms) < :cutoff_ms;
 
--- Sweep — drops every chunk older than the cutoff in one statement.
--- Run after `findExpiredSummaries` returns the summaries we want to log.
--- Cheap because `updated_at_ms` is the most-recent timestamp on each
--- chunk row, not a separate index (the sweep is happy with a full scan
--- because the table is expected to stay under a few hundred rows even
--- under worst-case "user records voice every minute for a day" usage).
+-- Sweep — drops every chunk for any voice that has at least one chunk
+-- older than the cutoff. Run after `findExpiredSummaries` returns the
+-- summaries we want to log. Mirrors the `findExpiredSummaries` predicate
+-- (MIN(updated_at_ms) < cutoff per voice) so the two queries always
+-- agree: if a voice is reported expired, ALL of its chunks are then
+-- dropped, not just the rows whose individual `updated_at_ms` is below
+-- the cutoff. The naive `WHERE updated_at_ms < cutoff` would leave a
+-- voice in a permanently-unassemblable "fresh chunks for half the
+-- indices, expired chunks for the other half — count never reaches
+-- total" state. PR-D2b.1 review round 2 (2026-05-17).
+--
+-- Cheap because the table is expected to stay under a few hundred rows
+-- even under worst-case "user records voice every minute for a day"
+-- usage — the GROUP BY + HAVING walks the same row set we already touch
+-- on each chunk insert.
 deleteOlderThan:
-DELETE FROM voice_chunks WHERE updated_at_ms < :cutoff_ms;
+DELETE FROM voice_chunks
+WHERE voice_id IN (
+    SELECT voice_id
+    FROM voice_chunks
+    GROUP BY voice_id
+    HAVING MIN(updated_at_ms) < :cutoff_ms
+);
 
 -- Hot path — save a chunk as it arrives. `INSERT OR REPLACE` makes
 -- relay redelivery of the same (voice_id, idx) idempotent: bytes are
