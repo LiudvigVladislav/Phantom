@@ -129,5 +129,25 @@ async fn main() {
         }
     });
 
+    // Background task: sweep expired media chunks every hour (PR-M1r).
+    // TTL is per-media-entry: if the earliest chunk is older than media_ttl_secs,
+    // the entire entry is removed. Relay never touches content; only metadata
+    // (media_id prefix, chunk count, age) is logged.
+    let media_sweep_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        let ttl_secs = media_sweep_state.config.media_ttl_secs;
+        let ttl_ms = ttl_secs * 1_000;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3_600));
+        loop {
+            interval.tick().await;
+            let swept = media_sweep_state.media_store.sweep_expired(ttl_ms).await;
+            if swept > 0 {
+                tracing::info!(swept = swept, "media sweeper removed expired entries");
+            } else {
+                tracing::debug!("media sweeper: no expired entries");
+            }
+        }
+    });
+
     axum::serve(listener, app).await.unwrap();
 }

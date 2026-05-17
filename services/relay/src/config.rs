@@ -31,6 +31,19 @@ pub struct RelayConfig {
     /// The relay never embeds Google FCM, Apple APNs, or any third-party
     /// push provider per ADR-001 / ADR-016 metadata-privacy posture.
     pub ntfy_url: Option<String>,
+
+    // ── Media upload (PR-M1r) ─────────────────────────────────────────────────
+
+    /// Hard cap on POST /media/upload-chunk body in bytes. Client targets ≤2600;
+    /// relay enforces 3072. Different from `/relay/send`'s 4096 cap.
+    pub max_media_upload_body_bytes: usize,
+    /// Maximum number of chunks permitted per media object.
+    pub max_media_chunks: u32,
+    /// Maximum cumulative ciphertext bytes stored per `media_id` (1 MiB).
+    pub max_media_bytes: u64,
+    /// How long media chunks are retained before the sweeper removes them
+    /// (seconds). Default 7 days.
+    pub media_ttl_secs: u64,
 }
 
 impl RelayConfig {
@@ -48,6 +61,10 @@ impl RelayConfig {
             ntfy_url: None,
             rate_limit_per_window: 60,
             rate_limit_window_secs: 60,
+            max_media_upload_body_bytes: crate::media::MAX_MEDIA_UPLOAD_BODY_BYTES,
+            max_media_chunks: crate::media::MAX_MEDIA_CHUNKS,
+            max_media_bytes: crate::media::MAX_MEDIA_BYTES,
+            media_ttl_secs: 7 * 24 * 3600,
         }
     }
 
@@ -80,6 +97,22 @@ impl RelayConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            max_media_upload_body_bytes: std::env::var("RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::media::MAX_MEDIA_UPLOAD_BODY_BYTES),
+            max_media_chunks: std::env::var("RELAY_MAX_MEDIA_CHUNKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::media::MAX_MEDIA_CHUNKS),
+            max_media_bytes: std::env::var("RELAY_MAX_MEDIA_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::media::MAX_MEDIA_BYTES),
+            media_ttl_secs: std::env::var("RELAY_MEDIA_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(7 * 24 * 3600), // 7 days
         }
     }
 }
@@ -96,6 +129,10 @@ impl std::fmt::Debug for RelayConfig {
             .field("rate_limit_per_window", &self.rate_limit_per_window)
             .field("rate_limit_window_secs", &self.rate_limit_window_secs)
             .field("ntfy_url", &self.ntfy_url)
+            .field("max_media_upload_body_bytes", &self.max_media_upload_body_bytes)
+            .field("max_media_chunks", &self.max_media_chunks)
+            .field("max_media_bytes", &self.max_media_bytes)
+            .field("media_ttl_secs", &self.media_ttl_secs)
             .finish()
     }
 }

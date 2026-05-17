@@ -4,6 +4,7 @@
 use crate::auth::{ChallengeStore, SigningKeyBindings};
 use crate::config::RelayConfig;
 use crate::envelope::Envelope;
+use crate::media::MediaStore;
 use crate::prekeys::PreKeyStore;
 use crate::rest_fallback::{IdempotencyCache, RestEnvelope, RestTokenStore, SeqCounter, SessionChallengeCache};
 use serde::{Deserialize, Serialize};
@@ -103,6 +104,13 @@ pub struct AppState {
     pub rest_store: RwLock<HashMap<String, Vec<RestEnvelope>>>,
     /// Monotonic per-recipient sequence counter for REST poll resume.
     pub rest_seq: SeqCounter,
+
+    // ── Media upload store (PR-M1r) ───────────────────────────────────────────
+
+    /// In-memory store for encrypted media chunks uploaded via
+    /// POST /media/upload-chunk. Keyed by opaque `media_id` capability token.
+    /// Relay never inspects ciphertext content — only stores and serves blobs.
+    pub media_store: MediaStore,
 }
 
 impl AppState {
@@ -141,6 +149,8 @@ impl AppState {
             rest_idempotency: IdempotencyCache::new(),
             rest_store: RwLock::new(HashMap::new()),
             rest_seq: SeqCounter::new(),
+            // Media upload (PR-M1r)
+            media_store: MediaStore::new(),
         }
     }
 
