@@ -1443,6 +1443,148 @@ class KtorRelayTransport(
     // controlled mutations — the underlying mutable collections are never
     // returned. Removing these is safe; only the test will fail to build.
 
+    // ── PR-D1c: REST fallback migration of pending WS outbound ──────────────
+    //
+    // Test #49 (2026-05-16, Tele2 LTE Иркутская) reproduced an X3DH bootstrap
+    // ordering bug: the very first outbound envelope after onboarding is a
+    // bootstrap message carrying the x3dhInit header. If WS delivers the
+    // frame on the wire but the relay's Ack never makes it back, that
+    // envelope sits in [pendingAcks]. The state machine then switches into
+    // RestActive and the NEXT send() routes through REST. Receiver sees the
+    // second envelope without ever having seen the bootstrap, drops it as a
+    // "legacy envelope: no session and no x3dhInit", and decrypt fails for
+    // good. The fix lives one layer up: [HybridRelayTransport] snapshots
+    // every pending outbound here and re-sends it over REST in sequenceTs
+    // order BEFORE any new REST send is allowed through. The two methods
+    // below are the read-side and remove-side of that contract — both
+    // public because the wrapper lives in a different Gradle module
+    // (`apps/android`, not `shared/core/transport`), so `internal` is
+    // unreachable.
+
+    /**
+     * Immutable snapshot of one outbound envelope that has not yet been
+     * confirmed ACK'd by the relay over WS. Returned by
+     * [snapshotPendingOutbound] for [HybridRelayTransport] to re-send over
+     * REST when the state machine switches WS → REST. `payloadBase64` and
+     * `sealedSenderBase64` are the original WS ciphertext blobs — re-sending
+     * requires no re-encrypt and no ratchet advance.
+     *
+     * `sequenceTs` is the per-transport monotone counter (NOT wall-clock).
+     * It exists only to define a stable sort order for the migration; the
+     * REST orchestrator passes its own wall-clock `sequence_ts` to the relay.
+     */
+    data class PendingOutboundEnvelope(
+        val id: String,
+        val to: String,
+        val payloadBase64: String,
+        val sealedSenderBase64: String,
+        val sequenceTs: Long,
+    )
+
+    /**
+     * Snapshot of all outbound envelopes that are either (a) on the wire
+     * awaiting an ACK ([pendingAcks]) or (b) queued for the next live WS
+     * session ([pendingOutbox]). Returned as an immutable list sorted by
+     * [PendingOutboundEnvelope.sequenceTs] ASC so the caller re-sends in the
+     * exact order the application originally produced — critical for X3DH
+     * bootstrap to land before any session-existing follow-up.
+     *
+     * If the same id appears in both maps (a transient state the
+     * flush/merge paths can briefly produce while moving an entry across)
+     * it is included once.
+     *
+     * Atomicity (PR-D1c review round 3 fix): three nested locks —
+     * `outboundSendMutex` → `pendingAcksLock` → `outboxMutex`. The
+     * outermost `outboundSendMutex` is the key fix: without it,
+     * [flushPendingOutbox] has a window where it has cleared
+     * `pendingOutbox` and put envelopes into a local `toFlush` list, but
+     * has not yet inserted them into `pendingAcks`. During that window a
+     * snapshot that only takes the two inner locks would see those
+     * envelopes nowhere and silently drop them from migration. Since
+     * [flushPendingOutbox] holds `outboundSendMutex` for its entire
+     * snapshot+clear+wire-write+re-track cycle (PR-H2a.2), taking
+     * `outboundSendMutex` here makes the snapshot wait for the flush to
+     * settle before reading. The two inner lock acquisitions match the
+     * order used by [mergeUnackedIntoOutboxOrdered] and the ACK
+     * watchdog, so no inversion deadlock is possible.
+     */
+    suspend fun snapshotPendingOutbound(): List<PendingOutboundEnvelope> {
+        return outboundSendMutex.withLock {
+            pendingAcksLock.withLock {
+                outboxMutex.withLock {
+                    val seen = HashSet<String>(pendingAcks.size + pendingOutbox.size)
+                    val merged = ArrayList<PendingOutboundEnvelope>(
+                        pendingAcks.size + pendingOutbox.size
+                    )
+                    for (entry in pendingAcks.values) {
+                        val msg = entry.message
+                        if (seen.add(msg.messageId)) {
+                            merged.add(
+                                PendingOutboundEnvelope(
+                                    id = msg.messageId,
+                                    to = msg.to,
+                                    payloadBase64 = msg.payload,
+                                    sealedSenderBase64 = msg.sealedSender,
+                                    sequenceTs = entry.sequenceTs,
+                                )
+                            )
+                        }
+                    }
+                    for (entry in pendingOutbox) {
+                        val send = entry.message as? RelayMessage.Send ?: continue
+                        if (seen.add(send.messageId)) {
+                            merged.add(
+                                PendingOutboundEnvelope(
+                                    id = send.messageId,
+                                    to = send.to,
+                                    payloadBase64 = send.payload,
+                                    sealedSenderBase64 = send.sealedSender,
+                                    sequenceTs = entry.sequenceTs,
+                                )
+                            )
+                        }
+                    }
+                    merged.sortedBy { it.sequenceTs }
+                }
+            }
+        }
+    }
+
+    /**
+     * Atomically remove an envelope from BOTH [pendingAcks] and
+     * [pendingOutbox]. Called by [HybridRelayTransport] AFTER the REST
+     * orchestrator confirms the envelope was accepted (status 201 or 200).
+     *
+     * Atomicity across both maps AND across an in-progress
+     * [flushPendingOutbox] is load-bearing. Without [outboundSendMutex]
+     * the flush window (envelope in local `toFlush`, not in any map) would
+     * let mark return as a no-op while the flush then inserts the envelope
+     * into `pendingAcks`. A subsequent WS reconnect would re-flush via
+     * `sendRaw` and the relay would live-deliver a duplicate of an
+     * envelope the recipient has already received via REST.
+     *
+     * Lock order (PR-D1c review round 3 fix): `outboundSendMutex` →
+     * `pendingAcksLock` → `outboxMutex`. Matches [snapshotPendingOutbound]
+     * and the rest of the file.
+     *
+     * Safe to call when [id] is in neither map — no-op in that case.
+     */
+    suspend fun markPendingOutboundAcceptedByFallback(id: String) {
+        outboundSendMutex.withLock {
+            pendingAcksLock.withLock {
+                pendingAcks.remove(id)
+                outboxMutex.withLock {
+                    val it = pendingOutbox.iterator()
+                    while (it.hasNext()) {
+                        val entry = it.next()
+                        val send = entry.message as? RelayMessage.Send ?: continue
+                        if (send.messageId == id) it.remove()
+                    }
+                }
+            }
+        }
+    }
+
     internal suspend fun snapshotOutboxForTest(): List<OutboxEntry> =
         outboxMutex.withLock { pendingOutbox.toList() }
 

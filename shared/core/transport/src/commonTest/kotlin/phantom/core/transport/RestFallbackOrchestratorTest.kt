@@ -368,4 +368,168 @@ class RestFallbackOrchestratorTest {
         )
         assertEquals(5, RestFallbackOrchestrator.SEND_MAX_ATTEMPTS)
     }
+
+    // ── PR-D1c.1 token-lifecycle regression tests ────────────────────────────
+
+    /**
+     * Helper: build a session script that hands out `T1`, `T2`, … and
+     * lets the caller observe how many `/auth/session` round-trips really
+     * happened. Each invocation produces a fresh, healthy
+     * `restFallback=true` capability response.
+     */
+    private class CountingAuth {
+        var count: Int = 0
+        val script: (AuthSessionRequest) -> RestFallbackResponse<AuthSessionResponse> = { _ ->
+            count++
+            RestFallbackResponse(
+                statusCode = 200,
+                bodyParsed = AuthSessionResponse(
+                    token = "T$count",
+                    expiresAt = 3_600_000L,
+                    restFallback = true,
+                    maxSendBodyBytes = 4096,
+                    pollMaxEnvelopes = 1,
+                ),
+                rawBody = "{}",
+                elapsedMs = 1L,
+            )
+        }
+    }
+
+    @Test
+    fun bootstrap_caches_token_no_extra_auth_on_first_send() = runTest {
+        // PR-D1c.1 fix #1: the old bootstrap() called authSessionOnce() but
+        // never wrote the returned token/expiresAt into cache, so the first
+        // sendEnvelope re-did /auth/session. Test #50 paid 700 ms of TSPU
+        // latency for this. After the fix, bootstrap must prime the cache.
+        val auth = CountingAuth()
+        val transport = FakeTransport().apply { sessionScript = auth.script }
+        val orch = orchestrator(transport)
+        orch.bootstrap()
+        assertEquals(1, auth.count, "bootstrap should issue exactly one /auth/session")
+
+        val outcome = orch.sendEnvelope(
+            envelopeId = "env-1",
+            toHex = "01".repeat(32),
+            payloadBase64 = "AAAA",
+            sequenceTs = 0L,
+        )
+        assertIs<SendOutcome.Accepted>(outcome)
+        assertEquals(
+            1, auth.count,
+            "sendEnvelope after bootstrap must reuse the cached token, no extra /auth/session",
+        )
+        assertEquals(
+            "T1", transport.sendCalls.single().token,
+            "sendEnvelope must use the token cached during bootstrap",
+        )
+    }
+
+    @Test
+    fun send_envelope_401_refreshes_and_retries_with_new_token() = runTest {
+        // PR-D1c.1 fix #3: the old sendEnvelope captured `token` once before
+        // the retry loop, so even after the 401-branch called ensureToken()
+        // the next attempt re-used the stale token. After the fix, the token
+        // is acquired inside the loop, with staleToken CAS.
+        val auth = CountingAuth()
+        val transport = FakeTransport().apply { sessionScript = auth.script }
+        transport.sendScripts.addLast { _ -> RestFallbackResponse(401, null, "unauth", 1L) }
+        transport.sendScripts.addLast { _ -> RestFallbackResponse(201, SendResponse(1), "{}", 1L) }
+
+        val orch = orchestrator(transport)
+        orch.bootstrap()
+        assertEquals(1, auth.count)
+
+        val outcome = orch.sendEnvelope(
+            envelopeId = "env-1",
+            toHex = "01".repeat(32),
+            payloadBase64 = "AAAA",
+            sequenceTs = 0L,
+        )
+        assertIs<SendOutcome.Accepted>(outcome)
+        assertEquals(
+            2, auth.count,
+            "401 must trigger exactly one /auth/session refresh (bootstrap + 1)",
+        )
+        assertEquals(2, transport.sendCalls.size, "send must be retried after the 401 refresh")
+        assertEquals(
+            "T1", transport.sendCalls[0].token,
+            "first attempt uses the originally-cached token",
+        )
+        assertEquals(
+            "T2", transport.sendCalls[1].token,
+            "retry must use the refreshed token, NOT the stale one captured before the loop",
+        )
+    }
+
+    @Test
+    fun acquire_or_refresh_token_cas_reuses_when_another_caller_refreshed() = runTest {
+        // PR-D1c.1 fix #2: without CAS, two coroutines that each receive 401
+        // for the same stale token would both forceRefresh, the server would
+        // replace token A with token B, the first coroutine's "refreshed"
+        // token gets invalidated immediately, and the next attempt hits 401
+        // again. CAS path: if cached != staleToken, reuse cached.
+        val auth = CountingAuth()
+        val transport = FakeTransport().apply { sessionScript = auth.script }
+        val orch = orchestrator(transport)
+
+        // Fresh acquire → T1
+        val t1 = orch.acquireOrRefreshToken(reason = "test")
+        assertEquals("T1", t1)
+        assertEquals(1, auth.count)
+
+        // Coroutine A's token went stale → forced refresh → T2
+        val t2 = orch.acquireOrRefreshToken(reason = "test", staleToken = "T1")
+        assertEquals("T2", t2)
+        assertEquals(2, auth.count, "stale-token caller must refresh when cached==stale")
+
+        // Coroutine B was also holding T1 when its 401 happened. By the time
+        // B enters the mutex, cache already holds T2. CAS path must reuse.
+        val t2cas = orch.acquireOrRefreshToken(reason = "test", staleToken = "T1")
+        assertEquals("T2", t2cas)
+        assertEquals(
+            2, auth.count,
+            "CAS path must NOT issue a fresh /auth/session when cached != staleToken",
+        )
+    }
+
+    @Test
+    fun capabilities_updated_on_token_refresh() = runTest {
+        // PR-D1c.1 side benefit: every successful auth-session response now
+        // re-publishes capabilities. If the relay flips restFallback=false
+        // at runtime (e.g. operator disables REST), the orchestrator picks
+        // that up on the next refresh rather than holding a stale "true".
+        var count = 0
+        val transport = FakeTransport().apply {
+            sessionScript = { _ ->
+                count++
+                val restEnabled = (count == 1)
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = AuthSessionResponse(
+                        token = "T$count",
+                        expiresAt = 3_600_000L,
+                        restFallback = restEnabled,
+                        maxSendBodyBytes = if (restEnabled) 4096 else 0,
+                        pollMaxEnvelopes = if (restEnabled) 1 else 0,
+                    ),
+                    rawBody = "{}",
+                    elapsedMs = 1L,
+                )
+            }
+        }
+        val orch = orchestrator(transport)
+        orch.bootstrap()
+        assertEquals(true, orch.capabilities.value.restFallback)
+        assertEquals(4096, orch.capabilities.value.maxSendBodyBytes)
+
+        // Drive a second auth (stale-token path) and check capabilities follow.
+        val refreshed = orch.acquireOrRefreshToken(reason = "test", staleToken = "T1")
+        assertEquals("T2", refreshed)
+        assertEquals(
+            false, orch.capabilities.value.restFallback,
+            "refreshed capability snapshot must propagate to _capabilities.value",
+        )
+        assertEquals(0, orch.capabilities.value.maxSendBodyBytes)
+    }
 }
