@@ -511,7 +511,12 @@ when an entry mentions a rejected approach.
 **Decision locked 2026-05-17 evening — A + C параллельно** (Vladislav + architect aligned).
 - **B (compact serialization PR-D2b.3b) rejected.** Architect quote: "Compact serialization даст ускорение, но всё равно останется старая архитектура: голосовое = много ratchet envelopes. Даже если 150 chunks превратятся в 38 chunks, это всё ещё десятки отдельных сообщений, десятки ACK, десятки retry, сложный UX и задержка. Это стопгап, а не продуктовый путь."
 - **PR #166 parked, не merge.** D2b.1 остаётся в master как foundation / fallback / research result.
-- **PR-M1 — encrypted media upload for voice.** Contract: record → mediaId + mediaKey → encrypt blob locally → split encrypted blob into upload chunks → POST `/media/upload-chunk` (small body, idempotency key) → send one E2E voice manifest `{type:"voice", mediaId, durationMs, mime, chunkCount, sizeBytes, sha256, key}` → receiver GETs `/media/chunk` (Tele2 small-GET reliable per 2026-05-16 Layer B), reassembles, decrypts, inserts one voice row. Retry/resume mandatory. Tiny POST responses.
+- **PR-M1 contract LOCKED (architect apply 2026-05-17 evening).** Split into 3 PRs:
+  - **M1r** — relay: `POST /media/upload-chunk` + `GET /media/chunk/{mediaId}/{idx}`, bearer-session auth, hard cap 3072 bytes (client target ≤2600), idempotency by `(media_id, idx, ciphertext_hash)`, SQLite `media_chunks`, TTL=7d + sweeper, quotas `maxMediaChunks=256` / `maxMediaBytes=512KB–1MB`, no DELETE in round 1. `mediaId = base64url(random 32 bytes)` capability token.
+  - **M1k** — Kotlin `MediaUploadTransport` + manifest model + XChaCha20-Poly1305 (AAD=mediaId), inert/not wired. Manifest `{type:"voice_v2", mediaId, mediaKey, nonce, alg:"xchacha20poly1305-v1", durationMs, mime, chunkCount, encryptedSizeBytes, plainSizeBytes, sha256(plaintext)}`.
+  - **M1w** — wire `sendAudio` to M1 (upload all chunks → THEN send single manifest via `/relay/send`); receiver on `voice_v2` GETs chunks, reassembles, decrypts+verifies, inserts one voice row. D2b legacy parked.
+  - Sequential upload, single voice at a time, 1:1 only.
+  - Throughput: ~22–25 chunks vs current 150 → ~12–20 s on Tele2 (still REST-bound, not instant).
 - **PR-C1 — calls capability gating (parallel track).** Small scope: `Stable realtime → calls enabled`, `Limited realtime / REST / Tor / Reality-without-realtime-proof → calls disabled`. Call button allowed only when `realtimeStable == true`, Limited realtime copy stays, log `CALL_CAPABILITY disabled reason=limited_realtime`. Full RealtimeProbe (upstream frame + downstream ack + 10–20 s hold + RTT/jitter/loss) lands later in C2/C3.
 - **Goal.** Voice = async encrypted media (not ratchet envelopes); calls blocked until stable realtime transport exists.
 
