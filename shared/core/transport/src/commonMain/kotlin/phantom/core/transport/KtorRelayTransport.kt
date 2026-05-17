@@ -351,6 +351,15 @@ class KtorRelayTransport(
         val msgId = entry.message.messageId
         val sentMark = entry.sentAt
         val deadlineScope = ackDeadlineScopeOverride ?: transportScope
+        // PR-D1d round-1 hardening: cancel any pre-existing deadline Job for
+        // this msgId before replacing the map entry. The production removal
+        // paths all route through `removePendingAckLocked` so this is unlikely
+        // to fire in practice, but guarantees the invariant:
+        //     one pendingAck msgId ⇒ at most one active deadline Job.
+        // Without this, a re-arm under an edge-case path would orphan the old
+        // coroutine (still running, eventually firing a stale expiry event for
+        // an envelope that already has a fresh timer).
+        ackDeadlineJobs.remove(msgId)?.cancel()
         ackDeadlineJobs[msgId] = deadlineScope.launch {
             delay(RelayTransportConfig.ACK_DEADLINE_MS)
             // Acquire the lock ONCE for the post-delay check + map cleanup +
