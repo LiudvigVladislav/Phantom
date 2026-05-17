@@ -45,6 +45,8 @@ import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_ICE
 import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_OFFER
 import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_REJECT
 import phantom.core.messaging.MessagingService
+import phantom.core.transport.CallDisabledReason
+import phantom.core.transport.TransportCapabilities
 
 @Serializable
 private data class IceCandidateJson(
@@ -58,19 +60,26 @@ class CallManager(
     private val messagingService: MessagingService,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     /**
-     * PR-D2a (2026-05-17): guard for outbound call start on Limited
-     * realtime transports. WebRTC needs a stable realtime channel; REST
-     * short-poll fallback cannot carry SDP/ICE/audio at the latency
-     * a call requires. When `false`, [startCall] returns early and
-     * logs `CALL_TX blocked_limited_realtime` so the user-visible
-     * "ringing but never connects" failure mode never happens.
+     * PR-C1 (2026-05-17): defence-in-depth guard for outbound call start.
      *
-     * Default `{ true }` keeps existing tests + tooling untouched.
-     * The Android DI wires this to the same source as `canSendVoice`
-     * (`hybridTransport.stateMachine.state.value == RestMode.WsActive`).
-     * A richer `TransportCapabilities` type lands in C-track PR-C1.
+     * Supplying a lambda rather than a [kotlinx.coroutines.flow.StateFlow]
+     * avoids a Flow dependency in [CallManager]'s constructor. The lambda
+     * reads [AppContainer._transportCapabilities].value on every [startCall]
+     * invocation — always the current snapshot, never stale.
+     *
+     * Default returns a fully-permissive snapshot so existing tests and
+     * tooling that construct [CallManager] directly are unaffected.
      */
-    private val canStartCalls: () -> Boolean = { true },
+    private val transportCapabilitiesProvider: () -> TransportCapabilities = {
+        TransportCapabilities(
+            canSendText = true,
+            canSendVoice = true,
+            canStartCalls = true,
+            realtimeStable = true,
+            callDisabledReason = null,
+            restModeLabel = null,
+        )
+    },
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -111,19 +120,12 @@ class CallManager(
 
     suspend fun startCall(toPubKeyHex: String, toUsername: String) {
         if (_activeCall.value != null) return
-        // PR-D2a — call-layer guard. UI button is gated separately; this
-        // second layer catches programmatic / retry / deep-link paths that
-        // do not flow through the chat top-bar. No state mutation here —
-        // we never enter CALLING, never light up the UI, never touch
-        // AudioManager. The user sees the snackbar from the UI guard;
-        // this path keeps internal state clean if UI somehow let through.
-        if (!canStartCalls()) {
-            android.util.Log.w(
-                "CallManager",
-                "CALL_TX blocked_limited_realtime to=${toPubKeyHex.take(12)} source=call_manager",
-            )
-            return
-        }
+        // PR-C1 — defence-in-depth call-layer guard.
+        // The UI button is gated by ChatScreen; this second layer catches
+        // programmatic / retry / deep-link paths that bypass ChatScreen.
+        // No state mutation occurs on early return — we never enter CALLING,
+        // never touch AudioManager, never construct a PeerConnection.
+        if (!checkCallCapability(transportCapabilitiesProvider())) return  // package-level helper
         val callId = uuid4().toString()
         pendingIceCandidates.clear()
         _activeCall.value = ActiveCall(callId, toPubKeyHex, toUsername, CallState.CALLING)
@@ -416,4 +418,37 @@ class CallManager(
         peerConnectionFactory = null
         scope.cancel()
     }
+}
+
+// ── Package-level guard helper ────────────────────────────────────────────────
+//
+// Kept outside [CallManager] so it can be unit-tested without constructing the
+// WebRTC stack (PeerConnectionFactory / IceServer require native initialisation
+// which is unavailable in JVM unit tests). [CallManager.startCall] delegates
+// to this function.
+//
+// Log format (locked by architect, PR-C1):
+//   CALL_TX blocked_<reason> reason=<reason> mode=<restModeLabel|null> source=call_manager
+// Tag: PhantomTransport (consistent with UI-level CALL_CAPABILITY lines).
+
+/**
+ * Returns `true` if [caps] permits a call to start.
+ * Returns `false` and logs a single `CALL_TX blocked_*` line if not.
+ *
+ * Visible to `androidUnitTest` (same module) and used by [CallManager.startCall].
+ */
+internal fun checkCallCapability(caps: TransportCapabilities): Boolean {
+    if (caps.canStartCalls) return true
+    val reason = when (caps.callDisabledReason) {
+        CallDisabledReason.LIMITED_REALTIME -> "limited_realtime"
+        CallDisabledReason.TOR_TRANSPORT    -> "tor_transport"
+        CallDisabledReason.REALITY_UNPROBED -> "reality_unprobed"
+        CallDisabledReason.NO_TRANSPORT     -> "no_transport"
+        null                                -> "unknown"
+    }
+    android.util.Log.i(
+        "PhantomTransport",
+        "CALL_TX blocked_${reason} reason=${reason} mode=${caps.restModeLabel} source=call_manager",
+    )
+    return false
 }

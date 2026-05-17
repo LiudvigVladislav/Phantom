@@ -61,9 +61,8 @@ const TOKEN_TTL_MS: u64 = 3_600_000;
 const SESSION_CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Per-identity idempotency-key LRU cap: 10 K entries.
-// SAFETY: 10_000 is not zero.
 const IDEMPOTENCY_LRU_CAP: std::num::NonZeroUsize =
-    unsafe { std::num::NonZeroUsize::new_unchecked(10_000) };
+    std::num::NonZeroUsize::new(10_000).unwrap();
 
 /// Idempotency-key TTL: 24 hours.
 const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3_600);
@@ -199,11 +198,10 @@ struct SessionCacheEntry {
 ///
 ///   - `Hit(token)`         → replay; safe to return the cached token.
 ///   - `SignatureMismatch`  → `(identity, challenge)` is in cache but the
-///                            supplied signature does not match the one
-///                            that earned the original token. Handler MUST
-///                            return 401 Unauthorized.
+///     supplied signature does not match the one that earned the original
+///     token. Handler MUST return 401 Unauthorized.
 ///   - `Miss`               → no cached entry for this tuple; handler
-///                            proceeds with the normal verify+consume path.
+///     proceeds with the normal verify+consume path.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CacheLookup {
     Hit(String),

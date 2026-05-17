@@ -41,6 +41,15 @@ kotlin {
     }
 
     sourceSets {
+        // JVM-based unit tests for Android-only code (android.util.Log is stubbed by AGP).
+        // Runs with ./gradlew :apps:android:testDebugUnitTest (no device required).
+        val androidUnitTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+                implementation(project(":shared:core:transport"))
+            }
+        }
+
         androidMain.dependencies {
             implementation(compose.runtime)
             implementation(compose.foundation)
@@ -179,6 +188,14 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    testOptions {
+        // Return default values (null/0/false) for unstubbed Android framework
+        // calls in JVM unit tests. Required for android.util.Log calls inside
+        // checkCallCapability (CallManagerGuardTest). Without this, any Log.*
+        // invocation throws RuntimeException("Method not mocked").
+        unitTests.isReturnDefaultValues = true
     }
 
     // Required by kmp-tor:resource-noexec-tor 409.x (ADR-016 Stage 2).

@@ -12,6 +12,7 @@ pub mod auth;
 pub mod config;
 pub mod envelope;
 pub mod error;
+pub mod media;
 pub mod prekeys;
 pub mod push;
 pub mod rest_fallback;
