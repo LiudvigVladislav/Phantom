@@ -655,10 +655,14 @@ class AppContainer(private val context: Context) {
             signingKeyProvider = { identityManager.loadSigningKeyPair() },
             // PR-C1 (2026-05-17): voice send guard via TransportCapabilities.
             // Single source of truth: transportCapabilities.value.canSendVoice.
-            // Covers Tor (blocked) + Limited realtime (allowed per D2b.2 intent)
-            // + no-transport (blocked). When hybridTransport is null (Alpha 1
-            // record without a signing key), canSendVoice defaults to false
-            // (NO_TRANSPORT reason) — safe conservative fallback.
+            // Voice is allowed ONLY on WsActive + no Tor. Limited realtime
+            // (RestActive/WsCandidate), Tor, and null state all block. The
+            // old D2b voice-over-/relay/send path was parked as
+            // proof-of-concept (PR #166); voice re-opens in Limited realtime
+            // when PR-M1w wires the new media-upload path. When
+            // hybridTransport is null (Alpha 1 record without a signing
+            // key), canSendVoice = false (NO_TRANSPORT reason) — safe
+            // conservative fallback.
             canSendVoice = {
                 val caps = _transportCapabilities.value
                 val allowed = caps.canSendVoice
