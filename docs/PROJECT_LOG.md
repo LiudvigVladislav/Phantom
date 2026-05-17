@@ -491,6 +491,29 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-17 (sun) · PR-D2b.2 + D2b.3a probe parked as proof-of-concept — Test #54/#55 surface real cost: 5-sec voice = 150 chunks × 700 ms ≈ 2 min on Tele2 REST; architect-recommended pivot to PR-M1 (encrypted media upload) + PR-C1 (calls capability gating)
+
+**Branch state.** Draft PR #166 on `feat/pr-d2b2-flip-canSendVoice-and-15s-cap` holds two commits, NOT merged:
+- `89f1bf0c` — PR-D2b.2: `canSendVoice = (WsActive || RestActive || WsCandidate)`, `canStartCalls = WsActive only`; removed D2a voice UI guard in `ChatScreen.onMicClick`; kept call UI guard in `onVoiceCall`; added `VOICE_RECORDER_MAX_DURATION_MS = 15_000L` auto-stop that reuses manual-stop pipeline via local `stopAndSendRecording` val; logs `VOICE_TX recorder_auto_stop`.
+- `89298f37` — PR-D2b.3a probe: `AUDIO_CHUNK_BYTES = 3072 → 256` (temporary diagnostic), 8-field `VOICE_TX size_probe` log (rawBytes/jsonEncoded/padded/paddedB64/bodyBytes etc.), `sendAudio` failure path stamps `MessageStatus.FAILED` on `chunk_send_fail`. Test renamed `sendAudio_returnsFailureAndStampsRowFailed_whenChunkSendRejected`.
+
+**Test #54 (chunk=3072).** `send_oversize`: rawBytes=3072 → REST bodyBytes ≈ 22 288 → REST cap `max_send_body=4096` rejected every chunk. Confirmed: 6.5× JSON-int-array bloat on ratchet `EncryptedMessage` ByteArray serialization is the root multiplier. Architect recommended size-probe instead of blind retune.
+
+**Test #55 (chunk=256).** Probe = PASS at envelope level: rawBytes=256 → bodyBytes ≈ 3672–3856 < 4096, status=201, `chunk_send_ok`. Durable receiver path also confirmed live (`VOICE_RX chunk_received → chunk_decode_ok → chunk_saved source=durable → ack_deliver_send`, `assembly_waiting received=N/total`). End-to-end = FAIL: 38 KB voice / 256 B = **150 chunks × ~700–800 ms = ~100–120 s upload**, UX-unacceptable; user sent a second voice before first completed, creating overlapping 150+166-chunk streams, no `assembly_complete` reached, no UI voice message appeared (intentional — no partial placeholder in v1). On chat re-entry two local outgoing voice rows surfaced — UX bug, not transport bug.
+
+**Architect verdict (2026-05-17).** "Я бы остановил текущую ветку D2b.2/D2b.3 как 'proof-of-concept, не product-ready' и стартовал новый design: PR-M1 — encrypted media upload for voice messages. А для звонков отдельно: PR-C1 — call capability gating + realtime probe design." Reasoning: voice = async store-and-forward media; calls = realtime stream; both share a common Media Core (codec/Opus, mediaKey, chunks, upload/download, manifest, progress, retry/resume) but are distinct transports. Sending voice as 150 ratchet envelopes is structurally wrong for UX even if each envelope succeeds.
+
+**Open paths (no "go" yet from Vladislav).**
+- **A.** Park PR #166 as proof-of-concept; start PR-M1 (encrypted media upload — record → mediaKey → encrypt locally → upload encrypted chunks via REST media endpoint with idempotency → send small E2E voice manifest `{voiceId, mediaKey, duration, mime, chunkCount, sha256}` → receiver GETs + decrypts + inserts one voice row). Tele2 constraints: upload body ~1500–2000 B, tiny responses, GET for download (Tele2 small-GET is reliable per 2026-05-16 diagnostic Layer B).
+- **B.** Stopgap PR-D2b.3b (compact `EncryptedMessage` serialization: ByteArray → base64 string vs JSON int-arrays) → ~5× shrink → ~38 chunks per 38 KB voice instead of 150, plus in-progress guard (`voiceSendInProgress(conversationId)` → block second voice + log `VOICE_TX blocked_send_in_progress`), uploading-state UI, replace misleading "voice too long" copy. Faster to ship but still ratchet-envelope architecture.
+- **C.** PR-C1 in parallel (TransportCapabilities: Limited realtime → calls disabled, Stable realtime → enabled, Tor/REST-only → disabled) + realistic realtime probe (open channel, send upstream frame, receive downstream ack, hold 10–20 s, measure RTT/jitter/loss) — replaces current `/health` proxy. C2 = Reality endpoint pool (multi IP/ASN/SNI/port), C3 = WebRTC+TURN-TLS vs custom Opus-over-Reality.
+
+**Decision pending.** Vladislav to choose A (clean pivot), B→A (stopgap then pivot), or C in parallel. Default per architect: A + C in parallel; M1 unblocks voice, C-track unblocks calls without coupling.
+
+**Source-of-truth artefacts.** Architect transcripts in `C:\Users\felix\OneDrive\Рабочий стол\messages.txt` (Test #55 narrative + Q&A on speed + Q&A on calls-first). Test logs `test55-tecno.log` / `test55-emu.log` already captured. APK still `apps/android/build/outputs/apk/debug/android-debug.apk`.
+
+---
+
 ### 2026-05-17 (sat late night) · PR-D2b.1 merged — durable voice chunk core + sender hardening (still gated by D2a)
 
 **Goal.** Once PR-D2a closed the UX gap on voice/calls in Limited realtime (Test #53 → #53.2 PASS), the next layer is the real fix for voice over REST short-poll: keep the existing chunk-first/encrypt-each architecture from PR #32 (2026-05-04), but make it production-ready on Tele2 LTE. Split D2b into two PRs per architect review: **D2b.1** = durable chunk core + sender hardening; voice on Limited realtime stays gated by D2a until **D2b.2** flips the gate.
