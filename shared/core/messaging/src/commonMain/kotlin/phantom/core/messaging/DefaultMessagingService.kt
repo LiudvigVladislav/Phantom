@@ -139,6 +139,11 @@ class DefaultMessagingService(
      * retry forever than silently drop a voice message).
      */
     private val voiceV2DownloadRepository: VoiceV2DownloadRepository? = null,
+    /**
+     * Download orchestrator for voice_v2 chunks (PR-M1w, Commit 4).
+     * Nullable; when non-null, [runVoiceV2DownloadTask] delegates to it.
+     */
+    private val voiceV2DownloadOrchestrator: VoiceV2DownloadOrchestrator? = null,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -2597,11 +2602,18 @@ class DefaultMessagingService(
     }
 
     /**
-     * Download orchestrator stub. Full implementation in Commit 4 (VoiceV2DownloadOrchestrator).
-     * Called from [handleVoiceV2Manifest] via a scope.launch. The TODO above references this.
+     * Download task dispatcher — delegates to [VoiceV2DownloadOrchestrator] when wired.
+     * Called from [handleVoiceV2Manifest] and the startReceiving finalizer via scope.launch.
+     *
+     * When the orchestrator is null (tests that don't inject it), this is a no-op:
+     * the task row stays PENDING and the UI shows the spinner indefinitely.
+     * Production AppContainer always wires the orchestrator.
+     *
+     * TODO(PR-M1w §8): after Test #56, flip canSendVoice for RestActive/WsCandidate
+     * in TransportCapabilitiesResolver (separate Commit 5 step per design §8).
      */
     internal open suspend fun runVoiceV2DownloadTask(mediaId: String) {
-        // Commit 4 overrides this with the full chunk-GET + reassemble + decrypt + file-write flow.
+        voiceV2DownloadOrchestrator?.runDownloadTask(mediaId)
     }
 }
 
