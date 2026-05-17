@@ -1,0 +1,21 @@
+-- 16.sqm — voice_chunks reassembly table for durable voice receive (PR-D2b.1).
+--
+-- Adds a single new table with no foreign-key references, no impact on
+-- existing rows. Forward-only: every install upgrades cleanly without
+-- a `pm clear`. The table starts empty; first chunk received after the
+-- upgrade populates the first row.
+--
+-- See VoiceChunk.sq for full rationale, columns, and queries.
+
+CREATE TABLE voice_chunks (
+    voice_id          TEXT    NOT NULL,
+    idx               INTEGER NOT NULL,
+    total             INTEGER NOT NULL,
+    conversation_id   TEXT    NOT NULL,
+    sender_pubkey_hex TEXT    NOT NULL,
+    mime_type         TEXT    NOT NULL,
+    duration_ms       INTEGER NOT NULL,
+    chunk_bytes       BLOB    NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (voice_id, idx)
+);
