@@ -361,6 +361,90 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-17 (sat) · Test #51 partial PASS — PR-D1c + D1c.1 merged to master, bootstrap-ordering bug closed end-to-end on Tele2 LTE
+
+**Goal.** Verify PR-D1c (migrate pending WS outbox → REST on mode switch) + PR-D1c.1 (REST session token lifecycle / CAS / mutex / 401 refresh fix) on real hardware. Test #50 (2026-05-16) had reproduced the bootstrap-ordering symptom on Tele2 LTE: the migration logic ran but the very first REST send returned 401 because of three token-cache bugs. PR-D1c.1 fixed all three and was bundled into PR #157.
+
+**Test #51 setup.** Tecno (phone identity `9ecca9679dbc0529…`) on Tele2 LTE Иркутская + emulator-5554 (identity `592cf3c06040…`) on dev Wi-Fi. Fresh install (`pm clear phantom.android` both sides), APK from `feat/pr-d1c-migrate-pending-ws-to-rest` head `61a051f1`, structured `REST_TRACE` capture per `feedback_logcat_format`.
+
+**End-to-end PASS — the full token + migration + REST send chain works.** Compressed phone log timeline:
+
+```
+22:28:24 token_refresh_start reason=bootstrap force=true stale=false   ← PR-D1c.1 acquireOrRefreshToken
+22:28:27 session_response status=200 elapsedMs=673 rest_fallback=true max_body=4096
+22:28:27 token_cached reason=bootstrap expiresInMs=3601017             ← PR-D1c.1 fix #1: bootstrap caches token
+22:28:27 capability_enabled max_body=4096 poll_max_envelopes=1
+22:28:27 bootstrap_ok capability=true
+22:28:27 orchestrator_started
+22:28:27 poll_stopped reason=ws_active                                  ← REST orchestrator dormant while WS is up
+22:29:23 SEND_TRACE send_start id=d2416afe... textLen=3                 ← user sends first message
+22:29:24 relay_send_call id=d2416afe... payloadBytes=1024               ← goes via WS first
+22:29:24 relay_send_return id=d2416afe... ok=true                       ← WS write succeeded, no ACK yet
+22:29:31 counter_tick kind=active count=1 pending_acks=1                ← Tele2 layer A: WS frame upstream dropped
+22:30:03 counter_tick kind=active count=2 pending_acks=1
+22:30:03 mode_switched from=WsActive to=REST_ACTIVE reason=active_outbound_threshold
+22:30:03 migrate_pending_arm from=WsActive to=RestActive                ← PR-D1c migration ARMs
+22:30:03 poll_started mode=RestActive
+22:30:03 token_reused reason=poll expiresInMs=3505198                   ← PR-D1c.1 fix #2: Mutex serialises, single cache
+22:30:03 migrate_pending_start count=1                                  ← PR-D1c picks up the WS outbox
+22:30:03 migrate_pending_send id=d2416afe seq=1 bodyBytes=1808
+22:30:03 token_reused reason=send expiresInMs=3505190                   ← PR-D1c.1 fix #3: token re-acquired inside loop
+22:30:04 send_response id=d2416afe status=201 elapsedMs=577             ← REST send succeeded with cached token
+22:30:04 migrate_pending_ok id=d2416afe status=201
+22:30:04 migrate_pending_done ok=1 failed=0
+```
+
+Emulator side (same `d2416afe` envelope landing via REST poll on the receiver's side after the sender migrated it):
+
+```
+03:30:54 handleDeliver start: id=d2416afe... sealed=true payloadBytes=1368
+03:30:54 Sender identified: 9ecca9679dbc0529...
+03:30:54 Bootstrapping recipient session: conv=592cf3c06040...
+03:30:54 Decrypt OK after bootstrap: plaintextBytes=62                  ← X3DH/double-ratchet session created
+03:30:54 Payload parsed: type=message textLen=3
+03:30:54 DB insertMessage OK
+03:30:54 Creating new conversation as REQUEST
+```
+
+The "Decrypt OK after bootstrap" line is the smoking gun. Before PR-D1c the bootstrap envelope was lost when the state machine flipped mid-flight, so the receiver got the *second* message first and had no session — that was the original Test #49/#50 symptom.
+
+**Steady-state validation — REST orchestrator runs cleanly for the full session.** After the first send, the phone stays in `RestActive` and every subsequent send/poll/ack reuses the cached token: `token_reused reason=send` / `reason=poll` / `reason=ack` on every operation, zero additional `/auth/session` calls, all `send_response status=201`. Five more text messages exchanged both directions over ~3 minutes: all delivered, all decrypted, all ack'd. Duplicate envelopes from REST poll redelivery handled by the H2b ledger guard (`inbound_skip_already_processed id=…`).
+
+**What's closed and what's still open after Test #51.** Mapping each architectural concern from Test #48/#49 to its current state on master:
+
+| Concern | Status after Test #51 |
+|---|---|
+| Direct probe rejecting healthy `/health` on Tele2 | ✅ closed by PR-R0.3 — `direct.result ok=true totalMs=611` |
+| REST capability discovery | ✅ closed by PR-D0r/D1/D1b — `rest_fallback=true max_body=4096` advertised, client honours |
+| WS→REST mode switch | ✅ closed — `mode_switched from=WsActive to=REST_ACTIVE reason=active_outbound_threshold` fires correctly |
+| Pending WS outbox migration to REST | ✅ closed by PR-D1c — `migrate_pending_arm/start/send/ok/done` runs end-to-end |
+| Bootstrap envelope ordering across mode switch | ✅ closed by PR-D1c — receiver gets bootstrap envelope first, X3DH session created |
+| REST session token cached after bootstrap | ✅ closed by PR-D1c.1 fix #1 — `token_cached reason=bootstrap` then `token_reused` on every subsequent op |
+| Concurrent token-refresh race | ✅ closed by PR-D1c.1 fix #2 — `Mutex` + CAS via `staleToken` parameter |
+| 401 refresh propagates to retry attempts | ✅ closed by PR-D1c.1 fix #3 — token acquired inside the retry loop |
+| Text delivery via REST end-to-end | ✅ confirmed — six messages each direction, all received and decrypted |
+| ACK-after-save / inbound deduplication | ✅ confirmed — H2b ledger guard handles REST redelivery |
+| **WS→REST latency** | ❌ **~40 s** wait for 2 active counter ticks — UX-blocker for next PR |
+| **Voice over REST** | ❌ blocked — `route_send` shows 11–55 KB voice chunks rejected by `send_oversize max=4096` cap |
+| Prekey publish response timeout occasionally | ❗ minor — one `upload_fail SocketTimeoutException elapsedMs=183696` on the phone log, did not block Test #51 (prekeys were already valid) |
+
+**Merge decision.** Vladislav verdict: merge. Reliability fix is proven on real hardware; the remaining UX latency and voice gaps are next-PR scope, not D1c scope. PR #157 was already `MERGEABLE / CLEAN` with head `61a051f1` (PR #158 had been bundled into the D1c branch as a merge commit on 2026-05-16). Squash-merged to master as `d7a05273` with a commit message that enumerates the three D1c.1 token-lifecycle fixes and the Test #51 evidence. Branch `feat/pr-d1c-migrate-pending-ws-to-rest` deleted.
+
+**Next-PR plan locked.** Discussion converged on three follow-ups in priority order:
+
+1. **PR-D1d — fast active-outbound degrade.** The 40-second wait for two counter ticks is the dominant UX cost in Test #51. New mechanism: when an envelope enters `pendingAcks` over WS, arm a per-envelope ACK deadline timer = 10 s. If ACK for that `msg_id` does not arrive before the deadline, emit `RestStateMachine.Event.ActiveOutboundAckTimeout(msg_id, ageMs)` and switch `WS_ACTIVE → REST_ACTIVE` immediately; PR-D1c migration then picks up the same envelope and delivers it over REST. Reset condition is strict: timer is cancelled **only** by ACK on the same envelope-id (not by any incoming WS frame — partial socket liveness ≠ ACK for our outbound envelope). 10 s chosen over 8 s (false-positive risk on radio wake / weak LTE) and over 15 s (still feels slow). Expected outcome on Tele2: first message latency drops from ~40-60 s to ~10-15 s. Council not requested — the trade-off is well-defined and the empirical baseline (`pingInterval(15s)` already deployed in Run C on healthy WS) is the safety margin. New `REST_TRACE` lines: `ack_deadline_armed id=… timeoutMs=10000` / `ack_deadline_cancelled id=… reason=ack_received` / `ack_deadline_expired id=… ageMs=10000` / `mode_switched … reason=active_outbound_ack_timeout`. Test #52 acceptance: first phone→emu text under 15 s, no false REST switch on emulator direct smoke.
+2. **PR-D2a — UI gating for voice in `Limited realtime`.** Honest stop-gap before D2b. When `RestStateMachine.state == RestActive`, the chat composer must either disable the voice button or surface a message: "Голосовые временно недоступны в режиме Limited realtime. Текстовые сообщения доставляются через резервный канал." / "Voice messages are temporarily unavailable in Limited realtime mode. Text messages are delivered via REST fallback." Stops the user from believing a 55 KB voice envelope "sent" when it was rejected client-side by `send_oversize`. Small PR, no protocol changes.
+3. **PR-D2b — voice-over-REST chunking.** Larger protocol work: target REST body ≤ 2-3 KB per chunk (well under the 4096 cap), receiver reassembles with sequence ordering + retry + reassembly timer. Not merged with D2a — separate scope, separate review pass. Sequenced after D1d.
+
+**Deferred follow-ups.**
+- **Prekey upload response timeout fallback (PR-R0.5 / PR-PK1).** After POST `/prekeys/publish` times out, query `GET /prekeys/status`; if the server already shows fresh prekeys, treat the upload as successful. Same root cause as Tele2 Layer B (POST upstream OK, response dropped downstream). Low priority — did not block Test #51.
+- **`mirror_envelope_to_rest_store` `from: ""` for sealed-sender envelopes** still queued from 2026-05-16; not surfaced by Test #51 because sealed-sender is the Alpha-2 default.
+
+**Process notes.**
+- Confirmed PR-D1c.1 was already inside PR #157 (head OID `61a051f1`) before squash-merging. The `gh pr view 157 --json` cross-check is a cheap habit; running it before every cross-PR merge has saved at least one "merged the wrong head" near-miss already.
+- Architect (sub-agent) framed PR-D1d threshold question as "8 / 10 / 15 s, per-envelope vs global, reset on any incoming frame vs only ACK-of-same-id". Three trade-off pairs in one prompt. Vladislav picked the strictest answer set on all three. Saving here so the next session does not re-litigate the same questions: **10 s, per-envelope, reset only by ACK(same-id)**.
+- Squash-merge commit body for PR #157 was crafted to enumerate the three D1c.1 fixes + Test #51 evidence + known follow-ups. Future `git log` greps for the bootstrap-ordering bug will find this commit directly without needing to walk the PR branch history.
+
 ### 2026-05-16 (fri) · Tele2 reliability Round 2 + REST fallback transport — PR-R0.2/R0.3/R0.4a/R0.4b + PR-D0r + PR-D1 all merged
 
 **Six PRs merged on master in one day.** Two threads: (1) finish the Tele2 reliability sprint that started 2026-05-15, (2) discover a deeper Tele2 failure mode (WS frame layer is dropped after handshake) and design + ship the REST short-poll fallback transport.
