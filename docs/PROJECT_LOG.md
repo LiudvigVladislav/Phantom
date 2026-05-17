@@ -355,11 +355,212 @@ on advice that references prior commits — even from another LLM.
 
 ---
 
+## Open follow-ups / unfinished items
+
+> **Maintenance rule.** Any session that ships a PR or makes a non-trivial
+> decision must check this list — append items that are deferred, mark
+> items that landed, and avoid duplicating across the Session journal.
+> This is the durable "what's not done" snapshot — Session journal entries
+> tell the story, this list answers "what's still on the queue".
+
+### Reliability / transport (D-track, post-D1d)
+
+- **PR-D2a — Voice UI + send-layer guard for Limited realtime.** Two-level
+  guard: (1) voice button disabled when `RestStateMachine.current != WsActive`
+  with snackbar copy "Голосовые временно недоступны в режиме Limited
+  realtime. Текстовые сообщения доставляются через резервный канал."; (2)
+  send pipeline blocks audio_chunk creation and logs
+  `VOICE_TX blocked_limited_realtime mode=<state>`. Scope is strictly
+  guard-only — no transport, DB, crypto, chunking, or receiver changes.
+  If a call button already surfaces in UI, gate it identically.
+  Acceptance: voice blocked on Limited realtime, allowed on WsActive,
+  text continues to work, structured log entry present.
+- **PR-D2b — Voice-over-REST chunking.** Real fix. Pre-encrypt chunking
+  targeting body 2500–3000 b (hard cap 4096 b). `audio_chunk` envelope
+  with `voiceId / index / total`. Receiver assembles by voiceId; ACK
+  fires only after chunk persisted. Final DB insert is a single voice
+  message after `assembly_complete`. Required logs:
+  `VOICE_TX chunk_prepare / chunk_send_rest`,
+  `VOICE_RX chunk_received / chunk_saved / assembly_complete /
+  message_insert_ok`, `REST_TRACE ack_after_save id=...`.
+  Acceptance: voice 5–10 s round-trips on Tele2 in both directions,
+  zero `send_oversize`, no duplicate processing in relay, ACK strictly
+  after save.
+- **PR-R0.5 / PR-PK1 — Prekey upload response-drop fallback.**
+  `/prekeys/publish` POST body lands server-side (Caddy shows 201 ~3 ms)
+  but the 18-byte response is dropped downstream on Tele2 ~30 s of the
+  time, causing client `SocketTimeoutException` and retries. Low-impact
+  because three retries currently mask it, but burns 30 s × 3 per
+  attempt. Fix idea: after POST timeout, GET `/prekeys/status/<identity>`;
+  if `opks_remaining` / `spk_key_id` updated to expected post-upload
+  values → treat upload as success (soft-success path). **Priority: low.**
+- **PR-D0r follow-up — Sealed-sender empty mirror.** Mirror envelope to
+  REST store with `from=from_identity` when sealed_sender is empty
+  (review note from PR-D0r round). Currently not blocking but should
+  be closed before next REST API surface change.
+- **WS keepalive on Tele2 — diagnostic open.** Phone-side
+  `inbound_frames=0 pings_received=0` across every WS session lifetime
+  (~31 s) on Tele2 LTE. Direct WS is honest "Online via Direct · Limited
+  realtime" because realtime is unreliable; REST fallback covers
+  text. Not actionable today — covered by D-track REST design. If C-track
+  resurrects WS as a primary realtime path it must include a Tele2
+  keepalive answer (server-side TCP keepalive alone is insufficient
+  per Test #48 evidence).
+
+### Calls (C-track — Standalone realtime stream)
+
+Calls are intentionally **NOT** in the D-track. WebRTC needs a stable
+realtime channel; REST short-poll cannot carry voice/video at acceptable
+latency.
+
+- **C1 — TransportCapabilities for calls.** A unified `TransportCapabilities`
+  type (`text / voiceMessages / calls / realtimeUdp`) drives UI gating
+  honestly. Call button must be disabled when transport ≠ stable realtime.
+  Today this state is implicit; an explicit type is required before any
+  attempt to ship calls on Limited realtime networks.
+- **C2 — Reality endpoint pool with realistic probe.** Today `/health`
+  passes but WS realtime is dead — health check is a false-positive.
+  Probe must include a real WS handshake + first frame exchange and
+  iterate across multiple endpoints (different IP / ASN / SNI / port).
+  First stable endpoint wins.
+- **C3 — Realtime call transport.** Two candidate paths, both
+  blocked on C2 evidence: (A) WebRTC + TURN-over-TLS on 443;
+  (B) custom low-bitrate Opus stream over Reality WebSocket with
+  jitter buffer + push-to-talk fallback. Decide after C2 measures
+  what Tele2 actually allows.
+
+### Repo / docs
+
+- **`docs/calls-experimental` ADR refresh.** Track A item #4 marked
+  ✅ merged but the doc itself is now out of date relative to the C-track
+  plan. Update or supersede.
+- **`KNOWN_ISSUES.md` Tele2 entry.** Should add a plain-English entry
+  describing the Tele2 LTE realtime limitation (text via REST works,
+  voice queued for D2b, calls unsupported until C-track) so external
+  users hitting "Online via Direct · Limited realtime" can read what
+  it means.
+
+### Historical / paused
+
+- **Phase 1 connectivity matrix (Tests #43-#47).** Paused 2026-05-15
+  per strategic pivot; resumes if priority shifts back. Scope reference
+  intact in memory `project_phase1_scope_2026_05_14`.
+- **Tor bridge BridgeDB-on-device fetcher.** Deferred (Briar doesn't
+  have one either — bridge freshness, not the fetcher, is the bottleneck).
+- **Cross-operator testing (Beeline / Megafon).** Blocked on hardware:
+  Tecno SIM is Wi-Fi only; second phone with mobile data still incoming.
+- **Tor-bridge rotation ADR.** Architect-recommended retrospective,
+  not started.
+
+---
+
 ## Session journal
 
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-17 (sat) · Test #52 PASS — PR-D1d merged, fast active-outbound ACK deadline closes the ~40 s WS→REST latency gap on Tele2 LTE
+
+**Goal.** Verify PR-D1d (10 s per-envelope ACK deadline) on the same
+Tele2 LTE Иркутская hardware that exposed the ~40 s `active_outbound_threshold`
+latency in Test #51, and merge if the contract holds.
+
+**Test #52 setup.** Tecno `103603734A004351` on Tele2 LTE Иркутская +
+emulator-5554 on dev Wi-Fi. APK from `feat/pr-d1d-active-outbound-ack-deadline`
+head `5859f306` (PR-D1d + round-1 hardening `armAckDeadlineLocked` cancels
+any pre-existing Job before replacement). Structured `REST_TRACE` +
+`PhantomRelay` capture per `feedback_logcat_format`.
+
+**Acceptance — fast active-outbound degrade.** First stuck outbound
+envelope migrates to REST after exactly the configured `ACK_DEADLINE_MS=10000`,
+not after 2× WS session deaths (~40–60 s). Phone-side timeline of
+`397df3c7` (first text after bootstrap):
+
+```
+23:59:05.459  Sending envelope: id=397df3c7 seq=1 sealed=true payloadBytes=1368
+23:59:05.460  outbound_ack_deadline_armed id=397df3c7 timeoutMs=10000
+23:59:15.464  outbound_ack_deadline_expired id=397df3c7 ageMs=10004    ← timer fires at 10 s
+23:59:15.468  mode_switched from=WsActive to=REST_ACTIVE reason=active_outbound_ack_timeout
+23:59:15.469  migrate_pending_arm from=WsActive to=RestActive
+23:59:15.475  migrate_pending_send id=397df3c7 seq=1 bodyBytes=1808
+23:59:16.130  send_response id=397df3c7 status=201 elapsedMs=625        ← REST POST success
+23:59:16.130  migrate_pending_ok id=397df3c7 status=201
+23:59:16.131  migrate_pending_done ok=1 failed=0
+```
+
+Total user-visible latency from `send_start` to relay-accepted = **~11 s**
+(10 s deadline + 0.6 s REST POST). Test #51 baseline was ~40 s on the
+same network.
+
+Emulator received the migrated envelope correctly:
+
+```
+05:00:06.484  Received envelope: id=397df3c7 sealed=true payloadBytes=1368
+05:00:06.532  Decrypt OK after bootstrap: plaintextBytes=62
+05:00:06.539  Payload parsed: type=message textLen=3
+05:00:06.567  handleDeliver DONE for id=397df3c7 (ack-deliver sent)
+```
+
+**Acceptance — healthy ACK path cancels deadline.** Emulator → phone
+`7cc11e42` (steady-state direction, ACK arrives within ~100 ms):
+
+```
+05:00:13.151  Sending envelope: id=7cc11e42 seq=1 payloadBytes=1368
+05:00:13.152  outbound_ack_deadline_armed id=7cc11e42 timeoutMs=10000
+05:00:13.255  outbound_ack_deadline_cancelled id=7cc11e42 reason=ack_received
+05:00:13.255  Ack from relay: id=7cc11e42 status=delivered
+```
+
+Timer armed → cancelled within 100 ms. No false REST switch on a healthy
+WS frame. Helper invariant (one pendingAck msgId ⇒ at most one active
+deadline Job) holds.
+
+**Acceptance — subsequent texts route through REST cleanly.** After the
+first envelope migrates, the orchestrator stays in `RestActive` for the
+rest of the session. Tele2 → emu (`3d92286f`, `46411fcd`, `30c2ab4d`)
+and emu → Tele2 (`d7183d3e`, `8f590e1`, `b635b761`) all complete with
+`status=201` + REST poll + decrypt OK. Six texts round-tripped over
+~3 minutes on Tele2 LTE.
+
+**Tele2 baseline acknowledged.** Phone-side WS continues to die every
+~31 s (`SocketTimeoutException: sent ping but didn't receive pong within
+15000ms (after 0 successful ping/pongs)`) — server sees `pings_received=0
+inbound_frames=0` as before. This is the Test #48 Tele2 Layer A profile
+that REST fallback was designed for; the WS-death cadence is **not** a
+D1d regression. D1d's contract is "do not wait for the WS to die to
+notice the outbound is stuck", which is exactly what the logs show.
+
+**Voice / calls confirmed out-of-scope for this PR.** Test #52 logs
+contain zero `audio_chunk` / `VOICE_TX` / `VOICE_RX` lines. Media
+delivery on Limited realtime networks is the next track:
+
+- **PR-D2a** (next, this session) — UI + send-layer guard so voice on
+  Limited realtime fails fast with a clear message instead of "recorded
+  and disappeared".
+- **PR-D2b** — voice-over-REST chunking (body ≤ 4096 b, ACK after save,
+  receiver reassembly).
+- **C-track** — calls on a stable realtime channel (Reality endpoint
+  pool with realistic probe, then TURN-TLS or custom Opus-over-Reality).
+
+See [Open follow-ups](#open-follow-ups--unfinished-items) above for the
+full queue.
+
+**Key commits / PRs.**
+
+- PR #160 (squash-merged as `3e4293c3`) — `feat(transport): PR-D1d —
+  fast active-outbound ACK deadline (10s per-envelope timer)`.
+- Round-1 hardening commit `5859f306` (one-liner in
+  `armAckDeadlineLocked`: `ackDeadlineJobs.remove(msgId)?.cancel()`
+  before replacement, preserves "at most one Job per msgId" invariant).
+- PR #159 (squash-merged as `67cfd0b0`) — Test #51 entry + MASTER_TIMELINE
+  bump.
+- 5 production removal sites for `pendingAcks` routed through
+  `removePendingAckLocked` / `clearAllPendingAcksLocked` helpers; 2
+  insertion sites (`send()` + flush re-track) route through
+  `armAckDeadlineLocked`. State machine remains a pure reducer;
+  HybridRelayTransport does the `state == RestMode.WsActive` mode-check
+  before submitting the event.
 
 ### 2026-05-17 (sat) · Test #51 partial PASS — PR-D1c + D1c.1 merged to master, bootstrap-ordering bug closed end-to-end on Tele2 LTE
 
