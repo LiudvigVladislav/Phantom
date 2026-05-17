@@ -1417,7 +1417,16 @@ class DefaultMessagingServiceTest {
     // and throws out of the runCatching loop on `false`.
 
     @Test
-    fun sendAudio_returnsFailureAndKeepsMessageQueued_whenChunkSendRejected() = runTest {
+    fun sendAudio_returnsFailureAndStampsRowFailed_whenChunkSendRejected() = runTest {
+        // PR-D2b.3a (2026-05-17): renamed + extended. Pre-D2b.3a the row
+        // stayed at `QUEUED` and no `updateStatus` was issued — the UI
+        // then showed three undelivered voices labelled as if they had
+        // gone through (Test #54 surfaced this on Tecno). Post-D2b.3a:
+        // on any deterministic send-loop failure we issue
+        // `updateStatus(localMsgId, FAILED)` so the chat surface reflects
+        // the truth. The FakeMessageRepository records every status
+        // update in `statusUpdates` without mutating the original row,
+        // so we assert against the map.
         LibsodiumInitializer.initialize()
         val transport = FakeRelayTransport()
         // First send succeeds, every subsequent send returns false to model
@@ -1456,14 +1465,17 @@ class DefaultMessagingServiceTest {
 
         assertEquals(true, result.isFailure,
             "sendAudio must surface failure when transport.send rejects a chunk")
-        // The local DB row was inserted before the loop, so it MUST stay
-        // visible to the UI — but at status QUEUED, never flipped to SENT,
-        // so the user sees "not yet delivered" instead of "sent" while
-        // half the chunks silently never reached the relay.
+        // The local DB row was inserted before the loop and is still
+        // visible to the UI. Its initial inserted-status was QUEUED;
+        // the FakeMessageRepository does not mutate the entity in-place
+        // on updateStatus (it records the change in `statusUpdates`),
+        // so the entity's `.status` field stays at the inserted value.
         val audioRow = msgRepo.messages.single { it.plaintextCache?.startsWith("[AUDIO:") == true }
         assertEquals(MessageStatus.QUEUED, audioRow.status)
-        // No success-side updateStatus(localMsgId, SENT) ever fired.
-        assertEquals(null, msgRepo.statusUpdates[audioRow.id])
+        // PR-D2b.3a: the failure handler MUST have stamped the row as
+        // FAILED via updateStatus — that is what flips the chat surface
+        // from "looks sent" to "send failed" after Test #54.
+        assertEquals(MessageStatus.FAILED, msgRepo.statusUpdates[audioRow.id])
         // Exactly two `transport.send` calls — chunk 0 succeeded, chunk 1
         // was rejected and threw out of the loop before chunk 2 would have
         // been tried (there is no chunk 2 here — total = 2 — but the

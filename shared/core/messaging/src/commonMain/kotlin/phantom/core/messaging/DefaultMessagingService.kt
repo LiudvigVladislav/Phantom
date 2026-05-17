@@ -167,23 +167,24 @@ class DefaultMessagingService(
 
     companion object {
         const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
-        // PR-D2b.1 (2026-05-17): shrunk from 8 KB → 3 KB so envelopes pass
-        // the REST short-poll body cap. Background: D1c+D1d turned REST
-        // into a first-class transport for text on Tele2 LTE; D2a closed
-        // voice on that path as a temporary guard after Test #53.1 showed
-        // a real envelope `bodyBytes=7608 > max=4096` on the migrate path
-        // for the old 8 KB chunk. D2b is doing voice over REST properly,
-        // so every chunk envelope must stay under `max_send_body_bytes`
-        // (server-side cap = 4096; client-side target ≈ 2.5–3 KB ciphertext
-        // for headroom). 3 KB raw input + Ratchet + JSON wrap + Base64 +
-        // padding empirically lands around 3.5–4 KB on the wire. If real
-        // device logs show `chunk_prepare` envelopeBytes > 4096 even at
-        // 3 KB, shrink further to 2 KB — the `VOICE_TX chunk_prepare`
-        // log line carries the exact `envelopeBytes` so this is empirical,
-        // not theoretical. Group voice (`DefaultGroupMessagingService`)
-        // references this same constant, so group voice gets the smaller
-        // chunks too — accepted side effect documented in the PR body.
-        const val AUDIO_CHUNK_BYTES = 3 * 1024          // 3 KB plaintext per chunk; tuned for REST fallback envelope cap
+        // PR-D2b.3a probe (2026-05-17): temporarily shrunk from 3 KB → 256 B
+        // for the size-probe pass after Test #54. Background: 3 KB raw chunks
+        // produced 22 KB REST bodies (5.5× over the 4096 cap) and every
+        // chunk failed with `send_oversize`. `MessagePadding.BLOCK_SIZE = 256`
+        // is NOT the 16 KB floor — the bloat lives in `json.encodeToString`
+        // of `EncryptedMessage` where ByteArray fields become JSON int-arrays
+        // (each byte renders as `"127,"` ≈ 4 chars), so ~6.5× expansion is
+        // structural, not proportional to audio bytes. We need empirical
+        // numbers before choosing a real fix: at 256 B raw, do REST bodies
+        // get under 4096, or does the int-array overhead dominate regardless?
+        // The `VOICE_TX size_probe` log (added in the chunk loop below)
+        // records all eight intermediate sizes per chunk so the next round
+        // can pick between (A) finalise a small AUDIO_CHUNK_BYTES, or (B)
+        // change `EncryptedMessage` ByteArray serialisation to base64 strings.
+        // Group voice (`DefaultGroupMessagingService`) references this same
+        // constant, so it gets the probe size too — accepted for the probe
+        // run; the final D2b.3b PR may need a per-call-site override.
+        const val AUDIO_CHUNK_BYTES = 256          // PR-D2b.3a probe — final value chosen after Test #55
 
         // PR-G1 (2026-05-12): hard cap for the prekey-bundle HTTP fetch on
         // the send-bootstrap path. Without this, a slow / dead
@@ -640,7 +641,7 @@ class DefaultMessagingService(
             "VOICE_TX send_start voiceId=${voiceId.take(8)} totalChunks=$total rawBytes=${audioBytes.size} chunkSizeBytes=$AUDIO_CHUNK_BYTES",
         )
 
-        return runCatching {
+        val result = runCatching {
             for (i in 0 until total) {
                 val start = i * AUDIO_CHUNK_BYTES
                 val end = minOf((i + 1) * AUDIO_CHUNK_BYTES, audioBytes.size)
@@ -670,19 +671,49 @@ class DefaultMessagingService(
                 val paddedCiphertext = MessagePadding.pad(ciphertext)
                 val envelopeId = uuid4().toString()
 
+                // PR-D2b.3a probe (2026-05-17): hoist `sealedSender` and the
+                // base64 payload encoding out of the inline `transport.send`
+                // call so we can log their sizes before submission. The
+                // values themselves are identical to the inlined version —
+                // this only changes when we measure them.
+                val sealedSenderBytes = SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                val sealedSenderB64 = Base64.encode(sealedSenderBytes)
+                val paddedB64 = paddedCiphertext.encodeBase64()
+
                 messagingLog(
                     MessagingLogLevel.INFO,
                     "VOICE_TX chunk_prepare voiceId=${voiceId.take(8)} idx=$i/$total rawBytes=${slice.size} envelopeBytes=${paddedCiphertext.size} envelopeId=${envelopeId.take(8)}",
+                )
+
+                // PR-D2b.3a probe: detailed size breakdown per chunk so the
+                // post-Test #55 analysis can choose between micro-chunks
+                // (Scenario A) and EncryptedMessage base64 serialisation
+                // (Scenario B). Key field for the choice is
+                // `jsonEncodedEncryptedBytes`: if it stays large (~5 KB+)
+                // even on a 256-byte raw chunk, the bloat is structural
+                // (ByteArray→JSON int-array) and shrinking raw further
+                // will not help. If it scales with `audioRawBytes`, a
+                // smaller final `AUDIO_CHUNK_BYTES` is enough.
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_TX size_probe voiceId=${voiceId.take(8)} idx=$i/$total " +
+                        "audioRawBytes=${slice.size} " +
+                        "audioChunkB64Chars=${chunkBase64.length} " +
+                        "jsonPayloadPlaintextBytes=${payloadBytes.size} " +
+                        "jsonEncodedEncryptedBytes=${ciphertext.size} " +
+                        "paddedCiphertextBytes=${paddedCiphertext.size} " +
+                        "sealedSenderBytes=${sealedSenderBytes.size} " +
+                        "sealedSenderB64Chars=${sealedSenderB64.length} " +
+                        "paddedB64Chars=${paddedB64.length} " +
+                        "envelopeId=${envelopeId.take(8)}",
                 )
 
                 val sent = transport.send(
                     RelayMessage.Send(
                         to = recipientPublicKeyHex,
                         from = "",
-                        sealedSender = Base64.encode(
-                            SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                        ),
-                        payload = paddedCiphertext.encodeBase64(),
+                        sealedSender = sealedSenderB64,
+                        payload = paddedB64,
                         messageId = envelopeId,
                     )
                 )
@@ -716,6 +747,31 @@ class DefaultMessagingService(
                 "VOICE_TX send_complete voiceId=${voiceId.take(8)} totalChunks=$total",
             )
         }
+
+        // PR-D2b.3a (2026-05-17): on any deterministic failure during the
+        // chunk loop (transport.send returning `false` on `send_oversize`,
+        // a crypto exception, a repository write throwing, etc.), stamp
+        // the local placeholder row as `FAILED` so the chat UI no longer
+        // shows the voice as "sent". Test #54 surfaced the symptom: three
+        // partial sendAudio() calls failed at the first chunk with
+        // `send_oversize`, but the local rows stayed `QUEUED` with
+        // `sent=true`, so the user saw three undelivered voices labelled
+        // as if they had gone through. Wrapped in `runCatching` because
+        // the DB update is best-effort — we already failed the send;
+        // a DB hiccup here should not mask the original failure.
+        if (result.isFailure) {
+            val cause = result.exceptionOrNull()
+            val reason = cause?.let { it::class.simpleName } ?: "unknown"
+            val message = cause?.message?.take(120) ?: ""
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "VOICE_TX send_failed voiceId=${voiceId.take(8)} reason=$reason message=$message",
+            )
+            runCatching {
+                messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
+            }
+        }
+        return result
     }
 
     override suspend fun startReceiving() {
