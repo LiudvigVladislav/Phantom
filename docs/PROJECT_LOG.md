@@ -365,16 +365,23 @@ on advice that references prior commits — even from another LLM.
 
 ### Reliability / transport (D-track, post-D1d)
 
-- **PR-D2a — Voice UI + send-layer guard for Limited realtime.** Two-level
-  guard: (1) voice button disabled when `RestStateMachine.current != WsActive`
-  with snackbar copy "Голосовые временно недоступны в режиме Limited
-  realtime. Текстовые сообщения доставляются через резервный канал."; (2)
-  send pipeline blocks audio_chunk creation and logs
-  `VOICE_TX blocked_limited_realtime mode=<state>`. Scope is strictly
-  guard-only — no transport, DB, crypto, chunking, or receiver changes.
-  If a call button already surfaces in UI, gate it identically.
-  Acceptance: voice blocked on Limited realtime, allowed on WsActive,
-  text continues to work, structured log entry present.
+- **✅ PR-D2a — Voice / call UI + send-layer guard for Limited realtime.**
+  Merged 2026-05-17 night as PR #162 (master `210b827f`). Two-layer
+  guard: UI in `ChatScreen.onMicClick` + `onVoiceCall` (Snackbar
+  refusal at gesture start + `MEDIA_CAPABILITY blocked
+  feature=voice|call mode=<state> source=ui` log), send layer in
+  `DefaultMessagingService.sendAudio` (`VOICE_TX blocked_limited_realtime
+  … source=send_layer`) and `CallManager.startCall` (`CALL_TX
+  blocked_limited_realtime … source=call_manager`). Voice guard also
+  tears down an in-progress recorder cleanly if transport degrades
+  mid-recording. Snackbar copy lives in `res/values/strings.xml` —
+  EN-only for now to match the rest of the inline-EN chat UI (Test
+  #53.1 evidence: a `values-ru/` translation just for D2a strings
+  disagreed with the surrounding EN UI on RU-locale devices). Verified
+  end-to-end on Tecno `103603734A004351` (Tele2 LTE Иркутская) across
+  Test #53 → #53.1 → #53.2. Voice on REST **is still not delivered**
+  by D2a — it is refused politely instead of silently failing. The
+  real fix is PR-D2b.
 - **PR-D2b — Voice-over-REST chunking.** Real fix. Pre-encrypt chunking
   targeting body 2500–3000 b (hard cap 4096 b). `audio_chunk` envelope
   with `voiceId / index / total`. Receiver assembles by voiceId; ACK
@@ -459,6 +466,157 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-17 (sat night) · PR-D2a merged — UX guard for voice/calls on Limited realtime + EN-only Snackbar (Test #53 → #53.1 → #53.2 PASS)
+
+**Goal.** Once PR-D1d closed the ~40 s text-message latency on Tele2
+LTE, the next user-visible failure mode was voice messages and calls
+silently dying on `RestActive`: REST short-poll caps the body at
+4096 bytes, an `audio_chunk` envelope is 11–55 KB, and WebRTC cannot
+work over a poll loop at all. The temporary fix — gate both features
+at the UI and at the send/call layer when the orchestrator is not
+in `WsActive`, with a clear English Snackbar — buys the real fix
+(PR-D2b voice-over-REST chunking, plus the separate C-track for
+calls) room to land without leaving the user staring at a recorder
+that never sends or a call screen that never rings.
+
+**Contract locked with Vladislav 2026-05-17.** Source of truth =
+`RestStateMachine.current` (not display text). Two-layer guard:
+ChatScreen blocks at the gesture, `DefaultMessagingService.sendAudio`
++ `CallManager.startCall` block at the send layer for any path that
+bypasses the UI (programmatic, deep-link, retry). Rule:
+`voiceAllowed == callsAllowed == (mode == null || mode == WsActive)`
+— `null` covers Alpha 1 / pre-bootstrap where there is no hybrid
+transport object. Structured logs on every guard hit so the path
+is visible in `PhantomHybrid:V` capture without describing what
+was on screen. Scope strictly guard-only — no transport / crypto /
+DB / chunking change; voice on REST gets its real fix in PR-D2b.
+
+**Implementation (PR #162 → squash `210b827f`).** Three commits
+folded into one squash merge:
+
+- **D2a (initial).** `DefaultMessagingService` adds
+  `canSendVoice: () -> Boolean = { true }` ctor param; `sendAudio`
+  returns `Result.failure(IllegalStateException(...))` and logs
+  `VOICE_TX blocked_limited_realtime conv=… audioBytes=… source=send_layer`
+  (default `{ true }` preserves existing tests). `CallManager` adds
+  `canStartCalls: () -> Boolean = { true }`; `startCall` returns
+  early + `CALL_TX blocked_limited_realtime to=… source=call_manager`
+  — no `CALLING` state transition, no `AudioManager` touch on a
+  closed gate. `AppContainer` wires both lambdas to the same source
+  (`hybridTransport?.stateMachine?.state?.value == RestMode.WsActive`),
+  `null` returns `true`. ChatScreen `onMicClick` + `onVoiceCall`
+  Snackbar refusal at gesture start; mic guard also tears down
+  any in-progress recorder (`mediaRecorder.stop/release/null` +
+  `audioFile.delete`) if the transport degrades mid-recording so
+  the user sees the Snackbar instead of a silent send-then-fail.
+- **D2a.1 (localisation + UI observability).** Snackbar copy moved
+  out of inline Kotlin into Android string resources
+  (`res/values/strings.xml` EN). UI guard sites add
+  `Log.w("PhantomHybrid", "MEDIA_CAPABILITY blocked feature=voice|call
+  mode=$mode source=ui recording_in_progress=…")`. Existing send-layer
+  logs extended with `source=send_layer` / `source=call_manager` so
+  a log reader can tell at a glance which layer fired.
+- **D2a.2 (drop values-ru).** Test #53.1 evidence showed that
+  shipping a Russian translation for just these two strings while
+  the rest of the chat UI is hardcoded English inline made the
+  Snackbar disagree with the surrounding screen on RU-locale
+  devices. Delete `res/values-ru/strings.xml`; keep only the EN
+  default. Comment in `values/strings.xml` documents that the
+  Russian copy comes back during a proper centralised localisation
+  pass, not piecemeal.
+
+**Test #53 (2026-05-17 evening).** Tecno `103603734A004351` on
+Tele2 LTE Иркутская + emulator-5554. UI guards visibly fired (mic
++ call buttons both refused with Snackbar). Architect flagged two
+gaps before merge: (1) no `MEDIA_CAPABILITY` log line — UI-level
+guard was invisible in logcat unless the user described the screen;
+(2) RU Snackbar copy on EN-locale device — localisation needed.
+
+**Test #53.1 (D2a.1 APK, same hardware).** UI logs now present and
+correct on Tecno: `MEDIA_CAPABILITY blocked feature=voice
+mode=RestActive source=ui recording_in_progress=false` and
+`feature=call mode=RestActive source=ui` both captured during the
+`RestActive` window. Send-layer logs not triggered (UI caught the
+gestures first, which is the intended layering). Emulator stayed
+on `WsActive` end-to-end, voice/call buttons remained enabled —
+expected, the contract is "Limited realtime blocks media, stable
+WS allows it". Bonus evidence on the emulator: REST migrate path
+already saw a real oversize voice envelope —
+`migrate_pending_skip_oversize id=e96223a6 bodyBytes=7608 max=4096`
+— which is the concrete case PR-D2b will need to handle. Snackbar
+text however still rendered Russian because Tecno's system locale
+is Russian and the platform correctly chose `values-ru/`.
+
+**Test #53.2 (D2a.2 APK, same hardware).** Vladislav confirmed
+visual PASS — Snackbar copy now renders English on the device,
+matching the rest of the EN-only chat UI. Architect signed off:
+acceptance criterion for localisation is visual on the device
+(snackbar text does not show up in `logcat`), and D2a's job as a
+**temporary UX guard** is done — Limited realtime blocks media,
+stable WS allows media, EN copy across the board, structured logs
+on every guard layer.
+
+**Status after merge.**
+
+- ✅ Voice messages blocked at UI + send layer on `RestActive` /
+  `WsCandidate`; English Snackbar; no silent failure.
+- ✅ Calls blocked at UI + `CallManager.startCall`; English
+  Snackbar; no `CALLING` state, no `AudioManager` touch on closed
+  gate.
+- ✅ Structured logs at both layers (`MEDIA_CAPABILITY` UI,
+  `VOICE_TX` / `CALL_TX` send layer) with explicit `source=` so a
+  log reader sees which path fired.
+- ✅ Text fallback unaffected — Test #53 / #53.1 / #53.2 all
+  delivered ordinary text messages through the REST path while the
+  media guards were closed.
+
+**What this does NOT do — explicitly.** Voice messages on REST
+**are still not delivered**; they are now politely refused instead
+of silently failing. Calls on REST **are still not delivered**;
+they are now politely refused instead of opening a never-connecting
+call screen. The real fixes are tracked separately:
+
+- **PR-D2b** — voice-over-REST chunking. Real fix. Split audio into
+  ≤ 4096-byte (target ≈ 2.5–3 KB for headroom) encrypted chunks,
+  ACK strictly after save, receiver reassembles by `voiceId`, single
+  DB voice message after `assembly_complete`. Test #53.1 emulator
+  log already produced the concrete oversize case
+  (`bodyBytes=7608 > max=4096`) so D2b has real telemetry to design
+  against, not just specification.
+- **C-track** — calls on a stable realtime channel.
+  - **PR-C1** `TransportCapabilities` typed gate
+    (`text / voiceMessages / calls / realtimeUdp`) — replaces the
+    `state == WsActive` shorthand once Reality endpoint pool + WS
+    probe land.
+  - **PR-C2** Reality endpoint pool + realistic probe (current
+    probe is `/health`, which doesn't catch the Tele2 Layer A
+    silent-WS-drop pattern; need a WS-handshake probe).
+  - **PR-C3** TURN-over-TLS:443 or custom Opus-over-Reality —
+    whichever survives Tele2 / МТС / Beeline LTE in field tests.
+
+**Open follow-ups updated.** D-track item D2a moves from "open"
+to "closed (UX guard layer)". D2b remains the headline real-fix
+work. C1–C3 remain queued separately. Tele2 WS keepalive baseline
+**unchanged** — phone-side WS still dies every ~31 s with
+`pings_received=0 inbound_frames=0` (the Test #48 Tele2 Layer A
+profile the REST fallback was designed for, not a D2a regression).
+
+**Key commits / PRs.**
+
+- PR #162 (squash-merged as `210b827f`) — `feat(media): PR-D2a —
+  UI + send-layer guard for voice/calls on Limited realtime`.
+  Folds three iteration commits: `35d3ced2` (initial guards +
+  wiring + RU Snackbar inline), `952bc2c9` (D2a.1 — string
+  resources + `MEDIA_CAPABILITY` UI logs + `source=` fields on
+  send-layer logs), `263a53fc` (D2a.2 — drop `values-ru` to match
+  EN-only inline UI).
+- 5 files changed, 163 insertions: `DefaultMessagingService.kt`
+  (+34), `CallManager.kt` (+27), `AppContainer.kt` (+21),
+  `ChatScreen.kt` (+60), `res/values/strings.xml` (+21 new).
+- No backwards-compatibility shims — default `{ true }` lambdas on
+  both ctor params preserve every existing test path and Alpha 1
+  bare-WS flow without a feature flag.
 
 ### 2026-05-17 (sat) · Test #52 PASS — PR-D1d merged, fast active-outbound ACK deadline closes the ~40 s WS→REST latency gap on Tele2 LTE
 
