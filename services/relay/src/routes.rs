@@ -5,6 +5,7 @@ use crate::{
     auth::{AuthError, NONCE_LEN},
     envelope::*,
     error::RelayError,
+    media::{download_chunk, upload_chunk, MAX_MEDIA_UPLOAD_BODY_BYTES},
     prekeys::{
         DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
         SignedPreKeyPublicBundle,
@@ -21,7 +22,7 @@ use subtle::ConstantTimeEq;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        DefaultBodyLimit, Path, Query, State,
     },
     http::StatusCode,
     response::IntoResponse,
@@ -80,6 +81,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/relay/send",        post(rest_send))
         .route("/relay/poll",        get(rest_poll))
         .route("/relay/ack-deliver", post(rest_ack_deliver))
+        // ── Encrypted media upload/download (PR-M1r) ────────────────────
+        // Relay stores only opaque ciphertext keyed by a capability token
+        // (media_id). Bearer session auth identical to /relay/send.
+        // B2: route-level body cap at 3072 bytes — enforced by the HTTP
+        // framing layer BEFORE the handler buffers the body. The global
+        // RequestBodyLimitLayer (~65 KB) below still applies as the ceiling
+        // for all other routes; this per-route layer overrides it downward
+        // for upload-chunk specifically so an oversized body is rejected
+        // before any handler memory allocation occurs. The in-handler check
+        // at media.rs remains as defence-in-depth.
+        .route(
+            "/media/upload-chunk",
+            post(upload_chunk).layer(DefaultBodyLimit::max(MAX_MEDIA_UPLOAD_BODY_BYTES)),
+        )
+        .route("/media/chunk/{media_id}/{idx}", get(download_chunk))
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
@@ -721,7 +737,7 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let _ws_sent_seq = crate::rest_fallback::mirror_envelope_to_rest_store(
-                &state,
+                state,
                 &to,
                 &msg_id,
                 &sealed_sender,
@@ -757,7 +773,7 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 // this is a hint to the recipient device that a message
                 // is waiting, not a delivery primitive. See push.rs for
                 // privacy boundary and rationale.
-                wake_offline_recipient(Arc::clone(&state), to.clone());
+                wake_offline_recipient(Arc::clone(state), to.clone());
             }
 
             // Ack back to sender
@@ -819,7 +835,7 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
             // store so a subsequent /relay/poll from the SAME recipient
             // does not re-deliver an envelope already acked over WS.
             let _rest_removed = crate::rest_fallback::remove_envelope_from_rest_store(
-                &state,
+                state,
                 from_identity,
                 &msg_id,
             )
@@ -1017,7 +1033,7 @@ async fn submit_report(
 
 fn check_admin_token(params: &HashMap<String, String>, state: &Arc<AppState>) -> bool {
     match &state.config.secret_token {
-        Some(expected) => params.get("token").map_or(false, |provided| {
+        Some(expected) => params.get("token").is_some_and(|provided| {
             let ok: bool = provided.as_bytes().ct_eq(expected.as_bytes()).into();
             ok
         }),

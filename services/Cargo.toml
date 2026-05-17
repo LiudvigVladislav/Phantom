@@ -59,5 +59,10 @@ lru = "0.12"
 # sha2 transitively; declaring it explicitly here keeps the dep audit honest.
 sha2 = "0.10"
 
+# Base64 encoding/decoding for media ciphertext blobs (PR-M1r). reqwest pulls
+# base64 v0.22 transitively; declaring it explicitly pins the version used
+# in media.rs and keeps the dep audit honest.
+base64 = "0.22"
+
 # Testing
 tokio-test = "0.4"

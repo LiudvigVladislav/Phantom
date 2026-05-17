@@ -193,6 +193,12 @@ pub struct RateBucket {
     pub window_start: std::time::Instant,
 }
 
+impl Default for PreKeyStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PreKeyStore {
     pub fn new() -> Self {
         Self {
