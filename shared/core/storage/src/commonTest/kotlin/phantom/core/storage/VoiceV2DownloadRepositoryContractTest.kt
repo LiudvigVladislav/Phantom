@@ -85,7 +85,7 @@ class VoiceV2DownloadRepositoryContractTest {
     fun update_toFailed_setsStatusAndReason() = runTest {
         val repo = newRepo()
         repo.insert(task("m1"))
-        repo.update("m1", VoiceV2DownloadRepository.STATUS_FAILED, "sha256_mismatch")
+        repo.update("m1", VoiceV2DownloadRepository.STATUS_FAILED, "sha256_mismatch", nowMs = 12345L)
 
         val updated = repo.find("m1")
         assertNotNull(updated)
@@ -146,12 +146,12 @@ class FakeVoiceV2DownloadRepository : VoiceV2DownloadRepository {
             .filter { it.status == VoiceV2DownloadRepository.STATUS_PENDING }
             .sortedBy { it.createdAtMs }
 
-    override suspend fun update(mediaId: String, status: String, failureReason: String?) {
+    override suspend fun update(mediaId: String, status: String, failureReason: String?, nowMs: Long) {
         val existing = store[mediaId] ?: return
         store[mediaId] = existing.copy(
             status          = status,
             failureReason   = failureReason,
-            lastAttemptAtMs = existing.lastAttemptAtMs + 1L, // monotonic stub — tests don't assert exact value
+            lastAttemptAtMs = nowMs,
         )
     }
 

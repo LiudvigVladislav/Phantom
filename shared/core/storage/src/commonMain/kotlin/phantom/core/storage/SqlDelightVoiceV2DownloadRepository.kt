@@ -5,7 +5,6 @@ package phantom.core.storage
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.datetime.Clock
 import phantom.core.storage.db.PhantomDatabase
 
 /**
@@ -36,23 +35,48 @@ class SqlDelightVoiceV2DownloadRepository(
 
     override suspend fun find(mediaId: String): VoiceV2DownloadRepository.Task? =
         withContext(Dispatchers.IO) {
-            db.voiceV2DownloadQueries.find(mediaId).executeAsOneOrNull()?.toTask()
+            db.voiceV2DownloadQueries.find(mediaId).executeAsOneOrNull()?.let { row ->
+                VoiceV2DownloadRepository.Task(
+                    mediaId          = row.media_id,
+                    conversationId   = row.conversation_id,
+                    senderPubKeyHex  = row.sender_pubkey_hex,
+                    manifestJson     = row.manifest_json,
+                    status           = row.status,
+                    chunkCount       = row.chunk_count.toInt(),
+                    lastAttemptAtMs  = row.last_attempt_at_ms,
+                    failureReason    = row.failure_reason,
+                    createdAtMs      = row.created_at_ms,
+                )
+            }
         }
 
     override suspend fun findPending(): List<VoiceV2DownloadRepository.Task> =
         withContext(Dispatchers.IO) {
-            db.voiceV2DownloadQueries.findPending().executeAsList().map { it.toTask() }
+            db.voiceV2DownloadQueries.findPending().executeAsList().map { row ->
+                VoiceV2DownloadRepository.Task(
+                    mediaId          = row.media_id,
+                    conversationId   = row.conversation_id,
+                    senderPubKeyHex  = row.sender_pubkey_hex,
+                    manifestJson     = row.manifest_json,
+                    status           = row.status,
+                    chunkCount       = row.chunk_count.toInt(),
+                    lastAttemptAtMs  = row.last_attempt_at_ms,
+                    failureReason    = row.failure_reason,
+                    createdAtMs      = row.created_at_ms,
+                )
+            }
         }
 
     override suspend fun update(
         mediaId: String,
         status: String,
         failureReason: String?,
+        nowMs: Long,
     ): Unit = withContext(Dispatchers.IO) {
         db.voiceV2DownloadQueries.update(
             status             = status,
             failure_reason     = failureReason,
-            last_attempt_at_ms = Clock.System.now().toEpochMilliseconds(),
+            last_attempt_at_ms = nowMs,
             media_id           = mediaId,
         )
     }
@@ -66,19 +90,4 @@ class SqlDelightVoiceV2DownloadRepository(
         withContext(Dispatchers.IO) {
             db.voiceV2DownloadQueries.deleteAll()
         }
-
-    // ── helpers ───────────────────────────────────────────────────────────────
-
-    private fun phantom.core.storage.db.Voice_v2_downloads.toTask() =
-        VoiceV2DownloadRepository.Task(
-            mediaId          = media_id,
-            conversationId   = conversation_id,
-            senderPubKeyHex  = sender_pubkey_hex,
-            manifestJson     = manifest_json,
-            status           = status,
-            chunkCount       = chunk_count.toInt(),
-            lastAttemptAtMs  = last_attempt_at_ms,
-            failureReason    = failure_reason,
-            createdAtMs      = created_at_ms,
-        )
 }

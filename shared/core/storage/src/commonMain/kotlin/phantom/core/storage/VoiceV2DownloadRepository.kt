@@ -38,8 +38,8 @@ interface VoiceV2DownloadRepository {
     /** All tasks whose status is [STATUS_PENDING], ordered by [Task.createdAtMs] ascending. */
     suspend fun findPending(): List<Task>
 
-    /** Update status and optional failure reason. Also records [lastAttemptAtMs]. */
-    suspend fun update(mediaId: String, status: String, failureReason: String?)
+    /** Update status and optional failure reason. Caller passes [nowMs] for `last_attempt_at_ms`. */
+    suspend fun update(mediaId: String, status: String, failureReason: String?, nowMs: Long)
 
     /** Delete a single task (called after successful download). */
     suspend fun delete(mediaId: String)

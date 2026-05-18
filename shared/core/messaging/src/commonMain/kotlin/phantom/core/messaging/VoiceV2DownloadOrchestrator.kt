@@ -5,6 +5,7 @@ package phantom.core.messaging
 
 import com.ionspin.kotlin.crypto.hash.Hash
 import kotlinx.coroutines.delay
+import kotlinx.datetime.Clock
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import phantom.core.crypto.MediaCrypto
@@ -119,7 +120,7 @@ class VoiceV2DownloadOrchestrator(
         // Update message row + task row
         messageRepo.updateMessageText(task.mediaId, "[AUDIO_LOCAL:$audioPath]")
         messageRepo.updateStatus(task.mediaId, MessageStatus.DELIVERED)
-        downloadRepo.update(mediaId, VoiceV2DownloadRepository.STATUS_COMPLETE, null)
+        downloadRepo.update(mediaId, VoiceV2DownloadRepository.STATUS_COMPLETE, null, Clock.System.now().toEpochMilliseconds())
         downloadRepo.delete(mediaId) // task complete — free space immediately
 
         log("MEDIA_RX download_complete mediaId=${mediaId.take(8)} plainBytes=${plainAudio.size}")
@@ -165,7 +166,7 @@ class VoiceV2DownloadOrchestrator(
 
     private suspend fun markFailed(mediaId: String, reason: String) {
         // Receiver message row PK == mediaId (see DefaultMessagingService.handleVoiceV2Manifest line 2523).
-        downloadRepo.update(mediaId, VoiceV2DownloadRepository.STATUS_FAILED, reason)
+        downloadRepo.update(mediaId, VoiceV2DownloadRepository.STATUS_FAILED, reason, Clock.System.now().toEpochMilliseconds())
         messageRepo.updateStatus(mediaId, MessageStatus.FAILED)
         messageRepo.updateMessageText(mediaId, "[AUDIO_FAILED:$reason]")
     }
