@@ -491,6 +491,31 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-18 (mon, evening) · PR-M2c.0 cap probe complete — bigger chunks blocked on Tele2 Helsinki path, next track is route diversity
+
+**Branch state.** PR #176 (M2b parallelism) stays closed/parked (revert merged 2026-05-18 as #178). PR #179 (relay media body cap is config-driven) merged to master as `c05f4127`. No further code shipped to master in this session beyond the relay fix. Probe-side Android changes preserved on retained branch `diag/m2c0-media-route-probe` for future Romania-path re-run.
+
+**Investigation path.** Test #66 ran the original probe and got `413 outcome=relay_too_large` for every body size ≥ 5500. Architect read it as "Tele2 not letting us through", but a code trace found two cap-enforcement layers in the relay: the in-handler check (config-driven via `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES`) and the axum `DefaultBodyLimit` middleware (hard-coded to the `MAX_MEDIA_UPLOAD_BODY_BYTES = 3072` constant at `services/relay/src/routes.rs:96`). The env-var override only lifted the in-handler check; the middleware still rejected anything > 3072. PR #179 routes both layers through `state.config.max_media_upload_body_bytes`, and ships two new tests (`test_http_body_limit_respects_config_override`, `test_http_body_limit_fires_above_config_override`) that catch any future regression of the same kind. VPS deploy with `--build` confirmed the fix: a smoke `curl` of a 5400-byte POST returned 401 (auth) instead of 413 (cap).
+
+**Test #66.1** (probe v1 after the fix) lifted the 413 wall but exposed a probe-code bug: the same line could read `status=201 outcome=stored elapsedMs=15008 error=InterruptedIOException:timeout`. Architect-debriefed: status was captured before the body read, then `response.body?.string()` timed out at the OkHttp read-timeout, and the probe didn't distinguish "relay-side success but Tele2 dropped the response body" from "relay-side failure". Probe was rewritten as v2.1 with non-overlapping outcome enums (`STORED` / `DUPLICATE` / `STORED_RESPONSE_DROPPED` / `RELAY_TOO_LARGE` / `AUTH_FAIL` / `BAD_REQUEST` / `REQUEST_TIMEOUT` / `OTHER_HTTP` / `FAIL_EXCEPTION` for upload; `OK` / `SHA_MISMATCH` / `BODY_READ_FAILED` / `NOT_FOUND` / `AUTH_FAIL` / `OTHER_HTTP` / `REQUEST_TIMEOUT` / `SKIPPED` for download), a 2400-byte control row (current production wire size — sanity-checks the probe decoder + tells us whether Tele2 Layer B already bites at production size), and explicit SHA-256 hex prefixes in each result line for cross-referencing with relay logs. Final-verdict logic was switched from `largestStoredSafe` (upload-only) to `largestFullRoundtrip` (upload AND download) as the architect insisted: shipping a chunk size the receiver cannot download is the actual Test #62-#65 failure mode.
+
+**Test #66.2 result** (probe v2.1):
+
+| Body | relayStored | fullRoundtrip | upload avg ms | download avg ms | Verdict |
+|---|---|---|---|---|---|
+| 2400 (control) | 3/3 | **3/3** | 725 | 733 | stable_full |
+| 5500 | 5/5 | 0/5 | ~15 000 | n/a | stored_but_resp_dropped |
+| 6500 | 5/5 | 0/5 | ~15 000 | n/a | stored_but_resp_dropped |
+| 7168 | 0/3 | 0/3 | timeout | n/a | unstable |
+
+**M2C0_FINAL on Helsinki:** `stableMaxBodyFullRoundtrip=2400 largestUploadOnly=6500 recommendedRawChunkBytes=1700`.
+
+**Locked decision.** Do not ship PR-M2c bigger chunks on the Helsinki path. Production `TARGET_RAW_CHUNK_BYTES` stays at 1700. The Tele2 LTE middlebox cleanly accepts requests up to ~6500 bytes (relay log proves chunks land), but reliably drops the 201-response body on upload and the GET-body on download for sizes > ~2400. Increasing chunk size would speed up senders but break receiver downloads. The audit document `docs/design/voice-delivery-audit-2026-05-18.md` Section 8 captures the data and the rejection.
+
+**Next track: PR-INFRA-MediaRO.** Deploy a second `phantom-relay` (full binary, not bridge) at a different VPS/ASN (FlokiNET Romania candidate — bridge2 deployment exists as a reference). Allocate `media-ro.phntm.pro` (or similar). Decide auth model (federated identity vs per-relay registry). Re-run the probe with two `MediaProbeEndpoint` entries. If Romania gives `fullRoundtrip 5/5` at 5500 or 6500, design `mediaRelayId` extension to `VoiceManifestV2` and route media via the better path per-voice. Probe code retained on `diag/m2c0-media-route-probe` so the Romania re-run is one-config-edit-and-rebuild away, not a fresh probe rewrite.
+
+**Architectural insight preserved as memory entry** (`feedback_tele2_media_path_ceiling_2026_05_18.md`): for the current single-relay `relay.phntm.pro` deployment, Tele2 LTE full-roundtrip ceiling on `/media/upload-chunk` + `/media/chunk/.../...` is approximately 2400 bytes wire body. Upload-only ceiling is ~6500 bytes (sender pushes successfully, but Tele2 drops the response on the way back, and the same path drops GET responses on download). Any future attempt to raise chunk size on this single endpoint will hit the same ceiling; the lever is route diversity, not chunk size, codec, parallelism, or in-handler cap.
+
 ### 2026-05-18 (mon, late) · PR-M2a merged — voice-note recorder profile shrinks 5-sec voice ~40 % (`bc94a4d4` on master)
 
 **Branch state.** PR #174 squash-merged to master as `bc94a4d4`. Single commit on top of M1w. Branch deleted on remote.
