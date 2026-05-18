@@ -836,8 +836,19 @@ class DefaultMessagingService(
 
             val manifest = uploadResult.getOrThrow()
 
-            // Step 6 — Encrypt manifest through ratchet + send
-            val payloadBytes = json.encodeToString(manifest).encodeToByteArray()
+            // Step 6 — Wrap manifest in MessagePayload(TYPE_VOICE_V2) so the
+            // receiver's `payload.type == TYPE_VOICE_V2` branch fires. Before
+            // this fix the raw VoiceManifestV2 JSON went on the wire; the
+            // receiver decoded it as `MessagePayload(type=message, text="")`
+            // and surfaced it as an empty chat bubble (Test #57 root cause).
+            val manifestJson = json.encodeToString(manifest)
+            val payload = MessagePayload(
+                type           = MessagePayload.TYPE_VOICE_V2,
+                text           = manifestJson,
+                sentAt         = Clock.System.now().toEpochMilliseconds(),
+                senderUsername = identity.username,
+            )
+            val payloadBytes = json.encodeToString(payload).encodeToByteArray()
             val encrypted = encryptUnderLock(
                 conversationId        = conversationId,
                 recipientPublicKeyHex = recipientPublicKeyHex,
@@ -1817,9 +1828,10 @@ class DefaultMessagingService(
             // download task, ACKs the manifest (so the relay drops the envelope),
             // then kicks off the chunk download coroutine.
             if (payload.type == MessagePayload.TYPE_VOICE_V2) {
+                // The manifest JSON lives in payload.text (see sendAudioV2 wrap).
                 handleVoiceV2Manifest(
                     deliver         = deliver,
-                    payloadText     = plainBytes!!.decodeToString(),
+                    payloadText     = payload.text,
                     senderPubKeyHex = senderPubKeyHex,
                     conversationId  = conversationId,
                     nowMs           = Clock.System.now().toEpochMilliseconds(),
