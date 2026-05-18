@@ -422,4 +422,123 @@ After M2c.0 confirms the safe ceiling.
 - **M2b.2** Adaptive parallelism + timeout budget + tap-to-retry UX —
   rebased fresh, not built on the parked #176.
 
+## Section 8 — M2c.0 probe results (2026-05-18 evening)
+
+The Tele2 cap probe described in Section 7 was run twice after relay
+fixes (PR #179 — config-driven body cap) and a probe-code clean-up
+(state-separated outcome enums + 2400-byte control). Results:
+
+### Test #66.1 (probe v1, after #179)
+
+5500/6500 uploads returned `status=201` from relay but every attempt
+also recorded `error=InterruptedIOException:timeout` and 15-sec elapsed.
+7168+ uploads couldn't capture a status at all. Probe's mixed-state
+logging made it hard to read the actual signal; architect flagged the
+probe needed rewriting before any production decision.
+
+### Test #66.2 (probe v2.1, state-separated outcomes + 2400 control)
+
+| Body | relayStored | fullRoundtrip | upload avg ms | download avg ms | Verdict |
+|---|---|---|---|---|---|
+| **2400** (control) | **3/3** | **3/3** | 725 | 733 | **stable_full** |
+| 5500 | 5/5 | 0/5 | ~15 000 | n/a (body_read_failed) | stored_but_resp_dropped |
+| 6500 | 5/5 | 0/5 | ~15 000 | n/a (body_read_failed) | stored_but_resp_dropped |
+| 7168 | 0/3 | 0/3 | timeout | n/a (skipped) | unstable |
+
+**M2C0_FINAL on Helsinki:**
+
+```
+stableMaxBodyFullRoundtrip = 2400
+largestUploadOnly          = 6500
+recommendedRawChunkBytes   = 1700
+```
+
+### Interpretation
+
+- 2400 control passing `stable_full` with matching SHA-256 means the
+  probe decoder is correct and we can trust the larger-size results.
+- 5500 and 6500 reach the relay (server-side `chunk stored`) but Tele2's
+  middlebox drops the 201-response body on the way back AND drops the
+  GET response body when the receiver tries to download the chunk. This
+  is the same "Tele2 Layer B" pattern documented at the top of MASTER
+  TIMELINE for `/prekeys/publish` responses (PR-R0.5 fallback was queued
+  for that exact class of issue on prekey status; here it bites the
+  /media GET body).
+- 7168 doesn't reach the relay at all — the upstream POST body never
+  finishes. Tele2 cuts the request before completion.
+- **Upload-only ceiling (~6500) is HIGHER than full-roundtrip ceiling
+  (2400)**. Sender could push bigger chunks if response-drop were
+  tolerated via idempotent retry, but the receiver must download the
+  bytes back, and that's the binding constraint.
+
+### Locked decision
+
+**Do NOT ship PR-M2c bigger chunks on the Helsinki path.** Production
+`TARGET_RAW_CHUNK_BYTES` stays at 1700. Increasing chunk size beyond
+2400 wire body would make receiver downloads on Tele2 fail.
+
+The Phase 1 plan (Section 5) is therefore **rejected as not feasible
+on the current single-relay infrastructure**. Phase 2 / 3 / 4 options
+are revisited below.
+
+### Next track: route diversity (PR-INFRA-MediaRO)
+
+The bottleneck is no longer codec, transport, parallelism, or chunk
+size — it's the specific network path `Tele2 → relay.phntm.pro
+(Hetzner Helsinki)`. Different ASN, different country, possibly
+different SNI / cert chain may transit Tele2 middleboxes without the
+Layer B response-body drop.
+
+Plan:
+
+1. **PR-INFRA-MediaRO** — deploy a second `phantom-relay` (the full
+   binary, not just a WebTunnel bridge) at a different VPS. Candidate
+   path: FlokiNET Romania (we already have an Ed25519 SSH key for that
+   provider; bridge2 deployment exists as a reference; the relay is the
+   same Rust binary + Caddy + .env recipe).
+
+2. Allocate a new subdomain (`media-ro.phntm.pro` or
+   `relay-ro.phntm.pro`), set up Caddy with Let's Encrypt, run
+   `phantom-relay` with the same env (including the now-config-driven
+   `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES`).
+
+3. Decide auth model:
+   - **Federated identity** — both relays share the same Ed25519
+     signing pubkey, so any client's challenge-signed session works on
+     both. Simpler protocol but requires sharing the relay's signing
+     key across two boxes.
+   - **Per-relay identity registry** — each relay has its own keypair;
+     client acquires separate session tokens for each. Cleaner trust
+     boundary, more orchestrator work on the client.
+
+4. Re-run the M2c.0 probe with two `MediaProbeEndpoint` entries
+   (Helsinki + Romania). If Romania gives `fullRoundtrip 5/5` on 5500
+   or 6500, the result unblocks larger chunks on **the Romania path
+   specifically**.
+
+5. Design the `mediaRelayId` extension to `VoiceManifestV2`: sender
+   picks an endpoint at upload time, embeds its id in the manifest,
+   receiver downloads from the same id. Endpoint failover and pool
+   management come after the proof-of-concept measurement.
+
+### Other Phase 2/3 options (now informational, not blocked)
+
+- **M2b.2 adaptive parallelism + tap-to-retry UX** — still useful for
+  long voices, but won't change the chunk-count math. Lower priority.
+- **M2a.2 VBR overshoot fix** — same. Useful when we have a faster
+  delivery path; not the top priority while voice is stuck at 1700.
+- **Single-blob upload (Option D in Section 4)** — interesting on a
+  hypothetical second endpoint that proves Tele2-passable for larger
+  bodies, but premature now.
+
+### Probe code retention
+
+The Android-side probe runner (`Tele2CapProbe.kt`, exposure fields on
+`AppContainer`, "Run media route probe" row in `SettingsScreen`) was
+intentionally kept off `master` because it's diagnostic-only. The code
+is preserved on a feature branch (`diag/m2c0-media-route-probe`) so
+the Romania-path probe in step 4 above can reuse it by adding a second
+`MediaProbeEndpoint` entry and rebuilding the APK — no probe code
+needs to be re-written from scratch.
+
 End of audit.
