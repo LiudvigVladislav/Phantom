@@ -583,3 +583,81 @@ async fn test_http_layer_body_limit() {
          route-level DefaultBodyLimit may not be wired correctly",
     );
 }
+
+// ── Test 12: config-driven body cap (PR-M2c.0 prerequisite) ────────────────────
+
+/// Both the route-level DefaultBodyLimit middleware AND the in-handler body cap
+/// check must source the limit from `state.config.max_media_upload_body_bytes`,
+/// so the env var `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES` actually moves the ceiling.
+///
+/// Before the PR-M2c.0 fix, the axum layer was hard-coded to the constant
+/// `MAX_MEDIA_UPLOAD_BODY_BYTES = 3072`, silently overriding any env override.
+/// PR-M2c.0 cap probe (Test #66, 2026-05-18) caught this: env was set to 9000,
+/// the in-handler check accepted bodies up to 9000, but the axum layer still
+/// rejected them at 3072. The fix routes both layers through the same config
+/// field.
+#[tokio::test]
+async fn test_http_body_limit_respects_config_override() {
+    // Build a custom config with an elevated cap.
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.max_media_upload_body_bytes = 9_000;
+    let app = build_app_with_config(cfg);
+
+    // 5500-byte body — would have failed under the old hard-coded 3072 layer,
+    // must now reach the handler (which will then 400/401 for auth/format,
+    // but the key point is: NOT 413 PAYLOAD_TOO_LARGE).
+    let payload = vec![b'X'; 5_500];
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/media/upload-chunk")
+                .header("content-type", "application/json")
+                // No auth header — body limit (if it were going to fire) runs first.
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        res.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "HTTP-layer body limit must respect config override; \
+         got 413 even though config.max_media_upload_body_bytes = 9000 \
+         (axum layer is probably still hard-coded to the constant)",
+    );
+}
+
+// ── Test 13: config override still gates beyond its value ──────────────────────
+
+/// Symmetric to Test 12: confirm a body that exceeds the elevated cap STILL
+/// gets 413. This guards against accidentally removing the layer entirely.
+#[tokio::test]
+async fn test_http_body_limit_fires_above_config_override() {
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.max_media_upload_body_bytes = 5_000;
+    let app = build_app_with_config(cfg);
+
+    // 5001 bytes — one byte over the elevated cap.
+    let payload = vec![b'X'; 5_001];
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/media/upload-chunk")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "HTTP-layer body limit must still fire above the configured cap",
+    );
+}

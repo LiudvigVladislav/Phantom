@@ -5,7 +5,7 @@ use crate::{
     auth::{AuthError, NONCE_LEN},
     envelope::*,
     error::RelayError,
-    media::{download_chunk, upload_chunk, MAX_MEDIA_UPLOAD_BODY_BYTES},
+    media::{download_chunk, upload_chunk},
     prekeys::{
         DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
         SignedPreKeyPublicBundle,
@@ -84,16 +84,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         // ── Encrypted media upload/download (PR-M1r) ────────────────────
         // Relay stores only opaque ciphertext keyed by a capability token
         // (media_id). Bearer session auth identical to /relay/send.
-        // B2: route-level body cap at 3072 bytes — enforced by the HTTP
-        // framing layer BEFORE the handler buffers the body. The global
-        // RequestBodyLimitLayer (~65 KB) below still applies as the ceiling
-        // for all other routes; this per-route layer overrides it downward
-        // for upload-chunk specifically so an oversized body is rejected
-        // before any handler memory allocation occurs. The in-handler check
-        // at media.rs remains as defence-in-depth.
+        // B2: route-level body cap — enforced by the HTTP framing layer
+        // BEFORE the handler buffers the body. Sourced from
+        // `state.config.max_media_upload_body_bytes` so the env var
+        // `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES` applies to BOTH layers
+        // (this axum middleware AND the in-handler defence-in-depth check
+        // at media.rs:228). Previously the constant MAX_MEDIA_UPLOAD_BODY_BYTES
+        // was hard-coded here, which silently overrode any env override
+        // (caught during PR-M2c.0 cap probe 2026-05-18). The global
+        // RequestBodyLimitLayer below (~65 KB ceiling) still applies to all
+        // other routes; this per-route layer overrides it downward for
+        // /media/upload-chunk specifically. The in-handler check at media.rs
+        // remains as defence-in-depth.
         .route(
             "/media/upload-chunk",
-            post(upload_chunk).layer(DefaultBodyLimit::max(MAX_MEDIA_UPLOAD_BODY_BYTES)),
+            post(upload_chunk)
+                .layer(DefaultBodyLimit::max(state.config.max_media_upload_body_bytes)),
         )
         .route("/media/chunk/{media_id}/{idx}", get(download_chunk))
         .layer(TimeoutLayer::with_status_code(

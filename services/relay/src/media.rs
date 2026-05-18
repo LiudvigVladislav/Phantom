@@ -47,8 +47,13 @@ use crate::{rest_fallback::extract_bearer, state::AppState};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Hard limit on the POST /media/upload-chunk body. Client targets ≤2600;
-/// relay rejects anything above 3072.
+/// Default POST /media/upload-chunk body cap. Used by `config::default()` and
+/// as the env-var fallback in `config::from_env()`. The effective runtime cap
+/// is `state.config.max_media_upload_body_bytes`, sourced from
+/// `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES` if set, otherwise this default. Both
+/// the axum `DefaultBodyLimit` middleware (routes.rs) and the in-handler
+/// defence-in-depth check below read from that same config field, so the env
+/// var fully governs the cap.
 pub(crate) const MAX_MEDIA_UPLOAD_BODY_BYTES: usize = 3_072;
 
 /// Maximum number of chunks per media object.
