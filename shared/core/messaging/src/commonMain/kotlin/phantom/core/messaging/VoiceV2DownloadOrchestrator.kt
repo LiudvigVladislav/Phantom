@@ -4,7 +4,13 @@
 package phantom.core.messaging
 
 import com.ionspin.kotlin.crypto.hash.Hash
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.datetime.Clock
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
@@ -63,24 +69,87 @@ class VoiceV2DownloadOrchestrator(
             return
         }
 
-        // Download all chunks sequentially
-        val chunks = mutableListOf<ByteArray>()
-        for (idx in 0 until manifest.chunkCount) {
-            val chunkBytes = downloadChunkWithRefresh(manifest.mediaId, idx)
-            if (chunkBytes == null) {
-                // Permanent failure: relay lost the chunks (TTL expiry or relay restart)
-                log("MEDIA_RX download_failed mediaId=${mediaId.take(8)} reason=media_chunks_gone idx=$idx")
-                markFailed(mediaId, "media_chunks_gone")
-                return
-            }
-            chunks.add(chunkBytes)
-        }
+        // PR-M2b — download chunks in parallel with bounded concurrency.
+        // Sequential 1-chunk-per-RTT was the bottleneck for long voices on
+        // Tele2 LTE: Test #62 measured ~100 s for a 35-sec voice (89 chunks
+        // × ~1.1 s each). With parallelism=2 the same voice should land in
+        // ~50 s without changing codec, transport, or any of the downstream
+        // crypto/sha256 verification (those still run on the reassembled
+        // blob, post-await).
+        //
+        // Result-collection contract:
+        //   - chunks indexed by idx, NOT arrival order → reassembly is
+        //     deterministic regardless of which worker finishes first
+        //   - one chunk failure throws → coroutineScope cancels siblings
+        //   - markFailed runs exactly once, on the catching branch below
+        //   - Token CAS in RestFallbackOrchestrator.acquireOrRefreshMediaToken
+        //     is under tokenMutex.withLock so two concurrent 401s serialise
+        //     into a single /auth/session refresh
+        val chunks = arrayOfNulls<ByteArray>(manifest.chunkCount)
+        val semaphore = Semaphore(permits = DOWNLOAD_PARALLELISM)
+        log(
+            "MEDIA_RX download_parallel_start mediaId=${mediaId.take(8)} " +
+                "chunks=${manifest.chunkCount} parallelism=$DOWNLOAD_PARALLELISM"
+        )
 
-        // Reassemble ciphertext blob
-        val totalSize = chunks.sumOf { it.size }
+        val parallelResult = runCatching {
+            coroutineScope {
+                (0 until manifest.chunkCount).map { idx ->
+                    async {
+                        semaphore.withPermit {
+                            val bytes = downloadChunkWithRefresh(manifest.mediaId, idx)
+                                ?: throw MediaChunkGoneException(idx)
+                            chunks[idx] = bytes
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+        parallelResult.exceptionOrNull()?.let { ex ->
+            // CancellationException MUST be rethrown unchanged. runCatching catches
+            // every Throwable including the structured-concurrency cancellation
+            // signal — if the DMS appScope (or any parent) is cancelling us (app
+            // exit, user navigation, manifest superseded by a duplicate, etc.),
+            // marking the voice FAILED here would be a silent data corruption:
+            // the chunks are still on the relay, the download was simply paused
+            // mid-flight, and the next process start should resume it via the
+            // startReceiving finalizer. The M1w PR-M1w R4 commit already learned
+            // this lesson on the sender side (sendAudioV2 wraps in scope.launch
+            // with a `catch (ce: CancellationException) { throw ce }` clause);
+            // mirror it here for symmetry.
+            if (ex is CancellationException) throw ex
+            when (ex) {
+                is MediaChunkGoneException -> {
+                    log(
+                        "MEDIA_RX download_failed mediaId=${mediaId.take(8)} " +
+                            "reason=media_chunks_gone idx=${ex.idx}"
+                    )
+                    markFailed(mediaId, "media_chunks_gone")
+                }
+                else -> {
+                    log(
+                        "MEDIA_RX download_failed mediaId=${mediaId.take(8)} " +
+                            "reason=parallel_download_error error=${ex::class.simpleName}"
+                    )
+                    markFailed(mediaId, "parallel_download_error")
+                }
+            }
+            return
+        }
+        log(
+            "MEDIA_RX download_parallel_complete mediaId=${mediaId.take(8)} " +
+                "chunks=${manifest.chunkCount}"
+        )
+
+        // Reassemble ciphertext blob in strict idx order (0..N-1).
+        val totalSize = chunks.sumOf { it!!.size }
         val encryptedBlob = ByteArray(totalSize)
         var offset = 0
-        for (c in chunks) { c.copyInto(encryptedBlob, offset); offset += c.size }
+        for (i in 0 until manifest.chunkCount) {
+            val c = chunks[i]!!
+            c.copyInto(encryptedBlob, offset)
+            offset += c.size
+        }
 
         // Decrypt
         val plainAudio = runCatching {
@@ -175,5 +244,17 @@ class VoiceV2DownloadOrchestrator(
         private const val MAX_TOKEN_ATTEMPTS = 3
         private const val MAX_NETWORK_ATTEMPTS = 5
         private val NETWORK_RETRY_DELAYS_MS = longArrayOf(1_000L, 3_000L, 8_000L, 20_000L, 60_000L)
+        // PR-M2b — receiver-side concurrent chunk downloads. 2 is the safe
+        // starting point for Tele2 LTE middleboxes. Fallback to 1 is a
+        // single-line constant change if Test #64 surfaces throttling.
+        private const val DOWNLOAD_PARALLELISM = 2
     }
 }
+
+/**
+ * Thrown by the parallel chunk-download workers when [MediaUploadTransport]
+ * returns no bytes for a given chunk (404, terminal auth failure, etc.).
+ * Caught by the outer `runCatching { coroutineScope { ... } }` so the
+ * sibling workers cancel and `markFailed` runs exactly once.
+ */
+private class MediaChunkGoneException(val idx: Int) : Exception("chunk $idx gone")
