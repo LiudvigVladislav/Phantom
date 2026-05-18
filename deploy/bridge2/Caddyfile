@@ -66,3 +66,53 @@ bridge2.phntm.pro {
         level  INFO
     }
 }
+
+# -----------------------------------------------------------------------------
+# media-ro.phntm.pro — diagnostic / beta media relay (PR-INFRA-MediaRO).
+#
+# Co-tenant vhost on the same bridge2 VPS. Reverse-proxies into the
+# `phantom-relay-ro` container on bridge2-internal Docker network. Same
+# proxy pattern as the primary relay.phntm.pro vhost on the Hetzner box
+# (TLS termination + WS upgrade + flush_interval=-1 for media chunks).
+#
+# Created 2026-05-18 to give the M2c.0 cap probe a second `MediaProbeEndpoint`
+# on a different ASN/country than Hetzner Helsinki. If the probe confirms a
+# higher full-roundtrip ceiling here, this vhost may be promoted to a
+# permanent media relay; until then it's diagnostic/beta only and may be
+# disabled by removing this block + `caddy reload`.
+#
+# DNS for this host (added 2026-05-18):
+#   A    media-ro.phntm.pro → 185.165.171.206
+#   AAAA media-ro.phntm.pro → 2a06:1700:0:724::d454:8ad0
+# -----------------------------------------------------------------------------
+media-ro.phntm.pro {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options        "DENY"
+        Referrer-Policy        "no-referrer"
+        -Server
+    }
+
+    reverse_proxy phantom-relay-ro:8080 {
+        header_up X-Real-IP         {remote_host}
+        header_up X-Forwarded-For   {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Long-lived WS sessions and chunked media transfers must not be
+        # killed by a 60-second idle timeout. Same config as the primary
+        # relay.phntm.pro vhost.
+        transport http {
+            read_timeout  0
+            write_timeout 0
+            dial_timeout  10s
+        }
+        flush_interval -1
+    }
+
+    log {
+        output stdout
+        format json
+        level  INFO
+    }
+}

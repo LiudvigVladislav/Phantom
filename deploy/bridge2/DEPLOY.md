@@ -310,16 +310,181 @@ Copy the resulting `.tar.gz` off-host (encrypted, two locations). Losing this vo
 
 ---
 
+## Step 12 — PR-INFRA-MediaRO add-on (2026-05-18)
+
+Adds a co-tenant `phantom-relay-ro` container + `media-ro.phntm.pro` Caddy vhost on the existing bridge2 host. Diagnostic / beta only — used by the M2c.0 cap probe to compare Tele2 LTE full-roundtrip throughput between Hetzner Helsinki and FlokiNET Romania paths. Does NOT alter the bridge2 WebTunnel role.
+
+### 12.1 — Pre-check: bridge2 health BEFORE deploying media relay
+
+The relay co-tenant adds ~150–300 MB RAM usage and a few CPU percent. With 1 GB total RAM on this VPS the headroom is tight. Capture baseline before any change:
+
+```bash
+ssh phantomadmin@bridge2.phntm.pro
+free -m
+df -h
+docker stats --no-stream
+docker ps
+```
+
+Expected baseline (no media relay yet):
+- `free -m` available ≥ 600 MB
+- `docker ps` shows `phantom-bridge2-caddy` + `phantom-bridge2-webtunnel`
+
+If available memory is already < 400 MB, abort — there is not enough headroom for a third container at this VPS tier.
+
+### 12.2 — DNS records
+
+Add on the same DNS provider that hosts `bridge2.phntm.pro`:
+
+```
+A     media-ro.phntm.pro → 185.165.171.206
+AAAA  media-ro.phntm.pro → 2a06:1700:0:724::d454:8ad0
+```
+
+Same IPs as `bridge2.phntm.pro` (the box is shared). Wait until the records resolve from at least two `dig` checks before continuing — Caddy needs to complete the Let's Encrypt HTTP-01 challenge on first start, which requires the A record live.
+
+### 12.3 — Update repo on VPS
+
+```bash
+ssh phantomadmin@bridge2.phntm.pro
+cd ~/Phantom
+git fetch origin
+git checkout master
+git pull origin master
+```
+
+### 12.4 — Update the bridge2 `.env`
+
+The existing `.env` already has the WebTunnel secrets. Append the media-relay env:
+
+```bash
+cd ~/Phantom/deploy/bridge2
+grep -c 'RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES' .env || \
+  echo 'RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES=9000' >> .env
+grep 'RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES' .env
+# Expected: RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES=9000
+```
+
+### 12.5 — Build and start the relay container
+
+```bash
+cd ~/Phantom/deploy/bridge2
+docker compose -f docker-compose.yml up -d --build phantom-relay-ro
+```
+
+This builds the relay image (~30–60 s first time, leverages BuildKit cache afterwards) and brings up only the new service. Caddy and the WebTunnel bridge are untouched.
+
+Verify the relay started:
+
+```bash
+docker ps --format '{{.Names}}  {{.Image}}  {{.Status}}' | grep phantom-relay-ro
+docker logs phantom-relay-ro --tail 10
+# Expected last line:
+#   phantom-relay starting host=0.0.0.0 port=8080 max_payload_kb=1024 ...
+docker exec phantom-relay-ro env | grep RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES
+# Expected: RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES=9000
+```
+
+### 12.6 — Reload Caddy with the new media-ro vhost
+
+The Caddyfile change is in `git pull` already. Apply it:
+
+```bash
+cd ~/Phantom/deploy/bridge2
+docker compose -f docker-compose.yml up -d caddy
+# OR (safer — no container restart, only config reload):
+docker exec phantom-bridge2-caddy caddy reload --config /etc/caddy/Caddyfile
+docker logs phantom-bridge2-caddy --tail 5
+```
+
+If the reload errors, check the Caddy config is mounted (read-only) and the syntax is valid; Caddy will refuse to swap the running config on syntax errors so the WebTunnel vhost stays up.
+
+### 12.7 — Verify both vhosts work + bridge is unaffected
+
+Bridge2 health (must still pass):
+
+```bash
+# WebTunnel secret path — must NOT 404
+curl -sI -m 5 "https://bridge2.phntm.pro/35ab85ebe42af5214b579de2560d955b" | head -5
+
+# bridge2 root — fake landing
+curl -sI -m 5 "https://bridge2.phntm.pro/" | head -3
+
+# Bridge process logs — should be quiet / no panic
+docker logs phantom-bridge2-webtunnel --tail 20
+```
+
+Media-ro health (new):
+
+```bash
+curl -sI -m 5 "https://media-ro.phntm.pro/health" | head -3
+# Expected: HTTP/2 200 (or HTTP/1.1 200) — Caddy TLS → relay /health
+
+# Smoke test that the media body cap is applied:
+curl -sI -m 5 "https://media-ro.phntm.pro/auth/session" -X POST | head -3
+# Expected: 422 (empty body — relay's /auth/session needs JSON)
+```
+
+### 12.8 — Resource sanity check after deploy
+
+```bash
+free -m
+docker stats --no-stream
+```
+
+Expected:
+- `free -m` available ≥ 250 MB (bridge2 baseline minus ~150 MB relay)
+- `phantom-relay-ro` MEM USAGE < 384 MB (the `mem_limit` in compose)
+- bridge container CPU < 5 % steady-state
+
+If available memory drops below 150 MB or the bridge starts paging, stop the relay container immediately (see rollback below).
+
+### 12.9 — Rollback
+
+If the relay or its vhost breaks anything:
+
+```bash
+# Stop just the relay (Caddy + WebTunnel keep running)
+cd ~/Phantom/deploy/bridge2
+docker compose -f docker-compose.yml stop phantom-relay-ro
+docker compose -f docker-compose.yml rm -f phantom-relay-ro
+
+# Optional — remove the media-ro vhost from active Caddy config
+# (the Caddyfile in git is unchanged; just reload to drop the vhost
+#  for now, OR edit a local copy and `caddy reload`):
+docker exec phantom-bridge2-caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+The WebTunnel bridge keeps serving normally — bridge fingerprint is unaffected, Tor descriptor cache is unchanged.
+
+### 12.10 — Probe re-run from the Android side
+
+After 12.5–12.7 pass, on the dev workstation:
+
+```bash
+cd "d:/VL Stories Studio/Phantom"
+git checkout diag/m2c0-media-route-probe
+# Probe code on this branch already references `MediaProbeEndpoint(id="helsinki", ...)`.
+# A follow-up commit on the same branch adds `id="romania", baseUrl="https://media-ro.phntm.pro", ...`
+# and exposes a second token-provider scoped to that orchestrator. Rebuild APK,
+# install on Tecno, and tap Settings → Diagnostics → "Run media route probe".
+```
+
+Logcat will emit `M2C0_PROBE upload_result endpoint=romania ...`, `M2C0_SUMMARY endpoint=romania size=… verdict=…`, and a single `M2C0_FINAL` line that compares the two endpoints and picks the better one. If Romania gives `verdict=stable_full` at 5500+ where Helsinki failed, M2c becomes feasible **for that specific endpoint** via the `mediaRelayId` design sketch in `docs/design/voice-delivery-audit-2026-05-18.md` Section 8.
+
+---
+
 ## Reference: where things live
 
 | Path on VPS | Purpose |
 |---|---|
-| `~/Phantom/deploy/bridge2/docker-compose.yml` | Stack definition (caddy + webtunnel-bridge) |
-| `~/Phantom/deploy/bridge2/Caddyfile` | TLS terminator + reverse-proxy config |
-| `~/Phantom/deploy/bridge2/webtunnel-landing/index.html` | Fake landing page |
-| `~/Phantom/deploy/bridge2/.env` | Per-host secrets (gitignored) |
+| `~/Phantom/deploy/bridge2/docker-compose.yml` | Stack definition (caddy + webtunnel-bridge + phantom-relay-ro) |
+| `~/Phantom/deploy/bridge2/Caddyfile` | TLS terminator + reverse-proxy config (bridge2 + media-ro vhosts) |
+| `~/Phantom/deploy/bridge2/webtunnel-landing/index.html` | Fake landing page (bridge2 vhost only) |
+| `~/Phantom/deploy/bridge2/.env` | Per-host secrets (gitignored). Includes `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES=9000` for PR-INFRA-MediaRO. |
 | Docker volume `webtunnel-tor-state` | Bridge identity keys + descriptor cache |
-| Docker volume `caddy-data` | Let's Encrypt certs |
+| Docker volume `caddy-data` | Let's Encrypt certs (covers both vhosts) |
+| Docker volume `phantom-relay-ro-reports` | Media relay abuse-report log directory (`/var/phantom`) |
 
 ---
 

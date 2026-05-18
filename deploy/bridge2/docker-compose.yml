@@ -52,12 +52,71 @@ services:
       - bridge2-internal
     depends_on:
       - webtunnel-bridge
+      - phantom-relay-ro
     cap_drop:
       - ALL
     cap_add:
       - NET_BIND_SERVICE   # binds 80 + 443 as non-root
     security_opt:
       - no-new-privileges:true
+
+  # ──────────────────────────────────────────────────────────────────────
+  # PHANTOM media relay (PR-INFRA-MediaRO, 2026-05-18 — diagnostic / beta).
+  #
+  # Co-tenant on the bridge2 VPS as a *zero-cost* second media endpoint
+  # for the M2c.0 cap probe. The probe on Helsinki (Test #66.2) measured
+  # full-roundtrip ceiling at 2400 wire bytes; we now want to see if a
+  # different ASN/country (FlokiNET Romania vs Hetzner Helsinki) lifts
+  # that ceiling on Tele2 LTE.
+  #
+  # Hard constraints because this box is shared with the WebTunnel bridge:
+  #   - mem_limit caps RAM at 384 MB so a runaway relay can't starve the
+  #     bridge process. With 1 GB total VPS RAM and Tor+WebTunnel needing
+  #     ~200 MB headroom, leaving ~400 MB for the relay is tight but safe.
+  #   - read_only rootfs + minimal tmpfs.
+  #   - cap_drop ALL.
+  #   - container does NOT bind a host port; Caddy reverse-proxies via
+  #     bridge2-internal Docker network.
+  #   - No ntfy / no push notifications (the push backend lives on
+  #     Helsinki primary and is irrelevant for the probe).
+  #
+  # Rollback: docker compose -f docker-compose.yml stop phantom-relay-ro
+  # then remove the media-ro.phntm.pro vhost block from Caddyfile and
+  # `docker exec phantom-bridge2-caddy caddy reload --config /etc/caddy/Caddyfile`.
+  # WebTunnel bridge is unaffected.
+  # ──────────────────────────────────────────────────────────────────────
+  phantom-relay-ro:
+    build:
+      # Build context is the repo root (../../) so the Dockerfile can
+      # reach both services/Cargo.toml and services/relay/.
+      context: ../..
+      dockerfile: services/relay/Dockerfile
+    image: phantom-relay:latest
+    container_name: phantom-relay-ro
+    restart: unless-stopped
+    env_file:
+      - .env
+    expose:
+      - "8080"
+    networks:
+      - bridge2-internal
+    # Hard memory cap. If the relay tries to exceed this Docker kills it
+    # rather than letting it OOM-kill the WebTunnel bridge alongside it.
+    mem_limit: 384m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Read-only rootfs. The relay writes its abuse-report log to
+    # /var/phantom (see state.rs `append_report_to_disk`). On bridge2 we
+    # don't expect abuse reports against the diagnostic endpoint but the
+    # volume is provided for safety so the relay doesn't crash trying to
+    # write to a read-only path.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    volumes:
+      - phantom-relay-ro-reports:/var/phantom
 
   # ──────────────────────────────────────────────────────────────────────
   # Operator-controlled WebTunnel bridge.
@@ -110,3 +169,4 @@ volumes:
   caddy-data:
   caddy-config:
   webtunnel-tor-state:
+  phantom-relay-ro-reports:
