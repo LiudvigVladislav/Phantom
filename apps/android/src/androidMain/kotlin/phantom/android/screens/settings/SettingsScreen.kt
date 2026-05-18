@@ -347,6 +347,54 @@ fun SettingsScreen(
                 }
             }
 
+            // PR-M2c.0 — diagnostics row. Removed once the probe data lands the
+            // production M2c chunk-size change. Visible in all builds because
+            // this is a one-shot field-test triggered by a single tap.
+            item {
+                Spacer(Modifier.height(20.dp))
+                SettingsGroupHeader("Diagnostics")
+                Spacer(Modifier.height(10.dp))
+                var probeStatus by remember { mutableStateOf<String?>(null) }
+                var probeRunning by remember { mutableStateOf(false) }
+                SettingsGroupCard {
+                    SettingsRowItem(
+                        icon = { PhIconInfo(color = CyanAccent, size = 16.dp) },
+                        label = if (probeRunning) "Running media probe…" else "Run media route probe",
+                        value = probeStatus,
+                        onClick = run@ {
+                            if (probeRunning) return@run
+                            val tokenProvider = container.mediaAuthTokenProvider
+                            val relayBase = container.relayHttpBaseForProbe
+                            if (tokenProvider == null || relayBase == null) {
+                                probeStatus = "Hybrid transport not ready — open a chat first"
+                                return@run
+                            }
+                            probeRunning = true
+                            probeStatus = "Running media probe…"
+                            scope.launch {
+                                runCatching {
+                                    phantom.android.diagnostics.Tele2CapProbe(
+                                        tokenProvider = tokenProvider,
+                                        relayBaseUrl = relayBase,
+                                        log = { msg ->
+                                            android.util.Log.i("PhantomMedia", msg)
+                                        },
+                                    ).run { status -> probeStatus = status }
+                                }.onFailure { ex ->
+                                    android.util.Log.w(
+                                        "PhantomMedia",
+                                        "M2C0_PROBE crashed: ${ex::class.simpleName}: ${ex.message}",
+                                        ex,
+                                    )
+                                    probeStatus = "Crashed: ${ex::class.simpleName}"
+                                }
+                                probeRunning = false
+                            }
+                        },
+                    )
+                }
+            }
+
             // Footer — quiet build identifier per FULL_COMPOSE
             item {
                 Spacer(Modifier.height(8.dp))

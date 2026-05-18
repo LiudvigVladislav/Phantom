@@ -201,6 +201,17 @@ class AppContainer(private val context: Context) {
         private set
 
     /**
+     * PR-M2c.0 diagnostic exposure — token provider + relay base URL for the
+     * Tele2 cap probe in SettingsScreen. Null in the Alpha-1 migration window
+     * (when `signingPubHexForRest` is null). Removed once M2c production
+     * change lands.
+     */
+    var mediaAuthTokenProvider: phantom.core.transport.MediaAuthTokenProvider? = null
+        private set
+    var relayHttpBaseForProbe: String? = null
+        private set
+
+    /**
      * PR-C1 (2026-05-17): current transport capability snapshot.
      *
      * Derived from [hybridTransport]'s [RestStateMachine] and [torService]
@@ -532,6 +543,9 @@ class AppContainer(private val context: Context) {
             val mediaAuthTokenProviderLocal = phantom.core.transport.RestMediaAuthTokenProvider(
                 orchestrator = restOrchestrator,
             )
+            // PR-M2c.0 — expose for the SettingsScreen diagnostic probe.
+            this@AppContainer.mediaAuthTokenProvider = mediaAuthTokenProviderLocal
+            this@AppContainer.relayHttpBaseForProbe = relayHttpBase
             voiceV2SenderLocal = phantom.core.messaging.VoiceV2Sender(
                 mediaCrypto    = mediaCryptoLocal,
                 mediaTransport = mediaUploadTransportLocal,
