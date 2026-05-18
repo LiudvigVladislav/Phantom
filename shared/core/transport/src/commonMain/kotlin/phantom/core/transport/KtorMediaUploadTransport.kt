@@ -121,7 +121,19 @@ class KtorMediaUploadTransport(
             }
             val rawBody = response.bodyAsText()
             mapUploadResponse(response.status, rawBody)
-        }.getOrElse { e -> Result.failure(e) }
+        }.getOrElse { e ->
+            // Wrap network/IO exceptions (SocketTimeoutException, IOException,
+            // ConnectException, etc.) as MediaTransportException so VoiceV2Sender's
+            // network-retry loop (5 attempts, backoff 1s/3s/8s/20s/60s) fires.
+            // Before this fix, a single Tele2 LTE upload timeout killed the entire
+            // voice upload because VoiceV2Sender treated non-MediaTransportException
+            // as terminal (Test #57 second blocker).
+            Result.failure(
+                MediaTransportException(
+                    "upload-chunk network ${e::class.simpleName}: ${e.message?.take(120) ?: ""}"
+                )
+            )
+        }
     }
 
     override suspend fun downloadChunk(
@@ -136,7 +148,14 @@ class KtorMediaUploadTransport(
             }
             val rawBody = response.bodyAsText()
             mapDownloadResponse(response.status, rawBody)
-        }.getOrElse { e -> Result.failure(e) }
+        }.getOrElse { e ->
+            // Same wrap rationale as uploadChunk — see comment there.
+            Result.failure(
+                MediaTransportException(
+                    "download-chunk network ${e::class.simpleName}: ${e.message?.take(120) ?: ""}"
+                )
+            )
+        }
     }
 
     // ── response mappers ───────────────────────────────────────────────────────
@@ -159,7 +178,7 @@ class KtorMediaUploadTransport(
             Result.failure(IllegalArgumentException("upload-chunk 400: $rawBody"))
         }
         HttpStatusCode.Unauthorized -> {
-            Result.failure(MediaAuthException)
+            Result.failure(MediaAuthException("media_auth_401"))
         }
         else -> {
             Result.failure(MediaTransportException("upload-chunk unexpected status=${status.value}: $rawBody"))
@@ -181,7 +200,7 @@ class KtorMediaUploadTransport(
             )
         }
         HttpStatusCode.NotFound -> Result.failure(NotFoundException)
-        HttpStatusCode.Unauthorized -> Result.failure(MediaAuthException)
+        HttpStatusCode.Unauthorized -> Result.failure(MediaAuthException("media_auth_401"))
         else -> Result.failure(MediaTransportException("download-chunk unexpected status=${status.value}: $rawBody"))
     }
 

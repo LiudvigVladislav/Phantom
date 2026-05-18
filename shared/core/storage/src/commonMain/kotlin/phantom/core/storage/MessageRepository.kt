@@ -23,6 +23,10 @@ interface MessageRepository {
 
 enum class MessageStatus {
     QUEUED,
+    /** Sender: media chunks are being uploaded to the relay (PR-M1w). */
+    UPLOADING,
+    /** Receiver: media chunks are being downloaded from the relay (PR-M1w). */
+    DOWNLOADING,
     /**
      * Encryption attempted but the recipient has no published prekey
      * bundle on the relay yet (404 from PreKeyApi.fetchBundle). The

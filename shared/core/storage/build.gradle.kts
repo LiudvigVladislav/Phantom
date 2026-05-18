@@ -50,7 +50,7 @@ sqldelight {
         create("PhantomDatabase") {
             packageName.set("phantom.core.storage.db")
             srcDirs("src/commonMain/sqldelight")
-            version = 13
+            version = 17
         }
     }
 }

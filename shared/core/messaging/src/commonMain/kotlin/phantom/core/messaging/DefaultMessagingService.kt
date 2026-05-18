@@ -40,7 +40,9 @@ import phantom.core.storage.ProcessedEnvelopeRepository
 import phantom.core.storage.ReactionRepository
 import phantom.core.storage.TrustTier
 import phantom.core.storage.VoiceChunkRepository
+import phantom.core.storage.VoiceV2DownloadRepository
 import phantom.core.transport.BundleFetchException
+import kotlinx.coroutines.launch
 import phantom.core.transport.PreKeyApi
 import phantom.core.transport.RelayMessage
 import phantom.core.transport.RelayTransport
@@ -121,6 +123,27 @@ class DefaultMessagingService(
      * always wires the real SQLDelight repository through AppContainer.
      */
     private val voiceChunkRepository: VoiceChunkRepository? = null,
+    /**
+     * Composite voice-v2 upload helper (PR-M1w). When non-null, [sendAudio]
+     * switches from the legacy audio_chunk ratchet path to the encrypted-media
+     * upload path: encrypt → chunk → upload → send one manifest envelope.
+     * When null, [sendAudio] falls back to the legacy audio_chunk path so
+     * existing tests that construct DMS without this dependency still compile.
+     */
+    private val voiceV2Sender: VoiceV2Sender? = null,
+    /**
+     * Durable download-task store for voice_v2 manifests (PR-M1w, Q4).
+     * Nullable + default null for test call-site compatibility. Production
+     * AppContainer MUST wire a non-null instance. A null value causes the
+     * voice_v2 receive handler to refuse ACKing the manifest (better to
+     * retry forever than silently drop a voice message).
+     */
+    private val voiceV2DownloadRepository: VoiceV2DownloadRepository? = null,
+    /**
+     * Download orchestrator for voice_v2 chunks (PR-M1w, Commit 4).
+     * Nullable; when non-null, [runVoiceV2DownloadTask] delegates to it.
+     */
+    private val voiceV2DownloadOrchestrator: VoiceV2DownloadOrchestrator? = null,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -128,6 +151,19 @@ class DefaultMessagingService(
 
     /** Called by the platform container after the initial prekey-bundle publish attempt. */
     fun markBootstrapReady() { _bootstrapReady.value = true }
+
+    // PR-M1w: single voice in-flight per conversation. Guarded by mutexFor(conversationId).
+    private val voiceSendInProgress = mutableSetOf<String>()
+
+    init {
+        // Q4: loud WARN if production wires this incorrectly.
+        if (voiceV2DownloadRepository == null) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "MEDIA_RX no_download_repo running_in_degraded_mode — voice_v2 manifests will NOT be ACKed",
+            )
+        }
+    }
 
     private val _incomingMessages = MutableSharedFlow<IncomingMessage>(
         replay = 0,
@@ -575,6 +611,11 @@ class DefaultMessagingService(
      *
      * The sender's own DB row uses the full reassembled base64 so AudioBubble
      * renders immediately without waiting for chunk acknowledgements.
+     *
+     * PR-M1w: when [voiceV2Sender] is wired, this method switches to the
+     * encrypted-media upload path (encrypt → chunk → /media/upload-chunk × N →
+     * single voice_v2 manifest envelope). The legacy audio_chunk path is kept
+     * as a fallback for tests that construct DMS without [voiceV2Sender].
      */
     @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
     override suspend fun sendAudio(
@@ -592,10 +633,7 @@ class DefaultMessagingService(
 
         // PR-D2a — send-layer guard. UI button is gated separately, but a
         // gesture / callback / retry path can still call here; this guard
-        // makes "recorded but disappeared" impossible. Voice-over-REST
-        // chunking lands in PR-D2b; until then the only honest answer on a
-        // degraded transport is to fail loudly so the caller can show the
-        // user what happened.
+        // makes "recorded but disappeared" impossible.
         if (!canSendVoice()) {
             messagingLog(
                 MessagingLogLevel.WARN,
@@ -610,6 +648,13 @@ class DefaultMessagingService(
             ?: return Result.failure(IllegalStateException(
                 "sendAudio: no conversation found for id=$conversationId"
             ))
+
+        // PR-M1w: use encrypted-media path when VoiceV2Sender is wired.
+        if (voiceV2Sender != null) {
+            return sendAudioV2(conversationId, conv, audioBytes, durationMs, mimeType)
+        }
+
+        // ── Legacy audio_chunk path (kept for tests + backward compat) ──────────
         val recipientPublicKeyHex = conv.theirPublicKeyHex
 
         val voiceId = uuid4().toString()
@@ -705,7 +750,7 @@ class DefaultMessagingService(
 
             conversationRepository.upsertConversation(
                 conv.copy(
-                    lastMessagePreview = "🎤 Voice message",
+                    lastMessagePreview = "Voice message",
                     lastMessageAt = Clock.System.now().toEpochMilliseconds(),
                 )
             )
@@ -716,6 +761,164 @@ class DefaultMessagingService(
                 "VOICE_TX send_complete voiceId=${voiceId.take(8)} totalChunks=$total",
             )
         }
+    }
+
+    /**
+     * PR-M1w encrypted-media send path (voice_v2).
+     *
+     * Step-by-step per §3 of the design:
+     * 1. In-progress guard — prevents two concurrent uploads for the same conversation.
+     * 2. Local row INSERT (QUEUED) with [AUDIO:<base64>] — sender-side self-contained playback (Q1).
+     * 3. Status → UPLOADING.
+     * 4. Delegate to [VoiceV2Sender.uploadVoice] (encrypt + chunk + upload).
+     * 5. On failure → FAILED, remove guard, no manifest.
+     * 6. On success → build manifest payload, encrypt, send via transport.
+     * 7. Update conversation preview; remove guard.
+     * Status → SENT/DELIVERED arrives via the existing acks flow handler.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    private suspend fun sendAudioV2(
+        conversationId: String,
+        conv: ConversationEntity,
+        audioBytes: ByteArray,
+        durationMs: Long,
+        mimeType: String,
+    ): Result<Unit> {
+        val sender = voiceV2Sender!! // safe: caller already null-checked
+        val recipientPublicKeyHex = conv.theirPublicKeyHex
+
+        // Step 1 — In-progress guard
+        val alreadyInProgress = mutexFor(conversationId).withLock {
+            if (voiceSendInProgress.contains(conversationId)) true
+            else { voiceSendInProgress.add(conversationId); false }
+        }
+        if (alreadyInProgress) {
+            return Result.failure(IllegalStateException(
+                "A voice message is still uploading. Please wait."
+            ))
+        }
+
+        val insertedAtMs = Clock.System.now().toEpochMilliseconds()
+        val outgoingTimerSecs = conversationRepository.getDisappearingTimer(conversationId)
+        val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) insertedAtMs + outgoingTimerSecs * 1_000L else null
+
+        // Step 2 — Local row INSERT (QUEUED). Q1: sender stores Base64 for self-contained playback.
+        val localMsgId = uuid4().toString()
+        val fullBase64 = Base64.encode(audioBytes)
+        messageRepository.insertMessage(
+            MessageEntity(
+                id             = localMsgId,
+                conversationId = conversationId,
+                ciphertext     = ByteArray(0),
+                plaintextCache = "[AUDIO:$fullBase64]",
+                sent           = true,
+                status         = MessageStatus.QUEUED,
+                createdAt      = insertedAtMs,
+                expiresAtMs    = outgoingExpiresAtMs,
+            )
+        )
+
+        // Step 3 — Status → UPLOADING
+        messageRepository.updateStatus(localMsgId, MessageStatus.UPLOADING)
+
+        // Steps 4–7 launched on the DMS-injected appScope so the upload survives
+        // UI lifecycle changes (MB8, Test #58). The caller (ChatScreen viewModelScope
+        // or any other Compose scope) returns immediately after scheduling the job.
+        // The in-progress guard is released INSIDE the launched coroutine — moving
+        // it outside would allow a second concurrent send to fire before the first
+        // one has truly finished (or failed).
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "MEDIA_TX upload_job_started scope=dms localMsgId=${localMsgId.take(8)}",
+        )
+        scope.launch {
+            try {
+                val uploadResult = sender.uploadVoice(audioBytes, durationMs, mimeType)
+                if (uploadResult.isFailure) {
+                    val reason = uploadResult.exceptionOrNull()?.message?.take(60) ?: "unknown"
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "MEDIA_TX send_failed_no_manifest mediaId=unknown reason=$reason",
+                    )
+                    messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
+                    return@launch
+                }
+
+                val manifest = uploadResult.getOrThrow()
+
+                // Step 6 — Wrap manifest in MessagePayload(TYPE_VOICE_V2) so the
+                // receiver's `payload.type == TYPE_VOICE_V2` branch fires. Before
+                // this fix the raw VoiceManifestV2 JSON went on the wire; the
+                // receiver decoded it as `MessagePayload(type=message, text="")`
+                // and surfaced it as an empty chat bubble (Test #57 root cause).
+                val manifestJson = json.encodeToString(manifest)
+                val payload = MessagePayload(
+                    type           = MessagePayload.TYPE_VOICE_V2,
+                    text           = manifestJson,
+                    sentAt         = Clock.System.now().toEpochMilliseconds(),
+                    senderUsername = identity.username,
+                )
+                val payloadBytes = json.encodeToString(payload).encodeToByteArray()
+                val encrypted = encryptUnderLock(
+                    conversationId        = conversationId,
+                    recipientPublicKeyHex = recipientPublicKeyHex,
+                    plaintext             = payloadBytes,
+                )
+                val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
+                val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
+                val envelopeId = uuid4().toString()
+
+                transport.send(
+                    RelayMessage.Send(
+                        to           = recipientPublicKeyHex,
+                        from         = "",
+                        sealedSender = Base64.encode(
+                            SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                        ),
+                        payload   = paddedCiphertext.encodeBase64(),
+                        messageId = envelopeId,
+                    )
+                )
+                // transport.send returning false is OK — the envelope is in the outbox durable store
+                // (HybridRelayTransport retry path). The ratchet ack flow will lift SENT → DELIVERED.
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
+                        "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
+                )
+                // R5-3 — Flip local row UPLOADING → SENT immediately after manifest leaves us.
+                // Without this the sender bubble visually stays in UPLOADING until the
+                // receiver's read receipt (potentially many minutes on Limited realtime).
+                // Mirrors the text-send path which marks rows SENT after transport.send returns.
+                messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "MEDIA_TX local_status_sent mediaId=${manifest.mediaId.take(8)} " +
+                        "localMsgId=${localMsgId.take(8)}",
+                )
+
+                // Step 7 — Update conversation preview
+                conversationRepository.upsertConversation(
+                    conv.copy(
+                        lastMessagePreview = "Voice message",
+                        lastMessageAt      = Clock.System.now().toEpochMilliseconds(),
+                    )
+                )
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "MEDIA_TX upload_job_cancelled localMsgId=${localMsgId.take(8)} " +
+                        "reason=${ce.message?.take(60) ?: "scope_cancelled"}",
+                )
+                messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
+                throw ce
+            } finally {
+                mutexFor(conversationId).withLock {
+                    voiceSendInProgress.remove(conversationId)
+                }
+            }
+        }
+        return Result.success(Unit)
     }
 
     override suspend fun startReceiving() {
@@ -767,6 +970,33 @@ class DefaultMessagingService(
                     MessagingLogLevel.INFO,
                     "VOICE_RX finalizer_done voiceCount=${ready.size}",
                 )
+            }
+        }
+
+        // PR-M1w finalizer: resume any voice_v2 download tasks that were PENDING
+        // when the previous process died. Mirrors the D2b.1 chunk-assembly finalizer.
+        voiceV2DownloadRepository?.let { repo ->
+            val pending = repo.findPending()
+            if (pending.isNotEmpty()) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "MEDIA_RX finalizer_start taskCount=${pending.size}",
+                )
+                pending.forEach { task ->
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "MEDIA_RX finalizer_resume mediaId=${task.mediaId.take(8)}",
+                    )
+                    scope.launch {
+                        runCatching { runVoiceV2DownloadTask(task.mediaId) }
+                            .onFailure { ex ->
+                                messagingLog(
+                                    MessagingLogLevel.WARN,
+                                    "MEDIA_RX finalizer_task_threw mediaId=${task.mediaId.take(8)} error=${ex::class.simpleName}",
+                                )
+                            }
+                    }
+                }
             }
         }
 
@@ -1622,6 +1852,22 @@ class DefaultMessagingService(
                 return@runCatching
             }
 
+            // PR-M1w: encrypted-media voice manifest. The receiver saves a durable
+            // download task, ACKs the manifest (so the relay drops the envelope),
+            // then kicks off the chunk download coroutine.
+            if (payload.type == MessagePayload.TYPE_VOICE_V2) {
+                // The manifest JSON lives in payload.text (see sendAudioV2 wrap).
+                handleVoiceV2Manifest(
+                    deliver         = deliver,
+                    payloadText     = payload.text,
+                    senderUsername  = payload.senderUsername,
+                    senderPubKeyHex = senderPubKeyHex,
+                    conversationId  = conversationId,
+                    nowMs           = Clock.System.now().toEpochMilliseconds(),
+                )
+                return@runCatching
+            }
+
             // Route call-signalling messages to CallManager; never store as chat messages.
             if (payload.type in MessagePayload.CALL_TYPES) {
                 onCallMessage?.invoke(payload, senderPubKeyHex)
@@ -2247,6 +2493,206 @@ class DefaultMessagingService(
             body.startsWith("[FILE:")  -> "📎 File"
             else                       -> body.take(60)
         }
+    }
+
+    // ── PR-M1w receive path ────────────────────────────────────────────────────
+
+    /**
+     * Handles an incoming [TYPE_VOICE_V2] manifest envelope (§4, PR-M1w).
+     *
+     * Contract (Q4): ACK is sent ONLY after the durable task INSERT commits.
+     * If [voiceV2DownloadRepository] is null (degraded mode), we do NOT ack —
+     * the relay will redeliver on the next poll so the message is not lost.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    private suspend fun handleVoiceV2Manifest(
+        deliver: RelayMessage.Deliver,
+        payloadText: String,
+        senderUsername: String,
+        senderPubKeyHex: String,
+        conversationId: String,
+        nowMs: Long,
+    ) {
+        val repo = voiceV2DownloadRepository
+        if (repo == null) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "MEDIA_RX no_download_repo envelopeId=${deliver.messageId.take(8)} — manifest NOT acked, will redeliver",
+            )
+            return
+        }
+
+        // Step 1 — Parse manifest
+        val manifest = runCatching {
+            json.decodeFromString<VoiceManifestV2>(payloadText)
+        }.getOrElse { ex ->
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "MEDIA_RX manifest_parse_fail envelopeId=${deliver.messageId.take(8)} error=${ex::class.simpleName}",
+            )
+            transport.sendDeliveryAck(deliver.messageId)
+            return
+        }
+
+        // Step 1b — Validate manifest fields (security: reject before any DB write)
+        val validationFailure = validateVoiceV2Manifest(manifest)
+        if (validationFailure != null) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "MEDIA_RX manifest_invalid envelopeId=${deliver.messageId.take(8)} " +
+                    "reason=$validationFailure mediaId=${manifest.mediaId.take(8)}",
+            )
+            transport.sendDeliveryAck(deliver.messageId)
+            return
+        }
+
+        // Step 2 — Idempotency check
+        val existing = repo.find(manifest.mediaId)
+        if (existing != null) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "MEDIA_RX manifest_duplicate mediaId=${manifest.mediaId.take(8)} status=${existing.status}",
+            )
+            transport.sendDeliveryAck(deliver.messageId)
+            return
+        }
+
+        // Step 3 — Insert local message row (DOWNLOADING)
+        val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
+        val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
+        messageRepository.insertMessage(
+            MessageEntity(
+                id             = manifest.mediaId, // stable PK mirrors D2b.1 voiceId pattern
+                conversationId = conversationId,
+                ciphertext     = ByteArray(0),
+                plaintextCache = "[AUDIO_DOWNLOADING]",
+                sent           = false,
+                status         = MessageStatus.DOWNLOADING,
+                createdAt      = nowMs,
+                expiresAtMs    = expiresAtMs,
+            )
+        )
+
+        // Step 4 — Insert durable download task. MUST commit before ACK.
+        repo.insert(
+            VoiceV2DownloadRepository.Task(
+                mediaId         = manifest.mediaId,
+                conversationId  = conversationId,
+                senderPubKeyHex = senderPubKeyHex,
+                manifestJson    = json.encodeToString(manifest),
+                status          = VoiceV2DownloadRepository.STATUS_PENDING,
+                chunkCount      = manifest.chunkCount,
+                lastAttemptAtMs = 0L,
+                failureReason   = null,
+                createdAtMs     = nowMs,
+            )
+        )
+
+        // Step 5 — ACK manifest envelope (durable save already committed above).
+        transport.sendDeliveryAck(deliver.messageId)
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "MEDIA_RX manifest_acked_and_queued mediaId=${manifest.mediaId.take(8)} chunks=${manifest.chunkCount}",
+        )
+
+        // Step 6 — Emit placeholder to UI
+        _incomingMessages.emit(
+            IncomingMessage(
+                id                 = manifest.mediaId,
+                conversationId     = conversationId,
+                senderPublicKeyHex = senderPubKeyHex,
+                text               = "[AUDIO_DOWNLOADING]",
+                receivedAt         = nowMs,
+            )
+        )
+        // R6.1 — Update conversation preview + unreadCount so the Chats list
+        // shows the unread badge for incoming voice. Mirrors the normal-message
+        // path at line 2067 (text messages). Without unreadCount++ the chat
+        // row looked "read" even though the user hadn't opened it (Test #60).
+        val existingConv = conversationRepository.getConversation(conversationId) ?: return
+        conversationRepository.upsertConversation(
+            existingConv.copy(
+                lastMessagePreview = "🎤 Voice message",
+                lastMessageAt      = nowMs,
+                unreadCount        = existingConv.unreadCount + 1,
+            )
+        )
+        // R5-2 — Use senderUsername from wrapped MessagePayload as the
+        // notification display name. Falls back to pubkey-truncated form only
+        // when the sender didn't set a username. Mirrors the normal-message
+        // path at line 2077.
+        val senderName = senderUsername.ifBlank { senderPubKeyHex.take(8) }
+        onNewMessageNotification?.invoke(conversationId, senderName, "Voice message", senderPubKeyHex)
+
+        // Step 7 — Trigger download (Commit 4 wires runDownloadTask).
+        // TODO(PR-M1w Commit4): replace stub with voiceV2DownloadOrchestrator.runDownloadTask(manifest.mediaId)
+        scope.launch {
+            runCatching { runVoiceV2DownloadTask(manifest.mediaId) }
+                .onFailure { ex ->
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "MEDIA_RX download_task_threw mediaId=${manifest.mediaId.take(8)} error=${ex::class.simpleName}",
+                    )
+                }
+        }
+    }
+
+    /**
+     * Returns the failed field name if the manifest is invalid, null if OK.
+     * Security: reject any manifest with wrong key/nonce/sha256 sizes before
+     * inserting any rows (prevents relay from poisoning our local DB).
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    private fun validateVoiceV2Manifest(m: VoiceManifestV2): String? {
+        if (m.mediaId.isBlank()) return "mediaId"
+        if (runCatching { Base64.decode(m.mediaKey) }.getOrNull()?.size != 32) return "mediaKey"
+        if (runCatching { Base64.decode(m.nonce) }.getOrNull()?.size != 24) return "nonce"
+        if (runCatching { Base64.decode(m.sha256) }.getOrNull()?.size != 32) return "sha256"
+        if (m.chunkCount !in 1..256) return "chunkCount"
+        if (m.encryptedSizeBytes <= 0) return "encryptedSizeBytes"
+        if (m.alg != VoiceManifestV2.ALG) return "alg"
+        return null
+    }
+
+    /**
+     * Download task dispatcher — delegates to [VoiceV2DownloadOrchestrator] when wired.
+     * Called from [handleVoiceV2Manifest] and the startReceiving finalizer via scope.launch.
+     *
+     * When the orchestrator is null (tests that don't inject it), this is a no-op:
+     * the task row stays PENDING and the UI shows the spinner indefinitely.
+     * Production AppContainer always wires the orchestrator.
+     *
+     * TODO(PR-M1w §8): after Test #56, flip canSendVoice for RestActive/WsCandidate
+     * in TransportCapabilitiesResolver (separate Commit 5 step per design §8).
+     */
+    internal open suspend fun runVoiceV2DownloadTask(mediaId: String) {
+        voiceV2DownloadOrchestrator?.runDownloadTask(mediaId)
+        // R5-1 — UI/state propagation after download completes.
+        // The orchestrator updated `plaintextCache` to `[AUDIO_LOCAL:<path>]` and
+        // set status=DELIVERED in the DB, but ChatScreen observes the
+        // `incomingMessages` flow rather than polling the DB. Without this emit
+        // the bubble stays on `[AUDIO_DOWNLOADING]` even though the audio is
+        // on disk and playable (Test #59 root cause).
+        val updated = messageRepository.getMessageById(mediaId) ?: return
+        // Only emit if the orchestrator actually finalised the row. Failed/pending
+        // rows have prefixes other than [AUDIO_LOCAL:]; those will surface via
+        // the FAILED-status branch in ChatScreen StatusIcon and don't need a
+        // new incoming-message event.
+        val finalText = updated.plaintextCache.orEmpty()
+        if (!finalText.startsWith("[AUDIO_LOCAL:")) return
+        _incomingMessages.emit(
+            IncomingMessage(
+                id                 = updated.id,
+                conversationId     = updated.conversationId,
+                senderPublicKeyHex = "", // not surfaced by ChatScreen for self-refresh
+                text               = finalText,
+                receivedAt         = Clock.System.now().toEpochMilliseconds(),
+            )
+        )
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "MEDIA_RX message_ready mediaId=${mediaId.take(8)} path=AUDIO_LOCAL",
+        )
     }
 }
 

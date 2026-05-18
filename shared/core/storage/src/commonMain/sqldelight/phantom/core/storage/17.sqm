@@ -1,0 +1,20 @@
+-- 17.sqm — voice_v2_downloads task table for durable media download state (PR-M1w).
+--
+-- Tracks the state of each pending voice_v2 manifest download so a process
+-- death between manifest receipt and final audio assembly is recoverable on
+-- the next startReceiving call. Once COMPLETE, the row is deleted immediately.
+-- A FAILED row is retained so the UI can surface the failure reason.
+--
+-- status values: 'pending' | 'complete' | 'failed'
+
+CREATE TABLE voice_v2_downloads (
+    media_id           TEXT    NOT NULL PRIMARY KEY,
+    conversation_id    TEXT    NOT NULL,
+    sender_pubkey_hex  TEXT    NOT NULL,
+    manifest_json      TEXT    NOT NULL,
+    status             TEXT    NOT NULL DEFAULT 'pending',
+    chunk_count        INTEGER NOT NULL,
+    last_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+    failure_reason     TEXT,
+    created_at_ms      INTEGER NOT NULL
+);

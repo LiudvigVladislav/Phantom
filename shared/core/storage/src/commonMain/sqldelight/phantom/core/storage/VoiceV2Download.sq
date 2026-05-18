@@ -1,0 +1,40 @@
+-- VoiceV2Download.sq — schema + queries for the voice_v2_downloads durable task table (PR-M1w).
+--
+-- Table is also created by migration 17.sqm for upgrades from earlier schema
+-- versions. New installs use the CREATE TABLE statement below.
+
+CREATE TABLE voice_v2_downloads (
+    media_id           TEXT    NOT NULL PRIMARY KEY,
+    conversation_id    TEXT    NOT NULL,
+    sender_pubkey_hex  TEXT    NOT NULL,
+    manifest_json      TEXT    NOT NULL,
+    status             TEXT    NOT NULL DEFAULT 'pending',
+    chunk_count        INTEGER NOT NULL,
+    last_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+    failure_reason     TEXT,
+    created_at_ms      INTEGER NOT NULL
+);
+
+insert:
+INSERT OR IGNORE INTO voice_v2_downloads(
+    media_id, conversation_id, sender_pubkey_hex, manifest_json,
+    status, chunk_count, last_attempt_at_ms, failure_reason, created_at_ms
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+find:
+SELECT * FROM voice_v2_downloads WHERE media_id = ?;
+
+findPending:
+SELECT * FROM voice_v2_downloads WHERE status = 'pending' ORDER BY created_at_ms ASC;
+
+update:
+UPDATE voice_v2_downloads
+SET status = ?, failure_reason = ?, last_attempt_at_ms = ?
+WHERE media_id = ?;
+
+delete:
+DELETE FROM voice_v2_downloads WHERE media_id = ?;
+
+deleteAll:
+DELETE FROM voice_v2_downloads;

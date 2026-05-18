@@ -63,11 +63,11 @@ class TransportCapabilitiesResolverTest {
     }
 
     @Test
-    fun wsCandidate_noTor_canSendVoice_false_untilM1w() {
-        // Voice gated in Limited realtime until PR-M1w wires encrypted media
-        // upload. D2b voice-over-/relay/send path is parked.
+    fun wsCandidate_noTor_canSendVoice_true_afterM1w() {
+        // PR-M1w wired (2026-05-18): voice in Limited realtime uses the
+        // encrypted-media-upload path. D2b voice-over-/relay/send path is parked.
         val caps = TransportCapabilitiesResolver.resolve(RestMode.WsCandidate, torActive = false)
-        assertFalse(caps.canSendVoice)
+        assertTrue(caps.canSendVoice)
     }
 
     @Test
@@ -91,11 +91,11 @@ class TransportCapabilitiesResolverTest {
     }
 
     @Test
-    fun restActive_noTor_canSendVoice_false_untilM1w() {
-        // Voice gated in Limited realtime until PR-M1w wires encrypted media
-        // upload. D2b voice-over-/relay/send path is parked.
+    fun restActive_noTor_canSendVoice_true_afterM1w() {
+        // PR-M1w wired (2026-05-18): voice in Limited realtime uses the
+        // encrypted-media-upload path. D2b voice-over-/relay/send path is parked.
         val caps = TransportCapabilitiesResolver.resolve(RestMode.RestActive, torActive = false)
-        assertFalse(caps.canSendVoice)
+        assertTrue(caps.canSendVoice)
     }
 
     @Test
@@ -245,5 +245,27 @@ class TransportCapabilitiesResolverTest {
         assertEquals("WsActive", capsWithMode.restModeLabel)
         val capsNullMode = TransportCapabilitiesResolver.resolve(restMode = null, torActive = true)
         assertNull(capsNullMode.restModeLabel)
+    }
+
+    // ── PR-M1w (2026-05-18): voice now allowed in Limited realtime ───────────
+
+    @Test
+    fun restActive_canSendVoice_true_afterM1w() {
+        val caps = TransportCapabilitiesResolver.resolve(RestMode.RestActive, torActive = false)
+        assertTrue(caps.canSendVoice)
+        assertFalse(caps.canStartCalls)  // calls still blocked in Limited realtime
+    }
+
+    @Test
+    fun wsCandidate_canSendVoice_true_afterM1w() {
+        val caps = TransportCapabilitiesResolver.resolve(RestMode.WsCandidate, torActive = false)
+        assertTrue(caps.canSendVoice)
+        assertFalse(caps.canStartCalls)
+    }
+
+    @Test
+    fun tor_still_blocks_voice_afterM1w() {
+        val caps = TransportCapabilitiesResolver.resolve(RestMode.RestActive, torActive = true)
+        assertFalse(caps.canSendVoice)  // Tor still text-only
     }
 }

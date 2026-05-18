@@ -32,4 +32,13 @@
     <string name="c1_call_blocked_tor_transport">Calls are not available over Tor.</string>
     <string name="c1_call_blocked_reality_unprobed">Calls are temporarily unavailable in Limited realtime mode. Try again later on a stable realtime connection.</string>
     <string name="c1_call_blocked_no_transport">Calls are not available until a stable connection is established.</string>
+
+    <!--
+      PR-M1w (2026-05-18): in-progress guard copy.
+      Shown as a Snackbar when the user taps the microphone while a previous
+      voice message is still uploading (DefaultMessagingService.sendAudioV2
+      returns IllegalStateException with this message).
+      TODO(i18n): mirror in values-ru/strings.xml
+    -->
+    <string name="m1w_voice_still_uploading">A voice message is still uploading. Please wait.</string>
 </resources>

@@ -143,7 +143,7 @@ class KtorMediaUploadTransportTest {
         )
         val result = transport.uploadChunk(testToken, "id", 0, 1, smallCiphertext())
         assertTrue(result.isFailure)
-        assertTrue(result.exceptionOrNull() === MediaAuthException)
+        assertTrue(result.exceptionOrNull() is MediaAuthException)
     }
 
     // ── downloadChunk happy path ───────────────────────────────────────────────
@@ -187,7 +187,7 @@ class KtorMediaUploadTransportTest {
         )
         val result = transport.downloadChunk(testToken, "id", 0)
         assertTrue(result.isFailure)
-        assertTrue(result.exceptionOrNull() === MediaAuthException)
+        assertTrue(result.exceptionOrNull() is MediaAuthException)
     }
 
     // ── client-side oversize precheck ─────────────────────────────────────────

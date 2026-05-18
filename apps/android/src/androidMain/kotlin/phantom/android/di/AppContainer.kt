@@ -129,6 +129,14 @@ class AppContainer(private val context: Context) {
     // both the live chunk handler and the startReceiving finalizer call.
     val voiceChunkRepo = SqlDelightVoiceChunkRepository(dbHolder.database)
 
+    // PR-M1w (2026-05-18): durable task queue for voice_v2 downloads.
+    // Constructed unconditionally — the receiver must always have somewhere
+    // to enqueue inbound voice_v2 manifests even during the Alpha-1 migration
+    // window where signingPubHexForRest is null (i.e. sender-side M1w is
+    // inactive). Only the sender and download orchestrator are gated on
+    // signingPubHexForRest; the repository itself is always available.
+    val voiceV2DownloadRepo = phantom.core.storage.SqlDelightVoiceV2DownloadRepository(dbHolder.database)
+
     // Starts immediately — deletes expired messages while the app is alive.
     private val disappearingMessageScheduler = DisappearingMessageScheduler(messageRepo, appScope)
         .also { it.start() }
@@ -459,6 +467,12 @@ class AppContainer(private val context: Context) {
         // hybrid will construct normally. Crashing here would brick the app
         // for the entire migration window.
         val signingPubHexForRest = identity.signingPublicKeyHex
+        // PR-M1w (2026-05-18): nullable holders for sender-side objects.
+        // Remain null in the Alpha-1 migration window (signingPubHexForRest == null)
+        // so DefaultMessagingService falls back to the legacy audio_chunk path
+        // automatically — zero behaviour change for Alpha-1 records.
+        var voiceV2SenderLocal: phantom.core.messaging.VoiceV2Sender? = null
+        var voiceV2DownloadOrchestratorLocal: phantom.core.messaging.VoiceV2DownloadOrchestrator? = null
         if (signingPubHexForRest == null) {
             android.util.Log.w(
                 "PhantomHybrid",
@@ -499,6 +513,41 @@ class AppContainer(private val context: Context) {
                 transport = phantom.core.transport.createRestFallbackTransport(),
                 log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
             )
+
+            // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.
+            // MediaCrypto wraps libsodium AEAD (already initialized at app start).
+            // AndroidNativeOkHttpMediaUploadTransport: native OkHttp with HTTP/1.1
+            // pinned, fresh client per call, Connection:close. Replaces Ktor path
+            // because Test #58 relay logs confirmed Tele2 LTE drops Ktor/HTTP/2
+            // persistent connections, causing ~31s per-chunk stalls on the receiver
+            // side (25 chunks × 31s ≈ 13 min). KtorMediaUploadTransport stays in
+            // commonMain as the JVM/test fallback.
+            // RestMediaAuthTokenProvider is a thin adapter to the orchestrator's
+            // CAS facade — auth lives in the orchestrator, not here.
+            val mediaCryptoLocal = phantom.core.crypto.MediaCrypto()
+            val mediaUploadTransportLocal = phantom.core.transport.AndroidNativeOkHttpMediaUploadTransport(
+                relayBaseUrl = relayHttpBase,
+                log          = { msg -> android.util.Log.i("PhantomMedia", msg) },
+            )
+            val mediaAuthTokenProviderLocal = phantom.core.transport.RestMediaAuthTokenProvider(
+                orchestrator = restOrchestrator,
+            )
+            voiceV2SenderLocal = phantom.core.messaging.VoiceV2Sender(
+                mediaCrypto    = mediaCryptoLocal,
+                mediaTransport = mediaUploadTransportLocal,
+                tokenProvider  = mediaAuthTokenProviderLocal,
+                log            = { msg -> android.util.Log.i("PhantomMedia", msg) },
+            )
+            voiceV2DownloadOrchestratorLocal = phantom.core.messaging.VoiceV2DownloadOrchestrator(
+                downloadRepo   = voiceV2DownloadRepo,
+                messageRepo    = messageRepo,
+                mediaTransport = mediaUploadTransportLocal,
+                tokenProvider  = mediaAuthTokenProviderLocal,
+                mediaCrypto    = mediaCryptoLocal,
+                fileStore      = phantom.core.messaging.VoiceFileStore(context),
+                log            = { msg -> android.util.Log.i("PhantomMedia", msg) },
+            )
+
             val hybrid = phantom.android.transport.HybridRelayTransport(
                 wsTransport = wsTransport,
                 orchestrator = restOrchestrator,
@@ -683,6 +732,15 @@ class AppContainer(private val context: Context) {
             // finalizer resumes any voice whose chunks all landed before
             // the previous process death.
             voiceChunkRepository = voiceChunkRepo,
+            // PR-M1w (2026-05-18): encrypted media upload for 1:1 voice.
+            // voiceV2SenderLocal and voiceV2DownloadOrchestratorLocal are null
+            // during the Alpha-1 migration window (signingPubHexForRest == null);
+            // DMS falls back to legacy audio_chunk path when either is null.
+            // voiceV2DownloadRepo is always non-null so the receiver can always
+            // enqueue inbound manifests (avoids "no_download_repo degraded_mode").
+            voiceV2Sender               = voiceV2SenderLocal,
+            voiceV2DownloadRepository   = voiceV2DownloadRepo,
+            voiceV2DownloadOrchestrator = voiceV2DownloadOrchestratorLocal,
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.
