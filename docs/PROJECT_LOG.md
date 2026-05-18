@@ -491,6 +491,43 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-18 (mon) · PR-M1w merged — encrypted media-upload voice messages live for 1:1 chats (`561de17c` on master, 7 commits squashed)
+
+**Branch state.** PR #172 squash-merged to master as `561de17c`. Closes the long road from "voice = 150 ratchet envelopes ≈ 2 min on Tele2" (Test #55) to "voice = encrypted media upload + manifest envelope, end-to-end functional on Tele2 LTE" (Test #61). Branch `feat/pr-m1w-voice-upload` deleted on remote.
+
+**Commits squashed into `561de17c`** (in order):
+- 5 builder commits — M1 core (storage schema, sender/orchestrator, DMS handlers, UI bubbles). Effectively inert until integration.
+- `53253d6d` — fix-blockers MB1-MB5 from initial security + architect review (sha256 decode fail-closed, MediaAuthException class semantics, markFailed signature simplification, test assertion fix, SQLDelight CREATE TABLE for CI).
+- `40e98bb7` — CI-driven hidden-compile fixes (kotlinx-datetime out of storage module, opaque generated row class avoided via inline mapping, removed cross-module commonTest fakes).
+- `115b442b` — **live wire-up** caught by Test #56: AppContainer never constructed `VoiceV2Sender` / `VoiceV2DownloadRepository` / `VoiceV2DownloadOrchestrator` (the previous security review's "P8 — AppContainer DI complete with lines 738-740 wiring all three" was a hallucination — `git log -- AppContainer.kt` showed last touch was PR-C1). This commit also flips `TransportCapabilitiesResolver.canSendVoice = true` for `RestActive` + `WsCandidate` (calls stay false in Limited realtime).
+- `cc456a36` — MB6 + MB7 (Test #57): sender wraps `VoiceManifestV2` in `MessagePayload(type=TYPE_VOICE_V2)` so receiver's branch fires; `KtorMediaUploadTransport` wraps `SocketTimeoutException` as `MediaTransportException` so `VoiceV2Sender` retry loop fires.
+- `9ef4a76e` — R4 (Test #58): `AndroidNativeOkHttpMediaUploadTransport` mirrors the locked R0.1/R0.3 pattern (HTTP/1.1 only, fresh client per call, `ConnectionPool(0)`, `retryOnConnectionFailure(false)`, `Connection: close`, 10 s timeouts); `sendAudioV2` Steps 4-7 wrapped in `scope.launch` so the upload survives Compose lifecycle changes. Closed the ~31 s per-chunk Tele2 stall the architect verified via VPS logs (relay served chunks in milliseconds; phone Ktor client waited a full timeout between GETs).
+- `47a1b038` — R5 (Test #59): `runVoiceV2DownloadTask` re-reads the row and emits `IncomingMessage` after `download_complete` so `ChatScreen` transitions `[AUDIO_DOWNLOADING]` → playable voice without exit+reentry; `handleVoiceV2Manifest` threads `payload.senderUsername` so notification title shows the contact name not raw hex; sender row flips `UPLOADING → SENT` immediately after `manifest_sent` instead of waiting on ack flow. New logs: `MEDIA_RX message_ready`, `MEDIA_TX local_status_sent`.
+- `0a48c8cf` — R6.1 (Test #60): `handleVoiceV2Manifest` upserts conversation with `unreadCount + 1` and preview `🎤 Voice message` so the Chats list shows the unread badge the moment the manifest arrives.
+
+**Tests run on real hardware** (Tecno `103603734A004351` on Tele2 LTE Иркутская + `emulator-5554`):
+
+| # | Failure surface | Fix landed |
+|---|---|---|
+| #56 | `MEDIA_RX no_download_repo` at startup; emulator sent legacy `audio_chunk`; Tecno blocked by C1 gate | DI wire-up + capability flip (`115b442b`) |
+| #57 | Receiver decoded manifest as `MessagePayload(type=message, text="")` → empty chat bubble + envelope-id in notification | Manifest wrapper (`cc456a36`) |
+| #58 | Phone download = 1 chunk / ~31 s on Tele2 LTE; phone upload died on Compose scope cancel | Native OkHttp + DMS scope (`9ef4a76e`) |
+| #59 | Receiver bubble stuck on `[AUDIO_DOWNLOADING]` despite download_complete; sender bubble stuck on UPLOADING; notification showed raw hex | UI emit + sender label + status flip (`47a1b038`) |
+| #60 | Chats list never showed unread badge for incoming voice | `unreadCount + 1` upsert (`0a48c8cf`) |
+| #61 | — PASS — | (no fix needed) |
+
+**Architect verdict on Test #61.** "Test #61 = PASS. PR #172 ready to merge." All five functional gates green: voice delivery, native media transport, AUDIO_LOCAL transition, unread badge, notification title.
+
+**Known follow-up: PR-M2 performance pass.** Test #60 showed 5-sec voice = 39-57 KB and current sequential one-HTTP-RTT-per-chunk throughput would make 1-5 min voice take minutes to upload/download. Three M2 tracks queued:
+- **M2a** — recorder bitrate / voice-note profile (mono Opus / AAC at 16-32 kbps; 5 sec voice ≈ 10-20 KB).
+- **M2b** — download parallelism = 2 (receiver-side; lowest-risk concurrency win).
+- **M2c** — upload parallelism = 2 or adaptive (only after Tele2 stability proven for M2b).
+- **M2d** — optional batch endpoint (`GET /media/chunks?from=N&count=4`); later, carefully — large POST bodies on Tele2 have given trouble before.
+
+**Lesson logged: reviewer hallucination on DI claims.** Test #56 caught a fabricated positive finding from the security-reviewer agent and a matching fabrication in the builder agent's commit-5 summary. Both claimed "AppContainer wired with `voiceV2Sender / Repository / Orchestrator` at lines 738-740" — `git log -- AppContainer.kt` proved the file was last touched in PR-C1, with no M1w changes at all. The runtime `MEDIA_RX no_download_repo` log line emitted by DMS init was the source of truth. Memory entry `feedback_reviewer_hallucination_2026_05_18.md` codifies the rule: any reviewer claim of "wired" / "integrated" / "passed" with specific line numbers requires `git log -p` + `grep` proof before trust. The third instance of "Ktor / persistent HTTP on Tele2 stalls; replace with native OkHttp fresh client per call" (after R0.1 and R0.3) is also logged as `project_tele2_media_path_2026_05_18.md`.
+
+**Voice on Limited realtime is now production-functional**: voice records, encrypts, uploads chunks via native OkHttp + manifest envelope via ratchet, receiver downloads + decrypts + verifies sha256 + writes to `filesDir/voice/<mediaId>.<ext>`, chats list shows unread badge, notification shows contact name, bubble transitions to playable. The pre-existing audio_chunk path remains in code as the JVM/test fallback and for any in-flight Alpha-1 messages but is no longer the production sender path.
+
 ### 2026-05-17 (sun) · PR-D2b.2 + D2b.3a probe parked as proof-of-concept — Test #54/#55 surface real cost: 5-sec voice = 150 chunks × 700 ms ≈ 2 min on Tele2 REST; architect-recommended pivot to PR-M1 (encrypted media upload) + PR-C1 (calls capability gating)
 
 **Branch state.** Draft PR #166 on `feat/pr-d2b2-flip-canSendVoice-and-15s-cap` holds two commits, NOT merged:
