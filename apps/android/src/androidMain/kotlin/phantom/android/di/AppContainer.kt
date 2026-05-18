@@ -516,14 +516,18 @@ class AppContainer(private val context: Context) {
 
             // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.
             // MediaCrypto wraps libsodium AEAD (already initialized at app start).
-            // KtorMediaUploadTransport reuses the long-lived REST Ktor client (same
-            // HTTP/1.1-pinned one used by /relay/send and /relay/poll).
+            // AndroidNativeOkHttpMediaUploadTransport: native OkHttp with HTTP/1.1
+            // pinned, fresh client per call, Connection:close. Replaces Ktor path
+            // because Test #58 relay logs confirmed Tele2 LTE drops Ktor/HTTP/2
+            // persistent connections, causing ~31s per-chunk stalls on the receiver
+            // side (25 chunks × 31s ≈ 13 min). KtorMediaUploadTransport stays in
+            // commonMain as the JVM/test fallback.
             // RestMediaAuthTokenProvider is a thin adapter to the orchestrator's
             // CAS facade — auth lives in the orchestrator, not here.
             val mediaCryptoLocal = phantom.core.crypto.MediaCrypto()
-            val mediaUploadTransportLocal = phantom.core.transport.KtorMediaUploadTransport(
-                httpClient   = restHttpClient,
+            val mediaUploadTransportLocal = phantom.core.transport.AndroidNativeOkHttpMediaUploadTransport(
                 relayBaseUrl = relayHttpBase,
+                log          = { msg -> android.util.Log.i("PhantomMedia", msg) },
             )
             val mediaAuthTokenProviderLocal = phantom.core.transport.RestMediaAuthTokenProvider(
                 orchestrator = restOrchestrator,

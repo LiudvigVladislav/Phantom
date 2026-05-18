@@ -821,76 +821,94 @@ class DefaultMessagingService(
         // Step 3 — Status → UPLOADING
         messageRepository.updateStatus(localMsgId, MessageStatus.UPLOADING)
 
-        // Steps 4–6 wrapped in try/finally so the in-progress guard is always released.
-        return try {
-            val uploadResult = sender.uploadVoice(audioBytes, durationMs, mimeType)
-            if (uploadResult.isFailure) {
-                val reason = uploadResult.exceptionOrNull()?.message?.take(60) ?: "unknown"
+        // Steps 4–7 launched on the DMS-injected appScope so the upload survives
+        // UI lifecycle changes (MB8, Test #58). The caller (ChatScreen viewModelScope
+        // or any other Compose scope) returns immediately after scheduling the job.
+        // The in-progress guard is released INSIDE the launched coroutine — moving
+        // it outside would allow a second concurrent send to fire before the first
+        // one has truly finished (or failed).
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "MEDIA_TX upload_job_started scope=dms localMsgId=${localMsgId.take(8)}",
+        )
+        scope.launch {
+            try {
+                val uploadResult = sender.uploadVoice(audioBytes, durationMs, mimeType)
+                if (uploadResult.isFailure) {
+                    val reason = uploadResult.exceptionOrNull()?.message?.take(60) ?: "unknown"
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "MEDIA_TX send_failed_no_manifest mediaId=unknown reason=$reason",
+                    )
+                    messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
+                    return@launch
+                }
+
+                val manifest = uploadResult.getOrThrow()
+
+                // Step 6 — Wrap manifest in MessagePayload(TYPE_VOICE_V2) so the
+                // receiver's `payload.type == TYPE_VOICE_V2` branch fires. Before
+                // this fix the raw VoiceManifestV2 JSON went on the wire; the
+                // receiver decoded it as `MessagePayload(type=message, text="")`
+                // and surfaced it as an empty chat bubble (Test #57 root cause).
+                val manifestJson = json.encodeToString(manifest)
+                val payload = MessagePayload(
+                    type           = MessagePayload.TYPE_VOICE_V2,
+                    text           = manifestJson,
+                    sentAt         = Clock.System.now().toEpochMilliseconds(),
+                    senderUsername = identity.username,
+                )
+                val payloadBytes = json.encodeToString(payload).encodeToByteArray()
+                val encrypted = encryptUnderLock(
+                    conversationId        = conversationId,
+                    recipientPublicKeyHex = recipientPublicKeyHex,
+                    plaintext             = payloadBytes,
+                )
+                val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
+                val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
+                val envelopeId = uuid4().toString()
+
+                transport.send(
+                    RelayMessage.Send(
+                        to           = recipientPublicKeyHex,
+                        from         = "",
+                        sealedSender = Base64.encode(
+                            SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                        ),
+                        payload   = paddedCiphertext.encodeBase64(),
+                        messageId = envelopeId,
+                    )
+                )
+                // transport.send returning false is OK — the envelope is in the outbox durable store
+                // (HybridRelayTransport retry path). Leave row at UPLOADING; acks flow will SENT/DELIVERED.
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
+                        "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
+                )
+
+                // Step 7 — Update conversation preview
+                conversationRepository.upsertConversation(
+                    conv.copy(
+                        lastMessagePreview = "Voice message",
+                        lastMessageAt      = Clock.System.now().toEpochMilliseconds(),
+                    )
+                )
+            } catch (ce: kotlinx.coroutines.CancellationException) {
                 messagingLog(
                     MessagingLogLevel.WARN,
-                    "MEDIA_TX send_failed_no_manifest mediaId=unknown reason=$reason",
+                    "MEDIA_TX upload_job_cancelled localMsgId=${localMsgId.take(8)} " +
+                        "reason=${ce.message?.take(60) ?: "scope_cancelled"}",
                 )
                 messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
-                return Result.failure(uploadResult.exceptionOrNull()!!)
-            }
-
-            val manifest = uploadResult.getOrThrow()
-
-            // Step 6 — Wrap manifest in MessagePayload(TYPE_VOICE_V2) so the
-            // receiver's `payload.type == TYPE_VOICE_V2` branch fires. Before
-            // this fix the raw VoiceManifestV2 JSON went on the wire; the
-            // receiver decoded it as `MessagePayload(type=message, text="")`
-            // and surfaced it as an empty chat bubble (Test #57 root cause).
-            val manifestJson = json.encodeToString(manifest)
-            val payload = MessagePayload(
-                type           = MessagePayload.TYPE_VOICE_V2,
-                text           = manifestJson,
-                sentAt         = Clock.System.now().toEpochMilliseconds(),
-                senderUsername = identity.username,
-            )
-            val payloadBytes = json.encodeToString(payload).encodeToByteArray()
-            val encrypted = encryptUnderLock(
-                conversationId        = conversationId,
-                recipientPublicKeyHex = recipientPublicKeyHex,
-                plaintext             = payloadBytes,
-            )
-            val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
-            val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
-            val envelopeId = uuid4().toString()
-
-            transport.send(
-                RelayMessage.Send(
-                    to           = recipientPublicKeyHex,
-                    from         = "",
-                    sealedSender = Base64.encode(
-                        SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                    ),
-                    payload   = paddedCiphertext.encodeBase64(),
-                    messageId = envelopeId,
-                )
-            )
-            // transport.send returning false is OK — the envelope is in the outbox durable store
-            // (HybridRelayTransport retry path). Leave row at UPLOADING; acks flow will SENT/DELIVERED.
-            messagingLog(
-                MessagingLogLevel.INFO,
-                "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
-                    "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
-            )
-
-            // Step 7 — Update conversation preview
-            conversationRepository.upsertConversation(
-                conv.copy(
-                    lastMessagePreview = "Voice message",
-                    lastMessageAt      = Clock.System.now().toEpochMilliseconds(),
-                )
-            )
-
-            Result.success(Unit)
-        } finally {
-            mutexFor(conversationId).withLock {
-                voiceSendInProgress.remove(conversationId)
+                throw ce
+            } finally {
+                mutexFor(conversationId).withLock {
+                    voiceSendInProgress.remove(conversationId)
+                }
             }
         }
+        return Result.success(Unit)
     }
 
     override suspend fun startReceiving() {
