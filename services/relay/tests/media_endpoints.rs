@@ -630,6 +630,163 @@ async fn test_http_body_limit_respects_config_override() {
     );
 }
 
+// ── Test 14-16: PR-M2d.1 — Prefer: return=minimal → 204 No Content ───────────
+
+/// PR-M2d.1: when the client sends `Prefer: return=minimal`, successful
+/// upload returns 204 No Content with chunk-status in headers instead of
+/// the legacy 201 + JSON body. This removes the response body from the
+/// upload roundtrip on Tele2 LTE where Layer B reliably drops bodies > 2400
+/// bytes (Test #66.2 result).
+#[tokio::test]
+async fn test_upload_prefer_minimal_returns_204_on_stored() {
+    let app = build_app();
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x14);
+    let mid = media_id(0x14);
+
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let ct = vec![0x11_u8; 64];
+    let body = json!({
+        "media_id":       mid,
+        "idx":            0_u32,
+        "total":          1_u32,
+        "ciphertext_b64": b64(&ct),
+    });
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/media/upload-chunk")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .header("prefer", "return=minimal")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::NO_CONTENT, "expected 204 on minimal");
+    let headers = res.headers().clone();
+    assert_eq!(
+        headers.get("x-chunk-stored").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "X-Chunk-Stored header must be set",
+    );
+    assert_eq!(
+        headers.get("x-chunk-duplicate").and_then(|v| v.to_str().ok()),
+        Some("0"),
+        "X-Chunk-Duplicate must be 0 on a fresh store",
+    );
+    assert_eq!(
+        headers.get("x-chunk-idx").and_then(|v| v.to_str().ok()),
+        Some("0"),
+        "X-Chunk-Idx must echo the stored index",
+    );
+    // 204 mandates no body content per RFC 9110 §15.3.5.
+    let bytes = to_bytes(res.into_body(), 32).await.unwrap();
+    assert!(bytes.is_empty(), "204 response must have empty body, got {} bytes", bytes.len());
+}
+
+/// Same media_id+idx with same ciphertext POSTed twice with Prefer: return=minimal
+/// — second call must return 204 with X-Chunk-Duplicate: 1.
+#[tokio::test]
+async fn test_upload_prefer_minimal_returns_204_on_duplicate() {
+    let app = build_app();
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x15);
+    let mid = media_id(0x15);
+
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let ct = vec![0x22_u8; 80];
+    let body = json!({
+        "media_id":       mid,
+        "idx":            0_u32,
+        "total":          1_u32,
+        "ciphertext_b64": b64(&ct),
+    });
+
+    // First upload
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/media/upload-chunk")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .header("prefer", "return=minimal")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::NO_CONTENT, "first upload 204");
+    let dup1 = res1.headers().get("x-chunk-duplicate").and_then(|v| v.to_str().ok())
+        .unwrap_or("?").to_string();
+    assert_eq!(dup1, "0", "first upload must NOT be a duplicate");
+
+    // Second upload, same bytes
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/media/upload-chunk")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .header("prefer", "return=minimal")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::NO_CONTENT, "second upload 204 too");
+    let dup2 = res2.headers().get("x-chunk-duplicate").and_then(|v| v.to_str().ok())
+        .unwrap_or("?").to_string();
+    assert_eq!(dup2, "1", "second upload must be flagged as duplicate");
+}
+
+/// Backward-compat: a client that does NOT send Prefer: return=minimal must
+/// still receive the legacy 201/200 + JSON body. Guards against accidentally
+/// breaking old APKs that rely on the JSON shape.
+#[tokio::test]
+async fn test_upload_no_prefer_keeps_legacy_201_json() {
+    let app = build_app();
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x16);
+    let mid = media_id(0x16);
+
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let ct = vec![0x33_u8; 96];
+    let body = json!({
+        "media_id":       mid,
+        "idx":            0_u32,
+        "total":          1_u32,
+        "ciphertext_b64": b64(&ct),
+    });
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/media/upload-chunk")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                // No Prefer header.
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "legacy clients still get 201");
+    let bytes = to_bytes(res.into_body(), 512).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v.get("status").and_then(|v| v.as_str()), Some("stored"));
+    assert_eq!(v.get("idx").and_then(|v| v.as_u64()), Some(0));
+}
+
 // ── Test 13: config override still gates beyond its value ──────────────────────
 
 /// Symmetric to Test 12: confirm a body that exceeds the elevated cap STILL
