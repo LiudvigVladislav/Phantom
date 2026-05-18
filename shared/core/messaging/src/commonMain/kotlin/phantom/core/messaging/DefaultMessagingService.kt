@@ -2605,11 +2605,17 @@ class DefaultMessagingService(
                 receivedAt         = nowMs,
             )
         )
+        // R6.1 — Update conversation preview + unreadCount so the Chats list
+        // shows the unread badge for incoming voice. Mirrors the normal-message
+        // path at line 2067 (text messages). Without unreadCount++ the chat
+        // row looked "read" even though the user hadn't opened it (Test #60).
+        val existingConv = conversationRepository.getConversation(conversationId) ?: return
         conversationRepository.upsertConversation(
-            conversationRepository.getConversation(conversationId)?.copy(
-                lastMessagePreview = "Voice message",
+            existingConv.copy(
+                lastMessagePreview = "🎤 Voice message",
                 lastMessageAt      = nowMs,
-            ) ?: return
+                unreadCount        = existingConv.unreadCount + 1,
+            )
         )
         // R5-2 — Use senderUsername from wrapped MessagePayload as the
         // notification display name. Falls back to pubkey-truncated form only
