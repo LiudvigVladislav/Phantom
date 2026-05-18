@@ -40,6 +40,10 @@ actual class VoiceFileStore(private val context: Context) {
     private fun mimeToExtension(mime: String): String = when {
         mime.startsWith("audio/ogg")  -> "ogg"
         mime.startsWith("audio/opus") -> "opus"
+        // audio/m4a is what the AAC-fallback sender sets (PR-M2a). audio/mp4
+        // is the IANA-registered form — accept both so receiver always lands
+        // on the .m4a extension MediaPlayer expects.
+        mime.startsWith("audio/m4a")  -> "m4a"
         mime.startsWith("audio/mp4")  -> "m4a"
         mime.startsWith("audio/3gpp") -> "3gp"
         else                          -> "audio"

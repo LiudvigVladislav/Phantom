@@ -299,31 +299,45 @@ fun GroupChatScreen(
 // ── Helper: start recording ────────────────────────────────────────────────────
 
 private fun startGroupRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder>? = runCatching {
-    // See startChatRecording() for the codec-selection rationale (Opus on
-    // API 29+, AAC fallback on API 26-28, mono 32 kbps Opus / 64 kbps AAC).
+    // PR-M2a: voice-note codec profile — see startChatRecording() for the full
+    // rationale. Targets 2-4 KB/sec on the wire (was 8-12 KB/sec).
     val useOpus = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
     val ext = if (useOpus) "ogg" else "m4a"
     val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.$ext")
+
+    val encoderName: String
+    val outputFormatName: String
+    val sampleRate = 16_000
+    val bitrate = 24_000
+    val channels = 1
+    val mime = if (useOpus) "audio/ogg" else "audio/m4a"
+
     @Suppress("DEPRECATION")
     val recorder = android.media.MediaRecorder().apply {
         setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
         if (useOpus) {
             setOutputFormat(android.media.MediaRecorder.OutputFormat.OGG)
             setAudioEncoder(android.media.MediaRecorder.AudioEncoder.OPUS)
-            setAudioSamplingRate(48_000)
-            setAudioChannels(1)
-            setAudioEncodingBitRate(48_000)
+            encoderName = "OPUS"
+            outputFormatName = "OGG"
         } else {
             setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
-            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
-            setAudioSamplingRate(44_100)
-            setAudioChannels(1)
-            setAudioEncodingBitRate(64_000)
+            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC_ELD)
+            encoderName = "AAC_ELD"
+            outputFormatName = "MPEG_4"
         }
+        setAudioSamplingRate(sampleRate)
+        setAudioChannels(channels)
+        setAudioEncodingBitRate(bitrate)
         setOutputFile(file.absolutePath)
         prepare()
         start()
     }
+    android.util.Log.i(
+        "PhantomMedia",
+        "VOICE_REC config encoder=$encoderName sampleRate=$sampleRate bitrate=$bitrate " +
+            "channels=$channels outputFormat=$outputFormatName mime=$mime scope=group"
+    )
     file to recorder
 }.getOrNull()
 
