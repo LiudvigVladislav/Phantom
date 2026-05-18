@@ -35,7 +35,7 @@ use std::{
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -223,11 +223,59 @@ struct UploadChunkResponse {
 ///  - `total > 256` → 413 `too_many_chunks`
 ///  - cumulative ciphertext bytes > 1 MiB → 413 `media_quota_exceeded`
 ///  - raw body > 3072 bytes → 413 `body_too_large`
+/// True if the client sent `Prefer: return=minimal` (RFC 7240 §4.2).
+///
+/// PR-M2d.1: when present, successful upload responses are `204 No Content`
+/// with all metadata moved to response headers. This removes the response
+/// body from the upload roundtrip entirely — which is the binding cost on
+/// Tele2 LTE where Layer B reliably drops response bodies > ~2400 bytes
+/// (verified by Test #66.2). For backward compatibility, requests without
+/// the header keep getting the legacy `201/200 + JSON` body.
+fn wants_minimal(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .any(|v| {
+            v.to_str()
+                .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case("return=minimal")))
+                .unwrap_or(false)
+        })
+}
+
+/// Build a 204 No Content response carrying chunk-status metadata in headers.
+///
+/// Headers:
+///   X-Chunk-Stored: 1                — chunk is now stored on the relay
+///   X-Chunk-Duplicate: 0|1           — 1 if this was a duplicate sha256 hit
+///   X-Chunk-Idx: <idx>               — chunk index that was stored
+///   Cache-Control: no-store, no-transform
+fn minimal_upload_response(idx: u32, duplicate: bool) -> axum::response::Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let h = resp.headers_mut();
+    h.insert("X-Chunk-Stored", HeaderValue::from_static("1"));
+    h.insert(
+        "X-Chunk-Duplicate",
+        if duplicate { HeaderValue::from_static("1") } else { HeaderValue::from_static("0") },
+    );
+    // Safe to unwrap: u32 decimal is always valid ASCII.
+    h.insert("X-Chunk-Idx", HeaderValue::from_str(&idx.to_string()).unwrap());
+    h.insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-store, no-transform"),
+    );
+    resp
+}
+
 pub async fn upload_chunk(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    // PR-M2d.1: clients opt into 204 + headers via `Prefer: return=minimal`.
+    // Captured up front because it affects both the duplicate and the
+    // stored success paths below; failure paths always return JSON regardless.
+    let minimal = wants_minimal(&headers);
+
     // 413 body cap first — before any other processing.
     let body_bytes = body.len();
     if body_bytes > state.config.max_media_upload_body_bytes {
@@ -351,8 +399,12 @@ pub async fn upload_chunk(
                 total     = req.total,
                 body_bytes = body_bytes,
                 status    = "duplicate",
+                minimal   = minimal,
                 "chunk duplicate",
             );
+            if minimal {
+                return minimal_upload_response(req.idx, true);
+            }
             return (
                 StatusCode::OK,
                 Json(UploadChunkResponse { status: "duplicate", idx: req.idx }),
@@ -417,9 +469,13 @@ pub async fn upload_chunk(
         total     = req.total,
         body_bytes = body_bytes,
         status    = "stored",
+        minimal   = minimal,
         "chunk stored",
     );
 
+    if minimal {
+        return minimal_upload_response(req.idx, false);
+    }
     (
         StatusCode::CREATED,
         Json(UploadChunkResponse { status: "stored", idx: req.idx }),

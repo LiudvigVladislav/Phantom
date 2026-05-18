@@ -78,16 +78,69 @@ class AndroidNativeOkHttpMediaUploadTransport(
                 .url(url)
                 .header("Authorization", "Bearer $token")
                 .header("Connection", "close")
+                // PR-M2d.1: opt into 204 + headers success path. Removes
+                // response body from the upload roundtrip — critical on Tele2
+                // LTE where the relay's 201/JSON response body is dropped on
+                // the way back (verified by Test #66.2 where status=201
+                // surfaced alongside InterruptedIOException at 15-sec
+                // readTimeout). Relay falls back to legacy 201/JSON if it
+                // does not understand the Prefer header.
+                .header("Prefer", "return=minimal")
                 .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
             var statusCode: Int
-            val rawBody: String
+            var headersOnlyElapsedMs = 0L
+            var bodyReadError: Throwable? = null
+            var rawBody = ""
+            var duplicateHeader = false
             client.newCall(request).execute().use { response: Response ->
                 statusCode = response.code
-                rawBody = response.body?.string() ?: ""
+                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
+                duplicateHeader = response.headers["X-Chunk-Duplicate"] == "1"
+                // PR-M2d.1: idempotency-aware body-read. Tele2 Layer B can
+                // drop response bodies after a valid status line arrived.
+                // We capture the status first; if status indicates the relay
+                // accepted/stored the chunk, body-read failure is non-fatal.
+                // For 204 (Prefer=minimal path) there is no body to read; for
+                // 201/200 (legacy path) we drain it but tolerate timeout.
+                rawBody = try {
+                    response.body?.string() ?: ""
+                } catch (e: Throwable) {
+                    bodyReadError = e
+                    ""
+                }
             }
-            val elapsed = System.currentTimeMillis() - startMs
-            log("MEDIA_HTTP upload_response mediaId=${mediaId.take(8)} idx=$idx status=$statusCode elapsedMs=$elapsed")
+            val totalElapsedMs = System.currentTimeMillis() - startMs
+            log(
+                "MEDIA_HTTP upload_response mediaId=${mediaId.take(8)} idx=$idx " +
+                    "status=$statusCode headersMs=$headersOnlyElapsedMs " +
+                    "bodyMs=${totalElapsedMs - headersOnlyElapsedMs} totalMs=$totalElapsedMs" +
+                    (bodyReadError?.let { " bodyReadError=${it::class.simpleName}" } ?: "")
+            )
+            // 204 is the new minimal-success path. Body always empty by RFC.
+            // Map duplicate vs stored from header instead of body.
+            if (statusCode == 204) {
+                return@runCatching if (duplicateHeader) {
+                    Result.success(MediaUploadTransport.UploadStatus.DUPLICATE)
+                } else {
+                    Result.success(MediaUploadTransport.UploadStatus.STORED)
+                }
+            }
+            // Idempotency-aware: 201/200 with body-read failure = relay
+            // already stored the chunk (status line arrived). Don't retry —
+            // a retry would just hit the same Layer B drop, costing another
+            // 15-sec readTimeout for no benefit.
+            if (bodyReadError != null && (statusCode == 201 || statusCode == 200)) {
+                log(
+                    "MEDIA_HTTP upload_response_body_dropped_ok mediaId=${mediaId.take(8)} " +
+                        "idx=$idx status=$statusCode — relay-stored success despite body-read failure"
+                )
+                return@runCatching if (statusCode == 201) {
+                    Result.success(MediaUploadTransport.UploadStatus.STORED)
+                } else {
+                    Result.success(MediaUploadTransport.UploadStatus.DUPLICATE)
+                }
+            }
             mapUploadStatus(statusCode, rawBody)
         }.getOrElse { e ->
             val elapsed = System.currentTimeMillis() - startMs
@@ -120,13 +173,19 @@ class AndroidNativeOkHttpMediaUploadTransport(
                 .get()
                 .build()
             var statusCode: Int
+            var headersOnlyElapsedMs = 0L
             val rawBody: String
             client.newCall(request).execute().use { response: Response ->
                 statusCode = response.code
+                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
                 rawBody = response.body?.string() ?: ""
             }
-            val elapsed = System.currentTimeMillis() - startMs
-            log("MEDIA_HTTP download_response mediaId=${mediaId.take(8)} idx=$idx status=$statusCode elapsedMs=$elapsed")
+            val totalElapsedMs = System.currentTimeMillis() - startMs
+            log(
+                "MEDIA_HTTP download_response mediaId=${mediaId.take(8)} idx=$idx " +
+                    "status=$statusCode headersMs=$headersOnlyElapsedMs " +
+                    "bodyMs=${totalElapsedMs - headersOnlyElapsedMs} totalMs=$totalElapsedMs"
+            )
             mapDownloadResult(statusCode, rawBody)
         }.getOrElse { e ->
             val elapsed = System.currentTimeMillis() - startMs
