@@ -491,6 +491,36 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-18 (mon, late) · PR-M2a merged — voice-note recorder profile shrinks 5-sec voice ~40 % (`bc94a4d4` on master)
+
+**Branch state.** PR #174 squash-merged to master as `bc94a4d4`. Single commit on top of M1w. Branch deleted on remote.
+
+**Scope.** Voice-note recorder profile only. No transport, manifest, crypto, DI, or parallelism changes. Both `ChatScreen.startChatRecording` and `GroupChatScreen.startGroupRecording` move from music-grade to voice-grade encoder settings:
+
+| | Before (M1w) | After (M2a) |
+|---|---|---|
+| OPUS path (API 29+) | 48 kHz / mono / 48 kbps | 16 kHz / mono / 24 kbps |
+| Fallback path (API 26-28) | AAC @ 44.1 kHz / 64 kbps | AAC_ELD @ 16 kHz / 24 kbps |
+| Container | OGG / MPEG_4 | OGG / MPEG_4 (unchanged) |
+| MIME | audio/ogg / audio/m4a | unchanged |
+| 5-sec voice (measured Test #62) | 39-57 KB | 23.5 KB |
+| 35-sec voice (measured Test #62) | ~270-400 KB est. | 150 KB / 89 chunks |
+
+AAC_ELD (Enhanced Low Delay AAC) is the Android voice profile available since API 16, so safe at our minSdk=26. OPUS guard `Build.VERSION.SDK_INT >= VERSION_CODES.Q` stays exactly as before. Channels stay mono (intentional — speech is mono and the same bitrate sounds cleaner than stereo).
+
+**Diagnostic logs added** (Test #62/63+ grep targets):
+- `VOICE_REC config encoder=OPUS|AAC_ELD sampleRate=16000 bitrate=24000 channels=1 outputFormat=OGG|MPEG_4 mime=audio/...` (emitted before MediaRecorder.start() to confirm the recorder applied the chosen profile rather than silently defaulting). The group recorder log appends `scope=group` to distinguish.
+- `VOICE_REC complete durationMs=... bytes=... bytesPerSec=... mime=...` (emitted at the call site after stop() to surface the real-world payload; `bytesPerSec` is integer-math with explicit `durationMs > 0` guard).
+
+**MIME mapping fix.** `VoiceFileStore.mimeToExtension` now matches `audio/m4a` (what the AAC-fallback sender sets) in addition to the IANA-canonical `audio/mp4`. Before the fix the AAC-fallback receive path landed on a generic `audio` extension; MediaPlayer auto-detected from content so playback worked, but the file extension was misleading.
+
+**Test #62 verdict.** Codec change applied and works end-to-end. 5-sec voice fell from 39-57 KB to 23.5 KB (~40-60 % reduction). 35-sec voice fell from ~270-400 KB estimate to 150 KB / 89 chunks. The architect-suggested M2a.1 follow-up (drop bitrate further 24 → 16 kbps to hit the strict ≤ 20 KB target) was prepared as commit `3a2689fc` and then **vetoed by Vladislav** ("нам надо, чтобы звук был идеальным, почти в HD") — the commit was reset on the feature branch with `git push --force-with-lease` before CI re-fired, and the PR shipped as the 24 kbps profile. The architectural call: quality > size for Phantom's premium-feel positioning. Size optimisation continues at the transport layer (PR-M2b) not the codec layer. The voice-quality preference is logged in agent memory as `feedback_voice_quality_priority.md` — 24 kbps is the floor, 16 kbps gated as a future "Data Saver" toggle.
+
+**Out of scope, queued for next sessions.**
+- PR-M2b — download parallelism = 2 (receiver UX; lowest-risk concurrency win on Tele2).
+- PR-M2c — upload parallelism = 2 (only after M2b proven stable).
+- PR-M2d — optional batch endpoint (`GET /media/chunks?from=N&count=4`), carefully because large POST bodies on Tele2 have given trouble before.
+
 ### 2026-05-18 (mon) · PR-M1w merged — encrypted media-upload voice messages live for 1:1 chats (`561de17c` on master, 7 commits squashed)
 
 **Branch state.** PR #172 squash-merged to master as `561de17c`. Closes the long road from "voice = 150 ratchet envelopes ≈ 2 min on Tele2" (Test #55) to "voice = encrypted media upload + manifest envelope, end-to-end functional on Tele2 LTE" (Test #61). Branch `feat/pr-m1w-voice-upload` deleted on remote.
