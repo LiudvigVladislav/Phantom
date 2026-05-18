@@ -148,7 +148,7 @@ class VoiceV2Sender(
                     ?: IllegalStateException("upload returned empty failure")
             }
         }
-        throw MediaAuthException // exhausted all token refresh attempts
+        throw MediaAuthException("auth_refresh_exhausted after $MAX_TOKEN_ATTEMPTS cycles mediaId=${mediaId.take(8)} idx=$idx")
     }
 
     /**

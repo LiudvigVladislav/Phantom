@@ -92,7 +92,7 @@ class MediaConflictException(val reason: String) : Exception("Media chunk confli
 class MediaQuotaException(val reason: String) : Exception("Media quota: $reason")
 
 /** Relay returned 401: the bearer token is missing or expired. */
-object MediaAuthException : Exception("Media auth token invalid or expired")
+class MediaAuthException(message: String = "media_auth_401") : Exception(message)
 
 /** Relay returned 404: the requested chunk does not exist. */
 object NotFoundException : Exception("Media chunk not found")

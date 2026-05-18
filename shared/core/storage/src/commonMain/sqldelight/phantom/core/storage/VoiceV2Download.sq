@@ -1,9 +1,19 @@
--- VoiceV2Download.sq — queries for the voice_v2_downloads durable task table (PR-M1w).
+-- VoiceV2Download.sq — schema + queries for the voice_v2_downloads durable task table (PR-M1w).
 --
--- Table created in migration 17.sqm. One row per received voice_v2 manifest;
--- the row survives process death so the download orchestrator can resume on
--- the next startReceiving call. Completed tasks are deleted immediately;
--- failed tasks are kept for UI surfacing.
+-- Table is also created by migration 17.sqm for upgrades from earlier schema
+-- versions. New installs use the CREATE TABLE statement below.
+
+CREATE TABLE voice_v2_downloads (
+    media_id           TEXT    NOT NULL PRIMARY KEY,
+    conversation_id    TEXT    NOT NULL,
+    sender_pubkey_hex  TEXT    NOT NULL,
+    manifest_json      TEXT    NOT NULL,
+    status             TEXT    NOT NULL DEFAULT 'pending',
+    chunk_count        INTEGER NOT NULL,
+    last_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+    failure_reason     TEXT,
+    created_at_ms      INTEGER NOT NULL
+);
 
 insert:
 INSERT OR IGNORE INTO voice_v2_downloads(

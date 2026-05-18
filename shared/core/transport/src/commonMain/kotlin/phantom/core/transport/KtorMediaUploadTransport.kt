@@ -159,7 +159,7 @@ class KtorMediaUploadTransport(
             Result.failure(IllegalArgumentException("upload-chunk 400: $rawBody"))
         }
         HttpStatusCode.Unauthorized -> {
-            Result.failure(MediaAuthException)
+            Result.failure(MediaAuthException("media_auth_401"))
         }
         else -> {
             Result.failure(MediaTransportException("upload-chunk unexpected status=${status.value}: $rawBody"))
@@ -181,7 +181,7 @@ class KtorMediaUploadTransport(
             )
         }
         HttpStatusCode.NotFound -> Result.failure(NotFoundException)
-        HttpStatusCode.Unauthorized -> Result.failure(MediaAuthException)
+        HttpStatusCode.Unauthorized -> Result.failure(MediaAuthException("media_auth_401"))
         else -> Result.failure(MediaTransportException("download-chunk unexpected status=${status.value}: $rawBody"))
     }
 

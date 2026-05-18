@@ -14,6 +14,7 @@ import phantom.core.transport.MediaUploadTransport
 import phantom.core.transport.NotFoundException
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -134,9 +135,9 @@ class VoiceV2DownloadOrchestratorTest {
         orc(repo, msgRepo, NotFoundTransport).runDownloadTask("media-abc")
 
         val task = repo.find("media-abc")
-        assertNull(task, "COMPLETE tasks are deleted; FAILED tasks stay — task: $task")
-        // If task stayed (FAILED), verify failure reason
-        // (Either deleted after mark or still there — accept both)
+        assertNotNull(task, "FAILED tasks must be retained for UI surfacing")
+        assertEquals(VoiceV2DownloadRepository.STATUS_FAILED, task.status)
+        assertEquals("media_chunks_gone", task.failureReason)
     }
 
     @Test

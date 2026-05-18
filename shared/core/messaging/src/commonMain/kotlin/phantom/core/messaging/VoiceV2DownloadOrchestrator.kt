@@ -58,7 +58,7 @@ class VoiceV2DownloadOrchestrator(
             json.decodeFromString<VoiceManifestV2>(task.manifestJson)
         }.getOrElse { ex ->
             log("MEDIA_RX download_failed mediaId=${mediaId.take(8)} reason=manifest_parse_error error=${ex::class.simpleName}")
-            markFailed(mediaId, task.mediaId, "manifest_parse_error")
+            markFailed(mediaId, "manifest_parse_error")
             return
         }
 
@@ -69,7 +69,7 @@ class VoiceV2DownloadOrchestrator(
             if (chunkBytes == null) {
                 // Permanent failure: relay lost the chunks (TTL expiry or relay restart)
                 log("MEDIA_RX download_failed mediaId=${mediaId.take(8)} reason=media_chunks_gone idx=$idx")
-                markFailed(mediaId, task.mediaId, "media_chunks_gone")
+                markFailed(mediaId, "media_chunks_gone")
                 return
             }
             chunks.add(chunkBytes)
@@ -91,16 +91,21 @@ class VoiceV2DownloadOrchestrator(
             )
         }.getOrElse { ex ->
             log("MEDIA_RX decrypt_failed mediaId=${mediaId.take(8)} error=${ex::class.simpleName}")
-            markFailed(mediaId, task.mediaId, "decrypt_failed")
+            markFailed(mediaId, "decrypt_failed")
             return
         }
 
         // SHA-256 verify (Q2: ionspin Hash.sha256)
-        val expectedSha256 = runCatching { Base64.decode(manifest.sha256) }.getOrElse { return }
+        val expectedSha256 = runCatching { Base64.decode(manifest.sha256) }
+            .getOrElse { ex ->
+                log("MEDIA_RX sha256_decode_failed mediaId=${mediaId.take(8)} error=${ex::class.simpleName}")
+                markFailed(mediaId, "sha256_decode_failed")
+                return
+            }
         val actualSha256 = Hash.sha256(plainAudio.toUByteArray()).toByteArray()
         if (!actualSha256.contentEquals(expectedSha256)) {
             log("MEDIA_RX sha256_mismatch mediaId=${mediaId.take(8)}")
-            markFailed(mediaId, task.mediaId, "sha256_mismatch")
+            markFailed(mediaId, "sha256_mismatch")
             return
         }
 
@@ -158,10 +163,11 @@ class VoiceV2DownloadOrchestrator(
         return last ?: Result.failure(MediaTransportException("download_network_retry_exhausted"))
     }
 
-    private suspend fun markFailed(mediaId: String, localMsgId: String, reason: String) {
+    private suspend fun markFailed(mediaId: String, reason: String) {
+        // Receiver message row PK == mediaId (see DefaultMessagingService.handleVoiceV2Manifest line 2523).
         downloadRepo.update(mediaId, VoiceV2DownloadRepository.STATUS_FAILED, reason)
-        messageRepo.updateStatus(localMsgId, MessageStatus.FAILED)
-        messageRepo.updateMessageText(localMsgId, "[AUDIO_FAILED:$reason]")
+        messageRepo.updateStatus(mediaId, MessageStatus.FAILED)
+        messageRepo.updateMessageText(mediaId, "[AUDIO_FAILED:$reason]")
     }
 
     companion object {
