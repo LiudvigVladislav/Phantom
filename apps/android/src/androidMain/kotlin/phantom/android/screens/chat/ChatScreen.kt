@@ -707,6 +707,17 @@ fun ChatScreen(
                                 scope.launch {
                                     val bytes = file.readBytes()
                                     val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
+                                    // PR-M2a — measured byte profile. bytesPerSec is the
+                                    // key acceptance metric: target 2-4 KB/sec means a
+                                    // 5-sec voice is 10-20 KB and a 60-sec voice 120-240 KB.
+                                    val bytesPerSec = if (recordingDurationMs > 0) {
+                                        bytes.size.toLong() * 1000L / recordingDurationMs
+                                    } else 0L
+                                    android.util.Log.i(
+                                        "PhantomMedia",
+                                        "VOICE_REC complete durationMs=$recordingDurationMs bytes=${bytes.size} " +
+                                            "bytesPerSec=$bytesPerSec mime=$mimeType"
+                                    )
                                     val result = container.messagingService?.sendAudio(
                                         conversationId = conversationId,
                                         audioBytes = bytes,
@@ -2565,40 +2576,64 @@ private fun InputBar(
 // ── Recording helper ──────────────────────────────────────────────────────────
 
 private fun startChatRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder> {
-    // Codec selection by API level. Voice notes inline as base64 in the chat
-    // payload, so smaller is better. Mono is intentional — at the same bitrate
-    // it sounds cleaner than stereo for speech and halves payload size, which
-    // matters on slow uplinks (Bug J / ISSUE-001 Tecno radio parking). A
-    // stereo voice-notes mode is reserved for the future Plus tier.
+    // PR-M2a: voice-note codec profile (was music-grade in PR-D2a).
+    //   OPUS @ 16 kHz mono 24 kbps  (API 29+, primary)
+    //   AAC_ELD @ 16 kHz mono 24 kbps  (API 26-28 fallback; AAC-LD is voice-optimised)
+    //
+    // Target: ~2-4 KB/sec on the wire so 5-sec voice ≈ 10-20 KB, 60-sec ≈ 120-240 KB.
+    // Old profile was 48/48 kbps Opus and 44.1/64 kbps AAC — that produced 5-sec
+    // voices weighing 39-57 KB and forced 25-34 chunks per voice on Tele2 LTE,
+    // which the M1w native OkHttp media transport could deliver but with
+    // user-visible UX cost (architect Test #60 verdict, see PROJECT_LOG.md).
+    //
+    // 16 kHz mono is the W3C/RFC-7587 voice-mode sweet spot for Opus and is
+    // also the documented sweet spot for AAC-LD. 24 kbps is "transparent voice"
+    // for both — voices remain natural, music is poor (intentional).
     val useOpus = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
     val ext = if (useOpus) "ogg" else "m4a"
     val file = java.io.File(context.cacheDir, "audio_${System.currentTimeMillis()}.$ext")
+
+    val encoderName: String
+    val outputFormatName: String
+    val sampleRate = 16_000
+    val bitrate = 24_000
+    val channels = 1
+    val mime = if (useOpus) "audio/ogg" else "audio/m4a"
+
     @Suppress("DEPRECATION")
     val recorder = android.media.MediaRecorder().apply {
         setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
         if (useOpus) {
-            // OGG + Opus, 48 kHz mono, 48 kbps — comfortably above the
-            // transparent-voice threshold (~24-32 kbps). Extra headroom helps
-            // on cheap OEM mics (Tecno-class) where the captured signal has
-            // more noise that needs more bits to encode without artefacts.
             setOutputFormat(android.media.MediaRecorder.OutputFormat.OGG)
             setAudioEncoder(android.media.MediaRecorder.AudioEncoder.OPUS)
-            setAudioSamplingRate(48_000)
-            setAudioChannels(1)
-            setAudioEncodingBitRate(48_000)
+            encoderName = "OPUS"
+            outputFormatName = "OGG"
         } else {
-            // Pre-API-29 fallback: AAC in MPEG-4 container. Still vastly better
-            // than the legacy AMR_NB this code used before.
+            // AAC_ELD (Enhanced Low Delay AAC): voice profile available since
+            // API 16, comfortably present on every API-26 device. Uses the
+            // same MPEG_4 container the previous code did, so the .m4a
+            // extension + VoiceFileStore mimeToExtension mapping still match.
             setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
-            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
-            setAudioSamplingRate(44_100)
-            setAudioChannels(1)
-            setAudioEncodingBitRate(64_000)
+            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC_ELD)
+            encoderName = "AAC_ELD"
+            outputFormatName = "MPEG_4"
         }
+        setAudioSamplingRate(sampleRate)
+        setAudioChannels(channels)
+        setAudioEncodingBitRate(bitrate)
         setOutputFile(file.absolutePath)
         prepare()
         start()
     }
+    // Diagnostic log: confirms the recorder actually applied the chosen profile
+    // rather than silently defaulting to something else. PR-M2a Test #62
+    // grep target: `VOICE_REC config encoder=OPUS|AAC_ELD` must appear before
+    // every voice-send for the profile change to be considered live.
+    android.util.Log.i(
+        "PhantomMedia",
+        "VOICE_REC config encoder=$encoderName sampleRate=$sampleRate bitrate=$bitrate " +
+            "channels=$channels outputFormat=$outputFormatName mime=$mime"
+    )
     return file to recorder
 }
 
