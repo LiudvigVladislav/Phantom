@@ -880,11 +880,21 @@ class DefaultMessagingService(
                     )
                 )
                 // transport.send returning false is OK — the envelope is in the outbox durable store
-                // (HybridRelayTransport retry path). Leave row at UPLOADING; acks flow will SENT/DELIVERED.
+                // (HybridRelayTransport retry path). The ratchet ack flow will lift SENT → DELIVERED.
                 messagingLog(
                     MessagingLogLevel.INFO,
                     "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
                         "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
+                )
+                // R5-3 — Flip local row UPLOADING → SENT immediately after manifest leaves us.
+                // Without this the sender bubble visually stays in UPLOADING until the
+                // receiver's read receipt (potentially many minutes on Limited realtime).
+                // Mirrors the text-send path which marks rows SENT after transport.send returns.
+                messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "MEDIA_TX local_status_sent mediaId=${manifest.mediaId.take(8)} " +
+                        "localMsgId=${localMsgId.take(8)}",
                 )
 
                 // Step 7 — Update conversation preview
@@ -1850,6 +1860,7 @@ class DefaultMessagingService(
                 handleVoiceV2Manifest(
                     deliver         = deliver,
                     payloadText     = payload.text,
+                    senderUsername  = payload.senderUsername,
                     senderPubKeyHex = senderPubKeyHex,
                     conversationId  = conversationId,
                     nowMs           = Clock.System.now().toEpochMilliseconds(),
@@ -2497,6 +2508,7 @@ class DefaultMessagingService(
     private suspend fun handleVoiceV2Manifest(
         deliver: RelayMessage.Deliver,
         payloadText: String,
+        senderUsername: String,
         senderPubKeyHex: String,
         conversationId: String,
         nowMs: Long,
@@ -2599,7 +2611,12 @@ class DefaultMessagingService(
                 lastMessageAt      = nowMs,
             ) ?: return
         )
-        onNewMessageNotification?.invoke(conversationId, senderPubKeyHex, "Voice message", senderPubKeyHex)
+        // R5-2 — Use senderUsername from wrapped MessagePayload as the
+        // notification display name. Falls back to pubkey-truncated form only
+        // when the sender didn't set a username. Mirrors the normal-message
+        // path at line 2077.
+        val senderName = senderUsername.ifBlank { senderPubKeyHex.take(8) }
+        onNewMessageNotification?.invoke(conversationId, senderName, "Voice message", senderPubKeyHex)
 
         // Step 7 — Trigger download (Commit 4 wires runDownloadTask).
         // TODO(PR-M1w Commit4): replace stub with voiceV2DownloadOrchestrator.runDownloadTask(manifest.mediaId)
@@ -2644,6 +2661,32 @@ class DefaultMessagingService(
      */
     internal open suspend fun runVoiceV2DownloadTask(mediaId: String) {
         voiceV2DownloadOrchestrator?.runDownloadTask(mediaId)
+        // R5-1 — UI/state propagation after download completes.
+        // The orchestrator updated `plaintextCache` to `[AUDIO_LOCAL:<path>]` and
+        // set status=DELIVERED in the DB, but ChatScreen observes the
+        // `incomingMessages` flow rather than polling the DB. Without this emit
+        // the bubble stays on `[AUDIO_DOWNLOADING]` even though the audio is
+        // on disk and playable (Test #59 root cause).
+        val updated = messageRepository.getMessageById(mediaId) ?: return
+        // Only emit if the orchestrator actually finalised the row. Failed/pending
+        // rows have prefixes other than [AUDIO_LOCAL:]; those will surface via
+        // the FAILED-status branch in ChatScreen StatusIcon and don't need a
+        // new incoming-message event.
+        val finalText = updated.plaintextCache.orEmpty()
+        if (!finalText.startsWith("[AUDIO_LOCAL:")) return
+        _incomingMessages.emit(
+            IncomingMessage(
+                id                 = updated.id,
+                conversationId     = updated.conversationId,
+                senderPublicKeyHex = "", // not surfaced by ChatScreen for self-refresh
+                text               = finalText,
+                receivedAt         = Clock.System.now().toEpochMilliseconds(),
+            )
+        )
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "MEDIA_RX message_ready mediaId=${mediaId.take(8)} path=AUDIO_LOCAL",
+        )
     }
 }
 
