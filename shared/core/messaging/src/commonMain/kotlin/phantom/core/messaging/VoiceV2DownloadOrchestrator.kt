@@ -69,72 +69,134 @@ class VoiceV2DownloadOrchestrator(
             return
         }
 
-        // PR-M2b — download chunks in parallel with bounded concurrency.
-        // Sequential 1-chunk-per-RTT was the bottleneck for long voices on
-        // Tele2 LTE: Test #62 measured ~100 s for a 35-sec voice (89 chunks
-        // × ~1.1 s each). With parallelism=2 the same voice should land in
-        // ~50 s without changing codec, transport, or any of the downstream
-        // crypto/sha256 verification (those still run on the reassembled
-        // blob, post-await).
+        // PR-M2b.1 — parallel download with typed failure outcomes + sequential
+        // fallback. Test #64 (Tele2 35-sec voice, mediaId=CluGa7GK on the relay):
+        // parallelism=2 activated and accelerated the first ~20 chunks (relay
+        // log proved pairs idx=1+0, idx=2+3, ..., idx=20+19 served), then idx=21
+        // and idx=23 caught InterruptedIOException at ~10 s each. The previous
+        // M2b implementation conflated NotFoundException, network timeout, and
+        // auth-refresh-exhausted into a single `null` return, all of which the
+        // caller then mapped to `media_chunks_gone`. Result: a transient TCP
+        // hiccup on a single chunk surfaced as "Voice unavailable" in the UI
+        // even though the relay had all 116 chunks stored (VPS log evidence).
         //
-        // Result-collection contract:
-        //   - chunks indexed by idx, NOT arrival order → reassembly is
-        //     deterministic regardless of which worker finishes first
-        //   - one chunk failure throws → coroutineScope cancels siblings
-        //   - markFailed runs exactly once, on the catching branch below
-        //   - Token CAS in RestFallbackOrchestrator.acquireOrRefreshMediaToken
-        //     is under tokenMutex.withLock so two concurrent 401s serialise
-        //     into a single /auth/session refresh
+        // The fix has three parts:
+        //   1. `downloadChunkOnce` returns a typed `ChunkDownloadResult`
+        //      so callers distinguish `Missing` (real 404) from `TransientFailure`
+        //      (timeout / network / auth exhaustion).
+        //   2. The orchestrator runs the parallel phase as best-effort: any
+        //      chunk that returns TransientFailure leaves its slot null and we
+        //      continue. Only Missing (404) is fatal at this stage.
+        //   3. After the parallel phase, a sequential phase sweeps the still-null
+        //      slots one-at-a-time. Sequential = the proven-stable pre-M2b path.
+        //      If sequential also returns TransientFailure, the task is LEFT
+        //      PENDING — chunks may still arrive on the next attempt — and the
+        //      startReceiving finalizer at next app start will retry the same
+        //      task via `findPending()`. The user keeps seeing [AUDIO_DOWNLOADING]
+        //      which is honest; they do NOT see a permanent "Voice unavailable"
+        //      false positive.
+        //
+        // CancellationException is rethrown unchanged before any decision,
+        // because a normal scope cancel must not corrupt the task state.
         val chunks = arrayOfNulls<ByteArray>(manifest.chunkCount)
-        val semaphore = Semaphore(permits = DOWNLOAD_PARALLELISM)
         log(
             "MEDIA_RX download_parallel_start mediaId=${mediaId.take(8)} " +
                 "chunks=${manifest.chunkCount} parallelism=$DOWNLOAD_PARALLELISM"
         )
+        val semaphore = Semaphore(permits = DOWNLOAD_PARALLELISM)
 
-        val parallelResult = runCatching {
+        val parallelOutcome = runCatching {
             coroutineScope {
                 (0 until manifest.chunkCount).map { idx ->
                     async {
                         semaphore.withPermit {
-                            val bytes = downloadChunkWithRefresh(manifest.mediaId, idx)
-                                ?: throw MediaChunkGoneException(idx)
-                            chunks[idx] = bytes
+                            when (val r = downloadChunkOnce(manifest.mediaId, idx)) {
+                                is ChunkDownloadResult.Success -> {
+                                    chunks[idx] = r.bytes
+                                    log(
+                                        "MEDIA_RX parallel_chunk_ok mediaId=${mediaId.take(8)} " +
+                                            "idx=$idx"
+                                    )
+                                }
+                                is ChunkDownloadResult.Missing -> {
+                                    // Real 404 — chunks gone — fail fast and cancel siblings.
+                                    throw MediaChunkGoneException(idx)
+                                }
+                                is ChunkDownloadResult.TransientFailure -> {
+                                    // Leave slot null; sequential phase will retry.
+                                    log(
+                                        "MEDIA_RX parallel_transient_failed mediaId=${mediaId.take(8)} " +
+                                            "idx=$idx reason=${r.reason}"
+                                    )
+                                }
+                            }
                         }
                     }
                 }.awaitAll()
             }
         }
-        parallelResult.exceptionOrNull()?.let { ex ->
-            // CancellationException MUST be rethrown unchanged. runCatching catches
-            // every Throwable including the structured-concurrency cancellation
-            // signal — if the DMS appScope (or any parent) is cancelling us (app
-            // exit, user navigation, manifest superseded by a duplicate, etc.),
-            // marking the voice FAILED here would be a silent data corruption:
-            // the chunks are still on the relay, the download was simply paused
-            // mid-flight, and the next process start should resume it via the
-            // startReceiving finalizer. The M1w PR-M1w R4 commit already learned
-            // this lesson on the sender side (sendAudioV2 wraps in scope.launch
-            // with a `catch (ce: CancellationException) { throw ce }` clause);
-            // mirror it here for symmetry.
+        parallelOutcome.exceptionOrNull()?.let { ex ->
             if (ex is CancellationException) throw ex
-            when (ex) {
-                is MediaChunkGoneException -> {
-                    log(
-                        "MEDIA_RX download_failed mediaId=${mediaId.take(8)} " +
-                            "reason=media_chunks_gone idx=${ex.idx}"
-                    )
-                    markFailed(mediaId, "media_chunks_gone")
-                }
-                else -> {
-                    log(
-                        "MEDIA_RX download_failed mediaId=${mediaId.take(8)} " +
-                            "reason=parallel_download_error error=${ex::class.simpleName}"
-                    )
-                    markFailed(mediaId, "parallel_download_error")
+            if (ex is MediaChunkGoneException) {
+                log(
+                    "MEDIA_RX download_failed mediaId=${mediaId.take(8)} " +
+                        "reason=media_chunks_gone idx=${ex.idx}"
+                )
+                markFailed(mediaId, "media_chunks_gone")
+                return
+            }
+            // Any unexpected non-cancellation throwable falls through to
+            // sequential fallback rather than markFailed — the chunks may
+            // still be there and a single-stream retry is the safer move.
+            log(
+                "MEDIA_RX parallel_unexpected mediaId=${mediaId.take(8)} " +
+                    "error=${ex::class.simpleName}"
+            )
+        }
+
+        // Phase 2: sequential sweep of still-null slots.
+        val missingIdx = (0 until manifest.chunkCount).filter { chunks[it] == null }
+        if (missingIdx.isNotEmpty()) {
+            log(
+                "MEDIA_RX download_fallback_sequential_start mediaId=${mediaId.take(8)} " +
+                    "remaining=${missingIdx.size}"
+            )
+            for (idx in missingIdx) {
+                when (val r = downloadChunkOnce(manifest.mediaId, idx)) {
+                    is ChunkDownloadResult.Success -> {
+                        chunks[idx] = r.bytes
+                        log(
+                            "MEDIA_RX sequential_chunk_ok mediaId=${mediaId.take(8)} " +
+                                "idx=$idx"
+                        )
+                    }
+                    is ChunkDownloadResult.Missing -> {
+                        log(
+                            "MEDIA_RX download_failed mediaId=${mediaId.take(8)} " +
+                                "reason=media_chunks_gone idx=$idx phase=sequential"
+                        )
+                        markFailed(mediaId, "media_chunks_gone")
+                        return
+                    }
+                    is ChunkDownloadResult.TransientFailure -> {
+                        // Sequential phase also failed. Do NOT markFailed.
+                        // Task stays PENDING; startReceiving finalizer will
+                        // resume on the next app start. Record the attempt
+                        // timestamp so the finalizer can rate-limit if needed.
+                        log(
+                            "MEDIA_RX download_transient_failed mediaId=${mediaId.take(8)} " +
+                                "idx=$idx reason=${r.reason} phase=sequential — task stays PENDING"
+                        )
+                        downloadRepo.update(
+                            mediaId,
+                            VoiceV2DownloadRepository.STATUS_PENDING,
+                            "transient: ${r.reason}",
+                            Clock.System.now().toEpochMilliseconds(),
+                        )
+                        return
+                    }
                 }
             }
-            return
         }
         log(
             "MEDIA_RX download_parallel_complete mediaId=${mediaId.take(8)} " +
@@ -197,24 +259,56 @@ class VoiceV2DownloadOrchestrator(
 
     // ── internal helpers ──────────────────────────────────────────────────────
 
-    private suspend fun downloadChunkWithRefresh(mediaId: String, idx: Int): ByteArray? {
+    /**
+     * Download one chunk with full token-refresh + network-retry handling.
+     *
+     * The returned [ChunkDownloadResult] distinguishes:
+     *   - [ChunkDownloadResult.Success] — bytes in hand.
+     *   - [ChunkDownloadResult.Missing] — the relay confirmed 404 NotFound.
+     *     Only this outcome justifies a permanent `media_chunks_gone` failure.
+     *   - [ChunkDownloadResult.TransientFailure] — auth refresh exhausted, network
+     *     timeout, or any other non-404 exception path. The caller should treat
+     *     this as "try again later" (sequential fallback or next startReceiving
+     *     pass) rather than a terminal failure.
+     *
+     * Prior to PR-M2b.1 this method returned `ByteArray?` with `null` meaning
+     * everything-except-success, which caused Test #64 to misreport
+     * `InterruptedIOException` on idx=21/23 as `media_chunks_gone` even though
+     * the VPS relay log confirmed every chunk was stored. The typed result is
+     * the contract fix that prevents that false positive.
+     */
+    private suspend fun downloadChunkOnce(mediaId: String, idx: Int): ChunkDownloadResult {
         var staleToken: String? = null
         repeat(MAX_TOKEN_ATTEMPTS) {
             val token = tokenProvider.acquireToken(reason = "media_download", staleToken = staleToken)
-                ?: return null // terminal auth failure
+                ?: return ChunkDownloadResult.TransientFailure("auth_token_null")
 
             val result = downloadWithNetworkRetry(token, mediaId, idx)
             when {
-                result.isSuccess -> return result.getOrThrow().ciphertext
-                result.exceptionOrNull() is NotFoundException -> return null // chunks gone
+                result.isSuccess -> {
+                    return ChunkDownloadResult.Success(result.getOrThrow().ciphertext)
+                }
+                result.exceptionOrNull() is NotFoundException -> {
+                    // Real 404 — relay does not have this chunk.
+                    return ChunkDownloadResult.Missing
+                }
                 result.exceptionOrNull() is MediaAuthException -> {
                     staleToken = token
                     // loop — let CAS provider refresh
                 }
-                else -> return null // other terminal error
+                result.exceptionOrNull() is MediaTransportException -> {
+                    val msg = result.exceptionOrNull()?.message?.take(80) ?: "transport_error"
+                    return ChunkDownloadResult.TransientFailure(msg)
+                }
+                else -> {
+                    val msg = result.exceptionOrNull()?.let {
+                        "${it::class.simpleName}:${it.message?.take(60)}"
+                    } ?: "unknown_error"
+                    return ChunkDownloadResult.TransientFailure(msg)
+                }
             }
         }
-        return null // auth refresh exhausted
+        return ChunkDownloadResult.TransientFailure("auth_refresh_exhausted")
     }
 
     private suspend fun downloadWithNetworkRetry(
@@ -252,9 +346,36 @@ class VoiceV2DownloadOrchestrator(
 }
 
 /**
- * Thrown by the parallel chunk-download workers when [MediaUploadTransport]
- * returns no bytes for a given chunk (404, terminal auth failure, etc.).
- * Caught by the outer `runCatching { coroutineScope { ... } }` so the
- * sibling workers cancel and `markFailed` runs exactly once.
+ * Typed outcome of a single chunk download attempt (PR-M2b.1).
+ *
+ * The contract: every caller must pattern-match all three variants. Replacing
+ * `ByteArray?` with this sealed hierarchy is the fix for Test #64's false
+ * `media_chunks_gone` reports — the previous nullable return collapsed
+ * auth-refresh-exhausted, network timeout, and real 404 into a single signal.
+ */
+private sealed class ChunkDownloadResult {
+    /** Relay returned the chunk ciphertext. */
+    class Success(val bytes: ByteArray) : ChunkDownloadResult()
+
+    /**
+     * Relay confirmed the chunk does not exist (HTTP 404 / NotFoundException).
+     * Only this outcome justifies a permanent `markFailed("media_chunks_gone")`.
+     */
+    object Missing : ChunkDownloadResult()
+
+    /**
+     * Auth refresh exhausted, network/transport error, or other non-404 path.
+     * Caller should retry sequentially or leave the task PENDING for the next
+     * startReceiving sweep — never markFailed on this outcome.
+     */
+    class TransientFailure(val reason: String) : ChunkDownloadResult()
+}
+
+/**
+ * Thrown by the parallel phase when one worker hits [ChunkDownloadResult.Missing]
+ * (real 404). Triggers structured-concurrency cancellation of sibling workers
+ * so the caller can react with a single `markFailed("media_chunks_gone")` call.
+ * Transient failures do NOT throw — they leave the chunks[idx] slot null for
+ * the sequential fallback phase to retry.
  */
 private class MediaChunkGoneException(val idx: Int) : Exception("chunk $idx gone")
