@@ -534,6 +534,14 @@ class AppContainer(private val context: Context) {
             val mediaUploadTransportLocal = phantom.core.transport.AndroidNativeOkHttpMediaUploadTransport(
                 relayBaseUrl = relayHttpBase,
                 log          = { msg -> android.util.Log.i("PhantomMedia", msg) },
+                // PR-M2f — relay advertises `media_capabilities.binary_v3=true`
+                // in the /auth/session response. The orchestrator caches the
+                // parsed capabilities; we consult the StateFlow on every chunk
+                // so the transport stays in sync with token refreshes without
+                // an explicit setter. Sticky 404/405 fallback inside the
+                // transport flips its own internal guard if the relay
+                // contradicts the announcement at runtime.
+                binaryV3Enabled = { restOrchestrator.capabilities.value.mediaBinaryV3 },
             )
             val mediaAuthTokenProviderLocal = phantom.core.transport.RestMediaAuthTokenProvider(
                 orchestrator = restOrchestrator,

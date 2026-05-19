@@ -34,7 +34,8 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, State},
+    body::Bytes,
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
@@ -174,6 +175,15 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// PR-M2f — lowercase hex encoding for the v3 ETag header.
+fn sha256_hex(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {
@@ -564,6 +574,303 @@ pub async fn download_chunk(
         })),
     )
         .into_response()
+}
+
+// ── PR-M2f — Binary v3 endpoints (additive; v2 above stays as fallback) ──────
+//
+// Path:   /media/v3/{media_id}/{idx}?total=N
+// Method: POST  — Content-Type: application/octet-stream, body = raw ciphertext
+// Method: GET   — returns application/octet-stream, body = raw ciphertext
+//
+// Removes the ~33% JSON+Base64 inflation from the wire. With the same storage
+// backend and the same idempotency contract as v2 (natural key (media_id, idx),
+// dedup by sha256(ciphertext)). Clients learn this endpoint exists via the
+// `media_capabilities.binary_v3=true` field in POST /auth/session.
+
+#[derive(Deserialize)]
+pub struct UploadV3Query {
+    pub total: u32,
+}
+
+/// POST /media/v3/{media_id}/{idx}?total=N
+///
+/// Body = raw ciphertext bytes. Always responds 204 No Content + headers on
+/// success (clients do not need to set `Prefer: return=minimal` — that header
+/// only existed to keep v2 backward-compatible). Response headers mirror v2's
+/// minimal path plus an `ETag` carrying the ciphertext sha256.
+pub async fn upload_chunk_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((media_id, idx)): Path<(String, u32)>,
+    Query(q): Query<UploadV3Query>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let total = q.total;
+
+    // 413 body cap first.
+    let body_bytes = body.len();
+    if body_bytes > state.config.max_media_upload_body_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({ "error": "body_too_large" })),
+        )
+            .into_response();
+    }
+
+    // Auth.
+    if validate_bearer(&headers, &state).await.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Authorization: Bearer <token> required" })),
+        )
+            .into_response();
+    }
+
+    // media_id sanity.
+    if media_id.is_empty() || media_id.len() > MAX_MEDIA_ID_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "media_id must be 1–64 chars" })),
+        )
+            .into_response();
+    }
+
+    if total == 0 || total > state.config.max_media_chunks {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({ "error": "too_many_chunks" })),
+        )
+            .into_response();
+    }
+
+    if idx >= total {
+        let prefix = &media_id[..media_id.len().min(8)];
+        tracing::info!(
+            event     = "MEDIA_V3",
+            action    = "upload_reject",
+            media_id  = %prefix,
+            reason    = "idx_oor",
+            body_bytes = body_bytes,
+            "idx {} >= total {}", idx, total,
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "idx must be less than total" })),
+        )
+            .into_response();
+    }
+
+    let ciphertext: Vec<u8> = body.to_vec();
+    let new_sha256 = sha256_bytes(&ciphertext);
+    let created_at_ms = now_ms();
+    let media_id_prefix = &media_id[..media_id.len().min(8)];
+
+    let mut store = state.media_store.inner.write().await;
+
+    let entry = store.entry(media_id.clone()).or_insert_with(|| MediaEntry {
+        total,
+        chunks: HashMap::new(),
+        earliest_created_at_ms: created_at_ms,
+    });
+
+    // Total consistency.
+    if entry.total != total {
+        tracing::info!(
+            "MEDIA_V3 upload_reject media_id={} reason=total_mismatch req_total={} entry_total={}",
+            media_id_prefix,
+            total,
+            entry.total,
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "total_mismatch" })),
+        )
+            .into_response();
+    }
+
+    // Idempotency: existing chunk at idx?
+    if let Some(existing) = entry.chunks.get(&idx) {
+        if existing.ciphertext_sha256 == new_sha256 {
+            tracing::info!(
+                event     = "MEDIA_V3",
+                action    = "upload",
+                media_id  = %media_id_prefix,
+                idx       = idx,
+                total     = total,
+                body_bytes = body_bytes,
+                status    = "duplicate",
+                "chunk duplicate",
+            );
+            return minimal_upload_response_v3(idx, true, &sha256_hex(&new_sha256));
+        } else {
+            tracing::info!(
+                event     = "MEDIA_V3",
+                action    = "upload",
+                media_id  = %media_id_prefix,
+                idx       = idx,
+                total     = total,
+                body_bytes = body_bytes,
+                status    = "conflict",
+                "ciphertext mismatch for same (media_id, idx)",
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "ciphertext_mismatch" })),
+            )
+                .into_response();
+        }
+    }
+
+    // Quota.
+    let current_bytes: u64 = entry.chunks.values().map(|c| c.ciphertext.len() as u64).sum();
+    let new_total_bytes = current_bytes + ciphertext.len() as u64;
+    if new_total_bytes > state.config.max_media_bytes {
+        tracing::info!(
+            event     = "MEDIA_V3",
+            action    = "upload_reject",
+            media_id  = %media_id_prefix,
+            reason    = "media_quota_exceeded",
+            body_bytes = body_bytes,
+            "media quota exceeded: current={} + new={} > max={}",
+            current_bytes, ciphertext.len(), MAX_MEDIA_BYTES,
+        );
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({ "error": "media_quota_exceeded" })),
+        )
+            .into_response();
+    }
+
+    entry.chunks.insert(
+        idx,
+        MediaChunk {
+            idx,
+            total,
+            ciphertext,
+            ciphertext_sha256: new_sha256,
+            created_at_ms,
+        },
+    );
+
+    tracing::info!(
+        event     = "MEDIA_V3",
+        action    = "upload",
+        media_id  = %media_id_prefix,
+        idx       = idx,
+        total     = total,
+        body_bytes = body_bytes,
+        status    = "stored",
+        "chunk stored",
+    );
+
+    minimal_upload_response_v3(idx, false, &sha256_hex(&new_sha256))
+}
+
+/// 204 No Content response for v3 successful upload. Mirrors v2's
+/// `minimal_upload_response` plus an `ETag` carrying the ciphertext sha256
+/// (hex-encoded, double-quoted per RFC 7232).
+fn minimal_upload_response_v3(idx: u32, duplicate: bool, sha256_hex: &str) -> axum::response::Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let h = resp.headers_mut();
+    h.insert("X-Chunk-Stored", HeaderValue::from_static("1"));
+    h.insert(
+        "X-Chunk-Duplicate",
+        if duplicate { HeaderValue::from_static("1") } else { HeaderValue::from_static("0") },
+    );
+    h.insert("X-Chunk-Idx", HeaderValue::from_str(&idx.to_string()).unwrap());
+    if let Ok(v) = HeaderValue::from_str(&format!("\"{}\"", sha256_hex)) {
+        h.insert("ETag", v);
+    }
+    h.insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-store, no-transform"),
+    );
+    resp
+}
+
+/// GET /media/v3/{media_id}/{idx}
+///
+/// Returns the stored chunk as `application/octet-stream`. ETag carries the
+/// ciphertext sha256 so the client can sanity-check transport integrity
+/// before crypto verification.
+pub async fn download_chunk_v3(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((media_id, idx)): Path<(String, u32)>,
+) -> impl IntoResponse {
+    if validate_bearer(&headers, &state).await.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Authorization: Bearer <token> required" })),
+        )
+            .into_response();
+    }
+
+    let media_id_prefix = &media_id[..media_id.len().min(8)];
+    let store = state.media_store.inner.read().await;
+
+    let Some(entry) = store.get(&media_id) else {
+        tracing::info!(
+            event    = "MEDIA_V3",
+            action   = "download_miss",
+            media_id = %media_id_prefix,
+            idx      = idx,
+            "chunk not found",
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not_found" })),
+        )
+            .into_response();
+    };
+
+    let Some(chunk) = entry.chunks.get(&idx) else {
+        tracing::info!(
+            event    = "MEDIA_V3",
+            action   = "download_miss",
+            media_id = %media_id_prefix,
+            idx      = idx,
+            "chunk not found",
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not_found" })),
+        )
+            .into_response();
+    };
+
+    let bytes_out = chunk.ciphertext.len();
+    let body: Vec<u8> = chunk.ciphertext.clone();
+    let etag = format!("\"{}\"", sha256_hex(&chunk.ciphertext_sha256));
+    let total = chunk.total;
+
+    tracing::info!(
+        event    = "MEDIA_V3",
+        action   = "download",
+        media_id = %media_id_prefix,
+        idx      = idx,
+        total    = total,
+        bytes    = bytes_out,
+        "chunk served",
+    );
+
+    let mut resp = (StatusCode::OK, body).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        h.insert(axum::http::header::ETAG, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&total.to_string()) {
+        h.insert("X-Chunk-Total", v);
+    }
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-transform"),
+    );
+    resp
 }
 
 // ── Base64 helpers (no external dep beyond what sha2 transitively brings) ─────

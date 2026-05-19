@@ -818,3 +818,276 @@ async fn test_http_body_limit_fires_above_config_override() {
         "HTTP-layer body limit must still fire above the configured cap",
     );
 }
+
+// ── PR-M2f — Binary v3 endpoint tests ────────────────────────────────────────
+
+/// POST /media/v3/{media_id}/{idx}?total=N with raw ciphertext body. Returns
+/// (app, status, x_chunk_duplicate header value, etag header value, body bytes).
+async fn upload_chunk_v3(
+    app: axum::Router,
+    token: &str,
+    media_id: &str,
+    idx: u32,
+    total: u32,
+    ciphertext: &[u8],
+) -> (axum::Router, StatusCode, Option<String>, Option<String>, Vec<u8>) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/media/v3/{}/{}?total={}", media_id, idx, total))
+                .header("content-type", "application/octet-stream")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::from(ciphertext.to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let dup = res
+        .headers()
+        .get("x-chunk-duplicate")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let etag = res
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let bytes = to_bytes(res.into_body(), 8192).await.unwrap().to_vec();
+    (app, status, dup, etag, bytes)
+}
+
+/// GET /media/v3/{media_id}/{idx}. Returns (app, status, content_type, etag, body bytes).
+async fn download_chunk_v3(
+    app: axum::Router,
+    token: &str,
+    media_id: &str,
+    idx: u32,
+) -> (axum::Router, StatusCode, Option<String>, Option<String>, Vec<u8>) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/media/v3/{}/{}", media_id, idx))
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let etag = res
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let bytes = to_bytes(res.into_body(), 65_536).await.unwrap().to_vec();
+    (app, status, ct, etag, bytes)
+}
+
+#[tokio::test]
+async fn test_v3_upload_returns_204_on_stored_and_get_returns_binary() {
+    let app = build_app();
+    let kp = SigningKey::generate(&mut OsRng);
+    let id = identity_hex(0x40);
+    let (app, token) = obtain_token(app, &id, &kp).await;
+    let mid = media_id(0x40);
+    let payload: Vec<u8> = (0..1700).map(|i| (i % 251) as u8).collect();
+
+    let (app, status, dup, etag, body) =
+        upload_chunk_v3(app, &token, &mid, 0, 1, &payload).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "v3 stored must be 204");
+    assert_eq!(dup.as_deref(), Some("0"), "first upload is not a duplicate");
+    assert!(etag.is_some(), "v3 stored response must carry an ETag");
+    assert!(body.is_empty(), "204 must have an empty body");
+
+    let (_, status, ct, etag2, dl) = download_chunk_v3(app, &token, &mid, 0).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct.as_deref(), Some("application/octet-stream"));
+    assert_eq!(etag2, etag, "GET ETag must match POST ETag (same ciphertext)");
+    assert_eq!(dl, payload, "GET body must equal the uploaded ciphertext byte-for-byte");
+}
+
+#[tokio::test]
+async fn test_v3_upload_returns_204_with_duplicate_flag_on_retry() {
+    let app = build_app();
+    let kp = SigningKey::generate(&mut OsRng);
+    let id = identity_hex(0x41);
+    let (app, token) = obtain_token(app, &id, &kp).await;
+    let mid = media_id(0x41);
+    let payload = vec![7u8; 512];
+
+    let (app, status1, dup1, etag1, _) =
+        upload_chunk_v3(app, &token, &mid, 0, 1, &payload).await;
+    assert_eq!(status1, StatusCode::NO_CONTENT);
+    assert_eq!(dup1.as_deref(), Some("0"));
+
+    let (_, status2, dup2, etag2, _) =
+        upload_chunk_v3(app, &token, &mid, 0, 1, &payload).await;
+    assert_eq!(status2, StatusCode::NO_CONTENT, "duplicate is still 204");
+    assert_eq!(dup2.as_deref(), Some("1"), "second upload must flag duplicate=1");
+    assert_eq!(etag2, etag1, "duplicate ETag must match original");
+}
+
+#[tokio::test]
+async fn test_v3_upload_409_on_ciphertext_mismatch_same_idx() {
+    let app = build_app();
+    let kp = SigningKey::generate(&mut OsRng);
+    let id = identity_hex(0x42);
+    let (app, token) = obtain_token(app, &id, &kp).await;
+    let mid = media_id(0x42);
+
+    let (app, status1, _, _, _) =
+        upload_chunk_v3(app, &token, &mid, 0, 1, &[1u8, 2, 3]).await;
+    assert_eq!(status1, StatusCode::NO_CONTENT);
+
+    let (_, status2, _, _, _) =
+        upload_chunk_v3(app, &token, &mid, 0, 1, &[9u8, 8, 7, 6]).await;
+    assert_eq!(
+        status2,
+        StatusCode::CONFLICT,
+        "same (media_id, idx) with different ciphertext must be 409",
+    );
+}
+
+#[tokio::test]
+async fn test_v3_download_404_on_unknown_idx() {
+    let app = build_app();
+    let kp = SigningKey::generate(&mut OsRng);
+    let id = identity_hex(0x43);
+    let (app, token) = obtain_token(app, &id, &kp).await;
+    let mid = media_id(0x43);
+
+    let (_, status, _, _, _) = download_chunk_v3(app, &token, &mid, 7).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown (media_id, idx) must be 404",
+    );
+}
+
+#[tokio::test]
+async fn test_v3_auth_required() {
+    let app = build_app();
+    let mid = media_id(0x44);
+
+    // POST without bearer.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/media/v3/{}/0?total=1", mid))
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(vec![0u8; 8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // GET without bearer.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/media/v3/{}/0", mid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_v3_v2_share_storage_v2_get_after_v3_upload() {
+    // Confirms additive design: v3 and v2 are two doors to the same in-memory store.
+    let app = build_app();
+    let kp = SigningKey::generate(&mut OsRng);
+    let id = identity_hex(0x45);
+    let (app, token) = obtain_token(app, &id, &kp).await;
+    let mid = media_id(0x45);
+    let payload = vec![42u8; 800];
+
+    let (app, status, _, _, _) =
+        upload_chunk_v3(app, &token, &mid, 0, 1, &payload).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, status, json) = download_chunk(app, &token, &mid, 0).await;
+    assert_eq!(status, StatusCode::OK, "v2 GET must find chunk uploaded via v3");
+    let b64_payload = json["ciphertext_b64"].as_str().expect("ciphertext_b64");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64_payload)
+        .expect("decode base64");
+    assert_eq!(decoded, payload, "v2 GET must return the same ciphertext bytes");
+}
+
+#[tokio::test]
+async fn test_session_response_includes_media_capabilities() {
+    let app = build_app();
+    let kp = SigningKey::generate(&mut OsRng);
+    let id = identity_hex(0x46);
+
+    // Replicate obtain_token's body but inspect the response JSON.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/auth/challenge?identity={}", id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let nonce_hex = serde_json::from_slice::<Value>(&to_bytes(res.into_body(), 4096).await.unwrap())
+        .unwrap()["nonce_hex"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let nonce_vec = hex::decode(&nonce_hex).unwrap();
+    let nonce_arr: [u8; 32] = nonce_vec.try_into().unwrap();
+    let sig: Signature = kp.sign(&nonce_arr);
+    let req_body = json!({
+        "identity":       &id,
+        "signing_pubkey": hex::encode(kp.verifying_key().to_bytes()),
+        "challenge":      nonce_hex,
+        "signature":      hex::encode(sig.to_bytes()),
+    });
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/session")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: Value = serde_json::from_slice(&to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
+    let caps = v.get("media_capabilities").expect("media_capabilities present");
+    assert_eq!(
+        caps.get("binary_v3").and_then(|x| x.as_bool()),
+        Some(true),
+        "binary_v3 must be advertised",
+    );
+    assert!(
+        caps.get("max_upload_body_bytes")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+            > 0,
+        "max_upload_body_bytes must be a positive number",
+    );
+}

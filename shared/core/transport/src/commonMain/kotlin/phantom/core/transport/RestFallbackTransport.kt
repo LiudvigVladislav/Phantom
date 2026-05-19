@@ -155,6 +155,23 @@ data class AuthSessionResponse(
     @SerialName("rest_fallback") val restFallback: Boolean = false,
     @SerialName("max_send_body_bytes") val maxSendBodyBytes: Int = 0,
     @SerialName("poll_max_envelopes") val pollMaxEnvelopes: Int = 0,
+    /**
+     * PR-M2f — server-announced media capabilities. Older relays that have
+     * not been redeployed yet omit this field entirely; the field default
+     * makes that case behave like `binary_v3=false` (client stays on v2).
+     */
+    @SerialName("media_capabilities") val mediaCapabilities: MediaCapabilities = MediaCapabilities(),
+)
+
+/**
+ * PR-M2f — media-endpoint capabilities advertised by the relay in the
+ * `/auth/session` response. New flags land here without breaking older
+ * clients that ignore unknown fields (kotlinx-serialization default).
+ */
+@Serializable
+data class MediaCapabilities(
+    @SerialName("binary_v3") val binaryV3: Boolean = false,
+    @SerialName("max_upload_body_bytes") val maxUploadBodyBytes: Int = 0,
 )
 
 // ── Wire models — /relay/send ────────────────────────────────────────────────
@@ -242,6 +259,15 @@ data class RelayCapabilities(
     val restFallback: Boolean,
     val maxSendBodyBytes: Int,
     val pollMaxEnvelopes: Int,
+    /**
+     * PR-M2f — `true` when the relay serves the binary `/media/v3/...`
+     * endpoint pair. False on older relays that haven't been redeployed yet
+     * and also after a runtime 404/405 fallback at the media transport
+     * layer (sticky disable until the next capability refresh).
+     */
+    val mediaBinaryV3: Boolean,
+    /** PR-M2f — relay's media upload body cap echoed in the session response. */
+    val mediaUploadBodyBytes: Int,
 ) {
     companion object {
         /**
@@ -254,6 +280,8 @@ data class RelayCapabilities(
             restFallback = false,
             maxSendBodyBytes = 0,
             pollMaxEnvelopes = 0,
+            mediaBinaryV3 = false,
+            mediaUploadBodyBytes = 0,
         )
     }
 }
@@ -263,4 +291,6 @@ fun AuthSessionResponse.toCapabilities(): RelayCapabilities = RelayCapabilities(
     restFallback = restFallback,
     maxSendBodyBytes = maxSendBodyBytes,
     pollMaxEnvelopes = pollMaxEnvelopes,
+    mediaBinaryV3 = mediaCapabilities.binaryV3,
+    mediaUploadBodyBytes = mediaCapabilities.maxUploadBodyBytes,
 )

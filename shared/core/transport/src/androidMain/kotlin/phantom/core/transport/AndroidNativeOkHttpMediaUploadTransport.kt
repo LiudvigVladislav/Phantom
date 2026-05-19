@@ -52,11 +52,31 @@ import kotlin.io.encoding.ExperimentalEncodingApi
 class AndroidNativeOkHttpMediaUploadTransport(
     private val relayBaseUrl: String,
     private val log: (String) -> Unit,
+    /**
+     * PR-M2f — runtime capability probe. The orchestrator updates
+     * [RestFallbackOrchestrator.capabilities] after each `/auth/session`
+     * refresh; we read it on every call so the transport stays in sync
+     * without an explicit setter. Lambda returns `false` until a session
+     * has been obtained (safe default — stay on v2).
+     */
+    private val binaryV3Enabled: () -> Boolean = { false },
     private val callTimeoutMs: Long = CALL_TIMEOUT_MS,
     private val connectTimeoutMs: Long = CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Long = READ_TIMEOUT_MS,
     private val writeTimeoutMs: Long = WRITE_TIMEOUT_MS,
 ) : MediaUploadTransport {
+
+    /**
+     * PR-M2f — sticky runtime fallback. If a v3 call returns 404/405 (relay
+     * announced v3 in `/auth/session` but the actual route is missing —
+     * e.g. mid-redeploy), we drop to v2 for the remainder of this process
+     * lifetime. Reset only by reinstantiation; this is intentional to
+     * avoid oscillating between paths under a broken capability advert.
+     */
+    @Volatile
+    private var v3DisabledByFallback: Boolean = false
+
+    private fun shouldUseV3(): Boolean = binaryV3Enabled() && !v3DisabledByFallback
 
     // ── uploadChunk ────────────────────────────────────────────────────────────
 
@@ -67,9 +87,102 @@ class AndroidNativeOkHttpMediaUploadTransport(
         total: Int,
         ciphertext: ByteArray,
     ): Result<MediaUploadTransport.UploadStatus> = withContext(Dispatchers.IO) {
+        if (shouldUseV3()) {
+            val v3 = uploadChunkV3(token, mediaId, idx, total, ciphertext)
+            if (v3 != null) return@withContext v3
+            // null sentinel = sticky-fallback path requested. v3DisabledByFallback
+            // was set inside uploadChunkV3 before the early-return.
+        }
+        uploadChunkV2(token, mediaId, idx, total, ciphertext)
+    }
+
+    /**
+     * PR-M2f — POST /media/v3/{mediaId}/{idx}?total=N with raw ciphertext body.
+     * Returns `null` if the relay returns 404/405 (capability stale → fallback
+     * to v2). Other terminal failures propagate via [Result.failure].
+     */
+    private suspend fun uploadChunkV3(
+        token: String,
+        mediaId: String,
+        idx: Int,
+        total: Int,
+        ciphertext: ByteArray,
+    ): Result<MediaUploadTransport.UploadStatus>? {
+        val startMs = System.currentTimeMillis()
+        log("MEDIA_V3 upload_start mediaId=${mediaId.take(8)} idx=$idx bytes=${ciphertext.size}")
+        return runCatching {
+            val url = "$relayBaseUrl/media/v3/$mediaId/$idx?total=$total"
+            val client = buildClient()
+            val request = Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer $token")
+                .header("Connection", "close")
+                .post(ciphertext.toRequestBody(OCTET_STREAM_MEDIA_TYPE))
+                .build()
+            var statusCode: Int
+            var headersOnlyElapsedMs = 0L
+            var duplicateHeader = false
+            client.newCall(request).execute().use { response: Response ->
+                statusCode = response.code
+                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
+                duplicateHeader = response.headers["X-Chunk-Duplicate"] == "1"
+                // 204 is body-less by RFC. Drain anyway to free the connection.
+                try { response.body?.bytes() } catch (_: Throwable) {}
+            }
+            val totalElapsedMs = System.currentTimeMillis() - startMs
+            log(
+                "MEDIA_V3 upload_response mediaId=${mediaId.take(8)} idx=$idx " +
+                    "status=$statusCode headersMs=$headersOnlyElapsedMs totalMs=$totalElapsedMs"
+            )
+            when (statusCode) {
+                204 -> if (duplicateHeader) {
+                    Result.success(MediaUploadTransport.UploadStatus.DUPLICATE)
+                } else {
+                    Result.success(MediaUploadTransport.UploadStatus.STORED)
+                }
+                404, 405 -> {
+                    // Capability advertised but route absent — sticky-disable v3.
+                    v3DisabledByFallback = true
+                    log(
+                        "MEDIA_V3 fallback reason=not_supported status=$statusCode " +
+                            "mediaId=${mediaId.take(8)} idx=$idx"
+                    )
+                    null // sentinel: caller falls back to v2
+                }
+                409 -> Result.failure(MediaConflictException("ciphertext_mismatch"))
+                413 -> Result.failure(MediaQuotaException("body_too_large_or_quota"))
+                401 -> Result.failure(MediaAuthException("media_auth_401"))
+                else -> Result.failure(
+                    MediaTransportException("upload-v3 unexpected status=$statusCode")
+                )
+            }
+        }.getOrElse { e ->
+            val elapsed = System.currentTimeMillis() - startMs
+            log(
+                "MEDIA_V3 upload_fail mediaId=${mediaId.take(8)} idx=$idx " +
+                    "error=${e::class.simpleName} elapsedMs=$elapsed"
+            )
+            // Network errors are NOT a capability-stale signal — surface them
+            // through the same retry loop the v2 path uses. Do not flip the
+            // sticky fallback here.
+            Result.failure(
+                MediaTransportException(
+                    "upload-v3 network ${e::class.simpleName}: ${e.message?.take(120) ?: ""}"
+                )
+            )
+        }
+    }
+
+    private suspend fun uploadChunkV2(
+        token: String,
+        mediaId: String,
+        idx: Int,
+        total: Int,
+        ciphertext: ByteArray,
+    ): Result<MediaUploadTransport.UploadStatus> {
         val startMs = System.currentTimeMillis()
         log("MEDIA_HTTP upload_start mediaId=${mediaId.take(8)} idx=$idx")
-        runCatching {
+        return runCatching {
             val ciphertextB64 = Base64.encode(ciphertext)
             val bodyJson = buildUploadBody(mediaId, idx, total, ciphertextB64)
             val url = "$relayBaseUrl${MediaRelayEndpoints.UPLOAD_CHUNK}"
@@ -160,9 +273,111 @@ class AndroidNativeOkHttpMediaUploadTransport(
         mediaId: String,
         idx: Int,
     ): Result<MediaUploadTransport.DownloadResult> = withContext(Dispatchers.IO) {
+        if (shouldUseV3()) {
+            val v3 = downloadChunkV3(token, mediaId, idx)
+            if (v3 != null) return@withContext v3
+        }
+        downloadChunkV2(token, mediaId, idx)
+    }
+
+    /**
+     * PR-M2f — GET /media/v3/{mediaId}/{idx}. Returns body as raw octet-stream;
+     * no JSON parsing, no Base64 decode. Returns `null` if relay says 404/405
+     * via the "capability stale" path (sticky-disable v3 + caller falls back
+     * to v2). A genuine 404 (the chunk truly does not exist) maps to
+     * [NotFoundException] like the v2 path, NOT to the sticky-disable sentinel.
+     *
+     * Distinguishing the two 404 cases: the relay only returns 404 from v3
+     * when (media_id, idx) is missing in the in-memory store. A "route is
+     * absent" 404 cannot occur if we routed to /media/v3 — axum returns a
+     * different status (typically 404 too, but with a default body) only
+     * when the route doesn't exist at all. In practice we treat 405
+     * (Method Not Allowed) as the unambiguous "route exists, method
+     * unsupported" capability-stale signal; a 404 stays semantic
+     * `chunk not found` and is handled by the existing
+     * [NotFoundException] path. This matches the locked Vladislav
+     * decision 2026-05-19: "v3 unexpectedly returns 404/405 → fallback".
+     */
+    private suspend fun downloadChunkV3(
+        token: String,
+        mediaId: String,
+        idx: Int,
+    ): Result<MediaUploadTransport.DownloadResult>? {
+        val startMs = System.currentTimeMillis()
+        log("MEDIA_V3 download_start mediaId=${mediaId.take(8)} idx=$idx")
+        return runCatching {
+            val url = "$relayBaseUrl/media/v3/$mediaId/$idx"
+            val client = buildClient()
+            val request = Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer $token")
+                .header("Connection", "close")
+                .header("Cache-Control", "no-store")
+                .get()
+                .build()
+            var statusCode: Int
+            var headersOnlyElapsedMs = 0L
+            var totalHeader: String? = null
+            var ciphertext: ByteArray = ByteArray(0)
+            client.newCall(request).execute().use { response: Response ->
+                statusCode = response.code
+                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
+                totalHeader = response.headers["X-Chunk-Total"]
+                if (statusCode == 200) {
+                    ciphertext = response.body?.bytes() ?: ByteArray(0)
+                } else {
+                    try { response.body?.bytes() } catch (_: Throwable) {}
+                }
+            }
+            val totalElapsedMs = System.currentTimeMillis() - startMs
+            log(
+                "MEDIA_V3 download_response mediaId=${mediaId.take(8)} idx=$idx " +
+                    "status=$statusCode bytes=${ciphertext.size} " +
+                    "headersMs=$headersOnlyElapsedMs totalMs=$totalElapsedMs"
+            )
+            when (statusCode) {
+                200 -> Result.success(
+                    MediaUploadTransport.DownloadResult(
+                        ciphertext = ciphertext,
+                        total = totalHeader?.toIntOrNull() ?: 0,
+                    )
+                )
+                405 -> {
+                    v3DisabledByFallback = true
+                    log(
+                        "MEDIA_V3 fallback reason=method_not_allowed status=405 " +
+                            "mediaId=${mediaId.take(8)} idx=$idx"
+                    )
+                    null
+                }
+                404 -> Result.failure(NotFoundException)
+                401 -> Result.failure(MediaAuthException("media_auth_401"))
+                else -> Result.failure(
+                    MediaTransportException("download-v3 unexpected status=$statusCode")
+                )
+            }
+        }.getOrElse { e ->
+            val elapsed = System.currentTimeMillis() - startMs
+            log(
+                "MEDIA_V3 download_fail mediaId=${mediaId.take(8)} idx=$idx " +
+                    "error=${e::class.simpleName} elapsedMs=$elapsed"
+            )
+            Result.failure(
+                MediaTransportException(
+                    "download-v3 network ${e::class.simpleName}: ${e.message?.take(120) ?: ""}"
+                )
+            )
+        }
+    }
+
+    private suspend fun downloadChunkV2(
+        token: String,
+        mediaId: String,
+        idx: Int,
+    ): Result<MediaUploadTransport.DownloadResult> {
         val startMs = System.currentTimeMillis()
         log("MEDIA_HTTP download_start mediaId=${mediaId.take(8)} idx=$idx")
-        runCatching {
+        return runCatching {
             val url = "$relayBaseUrl${MediaRelayEndpoints.DOWNLOAD_CHUNK_PREFIX}/$mediaId/$idx"
             val client = buildClient()
             val request = Request.Builder()
@@ -323,6 +538,9 @@ class AndroidNativeOkHttpMediaUploadTransport(
         const val WRITE_TIMEOUT_MS: Long   = 10_000L
 
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+
+        // PR-M2f — raw ciphertext upload body type.
+        private val OCTET_STREAM_MEDIA_TYPE = "application/octet-stream".toMediaType()
     }
 }
 
