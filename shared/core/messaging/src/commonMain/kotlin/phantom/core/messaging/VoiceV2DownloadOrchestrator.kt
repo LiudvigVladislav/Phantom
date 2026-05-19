@@ -66,16 +66,27 @@ class VoiceV2DownloadOrchestrator(
             return
         }
 
+        // PR-M2e — dynamic fresh-task window. The sender now sends the
+        // manifest after the first 3 chunks (EARLY_MANIFEST_AFTER_CHUNKS),
+        // so the receiver MUST treat 404 on still-uploading chunks as
+        // `chunk_not_ready_yet`, not `media_chunks_gone`. The window scales
+        // with chunkCount so a 200-chunk voice still has slack.
+        val freshWindowMs = computeFreshWindowMs(manifest.chunkCount)
+        log(
+            "MEDIA_RX fresh_window_ms mediaId=${mediaId.take(8)} " +
+                "chunkCount=${manifest.chunkCount} windowMs=$freshWindowMs " +
+                "createdAtMs=${task.createdAtMs}",
+        )
+
         // Download all chunks sequentially
         val chunks = mutableListOf<ByteArray>()
         for (idx in 0 until manifest.chunkCount) {
-            val chunkBytes = downloadChunkWithRefresh(manifest.mediaId, idx)
-            if (chunkBytes == null) {
-                // Permanent failure: relay lost the chunks (TTL expiry or relay restart)
-                log("MEDIA_RX download_failed mediaId=${mediaId.take(8)} reason=media_chunks_gone idx=$idx")
-                markFailed(mediaId, "media_chunks_gone")
-                return
-            }
+            val chunkBytes = downloadOneChunkWithFreshRetry(
+                mediaId          = manifest.mediaId,
+                idx              = idx,
+                taskCreatedAtMs  = task.createdAtMs,
+                freshWindowMs    = freshWindowMs,
+            ) ?: return // markFailed already invoked inside on terminal/expired
             chunks.add(chunkBytes)
             val received = idx + 1
             log(
@@ -137,24 +148,99 @@ class VoiceV2DownloadOrchestrator(
 
     // ── internal helpers ──────────────────────────────────────────────────────
 
-    private suspend fun downloadChunkWithRefresh(mediaId: String, idx: Int): ByteArray? {
+    /**
+     * PR-M2e — outcome of a single chunk-download attempt. Needed because the
+     * old `ByteArray?` return type collapsed 404 (NotFoundException) and
+     * terminal auth-exhausted failures into the same `null`. With overlap
+     * upload/download a 404 is now an expected transient on the upload tail.
+     */
+    private sealed interface ChunkOutcome {
+        data class Ok(val bytes: ByteArray) : ChunkOutcome
+        /** Relay returned 404 — chunk not yet uploaded OR genuinely expired. */
+        data object NotReady : ChunkOutcome
+        /** Auth refresh exhausted, transport gave up, etc. — not retryable. */
+        data object Terminal : ChunkOutcome
+    }
+
+    /**
+     * PR-M2e — wraps a single chunk download with the fresh-task retry loop.
+     * 404 is treated as `chunk_not_ready_yet` and retried with backoff
+     * (1s → 2s → 3s cap) while `now - taskCreatedAtMs < freshWindowMs`. Once
+     * the window expires, falls through to `markFailed(media_chunks_gone)`.
+     * Terminal errors mark failed immediately.
+     */
+    private suspend fun downloadOneChunkWithFreshRetry(
+        mediaId: String,
+        idx: Int,
+        taskCreatedAtMs: Long,
+        freshWindowMs: Long,
+    ): ByteArray? {
+        var backoffMs = NOT_READY_INITIAL_BACKOFF_MS
+        while (true) {
+            when (val outcome = downloadChunkOnce(mediaId, idx)) {
+                is ChunkOutcome.Ok -> return outcome.bytes
+                ChunkOutcome.NotReady -> {
+                    val ageMs = Clock.System.now().toEpochMilliseconds() - taskCreatedAtMs
+                    if (ageMs >= freshWindowMs) {
+                        log(
+                            "MEDIA_RX chunk_not_ready_deadline_exceeded " +
+                                "mediaId=${mediaId.take(8)} idx=$idx ageMs=$ageMs " +
+                                "windowMs=$freshWindowMs",
+                        )
+                        log("MEDIA_RX download_failed mediaId=${mediaId.take(8)} reason=media_chunks_gone idx=$idx")
+                        markFailed(mediaId, "media_chunks_gone")
+                        return null
+                    }
+                    log(
+                        "MEDIA_RX chunk_not_ready_yet mediaId=${mediaId.take(8)} " +
+                            "idx=$idx retry_in=${backoffMs}ms ageMs=$ageMs windowMs=$freshWindowMs",
+                    )
+                    delay(backoffMs)
+                    backoffMs = (backoffMs + 1_000L).coerceAtMost(NOT_READY_MAX_BACKOFF_MS)
+                }
+                ChunkOutcome.Terminal -> {
+                    log(
+                        "MEDIA_RX download_failed mediaId=${mediaId.take(8)} " +
+                            "reason=transport_terminal idx=$idx",
+                    )
+                    markFailed(mediaId, "transport_terminal")
+                    return null
+                }
+            }
+        }
+    }
+
+    private suspend fun downloadChunkOnce(mediaId: String, idx: Int): ChunkOutcome {
         var staleToken: String? = null
         repeat(MAX_TOKEN_ATTEMPTS) {
             val token = tokenProvider.acquireToken(reason = "media_download", staleToken = staleToken)
-                ?: return null // terminal auth failure
+                ?: return ChunkOutcome.Terminal
 
             val result = downloadWithNetworkRetry(token, mediaId, idx)
             when {
-                result.isSuccess -> return result.getOrThrow().ciphertext
-                result.exceptionOrNull() is NotFoundException -> return null // chunks gone
+                result.isSuccess -> return ChunkOutcome.Ok(result.getOrThrow().ciphertext)
+                result.exceptionOrNull() is NotFoundException -> return ChunkOutcome.NotReady
                 result.exceptionOrNull() is MediaAuthException -> {
                     staleToken = token
                     // loop — let CAS provider refresh
                 }
-                else -> return null // other terminal error
+                else -> return ChunkOutcome.Terminal
             }
         }
-        return null // auth refresh exhausted
+        return ChunkOutcome.Terminal
+    }
+
+    /**
+     * PR-M2e — dynamic fresh-task window in milliseconds. Larger voices need
+     * more grace because the sender's upload tail takes longer.
+     * Formula: clamp(chunkCount * PER_CHUNK_MS, [MIN, MAX]).
+     *   15 chunks  → 120 s (MIN floor)
+     *   107 chunks → 160 s
+     *   200 chunks → 300 s (MAX cap)
+     */
+    private fun computeFreshWindowMs(chunkCount: Int): Long {
+        val scaled = chunkCount.toLong() * FRESH_TASK_PER_CHUNK_MS
+        return scaled.coerceIn(FRESH_TASK_MIN_WINDOW_MS, FRESH_TASK_MAX_WINDOW_MS)
     }
 
     private suspend fun downloadWithNetworkRetry(
@@ -184,5 +270,19 @@ class VoiceV2DownloadOrchestrator(
         private const val MAX_TOKEN_ATTEMPTS = 3
         private const val MAX_NETWORK_ATTEMPTS = 5
         private val NETWORK_RETRY_DELAYS_MS = longArrayOf(1_000L, 3_000L, 8_000L, 20_000L, 60_000L)
+
+        // PR-M2e — dynamic fresh-task window. Vladislav 2026-05-19: fixed
+        // 60 s + 10 retries × 2 s would false-fail the tail of a 107-chunk
+        // voice on Tele2 LTE (~78 s upload). The window scales with chunk
+        // count so long voice notes have enough slack while pathological
+        // requests (chunkCount = 256 max from manifest) are still capped.
+        private const val FRESH_TASK_MIN_WINDOW_MS = 120_000L   // 2 min floor
+        private const val FRESH_TASK_PER_CHUNK_MS  = 1_500L     // ≈ measured per-chunk upload
+        private const val FRESH_TASK_MAX_WINDOW_MS = 300_000L   // 5 min cap
+
+        // PR-M2e — backoff for `chunk_not_ready_yet`. Climbs 1 s → 2 s → 3 s
+        // and stays at the cap until the fresh-task window expires.
+        private const val NOT_READY_INITIAL_BACKOFF_MS = 1_000L
+        private const val NOT_READY_MAX_BACKOFF_MS     = 3_000L
     }
 }

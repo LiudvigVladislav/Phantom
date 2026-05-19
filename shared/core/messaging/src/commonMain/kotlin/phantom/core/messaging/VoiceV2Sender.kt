@@ -50,6 +50,7 @@ class VoiceV2Sender(
         mime: String,
         onSplit: ((total: Int) -> Unit)? = null,
         onChunkUploaded: ((sent: Int, total: Int) -> Unit)? = null,
+        onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)? = null,
     ): Result<VoiceManifestV2> = runCatching {
         // Step 1: encrypt
         val enc = mediaCrypto.encryptVoice(audioBytes)
@@ -67,6 +68,29 @@ class VoiceV2Sender(
         )
         onSplit?.invoke(total)
 
+        // PR-M2e (2026-05-19): build the manifest up front so we can hand it
+        // to the early-manifest callback after the first few chunks. The
+        // receiver starts downloading while the sender is still uploading
+        // the tail; 404s during the dynamic fresh-task window are treated
+        // as `chunk_not_ready_yet` and retried, not as `media_chunks_gone`.
+        val manifest = VoiceManifestV2(
+            type               = VoiceManifestV2.TYPE,
+            mediaId            = enc.mediaId,
+            mediaKey           = Base64.encode(enc.mediaKey),
+            nonce              = Base64.encode(enc.nonce),
+            alg                = VoiceManifestV2.ALG,
+            durationMs         = durationMs,
+            mime               = mime,
+            chunkCount         = total,
+            encryptedSizeBytes = enc.ciphertext.size.toLong(),
+            plainSizeBytes     = audioBytes.size.toLong(),
+            sha256             = Base64.encode(enc.plaintextSha256),
+        )
+        // mediaKey / nonce / sha256 never appear in log lines per hard guardrail.
+
+        val earlyAt = minOf(EARLY_MANIFEST_AFTER_CHUNKS, total)
+        var earlyManifestSent = false
+
         // Step 3: upload loop (sequential, one chunk at a time)
         for (idx in 0 until total) {
             uploadChunkWithRefresh(
@@ -82,24 +106,22 @@ class VoiceV2Sender(
                     "sent=$sent total=$total",
             )
             onChunkUploaded?.invoke(sent, total)
+
+            // PR-M2e — fire the early-manifest callback exactly once, after
+            // the first K chunks have committed on the relay. Callback may
+            // suspend (it goes through the Double Ratchet + transport.send).
+            if (!earlyManifestSent && sent >= earlyAt && onEarlyManifest != null) {
+                earlyManifestSent = true
+                log(
+                    "MEDIA_TX early_manifest_sent mediaId=${enc.mediaId.take(8)} " +
+                        "afterChunks=$sent total=$total",
+                )
+                onEarlyManifest.invoke(manifest)
+            }
         }
         log("MEDIA_TX upload_complete mediaId=${enc.mediaId.take(8)} chunks=$total")
 
-        // Step 4: build manifest
-        VoiceManifestV2(
-            type               = VoiceManifestV2.TYPE,
-            mediaId            = enc.mediaId,
-            mediaKey           = Base64.encode(enc.mediaKey),
-            nonce              = Base64.encode(enc.nonce),
-            alg                = VoiceManifestV2.ALG,
-            durationMs         = durationMs,
-            mime               = mime,
-            chunkCount         = total,
-            encryptedSizeBytes = enc.ciphertext.size.toLong(),
-            plainSizeBytes     = audioBytes.size.toLong(),
-            sha256             = Base64.encode(enc.plaintextSha256),
-        )
-        // mediaKey / nonce / sha256 never appear in log lines per hard guardrail.
+        manifest
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
@@ -189,5 +211,12 @@ class VoiceV2Sender(
         private const val MAX_TOKEN_ATTEMPTS = 3
         private const val MAX_NETWORK_ATTEMPTS = 5
         private val NETWORK_RETRY_DELAYS_MS = longArrayOf(1_000L, 3_000L, 8_000L, 20_000L, 60_000L)
+
+        // PR-M2e — number of chunks the sender uploads before sending the
+        // manifest envelope. Vladislav 2026-05-19: K=3 (not 1) so the relay
+        // has stored proof-of-life chunks before the receiver is told to
+        // start downloading; this avoids spurious chunk_not_ready_yet
+        // logging on the very first chunk.
+        private const val EARLY_MANIFEST_AFTER_CHUNKS = 3
     }
 }
