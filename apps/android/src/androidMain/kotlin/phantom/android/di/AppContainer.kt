@@ -551,6 +551,20 @@ class AppContainer(private val context: Context) {
                 mediaTransport = mediaUploadTransportLocal,
                 tokenProvider  = mediaAuthTokenProviderLocal,
                 log            = { msg -> android.util.Log.i("PhantomMedia", msg) },
+                // PR-M2f.1 — debug-only Settings selector binds to a
+                // SharedPreferences int. Default 1700 == current production
+                // baseline; debug Settings UI offers 1700 / 2200 / 2300 /
+                // 2400 / 2600 so the chunk-size ceiling can be probed in
+                // one APK without rebuilding per row. The provider is
+                // invoked once per voice send (at chunk_split).
+                chunkSizeProvider = {
+                    phantom.android.diagnostics.ChunkSizeProbe.currentValue(
+                        context.getSharedPreferences(
+                            "phantom_prefs",
+                            Context.MODE_PRIVATE,
+                        )
+                    )
+                },
             )
             voiceV2DownloadOrchestratorLocal = phantom.core.messaging.VoiceV2DownloadOrchestrator(
                 downloadRepo   = voiceV2DownloadRepo,

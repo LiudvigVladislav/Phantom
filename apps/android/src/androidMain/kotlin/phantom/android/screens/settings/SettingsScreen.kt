@@ -314,6 +314,20 @@ fun SettingsScreen(
                 }
             }
 
+            // ── 6.5 Diagnostics (debug builds only) ──────────────────────
+            // PR-M2f.1 — runtime selector for `TARGET_RAW_CHUNK_BYTES` so the
+            // Tele2 LTE full-roundtrip ceiling can be probed in one APK
+            // across 1700 / 2200 / 2300 / 2400 / 2600. Production builds
+            // strip this section entirely via `BuildConfig.DEBUG`.
+            if (phantom.android.diagnostics.ChunkSizeProbe.isProbeAvailable) {
+                item { SettingsGroupHeader("Diagnostics") }
+                item {
+                    SettingsGroupCard {
+                        ChunkSizeProbeRow(context)
+                    }
+                }
+            }
+
             // ── 7. About ─────────────────────────────────────────────────
             item { SettingsGroupHeader("About") }
             item {
@@ -614,4 +628,47 @@ private fun formatByteSize(bytes: Long): String {
     if (bytes < 1_024) return "$bytes B"
     if (bytes < 1_024 * 1_024) return "${bytes / 1_024} KB"
     return "%.1f MB".format(bytes / 1_048_576.0)
+}
+
+/**
+ * PR-M2f.1 — debug-only row that lets the operator pick a raw-ciphertext
+ * chunk size from the [phantom.android.diagnostics.ChunkSizeProbe.CANDIDATES]
+ * matrix. Selection is persisted in `phantom_prefs` and the
+ * [phantom.core.messaging.VoiceV2Sender] reads it via the provider lambda on
+ * every new voice send.
+ */
+@Composable
+private fun ChunkSizeProbeRow(context: android.content.Context) {
+    val (selected, setSelected) =
+        phantom.android.diagnostics.ChunkSizeProbe.rememberSelectedChunkSize(context)
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        SettingsRowItem(
+            icon = { PhIconDatabase(color = CyanAccent, size = 16.dp) },
+            label = "Media chunk size",
+            value = "$selected B",
+            onClick = { expanded = true },
+        )
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.background(Surface),
+        ) {
+            phantom.android.diagnostics.ChunkSizeProbe.CANDIDATES.forEach { bytes ->
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = "$bytes B" + if (bytes == 1700) " (baseline)" else "",
+                            color = if (bytes == selected) CyanAccent else TextPrimary,
+                            fontSize = 14.sp,
+                        )
+                    },
+                    onClick = {
+                        setSelected(bytes)
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
 }

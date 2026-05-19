@@ -35,6 +35,18 @@ class VoiceV2Sender(
     private val mediaTransport: MediaUploadTransport,
     private val tokenProvider: MediaAuthTokenProvider,
     private val log: (String) -> Unit,
+    /**
+     * PR-M2f.1 (debug probe) — runtime chunk size override.
+     *
+     * Production-default returns [MediaChunker.TARGET_RAW_CHUNK_BYTES] = 1700.
+     * Android debug builds wire a SharedPreferences-backed provider so
+     * Settings → Diagnostics can select 1700 / 2200 / 2300 / 2400 / 2600
+     * across consecutive voice sends without rebuilding the APK. The provider
+     * is invoked exactly once per `uploadVoice` call (when the encrypted
+     * blob is split) — switching the selector mid-upload is harmless because
+     * the new value applies only to the NEXT voice.
+     */
+    private val chunkSizeProvider: () -> Int = { MediaChunker.TARGET_RAW_CHUNK_BYTES },
 ) {
 
     /**
@@ -60,11 +72,22 @@ class VoiceV2Sender(
         )
 
         // Step 2: split into upload-safe chunks
-        val chunks = MediaChunker.chunk(enc.ciphertext)
+        // PR-M2f.1 — chunk size now comes from a provider lambda so the debug
+        // selector in Settings can probe 1700 / 2200 / 2300 / 2400 / 2600 on
+        // the same APK. Clamped to a sane range as defence-in-depth against a
+        // SharedPreferences read returning a stale or out-of-range value.
+        val selectedChunkSize = chunkSizeProvider()
+            .coerceIn(MIN_PROBE_CHUNK_BYTES, MAX_PROBE_CHUNK_BYTES)
+        log(
+            "MEDIA_TX chunk_size_selected mediaId=${enc.mediaId.take(8)} " +
+                "bytes=$selectedChunkSize source=provider",
+        )
+        val chunks = MediaChunker.chunk(enc.ciphertext, chunkSize = selectedChunkSize)
         val total = chunks.size
         log(
             "MEDIA_TX chunk_split mediaId=${enc.mediaId.take(8)} " +
-                "chunkCount=$total totalCiphertextBytes=${enc.ciphertext.size}",
+                "chunkCount=$total chunkSizeBytes=$selectedChunkSize " +
+                "totalCiphertextBytes=${enc.ciphertext.size}",
         )
         onSplit?.invoke(total)
 
@@ -218,5 +241,13 @@ class VoiceV2Sender(
         // start downloading; this avoids spurious chunk_not_ready_yet
         // logging on the very first chunk.
         private const val EARLY_MANIFEST_AFTER_CHUNKS = 3
+
+        // PR-M2f.1 probe — defence-in-depth bounds for the chunk-size
+        // provider. The relay's HTTP body cap (default 9000) and the
+        // recorded Tele2 full-roundtrip ceiling (~2400 wire bytes on v3)
+        // sandwich the realistic search range. A stale/typo'd selector
+        // value gets clamped here rather than crashing the upload.
+        private const val MIN_PROBE_CHUNK_BYTES = 1024
+        private const val MAX_PROBE_CHUNK_BYTES = 8000
     }
 }
