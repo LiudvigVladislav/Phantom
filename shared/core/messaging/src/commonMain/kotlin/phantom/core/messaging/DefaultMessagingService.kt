@@ -144,6 +144,14 @@ class DefaultMessagingService(
      * Nullable; when non-null, [runVoiceV2DownloadTask] delegates to it.
      */
     private val voiceV2DownloadOrchestrator: VoiceV2DownloadOrchestrator? = null,
+    /**
+     * In-memory live chunk-progress bus (PR-M2d.1b). Sender callback hooks
+     * into [VoiceV2Sender] keyed by local message id; receiver callback hooks
+     * into [VoiceV2DownloadOrchestrator] keyed by mediaId (which is the row PK
+     * on the receive side). Cleared on completion/failure. Exposed to the UI
+     * via [mediaProgressBus].
+     */
+    val mediaProgressBus: MediaProgressBus = MediaProgressBus(),
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -833,7 +841,17 @@ class DefaultMessagingService(
         )
         scope.launch {
             try {
-                val uploadResult = sender.uploadVoice(audioBytes, durationMs, mimeType)
+                val uploadResult = sender.uploadVoice(
+                    audioBytes = audioBytes,
+                    durationMs = durationMs,
+                    mime       = mimeType,
+                    onSplit          = { total ->
+                        mediaProgressBus.update(localMsgId, sent = 0, total = total, direction = MediaProgressBus.Direction.UPLOAD)
+                    },
+                    onChunkUploaded  = { sent, total ->
+                        mediaProgressBus.update(localMsgId, sent = sent, total = total, direction = MediaProgressBus.Direction.UPLOAD)
+                    },
+                )
                 if (uploadResult.isFailure) {
                     val reason = uploadResult.exceptionOrNull()?.message?.take(60) ?: "unknown"
                     messagingLog(
@@ -841,6 +859,7 @@ class DefaultMessagingService(
                         "MEDIA_TX send_failed_no_manifest mediaId=unknown reason=$reason",
                     )
                     messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
+                    mediaProgressBus.clear(localMsgId)
                     return@launch
                 }
 
@@ -913,6 +932,7 @@ class DefaultMessagingService(
                 messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
                 throw ce
             } finally {
+                mediaProgressBus.clear(localMsgId)
                 mutexFor(conversationId).withLock {
                     voiceSendInProgress.remove(conversationId)
                 }
@@ -2666,7 +2686,22 @@ class DefaultMessagingService(
      * in TransportCapabilitiesResolver (separate Commit 5 step per design §8).
      */
     internal open suspend fun runVoiceV2DownloadTask(mediaId: String) {
-        voiceV2DownloadOrchestrator?.runDownloadTask(mediaId)
+        try {
+            voiceV2DownloadOrchestrator?.runDownloadTask(
+                mediaId = mediaId,
+                onChunkDownloaded = { received, total ->
+                    // Receiver row PK == mediaId (see handleVoiceV2Manifest insert path).
+                    mediaProgressBus.update(
+                        rowId = mediaId,
+                        sent = received,
+                        total = total,
+                        direction = MediaProgressBus.Direction.DOWNLOAD,
+                    )
+                },
+            )
+        } finally {
+            mediaProgressBus.clear(mediaId)
+        }
         // R5-1 — UI/state propagation after download completes.
         // The orchestrator updated `plaintextCache` to `[AUDIO_LOCAL:<path>]` and
         // set status=DELIVERED in the DB, but ChatScreen observes the
