@@ -5,7 +5,7 @@ use crate::{
     auth::{AuthError, NONCE_LEN},
     envelope::*,
     error::RelayError,
-    media::{download_chunk, upload_chunk},
+    media::{download_chunk, download_chunk_v3, upload_chunk, upload_chunk_v3},
     prekeys::{
         DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
         SignedPreKeyPublicBundle,
@@ -102,6 +102,16 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(state.config.max_media_upload_body_bytes)),
         )
         .route("/media/chunk/{media_id}/{idx}", get(download_chunk))
+        // PR-M2f — additive binary v3 endpoints. Raw ciphertext body removes
+        // the ~33% JSON+Base64 wire inflation that the legacy v2 pair carries.
+        // Same `state.config.max_media_upload_body_bytes` cap applies — the
+        // v3 path is the new operative chunk ceiling once clients adopt it.
+        .route(
+            "/media/v3/{media_id}/{idx}",
+            post(upload_chunk_v3)
+                .get(download_chunk_v3)
+                .layer(DefaultBodyLimit::max(state.config.max_media_upload_body_bytes)),
+        )
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),

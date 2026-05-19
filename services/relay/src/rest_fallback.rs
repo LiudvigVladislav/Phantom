@@ -550,6 +550,25 @@ pub struct SessionResponse {
     pub rest_fallback: bool,
     pub max_send_body_bytes: usize,
     pub poll_max_envelopes: usize,
+    /// PR-M2f — server-announced media capabilities. Clients consult this
+    /// object instead of guessing endpoint shapes. Extensible: future flags
+    /// (e.g. `range_download`, `max_range_bytes`, `recommended_chunk_bytes`)
+    /// land here without breaking older clients that ignore unknown fields.
+    pub media_capabilities: MediaCapabilities,
+}
+
+#[derive(Serialize)]
+pub struct MediaCapabilities {
+    /// True when the relay serves the binary `/media/v3/{mediaId}/{idx}`
+    /// endpoint pair. Clients MUST still tolerate a 404/405 from the v3
+    /// path and fall back to legacy `/media/upload-chunk` + `/media/chunk/...`
+    /// for safety, because relay redeploys may briefly disagree with the
+    /// cached session announcement.
+    pub binary_v3: bool,
+    /// Hard cap on `POST /media/v3/.../...` (and legacy `/media/upload-chunk`)
+    /// body bytes. Echoes `state.config.max_media_upload_body_bytes`. With v3,
+    /// raw ciphertext === body, so this is the operative chunk ceiling.
+    pub max_upload_body_bytes: usize,
 }
 
 #[derive(Deserialize)]
@@ -702,6 +721,10 @@ pub async fn rest_session(
                     rest_fallback: true,
                     max_send_body_bytes: REST_MAX_BODY_BYTES,
                     poll_max_envelopes: POLL_MAX_ENVELOPES,
+                    media_capabilities: MediaCapabilities {
+                        binary_v3: true,
+                        max_upload_body_bytes: state.config.max_media_upload_body_bytes,
+                    },
                 }),
             )
                 .into_response();
@@ -883,6 +906,10 @@ pub async fn rest_session(
             rest_fallback: true,
             max_send_body_bytes: REST_MAX_BODY_BYTES,
             poll_max_envelopes: POLL_MAX_ENVELOPES,
+            media_capabilities: MediaCapabilities {
+                binary_v3: true,
+                max_upload_body_bytes: state.config.max_media_upload_body_bytes,
+            },
         }),
     )
         .into_response()
