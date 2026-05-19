@@ -48,6 +48,8 @@ class VoiceV2Sender(
         audioBytes: ByteArray,
         durationMs: Long,
         mime: String,
+        onSplit: ((total: Int) -> Unit)? = null,
+        onChunkUploaded: ((sent: Int, total: Int) -> Unit)? = null,
     ): Result<VoiceManifestV2> = runCatching {
         // Step 1: encrypt
         val enc = mediaCrypto.encryptVoice(audioBytes)
@@ -63,6 +65,7 @@ class VoiceV2Sender(
             "MEDIA_TX chunk_split mediaId=${enc.mediaId.take(8)} " +
                 "chunkCount=$total totalCiphertextBytes=${enc.ciphertext.size}",
         )
+        onSplit?.invoke(total)
 
         // Step 3: upload loop (sequential, one chunk at a time)
         for (idx in 0 until total) {
@@ -73,6 +76,12 @@ class VoiceV2Sender(
                 chunkBytes = chunks[idx],
             )
             // uploadChunkWithRefresh throws on terminal failure.
+            val sent = idx + 1
+            log(
+                "MEDIA_TX upload_progress mediaId=${enc.mediaId.take(8)} " +
+                    "sent=$sent total=$total",
+            )
+            onChunkUploaded?.invoke(sent, total)
         }
         log("MEDIA_TX upload_complete mediaId=${enc.mediaId.take(8)} chunks=$total")
 

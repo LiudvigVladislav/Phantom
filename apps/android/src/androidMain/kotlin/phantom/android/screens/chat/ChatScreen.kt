@@ -85,6 +85,7 @@ import phantom.android.di.AppContainer
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+import phantom.core.messaging.MediaProgressBus
 import phantom.core.messaging.OutgoingMessage
 import phantom.core.messaging.SafetyReportCategory
 import phantom.core.storage.MessageEntity
@@ -118,6 +119,11 @@ fun ChatScreen(
     var recordingDurationMs by remember { mutableStateOf(0L) }
     var audioFile by remember { mutableStateOf<java.io.File?>(null) }
     var mediaRecorder by remember { mutableStateOf<android.media.MediaRecorder?>(null) }
+    // PR-M2d.1b — UI-side voice-send guard. Prevents a second tap on the mic
+    // button (or a bounced touch) from immediately starting a new recording
+    // while the previous one is still finalising / sending. Test #67b log
+    // showed a 334 ms re-entry after `VOICE_REC complete` — see Bug 1.
+    var voiceSendInProgress by remember { mutableStateOf(false) }
 
     // Release recorder on screen dispose
     DisposableEffect(Unit) {
@@ -696,8 +702,16 @@ fun ChatScreen(
                             }
                             return@InputBar
                         }
+                        if (voiceSendInProgress) {
+                            android.util.Log.i(
+                                "PhantomMedia",
+                                "VOICE_REC ignored_start reason=finalizing_or_sending isRecording=$isRecording",
+                            )
+                            return@InputBar
+                        }
                         if (isRecording) {
                             // Stop recording and send audio as chunks
+                            voiceSendInProgress = true
                             mediaRecorder?.stop()
                             mediaRecorder?.release()
                             mediaRecorder = null
@@ -705,47 +719,56 @@ fun ChatScreen(
                             val file = audioFile
                             if (file != null && file.exists()) {
                                 scope.launch {
-                                    val bytes = file.readBytes()
-                                    val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
-                                    // PR-M2a — measured byte profile. bytesPerSec is the
-                                    // key acceptance metric: target 2-4 KB/sec means a
-                                    // 5-sec voice is 10-20 KB and a 60-sec voice 120-240 KB.
-                                    val bytesPerSec = if (recordingDurationMs > 0) {
-                                        bytes.size.toLong() * 1000L / recordingDurationMs
-                                    } else 0L
-                                    android.util.Log.i(
-                                        "PhantomMedia",
-                                        "VOICE_REC complete durationMs=$recordingDurationMs bytes=${bytes.size} " +
-                                            "bytesPerSec=$bytesPerSec mime=$mimeType"
-                                    )
-                                    val result = container.messagingService?.sendAudio(
-                                        conversationId = conversationId,
-                                        audioBytes = bytes,
-                                        durationMs = recordingDurationMs,
-                                        mimeType = mimeType,
-                                    )
-                                    if (result != null && result.isFailure) {
-                                        // PR-M1w: distinguish in-progress guard from other failures.
-                                        // IllegalStateException("A voice message is still uploading…")
-                                        // comes from sendAudioV2's voiceSendInProgress guard.
-                                        val ex = result.exceptionOrNull()
-                                        val msg = if (ex is IllegalStateException &&
-                                            ex.message?.contains("still uploading") == true
-                                        ) {
-                                            context.getString(R.string.m1w_voice_still_uploading)
+                                    try {
+                                        val bytes = file.readBytes()
+                                        val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
+                                        // PR-M2a — measured byte profile. bytesPerSec is the
+                                        // key acceptance metric: target 2-4 KB/sec means a
+                                        // 5-sec voice is 10-20 KB and a 60-sec voice 120-240 KB.
+                                        val bytesPerSec = if (recordingDurationMs > 0) {
+                                            bytes.size.toLong() * 1000L / recordingDurationMs
+                                        } else 0L
+                                        android.util.Log.i(
+                                            "PhantomMedia",
+                                            "VOICE_REC complete durationMs=$recordingDurationMs bytes=${bytes.size} " +
+                                                "bytesPerSec=$bytesPerSec mime=$mimeType"
+                                        )
+                                        val result = container.messagingService?.sendAudio(
+                                            conversationId = conversationId,
+                                            audioBytes = bytes,
+                                            durationMs = recordingDurationMs,
+                                            mimeType = mimeType,
+                                        )
+                                        if (result != null && result.isFailure) {
+                                            // PR-M1w: distinguish in-progress guard from other failures.
+                                            // IllegalStateException("A voice message is still uploading…")
+                                            // comes from sendAudioV2's voiceSendInProgress guard.
+                                            val ex = result.exceptionOrNull()
+                                            val msg = if (ex is IllegalStateException &&
+                                                ex.message?.contains("still uploading") == true
+                                            ) {
+                                                context.getString(R.string.m1w_voice_still_uploading)
+                                            } else {
+                                                "Голосовое сообщение слишком длинное"
+                                            }
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                msg,
+                                                android.widget.Toast.LENGTH_SHORT,
+                                            ).show()
                                         } else {
-                                            "Голосовое сообщение слишком длинное"
+                                            reloadMessages()
+                                            if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
                                         }
-                                        android.widget.Toast.makeText(
-                                            context,
-                                            msg,
-                                            android.widget.Toast.LENGTH_SHORT,
-                                        ).show()
-                                    } else {
-                                        reloadMessages()
-                                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                    } finally {
+                                        // Release the UI guard once sendAudio returned (it returns
+                                        // immediately after launching the upload coroutine inside
+                                        // DMS — the upload itself continues on the DMS appScope).
+                                        voiceSendInProgress = false
                                     }
                                 }
+                            } else {
+                                voiceSendInProgress = false
                             }
                             audioFile = null
                         } else {
@@ -1278,6 +1301,10 @@ private fun MessageBubble(
     val isSent = entity.sent
     val rawText = entity.plaintextCache ?: "•••"
     val timeStr = formatMessageTime(entity.createdAt)
+    // PR-M2d.1b — live chunk-progress map shared across all bubbles in this
+    // ChatScreen. Compose deduplicates state subscriptions on the underlying
+    // StateFlow, so collecting per-bubble has no extra runtime cost.
+    val mediaProgress by container.mediaProgressBus.flow.collectAsState()
     // Single combined long-press panel — emoji row at top, action list
     // already expanded below it. Replaces the previous two-step UX where the
     // user had to tap "•••" inside the emoji popup to open a separate
@@ -1530,6 +1557,7 @@ private fun MessageBubble(
                         timeStr = timeStr,
                         status = entity.status,
                         context = context,
+                        progress = mediaProgress[entity.id],
                     )
                 } else {
                 // Text + time in a Box so time overlays bottom-right corner
@@ -2006,6 +2034,11 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCheckmark(
  *   [AUDIO_DOWNLOADING]       — PR-M1w manifest received but download not yet complete.
  *   [AUDIO_FAILED:<reason>]   — permanent failure (404 / sha256_mismatch / decrypt_failed).
  *
+ * PR-M2d.1b: optional [progress] carries live chunk N/M for the upload (sender)
+ * or download (receiver) phase. When present it overrides the static spinner
+ * with a "Uploading N/M" or "Downloading N/M" line; when null the bubble falls
+ * back to the pre-M2d.1b "Downloading…" label.
+ *
  * The DOWNLOADING and FAILED states do not attempt MediaPlayer construction.
  * AUDIO_LOCAL reads the file at [path] into a temp cache file on first play —
  * same lazy-load pattern as the legacy Base64 path, no Okio dependency.
@@ -2017,6 +2050,7 @@ private fun AudioBubble(
     timeStr: String,
     status: MessageStatus,
     context: android.content.Context,
+    progress: MediaProgressBus.Progress? = null,
 ) {
     // ── Resolve audio source ──────────────────────────────────────────────────
     val isDownloading = plaintextCache == "[AUDIO_DOWNLOADING]"
@@ -2024,6 +2058,28 @@ private fun AudioBubble(
     val isLocalFile = plaintextCache.startsWith("[AUDIO_LOCAL:")
     // Legacy sender self-playback: [AUDIO:<base64>]
     val isLegacyBase64 = plaintextCache.startsWith("[AUDIO:") && !isLocalFile
+
+    // PR-M2d.1b — sender uploading: voice_v2 sender keeps `[AUDIO:base64]`
+    // in the row for self-playback. While the upload loop is live, the bus
+    // entry has direction=UPLOAD. The presence of that entry is the
+    // authoritative "live upload" signal — the DB `status` column may still
+    // be QUEUED if the row was loaded between INSERT and UPLOADING status
+    // commit, so we do NOT gate on `status == UPLOADING` (Test #67b lesson).
+    val isUploadingSender = isSent
+        && progress != null
+        && progress.direction == MediaProgressBus.Direction.UPLOAD
+    // Diagnostic — confirms the UI lookup hits the bus entry while upload is live.
+    androidx.compose.runtime.LaunchedEffect(progress) {
+        if (progress != null) {
+            android.util.Log.i(
+                "PhantomMedia",
+                "MEDIA_UI progress_lookup found=true " +
+                    "direction=${progress.direction.name.lowercase()} " +
+                    "sent=${progress.sent} total=${progress.total} " +
+                    "isSent=$isSent status=${status.name}",
+            )
+        }
+    }
 
     // Path for AUDIO_LOCAL: strip prefix and trailing ']'
     val localFilePath: String? = if (isLocalFile) {
@@ -2035,8 +2091,34 @@ private fun AudioBubble(
         plaintextCache.removePrefix("[AUDIO:").trimEnd(']')
     } else null
 
-    // ── Downloading state: spinner + label ────────────────────────────────────
-    if (isDownloading) {
+    // ── Downloading or Uploading state: spinner + label ──────────────────────
+    if (isDownloading || isUploadingSender) {
+        // PR-M2d.1b: derive label + numeric progress fraction.
+        // - Receiver download: "Downloading N/M" when progress != null, else "Downloading…".
+        // - Sender upload:    "Uploading N/M".
+        val labelText: String
+        val fraction: Float?
+        if (isUploadingSender) {
+            val p = progress!!
+            labelText = "Uploading ${p.sent}/${p.total}"
+            fraction = if (p.total > 0) p.sent.toFloat() / p.total.toFloat() else null
+        } else if (progress != null && progress.direction == MediaProgressBus.Direction.DOWNLOAD) {
+            labelText = "Downloading ${progress.sent}/${progress.total}"
+            fraction = if (progress.total > 0) progress.sent.toFloat() / progress.total.toFloat() else null
+        } else {
+            labelText = "Downloading…"
+            fraction = null
+        }
+        // PR-M2d.1b polish (Test #67b1): the original Uploading/Downloading row
+        // read as faint/disabled on the cyan sent bubble. Sender bubble has a
+        // CyanAccent background, so spinner + label switch to a BgDeep ink for
+        // full contrast; receiver keeps the CyanAccent ink on the dark Surface
+        // bubble. Label text bumped to 12.sp + Medium weight, with a numeric
+        // "N/M" suffix that the user can read at a glance.
+        val inkColor = if (isSent) BgDeep else TextPrimary
+        val accentTint = if (isSent) BgDeep else CyanAccent
+        val pillBg = if (isSent) BgDeep.copy(alpha = 0.18f) else CyanAccent.copy(alpha = 0.12f)
+        val barTrack = if (isSent) BgDeep.copy(alpha = 0.20f) else Surface
         Row(
             modifier = Modifier.width(220.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -2046,14 +2128,14 @@ private fun AudioBubble(
                 modifier = Modifier
                     .size(36.dp)
                     .clip(RoundedCornerShape(50))
-                    .background(CyanAccent.copy(alpha = 0.12f)),
+                    .background(pillBg),
                 contentAlignment = Alignment.Center,
             ) {
-                // Static downward-arc to indicate downloading (no extra animation dep)
+                // Arc orientation: sender = upward-pointing, receiver = downward
                 Canvas(modifier = Modifier.size(18.dp)) {
                     drawArc(
-                        color = CyanAccent.copy(alpha = 0.7f),
-                        startAngle = 60f,
+                        color = accentTint.copy(alpha = 0.85f),
+                        startAngle = if (isUploadingSender) 240f else 60f,
                         sweepAngle = 240f,
                         useCenter = false,
                         style = androidx.compose.ui.graphics.drawscope.Stroke(
@@ -2064,27 +2146,41 @@ private fun AudioBubble(
                 }
             }
             Column(modifier = Modifier.weight(1f)) {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth().height(3.dp),
-                    color = CyanAccent.copy(alpha = 0.5f),
-                    trackColor = Surface,
-                )
-                Spacer(Modifier.height(5.dp))
+                if (fraction != null) {
+                    LinearProgressIndicator(
+                        progress = { fraction.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                        color = accentTint,
+                        trackColor = barTrack,
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                        color = accentTint.copy(alpha = 0.65f),
+                        trackColor = barTrack,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = "Downloading…",
-                        color = TextDim,
-                        fontSize = 10.sp,
+                        text = labelText,
+                        color = inkColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
                     )
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(3.dp),
                     ) {
-                        Text(text = timeStr, color = TextDim, fontSize = 10.sp)
+                        Text(
+                            text = timeStr,
+                            color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
+                            fontSize = 10.sp,
+                        )
                         if (isSent) StatusIcon(status = status)
                     }
                 }
@@ -2124,9 +2220,18 @@ private fun AudioBubble(
                     fontWeight = FontWeight.Medium,
                 )
                 Spacer(Modifier.height(2.dp))
+                // PR-M2d.1b: surface a static "Try again later" hint above the
+                // raw reason. Full tap-to-retry behaviour is intentionally out
+                // of scope for M2d.1b — locked to UI/state/progress only.
+                Text(
+                    text = "Try again later",
+                    color = TextDim,
+                    fontSize = 10.sp,
+                )
+                Spacer(Modifier.height(1.dp))
                 Text(
                     text = reason,
-                    color = TextDim,
+                    color = TextDim.copy(alpha = 0.7f),
                     fontSize = 9.sp,
                     maxLines = 1,
                 )

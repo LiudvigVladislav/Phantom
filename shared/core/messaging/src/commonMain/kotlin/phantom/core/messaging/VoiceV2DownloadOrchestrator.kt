@@ -50,7 +50,10 @@ class VoiceV2DownloadOrchestrator(
      * Download, decrypt, verify, and persist the audio for [mediaId].
      * Safe to call multiple times for the same mediaId (idempotent via find-guard).
      */
-    suspend fun runDownloadTask(mediaId: String) {
+    suspend fun runDownloadTask(
+        mediaId: String,
+        onChunkDownloaded: ((received: Int, total: Int) -> Unit)? = null,
+    ) {
         val task = downloadRepo.find(mediaId) ?: return // already deleted (complete) or never inserted
         if (task.status == VoiceV2DownloadRepository.STATUS_COMPLETE) return
 
@@ -74,6 +77,12 @@ class VoiceV2DownloadOrchestrator(
                 return
             }
             chunks.add(chunkBytes)
+            val received = idx + 1
+            log(
+                "MEDIA_RX download_progress mediaId=${mediaId.take(8)} " +
+                    "received=$received total=${manifest.chunkCount}",
+            )
+            onChunkDownloaded?.invoke(received, manifest.chunkCount)
         }
 
         // Reassemble ciphertext blob

@@ -386,6 +386,12 @@ class AppContainer(private val context: Context) {
     var messagingService: MessagingService? = null
         private set
 
+    // PR-M2d.1b — live chunk-progress bus for voice_v2 upload / download.
+    // Lifetime tied to the AppContainer (process). UI reads `flow` and
+    // looks up live N/M counters by message row id.
+    val mediaProgressBus: phantom.core.messaging.MediaProgressBus =
+        phantom.core.messaging.MediaProgressBus()
+
     // Initialised together with messagingService — requires identity for myPubKeyHex.
     var groupMessagingService: GroupMessagingService? = null
         private set
@@ -741,6 +747,7 @@ class AppContainer(private val context: Context) {
             voiceV2Sender               = voiceV2SenderLocal,
             voiceV2DownloadRepository   = voiceV2DownloadRepo,
             voiceV2DownloadOrchestrator = voiceV2DownloadOrchestratorLocal,
+            mediaProgressBus            = mediaProgressBus,
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.
