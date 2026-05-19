@@ -841,6 +841,70 @@ class DefaultMessagingService(
         )
         scope.launch {
             try {
+                // PR-M2e — extract the manifest-send block into a suspend lambda
+                // so it can fire either AS the early-manifest hook (after the
+                // first K=3 chunks) OR as a tail fallback (legacy path / very
+                // short voices). It's idempotent on its own state — the flag
+                // `manifestSent` guards against double-send.
+                var manifestSent = false
+                suspend fun sendManifestEnvelope(manifest: VoiceManifestV2) {
+                    if (manifestSent) return
+                    manifestSent = true
+                    val manifestJson = json.encodeToString(manifest)
+                    val payload = MessagePayload(
+                        type           = MessagePayload.TYPE_VOICE_V2,
+                        text           = manifestJson,
+                        sentAt         = Clock.System.now().toEpochMilliseconds(),
+                        senderUsername = identity.username,
+                    )
+                    val payloadBytes = json.encodeToString(payload).encodeToByteArray()
+                    val encrypted = encryptUnderLock(
+                        conversationId        = conversationId,
+                        recipientPublicKeyHex = recipientPublicKeyHex,
+                        plaintext             = payloadBytes,
+                    )
+                    val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
+                    val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
+                    val envelopeId = uuid4().toString()
+
+                    transport.send(
+                        RelayMessage.Send(
+                            to           = recipientPublicKeyHex,
+                            from         = "",
+                            sealedSender = Base64.encode(
+                                SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                            ),
+                            payload   = paddedCiphertext.encodeBase64(),
+                            messageId = envelopeId,
+                        )
+                    )
+                    // transport.send returning false is OK — the envelope is in
+                    // the outbox durable store (HybridRelayTransport retry path).
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
+                            "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
+                    )
+                    // R5-3 — Flip local row UPLOADING → SENT after manifest leaves us.
+                    // With PR-M2e this happens BEFORE the upload tail completes; the
+                    // remaining chunks continue in background and the sender bubble's
+                    // Uploading N/M counter keeps ticking until upload_complete.
+                    messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "MEDIA_TX local_status_sent mediaId=${manifest.mediaId.take(8)} " +
+                            "localMsgId=${localMsgId.take(8)}",
+                    )
+
+                    // Conversation preview update
+                    conversationRepository.upsertConversation(
+                        conv.copy(
+                            lastMessagePreview = "Voice message",
+                            lastMessageAt      = Clock.System.now().toEpochMilliseconds(),
+                        )
+                    )
+                }
+
                 val uploadResult = sender.uploadVoice(
                     audioBytes = audioBytes,
                     durationMs = durationMs,
@@ -851,12 +915,21 @@ class DefaultMessagingService(
                     onChunkUploaded  = { sent, total ->
                         mediaProgressBus.update(localMsgId, sent = sent, total = total, direction = MediaProgressBus.Direction.UPLOAD)
                     },
+                    onEarlyManifest  = { manifest -> sendManifestEnvelope(manifest) },
                 )
                 if (uploadResult.isFailure) {
                     val reason = uploadResult.exceptionOrNull()?.message?.take(60) ?: "unknown"
+                    // PR-M2e — distinguish "upload failed before manifest could be
+                    // sent" (legacy case) from "manifest already on the wire, tail
+                    // upload failed mid-stream" (new M2e edge). The receiver will
+                    // surface the tail failure via its own deadline path; this log
+                    // is the sender-side diagnostic that pairs with it.
+                    val tag = if (manifestSent) "send_failed_after_early_manifest"
+                              else "send_failed_no_manifest"
                     messagingLog(
                         MessagingLogLevel.WARN,
-                        "MEDIA_TX send_failed_no_manifest mediaId=unknown reason=$reason",
+                        "MEDIA_TX $tag localMsgId=${localMsgId.take(8)} reason=$reason " +
+                            "early_manifest_sent=$manifestSent",
                     )
                     messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
                     mediaProgressBus.clear(localMsgId)
@@ -864,65 +937,10 @@ class DefaultMessagingService(
                 }
 
                 val manifest = uploadResult.getOrThrow()
-
-                // Step 6 — Wrap manifest in MessagePayload(TYPE_VOICE_V2) so the
-                // receiver's `payload.type == TYPE_VOICE_V2` branch fires. Before
-                // this fix the raw VoiceManifestV2 JSON went on the wire; the
-                // receiver decoded it as `MessagePayload(type=message, text="")`
-                // and surfaced it as an empty chat bubble (Test #57 root cause).
-                val manifestJson = json.encodeToString(manifest)
-                val payload = MessagePayload(
-                    type           = MessagePayload.TYPE_VOICE_V2,
-                    text           = manifestJson,
-                    sentAt         = Clock.System.now().toEpochMilliseconds(),
-                    senderUsername = identity.username,
-                )
-                val payloadBytes = json.encodeToString(payload).encodeToByteArray()
-                val encrypted = encryptUnderLock(
-                    conversationId        = conversationId,
-                    recipientPublicKeyHex = recipientPublicKeyHex,
-                    plaintext             = payloadBytes,
-                )
-                val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
-                val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
-                val envelopeId = uuid4().toString()
-
-                transport.send(
-                    RelayMessage.Send(
-                        to           = recipientPublicKeyHex,
-                        from         = "",
-                        sealedSender = Base64.encode(
-                            SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                        ),
-                        payload   = paddedCiphertext.encodeBase64(),
-                        messageId = envelopeId,
-                    )
-                )
-                // transport.send returning false is OK — the envelope is in the outbox durable store
-                // (HybridRelayTransport retry path). The ratchet ack flow will lift SENT → DELIVERED.
-                messagingLog(
-                    MessagingLogLevel.INFO,
-                    "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
-                        "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
-                )
-                // R5-3 — Flip local row UPLOADING → SENT immediately after manifest leaves us.
-                // Without this the sender bubble visually stays in UPLOADING until the
-                // receiver's read receipt (potentially many minutes on Limited realtime).
-                // Mirrors the text-send path which marks rows SENT after transport.send returns.
-                messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
-                messagingLog(
-                    MessagingLogLevel.INFO,
-                    "MEDIA_TX local_status_sent mediaId=${manifest.mediaId.take(8)} " +
-                        "localMsgId=${localMsgId.take(8)}",
-                )
-
-                // Step 7 — Update conversation preview
-                conversationRepository.upsertConversation(
-                    conv.copy(
-                        lastMessagePreview = "Voice message",
-                        lastMessageAt      = Clock.System.now().toEpochMilliseconds(),
-                    )
-                )
+                // Fallback for the (rare) case where uploadVoice succeeded but
+                // onEarlyManifest never fired — e.g. EARLY_MANIFEST_AFTER_CHUNKS
+                // changed in a future refactor or a 0-chunk path slipped through.
+                sendManifestEnvelope(manifest)
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 messagingLog(
                     MessagingLogLevel.WARN,
