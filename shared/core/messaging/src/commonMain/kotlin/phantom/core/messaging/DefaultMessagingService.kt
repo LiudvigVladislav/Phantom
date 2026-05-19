@@ -919,9 +919,16 @@ class DefaultMessagingService(
                 )
                 if (uploadResult.isFailure) {
                     val reason = uploadResult.exceptionOrNull()?.message?.take(60) ?: "unknown"
+                    // PR-M2e — distinguish "upload failed before manifest could be
+                    // sent" (legacy case) from "manifest already on the wire, tail
+                    // upload failed mid-stream" (new M2e edge). The receiver will
+                    // surface the tail failure via its own deadline path; this log
+                    // is the sender-side diagnostic that pairs with it.
+                    val tag = if (manifestSent) "send_failed_after_early_manifest"
+                              else "send_failed_no_manifest"
                     messagingLog(
                         MessagingLogLevel.WARN,
-                        "MEDIA_TX send_failed_no_manifest mediaId=unknown reason=$reason " +
+                        "MEDIA_TX $tag localMsgId=${localMsgId.take(8)} reason=$reason " +
                             "early_manifest_sent=$manifestSent",
                     )
                     messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
