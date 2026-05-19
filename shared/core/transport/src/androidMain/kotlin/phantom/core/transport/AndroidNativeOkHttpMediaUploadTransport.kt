@@ -78,6 +78,47 @@ class AndroidNativeOkHttpMediaUploadTransport(
 
     private fun shouldUseV3(): Boolean = binaryV3Enabled() && !v3DisabledByFallback
 
+    /**
+     * PR-M2h — sticky runtime guard for the pooled-OkHttp v3 download path.
+     * Defaults to `true` (use pool). Flipped to `false` on the first
+     * `body_read_failed`, `request_timeout`, `SocketTimeoutException`,
+     * `InterruptedIOException`, truncated body, or pool-mode chunk that
+     * took longer than [POOL_STALL_THRESHOLD_MS]. Reset only by process
+     * restart — Vladislav 2026-05-20 locked: "не пытаться потом снова
+     * включить pooled в этом же тесте, иначе можно получить нестабильные
+     * качели". A 404 (`chunk_not_ready_yet` from M2e early-manifest) does
+     * NOT trip this guard.
+     *
+     * The guard governs only the *next* download attempt — a chunk that
+     * arrived OK but took > threshold still returns its bytes successfully,
+     * because re-fetching it on the fresh client would just waste another
+     * RTT on data we already hold.
+     */
+    @Volatile
+    private var useDownloadPool: Boolean = true
+
+    /**
+     * Pooled OkHttp client for the v3 download path. Single lazy instance,
+     * shared across calls so HTTP/1.1 keep-alive can actually reuse a
+     * connection across consecutive chunks. Upload path stays on the
+     * fresh-per-call [buildClient] because Tele2 POST retry-buffer issues
+     * (PR-R0.1 / PR-R0.3 / PR-M1w-R4) are not yet known to be safe under
+     * connection reuse. Same HTTP/1.1 pin and 10-second timeouts as the
+     * fresh client; the only differences are the connection pool and the
+     * absence of a `Connection: close` header on each request.
+     */
+    private val pooledDownloadClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .connectionPool(ConnectionPool(POOL_MAX_IDLE_CONNS, POOL_KEEP_ALIVE_MS, TimeUnit.MILLISECONDS))
+            .retryOnConnectionFailure(false)
+            .callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+            .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+            .writeTimeout(writeTimeoutMs, TimeUnit.MILLISECONDS)
+            .build()
+    }
+
     // ── uploadChunk ────────────────────────────────────────────────────────────
 
     override suspend fun uploadChunk(
@@ -304,27 +345,41 @@ class AndroidNativeOkHttpMediaUploadTransport(
         idx: Int,
     ): Result<MediaUploadTransport.DownloadResult>? {
         val startMs = System.currentTimeMillis()
-        log("MEDIA_V3 download_start mediaId=${mediaId.take(8)} idx=$idx")
+        // PR-M2h — decide pool-vs-fresh for THIS call. The flag is checked
+        // once per call so an in-flight stall on a previous chunk can switch
+        // subsequent chunks to fresh without disrupting the current one.
+        val pool = useDownloadPool
+        log(
+            "MEDIA_V3 download_start mediaId=${mediaId.take(8)} idx=$idx " +
+                "mode=${if (pool) "pooled" else "fresh"}"
+        )
         return runCatching {
             val url = "$relayBaseUrl/media/v3/$mediaId/$idx"
-            val client = buildClient()
-            val request = Request.Builder()
+            val client = if (pool) pooledDownloadClient else buildClient()
+            val builder = Request.Builder()
                 .url(url)
                 .header("Authorization", "Bearer $token")
-                .header("Connection", "close")
                 .header("Cache-Control", "no-store")
-                .get()
-                .build()
+            // PR-M2h — `Connection: close` is part of the fresh-per-call
+            // pattern (kill-after-response); on the pooled path it would
+            // defeat the entire reason for the pool (keep-alive reuse).
+            if (!pool) builder.header("Connection", "close")
+            val request = builder.get().build()
             var statusCode: Int
             var headersOnlyElapsedMs = 0L
             var totalHeader: String? = null
             var ciphertext: ByteArray = ByteArray(0)
+            var bodyReadError: Throwable? = null
             client.newCall(request).execute().use { response: Response ->
                 statusCode = response.code
                 headersOnlyElapsedMs = System.currentTimeMillis() - startMs
                 totalHeader = response.headers["X-Chunk-Total"]
                 if (statusCode == 200) {
-                    ciphertext = response.body?.bytes() ?: ByteArray(0)
+                    try {
+                        ciphertext = response.body?.bytes() ?: ByteArray(0)
+                    } catch (e: Throwable) {
+                        bodyReadError = e
+                    }
                 } else {
                     try { response.body?.bytes() } catch (_: Throwable) {}
                 }
@@ -333,16 +388,39 @@ class AndroidNativeOkHttpMediaUploadTransport(
             log(
                 "MEDIA_V3 download_response mediaId=${mediaId.take(8)} idx=$idx " +
                     "status=$statusCode bytes=${ciphertext.size} " +
-                    "headersMs=$headersOnlyElapsedMs totalMs=$totalElapsedMs"
+                    "mode=${if (pool) "pooled" else "fresh"} " +
+                    "headersMs=$headersOnlyElapsedMs totalMs=$totalElapsedMs" +
+                    (bodyReadError?.let { " bodyReadError=${it::class.simpleName}" } ?: "")
             )
-            when (statusCode) {
-                200 -> Result.success(
+
+            // PR-M2h — pool-stickiness checks. Order matters: body_read_failed
+            // is the harshest signal (we got bytes but they were truncated /
+            // the read errored mid-flight), so we trip BEFORE looking at
+            // status. A 404 is the M2e `chunk_not_ready_yet` early-manifest
+            // race and must NEVER trip the pool guard.
+            if (pool && bodyReadError != null) {
+                disablePool("body_read_failed", mediaId, idx, totalElapsedMs)
+            } else if (pool
+                && totalElapsedMs > POOL_STALL_THRESHOLD_MS
+                && statusCode != 404
+            ) {
+                disablePool("stall", mediaId, idx, totalElapsedMs)
+            }
+
+            when {
+                statusCode == 200 && bodyReadError == null -> Result.success(
                     MediaUploadTransport.DownloadResult(
                         ciphertext = ciphertext,
                         total = totalHeader?.toIntOrNull() ?: 0,
                     )
                 )
-                405 -> {
+                statusCode == 200 && bodyReadError != null -> Result.failure(
+                    MediaTransportException(
+                        "download-v3 body_read_failed mode=${if (pool) "pooled" else "fresh"} " +
+                            "error=${bodyReadError!!::class.simpleName}: ${bodyReadError!!.message?.take(120) ?: ""}"
+                    )
+                )
+                statusCode == 405 -> {
                     v3DisabledByFallback = true
                     log(
                         "MEDIA_V3 fallback reason=method_not_allowed status=405 " +
@@ -350,16 +428,24 @@ class AndroidNativeOkHttpMediaUploadTransport(
                     )
                     null
                 }
-                404 -> Result.failure(NotFoundException)
-                401 -> Result.failure(MediaAuthException("media_auth_401"))
+                statusCode == 404 -> Result.failure(NotFoundException)
+                statusCode == 401 -> Result.failure(MediaAuthException("media_auth_401"))
                 else -> Result.failure(
                     MediaTransportException("download-v3 unexpected status=$statusCode")
                 )
             }
         }.getOrElse { e ->
             val elapsed = System.currentTimeMillis() - startMs
+            // PR-M2h — exception path is the other half of the pool-stickiness
+            // check. Timeout / IO errors on the pooled client are exactly what
+            // we want to fall back from. Same one-way switch as the body-read
+            // error path above.
+            if (pool && isPoolDisablingException(e)) {
+                disablePool(e::class.simpleName ?: "exception", mediaId, idx, elapsed)
+            }
             log(
                 "MEDIA_V3 download_fail mediaId=${mediaId.take(8)} idx=$idx " +
+                    "mode=${if (pool) "pooled" else "fresh"} " +
                     "error=${e::class.simpleName} elapsedMs=$elapsed"
             )
             Result.failure(
@@ -411,6 +497,40 @@ class AndroidNativeOkHttpMediaUploadTransport(
                 )
             )
         }
+    }
+
+    /**
+     * PR-M2h — one-way kill switch for the pooled download path. Logs the
+     * fallback reason once and writes through the volatile flag so the very
+     * next [downloadChunkV3] call sees `mode=fresh`. Idempotent: subsequent
+     * calls log nothing further (the flag is already off).
+     */
+    private fun disablePool(reason: String, mediaId: String, idx: Int, elapsedMs: Long) {
+        if (!useDownloadPool) return
+        useDownloadPool = false
+        log(
+            "MEDIA_V3 download_pool_fallback reason=$reason " +
+                "mediaId=${mediaId.take(8)} idx=$idx totalMs=$elapsedMs " +
+                "threshold_ms=$POOL_STALL_THRESHOLD_MS"
+        )
+    }
+
+    /**
+     * PR-M2h — which exceptions on the pooled download path should sticky-
+     * disable the pool. Covers the transport-class failures the pool itself
+     * can cause: socket timeouts, IO interruptions, OkHttp internal stream
+     * resets. Does NOT include [NotFoundException] / [MediaAuthException]
+     * because those are semantic (M2e early-manifest race / 401) and
+     * unrelated to connection reuse.
+     */
+    private fun isPoolDisablingException(e: Throwable): Boolean {
+        val name = e::class.simpleName ?: ""
+        return name == "SocketTimeoutException"
+            || name == "InterruptedIOException"
+            || name == "EOFException"
+            || name == "StreamResetException"
+            || name == "IOException"
+            || name == "ConnectionShutdownException"
     }
 
     // ── Response mappers ───────────────────────────────────────────────────────
@@ -541,6 +661,20 @@ class AndroidNativeOkHttpMediaUploadTransport(
 
         // PR-M2f — raw ciphertext upload body type.
         private val OCTET_STREAM_MEDIA_TYPE = "application/octet-stream".toMediaType()
+
+        // PR-M2h — single-chunk wall-clock above which the pool path is
+        // considered worse than the fresh-per-call baseline (~1.1 s/chunk
+        // measured on Tele2 LTE in Test #71). 3000 ms ≈ 3× baseline; if
+        // pool reuse cannot beat that, the keep-alive isn't paying for the
+        // RTT it should be saving. Vladislav locked 2026-05-20.
+        private const val POOL_STALL_THRESHOLD_MS = 3_000L
+
+        // PR-M2h — pool sizing. 5 idle connections × 60-second keep-alive
+        // is OkHttp's own default and is plenty for the current sequential
+        // download loop (1 connection in flight); the headroom matters
+        // only if a future parallel-download experiment lands.
+        private const val POOL_MAX_IDLE_CONNS = 5
+        private const val POOL_KEEP_ALIVE_MS = 60_000L
     }
 }
 
