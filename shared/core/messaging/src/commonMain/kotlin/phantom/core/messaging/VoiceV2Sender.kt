@@ -6,6 +6,8 @@ package phantom.core.messaging
 import kotlinx.coroutines.delay
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
+import kotlin.math.ceil
+import kotlin.math.max
 import phantom.core.crypto.MediaCrypto
 import phantom.core.transport.MediaAuthException
 import phantom.core.transport.MediaAuthTokenProvider
@@ -38,7 +40,8 @@ class VoiceV2Sender(
     /**
      * PR-M2f.1 (debug probe) — runtime chunk size override.
      *
-     * Production-default returns [MediaChunker.TARGET_RAW_CHUNK_BYTES] = 1700.
+     * Production-default returns [MediaChunker.TARGET_RAW_CHUNK_BYTES]
+     * (3200 after PR-M2f.2; was 1700).
      * Android debug builds wire a SharedPreferences-backed provider so
      * Settings → Diagnostics can select 1700 / 2200 / 2300 / 2400 / 2600
      * across consecutive voice sends without rebuilding the APK. The provider
@@ -111,7 +114,21 @@ class VoiceV2Sender(
         )
         // mediaKey / nonce / sha256 never appear in log lines per hard guardrail.
 
-        val earlyAt = minOf(EARLY_MANIFEST_AFTER_CHUNKS, total)
+        // PR-M2f.2 — byte-based early-manifest threshold. The previous
+        // fixed `EARLY_MANIFEST_AFTER_CHUNKS = 3` was tuned for 1700-byte
+        // chunks (3 × 1700 = 5100 bytes of proof-of-life before the
+        // receiver is told to start downloading). Now that production
+        // `TARGET_RAW_CHUNK_BYTES = 3200` and the debug selector can push
+        // up to 3500, a fixed-3 threshold would delay the receiver to
+        // 9600+ bytes — almost double the original budget — and weaken
+        // the M2e upload/download overlap. Switching to a byte budget
+        // recovers the original M2e timing across all chunk sizes:
+        //   1700 → 3 chunks   2400 → 3 chunks
+        //   3200 → 2 chunks   3500 → 2 chunks
+        val earlyAt = max(
+            1,
+            ceil(EARLY_MANIFEST_AFTER_BYTES.toDouble() / selectedChunkSize).toInt(),
+        ).coerceAtMost(total)
         var earlyManifestSent = false
 
         // Step 3: upload loop (sequential, one chunk at a time)
@@ -235,12 +252,24 @@ class VoiceV2Sender(
         private const val MAX_NETWORK_ATTEMPTS = 5
         private val NETWORK_RETRY_DELAYS_MS = longArrayOf(1_000L, 3_000L, 8_000L, 20_000L, 60_000L)
 
-        // PR-M2e — number of chunks the sender uploads before sending the
-        // manifest envelope. Vladislav 2026-05-19: K=3 (not 1) so the relay
-        // has stored proof-of-life chunks before the receiver is told to
-        // start downloading; this avoids spurious chunk_not_ready_yet
-        // logging on the very first chunk.
-        private const val EARLY_MANIFEST_AFTER_CHUNKS = 3
+        // PR-M2e — byte budget the sender uploads before sending the
+        // manifest envelope (was a fixed chunk count until PR-M2f.2).
+        //
+        // 5100 bytes preserves the original 3 × 1700 = 5100 budget so the
+        // M2e overlap timing is identical at the 1700 baseline and degrades
+        // gracefully on larger chunks — relay has proof of life before the
+        // receiver is told to start downloading, but we don't accidentally
+        // postpone the manifest by ~9.6 KB once chunks grow to 3200.
+        //
+        // Per chunk size the threshold becomes:
+        //   `max(1, ceil(5100.0 / chunkSize)).coerceAtMost(total)`
+        //   1700 → 3   2400 → 3   3200 → 2   3500 → 2
+        //
+        // Vladislav 2026-05-19 locked policy: never K=1; the relay must
+        // have a couple of chunks stored before the receiver is told to
+        // start downloading so `chunk_not_ready_yet` doesn't fire on the
+        // very first attempted GET.
+        private const val EARLY_MANIFEST_AFTER_BYTES = 5_100
 
         // PR-M2f.1 probe — defence-in-depth bounds for the chunk-size
         // provider. The relay's HTTP body cap (default 9000) and the

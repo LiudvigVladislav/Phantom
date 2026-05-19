@@ -12,7 +12,7 @@ import kotlin.test.assertTrue
 class MediaChunkerTest {
 
     @Test
-    fun chunk_38KbBlob_produces23ChunksOf1700ExceptLast() {
+    fun chunk_38KbBlob_producesExpectedChunksOfTargetSizeExceptLast() {
         val inputSize = 38 * 1024  // 38 KB
         val blob = ByteArray(inputSize) { it.toByte() }
 
@@ -40,10 +40,10 @@ class MediaChunkerTest {
 
     @Test
     fun chunk_singleChunkInput_returns1Chunk() {
-        val blob = ByteArray(1700) { 0x42 }
+        val blob = ByteArray(MediaChunker.TARGET_RAW_CHUNK_BYTES) { 0x42 }
         val chunks = MediaChunker.chunk(blob)
         assertEquals(1, chunks.size)
-        assertEquals(1700, chunks[0].size)
+        assertEquals(MediaChunker.TARGET_RAW_CHUNK_BYTES, chunks[0].size)
     }
 
     @Test

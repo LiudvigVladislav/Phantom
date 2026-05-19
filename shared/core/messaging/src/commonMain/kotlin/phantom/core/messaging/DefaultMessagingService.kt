@@ -938,8 +938,10 @@ class DefaultMessagingService(
 
                 val manifest = uploadResult.getOrThrow()
                 // Fallback for the (rare) case where uploadVoice succeeded but
-                // onEarlyManifest never fired — e.g. EARLY_MANIFEST_AFTER_CHUNKS
-                // changed in a future refactor or a 0-chunk path slipped through.
+                // onEarlyManifest never fired — e.g. the byte-budget
+                // threshold (EARLY_MANIFEST_AFTER_BYTES) is reconfigured
+                // to require more bytes than a single chunk can deliver,
+                // or a 0-chunk path slipped through.
                 sendManifestEnvelope(manifest)
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 messagingLog(

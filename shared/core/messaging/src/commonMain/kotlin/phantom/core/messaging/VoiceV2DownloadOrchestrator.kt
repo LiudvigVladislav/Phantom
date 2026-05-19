@@ -67,7 +67,8 @@ class VoiceV2DownloadOrchestrator(
         }
 
         // PR-M2e — dynamic fresh-task window. The sender now sends the
-        // manifest after the first 3 chunks (EARLY_MANIFEST_AFTER_CHUNKS),
+        // manifest after a small byte budget (PR-M2f.2 byte-based path —
+        // ceil(EARLY_MANIFEST_AFTER_BYTES / chunkSize) chunks),
         // so the receiver MUST treat 404 on still-uploading chunks as
         // `chunk_not_ready_yet`, not `media_chunks_gone`. The window scales
         // with chunkCount so a 200-chunk voice still has slack.
