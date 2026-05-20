@@ -3,7 +3,10 @@
 
 package phantom.core.messaging
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.math.ceil
@@ -66,7 +69,35 @@ class VoiceV2Sender(
         onSplit: ((total: Int) -> Unit)? = null,
         onChunkUploaded: ((sent: Int, total: Int) -> Unit)? = null,
         onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)? = null,
-    ): Result<VoiceManifestV2> = runCatching {
+    ): Result<VoiceManifestV2> = try {
+        // PR-MEDIA-UPLOAD-CANCEL2 — explicit try/catch. The previous
+        // `runCatching` swallowed CancellationException as part of
+        // `Throwable`, so a user-tap-X that flipped the parent Job into a
+        // cancelled state was caught here, converted into a normal
+        // `Result.failure`, and the DMS `catch (CancellationException)`
+        // branch never ran. With explicit handling, `CancellationException`
+        // re-throws so the parent's `catch` can mark the upload as
+        // user-cancelled (delete row + log `upload_cancelled_by_user`),
+        // and other failures still resolve to `Result.failure(t)` exactly
+        // as before. Test #76.4 caught this: the user tapped X, the
+        // gesture detector fired `MEDIA_UI upload_cancel_tap`, DMS even
+        // fired `Job.cancel(...)` — but the upload coroutine just saw a
+        // failed Result, never the cancellation marker.
+        Result.success(uploadVoiceInner(audioBytes, durationMs, mime, onSplit, onChunkUploaded, onEarlyManifest))
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (t: Throwable) {
+        Result.failure(t)
+    }
+
+    private suspend fun uploadVoiceInner(
+        audioBytes: ByteArray,
+        durationMs: Long,
+        mime: String,
+        onSplit: ((total: Int) -> Unit)?,
+        onChunkUploaded: ((sent: Int, total: Int) -> Unit)?,
+        onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)?,
+    ): VoiceManifestV2 {
         // Step 1: encrypt
         val enc = mediaCrypto.encryptVoice(audioBytes)
         log(
@@ -131,14 +162,22 @@ class VoiceV2Sender(
         ).coerceAtMost(total)
         var earlyManifestSent = false
 
-        // Step 3: upload loop (sequential, one chunk at a time)
+        // Step 3: upload loop (sequential, one chunk at a time).
+        //
+        // PR-MEDIA-UPLOAD-CANCEL1 — `ensureActive()` checkpoints before and
+        // after each chunk upload give the X-tap cancel path a chance to
+        // stop the loop without waiting for the next network operation to
+        // throw. Without these the upload would continue chunk-by-chunk
+        // even after `cancelVoiceUpload(...)` cancelled the parent Job.
         for (idx in 0 until total) {
+            coroutineContext.ensureActive()
             uploadChunkWithRefresh(
                 mediaId = enc.mediaId,
                 idx = idx,
                 total = total,
                 chunkBytes = chunks[idx],
             )
+            coroutineContext.ensureActive()
             // uploadChunkWithRefresh throws on terminal failure.
             val sent = idx + 1
             log(
@@ -161,7 +200,7 @@ class VoiceV2Sender(
         }
         log("MEDIA_TX upload_complete mediaId=${enc.mediaId.take(8)} chunks=$total")
 
-        manifest
+        return manifest
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
@@ -235,13 +274,20 @@ class VoiceV2Sender(
     ): Result<MediaUploadTransport.UploadStatus> {
         var lastResult: Result<MediaUploadTransport.UploadStatus>? = null
         for (attempt in 1..MAX_NETWORK_ATTEMPTS) {
+            // PR-MEDIA-UPLOAD-CANCEL1 — cancellation checkpoints around
+            // each network round-trip and each backoff delay so a
+            // user-tap-X never has to wait a full retry budget to take
+            // effect.
+            coroutineContext.ensureActive()
             val r = mediaTransport.uploadChunk(token, mediaId, idx, total, chunkBytes)
+            coroutineContext.ensureActive()
             if (r.isSuccess) return r
             val ex = r.exceptionOrNull()
             if (ex !is MediaTransportException) return r // auth/quota/conflict — let caller handle
             lastResult = r
             if (attempt < MAX_NETWORK_ATTEMPTS) {
                 delay(NETWORK_RETRY_DELAYS_MS[attempt - 1])
+                coroutineContext.ensureActive()
             }
         }
         return lastResult ?: Result.failure(MediaTransportException("network_retry_exhausted"))

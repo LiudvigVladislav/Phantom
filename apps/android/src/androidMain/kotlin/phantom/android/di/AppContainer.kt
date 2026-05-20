@@ -770,6 +770,14 @@ class AppContainer(private val context: Context) {
             voiceV2DownloadRepository   = voiceV2DownloadRepo,
             voiceV2DownloadOrchestrator = voiceV2DownloadOrchestratorLocal,
             mediaProgressBus            = mediaProgressBus,
+            // PR-MEDIA-UPLOAD-CANCEL2.1 — route DMS media-side diagnostic
+            // logs (the upload cancel path in particular) to the
+            // `PhantomMedia` tag. `messagingLog(...)` itself writes under
+            // `PhantomMessaging`, which the standard logcat filter
+            // (`PhantomMedia:V PhantomUI:V PhantomTransport:V *:S`)
+            // excludes; the cancel diagnostic chain was invisible during
+            // Test #76.5 review even though the cancel worked.
+            mediaLog                    = { msg -> android.util.Log.i("PhantomMedia", msg) },
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.

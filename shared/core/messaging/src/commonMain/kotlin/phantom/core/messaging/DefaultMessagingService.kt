@@ -14,9 +14,13 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -152,6 +156,16 @@ class DefaultMessagingService(
      * via [mediaProgressBus].
      */
     val mediaProgressBus: MediaProgressBus = MediaProgressBus(),
+    /**
+     * PR-MEDIA-UPLOAD-CANCEL2.1 — Android logcat sink for media-tag
+     * diagnostics. `messagingLog(...)` writes under tag `PhantomMessaging`,
+     * which our standard logcat filters (`PhantomMedia:V PhantomUI:V
+     * PhantomTransport:V *:S`) exclude. The cancel path needed to be
+     * visible alongside `MEDIA_TX upload_*` from VoiceV2Sender (which goes
+     * through this same callback in AppContainer), so the wiring routes
+     * both to the same tag. Default is no-op for tests / non-Android.
+     */
+    private val mediaLog: (String) -> Unit = {},
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -162,6 +176,18 @@ class DefaultMessagingService(
 
     // PR-M1w: single voice in-flight per conversation. Guarded by mutexFor(conversationId).
     private val voiceSendInProgress = mutableSetOf<String>()
+
+    // PR-MEDIA-UPLOAD-CANCEL1: in-flight voice upload jobs keyed by
+    // localMsgId. Populated when `sendAudioV2` launches its upload coroutine
+    // on the DMS scope and removed by the same coroutine's `finally`. The
+    // X button on the uploading voice bubble routes through
+    // `cancelVoiceUpload(...)` which cancels the captured Job here. The
+    // separate Mutex below serialises concurrent insert / lookup / remove
+    // — `mutableMapOf` is not thread-safe and at least two threads
+    // (the DMS scope coroutine and any UI-triggered cancel call) reach it.
+    private val voiceUploadJobsLock = Mutex()
+    private val voiceUploadJobs = mutableMapOf<String, Job>()
+    private val USER_CANCELLED_UPLOAD = "user_cancelled_upload"
 
     init {
         // Q4: loud WARN if production wires this incorrectly.
@@ -839,14 +865,25 @@ class DefaultMessagingService(
             MessagingLogLevel.INFO,
             "MEDIA_TX upload_job_started scope=dms localMsgId=${localMsgId.take(8)}",
         )
-        scope.launch {
+        // PR-MEDIA-UPLOAD-CANCEL1 — hold the Job handle so the UI X-button
+        // path can find and cancel it. `lateinit var` is the standard trick
+        // for self-referencing a launched coroutine; the Job is assigned
+        // before the coroutine body actually starts running, so the cancel
+        // path that races with the very first `ensureActive` checkpoint
+        // still finds a live entry.
+        lateinit var uploadJob: Job
+        uploadJob = scope.launch {
+            // PR-M2e — manifestSent guards the early-vs-tail double-send
+            // race. PR-MEDIA-UPLOAD-CANCEL1 hoists it out of the `try`
+            // block so the cancel-by-user catch can log whether the
+            // receiver was already aware of this voice when we dropped it.
+            var manifestSent = false
             try {
                 // PR-M2e — extract the manifest-send block into a suspend lambda
                 // so it can fire either AS the early-manifest hook (after the
                 // first K=3 chunks) OR as a tail fallback (legacy path / very
                 // short voices). It's idempotent on its own state — the flag
                 // `manifestSent` guards against double-send.
-                var manifestSent = false
                 suspend fun sendManifestEnvelope(manifest: VoiceManifestV2) {
                     if (manifestSent) return
                     manifestSent = true
@@ -905,6 +942,20 @@ class DefaultMessagingService(
                     )
                 }
 
+                // PR-MEDIA-UPLOAD-CANCEL2 — early manifest is DISABLED while
+                // the X-button cancellation path exists. With it on, the
+                // sender pushes the manifest to the receiver after the
+                // first two chunks; if the user then taps X mid-upload the
+                // receiver has already started downloading and gets stuck
+                // at `MEDIA_RX chunk_not_ready_yet … reason=media_chunks_gone`
+                // (Test #76.4 reproduced this). Until the relay grows a
+                // receiver-side media-cancel / chunk-delete protocol, the
+                // manifest only goes out after `uploadVoice(...)` returns
+                // success (single tail `sendManifestEnvelope(manifest)` at
+                // the bottom of the try). This slows the M2e overlap to
+                // sequential upload-then-download, but the trade-off is
+                // correct cancellation semantics and no half-broken
+                // receiver bubbles.
                 val uploadResult = sender.uploadVoice(
                     audioBytes = audioBytes,
                     durationMs = durationMs,
@@ -915,7 +966,7 @@ class DefaultMessagingService(
                     onChunkUploaded  = { sent, total ->
                         mediaProgressBus.update(localMsgId, sent = sent, total = total, direction = MediaProgressBus.Direction.UPLOAD)
                     },
-                    onEarlyManifest  = { manifest -> sendManifestEnvelope(manifest) },
+                    onEarlyManifest  = null,
                 )
                 if (uploadResult.isFailure) {
                     val reason = uploadResult.exceptionOrNull()?.message?.take(60) ?: "unknown"
@@ -943,22 +994,139 @@ class DefaultMessagingService(
                 // to require more bytes than a single chunk can deliver,
                 // or a 0-chunk path slipped through.
                 sendManifestEnvelope(manifest)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                messagingLog(
-                    MessagingLogLevel.WARN,
-                    "MEDIA_TX upload_job_cancelled localMsgId=${localMsgId.take(8)} " +
-                        "reason=${ce.message?.take(60) ?: "scope_cancelled"}",
-                )
-                messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
+            } catch (ce: CancellationException) {
+                // PR-MEDIA-UPLOAD-CANCEL2 — robust user-cancel detection.
+                // CancellationException can be wrapped by the coroutine
+                // runtime (e.g. when crossing a Mutex/Job boundary), so
+                // check both the direct message and the cause's message
+                // for the `user_cancelled_upload` marker. Without this
+                // some user-cancel events would fall into the generic
+                // FAILED branch and leave the bubble in a confusing state.
+                if (ce.isUserUploadCancel()) {
+                    // The cleanup itself MUST run inside NonCancellable —
+                    // we already entered the cancelled context, and any
+                    // suspend point (Mutex.withLock, messageRepository.*)
+                    // would normally throw CancellationException again
+                    // and bypass the cleanup, leaving voiceSendInProgress
+                    // stuck (Test #76.4: "приложение не даёт записать
+                    // новое голосовое").
+                    withContext(NonCancellable) {
+                        val msg = "MEDIA_TX upload_cancelled_by_user localMsgId=${localMsgId.take(8)} " +
+                            "manifestSent=$manifestSent"
+                        messagingLog(MessagingLogLevel.INFO, msg)
+                        mediaLog(msg)
+                        runCatching { messageRepository.deleteMessage(localMsgId) }
+                    }
+                    // Do NOT rethrow — surfacing CancellationException to
+                    // the parent scope would attempt to cancel siblings on
+                    // some implementations. We've owned the cleanup here.
+                    return@launch
+                }
+                val scopeCancelMsg = "MEDIA_TX upload_job_cancelled localMsgId=${localMsgId.take(8)} " +
+                    "reason=${ce.message?.take(60) ?: "scope_cancelled"}"
+                messagingLog(MessagingLogLevel.WARN, scopeCancelMsg)
+                mediaLog(scopeCancelMsg)
+                withContext(NonCancellable) {
+                    runCatching { messageRepository.updateStatus(localMsgId, MessageStatus.FAILED) }
+                }
                 throw ce
             } finally {
-                mediaProgressBus.clear(localMsgId)
-                mutexFor(conversationId).withLock {
-                    voiceSendInProgress.remove(conversationId)
+                // PR-MEDIA-UPLOAD-CANCEL2 — cleanup runs unconditionally,
+                // even if the coroutine context is already cancelled. Each
+                // suspend in here (Mutex.withLock especially) would
+                // otherwise re-throw CancellationException and abort the
+                // remaining clearing, leaving stale entries in
+                // `voiceSendInProgress` (blocks future recordings) and
+                // `voiceUploadJobs` (memory leak + ghost cancel target).
+                withContext(NonCancellable) {
+                    mediaProgressBus.clear(localMsgId)
+                    voiceUploadJobsLock.withLock {
+                        voiceUploadJobs.remove(localMsgId)
+                    }
+                    mutexFor(conversationId).withLock {
+                        voiceSendInProgress.remove(conversationId)
+                    }
                 }
             }
         }
+        voiceUploadJobsLock.withLock {
+            voiceUploadJobs[localMsgId] = uploadJob
+        }
         return Result.success(Unit)
+    }
+
+    /** PR-MEDIA-UPLOAD-CANCEL2 — robust check for the user-cancel marker.
+     *  The marker may live directly on the message OR on the cause depending
+     *  on whether the framework wrapped the exception. */
+    private fun CancellationException.isUserUploadCancel(): Boolean {
+        return message == USER_CANCELLED_UPLOAD || cause?.message == USER_CANCELLED_UPLOAD
+    }
+
+    /**
+     * PR-MEDIA-UPLOAD-CANCEL1 — user-initiated voice upload cancellation
+     * triggered by the X button on the uploading bubble. Looks up the
+     * captured upload Job by `localMsgId`, cancels it with the
+     * `user_cancelled_upload` marker so the `sendAudioV2` catch branch can
+     * tell user-cancel apart from generic CancellationException, then
+     * clears the progress entry and deletes the local row.
+     */
+    override suspend fun cancelVoiceUpload(
+        conversationId: String,
+        localMsgId: String,
+    ): Result<Unit> = runCatching {
+        // PR-MEDIA-UPLOAD-CANCEL2.1 — mirror every cancel-path log line to
+        // `mediaLog` so it lands in the `PhantomMedia` tag and is visible
+        // under the standard `PhantomMedia:V` logcat filter. Otherwise the
+        // diagnostic chain breaks between the UI-side log (which uses
+        // `Log.i("PhantomMedia", …)` directly) and the DMS-side
+        // `messagingLog(...)` which uses tag `PhantomMessaging`.
+        val requestedMsg = "MEDIA_TX upload_cancel_requested localMsgId=${localMsgId.take(8)}"
+        messagingLog(MessagingLogLevel.INFO, requestedMsg)
+        mediaLog(requestedMsg)
+
+        val job = voiceUploadJobsLock.withLock {
+            voiceUploadJobs.remove(localMsgId)
+        }
+
+        if (job == null) {
+            // Either the upload already finished and the Job entry was
+            // cleared in the `finally`, or the user tapped X on a row that
+            // never had a live upload (e.g. an earlier FAILED row that
+            // still shows the X). Clear UI state defensively and best-
+            // effort drop a QUEUED / UPLOADING row so the bubble doesn't
+            // linger.
+            val noopMsg = "MEDIA_TX upload_cancel_noop localMsgId=${localMsgId.take(8)} reason=no_active_job"
+            messagingLog(MessagingLogLevel.WARN, noopMsg)
+            mediaLog(noopMsg)
+            mediaProgressBus.clear(localMsgId)
+            val msg = runCatching { messageRepository.getMessageById(localMsgId) }.getOrNull()
+            if (msg?.status == MessageStatus.UPLOADING || msg?.status == MessageStatus.QUEUED) {
+                runCatching { messageRepository.deleteMessage(localMsgId) }
+            }
+            mutexFor(conversationId).withLock {
+                voiceSendInProgress.remove(conversationId)
+            }
+            return@runCatching
+        }
+
+        // Cancel the coroutine and WAIT for it to finish via `join()`.
+        // PR-MEDIA-UPLOAD-CANCEL2 — Test #76.4 showed that without the
+        // join the UI reload (`onReloadMessages` on the caller side)
+        // could fire before the catch+finally inside `sendAudioV2`
+        // actually deleted the local row, so the bubble briefly
+        // re-appeared then vanished. After `join`, the row is gone and
+        // the next reload renders the LazyColumn without it. The
+        // launched coroutine's catch+finally is wrapped in
+        // `withContext(NonCancellable)` so it always completes — `join`
+        // here cannot deadlock.
+        job.cancel(CancellationException(USER_CANCELLED_UPLOAD))
+        val dispatchedMsg = "MEDIA_TX upload_cancel_dispatched localMsgId=${localMsgId.take(8)}"
+        messagingLog(MessagingLogLevel.INFO, dispatchedMsg)
+        mediaLog(dispatchedMsg)
+        job.join()
+        val joinedMsg = "MEDIA_TX upload_cancel_joined localMsgId=${localMsgId.take(8)}"
+        messagingLog(MessagingLogLevel.INFO, joinedMsg)
+        mediaLog(joinedMsg)
     }
 
     override suspend fun startReceiving() {

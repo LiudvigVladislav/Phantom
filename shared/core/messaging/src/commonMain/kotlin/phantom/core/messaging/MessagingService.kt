@@ -35,6 +35,24 @@ interface MessagingService {
         mimeType: String,
     ): Result<Unit>
 
+    /**
+     * PR-MEDIA-UPLOAD-CANCEL1 — cancel an in-flight outgoing voice upload by
+     * its local message id. Tapping the X on the uploading voice bubble
+     * (architect Test #76.3 verdict) reaches this entry point. The
+     * implementation cancels the per-upload [kotlinx.coroutines.Job], clears
+     * the progress entry on `mediaProgressBus`, releases the per-conversation
+     * voice-send guard, and either deletes the local row or marks it
+     * `FAILED` depending on what state it was in when the cancel arrived.
+     *
+     * The default no-op exists so platform fakes / tests do not have to
+     * implement it; [DefaultMessagingService] overrides with the real
+     * behaviour.
+     */
+    suspend fun cancelVoiceUpload(
+        conversationId: String,
+        localMsgId: String,
+    ): Result<Unit> = Result.success(Unit)
+
     // Start listening for relay messages (call after transport is connected)
     suspend fun startReceiving()
 

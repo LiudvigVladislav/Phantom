@@ -1245,6 +1245,14 @@ fun ChatScreen(
                                     pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
                                 }
                             },
+                            // PR-MEDIA-UPLOAD-CANCEL1 — after a cancelled
+                            // voice upload the local row is deleted from
+                            // the repo; the bubble needs the parent to
+                            // re-read messages so the LazyColumn loses
+                            // the cancelled entry.
+                            onReloadMessages = {
+                                scope.launch { reloadMessages() }
+                            },
                         )
                         } // end AnimatedVisibility
                     }
@@ -1489,6 +1497,11 @@ private fun MessageBubble(
     onForward: (cleanText: String, senderLabel: String) -> Unit,
     onPin: () -> Unit,
     onPinLocal: () -> Unit,
+    // PR-MEDIA-UPLOAD-CANCEL1 — invoked after a voice upload cancel
+    // completes so the parent can re-read messages and the deleted /
+    // cancelled bubble disappears from the LazyColumn. The parent wraps
+    // its own suspend `reloadMessages()` inside scope.launch.
+    onReloadMessages: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val bubbleCoroutineScope = rememberCoroutineScope()
@@ -1759,6 +1772,10 @@ private fun MessageBubble(
                     || rawText.startsWith("[AUDIO_DOWNLOADING]")
                     || rawText.startsWith("[AUDIO_FAILED:")
                 if (isAudio) {
+                    // PR-MEDIA-UPLOAD-CANCEL1 — only the sender side wires
+                    // a real cancel callback; receiver-download bubbles
+                    // intentionally leave it null so the X glyph
+                    // disappears (no UI for a no-op).
                     AudioBubble(
                         plaintextCache = rawText,
                         isSent = isSent,
@@ -1766,6 +1783,21 @@ private fun MessageBubble(
                         status = entity.status,
                         context = context,
                         progress = mediaProgress[entity.id],
+                        onCancelUpload = if (isSent) {
+                            {
+                                bubbleCoroutineScope.launch {
+                                    Log.i(
+                                        "PhantomMedia",
+                                        "MEDIA_UI upload_cancel_tap localMsgId=${entity.id.take(8)}",
+                                    )
+                                    container.messagingService?.cancelVoiceUpload(
+                                        conversationId = entity.conversationId,
+                                        localMsgId = entity.id,
+                                    )
+                                    onReloadMessages()
+                                }
+                            }
+                        } else null,
                     )
                 } else {
                 // Stacked layout: text on top, meta row (time + status) on its
@@ -2272,6 +2304,13 @@ private fun AudioBubble(
     status: MessageStatus,
     context: android.content.Context,
     progress: MediaProgressBus.Progress? = null,
+    // PR-MEDIA-UPLOAD-CANCEL1 — wired by the sender side only. The X
+    // button on an outgoing uploading bubble routes here; the lambda owns
+    // the call into `MessagingService.cancelVoiceUpload(...)`. Null
+    // suppresses the X visual entirely, which is the right behaviour for
+    // receiver download bubbles (no cancel path wired yet) and for any
+    // ready/failed state.
+    onCancelUpload: (() -> Unit)? = null,
 ) {
     // ── State detection (unchanged from M2d.1b — only visuals change) ─────────
     val isDownloading = plaintextCache == "[AUDIO_DOWNLOADING]"
@@ -2542,7 +2581,14 @@ private fun AudioBubble(
                         color = if (isSent) BgDeep.copy(alpha = 0.78f) else TextSecondary,
                     )
                 }
-                CancelXButton(isSent = isSent, onClick = { /* PR-UI follow-up — wire cancellation */ })
+                // PR-MEDIA-UPLOAD-CANCEL1: only render the X when the
+                // caller actually wired a cancel callback. Receiver
+                // download bubbles (and any other loading state without a
+                // cancellation surface) pass null and the X disappears
+                // entirely — Test #76.3 caught the prior no-op button.
+                if (onCancelUpload != null) {
+                    CancelXButton(isSent = isSent, onClick = onCancelUpload)
+                }
             } else if (durationLabel != null) {
                 Text(
                     text = durationLabel,
