@@ -491,6 +491,10 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-21 (thu, late) · Branch prune
+
+Branch prune: deleted 6 stale branches per delete-blind policy. List: `feat/pr-m2b-download-parallelism`, `feat/pr-d2b2-flip-canSendVoice-and-15s-cap`, `pr-d1b-rest-fallback-wireup` (3 commits — diff-verified as squash-merged via PR-D1b #157/#158), `fix/prekey-publish-reliability`, `feat/probe-step-observability`, `docs/2026-05-15-merge-update`. Retained per memory: `diag/m2c0-media-route-probe`, `fix/transport-tcp-keepalive`, `infra/media-ro-bridge2-cotenant`. Side-finding (deferred for triage): 117 additional local branches still `[gone]` on origin — broader sweep awaiting Vladislav's call.
+
 ### 2026-05-21 (thu) · Voice recorder UX hardening — PR #197 Recording Panel Matrix states 3+4 (REC2 trilogy) + PR #198 outgoing-voice upload cancel (CANCEL trilogy)
 
 **Branch state.** Two PRs squash-merged in sequence: `52a9773f` (#197 PR-UI-REC2 Locked + hold-to-lock + REC2.1 routing fix + REC2.2 lifecycle rewrite + REC2.3 gesture state machine + REC2.4 Locked-send routing + swipe-left-cancel + recorder crash hardening) and `b117dcb9` (#198 PR-MEDIA-UPLOAD-CANCEL1 + CANCEL2 + CANCEL2.1). Each PR went through 4–5 iterations driven by real-device test verdicts (#76, #76.1, #76.1.1, #76.1.2, #76.2, #76.3, #76.4, #76.5, #76.5b) before the architect signed off. All branches deleted on remote. Zero `AndroidRuntime` / `IllegalStateException` / `sha256_mismatch` / `decrypt_failed` / `media_chunks_gone` across the final passing test rounds.
