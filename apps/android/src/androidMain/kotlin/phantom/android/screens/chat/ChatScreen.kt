@@ -817,6 +817,13 @@ fun ChatScreen(
                         if (!capabilities.canSendVoice || voiceSendInProgress
                             || recordingState != null
                         ) return@InputBar
+                        // PR-UI-REC2.1 defence-in-depth: even if the UI somehow
+                        // routes a press-hold while the text input is non-empty,
+                        // never start a recording on top of pending text.
+                        if (inputText.trim().isNotEmpty()) {
+                            Log.i("PhantomMedia", "VOICE_REC ignored_start reason=text_not_empty")
+                            return@InputBar
+                        }
                         val hasPermission = ContextCompat.checkSelfPermission(
                             context, android.Manifest.permission.RECORD_AUDIO
                         ) == android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -902,6 +909,14 @@ fun ChatScreen(
                             // pre-finalize state for the `locked_send` log.
                             finalizeAndSendVoice()
                         } else {
+                            // PR-UI-REC2.1 defence-in-depth: never start a
+                            // recording while the text input has content.
+                            // This is the safety net behind the gesture-side
+                            // dispatch that routes send-text taps to onSend().
+                            if (inputText.trim().isNotEmpty()) {
+                                Log.i("PhantomMedia", "VOICE_REC ignored_start reason=text_not_empty")
+                                return@InputBar
+                            }
                             val hasPermission = ContextCompat.checkSelfPermission(
                                 context, android.Manifest.permission.RECORD_AUDIO
                             ) == android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -2922,6 +2937,18 @@ private fun InputBar(
     val isLive = recordingState == RecordingPanelState.Recording
         || recordingState == RecordingPanelState.Locked
 
+    // PR-UI-REC2.1 — Test #76 regression fix. The persistent right-side Box has
+    // a single `pointerInput(Unit)` whose suspended `awaitEachGesture` loop
+    // outlives every recomposition. Without `rememberUpdatedState`, the
+    // closure would freeze `text` / `recordingState` / `isEditing` to whatever
+    // they were at first composition and we'd dispatch every tap as if the
+    // button were still a mic. The captured State holders below give the
+    // gesture loop a fresh read on every gesture iteration without rebuilding
+    // the gesture handler itself (which would cancel an in-flight hold).
+    val currentTextState = androidx.compose.runtime.rememberUpdatedState(text)
+    val currentRecordingState = androidx.compose.runtime.rememberUpdatedState(recordingState)
+    val currentIsEditingState = androidx.compose.runtime.rememberUpdatedState(isEditing)
+
     // Phase 2 mockup: composer sits on SurfaceElevated, BorderSubtle 1px top.
     // Slightly more "premium" than the surrounding chat surface, signalling
     // the input zone without a heavy bar.
@@ -3129,12 +3156,35 @@ private fun InputBar(
                             val down = awaitFirstDown(requireUnconsumed = false)
                             val initialY = down.position.y
                             val pressStartMs = System.currentTimeMillis()
-                            // Capture whether a recording was already active at
-                            // press-down. If yes, this gesture is "tap to send"
-                            // — never trigger a hold-to-lock from an existing
-                            // recording, because the mic visual is now a Send
-                            // icon and the user does not expect press-hold UX.
-                            val startedIdle = recordingState == null
+
+                            // PR-UI-REC2.1: capture the visual mode at the
+                            // moment of press-down by reading the
+                            // rememberUpdatedState holders. This is the fix
+                            // for Test #76's "tap-send-arrow starts recording"
+                            // regression: the gesture detector now knows
+                            // exactly which visual the user pressed and
+                            // routes the tap accordingly.
+                            //
+                            //   started-as-mic       = no recording active AND
+                            //                          input is blank AND
+                            //                          we are not editing
+                            //                          → tap starts recording,
+                            //                            hold promotes to lock.
+                            //   started-as-send-text = no recording active AND
+                            //                          (text not blank OR editing)
+                            //                          → tap calls onSend()
+                            //                            (NOT recording).
+                            //   started-as-send-voice = recording was active
+                            //                          → tap calls onMicClick()
+                            //                            (finalise + send voice).
+                            val stateAtDown = currentRecordingState.value
+                            val textAtDown = currentTextState.value
+                            val editingAtDown = currentIsEditingState.value
+                            val startedAsMic = stateAtDown == null
+                                && textAtDown.isBlank() && !editingAtDown
+                            val startedAsSendText = stateAtDown == null
+                                && (textAtDown.isNotBlank() || editingAtDown)
+
                             var didStartHold = false
                             var didLock = false
 
@@ -3144,7 +3194,7 @@ private fun InputBar(
                                 val elapsed = System.currentTimeMillis() - pressStartMs
 
                                 if (!change.pressed) {
-                                    // Released
+                                    // Released — route by visual mode at press-down.
                                     when {
                                         didLock -> {
                                             // Already in Locked state. Stay there;
@@ -3153,42 +3203,55 @@ private fun InputBar(
                                         }
                                         didStartHold -> {
                                             // Was holding to record without
-                                            // sliding up. Release = send.
+                                            // sliding up. Release = send voice.
                                             onMicReleaseAfterHold()
                                         }
+                                        startedAsSendText -> {
+                                            // Visual was the cyan send-text arrow.
+                                            // Plain tap → send text, no recording.
+                                            Log.i("PhantomUI", "COMPOSER_ACTION send_text_clicked")
+                                            onSend()
+                                        }
+                                        stateAtDown != null -> {
+                                            // Visual was the cyan send-voice arrow
+                                            // (a recording was already in flight).
+                                            // Plain tap → finalise and send the
+                                            // voice. `locked_send` / `locked_cancel`
+                                            // annotations are emitted on the
+                                            // ChatScreen side based on the live
+                                            // recordingState at finalise time.
+                                            Log.i("PhantomUI", "COMPOSER_ACTION send_voice_clicked")
+                                            onMicClick()
+                                        }
                                         else -> {
-                                            // Plain tap (short press, no hold).
-                                            // Existing tap-to-toggle behaviour:
-                                            // start from idle, send if already
-                                            // recording. `locked_send` /
-                                            // `locked_cancel` annotations are
-                                            // captured on the ChatScreen side
-                                            // when state was Locked at the
-                                            // moment of the tap.
+                                            // Visual was the idle mic icon.
+                                            // Plain tap → start recording.
+                                            Log.i("PhantomUI", "COMPOSER_ACTION mic_pressed")
                                             onMicClick()
                                         }
                                     }
                                     break
                                 }
 
-                                // Long-press detection — promote tap into a
-                                // hold-to-record gesture, but only if we were
-                                // idle at press-down (the mic was actually a
-                                // mic). Re-entering hold from the send arrow
-                                // during recording would conflict with the
-                                // existing tap-to-send.
-                                if (!didStartHold && startedIdle
+                                // Long-press detection — only when the press
+                                // started on the mic visual. The hold gesture
+                                // is meaningless on a send-text arrow (we'd
+                                // start a recording the user does not want and
+                                // overwrite their typed message UX) and on a
+                                // send-voice arrow during recording (the user
+                                // expects tap-to-send, not press-and-hold).
+                                if (!didStartHold && startedAsMic
                                     && elapsed >= longPressTimeoutMs
                                 ) {
                                     didStartHold = true
                                     isMicHeld = true
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    Log.i("PhantomUI", "COMPOSER_ACTION mic_hold_start")
                                     onMicPressHold()
                                 }
 
                                 // Slide-up-to-lock detection — only meaningful
-                                // while holding (this gesture began as a hold
-                                // and a recording is in flight).
+                                // while holding.
                                 if (didStartHold && !didLock) {
                                     val dragUp = initialY - change.position.y
                                     if (dragUp >= lockThresholdPx) {
