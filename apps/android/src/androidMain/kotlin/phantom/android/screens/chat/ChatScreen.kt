@@ -1453,11 +1453,24 @@ private fun MessageBubble(
                 bottomStart = if (isSent) PhantomTokens.Radius.md else 2.dp,
                 bottomEnd = if (isSent) 2.dp else PhantomTokens.Radius.md,
             )
+            // Voice Bubble Matrix fix (Test #72): audio messages draw their own
+            // cyan/surface-elevated bubble inside AudioBubble. The parent
+            // MessageBubble shell was double-framing it. For audio rows we
+            // strip the parent's background/border/padding/clip and let
+            // AudioBubble fully own the visual.
+            val isAudioRow = rawText.startsWith("[AUDIO:")
+                || rawText.startsWith("[AUDIO_LOCAL:")
+                || rawText.startsWith("[AUDIO_DOWNLOADING]")
+                || rawText.startsWith("[AUDIO_FAILED:")
             Column(
                 modifier = Modifier
-                    .widthIn(min = 80.dp, max = 260.dp)
+                    .widthIn(
+                        min = if (isAudioRow) 220.dp else 80.dp,
+                        max = if (isAudioRow) 320.dp else 260.dp,
+                    )
                     .then(
-                        if (isSent) Modifier.background(
+                        if (isAudioRow) Modifier
+                        else if (isSent) Modifier.background(
                             color = PhantomTokens.Colors.Cyan,
                             shape = bubbleShape,
                         ) else Modifier
@@ -1478,7 +1491,10 @@ private fun MessageBubble(
                         onClick = {},
                         onLongClick = { showActionPanel = true },
                     )
-                    .padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp),
+                    .then(
+                        if (isAudioRow) Modifier
+                        else Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp)
+                    ),
             ) {
                 // Quote block (reply) — stacked above main text
                 if (isReply && quoteText.isNotEmpty()) {
@@ -2412,17 +2428,27 @@ private fun VoiceDisc(
                 drawPath(path, color = glyphTint)
             }
         } else if (isPlaying) {
-            // Pause glyph (12px).
-            Canvas(modifier = Modifier.size(12.dp)) {
-                drawRect(
+            // Pause glyph — two clearly separated bars (Test #72 fix: the
+            // previous 0.21/0.21 split read as a single solid block aka
+            // "stop button" on Tecno's screen pixel density).
+            Canvas(modifier = Modifier.size(14.dp)) {
+                val w = size.width
+                val h = size.height
+                val barW = w * 0.22f
+                val gapHalf = w * 0.10f
+                val top = h * 0.15f
+                val barH = h * 0.70f
+                drawRoundRect(
                     color = glyphTint,
-                    topLeft = Offset(size.width * 0.21f, size.height * 0.17f),
-                    size = androidx.compose.ui.geometry.Size(size.width * 0.21f, size.height * 0.66f),
+                    topLeft = Offset(w / 2f - gapHalf - barW, top),
+                    size = androidx.compose.ui.geometry.Size(barW, barH),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1f, 1f),
                 )
-                drawRect(
+                drawRoundRect(
                     color = glyphTint,
-                    topLeft = Offset(size.width * 0.58f, size.height * 0.17f),
-                    size = androidx.compose.ui.geometry.Size(size.width * 0.21f, size.height * 0.66f),
+                    topLeft = Offset(w / 2f + gapHalf, top),
+                    size = androidx.compose.ui.geometry.Size(barW, barH),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1f, 1f),
                 )
             }
         } else {
@@ -2493,14 +2519,22 @@ private fun VoiceWaveform(
     val phases = floatArrayOf(pulse0, pulse1, pulse2)
 
     Canvas(modifier = modifier) {
-        val barWidth = 2.dp.toPx()
-        val barGap = 3.dp.toPx()
-        val totalWidth = bars.size * barWidth + (bars.size - 1) * barGap
-        val startX = (size.width - totalWidth) / 2f
+        // Voice Bubble Matrix fix (Test #72): scale bar width + gap so the
+        // 36-bar waveform always fits the canvas width — previously a fixed
+        // 2dp bar + 3dp gap (177 dp total) overflowed the ~140-170 dp the
+        // weight(1f) middle column actually gets on 220-280 dp bubbles,
+        // pushing bars under the play button + percent labels.
+        // Keep the design's 2 : 3 width-to-gap ratio.
+        val n = bars.size
+        val gapToBarRatio = 1.5f
+        val barWidth = size.width / (n + (n - 1) * gapToBarRatio)
+        val barGap = barWidth * gapToBarRatio
+        val maxBarHeightDp = 24f
+        val canvasH = size.height
         bars.forEachIndexed { i, h ->
-            val barHeight = h.dp.toPx()
-            val left = startX + i * (barWidth + barGap)
-            val top = (size.height - barHeight) / 2f
+            val barHeight = (h.toFloat() / maxBarHeightDp) * canvasH
+            val left = i * (barWidth + barGap)
+            val top = (canvasH - barHeight) / 2f
             val baseColor = if (i < cutoff) activeColor else mutedColor
             val color = if (loading) baseColor.copy(alpha = phases[i % 3].coerceIn(0f, 1f))
                         else baseColor
@@ -2508,7 +2542,7 @@ private fun VoiceWaveform(
                 color = color,
                 topLeft = Offset(left, top),
                 size = androidx.compose.ui.geometry.Size(barWidth, barHeight),
-                cornerRadius = androidx.compose.ui.geometry.CornerRadius(1f, 1f),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth * 0.4f, barWidth * 0.4f),
             )
         }
     }
