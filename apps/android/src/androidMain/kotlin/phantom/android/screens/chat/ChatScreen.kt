@@ -146,12 +146,28 @@ fun ChatScreen(
     // showed a 334 ms re-entry after `VOICE_REC complete` — see Bug 1.
     var voiceSendInProgress by remember { mutableStateOf(false) }
 
+    // PR-UI-REC2.4 — crash hardening. `MediaRecorder.stop()` throws
+    // IllegalStateException whenever the recorder is in a non-Recording
+    // state (too short, already stopped, post-pause/resume race, etc.)
+    // and architect's Test #76.2 review caught the app crashing because
+    // we were calling `stop()` raw in multiple places. Centralise the
+    // teardown in a single helper that swallows the throw and logs the
+    // reason for the post-mortem; nullify the field BEFORE calling stop
+    // so a re-entrant teardown cannot double-stop the same instance.
+    fun stopReleaseRecorderSafely(reason: String) {
+        val recorder = mediaRecorder
+        mediaRecorder = null
+        if (recorder == null) return
+        runCatching { recorder.stop() }
+            .onFailure { Log.w("PhantomMedia", "VOICE_REC stop_failed reason=$reason", it) }
+        runCatching { recorder.release() }
+            .onFailure { Log.w("PhantomMedia", "VOICE_REC release_failed reason=$reason", it) }
+    }
+
     // Release recorder on screen dispose
     DisposableEffect(Unit) {
         onDispose {
-            mediaRecorder?.stop()
-            mediaRecorder?.release()
-            mediaRecorder = null
+            stopReleaseRecorderSafely(reason = "screen_dispose")
         }
     }
 
@@ -303,9 +319,7 @@ fun ChatScreen(
         }
         val statePriorToFinalize = recordingState ?: return
         voiceSendInProgress = true
-        runCatching { mediaRecorder?.stop() }
-        mediaRecorder?.release()
-        mediaRecorder = null
+        stopReleaseRecorderSafely(reason = "finalize_send")
         recordingState = null
         if (statePriorToFinalize == RecordingPanelState.Locked) {
             Log.i("PhantomMedia", "VOICE_REC locked_send")
@@ -787,9 +801,7 @@ fun ChatScreen(
                         if (recordingState == RecordingPanelState.Locked) {
                             Log.i("PhantomMedia", "VOICE_REC locked_cancel")
                         }
-                        runCatching { mediaRecorder?.stop() }
-                        mediaRecorder?.release()
-                        mediaRecorder = null
+                        stopReleaseRecorderSafely(reason = "cancel")
                         recordingState = null
                         audioFile?.delete()
                         audioFile = null
@@ -828,9 +840,7 @@ fun ChatScreen(
                                     "source=ui recording_state=${recordingState?.name ?: "idle"}",
                             )
                             if (recordingState != null) {
-                                runCatching { mediaRecorder?.stop() }
-                                mediaRecorder?.release()
-                                mediaRecorder = null
+                                stopReleaseRecorderSafely(reason = "capability_disabled")
                                 recordingState = null
                                 audioFile?.delete()
                                 audioFile = null
@@ -904,9 +914,24 @@ fun ChatScreen(
                             "PhantomMedia",
                             "VOICE_REC hold_release_cancel_too_short heldMs=$heldMs",
                         )
-                        runCatching { mediaRecorder?.stop() }
-                        mediaRecorder?.release()
-                        mediaRecorder = null
+                        stopReleaseRecorderSafely(reason = "too_short")
+                        recordingState = null
+                        audioFile?.delete()
+                        audioFile = null
+                    },
+                    onMicHoldSwipeCancel = { heldMs ->
+                        // PR-UI-REC2.4 — interim swipe-left-to-cancel handler.
+                        // Replaces the previous broken path where dragging the
+                        // finger right-to-left over the mic could still produce
+                        // a release-send if the elapsed time crossed
+                        // MIN_HOLD_SEND_MS. Full SwipeCancel state + visual
+                        // (trail / trash icon / threshold animation) ships in
+                        // PR-UI-REC3.
+                        Log.i(
+                            "PhantomMedia",
+                            "VOICE_REC hold_release_cancel_swipe_left heldMs=$heldMs",
+                        )
+                        stopReleaseRecorderSafely(reason = "swipe_left")
                         recordingState = null
                         audioFile?.delete()
                         audioFile = null
@@ -2918,6 +2943,7 @@ private fun InputBar(
     onMicDownStartRecording: () -> Boolean = { false },
     onMicHoldReleaseSend: (heldMs: Long) -> Unit = {},
     onMicHoldTooShortCancel: (heldMs: Long) -> Unit = {},
+    onMicHoldSwipeCancel: (heldMs: Long) -> Unit = {},
     onMicSlideUpLock: () -> Unit = {},
     onSendVoiceTap: () -> Unit = {},
     onCancelRecording: () -> Unit = {},
@@ -2931,20 +2957,26 @@ private fun InputBar(
     // before we transition from `Recording` to `Locked`. 60 dp is the WhatsApp /
     // Telegram convention for the slide-to-lock affordance.
     val lockThresholdPx = with(density) { 60.dp.toPx() }
+    // PR-UI-REC2.4 — interim swipe-left-to-cancel guard. Until the full
+    // SwipeCancel state is implemented in PR-UI-REC3, any meaningful left
+    // swipe during a hold must cancel the recording instead of falling
+    // through to `hold_release_send` on release (Test #76.2 caught the user
+    // dragging right-to-left and getting the voice sent).
+    val swipeCancelThresholdPx = with(density) { 56.dp.toPx() }
     var isMicHeld by remember { mutableStateOf(false) }
     val isLive = recordingState == RecordingPanelState.Recording
         || recordingState == RecordingPanelState.Locked
 
-    // PR-UI-REC2.3 — `text` / `isEditing` are read inside the gesture
-    // detector at press-down time, so wrap them in `rememberUpdatedState`
-    // to defeat the closure-freeze that `pointerInput(Unit)` would
-    // otherwise impose. `recordingState` is NOT captured here because
-    // the gesture detector itself only attaches to the mic Box (i.e.
-    // the branch where recording is inactive at first composition); the
-    // send-voice tap in an active-recording state is handled by a
-    // separate clickable in a sibling branch.
+    // PR-UI-REC2.4 — Test #76.2 verdict: `pointerInput(Unit)` freezes
+    // every value it captures by closure from first composition, so all
+    // state we want to read inside `awaitEachGesture` must come from
+    // `rememberUpdatedState` holders. Critically `isSendVoiceVisual` was
+    // captured as `false` from the idle-state first composition, so even
+    // after `recordingState` became `Locked` the gesture detector kept
+    // routing taps as mic-start — `ignored_start reason=busy state=Locked`.
     val currentTextState = androidx.compose.runtime.rememberUpdatedState(text)
     val currentIsEditingState = androidx.compose.runtime.rememberUpdatedState(isEditing)
+    val currentIsSendVoiceVisual = androidx.compose.runtime.rememberUpdatedState(recordingState != null)
 
     // Phase 2 mockup: composer sits on SurfaceElevated, BorderSubtle 1px top.
     // Slightly more "premium" than the surrounding chat surface, signalling
@@ -3182,28 +3214,26 @@ private fun InputBar(
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
                                 val downId = down.id
+                                val downX = down.position.x
                                 val downY = down.position.y
                                 val downTimeMs = System.currentTimeMillis()
 
-                                // Was the user pressing the send-voice arrow
-                                // (an in-flight recording) at press-down? If
-                                // yes, the gesture's job is to wait for
-                                // pointer-up and fire `onSendVoiceTap` once;
-                                // we do NOT start a new recording.
-                                //
-                                // Otherwise the user pressed the mic icon
-                                // (no recording active). Start recording now;
-                                // the callback owns the guards (busy / no
-                                // permission / no capability / text not
-                                // empty) and returns false if any of them
-                                // bail out — in which case we abort so a
-                                // subsequent release does not produce a
-                                // no-op send.
+                                // PR-UI-REC2.4 — read `isSendVoiceVisual`
+                                // through `rememberUpdatedState`. The plain
+                                // `val isSendVoiceVisual = …` captured by
+                                // this lambda is frozen to its value at
+                                // first composition (typically `false` while
+                                // idle), so without this indirection a tap
+                                // on the Send arrow after Lock was wrongly
+                                // routed back into `onMicDownStartRecording`
+                                // and produced `ignored_start reason=busy
+                                // state=Locked` — Test #76.2 blocker.
                                 val isSendVoiceTap = currentTextState.value.isBlank()
                                     && !currentIsEditingState.value
-                                    && isSendVoiceVisual
+                                    && currentIsSendVoiceVisual.value
 
                                 var locked = false
+                                var swipeCancelArmed = false
                                 var recordingStarted = false
 
                                 if (!isSendVoiceTap) {
@@ -3220,15 +3250,30 @@ private fun InputBar(
                                     val change = event.changes.firstOrNull { it.id == downId }
                                         ?: continue
 
-                                    // Drag-up-to-lock — only when we own a
-                                    // live recording from this press.
-                                    if (recordingStarted && !locked) {
+                                    if (recordingStarted && !locked && !swipeCancelArmed) {
+                                        // Drag-up-to-lock.
                                         val dragUp = downY - change.position.y
                                         if (dragUp >= lockThresholdPx) {
                                             locked = true
                                             isMicHeld = false
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                             onMicSlideUpLock()
+                                        } else {
+                                            // PR-UI-REC2.4 — interim
+                                            // swipe-left-to-cancel guard.
+                                            // PR-UI-REC3 will replace this
+                                            // with the full SwipeCancel
+                                            // state + trail / threshold UI;
+                                            // for now any sustained left
+                                            // swipe cancels the recording so
+                                            // we never accidentally `send`
+                                            // on a horizontal-only gesture.
+                                            val dragLeft = downX - change.position.x
+                                            if (dragLeft >= swipeCancelThresholdPx) {
+                                                swipeCancelArmed = true
+                                                isMicHeld = false
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            }
                                         }
                                     }
 
@@ -3236,14 +3281,14 @@ private fun InputBar(
                                         val heldMs = System.currentTimeMillis() - downTimeMs
                                         when {
                                             isSendVoiceTap -> {
-                                                // Tap on the send-voice arrow
-                                                // (recording was already in
-                                                // flight at press-down).
                                                 onSendVoiceTap()
                                             }
+                                            swipeCancelArmed -> {
+                                                onMicHoldSwipeCancel(heldMs)
+                                            }
                                             locked -> {
-                                                // Hands-free recording
-                                                // continues — release is a
+                                                // Hands-free locked recording
+                                                // continues; release is a
                                                 // no-op by design.
                                             }
                                             heldMs >= MIN_HOLD_SEND_MS -> {
