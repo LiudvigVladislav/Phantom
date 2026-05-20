@@ -121,9 +121,21 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     var showEmojiPanel by remember { mutableStateOf(false) }
 
-    // Voice recording state
-    var isRecording by remember { mutableStateOf(false) }
+    // PR-UI-REC1 (2026-05-20) — Voice recording state machine.
+    //
+    // `recordingState` is the canonical source of truth for whether a voice
+    // is being captured and, if so, in which sub-state. It replaces the old
+    // `var isRecording: Boolean` so the ticker and amplitude poller can tell
+    // Recording (live capture) from Paused (frozen capture) without resetting
+    // `recordingDurationMs` between them.
+    //
+    // Reachable values in this PR: Recording, Paused.
+    // Locked / SwipeCancel are declared so the RecordingPanel composable can
+    // be wired now and extended in PR-UI-REC2 (hold-to-lock) and PR-UI-REC3
+    // (swipe-to-cancel) without touching the surrounding state machine.
+    var recordingState by remember { mutableStateOf<RecordingPanelState?>(null) }
     var recordingDurationMs by remember { mutableStateOf(0L) }
+    val recordingAmplitudes = remember { mutableStateListOf<Float>() }
     var audioFile by remember { mutableStateOf<java.io.File?>(null) }
     var mediaRecorder by remember { mutableStateOf<android.media.MediaRecorder?>(null) }
     // PR-M2d.1b — UI-side voice-send guard. Prevents a second tap on the mic
@@ -149,18 +161,45 @@ fun ChatScreen(
             val result = startChatRecording(context)
             audioFile = result.first
             mediaRecorder = result.second
-            isRecording = true
+            recordingDurationMs = 0L
+            recordingAmplitudes.clear()
+            recordingState = RecordingPanelState.Recording
         }
     }
 
-    // Recording duration counter
-    LaunchedEffect(isRecording) {
-        if (isRecording) {
-            recordingDurationMs = 0L
-            while (isRecording) {
-                delay(100)
-                recordingDurationMs += 100
-            }
+    // PR-UI-REC1: recording-duration ticker. Increments only while the
+    // recorder is actually capturing (Recording / Locked). Pausing freezes
+    // the value in place; resuming continues from where it left off. The
+    // reset to 0 is owned by the start path (mic-button start +
+    // permissionLauncher), not by this effect — so a Paused → Recording
+    // transition does not lose accumulated time. The cleanup case (state
+    // back to null after send / cancel) just lets the loop exit and the
+    // next start clears it anew.
+    LaunchedEffect(recordingState) {
+        while (recordingState == RecordingPanelState.Recording
+            || recordingState == RecordingPanelState.Locked
+        ) {
+            delay(100)
+            recordingDurationMs += 100
+        }
+    }
+
+    // PR-UI-REC1: waveform amplitude poller. MediaRecorder.getMaxAmplitude()
+    // returns the peak audio level since the previous call (Android API ≥ 1),
+    // so a steady ~80 ms sample produces a ~12 Hz envelope — enough for a
+    // DAW-style scroll without burning battery. Samples are appended to a
+    // SnapshotStateList capped at 64 (the Recording Panel Matrix design
+    // budget), and emptied automatically when `recordingState` returns to
+    // null at the start of the next session.
+    LaunchedEffect(recordingState) {
+        while (recordingState == RecordingPanelState.Recording
+            || recordingState == RecordingPanelState.Locked
+        ) {
+            delay(80)
+            val raw = runCatching { mediaRecorder?.maxAmplitude ?: 0 }.getOrDefault(0)
+            val normalized = (raw.toFloat() / 32_768f).coerceIn(0f, 1f)
+            recordingAmplitudes.add(normalized)
+            while (recordingAmplitudes.size > 64) recordingAmplitudes.removeAt(0)
         }
     }
 
@@ -664,15 +703,32 @@ fun ChatScreen(
                     onEmojiToggle = { showEmojiPanel = !showEmojiPanel },
                     emojiPanelOpen = showEmojiPanel,
                     isEditing = editingMessage != null,
-                    isRecording = isRecording,
+                    recordingState = recordingState,
                     recordingDurationMs = recordingDurationMs,
+                    waveformAmplitudes = recordingAmplitudes,
                     onCancelRecording = {
-                        mediaRecorder?.stop()
+                        runCatching { mediaRecorder?.stop() }
                         mediaRecorder?.release()
                         mediaRecorder = null
-                        isRecording = false
+                        recordingState = null
                         audioFile?.delete()
                         audioFile = null
+                    },
+                    onPauseRecording = {
+                        // PR-UI-REC1: MediaRecorder.pause() is available since
+                        // API 24; minSdk is 26, so no runtime guard needed.
+                        runCatching { mediaRecorder?.pause() }
+                            .onSuccess { recordingState = RecordingPanelState.Paused }
+                            .onFailure {
+                                Log.w("PhantomMedia", "VOICE_REC pause_failed", it)
+                            }
+                    },
+                    onResumeRecording = {
+                        runCatching { mediaRecorder?.resume() }
+                            .onSuccess { recordingState = RecordingPanelState.Recording }
+                            .onFailure {
+                                Log.w("PhantomMedia", "VOICE_REC resume_failed", it)
+                            }
                     },
                     onMicClick = {
                         // PR-C1 (2026-05-17) — UI guard for voice via TransportCapabilities.
@@ -689,15 +745,15 @@ fun ChatScreen(
                                 "PhantomTransport",
                                 "VOICE_CAPABILITY disabled " +
                                     "reason=${capabilities.callDisabledReason?.name?.lowercase()} " +
-                                    "source=ui recording_in_progress=$isRecording",
+                                    "source=ui recording_state=${recordingState?.name ?: "idle"}",
                             )
                             // If we were already recording when the mode degraded (e.g. Tor
                             // activated mid-recording), tear the recorder down cleanly.
-                            if (isRecording) {
-                                mediaRecorder?.stop()
+                            if (recordingState != null) {
+                                runCatching { mediaRecorder?.stop() }
                                 mediaRecorder?.release()
                                 mediaRecorder = null
-                                isRecording = false
+                                recordingState = null
                                 audioFile?.delete()
                                 audioFile = null
                             }
@@ -712,17 +768,18 @@ fun ChatScreen(
                         if (voiceSendInProgress) {
                             android.util.Log.i(
                                 "PhantomMedia",
-                                "VOICE_REC ignored_start reason=finalizing_or_sending isRecording=$isRecording",
+                                "VOICE_REC ignored_start reason=finalizing_or_sending state=${recordingState?.name ?: "idle"}",
                             )
                             return@InputBar
                         }
-                        if (isRecording) {
-                            // Stop recording and send audio as chunks
+                        if (recordingState != null) {
+                            // Stop recording (from Recording or Paused — MediaRecorder
+                            // allows stop() from both per Android docs) and send.
                             voiceSendInProgress = true
-                            mediaRecorder?.stop()
+                            runCatching { mediaRecorder?.stop() }
                             mediaRecorder?.release()
                             mediaRecorder = null
-                            isRecording = false
+                            recordingState = null
                             val file = audioFile
                             if (file != null && file.exists()) {
                                 scope.launch {
@@ -786,7 +843,9 @@ fun ChatScreen(
                                 val result = startChatRecording(context)
                                 audioFile = result.first
                                 mediaRecorder = result.second
-                                isRecording = true
+                                recordingDurationMs = 0L
+                                recordingAmplitudes.clear()
+                                recordingState = RecordingPanelState.Recording
                             } else {
                                 permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
                             }
@@ -2773,14 +2832,16 @@ private fun InputBar(
     onEmojiToggle: () -> Unit,
     emojiPanelOpen: Boolean,
     isEditing: Boolean = false,
-    isRecording: Boolean = false,
+    recordingState: RecordingPanelState? = null,
     recordingDurationMs: Long = 0L,
+    waveformAmplitudes: List<Float> = emptyList(),
     onMicClick: () -> Unit = {},
     onCancelRecording: () -> Unit = {},
+    onPauseRecording: () -> Unit = {},
+    onResumeRecording: () -> Unit = {},
     onSend: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
-    val recordingSeconds = recordingDurationMs / 1000
     // Phase 2 mockup: composer sits on SurfaceElevated, BorderSubtle 1px top.
     // Slightly more "premium" than the surrounding chat surface, signalling
     // the input zone without a heavy bar.
@@ -2795,80 +2856,53 @@ private fun InputBar(
                 .height(1.dp)
                 .background(PhantomTokens.Colors.BorderSubtle),
         )
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp)
-                .padding(bottom = 4.dp),
-            // 2026-04-30 bug H fix: use CenterVertically so the
-            // smiley + cancel-X buttons line up with the
-            // OutlinedTextField placeholder baseline (Material 3
-            // default min-height ~56.dp). Bottom alignment used to
-            // glue the 36.dp icon to the bottom of the 56.dp row,
-            // which looked off-center with the "Message…" hint.
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // Left: cancel (X) during recording, emoji toggle otherwise.
-            // Square 40dp tap target + CircleShape ripple — combined with
-            // the row-level CenterVertically above, this puts the icon
-            // on the same visual baseline as the "Message…" placeholder
-            // even though the text-field default min-height is ~56.dp.
-            Box(
+        if (recordingState != null) {
+            // PR-UI-REC1 — Recording Panel Matrix. Takes over the whole
+            // composer row while recording so the four controls
+            // (Cancel · Center stack · Pause/Resume · Send) sit in a
+            // single, properly-padded layout matching the design.
+            RecordingPanel(
+                state = recordingState,
+                durationMs = recordingDurationMs,
+                amplitudes = waveformAmplitudes,
+                onCancel = onCancelRecording,
+                onPause = onPauseRecording,
+                onResume = onResumeRecording,
+                onSend = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onMicClick()
+                },
                 modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .clickable(onClick = if (isRecording) onCancelRecording else onEmojiToggle),
-                contentAlignment = Alignment.Center,
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .padding(bottom = 4.dp),
+            )
+        } else {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .padding(bottom = 4.dp),
+                // 2026-04-30 bug H fix: CenterVertically aligns the smiley
+                // button with the Material 3 default min-height (~56 dp) of
+                // the "Message…" placeholder. Bottom alignment used to glue
+                // the 36 dp icon to the bottom of the 56 dp row, which read
+                // off-center next to the hint.
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (isRecording) {
-                    // X — cancel recording
-                    Canvas(modifier = Modifier.size(18.dp)) {
-                        val sw = 2.dp.toPx()
-                        val pad = size.width * 0.18f
-                        drawLine(Danger, Offset(pad, pad), Offset(size.width - pad, size.height - pad), sw, StrokeCap.Round)
-                        drawLine(Danger, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
-                    }
-                } else {
-                    // PR C-followup-3 / bug 3 fix: this button toggles
-                    // the emoji panel — emoji icon, not the paperclip
-                    // (which would mean attachment-picker, a separate
-                    // future button).
-                    PhIconSmile(color = TextDim, size = 22.dp)
-                }
-            }
-            if (!isRecording) Spacer(Modifier.width(6.dp))
-
-            // Center: text field or recording indicator
-            if (isRecording) {
+                // Left: emoji toggle.
                 Box(
                     modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Surface2)
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    contentAlignment = Alignment.CenterStart,
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .clickable(onClick = onEmojiToggle),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Canvas(modifier = Modifier.size(10.dp)) {
-                            drawCircle(color = Danger)
-                        }
-                        Text(
-                            text = "Recording %d:%02d".format(recordingSeconds / 60, recordingSeconds % 60),
-                            color = TextPrimary,
-                            fontSize = 14.sp,
-                        )
-                    }
+                    PhIconSmile(color = TextDim, size = 22.dp)
                 }
-            } else {
-                // FULL_COMPOSE §05 composer input: 38dp pill (radius
-                // 9999), Surface bg + Border 1px. The earlier
-                // OutlinedTextField was ~56dp tall (Material 3 default
-                // min-height) with a 18dp rounded-rect — visually too
-                // heavy for the Phase-2 composer aesthetic. BasicTextField
-                // in a custom container reproduces the React mock exactly.
+                Spacer(Modifier.width(6.dp))
+
+                // Center: text field.
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -2902,81 +2936,55 @@ private fun InputBar(
                         },
                     )
                 }
-            }
 
-            Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(8.dp))
 
-            // Right: send button (text/edit) or mic button (empty/recording).
-            // Phase 2 mockup: 38dp circular Cyan with restrained glow
-            // (0 2px 10px rgba(0,212,255,0.10)) — present but never decorative.
-            if ((text.isNotBlank() || isEditing) && !isRecording) {
-                Box(
-                    modifier = Modifier
-                        .size(38.dp)
-                        .shadow(
-                            elevation = 6.dp,
-                            shape = CircleShape,
-                            clip = false,
-                            spotColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.18f),
-                            ambientColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.08f),
-                        )
-                        .clip(CircleShape)
-                        .background(PhantomTokens.Colors.Cyan)
-                        .clickable(onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onSend()
-                        }),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    if (isEditing) {
-                        Canvas(modifier = Modifier.size(18.dp)) {
-                            val sw = 2.dp.toPx()
-                            drawLine(BgDeep, Offset(size.width * 0.15f, size.height * 0.5f), Offset(size.width * 0.42f, size.height * 0.76f), sw, StrokeCap.Round)
-                            drawLine(BgDeep, Offset(size.width * 0.42f, size.height * 0.76f), Offset(size.width * 0.85f, size.height * 0.24f), sw, StrokeCap.Round)
-                        }
-                    } else {
-                        // Arrow-up icon
-                        Canvas(modifier = Modifier.size(20.dp)) {
-                            val sw = 2.2.dp.toPx()
-                            val cap = StrokeCap.Round
-                            val cx = size.width / 2f
-                            drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
-                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
-                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
-                        }
-                    }
-                }
-            } else {
-                // Mic button — tap to start recording; send arrow when recording
-                Box(
-                    modifier = Modifier
-                        .size(if (isRecording) 44.dp else 36.dp)
-                        .then(
-                            if (isRecording) Modifier.shadow(
-                                elevation = 12.dp,
+                // Right: send button if text present, mic otherwise.
+                if (text.isNotBlank() || isEditing) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .shadow(
+                                elevation = 6.dp,
                                 shape = CircleShape,
                                 clip = false,
-                                spotColor = CyanAccent.copy(alpha = 0.4f),
-                                ambientColor = CyanAccent.copy(alpha = 0.15f),
-                            ) else Modifier
-                        )
-                        .clip(CircleShape)
-                        .background(if (isRecording) CyanAccent else Color.Transparent)
-                        .clickable(onClick = onMicClick),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    if (isRecording) {
-                        // Send arrow (same as text send)
-                        Canvas(modifier = Modifier.size(20.dp)) {
-                            val sw = 2.2.dp.toPx()
-                            val cap = StrokeCap.Round
-                            val cx = size.width / 2f
-                            drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
-                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
-                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
+                                spotColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.18f),
+                                ambientColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.08f),
+                            )
+                            .clip(CircleShape)
+                            .background(PhantomTokens.Colors.Cyan)
+                            .clickable(onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onSend()
+                            }),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (isEditing) {
+                            Canvas(modifier = Modifier.size(18.dp)) {
+                                val sw = 2.dp.toPx()
+                                drawLine(BgDeep, Offset(size.width * 0.15f, size.height * 0.5f), Offset(size.width * 0.42f, size.height * 0.76f), sw, StrokeCap.Round)
+                                drawLine(BgDeep, Offset(size.width * 0.42f, size.height * 0.76f), Offset(size.width * 0.85f, size.height * 0.24f), sw, StrokeCap.Round)
+                            }
+                        } else {
+                            Canvas(modifier = Modifier.size(20.dp)) {
+                                val sw = 2.2.dp.toPx()
+                                val cap = StrokeCap.Round
+                                val cx = size.width / 2f
+                                drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
+                                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
+                                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
+                            }
                         }
-                    } else {
-                        // Mic icon (Canvas)
+                    }
+                } else {
+                    // Mic button — tap to start recording.
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .clickable(onClick = onMicClick),
+                        contentAlignment = Alignment.Center,
+                    ) {
                         Canvas(modifier = Modifier.size(22.dp)) {
                             val c = TextDim
                             val sw = 1.6.dp.toPx()
@@ -2998,6 +3006,302 @@ private fun InputBar(
                 }
             }
         }
+    }
+}
+
+// ── PR-UI-REC1 — Recording Panel Matrix ───────────────────────────────────────
+//
+// State enum. Recording / Paused are the only values reachable from the
+// composer in this PR. Locked is reserved for PR-UI-REC2 (hold-to-lock) and
+// SwipeCancel for PR-UI-REC3 (swipe-to-cancel) — they are declared here so
+// downstream PRs can add render branches without touching the state machine.
+enum class RecordingPanelState {
+    Recording,
+    Paused,
+    Locked,
+    SwipeCancel,
+}
+
+/**
+ * Composer-row variant rendered while a voice recording is in progress.
+ * Layout matches the Recording Panel Matrix design bundle: a 56 dp row of
+ * Cancel (X) · Center (dot + timer + waveform + optional PAUSED pill) ·
+ * Pause/Resume · Send. The same vertical footprint as the text composer so
+ * swapping in/out of recording produces zero layout shift.
+ */
+@Composable
+private fun RecordingPanel(
+    state: RecordingPanelState,
+    durationMs: Long,
+    amplitudes: List<Float>,
+    onCancel: () -> Unit,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onSend: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // Locked is visually treated as "live" (active dot + active waveform);
+    // SwipeCancel as "frozen" (paused-style dot + waveform). The lock badge
+    // and swipe-zone visuals are deferred to follow-up PRs.
+    val isLive = state == RecordingPanelState.Recording || state == RecordingPanelState.Locked
+
+    Row(
+        modifier = modifier.height(56.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        // Cancel (X). Hover/pressed states defer to the standard ripple.
+        RecPanelControl(
+            onClick = onCancel,
+            background = Color.Transparent,
+            border = false,
+        ) {
+            Canvas(modifier = Modifier.size(18.dp)) {
+                val sw = 1.5.dp.toPx()
+                val pad = size.width * 0.28f
+                drawLine(TextSecondary, Offset(pad, pad), Offset(size.width - pad, size.height - pad), sw, StrokeCap.Round)
+                drawLine(TextSecondary, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
+            }
+        }
+
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .height(44.dp)
+                .padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            RecPanelDot(live = isLive)
+            RecPanelTimer(durationMs = durationMs, paused = !isLive)
+            RecPanelWaveform(
+                amplitudes = amplitudes,
+                live = isLive,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(28.dp),
+            )
+            if (state == RecordingPanelState.Paused || state == RecordingPanelState.SwipeCancel) {
+                RecPanelPausedPill()
+            }
+        }
+
+        // Pause / Resume. Same geometric position in both states, glyph swap only.
+        RecPanelControl(
+            onClick = if (isLive) onPause else onResume,
+            background = Surface2,
+            border = true,
+        ) {
+            if (isLive) {
+                Canvas(modifier = Modifier.size(16.dp)) {
+                    val barW = size.width * 0.18f
+                    val barH = size.height * 0.62f
+                    val gap = size.width * 0.18f
+                    val centerX = size.width / 2f
+                    val y = (size.height - barH) / 2f
+                    drawRoundRect(
+                        color = TextPrimary,
+                        topLeft = Offset(centerX - gap / 2f - barW, y),
+                        size = Size(barW, barH),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                    )
+                    drawRoundRect(
+                        color = TextPrimary,
+                        topLeft = Offset(centerX + gap / 2f, y),
+                        size = Size(barW, barH),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                    )
+                }
+            } else {
+                Canvas(modifier = Modifier.size(16.dp)) {
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(size.width * 0.32f, size.height * 0.20f)
+                        lineTo(size.width * 0.82f, size.height * 0.50f)
+                        lineTo(size.width * 0.32f, size.height * 0.80f)
+                        close()
+                    }
+                    drawPath(path, color = TextPrimary)
+                }
+            }
+        }
+
+        // Send — same cyan disc used by the text composer.
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(PhantomTokens.Colors.Cyan)
+                .clickable(onClick = onSend),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(modifier = Modifier.size(20.dp)) {
+                val sw = 2.2.dp.toPx()
+                val cap = StrokeCap.Round
+                val cx = size.width / 2f
+                drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
+                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
+                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
+            }
+        }
+    }
+}
+
+/** 44 dp circular button used by Cancel and Pause/Resume in the recording panel. */
+@Composable
+private fun RecPanelControl(
+    onClick: () -> Unit,
+    background: Color,
+    border: Boolean,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .clip(CircleShape)
+            .background(background)
+            .then(
+                if (border) Modifier.border(1.dp, BorderSubtle, CircleShape)
+                else Modifier
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        content()
+    }
+}
+
+/** Recording-state dot. Live: 8 dp Danger disc with a pulsing aura (1 s,
+ *  ease-in-out, opacity 0 → 0.22, scale 0.7 → 1.0). Paused: 8 dp hollow ring
+ *  with a 1.5 dp Text-Tertiary stroke. */
+@Composable
+private fun RecPanelDot(live: Boolean) {
+    Box(modifier = Modifier.size(18.dp), contentAlignment = Alignment.Center) {
+        if (live) {
+            val transition = rememberInfiniteTransition(label = "recDotPulse")
+            val pulse by transition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 500, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+                label = "recDotPulseT",
+            )
+            val scale = 0.7f + (1.0f - 0.7f) * pulse
+            val alpha = 0f + (0.22f - 0f) * pulse
+            Canvas(modifier = Modifier.size(18.dp)) {
+                drawCircle(color = Danger.copy(alpha = alpha), radius = (size.width / 2f) * scale)
+            }
+            Canvas(modifier = Modifier.size(8.dp)) {
+                drawCircle(color = Danger)
+            }
+        } else {
+            Canvas(modifier = Modifier.size(8.dp)) {
+                val sw = 1.5.dp.toPx()
+                drawCircle(
+                    color = TextDim,
+                    radius = (size.minDimension - sw) / 2f,
+                    style = Stroke(width = sw),
+                )
+            }
+        }
+    }
+}
+
+/** Recording timer. JetBrains Mono 13 sp, tabular numerals so MM:SS does not
+ *  jitter horizontally. Paused state drops the colour to text-tertiary. */
+@Composable
+private fun RecPanelTimer(durationMs: Long, paused: Boolean) {
+    val totalSeconds = (durationMs / 1000).toInt()
+    val label = "%d:%02d".format(totalSeconds / 60, totalSeconds % 60)
+    Text(
+        text = label,
+        color = if (paused) TextDim else TextPrimary,
+        fontSize = 13.sp,
+        fontFamily = PhantomFontMono,
+        modifier = Modifier.widthIn(min = 32.dp),
+    )
+}
+
+/** DAW-style scrolling waveform. Most recent samples are right-justified and
+ *  drawn in the active color; older samples fade into the muted tone. The
+ *  number of bars rendered is computed from the canvas width so the panel
+ *  shrinks gracefully on narrow devices. */
+@Composable
+private fun RecPanelWaveform(
+    amplitudes: List<Float>,
+    live: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val activeColor = if (live) Danger else TextSecondary
+    val mutedColor = if (live) Danger.copy(alpha = 0.22f) else BorderSubtle
+    Canvas(modifier = modifier) {
+        val barWidthPx = 2.dp.toPx()
+        val gapPx = 2.5.dp.toPx()
+        val unit = barWidthPx + gapPx
+        if (unit <= 0f) return@Canvas
+        val maxBars = ((size.width + gapPx) / unit).toInt().coerceAtLeast(1)
+        val displayed = amplitudes.takeLast(maxBars)
+        val count = displayed.size
+        if (count == 0) return@Canvas
+        val totalWidth = count * unit - gapPx
+        val startX = (size.width - totalWidth).coerceAtLeast(0f)
+        val centerY = size.height / 2f
+        val recentCount = 26 // last 26 bars are "recent" per design annotations
+        val minBarHeightPx = 2.dp.toPx()
+        displayed.forEachIndexed { i, amp ->
+            val xLeft = startX + i * unit
+            val barHeight = (amp.coerceIn(0f, 1f) * size.height).coerceAtLeast(minBarHeightPx)
+            val isRecent = i >= count - recentCount
+            val color = if (isRecent) activeColor else mutedColor
+            drawRoundRect(
+                color = color,
+                topLeft = Offset(xLeft, centerY - barHeight / 2f),
+                size = Size(barWidthPx, barHeight),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidthPx / 2f),
+            )
+        }
+    }
+}
+
+/** "PAUSED" capsule shown to the right of the timer/waveform stack while the
+ *  recording is paused. Surface-elevated background, border-subtle outline,
+ *  mono 10 sp letter-spaced label with a tiny pause glyph. */
+@Composable
+private fun RecPanelPausedPill() {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Surface2)
+            .border(1.dp, BorderSubtle, RoundedCornerShape(999.dp))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+    ) {
+        Canvas(modifier = Modifier.size(9.dp)) {
+            val barW = size.width * 0.22f
+            val barH = size.height * 0.7f
+            val gap = size.width * 0.18f
+            val centerX = size.width / 2f
+            val y = (size.height - barH) / 2f
+            drawRoundRect(
+                color = TextDim,
+                topLeft = Offset(centerX - gap / 2f - barW, y),
+                size = Size(barW, barH),
+            )
+            drawRoundRect(
+                color = TextDim,
+                topLeft = Offset(centerX + gap / 2f, y),
+                size = Size(barW, barH),
+            )
+        }
+        Text(
+            text = "PAUSED",
+            color = TextDim,
+            fontSize = 10.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 1.sp,
+        )
     }
 }
 
