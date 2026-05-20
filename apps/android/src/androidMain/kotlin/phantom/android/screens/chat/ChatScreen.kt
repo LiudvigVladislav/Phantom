@@ -858,6 +858,10 @@ fun ChatScreen(
                     )
                 }
         ) {
+        // Day-start state ticks at local midnight so [ChatDateSep] flips
+        // "TODAY" → "YESTERDAY" without requiring a navigation refresh.
+        val dayStartMillis = rememberDayStartMillis()
+
         // Pre-process: filter out invisible profile cards, then inject date separators
         val chatItems = remember(messages) {
             buildList<ChatItem> {
@@ -996,7 +1000,7 @@ fun ChatScreen(
                 }
             }) { chatItem ->
                 when (chatItem) {
-                    is ChatItem.DateSep -> ChatDateSep(chatItem.millis)
+                    is ChatItem.DateSep -> ChatDateSep(chatItem.millis, dayStartMillis)
                     is ChatItem.Msg -> {
                         val msg = chatItem.entity
                         val isNew = msg.id !in initialIds
@@ -1150,12 +1154,18 @@ private fun E2EENoteRow(theirUsername: String) {
 }
 
 @Composable
-private fun ChatDateSep(millis: Long) {
+private fun ChatDateSep(millis: Long, dayStartMillis: Long) {
     // Design Brief v3 §9.5: just centered uppercase mono label, no hairlines.
+    // The label depends on [dayStartMillis] — a screen-level state that ticks
+    // at midnight via [rememberDayStartMillis]. Without that dependency, the
+    // separator captured "TODAY" once on first composition and never moved to
+    // "YESTERDAY" after the day rolled over (Vladislav 2026-05-20 report).
     val label = when {
-        isToday(millis) -> "TODAY"
-        isYesterday(millis) -> "YESTERDAY"
-        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(millis)).uppercase(java.util.Locale.US)
+        millis >= dayStartMillis -> "TODAY"
+        millis >= dayStartMillis - DAY_MILLIS -> "YESTERDAY"
+        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US)
+            .format(java.util.Date(millis))
+            .uppercase(java.util.Locale.US)
     }
     Box(
         modifier = Modifier
@@ -1171,21 +1181,37 @@ private fun ChatDateSep(millis: Long) {
     }
 }
 
-private fun isToday(millis: Long): Boolean {
-    val cal = java.util.Calendar.getInstance()
-    val today = java.util.Calendar.getInstance()
-    cal.timeInMillis = millis
-    return cal.get(java.util.Calendar.YEAR) == today.get(java.util.Calendar.YEAR) &&
-            cal.get(java.util.Calendar.DAY_OF_YEAR) == today.get(java.util.Calendar.DAY_OF_YEAR)
+private const val DAY_MILLIS: Long = 24L * 60L * 60L * 1000L
+
+/**
+ * Returns the wall-clock millis of the start of "today" (local midnight),
+ * and refreshes that state in-place when the day rolls over. Used by the
+ * chat day-separator labels so that a chat opened at 23:59 transitions
+ * from "TODAY" to "YESTERDAY" automatically at 00:00 without needing the
+ * user to navigate away and back.
+ */
+@Composable
+private fun rememberDayStartMillis(): Long {
+    var dayStart by remember { mutableLongStateOf(startOfDayMillis(System.currentTimeMillis())) }
+    LaunchedEffect(dayStart) {
+        // Sleep until just past the next local midnight, then refresh.
+        val now = System.currentTimeMillis()
+        val nextMidnight = dayStart + DAY_MILLIS
+        val waitMs = (nextMidnight - now).coerceAtLeast(60_000L) + 1_000L
+        delay(waitMs)
+        dayStart = startOfDayMillis(System.currentTimeMillis())
+    }
+    return dayStart
 }
 
-private fun isYesterday(millis: Long): Boolean {
+private fun startOfDayMillis(now: Long): Long {
     val cal = java.util.Calendar.getInstance()
-    cal.timeInMillis = millis
-    val yesterday = java.util.Calendar.getInstance()
-    yesterday.add(java.util.Calendar.DAY_OF_YEAR, -1)
-    return cal.get(java.util.Calendar.YEAR) == yesterday.get(java.util.Calendar.YEAR) &&
-            cal.get(java.util.Calendar.DAY_OF_YEAR) == yesterday.get(java.util.Calendar.DAY_OF_YEAR)
+    cal.timeInMillis = now
+    cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+    cal.set(java.util.Calendar.MINUTE, 0)
+    cal.set(java.util.Calendar.SECOND, 0)
+    cal.set(java.util.Calendar.MILLISECOND, 0)
+    return cal.timeInMillis
 }
 
 // ── Emoji panel ───────────────────────────────────────────────────────────────
@@ -1437,8 +1463,6 @@ private fun MessageBubble(
             horizontalArrangement = if (isSent) Arrangement.End else Arrangement.Start,
         ) {
         Box {
-            // time "06:26" ≈ 28dp + gap 3dp + status icon ≈ 18dp = ~56dp for sent, ~36dp for received
-            val timeReserve = if (isSent) 56.dp else 36.dp
             // Outer column: bubble + reaction pills stacked vertically
             Column {
             // Bubble shape per PHANTOM_FULL_COMPOSE §05:
@@ -1583,28 +1607,37 @@ private fun MessageBubble(
                         progress = mediaProgress[entity.id],
                     )
                 } else {
-                // Text + time in a Box so time overlays bottom-right corner
-                Box {
+                // Stacked layout: text on top, meta row (time + status) on its
+                // own footer line aligned to the trailing edge of the bubble.
+                // The previous Box-with-overlay layout reserved 36/56 dp of
+                // end-padding on the Text so the time could float in the
+                // bottom-right corner. That made the bubble grow to the
+                // widest wrapped line *plus* the reserved padding, and when
+                // the last wrapped line was short (e.g. "идут долго") it
+                // left a visible empty gap between the text and the time
+                // (Vladislav 2026-05-20 screenshot). Stacking the meta below
+                // the text lets the bubble hug the widest wrapped line and
+                // keeps the meta tight on its own row.
+                Text(
+                    text = text,
+                    color = if (isSent) BgDeep else TextPrimary,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.End)
+                        .padding(top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
                     Text(
-                        text = text,
-                        modifier = Modifier.padding(end = timeReserve),
-                        color = if (isSent) BgDeep else TextPrimary,
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp,
+                        text = timeStr,
+                        color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
+                        fontSize = 10.sp,
+                        lineHeight = 12.sp,
                     )
-                    Row(
-                        modifier = Modifier.align(Alignment.BottomEnd),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(3.dp),
-                    ) {
-                        Text(
-                            text = timeStr,
-                            color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
-                            fontSize = 10.sp,
-                            lineHeight = 12.sp,
-                        )
-                        if (isSent) StatusIcon(status = entity.status)
-                    }
+                    if (isSent) StatusIcon(status = entity.status)
                 }
                 } // end audio/text branch
 
