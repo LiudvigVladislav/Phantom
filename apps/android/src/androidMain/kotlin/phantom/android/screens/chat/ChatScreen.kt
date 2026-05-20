@@ -34,6 +34,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -282,6 +284,78 @@ fun ChatScreen(
             "PhantomUI",
             "ChatScreen reloadMessages: conv=${conversationId.take(24)}… loaded=${messages.size}",
         )
+    }
+
+    // PR-UI-REC2: shared finalise-and-send path. Two entry points reach it:
+    //   1. The in-panel Send tap and the legacy tap-to-toggle path (via
+    //      `onMicClick` when `recordingState != null`).
+    //   2. The release-after-press-and-hold gesture (via
+    //      `onMicReleaseAfterHold`) — WhatsApp-style "let go to send".
+    // Captures `recordingState` BEFORE clearing it so a Locked-state send can
+    // emit a `VOICE_REC locked_send` line for diagnostics.
+    fun finalizeAndSendVoice() {
+        if (voiceSendInProgress) {
+            android.util.Log.i(
+                "PhantomMedia",
+                "VOICE_REC ignored_finalize reason=already_in_progress state=${recordingState?.name ?: "idle"}",
+            )
+            return
+        }
+        val statePriorToFinalize = recordingState ?: return
+        voiceSendInProgress = true
+        runCatching { mediaRecorder?.stop() }
+        mediaRecorder?.release()
+        mediaRecorder = null
+        recordingState = null
+        if (statePriorToFinalize == RecordingPanelState.Locked) {
+            Log.i("PhantomMedia", "VOICE_REC locked_send")
+        }
+        val file = audioFile
+        if (file != null && file.exists()) {
+            scope.launch {
+                try {
+                    val bytes = file.readBytes()
+                    val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
+                    val bytesPerSec = if (recordingDurationMs > 0) {
+                        bytes.size.toLong() * 1000L / recordingDurationMs
+                    } else 0L
+                    android.util.Log.i(
+                        "PhantomMedia",
+                        "VOICE_REC complete durationMs=$recordingDurationMs bytes=${bytes.size} " +
+                            "bytesPerSec=$bytesPerSec mime=$mimeType"
+                    )
+                    val result = container.messagingService?.sendAudio(
+                        conversationId = conversationId,
+                        audioBytes = bytes,
+                        durationMs = recordingDurationMs,
+                        mimeType = mimeType,
+                    )
+                    if (result != null && result.isFailure) {
+                        val ex = result.exceptionOrNull()
+                        val msg = if (ex is IllegalStateException &&
+                            ex.message?.contains("still uploading") == true
+                        ) {
+                            context.getString(R.string.m1w_voice_still_uploading)
+                        } else {
+                            "Голосовое сообщение слишком длинное"
+                        }
+                        android.widget.Toast.makeText(
+                            context,
+                            msg,
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    } else {
+                        reloadMessages()
+                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                    }
+                } finally {
+                    voiceSendInProgress = false
+                }
+            }
+        } else {
+            voiceSendInProgress = false
+        }
+        audioFile = null
     }
 
     LaunchedEffect(conversationId) {
@@ -707,6 +781,12 @@ fun ChatScreen(
                     recordingDurationMs = recordingDurationMs,
                     waveformAmplitudes = recordingAmplitudes,
                     onCancelRecording = {
+                        // PR-UI-REC2: log a Locked-specific exit reason so a
+                        // future post-mortem can tell a Cancel-from-Locked
+                        // from a Cancel-from-Recording / Cancel-from-Paused.
+                        if (recordingState == RecordingPanelState.Locked) {
+                            Log.i("PhantomMedia", "VOICE_REC locked_cancel")
+                        }
                         runCatching { mediaRecorder?.stop() }
                         mediaRecorder?.release()
                         mediaRecorder = null
@@ -729,6 +809,50 @@ fun ChatScreen(
                             .onFailure {
                                 Log.w("PhantomMedia", "VOICE_REC resume_failed", it)
                             }
+                    },
+                    onMicPressHold = {
+                        // PR-UI-REC2: WhatsApp-style press-and-hold to start.
+                        // Capability + busy guards mirror the tap path below;
+                        // see [onMicClick] for the rationale.
+                        if (!capabilities.canSendVoice || voiceSendInProgress
+                            || recordingState != null
+                        ) return@InputBar
+                        val hasPermission = ContextCompat.checkSelfPermission(
+                            context, android.Manifest.permission.RECORD_AUDIO
+                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        if (!hasPermission) {
+                            permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                            return@InputBar
+                        }
+                        val result = startChatRecording(context)
+                        audioFile = result.first
+                        mediaRecorder = result.second
+                        recordingDurationMs = 0L
+                        recordingAmplitudes.clear()
+                        recordingState = RecordingPanelState.Recording
+                        Log.i("PhantomMedia", "VOICE_REC press_hold_start")
+                    },
+                    onMicReleaseAfterHold = {
+                        // PR-UI-REC2: release after press-and-hold without a
+                        // slide-up-to-lock sends the voice immediately
+                        // (WhatsApp parity). Logged here so a post-mortem can
+                        // tell a release-after-hold send from a Send-button
+                        // tap. The actual finalise+send happens via the same
+                        // path as the in-panel Send tap; we trigger it by
+                        // re-entering the existing toggle path through the
+                        // local helper defined alongside onMicClick.
+                        Log.i("PhantomMedia", "VOICE_REC press_release_send")
+                        finalizeAndSendVoice()
+                    },
+                    onLockGesture = {
+                        // PR-UI-REC2: slide-up-past-threshold during a
+                        // press-and-hold transitions to the hands-free Locked
+                        // state. The MediaRecorder is already running; only
+                        // the UI state changes.
+                        if (recordingState == RecordingPanelState.Recording) {
+                            recordingState = RecordingPanelState.Locked
+                            Log.i("PhantomMedia", "VOICE_REC locked_entered reason=hold_slide_up")
+                        }
                     },
                     onMicClick = {
                         // PR-C1 (2026-05-17) — UI guard for voice via TransportCapabilities.
@@ -773,68 +897,10 @@ fun ChatScreen(
                             return@InputBar
                         }
                         if (recordingState != null) {
-                            // Stop recording (from Recording or Paused — MediaRecorder
-                            // allows stop() from both per Android docs) and send.
-                            voiceSendInProgress = true
-                            runCatching { mediaRecorder?.stop() }
-                            mediaRecorder?.release()
-                            mediaRecorder = null
-                            recordingState = null
-                            val file = audioFile
-                            if (file != null && file.exists()) {
-                                scope.launch {
-                                    try {
-                                        val bytes = file.readBytes()
-                                        val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
-                                        // PR-M2a — measured byte profile. bytesPerSec is the
-                                        // key acceptance metric: target 2-4 KB/sec means a
-                                        // 5-sec voice is 10-20 KB and a 60-sec voice 120-240 KB.
-                                        val bytesPerSec = if (recordingDurationMs > 0) {
-                                            bytes.size.toLong() * 1000L / recordingDurationMs
-                                        } else 0L
-                                        android.util.Log.i(
-                                            "PhantomMedia",
-                                            "VOICE_REC complete durationMs=$recordingDurationMs bytes=${bytes.size} " +
-                                                "bytesPerSec=$bytesPerSec mime=$mimeType"
-                                        )
-                                        val result = container.messagingService?.sendAudio(
-                                            conversationId = conversationId,
-                                            audioBytes = bytes,
-                                            durationMs = recordingDurationMs,
-                                            mimeType = mimeType,
-                                        )
-                                        if (result != null && result.isFailure) {
-                                            // PR-M1w: distinguish in-progress guard from other failures.
-                                            // IllegalStateException("A voice message is still uploading…")
-                                            // comes from sendAudioV2's voiceSendInProgress guard.
-                                            val ex = result.exceptionOrNull()
-                                            val msg = if (ex is IllegalStateException &&
-                                                ex.message?.contains("still uploading") == true
-                                            ) {
-                                                context.getString(R.string.m1w_voice_still_uploading)
-                                            } else {
-                                                "Голосовое сообщение слишком длинное"
-                                            }
-                                            android.widget.Toast.makeText(
-                                                context,
-                                                msg,
-                                                android.widget.Toast.LENGTH_SHORT,
-                                            ).show()
-                                        } else {
-                                            reloadMessages()
-                                            if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
-                                        }
-                                    } finally {
-                                        // Release the UI guard once sendAudio returned (it returns
-                                        // immediately after launching the upload coroutine inside
-                                        // DMS — the upload itself continues on the DMS appScope).
-                                        voiceSendInProgress = false
-                                    }
-                                }
-                            } else {
-                                voiceSendInProgress = false
-                            }
-                            audioFile = null
+                            // Tap-to-finalize. Both Recording and Locked send
+                            // through the same helper, which captures the
+                            // pre-finalize state for the `locked_send` log.
+                            finalizeAndSendVoice()
                         } else {
                             val hasPermission = ContextCompat.checkSelfPermission(
                                 context, android.Manifest.permission.RECORD_AUDIO
@@ -2839,9 +2905,23 @@ private fun InputBar(
     onCancelRecording: () -> Unit = {},
     onPauseRecording: () -> Unit = {},
     onResumeRecording: () -> Unit = {},
+    onMicPressHold: () -> Unit = {},
+    onMicReleaseAfterHold: () -> Unit = {},
+    onLockGesture: () -> Unit = {},
     onSend: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val viewConfig = androidx.compose.ui.platform.LocalViewConfiguration.current
+    // PR-UI-REC2 — distance the finger must move up from the press-down point
+    // before we transition from `Recording` to `Locked`. 60 dp is the WhatsApp /
+    // Telegram convention for the slide-to-lock affordance.
+    val lockThresholdPx = with(density) { 60.dp.toPx() }
+    val longPressTimeoutMs = viewConfig.longPressTimeoutMillis
+    var isMicHeld by remember { mutableStateOf(false) }
+    val isLive = recordingState == RecordingPanelState.Recording
+        || recordingState == RecordingPanelState.Locked
+
     // Phase 2 mockup: composer sits on SurfaceElevated, BorderSubtle 1px top.
     // Slightly more "premium" than the surrounding chat surface, signalling
     // the input zone without a heavy bar.
@@ -2856,41 +2936,108 @@ private fun InputBar(
                 .height(1.dp)
                 .background(PhantomTokens.Colors.BorderSubtle),
         )
-        if (recordingState != null) {
-            // PR-UI-REC1 — Recording Panel Matrix. Takes over the whole
-            // composer row while recording so the four controls
-            // (Cancel · Center stack · Pause/Resume · Send) sit in a
-            // single, properly-padded layout matching the design.
-            RecordingPanel(
-                state = recordingState,
-                durationMs = recordingDurationMs,
-                amplitudes = waveformAmplitudes,
-                onCancel = onCancelRecording,
-                onPause = onPauseRecording,
-                onResume = onResumeRecording,
-                onSend = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    onMicClick()
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
-                    .padding(bottom = 4.dp),
-            )
-        } else {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp)
-                    .padding(bottom = 4.dp),
-                // 2026-04-30 bug H fix: CenterVertically aligns the smiley
-                // button with the Material 3 default min-height (~56 dp) of
-                // the "Message…" placeholder. Bottom alignment used to glue
-                // the 36 dp icon to the bottom of the 56 dp row, which read
-                // off-center next to the hint.
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                // Left: emoji toggle.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .padding(bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            // ── Conditional left + center + middle-right slots ──────────────
+            //
+            // PR-UI-REC2: the right-side mic/send Box (rendered last in this
+            // Row) is intentionally a persistent composable across all
+            // recording states so its `pointerInput` keeps tracking the
+            // user's finger across an idle → Recording → Locked transition.
+            // Compose preserves a composable's identity when its position in
+            // its parent (here: the last child of this Row) stays constant
+            // across recompositions, which means the gesture in flight is
+            // not cancelled when the rest of the Row swaps idle controls for
+            // recording controls underneath it.
+            if (recordingState != null) {
+                // X · Cancel
+                RecPanelControl(
+                    onClick = onCancelRecording,
+                    background = Color.Transparent,
+                    border = false,
+                ) {
+                    Canvas(modifier = Modifier.size(18.dp)) {
+                        val sw = 1.5.dp.toPx()
+                        val pad = size.width * 0.28f
+                        drawLine(TextSecondary, Offset(pad, pad), Offset(size.width - pad, size.height - pad), sw, StrokeCap.Round)
+                        drawLine(TextSecondary, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
+                    }
+                }
+
+                // Center stack: dot + (lock-badge if Locked) + timer + waveform + (paused pill if Paused)
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .padding(horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    RecPanelDot(live = isLive)
+                    if (recordingState == RecordingPanelState.Locked) {
+                        RecPanelLockBadge()
+                    }
+                    RecPanelTimer(durationMs = recordingDurationMs, paused = !isLive)
+                    RecPanelWaveform(
+                        amplitudes = waveformAmplitudes,
+                        live = isLive,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(28.dp),
+                    )
+                    if (recordingState == RecordingPanelState.Paused
+                        || recordingState == RecordingPanelState.SwipeCancel
+                    ) {
+                        RecPanelPausedPill()
+                    }
+                }
+
+                // Pause / Resume — same geometric position in Recording, Paused, and Locked
+                RecPanelControl(
+                    onClick = if (isLive) onPauseRecording else onResumeRecording,
+                    background = Surface2,
+                    border = true,
+                ) {
+                    if (isLive) {
+                        Canvas(modifier = Modifier.size(16.dp)) {
+                            val barW = size.width * 0.18f
+                            val barH = size.height * 0.62f
+                            val gap = size.width * 0.18f
+                            val centerX = size.width / 2f
+                            val y = (size.height - barH) / 2f
+                            drawRoundRect(
+                                color = TextPrimary,
+                                topLeft = Offset(centerX - gap / 2f - barW, y),
+                                size = Size(barW, barH),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                            )
+                            drawRoundRect(
+                                color = TextPrimary,
+                                topLeft = Offset(centerX + gap / 2f, y),
+                                size = Size(barW, barH),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                            )
+                        }
+                    } else {
+                        Canvas(modifier = Modifier.size(16.dp)) {
+                            val path = androidx.compose.ui.graphics.Path().apply {
+                                moveTo(size.width * 0.32f, size.height * 0.20f)
+                                lineTo(size.width * 0.82f, size.height * 0.50f)
+                                lineTo(size.width * 0.32f, size.height * 0.80f)
+                                close()
+                            }
+                            drawPath(path, color = TextPrimary)
+                        }
+                    }
+                }
+            } else {
+                // Idle composer: emoji + text field
                 Box(
                     modifier = Modifier
                         .size(40.dp)
@@ -2900,9 +3047,7 @@ private fun InputBar(
                 ) {
                     PhIconSmile(color = TextDim, size = 22.dp)
                 }
-                Spacer(Modifier.width(6.dp))
 
-                // Center: text field.
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -2936,29 +3081,147 @@ private fun InputBar(
                         },
                     )
                 }
+            }
 
-                Spacer(Modifier.width(8.dp))
+            // ── Persistent right-side mic / send button ─────────────────────
+            //
+            // PR-UI-REC2 hold-to-lock gesture lives on this Box. The Box is the
+            // last child of the outer Row in every state so Compose keeps its
+            // composition identity stable; the `pointerInput(Unit)` lambda is
+            // therefore registered once at first composition and continues to
+            // own the active pointer through every state transition.
+            //
+            // Gesture decisions:
+            //   tap                          → onMicClick() (start/finalize toggle)
+            //   long-press from idle         → onMicPressHold() — starts recording
+            //                                  in Recording state, then continues
+            //                                  to track the same pointer.
+            //   slide finger up > 60 dp      → onLockGesture() — transitions to
+            //                                  Locked, the user can release.
+            //   release after hold (no lock) → onMicReleaseAfterHold() — finalises
+            //                                  and sends, same as WhatsApp.
+            //   tap while recording or
+            //   release without hold-trigger → onMicClick() (the in-panel send
+            //                                  arrow uses this same callback).
+            val hasTextSend = (text.isNotBlank() || isEditing) && recordingState == null
+            val isSendVisualActive = recordingState != null || hasTextSend
+            val rightBoxSize = when {
+                recordingState != null -> 44.dp
+                hasTextSend -> 38.dp
+                else -> 36.dp
+            }
+            Box(
+                modifier = Modifier
+                    .size(rightBoxSize)
+                    .then(
+                        if (hasTextSend) Modifier.shadow(
+                            elevation = 6.dp,
+                            shape = CircleShape,
+                            clip = false,
+                            spotColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.18f),
+                            ambientColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.08f),
+                        ) else Modifier
+                    )
+                    .clip(CircleShape)
+                    .background(if (isSendVisualActive) PhantomTokens.Colors.Cyan else Color.Transparent)
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val initialY = down.position.y
+                            val pressStartMs = System.currentTimeMillis()
+                            // Capture whether a recording was already active at
+                            // press-down. If yes, this gesture is "tap to send"
+                            // — never trigger a hold-to-lock from an existing
+                            // recording, because the mic visual is now a Send
+                            // icon and the user does not expect press-hold UX.
+                            val startedIdle = recordingState == null
+                            var didStartHold = false
+                            var didLock = false
 
-                // Right: send button if text present, mic otherwise.
-                if (text.isNotBlank() || isEditing) {
-                    Box(
-                        modifier = Modifier
-                            .size(38.dp)
-                            .shadow(
-                                elevation = 6.dp,
-                                shape = CircleShape,
-                                clip = false,
-                                spotColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.18f),
-                                ambientColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.08f),
-                            )
-                            .clip(CircleShape)
-                            .background(PhantomTokens.Colors.Cyan)
-                            .clickable(onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                onSend()
-                            }),
-                        contentAlignment = Alignment.Center,
-                    ) {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull() ?: break
+                                val elapsed = System.currentTimeMillis() - pressStartMs
+
+                                if (!change.pressed) {
+                                    // Released
+                                    when {
+                                        didLock -> {
+                                            // Already in Locked state. Stay there;
+                                            // the gesture is over and the user is
+                                            // hands-free.
+                                        }
+                                        didStartHold -> {
+                                            // Was holding to record without
+                                            // sliding up. Release = send.
+                                            onMicReleaseAfterHold()
+                                        }
+                                        else -> {
+                                            // Plain tap (short press, no hold).
+                                            // Existing tap-to-toggle behaviour:
+                                            // start from idle, send if already
+                                            // recording. `locked_send` /
+                                            // `locked_cancel` annotations are
+                                            // captured on the ChatScreen side
+                                            // when state was Locked at the
+                                            // moment of the tap.
+                                            onMicClick()
+                                        }
+                                    }
+                                    break
+                                }
+
+                                // Long-press detection — promote tap into a
+                                // hold-to-record gesture, but only if we were
+                                // idle at press-down (the mic was actually a
+                                // mic). Re-entering hold from the send arrow
+                                // during recording would conflict with the
+                                // existing tap-to-send.
+                                if (!didStartHold && startedIdle
+                                    && elapsed >= longPressTimeoutMs
+                                ) {
+                                    didStartHold = true
+                                    isMicHeld = true
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onMicPressHold()
+                                }
+
+                                // Slide-up-to-lock detection — only meaningful
+                                // while holding (this gesture began as a hold
+                                // and a recording is in flight).
+                                if (didStartHold && !didLock) {
+                                    val dragUp = initialY - change.position.y
+                                    if (dragUp >= lockThresholdPx) {
+                                        didLock = true
+                                        isMicHeld = false
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        onLockGesture()
+                                    }
+                                }
+
+                                change.consume()
+                            }
+                            // Clear the hold flag if the gesture loop ended
+                            // without going through the release branch (e.g.
+                            // pointer cancelled by the framework).
+                            isMicHeld = false
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                when {
+                    recordingState != null -> {
+                        // Send arrow during recording — matches the text-composer send.
+                        Canvas(modifier = Modifier.size(20.dp)) {
+                            val sw = 2.2.dp.toPx()
+                            val cap = StrokeCap.Round
+                            val cx = size.width / 2f
+                            drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
+                        }
+                    }
+                    hasTextSend -> {
                         if (isEditing) {
                             Canvas(modifier = Modifier.size(18.dp)) {
                                 val sw = 2.dp.toPx()
@@ -2976,15 +3239,8 @@ private fun InputBar(
                             }
                         }
                     }
-                } else {
-                    // Mic button — tap to start recording.
-                    Box(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .clickable(onClick = onMicClick),
-                        contentAlignment = Alignment.Center,
-                    ) {
+                    else -> {
+                        // Mic icon (Canvas) — idle state.
                         Canvas(modifier = Modifier.size(22.dp)) {
                             val c = TextDim
                             val sw = 1.6.dp.toPx()
@@ -3002,6 +3258,27 @@ private fun InputBar(
                             drawPath(path, color = c, style = st)
                             drawLine(c, Offset(size.width * 0.5f, size.height * 0.78f), Offset(size.width * 0.5f, size.height * 0.95f), sw, StrokeCap.Round)
                         }
+                    }
+                }
+
+                // Floating lock-hint chip — shown above the mic while the user
+                // is mid-hold and the panel is still in `Recording` (not yet
+                // locked). The chip is the slide-up target; releasing without
+                // having reached it sends the voice, sliding up onto it
+                // promotes the panel to `Locked`. Rendered as a `Popup` so it
+                // can paint above the composer bounds and never clips against
+                // the InputBar.
+                if (isMicHeld && recordingState == RecordingPanelState.Recording) {
+                    Popup(
+                        alignment = Alignment.TopCenter,
+                        offset = IntOffset(0, -with(density) { 84.dp.toPx() }.toInt()),
+                        properties = PopupProperties(
+                            focusable = false,
+                            dismissOnBackPress = false,
+                            dismissOnClickOutside = false,
+                        ),
+                    ) {
+                        LockHintChip()
                     }
                 }
             }
@@ -3022,126 +3299,113 @@ enum class RecordingPanelState {
     SwipeCancel,
 }
 
-/**
- * Composer-row variant rendered while a voice recording is in progress.
- * Layout matches the Recording Panel Matrix design bundle: a 56 dp row of
- * Cancel (X) · Center (dot + timer + waveform + optional PAUSED pill) ·
- * Pause/Resume · Send. The same vertical footprint as the text composer so
- * swapping in/out of recording produces zero layout shift.
- */
+/** PR-UI-REC2 — Locked-state badge in the center stack of the recording panel.
+ *  28 dp cyan-tinted disc with a 11 px lock glyph. Static visual only; the
+ *  hold-to-lock gesture that produces this state lives on the persistent
+ *  right-side mic/send box in [InputBar]. */
 @Composable
-private fun RecordingPanel(
-    state: RecordingPanelState,
-    durationMs: Long,
-    amplitudes: List<Float>,
-    onCancel: () -> Unit,
-    onPause: () -> Unit,
-    onResume: () -> Unit,
-    onSend: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    // Locked is visually treated as "live" (active dot + active waveform);
-    // SwipeCancel as "frozen" (paused-style dot + waveform). The lock badge
-    // and swipe-zone visuals are deferred to follow-up PRs.
-    val isLive = state == RecordingPanelState.Recording || state == RecordingPanelState.Locked
-
-    Row(
-        modifier = modifier.height(56.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+private fun RecPanelLockBadge() {
+    Box(
+        modifier = Modifier
+            .size(28.dp)
+            .clip(CircleShape)
+            .background(CyanAccent.copy(alpha = 0.08f))
+            .border(1.dp, CyanAccent.copy(alpha = 0.32f), CircleShape),
+        contentAlignment = Alignment.Center,
     ) {
-        // Cancel (X). Hover/pressed states defer to the standard ripple.
-        RecPanelControl(
-            onClick = onCancel,
-            background = Color.Transparent,
-            border = false,
-        ) {
-            Canvas(modifier = Modifier.size(18.dp)) {
-                val sw = 1.5.dp.toPx()
-                val pad = size.width * 0.28f
-                drawLine(TextSecondary, Offset(pad, pad), Offset(size.width - pad, size.height - pad), sw, StrokeCap.Round)
-                drawLine(TextSecondary, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
-            }
-        }
-
-        Row(
-            modifier = Modifier
-                .weight(1f)
-                .height(44.dp)
-                .padding(horizontal = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            RecPanelDot(live = isLive)
-            RecPanelTimer(durationMs = durationMs, paused = !isLive)
-            RecPanelWaveform(
-                amplitudes = amplitudes,
-                live = isLive,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(28.dp),
+        Canvas(modifier = Modifier.size(11.dp)) {
+            val sw = 1.5.dp.toPx()
+            // Lock body — rounded rect in the lower half.
+            val bodyTop = size.height * 0.45f
+            val bodyHeight = size.height * 0.50f
+            val bodyWidth = size.width * 0.78f
+            val bodyLeft = (size.width - bodyWidth) / 2f
+            drawRoundRect(
+                color = CyanAccent,
+                topLeft = Offset(bodyLeft, bodyTop),
+                size = Size(bodyWidth, bodyHeight),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(sw),
+                style = Stroke(width = sw),
             )
-            if (state == RecordingPanelState.Paused || state == RecordingPanelState.SwipeCancel) {
-                RecPanelPausedPill()
+            // Lock shackle — half-rounded arc in the upper half.
+            val shacklePath = androidx.compose.ui.graphics.Path().apply {
+                val centerX = size.width / 2f
+                val shackleR = size.width * 0.22f
+                val shackleY = bodyTop
+                moveTo(centerX - shackleR, shackleY)
+                cubicTo(
+                    centerX - shackleR, shackleY - shackleR * 1.4f,
+                    centerX + shackleR, shackleY - shackleR * 1.4f,
+                    centerX + shackleR, shackleY,
+                )
             }
+            drawPath(
+                path = shacklePath,
+                color = CyanAccent,
+                style = Stroke(width = sw, cap = StrokeCap.Round),
+            )
         }
+    }
+}
 
-        // Pause / Resume. Same geometric position in both states, glyph swap only.
-        RecPanelControl(
-            onClick = if (isLive) onPause else onResume,
-            background = Surface2,
-            border = true,
-        ) {
-            if (isLive) {
-                Canvas(modifier = Modifier.size(16.dp)) {
-                    val barW = size.width * 0.18f
-                    val barH = size.height * 0.62f
-                    val gap = size.width * 0.18f
-                    val centerX = size.width / 2f
-                    val y = (size.height - barH) / 2f
-                    drawRoundRect(
-                        color = TextPrimary,
-                        topLeft = Offset(centerX - gap / 2f - barW, y),
-                        size = Size(barW, barH),
-                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
-                    )
-                    drawRoundRect(
-                        color = TextPrimary,
-                        topLeft = Offset(centerX + gap / 2f, y),
-                        size = Size(barW, barH),
-                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
-                    )
-                }
-            } else {
-                Canvas(modifier = Modifier.size(16.dp)) {
-                    val path = androidx.compose.ui.graphics.Path().apply {
-                        moveTo(size.width * 0.32f, size.height * 0.20f)
-                        lineTo(size.width * 0.82f, size.height * 0.50f)
-                        lineTo(size.width * 0.32f, size.height * 0.80f)
-                        close()
-                    }
-                    drawPath(path, color = TextPrimary)
-                }
-            }
-        }
-
-        // Send — same cyan disc used by the text composer.
+/** PR-UI-REC2 — floating "slide up to lock" hint shown above the mic while the
+ *  user holds it. The chip itself is the slide-up target; reaching its
+ *  vertical position is what trips the lock transition. Rendered inside a
+ *  [Popup] in [InputBar] so it can paint above the composer bounds. */
+@Composable
+private fun LockHintChip() {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
         Box(
             modifier = Modifier
                 .size(44.dp)
                 .clip(CircleShape)
-                .background(PhantomTokens.Colors.Cyan)
-                .clickable(onClick = onSend),
+                .background(Surface2)
+                .border(1.dp, CyanAccent.copy(alpha = 0.32f), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            Canvas(modifier = Modifier.size(20.dp)) {
-                val sw = 2.2.dp.toPx()
-                val cap = StrokeCap.Round
-                val cx = size.width / 2f
-                drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
-                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
-                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
+            Canvas(modifier = Modifier.size(18.dp)) {
+                val sw = 1.8.dp.toPx()
+                val bodyTop = size.height * 0.45f
+                val bodyHeight = size.height * 0.50f
+                val bodyWidth = size.width * 0.78f
+                val bodyLeft = (size.width - bodyWidth) / 2f
+                drawRoundRect(
+                    color = CyanAccent,
+                    topLeft = Offset(bodyLeft, bodyTop),
+                    size = Size(bodyWidth, bodyHeight),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(sw * 0.8f),
+                    style = Stroke(width = sw),
+                )
+                val shacklePath = androidx.compose.ui.graphics.Path().apply {
+                    val centerX = size.width / 2f
+                    val shackleR = size.width * 0.22f
+                    val shackleY = bodyTop
+                    moveTo(centerX - shackleR, shackleY)
+                    cubicTo(
+                        centerX - shackleR, shackleY - shackleR * 1.4f,
+                        centerX + shackleR, shackleY - shackleR * 1.4f,
+                        centerX + shackleR, shackleY,
+                    )
+                }
+                drawPath(
+                    path = shacklePath,
+                    color = CyanAccent,
+                    style = Stroke(width = sw, cap = StrokeCap.Round),
+                )
             }
+        }
+        // Small arrow + LOCK caption hint, mono so it reads as a UI affordance
+        // rather than copy.
+        Canvas(modifier = Modifier.size(width = 10.dp, height = 8.dp)) {
+            val sw = 1.5.dp.toPx()
+            val cap = StrokeCap.Round
+            val cx = size.width / 2f
+            drawLine(TextDim, Offset(cx, size.height * 0.95f), Offset(cx, size.height * 0.05f), sw, cap)
+            drawLine(TextDim, Offset(cx, size.height * 0.05f), Offset(cx - size.width * 0.35f, size.height * 0.35f), sw, cap)
+            drawLine(TextDim, Offset(cx, size.height * 0.05f), Offset(cx + size.width * 0.35f, size.height * 0.35f), sw, cap)
         }
     }
 }
