@@ -156,6 +156,16 @@ class DefaultMessagingService(
      * via [mediaProgressBus].
      */
     val mediaProgressBus: MediaProgressBus = MediaProgressBus(),
+    /**
+     * PR-MEDIA-UPLOAD-CANCEL2.1 — Android logcat sink for media-tag
+     * diagnostics. `messagingLog(...)` writes under tag `PhantomMessaging`,
+     * which our standard logcat filters (`PhantomMedia:V PhantomUI:V
+     * PhantomTransport:V *:S`) exclude. The cancel path needed to be
+     * visible alongside `MEDIA_TX upload_*` from VoiceV2Sender (which goes
+     * through this same callback in AppContainer), so the wiring routes
+     * both to the same tag. Default is no-op for tests / non-Android.
+     */
+    private val mediaLog: (String) -> Unit = {},
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -1001,11 +1011,10 @@ class DefaultMessagingService(
                     // stuck (Test #76.4: "приложение не даёт записать
                     // новое голосовое").
                     withContext(NonCancellable) {
-                        messagingLog(
-                            MessagingLogLevel.INFO,
-                            "MEDIA_TX upload_cancelled_by_user localMsgId=${localMsgId.take(8)} " +
-                                "manifestSent=$manifestSent",
-                        )
+                        val msg = "MEDIA_TX upload_cancelled_by_user localMsgId=${localMsgId.take(8)} " +
+                            "manifestSent=$manifestSent"
+                        messagingLog(MessagingLogLevel.INFO, msg)
+                        mediaLog(msg)
                         runCatching { messageRepository.deleteMessage(localMsgId) }
                     }
                     // Do NOT rethrow — surfacing CancellationException to
@@ -1013,11 +1022,10 @@ class DefaultMessagingService(
                     // some implementations. We've owned the cleanup here.
                     return@launch
                 }
-                messagingLog(
-                    MessagingLogLevel.WARN,
-                    "MEDIA_TX upload_job_cancelled localMsgId=${localMsgId.take(8)} " +
-                        "reason=${ce.message?.take(60) ?: "scope_cancelled"}",
-                )
+                val scopeCancelMsg = "MEDIA_TX upload_job_cancelled localMsgId=${localMsgId.take(8)} " +
+                    "reason=${ce.message?.take(60) ?: "scope_cancelled"}"
+                messagingLog(MessagingLogLevel.WARN, scopeCancelMsg)
+                mediaLog(scopeCancelMsg)
                 withContext(NonCancellable) {
                     runCatching { messageRepository.updateStatus(localMsgId, MessageStatus.FAILED) }
                 }
@@ -1066,10 +1074,15 @@ class DefaultMessagingService(
         conversationId: String,
         localMsgId: String,
     ): Result<Unit> = runCatching {
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "MEDIA_TX upload_cancel_requested localMsgId=${localMsgId.take(8)}",
-        )
+        // PR-MEDIA-UPLOAD-CANCEL2.1 — mirror every cancel-path log line to
+        // `mediaLog` so it lands in the `PhantomMedia` tag and is visible
+        // under the standard `PhantomMedia:V` logcat filter. Otherwise the
+        // diagnostic chain breaks between the UI-side log (which uses
+        // `Log.i("PhantomMedia", …)` directly) and the DMS-side
+        // `messagingLog(...)` which uses tag `PhantomMessaging`.
+        val requestedMsg = "MEDIA_TX upload_cancel_requested localMsgId=${localMsgId.take(8)}"
+        messagingLog(MessagingLogLevel.INFO, requestedMsg)
+        mediaLog(requestedMsg)
 
         val job = voiceUploadJobsLock.withLock {
             voiceUploadJobs.remove(localMsgId)
@@ -1082,10 +1095,9 @@ class DefaultMessagingService(
             // still shows the X). Clear UI state defensively and best-
             // effort drop a QUEUED / UPLOADING row so the bubble doesn't
             // linger.
-            messagingLog(
-                MessagingLogLevel.WARN,
-                "MEDIA_TX upload_cancel_noop localMsgId=${localMsgId.take(8)} reason=no_active_job",
-            )
+            val noopMsg = "MEDIA_TX upload_cancel_noop localMsgId=${localMsgId.take(8)} reason=no_active_job"
+            messagingLog(MessagingLogLevel.WARN, noopMsg)
+            mediaLog(noopMsg)
             mediaProgressBus.clear(localMsgId)
             val msg = runCatching { messageRepository.getMessageById(localMsgId) }.getOrNull()
             if (msg?.status == MessageStatus.UPLOADING || msg?.status == MessageStatus.QUEUED) {
@@ -1108,15 +1120,13 @@ class DefaultMessagingService(
         // `withContext(NonCancellable)` so it always completes — `join`
         // here cannot deadlock.
         job.cancel(CancellationException(USER_CANCELLED_UPLOAD))
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "MEDIA_TX upload_cancel_dispatched localMsgId=${localMsgId.take(8)}",
-        )
+        val dispatchedMsg = "MEDIA_TX upload_cancel_dispatched localMsgId=${localMsgId.take(8)}"
+        messagingLog(MessagingLogLevel.INFO, dispatchedMsg)
+        mediaLog(dispatchedMsg)
         job.join()
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "MEDIA_TX upload_cancel_joined localMsgId=${localMsgId.take(8)}",
-        )
+        val joinedMsg = "MEDIA_TX upload_cancel_joined localMsgId=${localMsgId.take(8)}"
+        messagingLog(MessagingLogLevel.INFO, joinedMsg)
+        mediaLog(joinedMsg)
     }
 
     override suspend fun startReceiving() {
