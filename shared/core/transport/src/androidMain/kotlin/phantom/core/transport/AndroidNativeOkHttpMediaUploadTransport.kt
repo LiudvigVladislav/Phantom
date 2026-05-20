@@ -80,14 +80,22 @@ class AndroidNativeOkHttpMediaUploadTransport(
 
     /**
      * PR-M2h — sticky runtime guard for the pooled-OkHttp v3 download path.
-     * Defaults to `true` (use pool). Flipped to `false` on the first
-     * `body_read_failed`, `request_timeout`, `SocketTimeoutException`,
-     * `InterruptedIOException`, truncated body, or pool-mode chunk that
-     * took longer than [POOL_STALL_THRESHOLD_MS]. Reset only by process
-     * restart — Vladislav 2026-05-20 locked: "не пытаться потом снова
-     * включить pooled в этом же тесте, иначе можно получить нестабильные
-     * качели". A 404 (`chunk_not_ready_yet` from M2e early-manifest) does
-     * NOT trip this guard.
+     * Flipped to `false` on the first `body_read_failed`, `request_timeout`,
+     * `SocketTimeoutException`, `InterruptedIOException`, truncated body,
+     * or pool-mode chunk that took longer than [POOL_STALL_THRESHOLD_MS].
+     * Reset only by process restart — Vladislav 2026-05-20 locked: "не
+     * пытаться потом снова включить pooled в этом же тесте, иначе можно
+     * получить нестабильные качели". A 404 (`chunk_not_ready_yet` from
+     * M2e early-manifest) does NOT trip this guard.
+     *
+     * **PR-M2h.1 (2026-05-20):** default flipped `true → false`. Test #72
+     * proved pool reuse is safe and fast on the emulator (~100 ms / chunk),
+     * but Tecno's first pooled download on Tele2 LTE stalled 10013 ms with
+     * `InterruptedIOException` before the sticky fallback kicked in. That
+     * gave the user a 10-second extra delay on every first voice — too
+     * costly to ship as the default. Pool stays as runtime-enableable code
+     * behind [setDownloadPoolEnabled] for diagnostics; the actual A/B
+     * adaptive-by-network probe is queued as a separate experiment.
      *
      * The guard governs only the *next* download attempt — a chunk that
      * arrived OK but took > threshold still returns its bytes successfully,
@@ -95,7 +103,17 @@ class AndroidNativeOkHttpMediaUploadTransport(
      * RTT on data we already hold.
      */
     @Volatile
-    private var useDownloadPool: Boolean = true
+    private var useDownloadPool: Boolean = false
+
+    /**
+     * PR-M2h.1 — diagnostic toggle. Lets a debug/Settings selector flip
+     * the pooled path on for testing. Sticky-disable still applies on any
+     * timeout/stall, so a one-off enable can be auto-reverted within the
+     * same session if pool reuse stops working mid-stream.
+     */
+    fun setDownloadPoolEnabled(enabled: Boolean) {
+        useDownloadPool = enabled
+    }
 
     /**
      * Pooled OkHttp client for the v3 download path. Single lazy instance,
