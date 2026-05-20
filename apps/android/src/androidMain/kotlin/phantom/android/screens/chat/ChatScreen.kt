@@ -810,38 +810,16 @@ fun ChatScreen(
                                 Log.w("PhantomMedia", "VOICE_REC resume_failed", it)
                             }
                     },
-                    onMicReleaseAfterHold = {
-                        // PR-UI-REC2.2: release after a press-and-hold with
-                        // sufficient hold duration. The gesture detector
-                        // already filtered out too-short releases via the
-                        // MIN_HOLD_SEND_MS gate, so by the time we get here
-                        // we have a real "release to send" intent. Routed
-                        // through the same finalise path as the in-panel
-                        // Send tap so the existing VOICE_REC complete /
-                        // MEDIA_TX upload_start lines are unchanged.
-                        Log.i("PhantomMedia", "VOICE_REC press_release_send durationMs=$recordingDurationMs")
-                        finalizeAndSendVoice()
-                    },
-                    onLockGesture = {
-                        // PR-UI-REC2: slide-up-past-threshold during a
-                        // press-and-hold transitions to the hands-free Locked
-                        // state. The MediaRecorder is already running; only
-                        // the UI state changes.
-                        if (recordingState == RecordingPanelState.Recording) {
-                            recordingState = RecordingPanelState.Locked
-                            Log.i("PhantomMedia", "VOICE_REC locked_entered reason=hold_slide_up")
-                        }
-                    },
-                    onMicClick = {
-                        // PR-C1 (2026-05-17) — UI guard for voice via TransportCapabilities.
-                        // Source of truth: container.transportCapabilities.canSendVoice.
-                        // Voice is allowed only when capabilities.canSendVoice is true.
-                        // In C1 this means WsActive without Tor. Limited realtime
-                        // (RestActive / WsCandidate), Tor, and no-transport all block;
-                        // voice in Limited realtime re-opens in PR-M1w via the new
-                        // encrypted media-upload path. The send-layer guard in
-                        // DefaultMessagingService.sendAudio is the second layer for any
-                        // path that bypasses this UI.
+                    // PR-UI-REC2.3 — new ACTION_DOWN-driven gesture lifecycle.
+                    // Replaces `onMicClick` (tap-toggle) +
+                    // `onMicReleaseAfterHold` + `onLockGesture` with five
+                    // focused callbacks that map cleanly onto pointer events.
+                    // See architect verdict on Test #76.1.2 for the rationale.
+                    onMicDownStartRecording = onMicDown@{
+                        // 1) capability guard (mirror of the legacy onMicClick
+                        //    capability-disabled branch, including the in-
+                        //    flight tear-down for a mid-recording capability
+                        //    drop).
                         if (!capabilities.canSendVoice) {
                             Log.w(
                                 "PhantomTransport",
@@ -849,8 +827,6 @@ fun ChatScreen(
                                     "reason=${capabilities.callDisabledReason?.name?.lowercase()} " +
                                     "source=ui recording_state=${recordingState?.name ?: "idle"}",
                             )
-                            // If we were already recording when the mode degraded (e.g. Tor
-                            // activated mid-recording), tear the recorder down cleanly.
                             if (recordingState != null) {
                                 runCatching { mediaRecorder?.stop() }
                                 mediaRecorder?.release()
@@ -865,43 +841,92 @@ fun ChatScreen(
                                     duration = androidx.compose.material3.SnackbarDuration.Short,
                                 )
                             }
-                            return@InputBar
+                            return@onMicDown false
                         }
-                        if (voiceSendInProgress) {
-                            android.util.Log.i(
+                        // 2) busy guard — never start a second recording on
+                        //    top of an in-flight upload or finalising tail.
+                        //    Architect-required defence after Test #76.1.2
+                        //    showed VOICE_REC config firing mid-upload.
+                        if (voiceSendInProgress || recordingState != null) {
+                            Log.i(
                                 "PhantomMedia",
-                                "VOICE_REC ignored_start reason=finalizing_or_sending state=${recordingState?.name ?: "idle"}",
+                                "VOICE_REC ignored_start reason=busy " +
+                                    "voiceSendInProgress=$voiceSendInProgress " +
+                                    "state=${recordingState?.name ?: "idle"}",
                             )
-                            return@InputBar
+                            return@onMicDown false
                         }
-                        if (recordingState != null) {
-                            // Tap-to-finalize. Both Recording and Locked send
-                            // through the same helper, which captures the
-                            // pre-finalize state for the `locked_send` log.
-                            finalizeAndSendVoice()
-                        } else {
-                            // PR-UI-REC2.1 defence-in-depth: never start a
-                            // recording while the text input has content.
-                            // This is the safety net behind the gesture-side
-                            // dispatch that routes send-text taps to onSend().
-                            if (inputText.trim().isNotEmpty()) {
-                                Log.i("PhantomMedia", "VOICE_REC ignored_start reason=text_not_empty")
-                                return@InputBar
-                            }
-                            val hasPermission = ContextCompat.checkSelfPermission(
-                                context, android.Manifest.permission.RECORD_AUDIO
-                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                            if (hasPermission) {
-                                val result = startChatRecording(context)
-                                audioFile = result.first
-                                mediaRecorder = result.second
-                                recordingDurationMs = 0L
-                                recordingAmplitudes.clear()
-                                recordingState = RecordingPanelState.Recording
-                            } else {
-                                permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
-                            }
+                        // 3) text-not-empty guard — UI-side dispatch already
+                        //    routes a Send-arrow tap to the text path, but
+                        //    keep the defence-in-depth log here for any future
+                        //    routing regression.
+                        if (inputText.trim().isNotEmpty()) {
+                            Log.i("PhantomMedia", "VOICE_REC ignored_start reason=text_not_empty")
+                            return@onMicDown false
                         }
+                        // 4) permission gate — RECORD_AUDIO. If we have it,
+                        //    start the recorder synchronously and tell the
+                        //    gesture detector recording is live. If we do
+                        //    not, fire the permission dialog and tell the
+                        //    detector to bail (a subsequent press will start
+                        //    once permission is granted).
+                        val hasPermission = ContextCompat.checkSelfPermission(
+                            context, android.Manifest.permission.RECORD_AUDIO
+                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        if (!hasPermission) {
+                            permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                            return@onMicDown false
+                        }
+                        // 5) start the recorder.
+                        val result = startChatRecording(context)
+                        audioFile = result.first
+                        mediaRecorder = result.second
+                        recordingDurationMs = 0L
+                        recordingAmplitudes.clear()
+                        recordingState = RecordingPanelState.Recording
+                        Log.i("PhantomMedia", "VOICE_REC hold_record_start")
+                        true
+                    },
+                    onMicHoldReleaseSend = { heldMs ->
+                        // Real pointer ACTION_UP after a held recording.
+                        // Send what we have via the same finalise path the
+                        // in-panel Send button uses.
+                        Log.i(
+                            "PhantomMedia",
+                            "VOICE_REC hold_release_send heldMs=$heldMs durationMs=$recordingDurationMs",
+                        )
+                        finalizeAndSendVoice()
+                    },
+                    onMicHoldTooShortCancel = { heldMs ->
+                        // Pointer ACTION_UP before MIN_HOLD_SEND_MS — treat
+                        // as accidental tap, drop the recording quietly.
+                        Log.i(
+                            "PhantomMedia",
+                            "VOICE_REC hold_release_cancel_too_short heldMs=$heldMs",
+                        )
+                        runCatching { mediaRecorder?.stop() }
+                        mediaRecorder?.release()
+                        mediaRecorder = null
+                        recordingState = null
+                        audioFile?.delete()
+                        audioFile = null
+                    },
+                    onMicSlideUpLock = {
+                        // Drag-up ≥ 60 dp while pressed — promote to Locked.
+                        // The MediaRecorder is already running; only the UI
+                        // state changes. Pointer ACTION_UP after this is a
+                        // no-op (handled in the gesture detector).
+                        if (recordingState == RecordingPanelState.Recording) {
+                            recordingState = RecordingPanelState.Locked
+                            Log.i("PhantomMedia", "VOICE_REC locked_entered reason=hold_slide_up")
+                        }
+                    },
+                    onSendVoiceTap = {
+                        // Tap on the cyan send-voice arrow while recording is
+                        // already in flight (Locked or Recording). Capability
+                        // / busy guards live inside finalizeAndSendVoice.
+                        Log.i("PhantomMedia", "VOICE_REC send_voice_tap state=${recordingState?.name ?: "idle"}")
+                        finalizeAndSendVoice()
                     },
                     onSend = {
                         val text = inputText.trim()
@@ -2887,36 +2912,38 @@ private fun InputBar(
     recordingState: RecordingPanelState? = null,
     recordingDurationMs: Long = 0L,
     waveformAmplitudes: List<Float> = emptyList(),
-    onMicClick: () -> Unit = {},
+    // PR-UI-REC2.3 — new gesture lifecycle. Replaces the prior
+    // `onMicClick / onMicReleaseAfterHold / onLockGesture` triplet with a
+    // proper ACTION_DOWN / ACTION_UP / drag state machine.
+    onMicDownStartRecording: () -> Boolean = { false },
+    onMicHoldReleaseSend: (heldMs: Long) -> Unit = {},
+    onMicHoldTooShortCancel: (heldMs: Long) -> Unit = {},
+    onMicSlideUpLock: () -> Unit = {},
+    onSendVoiceTap: () -> Unit = {},
     onCancelRecording: () -> Unit = {},
     onPauseRecording: () -> Unit = {},
     onResumeRecording: () -> Unit = {},
-    onMicReleaseAfterHold: () -> Unit = {},
-    onLockGesture: () -> Unit = {},
     onSend: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
     val density = androidx.compose.ui.platform.LocalDensity.current
-    val viewConfig = androidx.compose.ui.platform.LocalViewConfiguration.current
     // PR-UI-REC2 — distance the finger must move up from the press-down point
     // before we transition from `Recording` to `Locked`. 60 dp is the WhatsApp /
     // Telegram convention for the slide-to-lock affordance.
     val lockThresholdPx = with(density) { 60.dp.toPx() }
-    val longPressTimeoutMs = viewConfig.longPressTimeoutMillis
     var isMicHeld by remember { mutableStateOf(false) }
     val isLive = recordingState == RecordingPanelState.Recording
         || recordingState == RecordingPanelState.Locked
 
-    // PR-UI-REC2.1 — Test #76 regression fix. The persistent right-side Box has
-    // a single `pointerInput(Unit)` whose suspended `awaitEachGesture` loop
-    // outlives every recomposition. Without `rememberUpdatedState`, the
-    // closure would freeze `text` / `recordingState` / `isEditing` to whatever
-    // they were at first composition and we'd dispatch every tap as if the
-    // button were still a mic. The captured State holders below give the
-    // gesture loop a fresh read on every gesture iteration without rebuilding
-    // the gesture handler itself (which would cancel an in-flight hold).
+    // PR-UI-REC2.3 — `text` / `isEditing` are read inside the gesture
+    // detector at press-down time, so wrap them in `rememberUpdatedState`
+    // to defeat the closure-freeze that `pointerInput(Unit)` would
+    // otherwise impose. `recordingState` is NOT captured here because
+    // the gesture detector itself only attaches to the mic Box (i.e.
+    // the branch where recording is inactive at first composition); the
+    // send-voice tap in an active-recording state is handled by a
+    // separate clickable in a sibling branch.
     val currentTextState = androidx.compose.runtime.rememberUpdatedState(text)
-    val currentRecordingState = androidx.compose.runtime.rememberUpdatedState(recordingState)
     val currentIsEditingState = androidx.compose.runtime.rememberUpdatedState(isEditing)
 
     // Phase 2 mockup: composer sits on SurfaceElevated, BorderSubtle 1px top.
@@ -3080,198 +3107,57 @@ private fun InputBar(
                 }
             }
 
-            // ── Persistent right-side mic / send button ─────────────────────
+            // ── Right-side action button ──────────────────────────────────
             //
-            // PR-UI-REC2 hold-to-lock gesture lives on this Box. The Box is the
-            // last child of the outer Row in every state so Compose keeps its
-            // composition identity stable; the `pointerInput(Unit)` lambda is
-            // therefore registered once at first composition and continues to
-            // own the active pointer through every state transition.
+            // PR-UI-REC2.3 — split into TWO mutually-exclusive branches per
+            // architect verdict on Test #76.1.2:
             //
-            // Gesture decisions:
-            //   tap                          → onMicClick() (start/finalize toggle)
-            //   long-press from idle         → onMicPressHold() — starts recording
-            //                                  in Recording state, then continues
-            //                                  to track the same pointer.
-            //   slide finger up > 60 dp      → onLockGesture() — transitions to
-            //                                  Locked, the user can release.
-            //   release after hold (no lock) → onMicReleaseAfterHold() — finalises
-            //                                  and sends, same as WhatsApp.
-            //   tap while recording or
-            //   release without hold-trigger → onMicClick() (the in-panel send
-            //                                  arrow uses this same callback).
+            //   text-mode  → cyan Send-text arrow with plain `clickable`,
+            //                **no mic pointerInput** anywhere on this Box.
+            //                A tap here can never start a recording.
+            //   mic-mode   → persistent Box across the idle ↔ Recording ↔
+            //                Locked transitions, hosting the real ACTION_DOWN
+            //                / drag / ACTION_UP state machine. The visual
+            //                content switches mic-icon ↔ send-voice-arrow but
+            //                the Box identity stays, so an in-flight gesture
+            //                survives the state change.
+            //
+            // The text-mode ↔ mic-mode swap only happens while idle (the
+            // text input is hidden during recording, so the user cannot type
+            // while a recording is in flight). The Box-identity break
+            // between the two branches therefore cannot cancel an active
+            // recording.
             val hasTextSend = (text.isNotBlank() || isEditing) && recordingState == null
-            val isSendVisualActive = recordingState != null || hasTextSend
-            val rightBoxSize = when {
-                recordingState != null -> 44.dp
-                hasTextSend -> 38.dp
-                else -> 36.dp
-            }
-            Box(
-                modifier = Modifier
-                    .size(rightBoxSize)
-                    .then(
-                        if (hasTextSend) Modifier.shadow(
+            if (hasTextSend) {
+                // Text-mode Box. Architect's #76.1.2 acceptance rule 9:
+                // NEVER attach any pointerInput here. The tap goes only to
+                // `onSend()`; mic gestures cannot fire on this branch.
+                Box(
+                    modifier = Modifier
+                        .size(38.dp)
+                        .shadow(
                             elevation = 6.dp,
                             shape = CircleShape,
                             clip = false,
                             spotColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.18f),
                             ambientColor = PhantomTokens.Colors.Cyan.copy(alpha = 0.08f),
-                        ) else Modifier
-                    )
-                    .clip(CircleShape)
-                    .background(if (isSendVisualActive) PhantomTokens.Colors.Cyan else Color.Transparent)
-                    .pointerInput(Unit) {
-                        awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
-                            val initialY = down.position.y
-                            val pressStartMs = System.currentTimeMillis()
-
-                            // PR-UI-REC2.1: snapshot the visual mode at the
-                            // moment of press-down by reading the
-                            // rememberUpdatedState holders. Routes the tap
-                            // by what the user pressed, not by what the
-                            // closure happened to capture at first
-                            // composition.
-                            val stateAtDown = currentRecordingState.value
-                            val textAtDown = currentTextState.value
-                            val editingAtDown = currentIsEditingState.value
-                            val startedAsMic = stateAtDown == null
-                                && textAtDown.isBlank() && !editingAtDown
-                            val startedAsSendText = stateAtDown == null
-                                && (textAtDown.isNotBlank() || editingAtDown)
-
-                            // PR-UI-REC2.2: start recording at press-down (not
-                            // at the long-press boundary). Test #76.1.1 caught
-                            // the regression where the prior code only kicked
-                            // the recorder off at the long-press timeout, so a
-                            // user holding the mic for ~500 ms got only ~14 ms
-                            // of audio (because MediaRecorder.start() was
-                            // still warming up when they released). With the
-                            // recorder running from press-down, even a short
-                            // hold captures the entire press as audio. The
-                            // long-press timeout below now serves only as the
-                            // moment the lock-hint chip appears and slide-up
-                            // detection becomes active — it never restarts the
-                            // recorder.
-                            if (startedAsMic) {
-                                Log.i("PhantomUI", "COMPOSER_ACTION mic_pressed")
-                                onMicClick()
-                            }
-
-                            var didStartHold = false
-                            var didLock = false
-
-                            while (true) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.firstOrNull() ?: break
-                                val elapsed = System.currentTimeMillis() - pressStartMs
-
-                                if (!change.pressed) {
-                                    // Released — route by visual mode at press-down.
-                                    when {
-                                        didLock -> {
-                                            // Already in Locked state. Stay there;
-                                            // the gesture is over and the user is
-                                            // hands-free.
-                                        }
-                                        didStartHold && elapsed >= MIN_HOLD_SEND_MS -> {
-                                            // PR-UI-REC2.2: WhatsApp-style
-                                            // "release-to-send" — the user held
-                                            // past the long-press threshold AND
-                                            // past the minimum-send threshold,
-                                            // so finalise and ship.
-                                            Log.i(
-                                                "PhantomUI",
-                                                "COMPOSER_ACTION mic_hold_release_send elapsedMs=$elapsed",
-                                            )
-                                            onMicReleaseAfterHold()
-                                        }
-                                        didStartHold -> {
-                                            // PR-UI-REC2.2: hold detected but
-                                            // released before MIN_HOLD_SEND_MS.
-                                            // Cancel the recording so we never
-                                            // ship a near-empty voice (Test
-                                            // #76.1.1 case: a 500 ms hold under
-                                            // the previous code produced
-                                            // durationMs=0 / bytes=98 voices).
-                                            Log.i(
-                                                "PhantomUI",
-                                                "COMPOSER_ACTION mic_hold_release_cancel elapsedMs=$elapsed",
-                                            )
-                                            Log.i(
-                                                "PhantomMedia",
-                                                "VOICE_REC press_release_cancel_too_short elapsedMs=$elapsed",
-                                            )
-                                            onCancelRecording()
-                                        }
-                                        startedAsSendText -> {
-                                            // Visual was the cyan send-text arrow.
-                                            Log.i("PhantomUI", "COMPOSER_ACTION send_text_clicked")
-                                            onSend()
-                                        }
-                                        stateAtDown != null -> {
-                                            // Visual was the cyan send-voice arrow.
-                                            Log.i("PhantomUI", "COMPOSER_ACTION send_voice_clicked")
-                                            onMicClick()
-                                        }
-                                        else -> {
-                                            // Quick tap that started recording at
-                                            // press-down — recording continues
-                                            // hands-free (REC1 behaviour). The
-                                            // long-press timeout never fired,
-                                            // so we never crossed into hold
-                                            // mode; the user can still tap the
-                                            // in-panel Send or X.
-                                            Log.i(
-                                                "PhantomUI",
-                                                "COMPOSER_ACTION mic_tap_release elapsedMs=$elapsed",
-                                            )
-                                        }
-                                    }
-                                    break
-                                }
-
-                                // PR-UI-REC2.2: long-press timeout no longer
-                                // restarts the recorder. It only flips the
-                                // gesture into hold mode so the lock-hint chip
-                                // appears and the slide-up-to-lock detector
-                                // becomes live. Recording itself has been
-                                // running since press-down.
-                                if (!didStartHold && startedAsMic
-                                    && elapsed >= longPressTimeoutMs
-                                ) {
-                                    didStartHold = true
-                                    isMicHeld = true
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    Log.i("PhantomUI", "COMPOSER_ACTION mic_hold_start")
-                                }
-
-                                // Slide-up-to-lock detection — only meaningful
-                                // while holding.
-                                if (didStartHold && !didLock) {
-                                    val dragUp = initialY - change.position.y
-                                    if (dragUp >= lockThresholdPx) {
-                                        didLock = true
-                                        isMicHeld = false
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        onLockGesture()
-                                    }
-                                }
-
-                                change.consume()
-                            }
-                            // Clear the hold flag if the gesture loop ended
-                            // without going through the release branch (e.g.
-                            // pointer cancelled by the framework).
-                            isMicHeld = false
+                        )
+                        .clip(CircleShape)
+                        .background(PhantomTokens.Colors.Cyan)
+                        .clickable(onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            Log.i("PhantomUI", "COMPOSER_ACTION send_text_clicked")
+                            onSend()
+                        }),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (isEditing) {
+                        Canvas(modifier = Modifier.size(18.dp)) {
+                            val sw = 2.dp.toPx()
+                            drawLine(BgDeep, Offset(size.width * 0.15f, size.height * 0.5f), Offset(size.width * 0.42f, size.height * 0.76f), sw, StrokeCap.Round)
+                            drawLine(BgDeep, Offset(size.width * 0.42f, size.height * 0.76f), Offset(size.width * 0.85f, size.height * 0.24f), sw, StrokeCap.Round)
                         }
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                when {
-                    recordingState != null -> {
-                        // Send arrow during recording — matches the text-composer send.
+                    } else {
                         Canvas(modifier = Modifier.size(20.dp)) {
                             val sw = 2.2.dp.toPx()
                             val cap = StrokeCap.Round
@@ -3281,26 +3167,111 @@ private fun InputBar(
                             drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
                         }
                     }
-                    hasTextSend -> {
-                        if (isEditing) {
-                            Canvas(modifier = Modifier.size(18.dp)) {
-                                val sw = 2.dp.toPx()
-                                drawLine(BgDeep, Offset(size.width * 0.15f, size.height * 0.5f), Offset(size.width * 0.42f, size.height * 0.76f), sw, StrokeCap.Round)
-                                drawLine(BgDeep, Offset(size.width * 0.42f, size.height * 0.76f), Offset(size.width * 0.85f, size.height * 0.24f), sw, StrokeCap.Round)
+                }
+            } else {
+                // Mic-mode Box — persistent across mic ↔ send-voice. The
+                // pointerInput hosts the ACTION_DOWN-driven state machine.
+                val isSendVoiceVisual = recordingState != null
+                val micBoxSize = if (isSendVoiceVisual) 44.dp else 36.dp
+                Box(
+                    modifier = Modifier
+                        .size(micBoxSize)
+                        .clip(CircleShape)
+                        .background(if (isSendVoiceVisual) PhantomTokens.Colors.Cyan else Color.Transparent)
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val downId = down.id
+                                val downY = down.position.y
+                                val downTimeMs = System.currentTimeMillis()
+
+                                // Was the user pressing the send-voice arrow
+                                // (an in-flight recording) at press-down? If
+                                // yes, the gesture's job is to wait for
+                                // pointer-up and fire `onSendVoiceTap` once;
+                                // we do NOT start a new recording.
+                                //
+                                // Otherwise the user pressed the mic icon
+                                // (no recording active). Start recording now;
+                                // the callback owns the guards (busy / no
+                                // permission / no capability / text not
+                                // empty) and returns false if any of them
+                                // bail out — in which case we abort so a
+                                // subsequent release does not produce a
+                                // no-op send.
+                                val isSendVoiceTap = currentTextState.value.isBlank()
+                                    && !currentIsEditingState.value
+                                    && isSendVoiceVisual
+
+                                var locked = false
+                                var recordingStarted = false
+
+                                if (!isSendVoiceTap) {
+                                    recordingStarted = onMicDownStartRecording()
+                                    if (!recordingStarted) {
+                                        return@awaitEachGesture
+                                    }
+                                    isMicHeld = true
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                }
+
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == downId }
+                                        ?: continue
+
+                                    // Drag-up-to-lock — only when we own a
+                                    // live recording from this press.
+                                    if (recordingStarted && !locked) {
+                                        val dragUp = downY - change.position.y
+                                        if (dragUp >= lockThresholdPx) {
+                                            locked = true
+                                            isMicHeld = false
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            onMicSlideUpLock()
+                                        }
+                                    }
+
+                                    if (!change.pressed) {
+                                        val heldMs = System.currentTimeMillis() - downTimeMs
+                                        when {
+                                            isSendVoiceTap -> {
+                                                // Tap on the send-voice arrow
+                                                // (recording was already in
+                                                // flight at press-down).
+                                                onSendVoiceTap()
+                                            }
+                                            locked -> {
+                                                // Hands-free recording
+                                                // continues — release is a
+                                                // no-op by design.
+                                            }
+                                            heldMs >= MIN_HOLD_SEND_MS -> {
+                                                onMicHoldReleaseSend(heldMs)
+                                            }
+                                            else -> {
+                                                onMicHoldTooShortCancel(heldMs)
+                                            }
+                                        }
+                                        break
+                                    }
+                                    change.consume()
+                                }
+                                isMicHeld = false
                             }
-                        } else {
-                            Canvas(modifier = Modifier.size(20.dp)) {
-                                val sw = 2.2.dp.toPx()
-                                val cap = StrokeCap.Round
-                                val cx = size.width / 2f
-                                drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
-                                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
-                                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
-                            }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (isSendVoiceVisual) {
+                        Canvas(modifier = Modifier.size(20.dp)) {
+                            val sw = 2.2.dp.toPx()
+                            val cap = StrokeCap.Round
+                            val cx = size.width / 2f
+                            drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
+                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
                         }
-                    }
-                    else -> {
-                        // Mic icon (Canvas) — idle state.
+                    } else {
                         Canvas(modifier = Modifier.size(22.dp)) {
                             val c = TextDim
                             val sw = 1.6.dp.toPx()
@@ -3319,26 +3290,23 @@ private fun InputBar(
                             drawLine(c, Offset(size.width * 0.5f, size.height * 0.78f), Offset(size.width * 0.5f, size.height * 0.95f), sw, StrokeCap.Round)
                         }
                     }
-                }
 
-                // Floating lock-hint chip — shown above the mic while the user
-                // is mid-hold and the panel is still in `Recording` (not yet
-                // locked). The chip is the slide-up target; releasing without
-                // having reached it sends the voice, sliding up onto it
-                // promotes the panel to `Locked`. Rendered as a `Popup` so it
-                // can paint above the composer bounds and never clips against
-                // the InputBar.
-                if (isMicHeld && recordingState == RecordingPanelState.Recording) {
-                    Popup(
-                        alignment = Alignment.TopCenter,
-                        offset = IntOffset(0, -with(density) { 84.dp.toPx() }.toInt()),
-                        properties = PopupProperties(
-                            focusable = false,
-                            dismissOnBackPress = false,
-                            dismissOnClickOutside = false,
-                        ),
-                    ) {
-                        LockHintChip()
+                    // Floating lock-hint chip — visible while the user is
+                    // mid-hold and the panel is still in `Recording`. Once
+                    // they cross the slide-up threshold the chip disappears
+                    // (isMicHeld flips to false on lock).
+                    if (isMicHeld && recordingState == RecordingPanelState.Recording) {
+                        Popup(
+                            alignment = Alignment.TopCenter,
+                            offset = IntOffset(0, -with(density) { 84.dp.toPx() }.toInt()),
+                            properties = PopupProperties(
+                                focusable = false,
+                                dismissOnBackPress = false,
+                                dismissOnClickOutside = false,
+                            ),
+                        ) {
+                            LockHintChip()
+                        }
                     }
                 }
             }
