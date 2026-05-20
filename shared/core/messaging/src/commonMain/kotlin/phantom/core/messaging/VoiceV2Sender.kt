@@ -4,6 +4,8 @@
 package phantom.core.messaging
 
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.math.ceil
@@ -131,14 +133,22 @@ class VoiceV2Sender(
         ).coerceAtMost(total)
         var earlyManifestSent = false
 
-        // Step 3: upload loop (sequential, one chunk at a time)
+        // Step 3: upload loop (sequential, one chunk at a time).
+        //
+        // PR-MEDIA-UPLOAD-CANCEL1 — `ensureActive()` checkpoints before and
+        // after each chunk upload give the X-tap cancel path a chance to
+        // stop the loop without waiting for the next network operation to
+        // throw. Without these the upload would continue chunk-by-chunk
+        // even after `cancelVoiceUpload(...)` cancelled the parent Job.
         for (idx in 0 until total) {
+            coroutineContext.ensureActive()
             uploadChunkWithRefresh(
                 mediaId = enc.mediaId,
                 idx = idx,
                 total = total,
                 chunkBytes = chunks[idx],
             )
+            coroutineContext.ensureActive()
             // uploadChunkWithRefresh throws on terminal failure.
             val sent = idx + 1
             log(
@@ -235,13 +245,20 @@ class VoiceV2Sender(
     ): Result<MediaUploadTransport.UploadStatus> {
         var lastResult: Result<MediaUploadTransport.UploadStatus>? = null
         for (attempt in 1..MAX_NETWORK_ATTEMPTS) {
+            // PR-MEDIA-UPLOAD-CANCEL1 — cancellation checkpoints around
+            // each network round-trip and each backoff delay so a
+            // user-tap-X never has to wait a full retry budget to take
+            // effect.
+            coroutineContext.ensureActive()
             val r = mediaTransport.uploadChunk(token, mediaId, idx, total, chunkBytes)
+            coroutineContext.ensureActive()
             if (r.isSuccess) return r
             val ex = r.exceptionOrNull()
             if (ex !is MediaTransportException) return r // auth/quota/conflict — let caller handle
             lastResult = r
             if (attempt < MAX_NETWORK_ATTEMPTS) {
                 delay(NETWORK_RETRY_DELAYS_MS[attempt - 1])
+                coroutineContext.ensureActive()
             }
         }
         return lastResult ?: Result.failure(MediaTransportException("network_retry_exhausted"))

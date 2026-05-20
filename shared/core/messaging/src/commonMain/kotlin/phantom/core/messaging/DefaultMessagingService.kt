@@ -14,8 +14,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -162,6 +164,18 @@ class DefaultMessagingService(
 
     // PR-M1w: single voice in-flight per conversation. Guarded by mutexFor(conversationId).
     private val voiceSendInProgress = mutableSetOf<String>()
+
+    // PR-MEDIA-UPLOAD-CANCEL1: in-flight voice upload jobs keyed by
+    // localMsgId. Populated when `sendAudioV2` launches its upload coroutine
+    // on the DMS scope and removed by the same coroutine's `finally`. The
+    // X button on the uploading voice bubble routes through
+    // `cancelVoiceUpload(...)` which cancels the captured Job here. The
+    // separate Mutex below serialises concurrent insert / lookup / remove
+    // — `mutableMapOf` is not thread-safe and at least two threads
+    // (the DMS scope coroutine and any UI-triggered cancel call) reach it.
+    private val voiceUploadJobsLock = Mutex()
+    private val voiceUploadJobs = mutableMapOf<String, Job>()
+    private val USER_CANCELLED_UPLOAD = "user_cancelled_upload"
 
     init {
         // Q4: loud WARN if production wires this incorrectly.
@@ -839,14 +853,25 @@ class DefaultMessagingService(
             MessagingLogLevel.INFO,
             "MEDIA_TX upload_job_started scope=dms localMsgId=${localMsgId.take(8)}",
         )
-        scope.launch {
+        // PR-MEDIA-UPLOAD-CANCEL1 — hold the Job handle so the UI X-button
+        // path can find and cancel it. `lateinit var` is the standard trick
+        // for self-referencing a launched coroutine; the Job is assigned
+        // before the coroutine body actually starts running, so the cancel
+        // path that races with the very first `ensureActive` checkpoint
+        // still finds a live entry.
+        lateinit var uploadJob: Job
+        uploadJob = scope.launch {
+            // PR-M2e — manifestSent guards the early-vs-tail double-send
+            // race. PR-MEDIA-UPLOAD-CANCEL1 hoists it out of the `try`
+            // block so the cancel-by-user catch can log whether the
+            // receiver was already aware of this voice when we dropped it.
+            var manifestSent = false
             try {
                 // PR-M2e — extract the manifest-send block into a suspend lambda
                 // so it can fire either AS the early-manifest hook (after the
                 // first K=3 chunks) OR as a tail fallback (legacy path / very
                 // short voices). It's idempotent on its own state — the flag
                 // `manifestSent` guards against double-send.
-                var manifestSent = false
                 suspend fun sendManifestEnvelope(manifest: VoiceManifestV2) {
                     if (manifestSent) return
                     manifestSent = true
@@ -943,22 +968,105 @@ class DefaultMessagingService(
                 // to require more bytes than a single chunk can deliver,
                 // or a 0-chunk path slipped through.
                 sendManifestEnvelope(manifest)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
+            } catch (ce: CancellationException) {
+                // PR-MEDIA-UPLOAD-CANCEL1 — distinguish a user-initiated
+                // cancel (X-tap on the uploading bubble) from a
+                // scope-level cancellation (DMS shut down, network failure
+                // bubbled up as CancellationException, etc.). The marker
+                // string travels via `CancellationException("user_cancelled_upload")`
+                // from `cancelVoiceUpload`; everything else falls into the
+                // FAILED-state path so the bubble does not silently
+                // disappear on a generic cancel.
+                if (ce.message == USER_CANCELLED_UPLOAD) {
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "MEDIA_TX upload_cancelled_by_user localMsgId=${localMsgId.take(8)} " +
+                            "manifestSent=$manifestSent",
+                    )
+                    runCatching { messageRepository.deleteMessage(localMsgId) }
+                    // Do NOT rethrow — surfacing CancellationException to
+                    // the parent scope would attempt to cancel siblings on
+                    // some implementations. We've owned the cleanup here.
+                    return@launch
+                }
                 messagingLog(
                     MessagingLogLevel.WARN,
                     "MEDIA_TX upload_job_cancelled localMsgId=${localMsgId.take(8)} " +
                         "reason=${ce.message?.take(60) ?: "scope_cancelled"}",
                 )
-                messageRepository.updateStatus(localMsgId, MessageStatus.FAILED)
+                runCatching { messageRepository.updateStatus(localMsgId, MessageStatus.FAILED) }
                 throw ce
             } finally {
                 mediaProgressBus.clear(localMsgId)
+                voiceUploadJobsLock.withLock {
+                    voiceUploadJobs.remove(localMsgId)
+                }
                 mutexFor(conversationId).withLock {
                     voiceSendInProgress.remove(conversationId)
                 }
             }
         }
+        voiceUploadJobsLock.withLock {
+            voiceUploadJobs[localMsgId] = uploadJob
+        }
         return Result.success(Unit)
+    }
+
+    /**
+     * PR-MEDIA-UPLOAD-CANCEL1 — user-initiated voice upload cancellation
+     * triggered by the X button on the uploading bubble. Looks up the
+     * captured upload Job by `localMsgId`, cancels it with the
+     * `user_cancelled_upload` marker so the `sendAudioV2` catch branch can
+     * tell user-cancel apart from generic CancellationException, then
+     * clears the progress entry and deletes the local row.
+     */
+    override suspend fun cancelVoiceUpload(
+        conversationId: String,
+        localMsgId: String,
+    ): Result<Unit> = runCatching {
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "MEDIA_TX upload_cancel_requested localMsgId=${localMsgId.take(8)}",
+        )
+
+        val job = voiceUploadJobsLock.withLock {
+            voiceUploadJobs.remove(localMsgId)
+        }
+
+        if (job == null) {
+            // Either the upload already finished and the Job entry was
+            // cleared in the `finally`, or the user tapped X on a row that
+            // never had a live upload (e.g. an earlier FAILED row that
+            // still shows the X). Clear UI state defensively and best-
+            // effort drop a QUEUED / UPLOADING row so the bubble doesn't
+            // linger.
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "MEDIA_TX upload_cancel_noop localMsgId=${localMsgId.take(8)} reason=no_active_job",
+            )
+            mediaProgressBus.clear(localMsgId)
+            val msg = runCatching { messageRepository.getMessageById(localMsgId) }.getOrNull()
+            if (msg?.status == MessageStatus.UPLOADING || msg?.status == MessageStatus.QUEUED) {
+                runCatching { messageRepository.deleteMessage(localMsgId) }
+            }
+            mutexFor(conversationId).withLock {
+                voiceSendInProgress.remove(conversationId)
+            }
+            return@runCatching
+        }
+
+        // Cancel the coroutine. The `sendAudioV2` catch branch sees the
+        // marker message, owns the local-row deletion + progress clear, so
+        // we only emit the dispatch log here. We do NOT clear
+        // mediaProgressBus / delete the message twice — the launched
+        // coroutine's catch+finally will run before this call returns
+        // (job.cancel does not wait, but the resources are owned by the
+        // coroutine, not by this cancel path).
+        job.cancel(CancellationException(USER_CANCELLED_UPLOAD))
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "MEDIA_TX upload_cancel_dispatched localMsgId=${localMsgId.take(8)}",
+        )
     }
 
     override suspend fun startReceiving() {
