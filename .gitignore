@@ -110,3 +110,10 @@ private/
 *.pdf
 !legal/assets/*.pdf
 !docs/**/*.pdf
+
+# Local AI-agent operating guide. Claude Code reads project-root
+# CLAUDE.md automatically; the file stays on disk for the dev
+# workflow but is excluded from the public repo. The engineering
+# process docs that any contributor would need live in
+# docs/WORKING_RULES.md without the AI-specific framing.
+CLAUDE.md
