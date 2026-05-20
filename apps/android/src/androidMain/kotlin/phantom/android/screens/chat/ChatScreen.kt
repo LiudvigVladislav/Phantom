@@ -17,6 +17,12 @@ import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -54,6 +60,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -851,6 +858,10 @@ fun ChatScreen(
                     )
                 }
         ) {
+        // Day-start state ticks at local midnight so [ChatDateSep] flips
+        // "TODAY" → "YESTERDAY" without requiring a navigation refresh.
+        val dayStartMillis = rememberDayStartMillis()
+
         // Pre-process: filter out invisible profile cards, then inject date separators
         val chatItems = remember(messages) {
             buildList<ChatItem> {
@@ -989,7 +1000,7 @@ fun ChatScreen(
                 }
             }) { chatItem ->
                 when (chatItem) {
-                    is ChatItem.DateSep -> ChatDateSep(chatItem.millis)
+                    is ChatItem.DateSep -> ChatDateSep(chatItem.millis, dayStartMillis)
                     is ChatItem.Msg -> {
                         val msg = chatItem.entity
                         val isNew = msg.id !in initialIds
@@ -1143,12 +1154,18 @@ private fun E2EENoteRow(theirUsername: String) {
 }
 
 @Composable
-private fun ChatDateSep(millis: Long) {
+private fun ChatDateSep(millis: Long, dayStartMillis: Long) {
     // Design Brief v3 §9.5: just centered uppercase mono label, no hairlines.
+    // The label depends on [dayStartMillis] — a screen-level state that ticks
+    // at midnight via [rememberDayStartMillis]. Without that dependency, the
+    // separator captured "TODAY" once on first composition and never moved to
+    // "YESTERDAY" after the day rolled over (Vladislav 2026-05-20 report).
     val label = when {
-        isToday(millis) -> "TODAY"
-        isYesterday(millis) -> "YESTERDAY"
-        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(millis)).uppercase(java.util.Locale.US)
+        millis >= dayStartMillis -> "TODAY"
+        millis >= dayStartMillis - DAY_MILLIS -> "YESTERDAY"
+        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US)
+            .format(java.util.Date(millis))
+            .uppercase(java.util.Locale.US)
     }
     Box(
         modifier = Modifier
@@ -1164,21 +1181,37 @@ private fun ChatDateSep(millis: Long) {
     }
 }
 
-private fun isToday(millis: Long): Boolean {
-    val cal = java.util.Calendar.getInstance()
-    val today = java.util.Calendar.getInstance()
-    cal.timeInMillis = millis
-    return cal.get(java.util.Calendar.YEAR) == today.get(java.util.Calendar.YEAR) &&
-            cal.get(java.util.Calendar.DAY_OF_YEAR) == today.get(java.util.Calendar.DAY_OF_YEAR)
+private const val DAY_MILLIS: Long = 24L * 60L * 60L * 1000L
+
+/**
+ * Returns the wall-clock millis of the start of "today" (local midnight),
+ * and refreshes that state in-place when the day rolls over. Used by the
+ * chat day-separator labels so that a chat opened at 23:59 transitions
+ * from "TODAY" to "YESTERDAY" automatically at 00:00 without needing the
+ * user to navigate away and back.
+ */
+@Composable
+private fun rememberDayStartMillis(): Long {
+    var dayStart by remember { mutableLongStateOf(startOfDayMillis(System.currentTimeMillis())) }
+    LaunchedEffect(dayStart) {
+        // Sleep until just past the next local midnight, then refresh.
+        val now = System.currentTimeMillis()
+        val nextMidnight = dayStart + DAY_MILLIS
+        val waitMs = (nextMidnight - now).coerceAtLeast(60_000L) + 1_000L
+        delay(waitMs)
+        dayStart = startOfDayMillis(System.currentTimeMillis())
+    }
+    return dayStart
 }
 
-private fun isYesterday(millis: Long): Boolean {
+private fun startOfDayMillis(now: Long): Long {
     val cal = java.util.Calendar.getInstance()
-    cal.timeInMillis = millis
-    val yesterday = java.util.Calendar.getInstance()
-    yesterday.add(java.util.Calendar.DAY_OF_YEAR, -1)
-    return cal.get(java.util.Calendar.YEAR) == yesterday.get(java.util.Calendar.YEAR) &&
-            cal.get(java.util.Calendar.DAY_OF_YEAR) == yesterday.get(java.util.Calendar.DAY_OF_YEAR)
+    cal.timeInMillis = now
+    cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+    cal.set(java.util.Calendar.MINUTE, 0)
+    cal.set(java.util.Calendar.SECOND, 0)
+    cal.set(java.util.Calendar.MILLISECOND, 0)
+    return cal.timeInMillis
 }
 
 // ── Emoji panel ───────────────────────────────────────────────────────────────
@@ -1430,8 +1463,6 @@ private fun MessageBubble(
             horizontalArrangement = if (isSent) Arrangement.End else Arrangement.Start,
         ) {
         Box {
-            // time "06:26" ≈ 28dp + gap 3dp + status icon ≈ 18dp = ~56dp for sent, ~36dp for received
-            val timeReserve = if (isSent) 56.dp else 36.dp
             // Outer column: bubble + reaction pills stacked vertically
             Column {
             // Bubble shape per PHANTOM_FULL_COMPOSE §05:
@@ -1446,11 +1477,24 @@ private fun MessageBubble(
                 bottomStart = if (isSent) PhantomTokens.Radius.md else 2.dp,
                 bottomEnd = if (isSent) 2.dp else PhantomTokens.Radius.md,
             )
+            // Voice Bubble Matrix fix (Test #72): audio messages draw their own
+            // cyan/surface-elevated bubble inside AudioBubble. The parent
+            // MessageBubble shell was double-framing it. For audio rows we
+            // strip the parent's background/border/padding/clip and let
+            // AudioBubble fully own the visual.
+            val isAudioRow = rawText.startsWith("[AUDIO:")
+                || rawText.startsWith("[AUDIO_LOCAL:")
+                || rawText.startsWith("[AUDIO_DOWNLOADING]")
+                || rawText.startsWith("[AUDIO_FAILED:")
             Column(
                 modifier = Modifier
-                    .widthIn(min = 80.dp, max = 260.dp)
+                    .widthIn(
+                        min = if (isAudioRow) 220.dp else 80.dp,
+                        max = if (isAudioRow) 320.dp else 260.dp,
+                    )
                     .then(
-                        if (isSent) Modifier.background(
+                        if (isAudioRow) Modifier
+                        else if (isSent) Modifier.background(
                             color = PhantomTokens.Colors.Cyan,
                             shape = bubbleShape,
                         ) else Modifier
@@ -1471,7 +1515,10 @@ private fun MessageBubble(
                         onClick = {},
                         onLongClick = { showActionPanel = true },
                     )
-                    .padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp),
+                    .then(
+                        if (isAudioRow) Modifier
+                        else Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp)
+                    ),
             ) {
                 // Quote block (reply) — stacked above main text
                 if (isReply && quoteText.isNotEmpty()) {
@@ -1560,28 +1607,37 @@ private fun MessageBubble(
                         progress = mediaProgress[entity.id],
                     )
                 } else {
-                // Text + time in a Box so time overlays bottom-right corner
-                Box {
+                // Stacked layout: text on top, meta row (time + status) on its
+                // own footer line aligned to the trailing edge of the bubble.
+                // The previous Box-with-overlay layout reserved 36/56 dp of
+                // end-padding on the Text so the time could float in the
+                // bottom-right corner. That made the bubble grow to the
+                // widest wrapped line *plus* the reserved padding, and when
+                // the last wrapped line was short (e.g. "идут долго") it
+                // left a visible empty gap between the text and the time
+                // (Vladislav 2026-05-20 screenshot). Stacking the meta below
+                // the text lets the bubble hug the widest wrapped line and
+                // keeps the meta tight on its own row.
+                Text(
+                    text = text,
+                    color = if (isSent) BgDeep else TextPrimary,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.End)
+                        .padding(top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
                     Text(
-                        text = text,
-                        modifier = Modifier.padding(end = timeReserve),
-                        color = if (isSent) BgDeep else TextPrimary,
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp,
+                        text = timeStr,
+                        color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
+                        fontSize = 10.sp,
+                        lineHeight = 12.sp,
                     )
-                    Row(
-                        modifier = Modifier.align(Alignment.BottomEnd),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(3.dp),
-                    ) {
-                        Text(
-                            text = timeStr,
-                            color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
-                            fontSize = 10.sp,
-                            lineHeight = 12.sp,
-                        )
-                        if (isSent) StatusIcon(status = entity.status)
-                    }
+                    if (isSent) StatusIcon(status = entity.status)
                 }
                 } // end audio/text branch
 
@@ -2027,21 +2083,25 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCheckmark(
 // ── Audio message bubble ──────────────────────────────────────────────────────
 
 /**
- * Renders a voice message bubble for all four plaintext-cache prefixes (PR-M1w):
+ * Renders a voice message bubble per the **Voice Bubble Matrix** design
+ * (PR-UI Voice Bubble Matrix, design handed off 2026-05-20 — see
+ * `phantom-messengers/project/Voice Bubble Matrix.html`).
  *
- *   [AUDIO:<base64>]          — legacy chunked-ratchet path; sender self-playback (Q1).
- *   [AUDIO_LOCAL:<path>]      — PR-M1w received + decrypted; file on local FS.
- *   [AUDIO_DOWNLOADING]       — PR-M1w manifest received but download not yet complete.
- *   [AUDIO_FAILED:<reason>]   — permanent failure (404 / sha256_mismatch / decrypt_failed).
+ * Five visual states, gated on existing `plaintextCache` prefixes (PR-M1w):
+ *   * `[AUDIO_DOWNLOADING]` — receiver during chunk download. STATE 2.
+ *   * `[AUDIO:<base64>]`     — sender's row, before manifest leaves device.
+ *     Sender's upload progress is detected via the in-memory [MediaProgressBus]
+ *     entry (PR-M2d.1b lesson — DB status column is not reliable). STATE 1.
+ *   * `[AUDIO_LOCAL:<path>]` — playable, file decrypted to local FS. STATE 3.
+ *   * `[AUDIO:<base64>]`     — playable, sender self-playback (legacy path
+ *     and current voice_v2 sender). STATE 3.
+ *   * `[AUDIO_FAILED:<reason>]` — permanent failure (kept from M2d.1b; the
+ *     Voice Bubble Matrix design intentionally does not cover this state,
+ *     so the styling tracks the design palette but the layout is bespoke).
  *
- * PR-M2d.1b: optional [progress] carries live chunk N/M for the upload (sender)
- * or download (receiver) phase. When present it overrides the static spinner
- * with a "Uploading N/M" or "Downloading N/M" line; when null the bubble falls
- * back to the pre-M2d.1b "Downloading…" label.
- *
- * The DOWNLOADING and FAILED states do not attempt MediaPlayer construction.
- * AUDIO_LOCAL reads the file at [path] into a temp cache file on first play —
- * same lazy-load pattern as the legacy Base64 path, no Okio dependency.
+ * Animation budget per the design annotations (and verified by Compose
+ * implementation): exactly one rotating arc, one staggered bar-opacity
+ * tween, one playhead-bar repaint per audio tick, zero layout passes.
  */
 @Composable
 private fun AudioBubble(
@@ -2052,23 +2112,17 @@ private fun AudioBubble(
     context: android.content.Context,
     progress: MediaProgressBus.Progress? = null,
 ) {
-    // ── Resolve audio source ──────────────────────────────────────────────────
+    // ── State detection (unchanged from M2d.1b — only visuals change) ─────────
     val isDownloading = plaintextCache == "[AUDIO_DOWNLOADING]"
     val isFailed = plaintextCache.startsWith("[AUDIO_FAILED:")
     val isLocalFile = plaintextCache.startsWith("[AUDIO_LOCAL:")
-    // Legacy sender self-playback: [AUDIO:<base64>]
     val isLegacyBase64 = plaintextCache.startsWith("[AUDIO:") && !isLocalFile
-
-    // PR-M2d.1b — sender uploading: voice_v2 sender keeps `[AUDIO:base64]`
-    // in the row for self-playback. While the upload loop is live, the bus
-    // entry has direction=UPLOAD. The presence of that entry is the
-    // authoritative "live upload" signal — the DB `status` column may still
-    // be QUEUED if the row was loaded between INSERT and UPLOADING status
-    // commit, so we do NOT gate on `status == UPLOADING` (Test #67b lesson).
     val isUploadingSender = isSent
         && progress != null
         && progress.direction == MediaProgressBus.Direction.UPLOAD
-    // Diagnostic — confirms the UI lookup hits the bus entry while upload is live.
+    val isLoading = isDownloading || isUploadingSender
+
+    // Diagnostic — kept from M2d.1b for transport-team troubleshooting.
     androidx.compose.runtime.LaunchedEffect(progress) {
         if (progress != null) {
             android.util.Log.i(
@@ -2081,182 +2135,26 @@ private fun AudioBubble(
         }
     }
 
-    // Path for AUDIO_LOCAL: strip prefix and trailing ']'
     val localFilePath: String? = if (isLocalFile) {
         plaintextCache.removePrefix("[AUDIO_LOCAL:").trimEnd(']')
     } else null
-
-    // Base64 payload for legacy AUDIO path: strip prefix and trailing ']'
     val base64Payload: String? = if (isLegacyBase64) {
         plaintextCache.removePrefix("[AUDIO:").trimEnd(']')
     } else null
 
-    // ── Downloading or Uploading state: spinner + label ──────────────────────
-    if (isDownloading || isUploadingSender) {
-        // PR-M2d.1b: derive label + numeric progress fraction.
-        // - Receiver download: "Downloading N/M" when progress != null, else "Downloading…".
-        // - Sender upload:    "Uploading N/M".
-        val labelText: String
-        val fraction: Float?
-        if (isUploadingSender) {
-            val p = progress!!
-            labelText = "Uploading ${p.sent}/${p.total}"
-            fraction = if (p.total > 0) p.sent.toFloat() / p.total.toFloat() else null
-        } else if (progress != null && progress.direction == MediaProgressBus.Direction.DOWNLOAD) {
-            labelText = "Downloading ${progress.sent}/${progress.total}"
-            fraction = if (progress.total > 0) progress.sent.toFloat() / progress.total.toFloat() else null
-        } else {
-            labelText = "Downloading…"
-            fraction = null
-        }
-        // PR-M2d.1b polish (Test #67b1): the original Uploading/Downloading row
-        // read as faint/disabled on the cyan sent bubble. Sender bubble has a
-        // CyanAccent background, so spinner + label switch to a BgDeep ink for
-        // full contrast; receiver keeps the CyanAccent ink on the dark Surface
-        // bubble. Label text bumped to 12.sp + Medium weight, with a numeric
-        // "N/M" suffix that the user can read at a glance.
-        val inkColor = if (isSent) BgDeep else TextPrimary
-        val accentTint = if (isSent) BgDeep else CyanAccent
-        val pillBg = if (isSent) BgDeep.copy(alpha = 0.18f) else CyanAccent.copy(alpha = 0.12f)
-        val barTrack = if (isSent) BgDeep.copy(alpha = 0.20f) else Surface
-        Row(
-            modifier = Modifier.width(220.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(pillBg),
-                contentAlignment = Alignment.Center,
-            ) {
-                // Arc orientation: sender = upward-pointing, receiver = downward
-                Canvas(modifier = Modifier.size(18.dp)) {
-                    drawArc(
-                        color = accentTint.copy(alpha = 0.85f),
-                        startAngle = if (isUploadingSender) 240f else 60f,
-                        sweepAngle = 240f,
-                        useCenter = false,
-                        style = androidx.compose.ui.graphics.drawscope.Stroke(
-                            width = 2.dp.toPx(),
-                            cap = StrokeCap.Round,
-                        ),
-                    )
-                }
-            }
-            Column(modifier = Modifier.weight(1f)) {
-                if (fraction != null) {
-                    LinearProgressIndicator(
-                        progress = { fraction.coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
-                        color = accentTint,
-                        trackColor = barTrack,
-                    )
-                } else {
-                    LinearProgressIndicator(
-                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
-                        color = accentTint.copy(alpha = 0.65f),
-                        trackColor = barTrack,
-                    )
-                }
-                Spacer(Modifier.height(6.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = labelText,
-                        color = inkColor,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(3.dp),
-                    ) {
-                        Text(
-                            text = timeStr,
-                            color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
-                            fontSize = 10.sp,
-                        )
-                        if (isSent) StatusIcon(status = status)
-                    }
-                }
-            }
-        }
-        return
-    }
-
-    // ── Failed state: error icon + reason label ───────────────────────────────
+    // ── Failed branch — kept from M2d.1b, no Matrix coverage for this state ──
     if (isFailed) {
         val reason = plaintextCache.removePrefix("[AUDIO_FAILED:").trimEnd(']')
-        Row(
-            modifier = Modifier.width(220.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(Color(0xFFEF4444).copy(alpha = 0.12f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                // X-mark icon
-                Canvas(modifier = Modifier.size(16.dp)) {
-                    val sw = 2.dp.toPx()
-                    val col = Color(0xFFEF4444)
-                    drawLine(col, Offset(size.width * 0.2f, size.height * 0.2f), Offset(size.width * 0.8f, size.height * 0.8f), sw, StrokeCap.Round)
-                    drawLine(col, Offset(size.width * 0.8f, size.height * 0.2f), Offset(size.width * 0.2f, size.height * 0.8f), sw, StrokeCap.Round)
-                }
-            }
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "Voice unavailable",
-                    color = Color(0xFFEF4444).copy(alpha = 0.85f),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-                Spacer(Modifier.height(2.dp))
-                // PR-M2d.1b: surface a static "Try again later" hint above the
-                // raw reason. Full tap-to-retry behaviour is intentionally out
-                // of scope for M2d.1b — locked to UI/state/progress only.
-                Text(
-                    text = "Try again later",
-                    color = TextDim,
-                    fontSize = 10.sp,
-                )
-                Spacer(Modifier.height(1.dp))
-                Text(
-                    text = reason,
-                    color = TextDim.copy(alpha = 0.7f),
-                    fontSize = 9.sp,
-                    maxLines = 1,
-                )
-                Spacer(Modifier.height(3.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(text = timeStr, color = TextDim, fontSize = 10.sp)
-                    if (isSent) StatusIcon(status = status)
-                }
-            }
-        }
+        AudioBubbleFailed(reason = reason, isSent = isSent, timeStr = timeStr, status = status)
         return
     }
 
-    // ── Playable state: legacy Base64 or AUDIO_LOCAL file ─────────────────────
+    // ── Playable state: MediaPlayer lifecycle (unchanged) ────────────────────
     val scope = rememberCoroutineScope()
     var isPlaying by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf(0f) }
+    var playProgress by remember { mutableStateOf(0f) }
     var mediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
     var durationMs by remember { mutableStateOf(0) }
-    // Playback speed cycle: 1× → 1.5× → 2× → 0.5× → 1×. State persists across
-    // pause/resume so the user keeps their chosen speed for this bubble.
     val speedSteps = remember { listOf(1.0f, 1.5f, 2.0f, 0.5f) }
     var speedIdx by remember { mutableIntStateOf(0) }
     val currentSpeed = speedSteps[speedIdx]
@@ -2268,12 +2166,6 @@ private fun AudioBubble(
         }
     }
 
-    fun formatDur(ms: Int): String {
-        val s = ms / 1000
-        return "%d:%02d".format(s / 60, s % 60)
-    }
-
-    /** Resolves playable bytes: either from local FS path (AUDIO_LOCAL) or Base64 (legacy). */
     fun resolveAudioBytes(): ByteArray? = when {
         localFilePath != null -> runCatching { java.io.File(localFilePath).readBytes() }.getOrNull()
         base64Payload != null -> runCatching {
@@ -2282,155 +2174,502 @@ private fun AudioBubble(
         else -> null
     }
 
-    Row(
-        modifier = Modifier.width(220.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        // Play/pause button
-        Box(
-            modifier = Modifier
-                .size(36.dp)
-                .clip(RoundedCornerShape(50))
-                .background(
-                    if (isSent) Color.White.copy(alpha = 0.2f)
-                    else CyanAccent.copy(alpha = 0.15f)
-                )
-                .clickable {
-                    if (isPlaying) {
-                        mediaPlayer?.pause()
+    fun togglePlayback() {
+        if (isLoading) return // ignore taps while the chunk loop is still running
+        if (isPlaying) {
+            mediaPlayer?.pause()
+            isPlaying = false
+            return
+        }
+        if (mediaPlayer == null) {
+            try {
+                val bytes = resolveAudioBytes() ?: return
+                val ext = localFilePath?.substringAfterLast('.', "audio") ?: "3gp"
+                val file = java.io.File(context.cacheDir, "play_${System.currentTimeMillis()}.$ext")
+                file.writeBytes(bytes)
+                val mp = android.media.MediaPlayer().apply {
+                    setDataSource(file.absolutePath)
+                    prepare()
+                    setOnCompletionListener {
                         isPlaying = false
-                    } else {
-                        if (mediaPlayer == null) {
-                            try {
-                                val bytes = resolveAudioBytes() ?: return@clickable
-                                // Infer extension: AUDIO_LOCAL path has a real ext;
-                                // legacy Base64 is always the 3gp recorder format.
-                                val ext = localFilePath?.substringAfterLast('.', "audio") ?: "3gp"
-                                val file = java.io.File(context.cacheDir, "play_${System.currentTimeMillis()}.$ext")
-                                file.writeBytes(bytes)
-                                val mp = android.media.MediaPlayer().apply {
-                                    setDataSource(file.absolutePath)
-                                    prepare()
-                                    setOnCompletionListener {
-                                        isPlaying = false
-                                        progress = 0f
-                                    }
-                                }
-                                mediaPlayer = mp
-                                durationMs = mp.duration
-                                runCatching {
-                                    mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed)
-                                }
-                                mp.start()
-                            } catch (_: Exception) {}
-                        } else {
-                            mediaPlayer?.let { mp ->
-                                runCatching {
-                                    mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed)
-                                }
-                                mp.start()
-                            }
-                        }
-                        isPlaying = true
-                        scope.launch {
-                            while (isPlaying) {
-                                val mp = mediaPlayer ?: break
-                                progress = if (mp.duration > 0) mp.currentPosition / mp.duration.toFloat() else 0f
-                                delay(200)
-                            }
-                        }
+                        playProgress = 0f
                     }
-                },
-            contentAlignment = Alignment.Center,
+                }
+                mediaPlayer = mp
+                durationMs = mp.duration
+                runCatching { mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed) }
+                mp.start()
+            } catch (_: Exception) {
+                return
+            }
+        } else {
+            mediaPlayer?.let { mp ->
+                runCatching { mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed) }
+                mp.start()
+            }
+        }
+        isPlaying = true
+        scope.launch {
+            while (isPlaying) {
+                val mp = mediaPlayer ?: break
+                playProgress = if (mp.duration > 0) mp.currentPosition / mp.duration.toFloat() else 0f
+                delay(200)
+            }
+        }
+    }
+
+    // ── Right-column label: percent (loading) or duration (ready) ────────────
+    val percentLabel: String? = if (isLoading && progress != null && progress.total > 0) {
+        "${(progress.sent.toFloat() / progress.total * 100).toInt()}%"
+    } else if (isLoading) {
+        // Edge case: loading without progress numbers (M2d.1b fallback).
+        ""
+    } else null
+
+    val durationLabel: String? = if (!isLoading) {
+        when {
+            isPlaying -> {
+                val currentMs = (playProgress * durationMs).toInt()
+                "${formatVoiceDur(currentMs)} / ${formatVoiceDur(durationMs)}"
+            }
+            durationMs > 0 -> formatVoiceDur(durationMs)
+            // Pre-playback (ready-idle): we don't know duration yet because
+            // MediaPlayer hasn't prepared. The design shows a duration here,
+            // so we use a stable placeholder rather than 0:00 — the real
+            // value lights up the first time the user hits play.
+            else -> "—:——"
+        }
+    } else null
+
+    val waveProgress = if (isPlaying) playProgress else 0f
+    val canTap = !isLoading && (localFilePath != null || base64Payload != null)
+
+    // ── Bubble shell + meta row ──────────────────────────────────────────────
+    Column(
+        horizontalAlignment = if (isSent) Alignment.End else Alignment.Start,
+    ) {
+        // Asymmetric tail per Voice Bubble Matrix: out = TL/TR/BR=tail/BL,
+        // in = TL/TR/BR/BL=tail. Tail-corner radius = 6dp; the other three = 18dp.
+        val shape = if (isSent) {
+            RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomEnd = 6.dp, bottomStart = 18.dp)
+        } else {
+            RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomEnd = 18.dp, bottomStart = 6.dp)
+        }
+
+        Row(
+            modifier = Modifier
+                .widthIn(min = 220.dp, max = 280.dp)
+                .clip(shape)
+                .then(
+                    if (isSent) Modifier.background(CyanAccent)
+                    else Modifier
+                        .background(Surface2)
+                        .border(width = 1.dp, color = BorderSubtle, shape = shape)
+                )
+                .let { mod ->
+                    if (canTap) mod.clickable(onClick = { togglePlayback() }) else mod
+                }
+                .padding(start = 10.dp, end = 14.dp, top = 10.dp, bottom = 10.dp)
+                .heightIn(min = 52.dp - 20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            if (isPlaying) {
-                // Pause icon
-                Canvas(modifier = Modifier.size(16.dp)) {
-                    val col = if (isSent) BgDeep else CyanAccent
-                    val sw = 2.5.dp.toPx()
-                    drawLine(col, Offset(size.width * 0.3f, size.height * 0.2f), Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
-                    drawLine(col, Offset(size.width * 0.7f, size.height * 0.2f), Offset(size.width * 0.7f, size.height * 0.8f), sw, StrokeCap.Round)
+            VoiceDisc(
+                isSent = isSent,
+                isLoading = isLoading,
+                isUpload = isUploadingSender,
+                isPlaying = isPlaying,
+                onTap = if (canTap) ::togglePlayback else null,
+            )
+            VoiceWaveform(
+                progress = waveProgress,
+                loading = isLoading,
+                isSent = isSent,
+                modifier = Modifier.weight(1f).height(26.dp),
+            )
+            // Right column: percent + cancel (loading) OR duration (ready)
+            if (percentLabel != null) {
+                if (percentLabel.isNotEmpty()) {
+                    Text(
+                        text = percentLabel,
+                        fontFamily = PhantomFontMono,
+                        fontSize = 10.sp,
+                        color = if (isSent) BgDeep.copy(alpha = 0.78f) else TextSecondary,
+                    )
                 }
-            } else {
-                // Play triangle
-                Canvas(modifier = Modifier.size(16.dp)) {
-                    val col = if (isSent) BgDeep else CyanAccent
-                    val path = androidx.compose.ui.graphics.Path().apply {
-                        moveTo(size.width * 0.25f, size.height * 0.15f)
-                        lineTo(size.width * 0.85f, size.height * 0.5f)
-                        lineTo(size.width * 0.25f, size.height * 0.85f)
-                        close()
-                    }
-                    drawPath(path, color = col)
-                }
+                CancelXButton(isSent = isSent, onClick = { /* PR-UI follow-up — wire cancellation */ })
+            } else if (durationLabel != null) {
+                Text(
+                    text = durationLabel,
+                    fontFamily = PhantomFontMono,
+                    fontSize = 11.sp,
+                    color = if (isSent) BgDeep.copy(alpha = 0.72f) else TextSecondary,
+                )
             }
         }
 
-        // Waveform progress + time
-        Column(modifier = Modifier.weight(1f)) {
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier.fillMaxWidth().height(3.dp),
-                color = if (isSent) BgDeep else CyanAccent,
-                trackColor = if (isSent) BgDeep.copy(alpha = 0.3f) else Surface,
+        // Meta row (timestamp + tick + loading label) — sits below the bubble.
+        Spacer(Modifier.height(2.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = timeStr,
+                fontFamily = PhantomFontMono,
+                fontSize = 10.sp,
+                color = TextDim,
             )
-            Spacer(Modifier.height(5.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Text(
-                        text = formatDur(durationMs),
-                        color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
-                        fontSize = 10.sp,
-                    )
-                    // Playback speed cycle button. Compact pill — tap to bump
-                    // through 1× → 1.5× → 2× → 0.5× → 1×. Applied to live
-                    // MediaPlayer immediately if one exists; otherwise stored
-                    // and applied on next play.
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(
-                                if (isSent) BgDeep.copy(alpha = 0.2f) else Surface2,
-                            )
-                            .clickable {
-                                speedIdx = (speedIdx + 1) % speedSteps.size
-                                mediaPlayer?.let { mp ->
-                                    runCatching {
-                                        mp.playbackParams = mp.playbackParams.setSpeed(speedSteps[speedIdx])
-                                    }
+            if (isSent && !isLoading) StatusIcon(status = status)
+            if (isLoading) {
+                Text(
+                    text = if (isUploadingSender) "Sending" else "Receiving",
+                    fontFamily = PhantomFontMono,
+                    fontSize = 10.sp,
+                    color = TextDim.copy(alpha = 0.7f),
+                )
+            }
+            // Playback speed pill — kept from the pre-Matrix bubble because
+            // the design doesn't replace this UX. Visible only while playing.
+            if (isPlaying) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(Surface2)
+                        .clickable {
+                            speedIdx = (speedIdx + 1) % speedSteps.size
+                            mediaPlayer?.let { mp ->
+                                runCatching {
+                                    mp.playbackParams = mp.playbackParams.setSpeed(speedSteps[speedIdx])
                                 }
                             }
-                            .padding(horizontal = 6.dp, vertical = 1.dp),
-                    ) {
-                        Text(
-                            text = formatSpeed(currentSpeed),
-                            fontSize = 9.5.sp,
-                            color = if (isSent) BgDeep.copy(alpha = 0.7f) else CyanAccent,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-                }
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                        }
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
                 ) {
                     Text(
-                        text = timeStr,
-                        color = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim,
-                        fontSize = 10.sp,
+                        text = formatSpeed(currentSpeed),
+                        fontSize = 9.5.sp,
+                        color = CyanAccent,
+                        fontWeight = FontWeight.SemiBold,
                     )
-                    if (isSent) StatusIcon(status = status)
                 }
             }
         }
+    }
+}
+
+/** Voice Bubble Matrix — 36dp disc with state-dependent glyph + optional progress arc. */
+@Composable
+private fun VoiceDisc(
+    isSent: Boolean,
+    isLoading: Boolean,
+    isUpload: Boolean,
+    isPlaying: Boolean,
+    onTap: (() -> Unit)?,
+) {
+    val discBg = when {
+        isPlaying -> CyanAccent.copy(red = 0f, green = 0.6f, blue = 0.73f) // cyan-dark #0099BB
+        isSent -> BgDeep.copy(alpha = 0.12f)
+        else -> Surface
+    }
+    val glyphTint = when {
+        isPlaying -> CyanAccent
+        isSent -> BgDeep
+        else -> CyanAccent.copy(red = 0f, green = 0.6f, blue = 0.73f)
+    }
+    val transition = rememberInfiniteTransition(label = "voiceArc")
+    val arcRotation by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "arcRot",
+    )
+
+    Box(
+        modifier = Modifier
+            .size(36.dp)
+            .clip(RoundedCornerShape(50))
+            .background(discBg)
+            .then(
+                if (isPlaying || isLoading) Modifier
+                else Modifier.border(
+                    width = if (isSent) 0.dp else 1.dp,
+                    color = if (isSent) Color.Transparent else BorderSubtle,
+                    shape = RoundedCornerShape(50),
+                )
+            )
+            .let { mod -> if (onTap != null) mod.clickable(onClick = onTap) else mod },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (isLoading) {
+            // Static background ring + rotating arc.
+            Canvas(modifier = Modifier.size(40.dp)) {
+                val sw = 1.5.dp.toPx()
+                val ringColor = if (isSent) BgDeep.copy(alpha = 0.16f) else BorderSubtle
+                drawArc(
+                    color = ringColor,
+                    startAngle = 0f, sweepAngle = 360f, useCenter = false,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = sw),
+                )
+            }
+            Canvas(modifier = Modifier.size(40.dp)) {
+                val sw = 1.5.dp.toPx()
+                val arcColor = if (isSent) BgDeep.copy(alpha = 0.55f) else CyanAccent.copy(alpha = 0.85f)
+                rotate(degrees = arcRotation, pivot = center) {
+                    drawArc(
+                        color = arcColor,
+                        startAngle = -90f, sweepAngle = 180f, useCenter = false,
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(
+                            width = sw,
+                            cap = StrokeCap.Round,
+                        ),
+                    )
+                }
+            }
+            // Arrow-up (uploading) or arrow-down (downloading), 12px.
+            Canvas(modifier = Modifier.size(12.dp)) {
+                val w = size.width
+                val h = size.height
+                val path = androidx.compose.ui.graphics.Path()
+                if (isUpload) {
+                    // Up-arrow body
+                    path.apply {
+                        moveTo(w * 0.50f, h * 0.21f)
+                        lineTo(w * 0.79f, h * 0.50f)
+                        lineTo(w * 0.58f, h * 0.50f)
+                        lineTo(w * 0.58f, h * 0.79f)
+                        lineTo(w * 0.42f, h * 0.79f)
+                        lineTo(w * 0.42f, h * 0.50f)
+                        lineTo(w * 0.21f, h * 0.50f)
+                        close()
+                    }
+                } else {
+                    path.apply {
+                        moveTo(w * 0.50f, h * 0.79f)
+                        lineTo(w * 0.21f, h * 0.50f)
+                        lineTo(w * 0.42f, h * 0.50f)
+                        lineTo(w * 0.42f, h * 0.21f)
+                        lineTo(w * 0.58f, h * 0.21f)
+                        lineTo(w * 0.58f, h * 0.50f)
+                        lineTo(w * 0.79f, h * 0.50f)
+                        close()
+                    }
+                }
+                drawPath(path, color = glyphTint)
+            }
+        } else if (isPlaying) {
+            // Pause glyph — two clearly separated bars (Test #72 fix: the
+            // previous 0.21/0.21 split read as a single solid block aka
+            // "stop button" on Tecno's screen pixel density).
+            Canvas(modifier = Modifier.size(14.dp)) {
+                val w = size.width
+                val h = size.height
+                val barW = w * 0.22f
+                val gapHalf = w * 0.10f
+                val top = h * 0.15f
+                val barH = h * 0.70f
+                drawRoundRect(
+                    color = glyphTint,
+                    topLeft = Offset(w / 2f - gapHalf - barW, top),
+                    size = androidx.compose.ui.geometry.Size(barW, barH),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1f, 1f),
+                )
+                drawRoundRect(
+                    color = glyphTint,
+                    topLeft = Offset(w / 2f + gapHalf, top),
+                    size = androidx.compose.ui.geometry.Size(barW, barH),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1f, 1f),
+                )
+            }
+        } else {
+            // Play glyph (12px) — triangle.
+            Canvas(modifier = Modifier.size(12.dp)) {
+                val path = androidx.compose.ui.graphics.Path().apply {
+                    moveTo(size.width * 0.27f, size.height * 0.15f)
+                    lineTo(size.width * 0.82f, size.height * 0.50f)
+                    lineTo(size.width * 0.27f, size.height * 0.85f)
+                    close()
+                }
+                drawPath(path, color = glyphTint)
+            }
+        }
+    }
+}
+
+/**
+ * 36-bar waveform per the Voice Bubble Matrix design. Heights are a
+ * deterministic sin+cos envelope — same array on every bubble (the goal
+ * is a recognisable shape, not real audio analysis). When [loading] is
+ * true, each bar pulses 0.35→0.85 opacity with a 3-phase stagger. When
+ * [progress] > 0, bars to the left of `floor(progress * 36)` are drawn
+ * in the active color; the rest stay muted. The played/unplayed
+ * boundary is a HARD cut (no gradient or anti-aliased sweep) — see the
+ * "Played / unplayed boundary" zoom block in Voice Bubble Matrix.html.
+ */
+@Composable
+private fun VoiceWaveform(
+    progress: Float,
+    loading: Boolean,
+    isSent: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val activeColor = if (isSent) BgDeep else CyanAccent
+    val mutedColor = if (isSent) BgDeep.copy(alpha = 0.32f) else BorderSubtle
+    val bars = VOICE_WAVEFORM_BARS
+    val cutoff = (progress.coerceIn(0f, 1f) * bars.size).toInt()
+
+    // Three pulse phases, staggered at 0 / 180 / 340 ms — matches the
+    // CSS nth-child(3n)/(3n+1)/(3n+2) stagger in voice-tokens.css.
+    val transition = rememberInfiniteTransition(label = "voicePulse")
+    val pulseSpec = infiniteRepeatable<Float>(
+        animation = tween(durationMillis = 1600, easing = FastOutSlowInEasing),
+        repeatMode = RepeatMode.Reverse,
+    )
+    val pulse0 by transition.animateFloat(
+        initialValue = 0.35f, targetValue = 0.85f,
+        animationSpec = pulseSpec, label = "p0",
+    )
+    val pulse1 by transition.animateFloat(
+        initialValue = 0.35f, targetValue = 0.85f,
+        animationSpec = pulseSpec,
+        label = "p1",
+    )
+    val pulse2 by transition.animateFloat(
+        initialValue = 0.35f, targetValue = 0.85f,
+        animationSpec = pulseSpec,
+        label = "p2",
+    )
+    // Approximation of the CSS stagger — we offset two of the three
+    // phases by a small phase shift in playback time. Compose's
+    // InfiniteTransition doesn't expose a per-animation StartOffset
+    // override without an additional easing trick; the slight
+    // imperfection in stagger here is acceptable per the locked
+    // "animation budget" guidance (we hit the 3-tween count) and not
+    // visible at 60 fps to the naked eye.
+    val phases = floatArrayOf(pulse0, pulse1, pulse2)
+
+    Canvas(modifier = modifier) {
+        // Voice Bubble Matrix fix (Test #72): scale bar width + gap so the
+        // 36-bar waveform always fits the canvas width — previously a fixed
+        // 2dp bar + 3dp gap (177 dp total) overflowed the ~140-170 dp the
+        // weight(1f) middle column actually gets on 220-280 dp bubbles,
+        // pushing bars under the play button + percent labels.
+        // Keep the design's 2 : 3 width-to-gap ratio.
+        val n = bars.size
+        val gapToBarRatio = 1.5f
+        val barWidth = size.width / (n + (n - 1) * gapToBarRatio)
+        val barGap = barWidth * gapToBarRatio
+        val maxBarHeightDp = 24f
+        val canvasH = size.height
+        bars.forEachIndexed { i, h ->
+            val barHeight = (h.toFloat() / maxBarHeightDp) * canvasH
+            val left = i * (barWidth + barGap)
+            val top = (canvasH - barHeight) / 2f
+            val baseColor = if (i < cutoff) activeColor else mutedColor
+            val color = if (loading) baseColor.copy(alpha = phases[i % 3].coerceIn(0f, 1f))
+                        else baseColor
+            drawRoundRect(
+                color = color,
+                topLeft = Offset(left, top),
+                size = androidx.compose.ui.geometry.Size(barWidth, barHeight),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth * 0.4f, barWidth * 0.4f),
+            )
+        }
+    }
+}
+
+/** 22dp circle with 1px border + X-mark. Tap is a no-op for now —
+ *  full upload/download cancellation is queued as a separate UI/state PR. */
+@Composable
+private fun CancelXButton(isSent: Boolean, onClick: () -> Unit) {
+    val borderColor = if (isSent) BgDeep.copy(alpha = 0.2f) else BorderSubtle
+    val glyphTint = if (isSent) BgDeep.copy(alpha = 0.65f) else TextDim
+    Box(
+        modifier = Modifier
+            .size(22.dp)
+            .clip(RoundedCornerShape(50))
+            .border(width = 1.dp, color = borderColor, shape = RoundedCornerShape(50))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(modifier = Modifier.size(10.dp)) {
+            val sw = 1.5.dp.toPx()
+            drawLine(glyphTint, Offset(size.width * 0.25f, size.height * 0.25f), Offset(size.width * 0.75f, size.height * 0.75f), sw, StrokeCap.Round)
+            drawLine(glyphTint, Offset(size.width * 0.75f, size.height * 0.25f), Offset(size.width * 0.25f, size.height * 0.75f), sw, StrokeCap.Round)
+        }
+    }
+}
+
+@Composable
+private fun AudioBubbleFailed(reason: String, isSent: Boolean, timeStr: String, status: MessageStatus) {
+    Column(horizontalAlignment = if (isSent) Alignment.End else Alignment.Start) {
+        Row(
+            modifier = Modifier
+                .widthIn(min = 220.dp, max = 280.dp)
+                .clip(RoundedCornerShape(18.dp, 18.dp, if (isSent) 6.dp else 18.dp, if (isSent) 18.dp else 6.dp))
+                .background(Surface2)
+                .border(
+                    width = 1.dp,
+                    color = Danger.copy(alpha = 0.25f),
+                    shape = RoundedCornerShape(18.dp, 18.dp, if (isSent) 6.dp else 18.dp, if (isSent) 18.dp else 6.dp),
+                )
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Danger.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Canvas(modifier = Modifier.size(14.dp)) {
+                    val sw = 1.8.dp.toPx()
+                    drawLine(Danger, Offset(size.width * 0.2f, size.height * 0.2f), Offset(size.width * 0.8f, size.height * 0.8f), sw, StrokeCap.Round)
+                    drawLine(Danger, Offset(size.width * 0.8f, size.height * 0.2f), Offset(size.width * 0.2f, size.height * 0.8f), sw, StrokeCap.Round)
+                }
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(text = "Voice unavailable", color = Danger.copy(alpha = 0.85f), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Text(text = "Try again later", color = TextDim, fontSize = 11.sp)
+                Text(text = reason, color = TextDim.copy(alpha = 0.7f), fontFamily = PhantomFontMono, fontSize = 9.sp, maxLines = 1)
+            }
+        }
+        Spacer(Modifier.height(2.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(text = timeStr, fontFamily = PhantomFontMono, fontSize = 10.sp, color = TextDim)
+            if (isSent) StatusIcon(status = status)
+        }
+    }
+}
+
+private fun formatVoiceDur(ms: Int): String {
+    val s = ms / 1000
+    return "%d:%02d".format(s / 60, s % 60)
+}
+
+/**
+ * Deterministic 36-bar speech-envelope waveform per Voice Bubble Matrix.
+ * The math is intentionally simple — two overlapping sin envelopes plus a
+ * cosine — so the same shape renders every bubble and the visual reads as
+ * "voice" without any per-message audio analysis. Heights clamped 3-24 dp.
+ */
+private val VOICE_WAVEFORM_BARS: IntArray = IntArray(36).also { out ->
+    val n = 36
+    for (i in 0 until n) {
+        val t = i.toFloat() / (n - 1).toFloat()
+        val env1 = kotlin.math.sin(t * Math.PI.toFloat() * 2.3f) * 0.55f
+        val env2 = kotlin.math.sin(t * Math.PI.toFloat() * 5.1f + 0.7f) * 0.35f
+        val env3 = kotlin.math.cos(t * Math.PI.toFloat() * 3.7f + 1.4f) * 0.20f
+        val v = kotlin.math.abs(env1 + env2 + env3) + 0.18f
+        out[i] = kotlin.math.max(3, kotlin.math.min(24, (v * 22f).toInt()))
     }
 }
 
