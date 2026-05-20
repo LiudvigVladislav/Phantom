@@ -88,6 +88,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.produceState
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
@@ -3331,7 +3332,18 @@ private fun InputBar(
                                     && currentIsSendVoiceVisual.value
 
                                 var locked = false
-                                var swipeCancelArmed = false
+                                // PR-UI-REC3.1: replaced the previous
+                                // `swipeCancelArmed` boolean latch with a
+                                // haptic-fired tracker. Cancel intent is
+                                // re-evaluated from the LIVE drag distance
+                                // at release time (see release branch
+                                // below) so the user can drag back out of
+                                // the threshold and the gesture sends
+                                // instead of canceling. `swipeCancelHapticFired`
+                                // exists only to fire the haptic exactly
+                                // once when the finger first crosses the
+                                // threshold.
+                                var swipeCancelHapticFired = false
                                 var recordingStarted = false
 
                                 if (!isSendVoiceTap) {
@@ -3348,7 +3360,7 @@ private fun InputBar(
                                     val change = event.changes.firstOrNull { it.id == downId }
                                         ?: continue
 
-                                    if (recordingStarted && !locked && !swipeCancelArmed) {
+                                    if (recordingStarted && !locked) {
                                         // Drag-up-to-lock.
                                         val dragUp = downY - change.position.y
                                         if (dragUp >= lockThresholdPx) {
@@ -3362,22 +3374,33 @@ private fun InputBar(
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                             onMicSlideUpLock()
                                         } else {
-                                            // PR-UI-REC2.4 — swipe-left-to-
-                                            // cancel guard. PR-UI-REC3 adds
-                                            // the live swipe-progress
-                                            // visual on top of this gesture
-                                            // by publishing `swipeDragLeftPx`
-                                            // to the render branch.
+                                            // PR-UI-REC3.1 — keep updating
+                                            // `swipeDragLeftPx` on every
+                                            // pointer event (no
+                                            // `!swipeCancelArmed` short-
+                                            // circuit). The cancel
+                                            // decision is now taken at
+                                            // release time from the LIVE
+                                            // distance, so the user can
+                                            // drag past the threshold and
+                                            // then drag back below it to
+                                            // un-arm. Negative drag
+                                            // (finger moved right) clamps
+                                            // to 0 so the overlay never
+                                            // shows when the user is not
+                                            // actively swiping left.
                                             val dragLeft = downX - change.position.x
-                                            // Publish live distance for the
-                                            // visual layer (trail / handle /
-                                            // distance %). Negative drag
-                                            // (finger moved right) clamps to
-                                            // 0 so the overlay never shows
-                                            // when the user is not swiping.
                                             swipeDragLeftPx = dragLeft.coerceAtLeast(0f)
-                                            if (dragLeft >= swipeCancelThresholdPx) {
-                                                swipeCancelArmed = true
+                                            // Fire the threshold-crossing
+                                            // haptic exactly once. We do
+                                            // NOT fire haptic on crossing
+                                            // back — that would feel
+                                            // chatty during a hesitant
+                                            // gesture.
+                                            if (!swipeCancelHapticFired
+                                                && dragLeft >= swipeCancelThresholdPx
+                                            ) {
+                                                swipeCancelHapticFired = true
                                                 isMicHeld = false
                                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                             }
@@ -3386,11 +3409,23 @@ private fun InputBar(
 
                                     if (!change.pressed) {
                                         val heldMs = System.currentTimeMillis() - downTimeMs
+                                        // PR-UI-REC3.1 — final cancel
+                                        // decision uses the LIVE drag
+                                        // distance at the moment of
+                                        // release. If the user crossed
+                                        // 56 dp earlier but then dragged
+                                        // back below it, the recording
+                                        // sends normally (per heldMs).
+                                        // The percentage visual the user
+                                        // saw drop back down matches the
+                                        // actual gesture outcome.
+                                        val finalDragLeftPx = (downX - change.position.x).coerceAtLeast(0f)
+                                        val swipeCancelAtRelease = finalDragLeftPx >= swipeCancelThresholdPx
                                         when {
                                             isSendVoiceTap -> {
                                                 onSendVoiceTap()
                                             }
-                                            swipeCancelArmed -> {
+                                            swipeCancelAtRelease -> {
                                                 onMicHoldSwipeCancel(heldMs)
                                             }
                                             locked -> {
@@ -3841,52 +3876,60 @@ private fun RecPanelSwipeZone(
             )
         }
 
-        // Hint label "← SWIPE TO DISCARD". Sits on the left side. Fades
-        // to 0.55 alpha once the trail has covered it so the visual
-        // hierarchy moves to the live distance / handle as the gesture
-        // progresses.
+        // PR-UI-REC3.1 — single Row instead of two `align()`-anchored
+        // overlays. Test #76.6 on a narrow Tecno screen showed the
+        // CenterStart hint and the CenterEnd percentage running into
+        // each other because they did not share a layout pass. Now the
+        // hint occupies a weight=1 slot (it ellipsises if necessary)
+        // and the percent + trash handle have fixed widths on the
+        // right, so the two never collide.
         Row(
             modifier = Modifier
-                .align(Alignment.CenterStart)
-                .padding(start = 14.dp)
-                .graphicsLayer(alpha = (1f - clampedFraction * 0.6f).coerceIn(0.4f, 1f)),
+                .fillMaxSize()
+                .padding(start = 14.dp, end = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Canvas(modifier = Modifier.size(width = 9.dp, height = 9.dp)) {
-                val sw = 1.5.dp.toPx()
-                val cap = StrokeCap.Round
-                val cy = size.height / 2f
-                drawLine(Danger, Offset(size.width * 0.95f, cy), Offset(size.width * 0.05f, cy), sw, cap)
-                drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy - size.height * 0.35f), sw, cap)
-                drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy + size.height * 0.35f), sw, cap)
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .graphicsLayer(alpha = (1f - clampedFraction * 0.6f).coerceIn(0.4f, 1f)),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Canvas(modifier = Modifier.size(width = 9.dp, height = 9.dp)) {
+                    val sw = 1.5.dp.toPx()
+                    val cap = StrokeCap.Round
+                    val cy = size.height / 2f
+                    drawLine(Danger, Offset(size.width * 0.95f, cy), Offset(size.width * 0.05f, cy), sw, cap)
+                    drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy - size.height * 0.35f), sw, cap)
+                    drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy + size.height * 0.35f), sw, cap)
+                }
+                Text(
+                    text = "SWIPE TO DISCARD",
+                    color = Danger,
+                    fontSize = 10.sp,
+                    fontFamily = PhantomFontMono,
+                    letterSpacing = 1.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
-            Text(
-                text = "SWIPE TO DISCARD",
-                color = Danger,
-                fontSize = 10.sp,
-                fontFamily = PhantomFontMono,
-                letterSpacing = 1.sp,
-            )
-        }
 
-        // Live distance percentage + trash handle. Both anchored to the
-        // right edge of the zone; both stay visible throughout the swipe
-        // and the distance text updates in real time.
-        Row(
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
+            Spacer(Modifier.width(8.dp))
+
             Text(
                 text = "${(clampedFraction * 100).toInt()}%",
                 color = Danger.copy(alpha = 0.65f),
                 fontSize = 9.sp,
                 fontFamily = PhantomFontMono,
                 letterSpacing = 0.5.sp,
+                maxLines = 1,
+                textAlign = TextAlign.End,
+                modifier = Modifier.widthIn(min = 32.dp),
             )
+
+            Spacer(Modifier.width(6.dp))
+
             Box(
                 modifier = Modifier
                     .size(32.dp)
@@ -3900,17 +3943,13 @@ private fun RecPanelSwipeZone(
                     val white = Color.White
                     // Trash glyph: horizontal lid line + vertical body
                     // outline + two grip bars on top of lid.
-                    // Top line (lid)
                     drawLine(white, Offset(size.width * 0.15f, size.height * 0.30f), Offset(size.width * 0.85f, size.height * 0.30f), sw, cap)
-                    // Lid handle (small notch on top)
                     drawLine(white, Offset(size.width * 0.40f, size.height * 0.30f), Offset(size.width * 0.40f, size.height * 0.18f), sw, cap)
                     drawLine(white, Offset(size.width * 0.40f, size.height * 0.18f), Offset(size.width * 0.60f, size.height * 0.18f), sw, cap)
                     drawLine(white, Offset(size.width * 0.60f, size.height * 0.18f), Offset(size.width * 0.60f, size.height * 0.30f), sw, cap)
-                    // Body (rounded rect via four lines)
                     drawLine(white, Offset(size.width * 0.22f, size.height * 0.30f), Offset(size.width * 0.30f, size.height * 0.88f), sw, cap)
                     drawLine(white, Offset(size.width * 0.78f, size.height * 0.30f), Offset(size.width * 0.70f, size.height * 0.88f), sw, cap)
                     drawLine(white, Offset(size.width * 0.30f, size.height * 0.88f), Offset(size.width * 0.70f, size.height * 0.88f), sw, cap)
-                    // Inner ribs
                     drawLine(white, Offset(size.width * 0.40f, size.height * 0.42f), Offset(size.width * 0.40f, size.height * 0.78f), sw, cap)
                     drawLine(white, Offset(size.width * 0.60f, size.height * 0.42f), Offset(size.width * 0.60f, size.height * 0.78f), sw, cap)
                 }
