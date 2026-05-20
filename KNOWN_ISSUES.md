@@ -63,7 +63,7 @@ These bring the affected configuration from "messages stuck for 60 s" down to "1
 3. *Settings → Battery → Battery saver* → off during use
 4. If "Power Marathon" / "Smart Power" / "Phone Master" exists in the OEM apps, add PHANTOM to the whitelist
 
-**Long-term fix (Alpha 2).** Push-on-disconnect via Unified Push (FOSS protocol, no Google dependency). PHANTOM intentionally does **not** integrate Firebase Cloud Messaging: FCM would put a Google trackable identifier on every install and break the zero-third-party-metadata posture documented in [ADR-001](docs/adr/ADR-001-System-Boundaries.md) and [Threat Model v0](docs/threat-model/Threat_Model_v0.md). The Firebase Messaging service scaffolding was present in earlier builds as opt-in (gated on a missing `google-services.json`) and was removed entirely on 2026-05-14 to align the code with this stance.
+**Long-term fix.** The push-on-disconnect approach that earlier docs pointed at (Unified Push / FCM hybrids) was retired during the 2026-05-14 strategic pivot — both UnifiedPush and FCM are out of scope, because the metadata-leak posture documented in [ADR-001](docs/adr/ADR-001-System-Boundaries.md) and [Threat Model v0](docs/threat-model/Threat_Model_v0.md) makes any always-on third-party push channel an architectural non-starter. The current answer for this issue is the mitigations listed above (WifiLock, WakeLock, app-level ping/pong, `forceCancelAllEngineCalls`, relay store-and-forward) plus the Reality / REST fallback transports added later — they reduce the user-visible impact to a 1-3 s reconnect latency on affected OEMs. There is no separate scheduled push-channel work; if a future approach is identified, it will land as its own ADR.
 
 ---
 
@@ -214,9 +214,9 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 
 ---
 
-### ISSUE-013: Stateful NAT/CGN/TSPU silent drops on cellular Russia — Tor + UnifiedPush hybrid in implementation
+### ISSUE-013: Stateful NAT/CGN/TSPU silent drops on cellular Russia — multi-transport stack live, original hybrid plan superseded
 
-**Status:** Diagnosis revised 2026-05-04 (ADR-013 was wrong about firmware-radio-parking). ADR-014 TCP keepalive applied as Layer 2 — partial improvement (50 s → 120 s) but did not solve. Real fix is in implementation in `feat/tor-unified-push-transport` per **ADR-016 (Tor + UnifiedPush hybrid transport architecture)** and **ADR-018 (Threat Model v0.1 revision)**. Will move to "resolved" once ADR-016 ships and Beta validation passes.
+**Status:** Diagnosis revised 2026-05-04 (ADR-013 was wrong about firmware-radio-parking). The original "Tor + UnifiedPush hybrid" architecture proposed in `feat/tor-unified-push-transport` / ADR-016 / ADR-018 was **superseded by the 2026-05-14 strategic pivot and the 2026-05-15 follow-up**: UnifiedPush was retired (always-on third-party push channel was deemed an unrecoverable metadata leak), and Tor was demoted to a text-only emergency fallback after Test #42 on Tele2 LTE showed Reality probe failures dropping straight through to Tor. The current production stack now has three transports — direct WSS (`Standard`), Reality (`Private`, the load-bearing path on RU mobile per the pivot), and Tor (`Ghost`, text-only) — plus a REST-poll fallback (PR-D0r / PR-D1*) when WS Frame.Text is being dropped by the carrier middlebox. The "silent drops on cellular Russia" symptom no longer has a single fix; it is addressed in layers and tracked via the M1w / M2 / D0r / D1 sprints rather than a single hybrid PR.
 
 **Revised root cause.** The 4-test matrix on 2026-05-04 (Tecno Spark Go + Pixel 8 Pro emulator on the same МТС WiFi, identical network path) demonstrated that the "WebSocket dropped silently every 50-60 s" symptom appears on the **Pixel emulator running on a stable Windows PC** as well — invalidating the Tecno-firmware-radio-parking explanation. Both devices stay perfectly stable behind any VPN. The actual root cause is a **stateful network element along the path between Russian carrier WiFi and Hetinki relay**: Carrier-Grade NAT, transit border filtering (TSPU), or both. VPN tunnels emit their own keepalives at 10-25 s and refresh the NAT entry; bare WSS without TCP keepalive does not.
 
@@ -234,30 +234,21 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 
 Test 5 (МТС WiFi, both devices): connection lifetime improved 50 s → 120 s, but voice burst delivery still fails because the connection silently goes one-way during the burst. Layer 2 is **partially effective but not sufficient on its own** for cellular Russia. Kept as defence-in-depth on the direct WSS path; Tor mode will be the primary path for users on restrictive networks.
 
-**Real fix (ADR-016, in implementation 2026-05-04+):**
+**Current transport stack (post-2026-05-15 pivot):**
 
-Hybrid transport architecture combining:
+- **`Standard` — direct WSS.** Works on every tested network when the carrier path is healthy.
+- **`Private` — Reality / VLESS+REALITY through Xray.** The load-bearing transport on Russian mobile carriers (Tele2 / МТС). Auto-skipped when a system VPN is active (see ISSUE-015). When Reality probe fails, the chain falls through to Tor for text.
+- **`Ghost` — Tor v3 onion service** via `kmp-tor 2.6.0` (Tor 0.4.9.5, all four Android ABIs incl. ARM32). Demoted to text-only emergency fallback after Test #42 (2026-05-15) — cannot carry WebRTC for calls (TCP-only) and cannot carry voice messages reliably on RU LTE.
+- **REST fallback (PR-D0r / PR-D1 series).** When Tele2-class middlebox is silently dropping WS Frame.Text (the "Layer A" diagnosis 2026-05-16, see ISSUE-001 / Tele2 diagnostic notes in `docs/PROJECT_LOG.md`), the orchestrator flips the active transport to REST short-poll with server-side idempotency. PR-M1w then carries voice via the encrypted media-upload path on top of REST.
 
-- **Tor v3 onion service** for the data plane (defeats CGN/TSPU by routing through Tor circuits the stateful element does not fingerprint as PHANTOM-specific). Implemented via `kmp-tor 2.6.0` (bundled Tor 0.4.9.5, all four Android ABIs covered including ARM32 for Tecno/Itel users).
-- **Self-hosted UnifiedPush** for the wakeup channel (`ntfy.phntm.pro`, audited per `no-go-checks/03-ntfy-audit.md`). Distributor sees opaque per-install token and push timing only — never identity, never content. Push payload is a single null byte.
-- **Three Privacy Modes** (Auto / Always-Tor / Never) selectable in app settings. Auto is the default and uses direct WSS first, switches to Tor on repeated failure.
-- **Calls remain on direct WSS only.** Tor is TCP-only, WebRTC is UDP — architectural impossibility shared by Briar / Cwtch / Ricochet Refresh. Tor mode disables calls with explicit UX. Future research will explore alternative transport for calls.
+Calls in restrictive mobile networks remain **unproven** — the Reality+WebRTC combination has not had a production-quality test yet (tracked separately as PR-C2 / PR-C3 in the calls track).
 
-The combination delivers metadata-privacy + battery efficiency simultaneously — the unbuilt-yet architecture that no production messenger ships today (Briar = Tor, no push, battery cost; Signal = FCM push, no Tor, Google metadata leak).
+**Implementation references** (multi-PR, ongoing):
+- ADR-019 — Xray VLESS+REALITY as outer transport (production-validated Stage 5E, 2026-05-07).
+- ADR-018 — Threat Model v0.1 revision (Tor-mode limitations, scope decisions).
+- `docs/PROJECT_LOG.md` — Tele2 diagnostic, M1w voice path, M2 trilogy, D0r / D1 REST fallback, D2a voice-on-Limited-realtime gating.
 
-**Implementation tracking:** `feat/tor-unified-push-transport` branch.
-- ADR-016 (architecture decision)
-- ADR-018 (Threat Model v0.1 revision — honest about Tor-mode-no-calls, UnifiedPush distributor metadata, global-passive-adversary out of scope, Vanguards-Lite as built-in default rather than full Vanguards; renumbered from ADR-017 in 2026-05-14 cleanup)
-- `docs/research/tor-feasibility-2026-05-04/` — full feasibility research (10 docs + 3 NO-GO checks all passed)
-
-**Why this is now classified as "in implementation", not "limitation":**
-
-- Two disjoint research streams (transport investigation + Tor feasibility) produced consistent diagnoses
-- All architectural blockers have been reviewed: kmp-tor ARM32 GO, Vanguards-Lite GO, ntfy self-host CONDITIONAL GO with hardened config
-- Effort estimate ~3-4 weeks single-developer, comparable to original UnifiedPush-only Phase 5 plan
-- Solves both the silent-drop problem and the always-on-battery problem in one architecture
-
-**User-facing copy update (Privacy Policy + onboarding):** when ADR-016 ships, add: "PHANTOM works on restrictive networks (including Russian carriers without VPN) via a Tor-based fallback. The fallback is opt-in by default but the app will switch to it automatically if the direct connection fails repeatedly. Voice and video calls are not available in Tor mode — calls require a direct connection. Future work will explore alternative transport for calls in restrictive networks."
+The `feat/tor-unified-push-transport` branch retained as historical research artefact only — its UnifiedPush content is not on the roadmap.
 
 ---
 
@@ -283,7 +274,7 @@ The combination delivers metadata-privacy + battery efficiency simultaneously �
 3. **State desync between participants during establishment.** When transport reconnect fires between `call_offer` and `call_answer`, one side may show "in call / counting timer" while the other still shows "calling…" until ICE catches up. Self-resolves when the next signalling envelope arrives, typically within 1–3 s.
 4. **Speaker / earpiece routing varies.** On the phone, default routing is the earpiece (small speaker near the top, intended for holding to ear). Speaker toggle works but is a separate user action. On emulator there is no earpiece concept; default routes to the host audio device.
 
-**Root cause is architectural, not a localised bug.** WebRTC voice calls expect a stable persistent network session. PHANTOM's current transport on aggressive-OEM Android cycles through reconnects every ~30 seconds (ISSUE-013, by design until UnifiedPush). Each reconnect can disrupt ICE, DTLS-SRTP setup, or the foreground service hosting the WebRTC native code. There is no transport-layer fix without push-based wakeup.
+**Root cause is architectural, not a localised bug.** WebRTC voice calls expect a stable persistent network session. PHANTOM's transport on aggressive-OEM Android cycles through reconnects every ~30 seconds (ISSUE-013). Each reconnect can disrupt ICE, DTLS-SRTP setup, or the foreground service hosting the WebRTC native code. The original "fix this via push-based wakeup" plan was retired during the 2026-05-14 pivot (no UnifiedPush, no FCM). The current path forward for calls on restrictive networks is the dedicated calls track (PR-C2 Reality endpoint pool + realistic probe, PR-C3 TURN-over-TLS or Opus-over-Reality) — separate work, not bundled with the messaging-transport stack.
 
 **Recommendation for Alpha users:**
 
@@ -292,8 +283,8 @@ The combination delivers metadata-privacy + battery efficiency simultaneously �
 
 **Real fix path:**
 
-- **PR 2.6 (deferred to post-Phase-5):** explicit `JavaAudioDeviceModule`, `AudioFocus` request, suppress transport `forceReconnect()` while a call is active, default-on speakerphone for testing. Estimated 2–3 days when picked up.
-- **Phase 5 (UnifiedPush, ~Feb 2027):** push-based transport eliminates the 30-second reconnect cycle on aggressive-OEM devices, removing the architectural cause.
+- **PR 2.6 (post-pivot, no fixed date):** explicit `JavaAudioDeviceModule`, `AudioFocus` request, suppress transport `forceReconnect()` while a call is active, default-on speakerphone for testing. Estimated 2-3 days when picked up. Originally tagged "deferred to post-Phase-5"; Phase 5 was dissolved during the 2026-05-14 pivot so this is now simply queued behind the current voice-recorder UX track.
+- **Calls track (PR-C2 / PR-C3):** Reality endpoint pool with a realistic probe (the current `/health` probe does not catch Tele2's silent WS-drop pattern), then a transport that can carry WebRTC on restrictive networks — candidates include TURN-over-TLS on port 443 or a custom Opus-over-Reality envelope. This is the architectural answer that replaces the retired push-based-wakeup plan.
 
 **Scope decision rationale.** PRs #29 and #30 closed the user-visible call-UX bugs that were definitively fixable above the transport layer. Further iteration would require Tecno-specific WebRTC ADM debugging with diminishing returns. The development sprint priority shifted to PR 3 (voice messages over regular transport) which serves the same async-voice need at much higher reliability and is independent of WebRTC.
 
