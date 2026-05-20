@@ -2149,12 +2149,22 @@ private fun AudioBubble(
         return
     }
 
-    // ── Playable state: MediaPlayer lifecycle (unchanged) ────────────────────
+    // ── Playable state: MediaPlayer lifecycle ────────────────────────────────
     val scope = rememberCoroutineScope()
     var isPlaying by remember { mutableStateOf(false) }
+    // PR-UI-VB1 (2026-05-20): `playProgress` is the canonical playhead [0..1].
+    // It survives pause (the waveform freezes at the paused position) and is
+    // reset to 0 only by the MediaPlayer completion listener. The old logic
+    // hid `playProgress` behind `if (isPlaying) ... else 0f` which made
+    // pause look identical to stop — Vladislav Test #73 visual bug.
     var playProgress by remember { mutableStateOf(0f) }
     var mediaPlayer by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
     var durationMs by remember { mutableStateOf(0) }
+    // Reusable on-disk playback source. For [AUDIO_LOCAL:<path>] this is
+    // simply the underlying file; for [AUDIO:<base64>] legacy bubbles we
+    // decode once into the cacheDir and reuse it across the lifetime of the
+    // composable, then delete on dispose.
+    var playbackCacheFile by remember { mutableStateOf<java.io.File?>(null) }
     val speedSteps = remember { listOf(1.0f, 1.5f, 2.0f, 0.5f) }
     var speedIdx by remember { mutableIntStateOf(0) }
     val currentSpeed = speedSteps[speedIdx]
@@ -2163,15 +2173,62 @@ private fun AudioBubble(
         onDispose {
             mediaPlayer?.release()
             mediaPlayer = null
+            // Only delete the temp file we created for legacy base64 voices.
+            // For [AUDIO_LOCAL:<path>] the file is the authoritative voice
+            // store owned by VoiceFileStore — we must not delete it here.
+            playbackCacheFile?.takeIf { base64Payload != null }?.delete()
+            playbackCacheFile = null
         }
     }
 
-    fun resolveAudioBytes(): ByteArray? = when {
-        localFilePath != null -> runCatching { java.io.File(localFilePath).readBytes() }.getOrNull()
-        base64Payload != null -> runCatching {
-            android.util.Base64.decode(base64Payload, android.util.Base64.NO_WRAP)
-        }.getOrNull()
-        else -> null
+    // PR-UI-VB1: preload duration as soon as the bubble is in a ready
+    // (non-loading) state. Without this, durationMs stayed 0 until the user
+    // hit play for the first time, and the bubble showed "—:——" instead of
+    // the real total duration. `MediaMetadataRetriever` does the extraction
+    // on the IO dispatcher so the Compose main thread is never blocked, and
+    // the legacy base64 branch primes `playbackCacheFile` while it is at it
+    // so the first tap on Play doesn't re-decode.
+    LaunchedEffect(plaintextCache, isLoading) {
+        if (isLoading) return@LaunchedEffect
+        if (durationMs > 0) return@LaunchedEffect
+        val extracted = withContext(Dispatchers.IO) {
+            val sourceFile = when {
+                localFilePath != null -> {
+                    val f = java.io.File(localFilePath)
+                    if (f.exists()) f else null
+                }
+                base64Payload != null -> {
+                    val existing = playbackCacheFile
+                    if (existing != null && existing.exists()) {
+                        existing
+                    } else {
+                        val bytes = runCatching {
+                            android.util.Base64.decode(base64Payload, android.util.Base64.NO_WRAP)
+                        }.getOrNull() ?: return@withContext 0
+                        val f = java.io.File(
+                            context.cacheDir,
+                            "play_${System.currentTimeMillis()}_${plaintextCache.hashCode()}.audio",
+                        )
+                        f.writeBytes(bytes)
+                        playbackCacheFile = f
+                        f
+                    }
+                }
+                else -> null
+            } ?: return@withContext 0
+            runCatching {
+                val mmr = android.media.MediaMetadataRetriever()
+                try {
+                    mmr.setDataSource(sourceFile.absolutePath)
+                    mmr.extractMetadata(
+                        android.media.MediaMetadataRetriever.METADATA_KEY_DURATION
+                    )?.toLongOrNull()?.toInt() ?: 0
+                } finally {
+                    mmr.release()
+                }
+            }.getOrDefault(0)
+        }
+        if (extracted > 0) durationMs = extracted
     }
 
     fun togglePlayback() {
@@ -2183,12 +2240,28 @@ private fun AudioBubble(
         }
         if (mediaPlayer == null) {
             try {
-                val bytes = resolveAudioBytes() ?: return
-                val ext = localFilePath?.substringAfterLast('.', "audio") ?: "3gp"
-                val file = java.io.File(context.cacheDir, "play_${System.currentTimeMillis()}.$ext")
-                file.writeBytes(bytes)
+                // Prefer the original local file (no copy), fall back to the
+                // preloaded cache, last resort decode the legacy base64 here.
+                val playSourcePath: String = when {
+                    localFilePath != null && java.io.File(localFilePath).exists() -> localFilePath
+                    playbackCacheFile?.exists() == true -> playbackCacheFile!!.absolutePath
+                    base64Payload != null -> {
+                        val bytes = runCatching {
+                            android.util.Base64.decode(base64Payload, android.util.Base64.NO_WRAP)
+                        }.getOrNull() ?: return
+                        val ext = localFilePath?.substringAfterLast('.', "audio") ?: "audio"
+                        val f = java.io.File(
+                            context.cacheDir,
+                            "play_${System.currentTimeMillis()}.$ext",
+                        )
+                        f.writeBytes(bytes)
+                        playbackCacheFile = f
+                        f.absolutePath
+                    }
+                    else -> return
+                }
                 val mp = android.media.MediaPlayer().apply {
-                    setDataSource(file.absolutePath)
+                    setDataSource(playSourcePath)
                     prepare()
                     setOnCompletionListener {
                         isPlaying = false
@@ -2196,17 +2269,23 @@ private fun AudioBubble(
                     }
                 }
                 mediaPlayer = mp
-                durationMs = mp.duration
-                runCatching { mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed) }
-                mp.start()
+                if (durationMs <= 0) durationMs = mp.duration
             } catch (_: Exception) {
                 return
             }
-        } else {
-            mediaPlayer?.let { mp ->
-                runCatching { mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed) }
-                mp.start()
+        }
+        mediaPlayer?.let { mp ->
+            // If the player is sitting at the end of the clip (just completed
+            // and the user tapped Play again), rewind first so playback
+            // restarts from the beginning instead of returning instantly.
+            val totalMs = mp.duration
+            val nearEnd = totalMs > 0 && mp.currentPosition >= totalMs - 50
+            if (nearEnd) {
+                runCatching { mp.seekTo(0) }
+                playProgress = 0f
             }
+            runCatching { mp.playbackParams = mp.playbackParams.setSpeed(currentSpeed) }
+            mp.start()
         }
         isPlaying = true
         scope.launch {
@@ -2226,22 +2305,27 @@ private fun AudioBubble(
         ""
     } else null
 
+    // PR-UI-VB1: four-state label. `playProgress` is non-zero while the
+    // user is in the middle of a clip — either actively playing or paused
+    // partway through. Both states show "current / total" so paused stops
+    // looking like stopped. The genuine fallback "—:——" remains for cases
+    // where duration preload failed (e.g. corrupted file).
+    val hasPlaybackPosition = playProgress > 0f && playProgress < 0.999f
     val durationLabel: String? = if (!isLoading) {
         when {
-            isPlaying -> {
+            isPlaying || hasPlaybackPosition -> {
                 val currentMs = (playProgress * durationMs).toInt()
                 "${formatVoiceDur(currentMs)} / ${formatVoiceDur(durationMs)}"
             }
             durationMs > 0 -> formatVoiceDur(durationMs)
-            // Pre-playback (ready-idle): we don't know duration yet because
-            // MediaPlayer hasn't prepared. The design shows a duration here,
-            // so we use a stable placeholder rather than 0:00 — the real
-            // value lights up the first time the user hits play.
             else -> "—:——"
         }
     } else null
 
-    val waveProgress = if (isPlaying) playProgress else 0f
+    // PR-UI-VB1: waveform tracks the canonical playhead always — pause must
+    // keep the highlighted bars in place; only MediaPlayer's onCompletion
+    // resets `playProgress` to 0, which naturally clears the waveform too.
+    val waveProgress = playProgress
     val canTap = !isLoading && (localFilePath != null || base64Payload != null)
 
     // ── Bubble shell + meta row ──────────────────────────────────────────────
