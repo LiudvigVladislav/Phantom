@@ -56,6 +56,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -3010,6 +3011,15 @@ private fun InputBar(
     // dragging right-to-left and getting the voice sent).
     val swipeCancelThresholdPx = with(density) { 56.dp.toPx() }
     var isMicHeld by remember { mutableStateOf(false) }
+    // PR-UI-REC3 — live swipe-left distance in pixels. The gesture loop
+    // writes this on every drag event; the render branch reads it to
+    // overlay the SwipeCancel state 4 visual (trail / threshold marker /
+    // trash handle / live distance %). Kept here at the InputBar scope so
+    // both the gesture loop (writer) and the visual branch (reader) live
+    // in the same composition. Reset to 0 at the end of every gesture so
+    // a completed-then-restarted recording does not inherit stale swipe
+    // progress.
+    var swipeDragLeftPx by remember { mutableFloatStateOf(0f) }
     val isLive = recordingState == RecordingPanelState.Recording
         || recordingState == RecordingPanelState.Locked
 
@@ -3058,83 +3068,115 @@ private fun InputBar(
             // not cancelled when the rest of the Row swaps idle controls for
             // recording controls underneath it.
             if (recordingState != null) {
-                // X · Cancel
+                // PR-UI-REC3 — derive whether the swipe-cancel overlay
+                // should take over the center / sides of the row. The
+                // visible threshold (8 dp) is a small dead zone so a
+                // jittery fingertip does not flicker the overlay in and
+                // out; once past it, the SwipeZone is visible and the
+                // side controls dim to 0.4 opacity per the design brief.
+                val swipeVisibleThresholdPx = with(density) { 8.dp.toPx() }
+                val isSwipeOverlayActive = swipeDragLeftPx > swipeVisibleThresholdPx
+                    && recordingState != RecordingPanelState.Locked
+                val swipeFraction = (swipeDragLeftPx / swipeCancelThresholdPx).coerceIn(0f, 1f)
+                val dimmedAlpha = if (isSwipeOverlayActive) 0.4f else 1f
+
+                // X · Cancel (or Resume-disabled visual while swiping).
+                // The click handler is suppressed during the overlay so
+                // the user does not accidentally tap-cancel while the
+                // swipe gesture is already arming the same outcome.
                 RecPanelControl(
-                    onClick = onCancelRecording,
+                    onClick = if (isSwipeOverlayActive) ({}) else onCancelRecording,
                     background = Color.Transparent,
                     border = false,
                 ) {
-                    Canvas(modifier = Modifier.size(18.dp)) {
-                        val sw = 1.5.dp.toPx()
-                        val pad = size.width * 0.28f
-                        drawLine(TextSecondary, Offset(pad, pad), Offset(size.width - pad, size.height - pad), sw, StrokeCap.Round)
-                        drawLine(TextSecondary, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
+                    Box(modifier = Modifier.graphicsLayer(alpha = dimmedAlpha)) {
+                        Canvas(modifier = Modifier.size(18.dp)) {
+                            val sw = 1.5.dp.toPx()
+                            val pad = size.width * 0.28f
+                            drawLine(TextSecondary, Offset(pad, pad), Offset(size.width - pad, size.height - pad), sw, StrokeCap.Round)
+                            drawLine(TextSecondary, Offset(size.width - pad, pad), Offset(pad, size.height - pad), sw, StrokeCap.Round)
+                        }
                     }
                 }
 
-                // Center stack: dot + (lock-badge if Locked) + timer + waveform + (paused pill if Paused)
-                Row(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(44.dp)
-                        .padding(horizontal = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    RecPanelDot(live = isLive)
-                    if (recordingState == RecordingPanelState.Locked) {
-                        RecPanelLockBadge()
-                    }
-                    RecPanelTimer(durationMs = recordingDurationMs, paused = !isLive)
-                    RecPanelWaveform(
-                        amplitudes = waveformAmplitudes,
-                        live = isLive,
+                // Center: either the standard dot+timer+waveform stack OR
+                // the SwipeCancel zone (trail / threshold / hint / handle).
+                if (isSwipeOverlayActive) {
+                    RecPanelSwipeZone(
+                        swipeFraction = swipeFraction,
                         modifier = Modifier
                             .weight(1f)
-                            .height(28.dp),
+                            .height(44.dp)
+                            .padding(horizontal = 4.dp),
                     )
-                    if (recordingState == RecordingPanelState.Paused
-                        || recordingState == RecordingPanelState.SwipeCancel
+                } else {
+                    // Center stack: dot + (lock-badge if Locked) + timer + waveform + (paused pill if Paused)
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                            .padding(horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        RecPanelPausedPill()
+                        RecPanelDot(live = isLive)
+                        if (recordingState == RecordingPanelState.Locked) {
+                            RecPanelLockBadge()
+                        }
+                        RecPanelTimer(durationMs = recordingDurationMs, paused = !isLive)
+                        RecPanelWaveform(
+                            amplitudes = waveformAmplitudes,
+                            live = isLive,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(28.dp),
+                        )
+                        if (recordingState == RecordingPanelState.Paused) {
+                            RecPanelPausedPill()
+                        }
                     }
                 }
 
                 // Pause / Resume — same geometric position in Recording, Paused, and Locked
+                // During SwipeCancel overlay it dims to 0.4 alpha and
+                // suppresses its tap handler so the user's gesture is the
+                // only thing in flight.
                 RecPanelControl(
-                    onClick = if (isLive) onPauseRecording else onResumeRecording,
+                    onClick = if (isSwipeOverlayActive) ({}) else if (isLive) onPauseRecording else onResumeRecording,
                     background = Surface2,
                     border = true,
                 ) {
-                    if (isLive) {
-                        Canvas(modifier = Modifier.size(16.dp)) {
-                            val barW = size.width * 0.18f
-                            val barH = size.height * 0.62f
-                            val gap = size.width * 0.18f
-                            val centerX = size.width / 2f
-                            val y = (size.height - barH) / 2f
-                            drawRoundRect(
-                                color = TextPrimary,
-                                topLeft = Offset(centerX - gap / 2f - barW, y),
-                                size = Size(barW, barH),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
-                            )
-                            drawRoundRect(
-                                color = TextPrimary,
-                                topLeft = Offset(centerX + gap / 2f, y),
-                                size = Size(barW, barH),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
-                            )
-                        }
-                    } else {
-                        Canvas(modifier = Modifier.size(16.dp)) {
-                            val path = androidx.compose.ui.graphics.Path().apply {
-                                moveTo(size.width * 0.32f, size.height * 0.20f)
-                                lineTo(size.width * 0.82f, size.height * 0.50f)
-                                lineTo(size.width * 0.32f, size.height * 0.80f)
-                                close()
+                    Box(modifier = Modifier.graphicsLayer(alpha = dimmedAlpha)) {
+                        if (isLive) {
+                            Canvas(modifier = Modifier.size(16.dp)) {
+                                val barW = size.width * 0.18f
+                                val barH = size.height * 0.62f
+                                val gap = size.width * 0.18f
+                                val centerX = size.width / 2f
+                                val y = (size.height - barH) / 2f
+                                drawRoundRect(
+                                    color = TextPrimary,
+                                    topLeft = Offset(centerX - gap / 2f - barW, y),
+                                    size = Size(barW, barH),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                                )
+                                drawRoundRect(
+                                    color = TextPrimary,
+                                    topLeft = Offset(centerX + gap / 2f, y),
+                                    size = Size(barW, barH),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                                )
                             }
-                            drawPath(path, color = TextPrimary)
+                        } else {
+                            Canvas(modifier = Modifier.size(16.dp)) {
+                                val path = androidx.compose.ui.graphics.Path().apply {
+                                    moveTo(size.width * 0.32f, size.height * 0.20f)
+                                    lineTo(size.width * 0.82f, size.height * 0.50f)
+                                    lineTo(size.width * 0.32f, size.height * 0.80f)
+                                    close()
+                                }
+                                drawPath(path, color = TextPrimary)
+                            }
                         }
                     }
                 }
@@ -3251,6 +3293,16 @@ private fun InputBar(
                 // pointerInput hosts the ACTION_DOWN-driven state machine.
                 val isSendVoiceVisual = recordingState != null
                 val micBoxSize = if (isSendVoiceVisual) 44.dp else 36.dp
+                // PR-UI-REC3 — dim the mic/send glyph (not the gesture
+                // surface!) to 0.4 when the swipe-cancel overlay is
+                // active. The Box keeps its `pointerInput` fully alive so
+                // the gesture in flight is not interrupted; only the
+                // visual content inside fades.
+                val swipeVisibleThresholdPx = with(density) { 8.dp.toPx() }
+                val isSwipeOverlayActiveOnRight = swipeDragLeftPx > swipeVisibleThresholdPx
+                    && recordingState != null
+                    && recordingState != RecordingPanelState.Locked
+                val rightGlyphAlpha = if (isSwipeOverlayActiveOnRight) 0.4f else 1f
                 Box(
                     modifier = Modifier
                         .size(micBoxSize)
@@ -3302,19 +3354,28 @@ private fun InputBar(
                                         if (dragUp >= lockThresholdPx) {
                                             locked = true
                                             isMicHeld = false
+                                            // PR-UI-REC3: reset live swipe
+                                            // progress when the gesture
+                                            // commits to lock instead of
+                                            // swipe-cancel.
+                                            swipeDragLeftPx = 0f
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                             onMicSlideUpLock()
                                         } else {
-                                            // PR-UI-REC2.4 — interim
-                                            // swipe-left-to-cancel guard.
-                                            // PR-UI-REC3 will replace this
-                                            // with the full SwipeCancel
-                                            // state + trail / threshold UI;
-                                            // for now any sustained left
-                                            // swipe cancels the recording so
-                                            // we never accidentally `send`
-                                            // on a horizontal-only gesture.
+                                            // PR-UI-REC2.4 — swipe-left-to-
+                                            // cancel guard. PR-UI-REC3 adds
+                                            // the live swipe-progress
+                                            // visual on top of this gesture
+                                            // by publishing `swipeDragLeftPx`
+                                            // to the render branch.
                                             val dragLeft = downX - change.position.x
+                                            // Publish live distance for the
+                                            // visual layer (trail / handle /
+                                            // distance %). Negative drag
+                                            // (finger moved right) clamps to
+                                            // 0 so the overlay never shows
+                                            // when the user is not swiping.
+                                            swipeDragLeftPx = dragLeft.coerceAtLeast(0f)
                                             if (dragLeft >= swipeCancelThresholdPx) {
                                                 swipeCancelArmed = true
                                                 isMicHeld = false
@@ -3349,36 +3410,48 @@ private fun InputBar(
                                     change.consume()
                                 }
                                 isMicHeld = false
+                                // PR-UI-REC3: drop any in-flight swipe
+                                // progress when the gesture ends so the
+                                // overlay disappears immediately and the
+                                // next recording starts with a clean
+                                // visual.
+                                swipeDragLeftPx = 0f
                             }
                         },
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (isSendVoiceVisual) {
-                        Canvas(modifier = Modifier.size(20.dp)) {
-                            val sw = 2.2.dp.toPx()
-                            val cap = StrokeCap.Round
-                            val cx = size.width / 2f
-                            drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
-                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
-                            drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
-                        }
-                    } else {
-                        Canvas(modifier = Modifier.size(22.dp)) {
-                            val c = TextDim
-                            val sw = 1.6.dp.toPx()
-                            val st = Stroke(width = sw, cap = StrokeCap.Round)
-                            drawRoundRect(
-                                color = c, style = st,
-                                topLeft = Offset(size.width * 0.33f, size.height * 0.08f),
-                                size = Size(size.width * 0.34f, size.height * 0.52f),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width * 0.17f),
-                            )
-                            val path = androidx.compose.ui.graphics.Path().apply {
-                                moveTo(size.width * 0.18f, size.height * 0.48f)
-                                cubicTo(size.width * 0.18f, size.height * 0.82f, size.width * 0.82f, size.height * 0.82f, size.width * 0.82f, size.height * 0.48f)
+                    // PR-UI-REC3 — wrap the glyph in a graphicsLayer alpha
+                    // so the visual fades to 0.4 when the swipe-cancel
+                    // overlay is active. The Box's pointerInput stays at
+                    // full hit-test priority — only the visual dims.
+                    Box(modifier = Modifier.graphicsLayer(alpha = rightGlyphAlpha)) {
+                        if (isSendVoiceVisual) {
+                            Canvas(modifier = Modifier.size(20.dp)) {
+                                val sw = 2.2.dp.toPx()
+                                val cap = StrokeCap.Round
+                                val cx = size.width / 2f
+                                drawLine(BgDeep, Offset(cx, size.height * 0.82f), Offset(cx, size.height * 0.18f), sw, cap)
+                                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx - size.width * 0.28f, size.height * 0.46f), sw, cap)
+                                drawLine(BgDeep, Offset(cx, size.height * 0.18f), Offset(cx + size.width * 0.28f, size.height * 0.46f), sw, cap)
                             }
-                            drawPath(path, color = c, style = st)
-                            drawLine(c, Offset(size.width * 0.5f, size.height * 0.78f), Offset(size.width * 0.5f, size.height * 0.95f), sw, StrokeCap.Round)
+                        } else {
+                            Canvas(modifier = Modifier.size(22.dp)) {
+                                val c = TextDim
+                                val sw = 1.6.dp.toPx()
+                                val st = Stroke(width = sw, cap = StrokeCap.Round)
+                                drawRoundRect(
+                                    color = c, style = st,
+                                    topLeft = Offset(size.width * 0.33f, size.height * 0.08f),
+                                    size = Size(size.width * 0.34f, size.height * 0.52f),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.width * 0.17f),
+                                )
+                                val path = androidx.compose.ui.graphics.Path().apply {
+                                    moveTo(size.width * 0.18f, size.height * 0.48f)
+                                    cubicTo(size.width * 0.18f, size.height * 0.82f, size.width * 0.82f, size.height * 0.82f, size.width * 0.82f, size.height * 0.48f)
+                                }
+                                drawPath(path, color = c, style = st)
+                                drawLine(c, Offset(size.width * 0.5f, size.height * 0.78f), Offset(size.width * 0.5f, size.height * 0.95f), sw, StrokeCap.Round)
+                            }
                         }
                     }
 
@@ -3700,6 +3773,149 @@ private fun RecPanelPausedPill() {
             fontFamily = PhantomFontMono,
             letterSpacing = 1.sp,
         )
+    }
+}
+
+/**
+ * PR-UI-REC3 — SwipeCancel state zone. Replaces the dot+timer+waveform
+ * center stack while the user is dragging the mic left to cancel. Layout
+ * matches the Recording Panel Matrix `CancelSwipePanel` design:
+ *
+ *   - Rounded zone (radius 22 dp) on `Danger.05` background with a
+ *     `Danger.18` border.
+ *   - Trail gradient (`Danger.22` → `Danger.04`) growing left-to-right as
+ *     the user drags; its width is `swipeFraction × zone width`.
+ *   - Fixed dashed threshold marker (1 px `Danger.55` dashed line) at the
+ *     full-cancel position so the user has a visible target.
+ *   - "← SWIPE TO DISCARD" hint label left-aligned, mono 10 sp `Danger`.
+ *   - Live distance percentage right-aligned next to the trash handle,
+ *     mono 9 sp `Danger.65`.
+ *   - 32 dp trash handle (Danger fill, white trash glyph) at the trail's
+ *     right edge — moves with the gesture.
+ */
+@Composable
+private fun RecPanelSwipeZone(
+    swipeFraction: Float,
+    modifier: Modifier = Modifier,
+) {
+    val clampedFraction = swipeFraction.coerceIn(0f, 1f)
+    val zoneShape = RoundedCornerShape(22.dp)
+    Box(
+        modifier = modifier
+            .clip(zoneShape)
+            .background(Danger.copy(alpha = 0.05f))
+            .border(1.dp, Danger.copy(alpha = 0.18f), zoneShape),
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            // Trail: gradient fill growing from left up to the threshold
+            // marker. The width tracks `clampedFraction` so the bar moves
+            // with the finger.
+            val trailWidth = (size.width * clampedFraction).coerceAtLeast(0f)
+            if (trailWidth > 0f) {
+                val trailBrush = androidx.compose.ui.graphics.Brush.horizontalGradient(
+                    colors = listOf(
+                        Danger.copy(alpha = 0.22f),
+                        Danger.copy(alpha = 0.04f),
+                    ),
+                    startX = 0f,
+                    endX = trailWidth,
+                )
+                drawRect(brush = trailBrush, topLeft = Offset.Zero, size = Size(trailWidth, size.height))
+            }
+
+            // Dashed threshold marker — fixed at the full-cancel position
+            // (right edge of the trail at fraction = 1.0). Indicates the
+            // visual target the user is dragging toward.
+            val thresholdX = (size.width * 1f).coerceAtMost(size.width - 1.dp.toPx())
+            val dashOn = 3.dp.toPx()
+            val dashOff = 3.dp.toPx()
+            val markerEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                floatArrayOf(dashOn, dashOff), 0f,
+            )
+            drawLine(
+                color = Danger.copy(alpha = 0.55f),
+                start = Offset(thresholdX, size.height * 0.15f),
+                end = Offset(thresholdX, size.height * 0.85f),
+                strokeWidth = 1.dp.toPx(),
+                pathEffect = markerEffect,
+            )
+        }
+
+        // Hint label "← SWIPE TO DISCARD". Sits on the left side. Fades
+        // to 0.55 alpha once the trail has covered it so the visual
+        // hierarchy moves to the live distance / handle as the gesture
+        // progresses.
+        Row(
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .padding(start = 14.dp)
+                .graphicsLayer(alpha = (1f - clampedFraction * 0.6f).coerceIn(0.4f, 1f)),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Canvas(modifier = Modifier.size(width = 9.dp, height = 9.dp)) {
+                val sw = 1.5.dp.toPx()
+                val cap = StrokeCap.Round
+                val cy = size.height / 2f
+                drawLine(Danger, Offset(size.width * 0.95f, cy), Offset(size.width * 0.05f, cy), sw, cap)
+                drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy - size.height * 0.35f), sw, cap)
+                drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy + size.height * 0.35f), sw, cap)
+            }
+            Text(
+                text = "SWIPE TO DISCARD",
+                color = Danger,
+                fontSize = 10.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 1.sp,
+            )
+        }
+
+        // Live distance percentage + trash handle. Both anchored to the
+        // right edge of the zone; both stay visible throughout the swipe
+        // and the distance text updates in real time.
+        Row(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "${(clampedFraction * 100).toInt()}%",
+                color = Danger.copy(alpha = 0.65f),
+                fontSize = 9.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 0.5.sp,
+            )
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(CircleShape)
+                    .background(Danger),
+                contentAlignment = Alignment.Center,
+            ) {
+                Canvas(modifier = Modifier.size(14.dp)) {
+                    val sw = 1.5.dp.toPx()
+                    val cap = StrokeCap.Round
+                    val white = Color.White
+                    // Trash glyph: horizontal lid line + vertical body
+                    // outline + two grip bars on top of lid.
+                    // Top line (lid)
+                    drawLine(white, Offset(size.width * 0.15f, size.height * 0.30f), Offset(size.width * 0.85f, size.height * 0.30f), sw, cap)
+                    // Lid handle (small notch on top)
+                    drawLine(white, Offset(size.width * 0.40f, size.height * 0.30f), Offset(size.width * 0.40f, size.height * 0.18f), sw, cap)
+                    drawLine(white, Offset(size.width * 0.40f, size.height * 0.18f), Offset(size.width * 0.60f, size.height * 0.18f), sw, cap)
+                    drawLine(white, Offset(size.width * 0.60f, size.height * 0.18f), Offset(size.width * 0.60f, size.height * 0.30f), sw, cap)
+                    // Body (rounded rect via four lines)
+                    drawLine(white, Offset(size.width * 0.22f, size.height * 0.30f), Offset(size.width * 0.30f, size.height * 0.88f), sw, cap)
+                    drawLine(white, Offset(size.width * 0.78f, size.height * 0.30f), Offset(size.width * 0.70f, size.height * 0.88f), sw, cap)
+                    drawLine(white, Offset(size.width * 0.30f, size.height * 0.88f), Offset(size.width * 0.70f, size.height * 0.88f), sw, cap)
+                    // Inner ribs
+                    drawLine(white, Offset(size.width * 0.40f, size.height * 0.42f), Offset(size.width * 0.40f, size.height * 0.78f), sw, cap)
+                    drawLine(white, Offset(size.width * 0.60f, size.height * 0.42f), Offset(size.width * 0.60f, size.height * 0.78f), sw, cap)
+                }
+            }
+        }
     }
 }
 
