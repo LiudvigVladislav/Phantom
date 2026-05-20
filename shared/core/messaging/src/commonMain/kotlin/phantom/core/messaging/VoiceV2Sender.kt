@@ -3,6 +3,7 @@
 
 package phantom.core.messaging
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlin.coroutines.coroutineContext
@@ -68,7 +69,35 @@ class VoiceV2Sender(
         onSplit: ((total: Int) -> Unit)? = null,
         onChunkUploaded: ((sent: Int, total: Int) -> Unit)? = null,
         onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)? = null,
-    ): Result<VoiceManifestV2> = runCatching {
+    ): Result<VoiceManifestV2> = try {
+        // PR-MEDIA-UPLOAD-CANCEL2 — explicit try/catch. The previous
+        // `runCatching` swallowed CancellationException as part of
+        // `Throwable`, so a user-tap-X that flipped the parent Job into a
+        // cancelled state was caught here, converted into a normal
+        // `Result.failure`, and the DMS `catch (CancellationException)`
+        // branch never ran. With explicit handling, `CancellationException`
+        // re-throws so the parent's `catch` can mark the upload as
+        // user-cancelled (delete row + log `upload_cancelled_by_user`),
+        // and other failures still resolve to `Result.failure(t)` exactly
+        // as before. Test #76.4 caught this: the user tapped X, the
+        // gesture detector fired `MEDIA_UI upload_cancel_tap`, DMS even
+        // fired `Job.cancel(...)` — but the upload coroutine just saw a
+        // failed Result, never the cancellation marker.
+        Result.success(uploadVoiceInner(audioBytes, durationMs, mime, onSplit, onChunkUploaded, onEarlyManifest))
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (t: Throwable) {
+        Result.failure(t)
+    }
+
+    private suspend fun uploadVoiceInner(
+        audioBytes: ByteArray,
+        durationMs: Long,
+        mime: String,
+        onSplit: ((total: Int) -> Unit)?,
+        onChunkUploaded: ((sent: Int, total: Int) -> Unit)?,
+        onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)?,
+    ): VoiceManifestV2 {
         // Step 1: encrypt
         val enc = mediaCrypto.encryptVoice(audioBytes)
         log(
@@ -171,7 +200,7 @@ class VoiceV2Sender(
         }
         log("MEDIA_TX upload_complete mediaId=${enc.mediaId.take(8)} chunks=$total")
 
-        manifest
+        return manifest
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
