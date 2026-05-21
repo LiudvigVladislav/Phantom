@@ -3896,7 +3896,26 @@ private fun RecPanelSwipeZone(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Canvas(modifier = Modifier.size(width = 9.dp, height = 9.dp)) {
+                // PR-UI-REC3.2 — animated left-arrow nudge. Suggests the
+                // swipe direction with a subtle horizontal oscillation
+                // (~3 dp range, 700 ms reverse-cycle, ease-in-out). The
+                // arrow drifts left then back to its rest position; the
+                // text stays still so the hint never blurs.
+                val arrowTransition = rememberInfiniteTransition(label = "swipeArrowNudge")
+                val arrowOffsetDp by arrowTransition.animateFloat(
+                    initialValue = 0f,
+                    targetValue = -3f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 700, easing = FastOutSlowInEasing),
+                        repeatMode = RepeatMode.Reverse,
+                    ),
+                    label = "swipeArrowOffset",
+                )
+                Canvas(
+                    modifier = Modifier
+                        .size(width = 9.dp, height = 9.dp)
+                        .offset(x = arrowOffsetDp.dp),
+                ) {
                     val sw = 1.5.dp.toPx()
                     val cap = StrokeCap.Round
                     val cy = size.height / 2f
@@ -3905,11 +3924,11 @@ private fun RecPanelSwipeZone(
                     drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy + size.height * 0.35f), sw, cap)
                 }
                 Text(
-                    text = "SWIPE TO DISCARD",
+                    text = "discard",
                     color = Danger,
-                    fontSize = 10.sp,
+                    fontSize = 11.sp,
                     fontFamily = PhantomFontMono,
-                    letterSpacing = 1.sp,
+                    letterSpacing = 0.5.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
