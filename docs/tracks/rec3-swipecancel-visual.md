@@ -48,4 +48,14 @@ Add the visual layer for the SwipeCancel state of the Recording Panel Matrix. Th
 
 ## Last hand-off
 
-(empty — track active)
+**Closed 2026-05-21.** PR #205 merged to `master` as `770e61f4`. Five iterations on a single feature branch (`feat/pr-ui-rec3-swipecancel-visual`):
+
+- **REC3** (`48a0f9fe`) — initial SwipeCancel state render branch: trail gradient, dashed threshold marker at 72 %, trash handle on the right, "SWIPE TO DISCARD" hint, live % indicator, side-control dim to 0.4, both themes. Wired into `InputBar` without touching the REC2.4 gesture-detector.
+- **REC3.1** (`bb511e3c`) — Test #76.6 fix: replaced two `align()` overlays with a single Row + weight=1 ellipsis hint so the % stops overlapping the text; killed the latching `swipeCancelArmed` flag so the user can drag past 56 dp and back below it (release decision now uses live `finalDragLeftPx`).
+- **REC3.2** (`1ff8a81a`) — shortened the hint to "discard" and added the animated arrow nudge (`rememberInfiniteTransition` + `animateFloat(targetValue = -3f)`) per Vladislav's screenshot review.
+- **REC3.3** (`70990a38`) — Pause/Resume in-panel control hidden while in press-hold Recording (`isPressHoldRecording = recordingState == Recording && isMicHeld`). Reappears in Locked, Paused, and Resumed-from-Paused.
+- **REC3.4** (`2e0b3260`) — Test #76.6c fix: stopped flipping `isMicHeld = false` in the swipe-haptic block (it was overloaded with chip-hiding but now also gates Pause via REC3.3, which made Pause appear at 100 %). Chip visibility moved to a `swipeDragLeftPx <= swipeVisibleThresholdPx` check on the Popup.
+
+Test #76.6d (Tecno, real device) PASS — chip stays hidden through the swipe, Pause stays hidden through press-hold, cancel arms/disarms cleanly, lock + paused render unchanged.
+
+Out-of-scope follow-ups from the mini-lock above remain open and are tracked in `docs/PROJECT_LOG.md → Open follow-ups`.
