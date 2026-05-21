@@ -491,6 +491,29 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-21 (thu, late) · PR-UI-REC3 SwipeCancel state visual
+
+Closed PR #205 (`feat/pr-ui-rec3-swipecancel-visual` → master `770e61f4`). Five iterations on a single feature branch — a textbook execution of the new `docs/WORKING_RULES.md` one-PR-per-layer + mini-lock + iterate-on-the-same-branch discipline:
+
+- **REC3** (`48a0f9fe`) — initial SwipeCancel render branch added to `InputBar`'s `recordingState != null` block: trail gradient (`Danger.22 → Danger.04`), dashed threshold marker at 72 %, trash handle on the right edge, "SWIPE TO DISCARD" hint, live % indicator, side-control dim to 0.4, both themes via existing tokens. Gesture detector untouched — REC2.4's swipe-left shim was already producing the cancel; REC3 made it *visible*.
+- **REC3.1** (`bb511e3c`) — Test #76.6 fix: replaced two `align()` overlays with a single Row + weight=1 ellipsis hint so the % stopped overlapping the text; killed the latching `swipeCancelArmed` flag so the user can drag past 56 dp and back below it without arming-then-being-stuck. Release decision now uses live `finalDragLeftPx = (downX - change.position.x).coerceAtLeast(0f)` so what the user sees on the % indicator matches the actual gesture outcome.
+- **REC3.2** (`1ff8a81a`) — shortened the hint to `"discard"` (matching Vladislav's screenshot) and added an animated arrow nudge via `rememberInfiniteTransition` + `animateFloat(targetValue = -3f)` so the affordance reads as motion-toward-discard.
+- **REC3.3** (`70990a38`) — hide the Pause/Resume in-panel control while in press-hold Recording (`isPressHoldRecording = recordingState == Recording && isMicHeld`). Reasoning: the user's finger is on the mic, so they can't reach the in-panel button with the same finger anyway, and showing it during a hold-gesture was visual noise. Pause reappears in Locked, Paused, and Resumed-from-Paused.
+- **REC3.4** (`2e0b3260`) — Test #76.6c fix: stopped flipping `isMicHeld = false` in the swipe-haptic block. That flip was carrying two responsibilities since REC2.4 — hiding the lock-hint chip at the 56 dp threshold AND (since REC3.3) gating Pause/Resume. When the user swiped past 56 dp, isMicHeld flipped, Pause reappeared briefly. Moved chip-hiding to a `swipeDragLeftPx <= swipeVisibleThresholdPx` check on the Popup so chip and Pause are gated by separate, intent-matching flags.
+
+Test #76.6d PASS confirmed by Vladislav on real device — chip hidden through swipe, Pause hidden through press-hold, cancel arms/disarms cleanly, lock and paused render unchanged.
+
+**Discipline checkpoint.** This is the first PR worked end-to-end under the new `docs/WORKING_RULES.md`. The mini-lock (`docs/tracks/rec3-swipecancel-visual.md`) was authored before the first commit per rule 3, with explicit scope / out-of-scope / parking conditions. Five iterations later, every fix was inside the agreed scope (UI render branch only, gesture-detector untouched, no transport / crypto / DB / chunk-size changes). Out-of-scope findings (durationMs source, empty-voice race, M2e re-enable, receiver-side cancel, notifications) stayed logged in `Open follow-ups`, none were "fixed in passing" per rule 7. No architectural reset was needed (rule 4 parking threshold never reached).
+
+**Known follow-ups (open after REC3).** Same list as the prior session — REC3 was a visual layer over the already-shipped REC2.4 gesture, so the queue is unchanged:
+
+1. **PR-UI-REC-FOLLOWUP** — recording duration source (ticker undercounts vs `MediaMetadataRetriever`).
+2. **Empty-voice race** when `heldMs >= 700` but `durationMs <= 0` — fix inside `finalizeAndSendVoice`, not at the gesture layer.
+3. **Re-enable M2e early manifest** once the relay grows a receiver-side media-cancel protocol.
+4. **Receiver download cancel** needs new relay endpoints.
+5. **Notifications flakiness diagnostic PR.**
+6. **Doc honesty PR** — KNOWN_ISSUES expansion (Tele2 Layer A/B, M1w/M2 trilogy, REC*), ADR-011/-023 status advance, MASTER_TIMELINE killed-deadlines cleanup. Deferred from earlier today; now next on the queue.
+
 ### 2026-05-21 (thu, late) · Branch prune
 
 Branch prune: deleted 6 stale branches per delete-blind policy. List: `feat/pr-m2b-download-parallelism`, `feat/pr-d2b2-flip-canSendVoice-and-15s-cap`, `pr-d1b-rest-fallback-wireup` (3 commits — diff-verified as squash-merged via PR-D1b #157/#158), `fix/prekey-publish-reliability`, `feat/probe-step-observability`, `docs/2026-05-15-merge-update`. Retained per memory: `diag/m2c0-media-route-probe`, `fix/transport-tcp-keepalive`, `infra/media-ro-bridge2-cotenant`. Side-finding (deferred for triage): 117 additional local branches still `[gone]` on origin — broader sweep awaiting Vladislav's call.
