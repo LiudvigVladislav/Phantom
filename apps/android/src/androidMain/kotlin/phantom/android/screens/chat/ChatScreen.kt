@@ -3405,11 +3405,27 @@ private fun InputBar(
                                             // back — that would feel
                                             // chatty during a hesitant
                                             // gesture.
+                                            // PR-UI-REC3.4: do NOT flip
+                                            // `isMicHeld` here. The finger
+                                            // is still on the mic during
+                                            // the entire swipe gesture
+                                            // (only `Lock` and gesture
+                                            // end legitimately mean
+                                            // "hands free"). The earlier
+                                            // flip was overloaded with
+                                            // hiding the lock-hint chip,
+                                            // but now that Pause /Resume
+                                            // visibility also keys off
+                                            // `isMicHeld`, flipping it on
+                                            // swipe-cross made the Pause
+                                            // button briefly appear at
+                                            // 100 % — Test #76.6c bug.
+                                            // Chip hiding now keys off
+                                            // `swipeDragLeftPx` instead.
                                             if (!swipeCancelHapticFired
                                                 && dragLeft >= swipeCancelThresholdPx
                                             ) {
                                                 swipeCancelHapticFired = true
-                                                isMicHeld = false
                                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                             }
                                         }
@@ -3502,7 +3518,21 @@ private fun InputBar(
                     // mid-hold and the panel is still in `Recording`. Once
                     // they cross the slide-up threshold the chip disappears
                     // (isMicHeld flips to false on lock).
-                    if (isMicHeld && recordingState == RecordingPanelState.Recording) {
+                    //
+                    // PR-UI-REC3.4 — also hide the chip once the swipe-cancel
+                    // overlay becomes visible (>8 dp drag-left). Previously
+                    // the haptic block flipped `isMicHeld = false` at the
+                    // 56 dp threshold to take the chip down for free, but
+                    // that flip also leaked into the Pause/Resume gate added
+                    // in REC3.3 and made the Pause button briefly appear
+                    // mid-swipe (Test #76.6c). The chip now keys off the
+                    // same `swipeDragLeftPx` threshold the rest of the
+                    // overlay uses, so it disappears as soon as the trail /
+                    // hint render in the row.
+                    if (isMicHeld
+                        && recordingState == RecordingPanelState.Recording
+                        && swipeDragLeftPx <= swipeVisibleThresholdPx
+                    ) {
                         Popup(
                             alignment = Alignment.TopCenter,
                             offset = IntOffset(0, -with(density) { 84.dp.toPx() }.toInt()),
