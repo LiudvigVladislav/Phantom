@@ -1,16 +1,16 @@
-# PHANTOM Alpha 1 — Known Issues
+# PHANTOM — Known Issues
 
-**Last updated:** 2026-05-02
-**Build:** master at `c62fbfff` — PR #28 (transport reliability) + PR #29 (calls UX, F-03/07/10/15) + PR #30 (calls media: mic permission, audio mode, black-screen) all merged.
-**Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS, plus Pixel 8 Pro emulators API 35), Hetzner VPS relay (`relay.phntm.pro`)
+**Last updated:** 2026-05-21
+**Build:** master at `8f4c68c9` — post-Alpha-1, ongoing development. Alpha-1 baseline (2026-04-27, tag `v0.1.0-alpha.1`) is preserved as historical context within this document; the project has since landed the M1w encrypted-media-upload trilogy, the M2 chunk-size sprint (M2a-M2h.1), the D0r/D1 REST fallback transport, the H1/H2 first-message + reconnect reliability sprint, and the REC recording-panel UX trilogy. There is **no fixed release deadline** as of the 2026-05-14 strategic pivot — see [`docs/project/MASTER_TIMELINE_2026.md`](docs/project/MASTER_TIMELINE_2026.md) for the live tracker.
+**Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS — Wi-Fi only since 2026-05-14, no SIM card; Pixel emulators API 35 on Windows dev machine), Tele2 LTE Иркутская (real-device, second SIM phone pending), MTS Wi-Fi (real-device, no SIM cellular path) Hetzner VPS relay (`relay.phntm.pro`).
 
 ---
 
 ## Overview
 
-PHANTOM Alpha 1 is a functional privacy-focused E2E messenger with verified end-to-end encryption (Double Ratchet via libsodium), Trust Tier message requests, and store-and-forward delivery via centralized relay over WebSocket Secure (WSS).
+PHANTOM is a privacy-focused E2E messenger with verified end-to-end encryption (Double Ratchet via libsodium, Sealed Sender, identity-prekey separation per ADR-009), Trust Tier message requests, multi-transport stack (direct WSS / Reality through Xray / Tor v3 onion as text-only emergency fallback) plus a REST-poll fallback for carrier-middlebox-affected networks, and store-and-forward delivery via a self-hosted relay.
 
-This document is intentionally exhaustive. Transparency about limitations is essential for a privacy tool — users deserve to know exactly what works and what doesn't.
+This document is intentionally exhaustive. Transparency about limitations is essential for a privacy tool — users deserve to know exactly what works and what doesn't. New issues are added at the bottom of each severity section; resolved issues stay in place with their resolution annotated so the project's evolution is readable.
 
 ## Document structure
 
@@ -29,41 +29,44 @@ This file separates two kinds of items:
 
 ## Critical Security Issues (P1)
 
-### ISSUE-001: WebSocket reconnects every ~60 s on aggressive-OEM Android skins
+### ISSUE-001: WebSocket reconnect cycles on aggressive-OEM Android skins and stateful carrier middleboxes
 
-**Symptom.** On certain OEM Android skins (Tecno HiOS verified, Xiaomi MIUI / Huawei EMUI strongly suspected) the foreground-service notification is visible and the WebSocket connects successfully, but the connection drops on a deterministic ~60-second cycle. Each cycle:
+**Symptom.** On certain OEM Android skins (Tecno HiOS verified) AND on multiple Russian carrier networks (МТС, Tele2 LTE — verified independently of OEM) the foreground-service notification stays visible and the WebSocket connects successfully, but the connection silently dies after some idle period (originally ~60 s on OEM-only diagnoses, later ~30–155 s under the carrier-middlebox half-open TCP pattern). Each cycle:
 
-1. Client logs `SocketTimeoutException: sent ping but didn't receive pong within 8000ms (after N successful ping/pongs)`
-2. Reconnect succeeds within ~1.5 s
-3. Any envelope the peer sent during the gap is delivered immediately on reconnect (store-and-forward keeps it durable)
+1. Client logs `SocketTimeoutException`, or — under the half-open pattern — no outbound `Ping` reaches the server at all (server-side `pings_received=0 inbound_frames=0` over the whole session).
+2. Reconnect succeeds within ~1 s once the dead socket is detected and torn down.
+3. Any envelope the peer sent during the gap is delivered immediately on reconnect (store-and-forward keeps it durable).
 
-**Impact.** A message sent to a recipient mid-reconnect arrives ~1–3 s later than usual. **No messages are lost.** On stock Android (Pixel 8 Pro emulator, etc.) on Wi-Fi the connection has been stable across multi-minute QA sessions with the same code path and the same relay endpoint. The issue is specifically the OEM skin's wireless power management overriding the foreground service's keepalive intent.
+**Impact.** A message sent to a recipient mid-reconnect arrives ~1–3 s later than usual. **No messages are lost** (PR-H2b processed-envelope ledger neutralises any relay redelivery — see ISSUE-004). On stable Wi-Fi without a stateful middlebox the connection has been stable across multi-minute QA sessions with the same code path and the same relay endpoint. The issue compounds two effects: (a) the OEM-side power management on Tecno HiOS that parks the Wi-Fi radio between transmissions, and (b) stateful network elements on the Russian carrier path that drop a long-lived idle WebSocket without sending a FIN.
 
-**Root cause.** OEM-side power management parks the Wi-Fi radio between transmissions to save battery, even with a foreground notification active and even when the device is plugged in. Small WebSocket frames get deferred into the next radio wake window; over enough deferrals the peer's PONG response misses the client's ping-timeout deadline and OkHttp forces a fresh connection. (Initial QA pointed at carrier NAT timeout; the WiFi-only retest with the phone and emulator on the same router proved the cause is on the device, not the network path.)
+**Root cause.** The 2026-05-04 4-test matrix on the same МТС Wi-Fi (Tecno Spark Go vs Pixel 8 Pro emulator on a stable PC) demonstrated the cycle on **both** devices — so OEM radio parking is one cause, not the only one. The actual primary contributor in production on Russian carriers is a stateful network element along the path (Carrier-Grade NAT, transit border filtering / TSPU, or both) that goes one-way silent without an explicit close. PR-H1b (`0baa4196`) diagnosed this as the half-open TCP black-hole pattern from `session_summary` lines (`pings_received=2-5` server-side vs `pings_sent=11` client-side, `since_last_ping_ms ≈ 153 s` on every dying session).
 
-**Mitigations shipped in Alpha 1.**
+**Mitigations shipped (current production policy, locked via the H1c/H1e diagnostic sprint).**
 
-- Foreground service holds `WifiLock(WIFI_MODE_FULL_HIGH_PERF)` and a partial `WakeLock` for its full lifetime ([apps/android/src/androidMain/kotlin/phantom/android/service/PhantomMessagingService.kt](apps/android/src/androidMain/kotlin/phantom/android/service/PhantomMessagingService.kt)) — commit `74e6af0a`
-- OkHttp transport-level ping is **disabled** (`pingInterval(0)`); application-level `RelayMessage.Ping/Pong` over WS frames is the sole liveness check (`PING_INTERVAL_MS = 10 s`, `PONG_TIMEOUT_MS = 60 s`). The previous OkHttp `pingInterval = 8 s` was killing every large envelope mid-upload because OkHttp's pingInterval is also its pong-timeout — a slow uplink could not return a pong before the next ping fired
-- `forceCancelAllEngineCalls()` so a hung WebSocket aborts in <2 s instead of 60 s — commit `2ee1d08d`
-- `cancelAndJoin` between reconnect generations so stale ping-timers cannot fire on the new socket — commit `846d6bed`
-- `RECONNECT_BASE_DELAY_MS = 1 s` to halve user-visible reconnect latency — commit `452a0b5e`
-- `ACK_TIMEOUT_MS = 60 s` so a slow uplink saturated by a large payload does not get torn down before the relay can ack
-- Relay `RELAY_MAX_PAYLOAD_BYTES = 1 048 576` (1 MiB) so voice notes (~67 KB per 5 s of base64-encoded 3GP audio) and other inlined media fit
-- Relay-side store-and-forward retains envelopes until the recipient sends `ack-deliver`
+The most recent policy is the PR-H1e "Run C" configuration (PR #134, master `bcc501be`, locked 2026-05-14 after a 4-run heartbeat experiment on `diag/h1e-ws-ping-experiments`):
 
-These bring the affected configuration from "messages stuck for 60 s" down to "1–3 s extra latency under network pressure" for **text** messages.
+- **App-level RelayMessage Ping/Pong over WS frames disabled** (`APP_LEVEL_PING_ENABLED=false`). Run C empirically doubled WS lifetime by removing this redundant heartbeat layer; tighter cadences (Run B 5 s) made the cycle worse, not better. App-level Ping was an early defensive belt that turned out to be a kill trigger on stateful middleboxes.
+- **OkHttp WebSocket `pingInterval(15s)` hard-coded** as the sole client-side liveness check.
+- **Dead-socket watchdog** triggers off the last inbound frame timestamp via `RelayTransport.lastInboundFrameElapsedMs` — ANY inbound frame keeps the socket alive, not just Pong (PR-H1c, `e946caba`).
+- **AlarmManager proactive reconnect at 45 s stale inbound** survives Doze and OEM AlarmManager throttling as a safety net below the 60 s pong-watchdog floor (ADR-011, now Accepted; PR-H1c).
+- **Distinct `TransportState.Reconnecting`** drives a "Reconnecting…" UX badge instead of the chat going dark.
+- **Server-side TCP `SO_KEEPALIVE`** (idle 15 s, interval 5 s, retries 3) via `socket2` `#[cfg(unix)]`, so the relay can drop half-open sockets server-side without waiting for the next read attempt.
+- Foreground service holds `WifiLock(WIFI_MODE_FULL_HIGH_PERF)` (downgraded to `FULL` by HiOS but kept anyway as defence-in-depth) and a partial `WakeLock` for its full lifetime (`74e6af0a`).
+- `forceCancelAllEngineCalls()` so a hung WebSocket aborts in <2 s instead of 60 s (`2ee1d08d`).
+- `cancelAndJoin` between reconnect generations so stale ping-timers cannot fire on the new socket (`846d6bed`).
 
-**Voice messages on Tecno-class OEMs: NOT delivered without VPN (known limitation).** End-to-end log analysis on 2026-04-28 confirmed an asymmetric outbound failure mode: the phone receives inbound envelopes from the relay (incoming text arrives) but its outbound channel to the relay goes silent within ~30–70 s of each reconnect — application-level Pings stop reaching the server even though no upload is in progress, so neither voice envelopes nor the periodic Ping frames reach the relay. Same emulator-to-emulator path delivers a 75 KB voice envelope in ~1 s; the failure is unambiguously local to the Tecno radio. **A VPN client running on the same phone restores voice delivery** because the VPN tunnel keeps a continuous keepalive that prevents the OEM radio from parking — but requiring users to run a VPN is not an acceptable product answer. Workarounds in the user-settings list below sometimes help, but cannot be guaranteed.
+**Test #37 verified** detection time dropped from 155 s → 30–46 s, recovery 5 s → ~1 s, zero message loss across twelve consecutive reconnect cycles per device. **Test #41** (the locked H1e Run C policy on Tecno МТС + emulator-on-dev-Wi-Fi) confirmed zero MAC errors / ledger-dedup misses / FIFO flush issues across 12 reconnects per device.
 
-**Workaround for Tecno HiOS users.**
+**Remaining residual on Tele2 LTE: WS Frame.Text silently dropped upstream** — see [ISSUE-018](#issue-018-tele2-lte-ws-frametext-silently-dropped-upstream) for the half of this story that the H1 sprint did not close. The REST fallback transport (PR-D0r / PR-D1 / PR-D1b / PR-D1c / PR-D1c.1 / PR-D1d) was built to address the Tele2-class case where even a healthy underlying TCP can no longer carry application frames.
+
+**Workaround for Tecno HiOS users** (in case the device-side radio parking dominates on a less-affected network):
 
 1. *Settings → Apps → PHANTOM → Battery* → Unrestricted
 2. *Settings → Apps → Special access → Battery optimization* → PHANTOM → Don't optimize
 3. *Settings → Battery → Battery saver* → off during use
 4. If "Power Marathon" / "Smart Power" / "Phone Master" exists in the OEM apps, add PHANTOM to the whitelist
 
-**Long-term fix.** The push-on-disconnect approach that earlier docs pointed at (Unified Push / FCM hybrids) was retired during the 2026-05-14 strategic pivot — both UnifiedPush and FCM are out of scope, because the metadata-leak posture documented in [ADR-001](docs/adr/ADR-001-System-Boundaries.md) and [Threat Model v0](docs/threat-model/Threat_Model_v0.md) makes any always-on third-party push channel an architectural non-starter. The current answer for this issue is the mitigations listed above (WifiLock, WakeLock, app-level ping/pong, `forceCancelAllEngineCalls`, relay store-and-forward) plus the Reality / REST fallback transports added later — they reduce the user-visible impact to a 1-3 s reconnect latency on affected OEMs. There is no separate scheduled push-channel work; if a future approach is identified, it will land as its own ADR.
+**Long-term direction (no fixed deadline; tracked in `docs/PROJECT_LOG.md → Open follow-ups`).** The push-on-disconnect approach earlier docs pointed at (Unified Push / FCM hybrids) was retired during the 2026-05-14 strategic pivot — both UnifiedPush and FCM are out of scope because the metadata-leak posture documented in [ADR-001](docs/adr/ADR-001-System-Boundaries.md) and [Threat Model v0](docs/threat-model/Threat_Model_v0.md) makes any always-on third-party push channel an architectural non-starter. The current answer is the H1c/H1e mitigations above plus the REST fallback. If a future approach is identified, it will land as its own ADR.
 
 ---
 
@@ -85,20 +88,21 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 
 ## High Severity (P2)
 
-### ISSUE-004: First envelope after reconnect+flush occasionally fails MAC verification
+### ISSUE-004: First envelope after reconnect+flush occasionally fails MAC verification  ✅ RESOLVED
 
-**Symptom:** When a recipient reconnects and the relay flushes multiple queued envelopes in quick succession, the first envelope sometimes fails decryption with "MAC validation failed". Subsequent envelopes in the same batch decrypt successfully.
+**Resolved by PR-H2b (#129, master `7008cf3e`, 2026-05-13).**
 
-**Observed in:** Earlier test sessions before fix `37e1414e` deployed. Not observed in final 2026-04-25 evening test session, but window for skipped message keys may still be tight.
+**Original symptom:** When a recipient reconnects and the relay flushes multiple queued envelopes in quick succession, the first envelope sometimes fails decryption with "MAC validation failed". Subsequent envelopes in the same batch decrypt successfully.
 
-**Root cause:** Out-of-order message delivery edge case in the Double Ratchet implementation. The skipped message keys window may be too small for high-burst recovery scenarios.
+**Root cause (confirmed during the H1/H2 diagnostic sprint).** Relay redelivery on a reconnect could re-issue the same envelope after the receiver had already advanced its ratchet chain — the second decrypt attempt would then operate on a chain key that no longer matched. The original "out-of-order delivery + skipped-key window" hypothesis was partly right: it also covered out-of-order MAC misses, but the dominant reproducer in the final round of testing was relay redelivery, not pure out-of-order arrival.
 
-**Mitigation in Alpha 1:** Sender retry logic exists; users can resend the failed message and it succeeds.
+**Fix shipped.** PR-H2b introduces a new `processed_envelopes` SQLDelight table (forward-only `15.sqm` migration, schema v15 → v16) that records every successfully-decrypted envelope id regardless of payload type (text, voice manifest, group control, read receipt). The ledger guard runs **before** `ratchet.decrypt`, so a re-delivered envelope is `Duplicate envelope (already in ledger)` rather than a MAC fail. `INSERT OR IGNORE` makes the guard race-safe under parallel decrypt; the ledger has an 8-day TTL (one day longer than relay store) so it cannot mask a legitimate replay-attack window. Read receipts and other control payloads that never inserted into `messages.id` (and so bypassed the legacy `messages.id` guard) are now also covered. The legacy `messages.id` guard is retained as defence-in-depth.
 
-**Planned fix (Alpha 2):**
-- Increase `MAX_SKIP` constant in Double Ratchet implementation (currently default)
-- Add monitoring metric for MAC verification failures
-- Consider automatic resend on MAC failure (with deduplication on receiver)
+**Test #34 / #37 verified** the fix end-to-end: 12 messages each direction across 12 reconnect cycles per device on Tecno МТС + emulator, zero MAC errors, no duplicate UI rows.
+
+**Related sprint work:** PR-H2a (`674ce231`) strict FIFO outbox via per-envelope `sequenceTs` + `outboundSendMutex`; PR-H2a.2 (`72e59ce9`) holds the mutex across the entire flush-Send loop so live-send cannot race past a higher `sequenceTs`. The complete trilogy closes the client-side reorder source (H2a/H2a.2) **and** the relay-redelivery class (H2b).
+
+**Still on the queue.** PR-H2c (skipped-message-keys per Signal spec) would close the *third* leg — legitimate future-message reorder from TCP retransmit pauses or Tor circuit shifts. Without H2c, a legitimately reordered frame between sender wire and receiver decrypt would still MAC-fail; the H2b ledger then prevents repeat-failure on redelivery, but the original message is lost. Tracked in `docs/PROJECT_LOG.md → Open follow-ups` at low priority — no production reproducer of legitimate reorder has surfaced since H2b landed.
 
 ---
 
@@ -115,16 +119,18 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 
 ---
 
-### ISSUE-006: No retry feedback when a message fails to send
+### ISSUE-006: No retry feedback when a message fails to send  ⚠️ PARTIALLY ADDRESSED
 
-**Symptom:** When the WebSocket is disconnected and the user sends a message, the message appears in the chat with no visual indication that it is pending. There is no "Sending..." spinner or pending icon. The message just sits there until reconnect.
+**Original symptom:** When the WebSocket is disconnected and the user sends a message, the message appears in the chat with no visual indication that it is pending. There is no "Sending..." spinner or pending icon. The message just sits there until reconnect.
 
-**Impact:** User uncertainty about whether the message was actually sent.
+**Status (2026-05-21).** Voice notes ARE covered:
+- **Upload progress UI shipped by PR-M2d.1b** (master `f804e0d8`): `AudioBubble` renders `Uploading N/M` (sender) and `Downloading N/M` (receiver), keyed off an in-memory `MediaProgressBus` `StateFlow<Map<rowId, Progress>>` so the UI ticks per chunk in real time.
+- **Cancellable upload shipped by PR-MEDIA-UPLOAD-CANCEL2.1** (PR #198 part 3, master `b117dcb9`): the X glyph on the uploading bubble now actually stops the upload via `MessagingService.cancelVoiceUpload(conversationId, localMsgId)`, propagates `CancellationException` cleanly through the upload coroutine, tears down the local row, and the bubble disappears from the LazyColumn. End-to-end log chain: `MEDIA_UI upload_cancel_tap` → `MEDIA_TX upload_cancel_requested` → `upload_cancel_dispatched` → `upload_cancelled_by_user manifestSent=false` → `upload_cancel_joined`.
+- **Sender row flips UPLOADING → SENT** as soon as the M2e early manifest envelope leaves the device, while the upload tail continues in background and the bubble counter keeps ticking — the user gets the "it's leaving" signal without waiting for the full upload.
 
-**Planned fix (Alpha 2):**
-- Pending icon (clock) on messages that are queued in outbox
-- Single check (✓) when relay acks (`status=delivered`)
-- Double check (✓✓) when recipient acks (`ack-deliver`)
+**Still open for text messages:**
+- The pending icon (clock) / single check / double check pattern in the original symptom has not been implemented yet for text messages. Text bubbles still appear immediately with no per-message status indicator.
+- Tracked in `docs/PROJECT_LOG.md → Open follow-ups` under "UI polish — per-message status icons", queued behind the doc-honesty pass and the durationMs / empty-voice follow-ups.
 
 ---
 
@@ -252,9 +258,11 @@ The `feat/tor-unified-push-transport` branch retained as historical research art
 
 ---
 
-### ISSUE-014: Calls — experimental feature in Alpha
+### ISSUE-014: Calls — experimental feature, unproven on Russian mobile carriers
 
-**Status:** WebRTC voice calls implemented and partially functional. Marked **experimental** in Alpha. Core text messaging is the primary supported feature; voice calls are best-effort and known-unstable on aggressive-OEM Android skins.
+**Status (refreshed 2026-05-21 post-pivot).** WebRTC voice calls remain **experimental**. Core text messaging is production-quality across the Standard / Private / REST-fallback stack; voice messages are production-quality on the encrypted media-upload path (M1w → M2). Calls are an entirely separate transport problem — they cannot ride the REST fallback (no realtime UDP through short-poll) and have not been validated on a Russian mobile carrier since the 2026-05-15 strategic pivot demoted Tor to text-only.
+
+**Strategic pivot context (2026-05-14 / 2026-05-15).** The earlier "Tor + UnifiedPush hybrid" answer (ADR-016) was retired and Tor was demoted to a text-only emergency fallback after Test #42 on Tele2 LTE showed Reality probe failures dropping straight through to Tor. Tor cannot carry WebRTC (no UDP through onion, latency too high, bandwidth insufficient). Reality is now the load-bearing mobile transport for both voice notes and the call path — but call-over-Reality has not had a production-quality test yet on RU LTE. The C-track (PR-C1 capabilities / PR-C2 Reality endpoint pool + realistic probe / PR-C3 TURN-over-TLS or Opus-over-Reality) is the queued architectural answer.
 
 **What works (verified 2026-05-02 on Tecno Spark Go ↔ Pixel 8 Pro emulator):**
 
@@ -431,15 +439,110 @@ These are documented for transparency about what we resolved during the developm
 
 ## Relay limitations
 
-### ISSUE-017: M1r media chunks are in-memory only
+### ISSUE-017: Media chunks are in-memory on the relay
 
-- **M1r media chunks are in-memory only.** Uploaded voice media may be
-  lost on relay restart before the receiver downloads them. Persistent
-  media storage is deferred to a follow-up PR (M1r.1 / M2).
+**Status (2026-05-21).** Unchanged in kind but the user-visible blast radius is narrower than the Alpha-1 wording suggested.
 
-**Impact.** If the relay process restarts while a voice message's chunks have been uploaded but not yet downloaded by the recipient, those chunks are lost. The sender has no way to detect this without re-sending. This affects voice messages only; text envelopes have the same semantics (also in-memory), which is documented in ISSUE-012.
+**What's true today.** The relay stores both text envelopes (`HashMap<identity, Vec<Envelope>>` + JSONL replay) and M1w media chunks (in-memory `MediaStore`) in process memory, with no SQLite/Sled backend. A relay restart between an upload's `manifest_sent` envelope and the recipient's `download_complete` would lose the un-downloaded chunks. The sender has no application-level retry signal for that case.
 
-**Planned fix.** M1r.1 will introduce SQLite or Sled-backed persistent chunk storage on the relay.
+**Why the impact is operationally smaller than it sounds.**
+- Sender-side: the M2e early manifest fires after ~5100 bytes of upload progress, but the sender continues uploading the tail in background and only commits `manifest_sent → SENT` after the manifest envelope acks. If the relay restarts mid-upload, the upload coroutine sees the WS or REST error and the row stays in a retryable state.
+- Receiver-side: the dynamic fresh-task window `(chunkCount × 1500 ms).coerceIn(120_000, 300_000)` plus backoff `1s → 2s → 3s` means the receiver patiently retries `404 not_ready_yet` for up to 2–5 min before declaring `media_chunks_gone`. A short relay restart fits inside that window. A long restart (≥ 5 min) loses the media — the sender has no automatic re-send today (queued as **PR-INFRA-MediaRO** + downstream "media-resend on receiver request" follow-up).
+- The text-envelope durability story documented under [ISSUE-012](#issue-012-relay-prekeystore--in-memory--jsonl-persistence) is unchanged: text survives via JSONL append-replay; client re-publish flow covers the lossy edges by design.
+
+**Long-term direction.** Persistent media storage on the relay (SQLite, Sled, or filesystem-backed `MediaStore`) is queued but not active; tracked in `docs/PROJECT_LOG.md → Open follow-ups` as part of the broader media-storage track. The current Alpha-2-quality answer is the in-memory store with the receiver's tolerant retry window — sufficient for the daily-usage profile, not sufficient for "phone offline 6 hours, then download".
+
+---
+
+### ISSUE-018: Tele2 LTE — WS Frame.Text silently dropped upstream
+
+**Status:** Known carrier-network limitation. Mitigated by automatic transport degrade to REST short-poll (PR-D0r / PR-D1d).
+
+**Symptom.** On Tele2 LTE Иркутская (verified Test #48 on Tecno `103603734A004351`, 2026-05-16), the WebSocket completes the 101 Upgrade handshake successfully but every subsequent application WS frame from phone to server is silently lost upstream. Server-side `session_summary` lines show `pings_received=0 inbound_frames=0` across ~20 consecutive phone WS sessions, each terminating at the server's ~153 s read timeout. The client side OkHttp `pingInterval(15s)` timeout firing at ~31 s is the **symptom**, not the cause — phone-side ping frames never reach the server in the first place.
+
+**Root cause.** Stateful Tele2 middlebox classifier that admits the WS Upgrade but treats subsequent persistent-WS-frame traffic as suspect and silently drops the body. The H1c/H1e hardening (PR-H1d disable-app-level-ping was considered then killed as wrong direction — `pings_received=0` on the server proves the symptom is not "client sends too fast", so removing client pings just extends zombie-WS lifetime without fixing anything).
+
+**Mitigation shipped.** REST short-poll fallback (PR-D0r relay endpoints + PR-D1/D1b/D1c/D1c.1/D1d client orchestrator). When the orchestrator's per-envelope ACK deadline (PR-D1d, 10 s) fires for a first stuck outbound envelope, the state machine flips `WsActive → RestActive`, the pending envelope migrates to a REST POST with `Idempotency-Key`, and subsequent sends use REST `/relay/send` + `/relay/poll` + `/relay/ack-deliver`. **Test #52 verified** end-to-end: first stuck outbound `397df3c7` armed at `+0.001 s`, expired at `+10.004 s`, migrate completed `send_response status=201 elapsedMs=625`, total user-visible latency ~11 s (was ~40 s on the pre-D1d build).
+
+**REST is not free.** Polling interval + idempotency cache + Tele2 Layer B response-drop (see [ISSUE-019](#issue-019-tele2-lte--post-response-dropped-downstream)) all add latency vs a healthy WS. Voice on REST requires the encrypted media-upload path (M1w + M2 trilogy) because REST `max_send_body=4096 b` is too small for raw voice chunks. Calls cannot run on REST at all (no realtime UDP) — see [ISSUE-014](#issue-014-calls--experimental-feature-unproven-on-russian-mobile-carriers).
+
+**Direct WS is intentionally retained** as a primary transport when the network admits it (Wi-Fi, non-Tele2 cellular, VPN). The REST fallback activates only when the orchestrator's state machine declares the WS realtime as Limited.
+
+---
+
+### ISSUE-019: Tele2 LTE — POST response dropped downstream
+
+**Status:** Known carrier-network limitation. Mitigated by request idempotency + client retry of the same `Idempotency-Key`.
+
+**Symptom.** On Tele2 LTE the same Test #48 verified that a `POST /prekeys/publish` with a 5863-byte body arrives at the server, gets processed (`status=201 duration=2.9ms resp=18b` in Caddy access log), but the 18-byte response is silently dropped downstream and never reaches the phone. The client then hits its 60 s SocketTimeout. Independent of OEM and independent of WS — affects REST POST replies on the same Tele2 path.
+
+**Mitigation shipped (PR-D0r round 1).** Per-identity LRU idempotency cache on the relay (10 000 keys × 24 h TTL, `sha2::Sha256` body hash) keyed by `(identity, Idempotency-Key)`. Every client REST send is retried with the **same** Idempotency-Key on any error path; if the server already processed the request, the retry hits the cache, returns the original response, and the client treats `status=201` as terminal success without double-spending.
+
+**Diagnostic posture.** Layer B is detectable by comparing Caddy access logs (where the response was written) against client logs (where the response was never received). The orchestrator's `migrate_pending_send` / `send_response` / `token_reused` log chain makes the round-trip visible end-to-end in real-device tests.
+
+**Why this isn't a separate failure category from Layer A.** Tele2 Layer A (WS Frame.Text drop, ISSUE-018) and Layer B (POST response drop, ISSUE-019) appear together in the same diagnostic sessions and seem to be the same family of stateful classifier behaviour — but the two layers need to be documented separately because the mitigation surface is different: Layer A drives the WS → REST transport switch, Layer B drives the idempotency contract inside the REST path.
+
+---
+
+### ISSUE-020: Tele2 media-path full-roundtrip ceiling on a single Helsinki relay
+
+**Status:** Architectural limitation of single-relay deployment on Tele2 LTE. Mitigated by chunk-size tuning + M2f binary `/media/v3` endpoint; the long-term fix is route diversity, not chunk size.
+
+**Symptom (PR-M2c.0 cap probe, 2026-05-18 evening).** The PR-M2c.0 probe v2.1 on Tecno Tele2 LTE measured the largest media body that survives a complete POST upload + GET download round trip through `relay.phntm.pro` Helsinki: **stableMaxBodyFullRoundtrip = 2400 bytes** on the v2 JSON+Base64 endpoint, **largestUploadOnly = 6500 bytes** (relay stores the chunk but the 201-response and the subsequent GET body get dropped downstream — same Layer B pattern as [ISSUE-019](#issue-019-tele2-lte--post-response-dropped-downstream)). Above 6500 b the request body itself fails to land.
+
+**Implication for media transport.** The earlier audit recommendation (Section 5 of `docs/design/voice-delivery-audit-2026-05-18.md`) to push chunk size to 5500–6500 b is **not feasible on the current single-relay infrastructure**. The probe's `recommendedRawChunkBytes=1700` was the v2-correct floor — but PR-M2f's binary `/media/v3/{mediaId}/{idx}` endpoint then removed the JSON+Base64 33 % wire-overhead inflation, giving back ~600–700 bytes within the same 2400 b full-roundtrip ceiling. Test #70.2 confirmed `chunk_size_selected = 3500` was stable on v3, and PR-M2f.2 locked production at `TARGET_RAW_CHUNK_BYTES = 3200` per Vladislav's never-ship-max-passed-once policy.
+
+**Long-term direction.** Route diversity, not chunk size: **PR-INFRA-MediaRO** would deploy a second `phantom-relay` at a different VPS/ASN (FlokiNET Romania candidate; an unrelated bridge2 deployment exists as a non-blocking reference but is WebTunnel-only) and surface the second route to clients via a `mediaRelayId` extension to `VoiceManifestV2`. The probe code is preserved on `diag/m2c0-media-route-probe` so the same matrix can be re-run with two `MediaProbeEndpoint` entries when a second route exists. **No active work** until the operations cost (second VPS, federated identity model, per-relay registry decisions) is approved.
+
+**Memory pointer.** `feedback_tele2_media_path_ceiling_2026_05_18.md` for the architectural insight captured in the agent memory.
+
+---
+
+### ISSUE-021: Native OkHttp pattern required for any new Android HTTPS path on RU LTE
+
+**Status:** Architectural pattern, captured to keep future PRs from re-introducing the bug class.
+
+**Background.** Three independent incidents on Russian carrier LTE (PR-R0.1 / PR-R0.3 prekey publish 2026-05-15, PR-M1w-R4 media download 2026-05-18) reproduced the same failure mode: Ktor or pooled-OkHttp HTTPS requests on RU LTE stall for 30+ s between consecutive requests even though the relay logs show the request was served in single-digit milliseconds. The phone simply does not see the response within a reasonable window. The pattern is independent of WS, independent of REST, independent of the M1w media path — it is intrinsic to long-lived OkHttp connections under RU carrier middleboxes.
+
+**Locked architectural rule.** Any new Android HTTPS path that has to work on Russian mobile carriers MUST use **native OkHttp with a fresh client per call**: `HttpClient.Builder` per call, `Connection: close`, `ConnectionPool(0)`, `retryOnConnectionFailure(false)`, 10 s timeouts. Connection-pool reuse is forbidden on RU LTE for application HTTPS. This is encoded in:
+
+- `createPreKeyPublishHttpClient()` in the PreKey API client (PR-R0).
+- `AndroidNativeOkHttpMediaUploadTransport` and `AndroidNativeOkHttpMediaDownloadTransport` in the media-upload path (PR-M1w-R4).
+- PR-G4 pinned REST OkHttp to `Protocol.HTTP_1_1` only on Android.
+
+**Why this isn't "just fix OkHttp / Ktor".** Both libraries are correct on the standards — the carrier middlebox behaviour is non-standard. Wrapping the lifecycle (one client per call) is cheaper and safer than trying to coax the libraries into matching middlebox quirks.
+
+**Memory pointer.** `project_tele2_media_path_2026_05_18.md` records the third reproducer; `feedback_technical_patterns.md` keeps the rule list.
+
+---
+
+### ISSUE-022: First-message-to-new-contact delay (~10–20 s yellow-dot)
+
+**Status:** Known follow-up. Diagnosed, not yet fixed.
+
+**Symptom.** When user A adds user B as a contact and immediately sends the first text message, the bubble appears with a yellow "Sending…" dot for roughly 10–20 s before flipping to Sent. The yellow-dot symptom is the legacy "first-message reliability" class first hit in Test #28 (2026-05-12).
+
+**Root cause (post-G4).** PR-G4 closed the "yellow dot for two minutes" class entirely by pinning REST OkHttp to HTTP/1.1 only (Test #30 dropped phone bundle fetch from 8009 ms × 4 timeouts to 151 ms × 1 OK). The remaining ~10–20 s delay observable across Tests #67b–#68 traces to a different layer: `PREKEY_TRACE upload_fail SocketTimeoutException elapsedMs=8021` in the bootstrap window for a freshly-added contact — same class as the H1e half-open WS pattern, just on the prekey path. The OPK publish times out the first time and only succeeds on retry.
+
+**Fix queued.** **PR-D1e — first-message bootstrap fast path.** No active work yet. Tracked in `docs/PROJECT_LOG.md → Open follow-ups`. Expected to combine (a) shorter per-attempt timeout with eager retry, (b) reuse the orchestrator's REST transport for prekey publish when WS is in Limited mode, (c) parallel bundle-fetch + send rather than sequential.
+
+**User impact today.** The bubble eventually sends and the conversation works normally from message 2 onward. No data loss, no silent failure — just a 10–20 s delay that an external user reasonably reads as "the app is slow".
+
+---
+
+### ISSUE-023: Receiver-side media cancel is not supported
+
+**Status:** Architectural limitation of the current relay media protocol. Blocks re-enabling the M2e early-manifest overlap.
+
+**Symptom.** The X glyph on the receiver-side downloading voice bubble is intentionally hidden (`AudioBubble.onCancelUpload = null` on the receive path). The receiver has no way to cancel an in-flight download or to tell the relay "stop holding the rest of this media for me". The X glyph on the sender-side uploading bubble works (PR-MEDIA-UPLOAD-CANCEL2.1 — see ISSUE-006), but that only stops the upload coroutine; it cannot retract a manifest already in the receiver's hands.
+
+**Knock-on effect: M2e overlap currently disabled.** PR-M2e's "early manifest after ~5100 bytes" shipped successfully for the happy path. But when the **sender** cancels a voice mid-upload after the early manifest has been issued, the receiver knows about a media the sender then refuses to complete — and would loop on `MEDIA_RX chunk_not_ready_yet … reason=media_chunks_gone` until its fresh-task window expired. PR-MEDIA-UPLOAD-CANCEL2 reverted M2e to a tail-only manifest (`sendAudioV2` passes `onEarlyManifest = null`) until the relay grows a real cancel/chunk-delete protocol. Sequential upload + tail manifest is correct semantically but slower than the M2e overlap baseline on long voices.
+
+**Long-term direction.** Two relay-side endpoints are required:
+1. `DELETE /media/v3/{mediaId}` — sender-issued chunk-delete that revokes the manifest's claim. Receiver responds to `404 mediaId_revoked` by deleting the in-progress download row and the local placeholder bubble.
+2. `POST /media/v3/{mediaId}/cancel-pull` — receiver-issued cancel that tells the relay "drop the chunks held for this mediaId for me". Without this, a receiver who cancels download today simply stops `GET`-ing; the relay still holds the chunks until the sender's TTL.
+
+Both are queued as **PR-MEDIA-CANCEL-PROTOCOL** with no fixed schedule. Once shipped, M2e overlap re-enables and the receiver bubble's X glyph becomes interactive.
 
 ---
 
@@ -448,4 +551,4 @@ These are documented for transparency about what we resolved during the developm
 This list is maintained as a living document. Issues are tracked in GitHub Issues at:
 https://github.com/LiudvigVladislav/Phantom/issues
 
-For external review and Beta planning, this snapshot represents the state at the end of Alpha 1 development sprint (2026-04-25).
+For external review and Beta planning, this snapshot represents the state of master `8f4c68c9` (2026-05-21). The Alpha-1 baseline snapshot (2026-04-25) is preserved upstream in this file's git history — `git log -p KNOWN_ISSUES.md` will reproduce the original wording for any issue ID.
