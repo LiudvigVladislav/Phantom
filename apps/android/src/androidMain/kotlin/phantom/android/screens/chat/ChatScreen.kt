@@ -3138,45 +3138,53 @@ private fun InputBar(
                     }
                 }
 
-                // Pause / Resume — same geometric position in Recording, Paused, and Locked
-                // During SwipeCancel overlay it dims to 0.4 alpha and
-                // suppresses its tap handler so the user's gesture is the
-                // only thing in flight.
-                RecPanelControl(
-                    onClick = if (isSwipeOverlayActive) ({}) else if (isLive) onPauseRecording else onResumeRecording,
-                    background = Surface2,
-                    border = true,
-                ) {
-                    Box(modifier = Modifier.graphicsLayer(alpha = dimmedAlpha)) {
-                        if (isLive) {
-                            Canvas(modifier = Modifier.size(16.dp)) {
-                                val barW = size.width * 0.18f
-                                val barH = size.height * 0.62f
-                                val gap = size.width * 0.18f
-                                val centerX = size.width / 2f
-                                val y = (size.height - barH) / 2f
-                                drawRoundRect(
-                                    color = TextPrimary,
-                                    topLeft = Offset(centerX - gap / 2f - barW, y),
-                                    size = Size(barW, barH),
-                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
-                                )
-                                drawRoundRect(
-                                    color = TextPrimary,
-                                    topLeft = Offset(centerX + gap / 2f, y),
-                                    size = Size(barW, barH),
-                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
-                                )
-                            }
-                        } else {
-                            Canvas(modifier = Modifier.size(16.dp)) {
-                                val path = androidx.compose.ui.graphics.Path().apply {
-                                    moveTo(size.width * 0.32f, size.height * 0.20f)
-                                    lineTo(size.width * 0.82f, size.height * 0.50f)
-                                    lineTo(size.width * 0.32f, size.height * 0.80f)
-                                    close()
+                // PR-UI-REC3.3 — hide Pause/Resume during press-hold
+                // recording. The user's finger is on the mic, so they
+                // physically can't reach the in-panel control with the
+                // same finger anyway. The button reappears as soon as
+                // the recording goes hands-free (Locked, Paused, or
+                // Resumed-from-Paused). SwipeCancel-state edge case
+                // returns true here as well so dimmed-Pause still
+                // appears if state ever transitions there.
+                val isPressHoldRecording = recordingState == RecordingPanelState.Recording
+                    && isMicHeld
+                if (!isPressHoldRecording) {
+                    RecPanelControl(
+                        onClick = if (isSwipeOverlayActive) ({}) else if (isLive) onPauseRecording else onResumeRecording,
+                        background = Surface2,
+                        border = true,
+                    ) {
+                        Box(modifier = Modifier.graphicsLayer(alpha = dimmedAlpha)) {
+                            if (isLive) {
+                                Canvas(modifier = Modifier.size(16.dp)) {
+                                    val barW = size.width * 0.18f
+                                    val barH = size.height * 0.62f
+                                    val gap = size.width * 0.18f
+                                    val centerX = size.width / 2f
+                                    val y = (size.height - barH) / 2f
+                                    drawRoundRect(
+                                        color = TextPrimary,
+                                        topLeft = Offset(centerX - gap / 2f - barW, y),
+                                        size = Size(barW, barH),
+                                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                                    )
+                                    drawRoundRect(
+                                        color = TextPrimary,
+                                        topLeft = Offset(centerX + gap / 2f, y),
+                                        size = Size(barW, barH),
+                                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.35f),
+                                    )
                                 }
-                                drawPath(path, color = TextPrimary)
+                            } else {
+                                Canvas(modifier = Modifier.size(16.dp)) {
+                                    val path = androidx.compose.ui.graphics.Path().apply {
+                                        moveTo(size.width * 0.32f, size.height * 0.20f)
+                                        lineTo(size.width * 0.82f, size.height * 0.50f)
+                                        lineTo(size.width * 0.32f, size.height * 0.80f)
+                                        close()
+                                    }
+                                    drawPath(path, color = TextPrimary)
+                                }
                             }
                         }
                     }
