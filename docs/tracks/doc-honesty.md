@@ -63,4 +63,19 @@
 
 ## Last hand-off
 
-(empty — track queued, not yet active)
+**Closed 2026-05-21 (late).** PR #208 merged to `master` as `d953b131`. Single PR, three logical commits — exactly the layout Vladislav locked when greenlighting the plan:
+
+- **`docs(known-issues): align with M1w/M2/REC reality (post-Alpha-1)`** (`1adc2d1e`) — title moved from "PHANTOM Alpha 1 — Known Issues" to "PHANTOM — Known Issues" (post-Alpha-1, no fixed release deadline). ISSUE-001 rewritten to cover the half-open TCP middlebox class + H1c/H1e Run C locked policy. ISSUE-004 marked ✅ RESOLVED by PR-H2b. ISSUE-006 marked ⚠️ PARTIALLY ADDRESSED (voice upload progress UI + cancel X glyph shipped; text status icons still queued). ISSUE-014 rewritten post-pivot (Tor demoted, Reality load-bearing, calls on RU LTE unproven). ISSUE-017 reframed under the M1w + receiver-tolerance window. New issues ISSUE-018 (Tele2 WS Frame.Text drop), ISSUE-019 (Tele2 POST response drop), ISSUE-020 (single-relay media ceiling), ISSUE-021 (native OkHttp pattern), ISSUE-022 (first-message bootstrap delay), ISSUE-023 (receiver-side media cancel unsupported) added.
+- **`docs(adr,timeline): advance ADRs and kill superseded deadlines`** (`94bace93`) — ADR-011 `proposed` → `Accepted` with status block citing PR-H1c `e946caba` + PR-H1e `bcc501be` (locked Run C policy: `APP_LEVEL_PING_ENABLED=false`, OkHttp WS `pingInterval(15s)`, AlarmManager proactive at 45 s, server TCP `SO_KEEPALIVE`). ADR-023 `proposed` → `Accepted` with status block citing PR #56 `d862f3d0` + grep-verified implementation footprint (`KeystoreBlobCipher` / `AndroidKeystoreBlobCipher` / `SqlDelightLocal*PreKeyRepository.privateKeyCipher` / `AndroidKeystoreBlobCipherTest`). MASTER_TIMELINE: strikethrough + cause-line per Vladislav's lock #2 on every killed calendar item (June 1 release, June secondary funding, 25-day plan, NLnet draft V2, FLOSS submission, Tag `v0.1.0-alpha.2`, June/July-Sept/Oct-Dec/Q1-2027 phased calendars, Phase 5 UnifiedPush 2027 risk).
+- **`docs(log): refresh current state and consolidate Open follow-ups`** (`ac15797c`) — new "What works today (master `8f4c68c9`, 2026-05-21)" block at the top of "Current state", with the Alpha-1 baseline preserved as historical context. New "Consolidated queue (Vladislav-locked order, 2026-05-21)" at the top of Open follow-ups matching the next-session locked sequence (REC-FOLLOWUP → notifications diag → D1e → network matrix → calls → voice A/B). "Deferred individual items" below the queue + "Historical / paused" preserved.
+
+Mini-lock acceptance criteria all met:
+- `git diff --stat origin/master..HEAD` shows ONLY `KNOWN_ISSUES.md`, `docs/PROJECT_LOG.md`, `docs/adr/ADR-011-*.md`, `docs/adr/ADR-023-*.md`, `docs/project/MASTER_TIMELINE_2026.md` — no `.kt`, `.rs`, `.gradle.kts`, docker, Caddyfile.
+- `KNOWN_ISSUES.md` read top-to-bottom does not contradict the last 10 master commits.
+- `MASTER_TIMELINE_2026.md` carries zero active post-pivot deadlines; every superseded item has explicit strikethrough + rationale.
+- `PROJECT_LOG.md → Open follow-ups` matches reality; the consolidated queue + deferred individuals + historical-paused break it into reviewable groups.
+- ADR-011 / ADR-023 statuses now point at the commits that shipped them.
+
+**Discipline checkpoint.** Second PR worked end-to-end under `docs/WORKING_RULES.md` (REC3 was the first). Mini-lock authored before scope per rule 3. Three logical commits inside one PR per Vladislav's PR-format lock. Strikethrough-not-delete for dead deadlines per his cleanup lock. ADR-023 status decision gated on `git log --grep` + grep verification, not on optimism, per his ADR lock. Out-of-scope findings during the docs pass (e.g. the text-bubble status-icon item under ISSUE-006) stayed logged as deferred follow-ups, not "fixed in passing".
+
+Next session's start: **PR-UI-REC-FOLLOWUP** per the locked queue at the top of `docs/PROJECT_LOG.md → Open follow-ups` — recording-duration source fix (`MediaMetadataRetriever` vs ticker undercount) + empty-voice race (`heldMs ≥ 700` but `durationMs ≤ 0`). Both have to be addressed inside `finalizeAndSendVoice`, not at the gesture layer.
