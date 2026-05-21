@@ -28,7 +28,32 @@ licence (LICENSE + NOTICE + SPDX headers on every .kt and .rs file +
 README §License — all shipped in the four-commit licence-hygiene
 patch on 2026-04-27).
 
-### What works (proven in QA-v10 / 2026-04-27)
+### What works today (master `8f4c68c9`, 2026-05-21)
+
+This block reflects the current production state of `master` after the M1w / M2 / H1 / H2 / D-track / REC sprints. The Alpha-1 baseline immediately below is preserved as a historical reference point.
+
+- ✅ **End-to-end encrypted 1:1 messaging** — Double Ratchet + Sealed Sender via libsodium; identity-prekey separation per ADR-009 implemented; F22 prekey private-key wrap via Android Keystore (ADR-023 Accepted, PR #56 `d862f3d0`); F8 Double Ratchet state wrap (ADR-024, PR #60 `cc48a333`); H2b idempotent envelope ledger (PR #129 `7008cf3e`) neutralises relay redelivery.
+- ✅ **Multi-transport stack with runtime gating** — three transports plus a fallback layer:
+  - **Direct WSS** (`Standard` mode) — the primary path on healthy networks; H1c/H1e Run C policy locked (PR-H1c `e946caba`, PR-H1e `bcc501be`).
+  - **Reality (VLESS+REALITY through Xray)** (`Private` mode) — load-bearing on RU mobile carriers per the 2026-05-15 strategic pivot follow-up; Stage 5E production-validated 2026-05-07.
+  - **Tor v3 onion service** (`Ghost` mode) — text-only emergency fallback per pivot. PR-E imported Briar's `bridges-s-ru` bridge set + Google-AMP-cache Snowflake (Test #6 reached Ghost-without-VPN on МТС in ~6 min).
+  - **REST short-poll fallback** (PR-D0r relay endpoints + PR-D1/D1b/D1c/D1c.1/D1d client orchestrator) — activates automatically when WS realtime degrades. Tested end-to-end on Tele2 LTE Иркутская.
+- ✅ **Encrypted media-upload voice messages 1:1** (M1w end-to-end). Record → encrypt (XChaCha20-Poly1305 AAD=mediaId) → chunk → upload via native OkHttp fresh-client-per-call → manifest envelope via ratchet → receiver durable enqueue + ACK + GET + decrypt + SHA-256 verify + bubble. PR-M1w (#172 `561de17c`) plus the M2a–M2h.1 sequence locked production chunk size = 3200 bytes, byte-based early manifest = 5100 bytes, ~3× throughput headroom vs the v2 ceiling.
+- ✅ **Recording Panel UX trilogy** — RecordingPanelState enum with Recording / Paused / Locked / SwipeCancel states. REC1 baseline (PR #195 `08ccf906`), REC2 WhatsApp-style hold-to-lock + recorder crash hardening + swipe-left-cancel safety shim (PR #197 `52a9773f`), REC3 SwipeCancel state visual + threshold/trail/animated arrow (PR #205 `770e61f4`).
+- ✅ **Outgoing voice upload cancel** — X glyph on the uploading bubble actually stops the upload via `MessagingService.cancelVoiceUpload` + `CancellationException` propagation + `NonCancellable` cleanup + `job.cancel + join` (PR-MEDIA-UPLOAD-CANCEL2.1 in PR #198 `b117dcb9`).
+- ✅ **Per-user Ed25519 signed-challenge auth** (F11+F26 closed via PR #72 `6e90e3c6`; ADR-027 Accepted). Replaced the shared WS token; production-validated on Tecno МТС + emulator 2026-05-09.
+- ✅ **Trust Tier flow** (first message → Message Requests, accept → Trusted) — unchanged from Alpha-1.
+- ✅ **Production relay** with store-and-forward at `wss://relay.phntm.pro/ws` plus the REST endpoints `/auth/session`, `/relay/send`, `/relay/poll`, `/relay/ack-deliver`, `/prekeys/publish`, `/prekeys/status`, `/media/v3/{mediaId}/{idx}` POST + GET.
+- ✅ **QR code + `phantom://invite/<base64>` deep links** — unchanged from Alpha-1.
+- ✅ **Crypto integration test suite green** (16/16 on Pixel 8 Pro / API 35); H2b storage contract + messaging tests green; D2b.1 voice durability tests green; M1w/M2 tests green; D0r REST-fallback integration tests green.
+- ✅ **Foreground-service WebSocket** with WifiLock + partial WakeLock + AlarmManager-driven 45 s proactive reconnect.
+- ✅ **Onboarding ToS** in EN, full Terms / Privacy Policy hosted at `/terms` and `/privacy` with EN ⇄ RU switcher (unchanged from Alpha-1).
+- ✅ **Settings → About** with all 6 contact addresses (unchanged from Alpha-1).
+- ✅ **Discipline scaffolding** — `docs/WORKING_RULES.md` codifies single-developer discipline (one active track, one PR per layer, mini-lock before code, two architectural failures = park, hand-off note on context switch, log everything, log-not-develop on new findings). First PR-end-to-end under that discipline = REC3 (PR #205) plus PR-DOC-HONESTY (this PR).
+
+### What works (proven in QA-v10 / 2026-04-27) — historical Alpha-1 baseline
+
+Preserved as the original snapshot at tag `v0.1.0-alpha.1` (commit `0246b50f`). Read alongside the **What works today** block above to see what changed.
 
 - ✅ End-to-end encrypted 1:1 messaging (libsignal + libsodium, Double Ratchet, Sealed Sender)
 - ✅ Trust Tier flow (first message → Message Requests, accept → Trusted)
@@ -362,6 +387,46 @@ on advice that references prior commits — even from another LLM.
 > items that landed, and avoid duplicating across the Session journal.
 > This is the durable "what's not done" snapshot — Session journal entries
 > tell the story, this list answers "what's still on the queue".
+
+### Consolidated queue (Vladislav-locked order, 2026-05-21)
+
+This is the next-session locked queue per the 2026-05-21 PR-DOC-HONESTY mini-lock + the session-close discipline note. Order is **locked** — do not reorder without explicit Vladislav greenlight.
+
+1. ✅ **PR-DOC-HONESTY** — KNOWN_ISSUES expansion + ADR-011/-023 status advance + MASTER_TIMELINE killed-deadlines cleanup + this consolidated queue. **In flight as this PR.**
+2. **PR-UI-REC-FOLLOWUP** — recording-duration source fix (the 100 ms ticker undercounts vs the `MediaMetadataRetriever` reading; Test #76.5b logs showed `durationMs=8000` on a ~12 s voice) AND the empty-voice race when `heldMs ≥ 700 ms` but `durationMs ≤ 0` (Test #76.3 logs: `hold_release_send heldMs=819 durationMs=0`). The right fix is `durationMs`-based gating inside `finalizeAndSendVoice`, not another gesture-layer change.
+3. **Notifications diagnostic PR** — Vladislav reported notification flakiness during Test #75. Pre-exists today's work; needs a diagnostic PR before any fix attempt.
+4. **PR-D1e first-message bootstrap fast path** — yellow-dot 10–20 s on first text after `add contact` (`PREKEY_TRACE upload_fail SocketTimeoutException elapsedMs=8021`); same class as the H1e half-open WS pattern but on the prekey path. See `KNOWN_ISSUES.md` ISSUE-022.
+5. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact promised in `feedback_strategy_decisions_2026_05_14.md`.
+6. **Calls testing — C-track sequence.** C1 typed `TransportCapabilities` gate (replace `state == WsActive` shorthand) → C2 Reality endpoint pool + realistic probe (current `/health` probe doesn't catch the Tele2 Layer A silent WS-drop pattern) → C3 TURN-over-TLS on 443 or custom Opus-over-Reality (decide after C2 measures what Tele2 actually allows).
+7. **Voice quality A/B** — confirmed 24 kbps OPUS mono 16 kHz as the production floor (`feedback_voice_quality_priority.md`); a future "Data Saver" 16 kbps toggle is gated behind this A/B.
+
+### Deferred individual items (not in the locked-order queue above)
+
+The items below are tracked durably but are not on the active queue. Most have been waiting for relay-side or operations work before they can land.
+
+- **M2e early-manifest re-enable** — depends on receiver-side media-cancel relay protocol (see `KNOWN_ISSUES.md` ISSUE-023). M2e overlap is currently disabled in favour of correct cancellation semantics; long voices ship at `max(upload, download)` instead of the M2e parallel baseline.
+- **Receiver-side media download cancel** — needs the two new relay endpoints sketched in ISSUE-023 (`DELETE /media/v3/{mediaId}` + `POST /media/v3/{mediaId}/cancel-pull`). Without these, the receiver bubble's X glyph is intentionally hidden.
+- **PR-INFRA-MediaRO — second relay route diversity** — deploy a second `phantom-relay` at a different VPS / ASN (FlokiNET Romania candidate); allocate a media subdomain; design `mediaRelayId` extension to `VoiceManifestV2`; re-run the PR-M2c.0 probe against two `MediaProbeEndpoint` entries. Probe code preserved on `diag/m2c0-media-route-probe`. Needs VPS budget + a decision on auth model (federated identity vs per-relay registry).
+- **PR-R0.5 / PR-PK1 — prekey upload response-drop fallback** — `/prekeys/publish` POST body lands server-side (201 ~3 ms) but the 18-byte response is dropped downstream on Tele2 ~30 % of the time. Three retries currently mask it but burn 30 s × 3. Fix idea: after POST timeout, GET `/prekeys/status/<identity>` and treat the soft-success path as terminal if `opks_remaining` / `spk_key_id` advanced.
+- **PR-D0r follow-up — sealed-sender empty mirror** — review note from PR-D0r round; mirror envelope to REST store with `from=from_identity` when `sealed_sender` is empty. Currently not blocking but should be closed before next REST API surface change.
+- **WS keepalive on Tele2 — diagnostic open** — phone-side `inbound_frames=0 pings_received=0` across every WS session lifetime (~31 s) on Tele2 LTE. Direct WS is honest "Online via Direct · Limited realtime" because realtime is unreliable; REST fallback covers text. Not actionable today; the C-track will need to address this if WS is resurrected as a primary realtime path.
+- **PR-H2c — skipped-message-keys per Signal spec** — closes the third leg of the H2 reorder story (legitimate future-message reorder from TCP retransmit pauses, multi-path mobile, Tor circuit shifts). No production reproducer of legitimate reorder has surfaced since H2b landed.
+- **UI stale-bubble track** — receiver `AudioBubble` briefly flashes "Downloading" after `download_complete` on some Test #70.2 chunk-size choices; Compose state-refresh issue. Tracked separately, no urgency.
+- **`docs/calls-experimental` ADR refresh** — Track A item #4 marked ✅ merged but the doc itself is out of date relative to the C-track plan; either update or formally supersede.
+- **93 non-docs `[gone]` local branches** — broader prune sweep awaiting Vladislav's explicit greenlight per `feedback_branch_prune_policy.md`.
+
+### Historical / paused
+
+- **Phase 1 connectivity matrix (Tests #43-#47)** — paused 2026-05-15 per strategic pivot; resumes if priority shifts back. Scope reference intact in memory `project_phase1_scope_2026_05_14`.
+- **Tor bridge BridgeDB-on-device fetcher** — deferred (Briar doesn't have one either — bridge freshness, not the fetcher, is the bottleneck).
+- **Cross-operator testing (Beeline / Megafon)** — blocked on hardware: Tecno SIM is Wi-Fi only since 2026-05-14; second phone with mobile data still incoming.
+- **Tor-bridge rotation ADR** — architect-recommended retrospective, not started.
+
+---
+
+### Pre-2026-05-21 sub-sections (preserved for context, do not re-edit)
+
+Below this point the original sub-section blocks (Reliability / transport, Calls, Repo / docs, Historical / paused) are preserved as the durable per-track journal. The **Consolidated queue** above is now the canonical "what's next" — these blocks are the per-item evidence trail.
 
 ### Reliability / transport (D-track, post-D1d)
 
