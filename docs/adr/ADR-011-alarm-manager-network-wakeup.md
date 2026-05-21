@@ -1,8 +1,39 @@
 # ADR-011: AlarmManager-Driven Periodic Network Wakeup
 
-Status: proposed
-Date: 2026-05-01
+Status: **Accepted** (implemented and refined through PR-H1c → PR-H1e Run C)
+Original date: 2026-05-01
+Acceptance date: 2026-05-13 (PR-H1c shipped the AlarmManager wakeup as part of the six-layer stale-socket recovery)
+Refined: 2026-05-14 (PR-H1e Run C locked the final cadence after a four-run heartbeat experiment)
 Layer: app/service (android)
+
+---
+
+## Status note (2026-05-21)
+
+This ADR landed in production through the H1 reliability sprint. The decision section below is preserved as originally drafted; this status note records what shipped and where.
+
+**Implementation references:**
+
+- **PR-H1c (#132, master `e946caba`, 2026-05-13)** — shipped the six-layer stale-socket recovery that includes the AlarmManager wakeup as designed in this ADR. The receiver path checks `lastInboundFrameElapsedMs` (broader than the original `lastPongMark` — see Decision §5 below) and calls `forceReconnect()` when the inbound channel is stale. **Test #37** verified detection time 155 s → 30–46 s, recovery 5 s → ~1 s, zero message loss across twelve consecutive reconnect cycles per device on Tecno МТС + emulator.
+- **PR-H1e (#134, master `bcc501be`, 2026-05-14)** — locked the final production cadence after a four-run heartbeat experiment on `diag/h1e-ws-ping-experiments`. The locked Run C policy is:
+  - `APP_LEVEL_PING_ENABLED=false` — the redundant app-level RelayMessage Ping/Pong layer is disabled; OkHttp WS Ping is the sole client-side liveness check.
+  - OkHttp WS `pingInterval(15s)` hard-coded.
+  - AlarmManager proactive reconnect at 45 s of stale inbound (below the 60 s pong-watchdog floor in §122 of the original decision) — survives Doze and OEM AlarmManager throttling as a safety net.
+  - Dead-socket watchdog continues ticking on `PING_INTERVAL_MS`.
+
+**Acceptance criteria (from §397 below) — verification status:**
+
+1. **3-minute screen-off Tecno HiOS delivery within 90 s** — verified by Test #37 / Test #41. Tecno is now Wi-Fi-only since 2026-05-14 (no SIM), so the OEM-radio-park leg of the original criterion is no longer reproducible on the current hardware; the half-open TCP middlebox class (which the same fix addresses) IS reproduced on a daily basis on Tele2 LTE.
+2. **`adb shell dumpsys alarm | grep phantom` shows the `PhantomWakeupReceiver` entry repeating at ~60 s** — confirmed in PR-H1c diagnostic logs.
+3. **`USE_EXACT_ALARM` revoke fallback** — implemented per Risks R1; verified in the AppContainer / `PhantomMessagingService.kt` wakeup path.
+4. **60-minute Doze soak with ≤ 3 % battery drain** — not formally measured. Field-tested on multiple device sessions without complaints; battery impact has not regressed against the Briar / Element reference numbers cited in §299.
+5. **Receiver logs "pong fresh — no action" vs "stale pong — forcing reconnect"** — both log lines present in production logcat after H1c. Note that under Run C the trigger is `lastInboundFrameElapsedMs`, not strictly pong age, so a more general phrasing is used in production code.
+
+**Remaining open question.** OQ-2 (adaptive interval — fire more often during active conversations, less often when idle for hours) is **still open** and tracked in `docs/PROJECT_LOG.md → Open follow-ups`. The locked 45 s / 60 s cadence is the production answer until that follow-up is picked up; no urgency given current battery field data.
+
+The Decision section below is preserved as-written for archival reasons. Read the Status note above for what's actually true today.
+
+---
 
 ---
 

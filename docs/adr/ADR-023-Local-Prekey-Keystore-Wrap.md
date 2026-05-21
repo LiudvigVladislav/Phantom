@@ -1,10 +1,37 @@
 # ADR-023: Local prekey private-key wrap via Android Keystore
 
-Status: proposed (2026-05-08; implementation lands in a follow-up PR)
+Status: **Accepted** (implemented)
+Original date: 2026-05-08
+Acceptance date: 2026-05-08 (same-day implementation in PR #56)
 Layer: shared/core/storage (KMP repository layer + Android-specific
 crypto helper), apps/android (Android Keystore platform binding)
 Extends: ADR-009 (Identity / Prekey Separation — defines *which* keys
 exist; this ADR defines *how* they sit at rest)
+
+---
+
+## Status note (2026-05-21)
+
+ADR-023 shipped in production via **PR #56 — `feat(storage): F22 — wrap local prekey private bytes with Android Keystore (PR-1 of 2)`** (master `d862f3d0`, originally `6737be91`, 2026-05-08). The decision below is implemented as-described.
+
+**Implementation footprint (verified by grep on master `8f4c68c9`):**
+
+- `shared/core/storage/src/commonMain/kotlin/phantom/core/storage/KeystoreBlobCipher.kt` — common-side `KeystoreBlobCipher` interface + `IdentityCipher` default singleton.
+- `shared/core/storage/src/androidMain/kotlin/phantom/core/storage/AndroidKeystoreBlobCipher.kt` — Android Keystore-backed AES-256-GCM concrete cipher matching the key-property profile in the Decision section below.
+- `shared/core/storage/src/androidInstrumentedTest/kotlin/phantom/core/storage/AndroidKeystoreBlobCipherTest.kt` — instrumented tests confirming the wrap / unwrap round trip on real Android devices.
+- `shared/core/storage/src/commonMain/kotlin/phantom/core/storage/SqlDelightLocalOneTimePreKeyRepository.kt` — OPK repository accepts `privateKeyCipher: KeystoreBlobCipher = IdentityCipher` and wraps/unwraps `private_key_hex` at the boundary.
+- `shared/core/storage/src/commonMain/kotlin/phantom/core/storage/SqlDelightLocalSignedPreKeyRepository.kt` — SignedPreKey repository follows the same wrap-at-boundary pattern, covering both `private_key_hex` and `previous_private_key_hex`.
+
+**Related work that built on the same primitive:**
+
+- **PR #60 — `feat(storage): H-1 — wrap Double Ratchet session state with Android Keystore` (master `cc48a333`).** Extends the same `KeystoreBlobCipher` primitive to Double Ratchet state. Tracked as a separate ADR (ADR-024).
+- The SQLCipher database passphrase wrap (`DatabasePassphraseManager` in `androidMain`) predates this ADR and uses the same Keystore key-property profile, which is why the wrap-at-boundary approach was lifted into a common interface rather than reinvented.
+
+**F22 threat-class closure.** The three memory-class threat scenarios listed in the Context section below (memory dump on a powered-on unlocked device; decrypted-DB leaving the device via debug backup; app-process compromise via shared content provider / IPC misuse) all now require an additional Android Keystore unwrap step that is gated by device unlock authentication. The identity X25519 private key was already Keystore-wrapped before this ADR; PR #56 closes the prekey leg; PR #60 closes the ratchet-state leg.
+
+The Decision and Risks sections below are preserved as the design record. Read the Status note above for what's true today.
+
+---
 
 ## Context
 
