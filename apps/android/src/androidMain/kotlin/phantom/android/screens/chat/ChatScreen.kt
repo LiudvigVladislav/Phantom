@@ -327,23 +327,58 @@ fun ChatScreen(
             Log.i("PhantomMedia", "VOICE_REC locked_send")
         }
         val file = audioFile
+        val tickerDurationMsAtFinalize = recordingDurationMs
         if (file != null && file.exists()) {
             scope.launch {
                 try {
                     val bytes = file.readBytes()
                     val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
-                    val bytesPerSec = if (recordingDurationMs > 0) {
-                        bytes.size.toLong() * 1000L / recordingDurationMs
+
+                    // PR-UI-REC-FOLLOWUP — source-of-truth duration. Read the
+                    // real encoded duration from the file via
+                    // MediaMetadataRetriever; fall back to the ticker if the
+                    // retriever cannot extract a positive value (rare encoder
+                    // edge cases). Emit which source was used so future tests
+                    // can attribute any remaining miscount unambiguously.
+                    val metadataDurationMs = readAudioDurationMs(file)
+                    val finalDurationMs = metadataDurationMs ?: tickerDurationMsAtFinalize
+                    val durationSource =
+                        if (metadataDurationMs != null) "metadata" else "ticker_fallback"
+
+                    // PR-UI-REC-FOLLOWUP — empty/too-short safety gate. The
+                    // gesture-layer 700 ms gate already drops releases the
+                    // user obviously did not intend to send, but the
+                    // MediaRecorder warm-up race (Test #76.3:
+                    // heldMs=819 durationMs=0, ~98 bytes) can still produce
+                    // a file with no playable audio. Drop it silently here
+                    // before any MEDIA_TX work starts; no relay envelope,
+                    // no LazyColumn row, no notification on the receiver.
+                    if (finalDurationMs < MIN_SENDABLE_VOICE_DURATION_MS ||
+                        bytes.size < MIN_SENDABLE_VOICE_BYTES
+                    ) {
+                        android.util.Log.i(
+                            "PhantomMedia",
+                            "VOICE_REC drop_empty durationMs=$finalDurationMs " +
+                                "tickerMs=$tickerDurationMsAtFinalize bytes=${bytes.size} " +
+                                "source=$durationSource reason=too_short_or_empty",
+                        )
+                        runCatching { file.delete() }
+                        return@launch
+                    }
+
+                    val bytesPerSec = if (finalDurationMs > 0) {
+                        bytes.size.toLong() * 1000L / finalDurationMs
                     } else 0L
                     android.util.Log.i(
                         "PhantomMedia",
-                        "VOICE_REC complete durationMs=$recordingDurationMs bytes=${bytes.size} " +
-                            "bytesPerSec=$bytesPerSec mime=$mimeType"
+                        "VOICE_REC complete durationMs=$finalDurationMs " +
+                            "tickerMs=$tickerDurationMsAtFinalize source=$durationSource " +
+                            "bytes=${bytes.size} bytesPerSec=$bytesPerSec mime=$mimeType"
                     )
                     val result = container.messagingService?.sendAudio(
                         conversationId = conversationId,
                         audioBytes = bytes,
-                        durationMs = recordingDurationMs,
+                        durationMs = finalDurationMs,
                         mimeType = mimeType,
                     )
                     if (result != null && result.isFailure) {
@@ -3578,6 +3613,58 @@ enum class RecordingPanelState {
  * silently drop the recording.
  */
 private const val MIN_HOLD_SEND_MS = 700L
+
+/**
+ * PR-UI-REC-FOLLOWUP — empty-voice safety gate inside `finalizeAndSendVoice`.
+ *
+ * The gesture-layer `MIN_HOLD_SEND_MS` above guards "user released too soon" by
+ * heldMs measured at the pointer event. It does NOT cover the warm-up race
+ * where the user holds long enough but `MediaRecorder` produces nothing
+ * playable (Test #76.3: `hold_release_send heldMs=819 durationMs=0`, gesture
+ * passed the 700 ms gate but the file is empty).
+ *
+ * This second gate runs after the file lands on disk and reads the audio
+ * file's real duration via `MediaMetadataRetriever`. If either the duration
+ * is below 700 ms OR the file is suspiciously small (< 1024 bytes), the row
+ * is dropped silently before the upload kicks off — no relay envelope leaves
+ * the device. Both conditions are required because (a) duration alone
+ * doesn't catch a broken file with garbage metadata, (b) bytes alone doesn't
+ * catch a very short but technically valid recording the user clearly didn't
+ * mean to send.
+ */
+private const val MIN_SENDABLE_VOICE_DURATION_MS = 700L
+private const val MIN_SENDABLE_VOICE_BYTES = 1024L
+
+/**
+ * PR-UI-REC-FOLLOWUP — read the real duration of a recorded audio file via
+ * `MediaMetadataRetriever`. Used as the source of truth for the `durationMs`
+ * value that ships in `VOICE_REC complete` logs, downstream `sendAudio`
+ * call, and ultimately the receiver-side `AudioBubble` timer.
+ *
+ * Background: the existing 100 ms in-Composable ticker undercounts long
+ * voices because it's paused or destroyed across some Compose state
+ * transitions (Test #76.5b: `durationMs=8000` on a ~12 s voice — roughly
+ * 33% undercount). The MediaRecorder writes the real elapsed encoded
+ * duration into the file container, which a `MediaMetadataRetriever` can
+ * read in single-digit ms on a finished file.
+ *
+ * Returns `null` if the retriever cannot extract a positive duration (some
+ * AAC_ELD-on-API-26-28 encoder edge cases, malformed files, etc) — the
+ * caller falls back to the ticker value in that case and emits
+ * `source=ticker_fallback` in the log so future tests can distinguish.
+ */
+private fun readAudioDurationMs(file: java.io.File): Long? = runCatching {
+    val retriever = android.media.MediaMetadataRetriever()
+    try {
+        retriever.setDataSource(file.absolutePath)
+        retriever
+            .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLongOrNull()
+            ?.takeIf { it > 0L }
+    } finally {
+        runCatching { retriever.release() }
+    }
+}.getOrNull()
 
 /** PR-UI-REC2 — Locked-state badge in the center stack of the recording panel.
  *  28 dp cyan-tinted disc with a 11 px lock glyph. Static visual only; the
