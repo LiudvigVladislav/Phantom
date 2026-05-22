@@ -388,13 +388,13 @@ on advice that references prior commits — even from another LLM.
 > This is the durable "what's not done" snapshot — Session journal entries
 > tell the story, this list answers "what's still on the queue".
 
-### Consolidated queue (Vladislav-locked order, 2026-05-21)
+### Consolidated queue (Vladislav-locked order, 2026-05-22)
 
-This is the next-session locked queue per the 2026-05-21 PR-DOC-HONESTY mini-lock + the session-close discipline note. Order is **locked** — do not reorder without explicit Vladislav greenlight.
+This is the next-session locked queue per the 2026-05-21 PR-DOC-HONESTY mini-lock + the session-close discipline note, refreshed after PR-UI-REC-FOLLOWUP closed on 2026-05-22. Order is **locked** — do not reorder without explicit Vladislav greenlight.
 
-1. ✅ **PR-DOC-HONESTY** — KNOWN_ISSUES expansion + ADR-011/-023 status advance + MASTER_TIMELINE killed-deadlines cleanup + this consolidated queue. **In flight as this PR.**
-2. **PR-UI-REC-FOLLOWUP** — recording-duration source fix (the 100 ms ticker undercounts vs the `MediaMetadataRetriever` reading; Test #76.5b logs showed `durationMs=8000` on a ~12 s voice) AND the empty-voice race when `heldMs ≥ 700 ms` but `durationMs ≤ 0` (Test #76.3 logs: `hold_release_send heldMs=819 durationMs=0`). The right fix is `durationMs`-based gating inside `finalizeAndSendVoice`, not another gesture-layer change.
-3. **Notifications diagnostic PR** — Vladislav reported notification flakiness during Test #75. Pre-exists today's work; needs a diagnostic PR before any fix attempt.
+1. ✅ **PR-DOC-HONESTY** — shipped 2026-05-21 (PR #208 + close #209). KNOWN_ISSUES expansion + ADR-011/-023 status advance + MASTER_TIMELINE killed-deadlines cleanup + this consolidated queue.
+2. ✅ **PR-UI-REC-FOLLOWUP** — shipped 2026-05-22 (PR #210 `a625bde7`). Metadata-derived voice duration via `MediaMetadataRetriever` + empty-voice safety gate (`finalizeAndSendVoice` guard, both 700 ms duration AND 1024-byte file-size required). Test #77 PASS.
+3. **Notifications diagnostic PR** — **next**. Vladislav reported notification flakiness during Test #75. Pre-exists today's work; needs a diagnostic PR before any fix attempt.
 4. **PR-D1e first-message bootstrap fast path** — yellow-dot 10–20 s on first text after `add contact` (`PREKEY_TRACE upload_fail SocketTimeoutException elapsedMs=8021`); same class as the H1e half-open WS pattern but on the prekey path. See `KNOWN_ISSUES.md` ISSUE-022.
 5. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact promised in `feedback_strategy_decisions_2026_05_14.md`.
 6. **Calls testing — C-track sequence.** C1 typed `TransportCapabilities` gate (replace `state == WsActive` shorthand) → C2 Reality endpoint pool + realistic probe (current `/health` probe doesn't catch the Tele2 Layer A silent WS-drop pattern) → C3 TURN-over-TLS on 443 or custom Opus-over-Reality (decide after C2 measures what Tele2 actually allows).
@@ -555,6 +555,29 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-22 (fri) · PR-UI-REC-FOLLOWUP — metadata-derived voice duration + empty-voice gate
+
+Closed PR #210 (`feat/pr-ui-rec-followup-duration-empty-race` → master `a625bde7`). One commit, one file (`ChatScreen.kt`), +92 / −5 lines. Test #77 PASS on Tecno (Vladislav verdict).
+
+**What shipped.** Two fundamentals left over from REC2.4 / REC3:
+
+1. **Recording-duration source fix.** Replaced the 100 ms ticker (Test #76.5b reproducer: `durationMs=8000` on a ~12 s voice; the ticker pauses or is destroyed across some Compose state transitions and undercounts ~33 % on long voices) with `MediaMetadataRetriever.METADATA_KEY_DURATION` read off the finished file after `stop()`. New private helper `readAudioDurationMs(file)` wraps the retriever in `runCatching` + `try { } finally { release() }`; returns `Long?` so the caller can fall back if the retriever cannot extract a positive value (some AAC_ELD-on-API-26–28 encoder edge cases). The `VOICE_REC complete` log now carries both `durationMs` (the final value used everywhere downstream) and `tickerMs` (old value, for diagnostic attribution) + `source=metadata|ticker_fallback`.
+2. **Empty-voice safety gate.** New private constants `MIN_SENDABLE_VOICE_DURATION_MS = 700L` and `MIN_SENDABLE_VOICE_BYTES = 1024L` next to `MIN_HOLD_SEND_MS`. New gate inside `finalizeAndSendVoice` runs after `readBytes()` + `readAudioDurationMs`: if `finalDurationMs < 700` OR `bytes.size < 1024`, log `VOICE_REC drop_empty durationMs=… tickerMs=… bytes=… source=… reason=too_short_or_empty`, `runCatching { file.delete() }`, `return@launch`. The outer `finally` still resets `voiceSendInProgress`. Catches the warm-up race the gesture-layer 700 ms `MIN_HOLD_SEND_MS` cannot catch (Test #76.3 class: `heldMs=819 durationMs=0`, file ~98 bytes — gesture passed the gate but `MediaRecorder` produced nothing playable).
+
+**Test #77 data points (Vladislav, real device).** Ticker undercount confirmed and fixed:
+
+- Scenario A (3–5 sec): `heldMs=4239 tickerMs=3100 metadata=3718` — metadata wins.
+- Scenario B (10–12 sec): `heldMs=11306 tickerMs=9900 metadata=11118` — ticker would have undercounted to 9.9 s on what was an 11.3 s hold.
+- Scenario C (locked-send, ~14 s from recorder start to Send tap): `tickerMs=12600 metadata=14038` — metadata matches wall-clock; the ~3 s gap user perceived as "wait, it's 11 s" was actually the gap between locked-entry and Send-tap, not a duration miscount.
+- Scenarios D (swipe-cancel) and E (sub-700 ms tap): no `VOICE_REC complete`, no `MEDIA_TX upload_*`, no new LazyColumn row — gesture-layer cancels still work, `drop_empty` gate is dormant in this run because every short tap was caught earlier by `MIN_HOLD_SEND_MS`. The new gate's branch is reachable; it just didn't trigger in the run because Vladislav couldn't reproduce the warm-up race today.
+
+**Discipline checkpoint.** Third PR end-to-end under `docs/WORKING_RULES.md` (REC3 → PR-DOC-HONESTY → REC-FOLLOWUP). Mini-lock authored before code per rule 3 (the `rec-followup.md` lock landed inside PR #209 closing PR-DOC-HONESTY). Held scope strictly: group voice path (`GroupChatScreen.kt` `sendGroupAudio`) was tempting because it has the same bug class, but it was explicitly out-of-scope per the mini-lock; left untouched, logged as a follow-up in this entry. Rule 4 parking threshold never reached.
+
+**Open follow-ups (added by this track):**
+
+- **Group voice durationMs + empty-voice guard** — `GroupChatScreen.kt` `sendGroupAudio` still ships ticker `recordingDurationMs` and has no empty-voice gate. Same bug class as 1:1; needs a separate group-durability track because the group voice path also lacks durable chunk storage keyed by `groupId` (per the D2b.1 commit note). No urgency until group voice surfaces as a tested feature.
+- **`tickerMs=` field cleanup** — once a few more real-device sessions confirm the metadata source is reliable, the `tickerMs=` field in the `VOICE_REC complete` log can be removed. It's there only for diagnostic attribution during the adoption phase.
 
 ### 2026-05-21 (thu, late) · PR-DOC-HONESTY — documentation honesty pass
 
