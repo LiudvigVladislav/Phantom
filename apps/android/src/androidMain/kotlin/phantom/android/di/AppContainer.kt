@@ -787,10 +787,39 @@ class AppContainer(private val context: Context) {
         }
 
         // Wire local notification callback — Android-only side-effect, not part of the KMP interface.
-        service.onNewMessageNotification = { convId, sender, preview, senderPubKeyHex ->
+        // PR-NOTIF-DIAG: callback signature gained a leading `source` field so the
+        // platform binding can log which incoming-message path triggered the
+        // notification. Diagnostic only — `source` is logged, not used for routing.
+        // The previous `PhantomMessaging`-tagged error log is preserved so older
+        // triage habits that filter on that tag still see the failure.
+        service.onNewMessageNotification = { source, convId, sender, preview, senderPubKeyHex ->
+            android.util.Log.i(
+                "PhantomNotif",
+                "NOTIF callback_invoked source=$source conv=${convId.take(8)} " +
+                    "sender=${senderPubKeyHex.take(8)} previewLen=${preview.length}",
+            )
             try {
-                PhantomNotificationManager.showMessageNotification(context, convId, sender, preview, senderPubKeyHex)
+                PhantomNotificationManager.showMessageNotification(
+                    context = context,
+                    source = source,
+                    conversationId = convId,
+                    senderName = sender,
+                    preview = preview,
+                    recipientPubKey = senderPubKeyHex,
+                )
+                android.util.Log.i(
+                    "PhantomNotif",
+                    "NOTIF callback_returned source=$source conv=${convId.take(8)}",
+                )
             } catch (e: Throwable) {
+                android.util.Log.e(
+                    "PhantomNotif",
+                    "NOTIF callback_threw source=$source conv=${convId.take(8)} " +
+                        "error=${e::class.simpleName}:${e.message}",
+                    e,
+                )
+                // Retained for backwards-compatibility with older diagnostic
+                // habits that grep `PhantomMessaging` for this exact phrase.
                 android.util.Log.e(
                     "PhantomMessaging",
                     "showMessageNotification threw (${e::class.simpleName}): ${e.message}",

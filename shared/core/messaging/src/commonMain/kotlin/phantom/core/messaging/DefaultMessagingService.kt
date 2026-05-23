@@ -474,9 +474,63 @@ class DefaultMessagingService(
      * Called on the scope's thread after a message is successfully decrypted and stored.
      * The callback must be non-blocking (fire-and-forget on the platform side).
      *
-     * Parameters: conversationId, senderName, preview, senderPublicKeyHex
+     * PR-NOTIF-DIAG (2026-05-22): added `source` as the FIRST parameter. Values are a
+     * closed enum: `text`, `voice_v1_assembled`, `voice_v1_chunk`, `voice_v2_manifest`.
+     * The platform binding logs this under the `PhantomNotif` tag so a logcat capture
+     * shows which incoming-message path triggered the notification — diagnostic only,
+     * not used for any routing decision. See `docs/tracks/notifications-diag.md`.
+     *
+     * Parameters: source, conversationId, senderName, preview, senderPublicKeyHex
      */
-    @Volatile var onNewMessageNotification: ((conversationId: String, senderName: String, preview: String, senderPublicKeyHex: String) -> Unit)? = null
+    @Volatile var onNewMessageNotification: ((source: String, conversationId: String, senderName: String, preview: String, senderPublicKeyHex: String) -> Unit)? = null
+
+    /**
+     * PR-NOTIF-DIAG (2026-05-22) — unified `runCatching` wrapper around the
+     * platform notification callback. Replaces four independent invoke sites
+     * that each had slightly different logging (text path had a "callback null"
+     * log, legacy voice chunk path had `VOICE_RX notification_start/ok`,
+     * the other two had nothing).
+     *
+     * Behaviour invariants — diagnostic only, do NOT alter:
+     * - `runCatching` swallows exceptions exactly as the old code did.
+     * - Callback is invoked at the SAME four code points (no new sites, no removed sites).
+     * - Arguments pass through unchanged — no truncation, no transformation.
+     *
+     * Logs (privacy: only first 8 chars of conv/sender pubkey, no plaintext,
+     * no ciphertext, no tokens):
+     * - `NOTIF invoke_attempt source=<…> conv=<8> sender=<8> callbackNull=<…>`
+     * - `NOTIF invoke_ok source=<…> conv=<8>`
+     * - `NOTIF invoke_threw source=<…> conv=<8> error=<class>:<message>`
+     */
+    private fun invokeIncomingNotificationCallback(
+        source: String,
+        conversationId: String,
+        senderName: String,
+        preview: String,
+        senderPubKeyHex: String,
+    ) {
+        val callbackNull = onNewMessageNotification == null
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "NOTIF invoke_attempt source=$source conv=${conversationId.take(8)} " +
+                "sender=${senderPubKeyHex.take(8)} callbackNull=$callbackNull",
+        )
+        runCatching {
+            onNewMessageNotification?.invoke(source, conversationId, senderName, preview, senderPubKeyHex)
+        }.onSuccess {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "NOTIF invoke_ok source=$source conv=${conversationId.take(8)}",
+            )
+        }.onFailure { e ->
+            messagingLog(
+                MessagingLogLevel.ERROR,
+                "NOTIF invoke_threw source=$source conv=${conversationId.take(8)} " +
+                    "error=${e::class.simpleName}:${e.message}",
+                e,
+            )
+        }
+    }
 
     /**
      * Optional group messaging delegate. When set, any incoming payload whose type is in
@@ -1406,9 +1460,15 @@ class DefaultMessagingService(
             )
         )
 
-        runCatching {
-            onNewMessageNotification?.invoke(conversationId, senderName, "🎤 Voice message", senderPubKeyHex)
-        }
+        // PR-NOTIF-DIAG: unified callback wrapper. Source = voice_v1_assembled
+        // (legacy voice path, full assembly inside DMS — D2b.1 durable receive).
+        invokeIncomingNotificationCallback(
+            source = "voice_v1_assembled",
+            conversationId = conversationId,
+            senderName = senderName,
+            preview = "🎤 Voice message",
+            senderPubKeyHex = senderPubKeyHex,
+        )
 
         // Successful end-to-end durable receive: free the partial state.
         repo.deleteByVoiceId(voiceId)
@@ -2035,17 +2095,25 @@ class DefaultMessagingService(
                             MessagingLogLevel.INFO,
                             "VOICE_RX emit_incoming_ok chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
                         )
-                        runCatching {
-                            messagingLog(
-                                MessagingLogLevel.INFO,
-                                "VOICE_RX notification_start chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
-                            )
-                            onNewMessageNotification?.invoke(conversationId, senderName, "🎤 Voice message", senderPubKeyHex)
-                            messagingLog(
-                                MessagingLogLevel.INFO,
-                                "VOICE_RX notification_ok chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
-                            )
-                        }
+                        // PR-NOTIF-DIAG: unified callback wrapper. Source = voice_v1_chunk
+                        // (legacy voice chunk path). The existing
+                        // VOICE_RX notification_start/ok lines stay in place
+                        // alongside as path-specific diagnostics.
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX notification_start chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
+                        )
+                        invokeIncomingNotificationCallback(
+                            source = "voice_v1_chunk",
+                            conversationId = conversationId,
+                            senderName = senderName,
+                            preview = "🎤 Voice message",
+                            senderPubKeyHex = senderPubKeyHex,
+                        )
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "VOICE_RX notification_ok chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)}",
+                        )
                         messagingLog(
                             MessagingLogLevel.INFO,
                             "VOICE_RX handler_complete chunkId=${chunkId.take(8)} result=assembled",
@@ -2294,22 +2362,23 @@ class DefaultMessagingService(
             )
 
             val senderName = payload.senderUsername.ifBlank { senderPubKeyHex.take(8) }
+            // PR-NOTIF-DIAG: unified callback wrapper. Source = text
+            // (incoming text via handleDeliver). The legacy
+            // "Invoking onNewMessageNotification callback (null=…)" line
+            // is preserved below as well — older diagnostic habits already
+            // grep for it, removal would be a behaviour change for triage
+            // workflows.
             messagingLog(
                 MessagingLogLevel.INFO,
                 "Invoking onNewMessageNotification callback (null=${onNewMessageNotification == null})",
             )
-            // Defensive: the platform notification callback may throw on pre-signed URLs
-            // or when background restrictions kick in. A thrown exception here used to
-            // propagate into the silent onFailure below and lose the stack entirely.
-            runCatching {
-                onNewMessageNotification?.invoke(conversationId, senderName, previewText(payload.text), senderPubKeyHex)
-            }.onFailure { notifErr ->
-                messagingLog(
-                    MessagingLogLevel.ERROR,
-                    "onNewMessageNotification threw (${notifErr::class.simpleName}): ${notifErr.message}",
-                    notifErr,
-                )
-            }
+            invokeIncomingNotificationCallback(
+                source = "text",
+                conversationId = conversationId,
+                senderName = senderName,
+                preview = previewText(payload.text),
+                senderPubKeyHex = senderPubKeyHex,
+            )
             // Tell the relay to drop this envelope from its store now that we
             // have safely persisted + emitted it. Without this the relay will
             // re-deliver the same message on every reconnect for up to
@@ -2830,7 +2899,19 @@ class DefaultMessagingService(
         // when the sender didn't set a username. Mirrors the normal-message
         // path at line 2077.
         val senderName = senderUsername.ifBlank { senderPubKeyHex.take(8) }
-        onNewMessageNotification?.invoke(conversationId, senderName, "Voice message", senderPubKeyHex)
+        // PR-NOTIF-DIAG: unified callback wrapper. Source = voice_v2_manifest
+        // (M1w 1:1 voice manifest path — `handleVoiceV2Manifest`). Previously
+        // a bare `?.invoke(...)` with no logs around it; now wrapped in
+        // `invokeIncomingNotificationCallback` for parity with the other three
+        // call sites. Preview stays "Voice message" (legacy spelling without
+        // the 🎤 emoji that the v1 paths use — diagnostic PR keeps it as-is).
+        invokeIncomingNotificationCallback(
+            source = "voice_v2_manifest",
+            conversationId = conversationId,
+            senderName = senderName,
+            preview = "Voice message",
+            senderPubKeyHex = senderPubKeyHex,
+        )
 
         // Step 7 — Trigger download (Commit 4 wires runDownloadTask).
         // TODO(PR-M1w Commit4): replace stub with voiceV2DownloadOrchestrator.runDownloadTask(manifest.mediaId)
