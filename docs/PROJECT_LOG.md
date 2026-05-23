@@ -388,13 +388,19 @@ on advice that references prior commits — even from another LLM.
 > This is the durable "what's not done" snapshot — Session journal entries
 > tell the story, this list answers "what's still on the queue".
 
-### Consolidated queue (Vladislav-locked order, 2026-05-22)
+### Consolidated queue (Vladislav-locked order, 2026-05-23)
 
-This is the next-session locked queue per the 2026-05-21 PR-DOC-HONESTY mini-lock + the session-close discipline note, refreshed after PR-UI-REC-FOLLOWUP closed on 2026-05-22. Order is **locked** — do not reorder without explicit Vladislav greenlight.
+This is the next-session locked queue, refreshed after PR-NOTIF-DIAG closed on 2026-05-23 with two new follow-ups generated (PR-UI-CHAT-AUTOSCROLL1, PR-NOTIF-POLICY1). Order below is **locked** — do not reorder without explicit Vladislav greenlight.
 
-1. ✅ **PR-DOC-HONESTY** — shipped 2026-05-21 (PR #208 + close #209). KNOWN_ISSUES expansion + ADR-011/-023 status advance + MASTER_TIMELINE killed-deadlines cleanup + this consolidated queue.
-2. ✅ **PR-UI-REC-FOLLOWUP** — shipped 2026-05-22 (PR #210 `a625bde7`). Metadata-derived voice duration via `MediaMetadataRetriever` + empty-voice safety gate (`finalizeAndSendVoice` guard, both 700 ms duration AND 1024-byte file-size required). Test #77 PASS.
-3. **Notifications diagnostic PR** — **next**. Vladislav reported notification flakiness during Test #75. Pre-exists today's work; needs a diagnostic PR before any fix attempt.
+1. ✅ **PR-DOC-HONESTY** — shipped 2026-05-21 (PR #208 + close #209).
+2. ✅ **PR-UI-REC-FOLLOWUP** — shipped 2026-05-22 (PR #210 `a625bde7`). Test #77 PASS.
+3. ✅ **PR-NOTIF-DIAG** — shipped 2026-05-23 (PR #213 `a0484602`). Test #78 PASS. Surfaced two new follow-ups (rows 4 and 5 below).
+4. **PR-UI-CHAT-AUTOSCROLL1** — fix `ChatScreen` not scrolling to bottom on open when unread messages arrived in the background. Mini-lock at `docs/tracks/chat-autoscroll.md`. Architect recommends doing this BEFORE PR-NOTIF-POLICY1 because it's the more user-visible bug Vladislav noticed by hand.
+5. **PR-NOTIF-POLICY1** — conversation-level notification with `InboxStyle` summary + unread count + clear-on-chat-open. Closes the perezatiranie finding from Test #78. Mini-lock at `docs/tracks/notif-policy.md`. Variant A vs B decision at mini-lock review.
+6. **PR-D1e** — first-message bootstrap fast path (yellow-dot 10–20 s on first text after `add contact`; PR-G4 closed the 8 s × 4 timeouts but the residual ~10 s on bootstrap remains). See `KNOWN_ISSUES.md` ISSUE-022.
+7. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact.
+8. **Calls testing — C-track sequence.** C1 typed `TransportCapabilities` gate → C2 Reality endpoint pool + realistic probe → C3 TURN-over-TLS on 443 or custom Opus-over-Reality.
+9. **Voice quality A/B** — 24 kbps OPUS mono 16 kHz confirmed as production floor; a future "Data Saver" 16 kbps toggle is gated behind this A/B.
 4. **PR-D1e first-message bootstrap fast path** — yellow-dot 10–20 s on first text after `add contact` (`PREKEY_TRACE upload_fail SocketTimeoutException elapsedMs=8021`); same class as the H1e half-open WS pattern but on the prekey path. See `KNOWN_ISSUES.md` ISSUE-022.
 5. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact promised in `feedback_strategy_decisions_2026_05_14.md`.
 6. **Calls testing — C-track sequence.** C1 typed `TransportCapabilities` gate (replace `state == WsActive` shorthand) → C2 Reality endpoint pool + realistic probe (current `/health` probe doesn't catch the Tele2 Layer A silent WS-drop pattern) → C3 TURN-over-TLS on 443 or custom Opus-over-Reality (decide after C2 measures what Tele2 actually allows).
@@ -555,6 +561,36 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-23 (sat) · PR-NOTIF-DIAG — incoming-message notification path observability
+
+Closed PR #213 (`feat/pr-notif-diag` → master `a0484602`). One commit, four files (`PhantomNotificationManager.kt` + `PhantomApplication.kt` + `AppContainer.kt` + `DefaultMessagingService.kt`), +295 / −39 lines. Test #78 PASS per architect verdict. Fourth PR end-to-end under `docs/WORKING_RULES.md` (REC3 → PR-DOC-HONESTY → REC-FOLLOWUP → NOTIF-DIAG).
+
+**What landed.** Diagnostic-only PR per mini-lock at `docs/tracks/notifications-diag.md` (merged earlier same day as PR #212). Adds structured `PhantomNotif`-tagged logs at every step from "envelope arrives" to "Android shows heads-up". Zero behaviour change — no new heads-ups, no missed heads-ups, no fix attempts. Modelled on PR-Diag (#143) for the WS transport path.
+
+Specifics:
+
+- `DefaultMessagingService.onNewMessageNotification` signature gained a leading `source: String` parameter (closed enum: `text`, `voice_v1_assembled`, `voice_v1_chunk`, `voice_v2_manifest`). Used for diagnostic attribution only. New private `invokeIncomingNotificationCallback(...)` helper unifies the four invoke call sites under one `runCatching` with `NOTIF invoke_attempt / invoke_ok / invoke_threw` lines. `runCatching` semantics preserved; legacy `Invoking onNewMessageNotification callback (null=…)` text-path line retained for backwards compatibility with older triage habits; legacy `VOICE_RX notification_start/ok` on the legacy voice chunk path also retained alongside.
+- `PhantomNotificationManager` got tag `PhantomNotif` and full show-path logging: `show_entry / api_level / permission_check (API 33+) / channel_check / skip reason=… / notify_called / notify_returned`. `createChannel` got attempt/created/skipped lines. `notificationId` logged on every show line (this turned out to be the smoking gun — see Finding below).
+- `PhantomApplication.onCreate` now writes one `NOTIF app_snapshot …` line per process start: `permissionGranted=… channelExists=… channelEnabled=… channelImportance=… appNotificationsEnabled=… sdk=…`. Gives every test logcat an immediate snapshot of the device's notification posture.
+- `AppContainer` wraps `onNewMessageNotification` callback with `PhantomNotif`-tagged `callback_invoked / callback_returned | callback_threw`. Old `PhantomMessaging`-tagged error log retained.
+
+**Test #78 evidence (Tecno HiOS SDK 31, Wi-Fi, 8 incoming events captured):**
+
+- 7 × `source=text`, 1 × `source=voice_v2_manifest`. All eight events produced the full chain: `NOTIF invoke_attempt → invoke_ok → callback_invoked → show_entry → api_level → channel_check (app_enabled=true channel_enabled=true channel_importance=4) → notify_called → notify_returned → callback_returned`. No `permission_check` line because SDK 31 is pre-Tiramisu (POST_NOTIFICATIONS not runtime). Zero `callback_threw`, zero `invoke_threw`, zero `SecurityException`, zero `AndroidRuntime`.
+- The voice path also produced the M1w download chain in parallel (`MEDIA_RX manifest_acked_and_queued → download_progress 1/8 … 8/8 → download_complete → message_ready path=AUDIO_LOCAL`), confirming voice notification + voice download both work end-to-end on Tele2-via-Wi-Fi.
+- Startup snapshot: `NOTIF app_snapshot channelExists=true channelEnabled=true channelImportance=4 appNotificationsEnabled=true sdk=31 permissionGranted=n_a_pre_33`. Permission/channel state is clean — flakiness is NOT a permission/channel cause.
+
+**Primary finding (architect, 2026-05-23):** All notifications for one conversation share `notificationId = conversationId.hashCode() = 687143777` (`tag = null`). Android's documented behaviour for `notify(int, Notification)` with the same id is **update** — every new arrival **replaces** the previous heads-up in the same slot. This is not a notification-pipeline bug — the pipeline works exactly as instrumented. It IS the UX bug Vladislav noticed as "notifications sometimes disappear after firing": they didn't disappear, they were replaced. The fix is a notification *policy* decision, not a pipeline plumbing fix. Tracked as **PR-NOTIF-POLICY1** (mini-lock authored same day; Variant A vs Variant B decision at mini-lock review).
+
+**Secondary finding (unrelated to notifications):** Vladislav surfaced "когда приходят сообщения, а ты находишься не в самом чате, и заходишь в чат с контактом, почему-то автоматом не скроллится вниз на новые сообщения". UI bug; not a notification-pipeline bug. Tracked as **PR-UI-CHAT-AUTOSCROLL1** (mini-lock authored same day).
+
+**Discipline checkpoint.** Held scope strictly: didn't change `notificationId` strategy / channel config / `NotificationCompat.Builder` visuals / permission re-ask UX / FG-service notification, even though the perezatiranie finding stared us in the face. The right place for those changes is PR-NOTIF-POLICY1, not this PR.
+
+**Open follow-ups generated by this track (added to consolidated queue):**
+
+- **PR-UI-CHAT-AUTOSCROLL1** — fix `ChatScreen` not scrolling to bottom on open when unread messages arrived in the background. Mini-lock at `docs/tracks/chat-autoscroll.md`. Architect's recommendation: do this BEFORE the notification policy because it's a more visible UX bug that Vladislav already noticed by hand.
+- **PR-NOTIF-POLICY1** — conversation-level notification with `InboxStyle` summary + unread count + clear-on-chat-open. Mini-lock at `docs/tracks/notif-policy.md`. Variant A (recommended) vs Variant B (per-message) decision deferred to mini-lock review.
 
 ### 2026-05-22 (fri) · PR-UI-REC-FOLLOWUP — metadata-derived voice duration + empty-voice gate
 
