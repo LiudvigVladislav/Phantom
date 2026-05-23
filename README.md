@@ -205,6 +205,8 @@ Before contributing code, please open an issue to discuss the change.
 
 PHANTOM's funding channels and sustainability plans are documented in machine-readable form in [`funding.json`](funding.json) at the repository root. The project accepts donations via Liberapay, Buy Me a Coffee, and cryptocurrency (BTC, XMR, ETH).
 
+PHANTOM is maintained by Willen LLC, a company registered in Wyoming, USA.
+
 ---
 
 ## License
