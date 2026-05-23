@@ -294,4 +294,43 @@ When groups / channels add their own paths in future PRs, they extend this enum 
 
 ## Last hand-off
 
-(empty — track queued, not yet active)
+**Closed 2026-05-23.** PR #213 merged to `master` as `a0484602`. One commit, four files (`PhantomNotificationManager.kt` + `PhantomApplication.kt` + `AppContainer.kt` + `DefaultMessagingService.kt`), +295 / −39 lines. Test #78 PASS per architect verdict; full notification chain visible end-to-end across all five scenarios on Tecno HiOS (SDK 31, Wi-Fi).
+
+**What landed (per the v2 mini-lock spec, no deviation):**
+
+- `DefaultMessagingService.kt` — `onNewMessageNotification` signature gained leading `source: String` (closed enum `text | voice_v1_assembled | voice_v1_chunk | voice_v2_manifest`). New private `invokeIncomingNotificationCallback(source, conv, name, preview, senderPubKeyHex)` helper unifies the four invoke call sites. `runCatching` semantics, transformation logic, and call-site count all preserved. Legacy `Invoking onNewMessageNotification callback (null=…)` line retained on the text path for older triage habits.
+- `PhantomNotificationManager.kt` — `LOG_TAG = "PhantomNotif"`. `showMessageNotification(...)` gained the `source` param. Full show-path logging: `show_entry`, `api_level`, `permission_check` (API 33+), `channel_check` (app+channel enable state + importance), `skip` reasons (`permission_denied | channel_disabled | notifications_disabled`), `notify_called id=… tag=…`, `notify_returned id=… tag=…`. `createChannel` got `channel_create_attempt`, `channel_created`, `channel_create_skipped reason=pre_o`. `notificationId` logged on every show line — exposed the perezatiranie finding below.
+- `PhantomApplication.kt` — new `logNotificationStartupSnapshot()` called once per process right after `createChannel(this)`: `NOTIF app_snapshot permissionGranted=… channelExists=… channelEnabled=… channelImportance=… appNotificationsEnabled=… sdk=…`.
+- `AppContainer.kt` — `onNewMessageNotification` callback wrapped under `PhantomNotif`: `callback_invoked → callback_returned | callback_threw`. Old `PhantomMessaging`-tagged error log kept for backwards compatibility.
+
+**Test #78 result (Vladislav + architect 2026-05-23):**
+
+PASS on core scenarios (foreground / background / locked) **and** extended (task-killed / Doze) — all five delivered notifications, no callback breaks, no `callback_threw`, no `invoke_threw`, no `SecurityException`, no `AndroidRuntime`. Logcat capture on Tecno SDK 31 (Tele2 Иркутская handset, Wi-Fi only) over 8 incoming events shows the full chain × 8:
+
+```
+NOTIF invoke_attempt → invoke_ok → callback_invoked → show_entry →
+api_level (sdk=31, so no permission_check line — POST_NOTIFICATIONS not
+runtime on pre-33) → channel_check (app_enabled=true channel_enabled=true
+channel_importance=4) → notify_called → notify_returned → callback_returned
+```
+
+Of the 8 events: 7 × `source=text`, 1 × `source=voice_v2_manifest`. The voice path also produced the M1w download chain in parallel (`MEDIA_RX manifest_acked_and_queued → download_progress 1/8 … 8/8 → download_complete → message_ready path=AUDIO_LOCAL`), confirming voice notification + voice download both work end-to-end on Tele2-via-Wi-Fi.
+
+**Primary finding (per architect):** **All notifications for one conversation share `notificationId = conversationId.hashCode() = 687143777` (`tag = null`).** Android's documented behaviour for `notify(int, Notification)` with the same id is **update** — every new notification replaces the previous one in the same slot. This is **not a notification-pipeline bug** — the pipeline works exactly as instrumented. It IS the UX bug Vladislav noticed as "notifications sometimes disappear after firing": they didn't disappear, they were replaced by the next one with the same id.
+
+**Secondary finding (unrelated to notifications, surfaced during the test):** When the user enters a chat and there are unread messages, `ChatScreen` does not auto-scroll to the bottom of the conversation. This is a UI bug, not a notification-pipeline bug. Tracked as a separate follow-up — see `docs/tracks/chat-autoscroll.md`.
+
+**Notification posture confirmed clean** (so the policy fix in PR-NOTIF-POLICY1 doesn't need to debug permission/channel state first):
+
+- `NOTIF channel_created channelId=phantom_messages importance=4` (IMPORTANCE_HIGH) at startup
+- `NOTIF app_snapshot channelExists=true channelEnabled=true channelImportance=4 appNotificationsEnabled=true sdk=31 permissionGranted=n_a_pre_33`
+- Per-event `NOTIF channel_check app_enabled=true channel_enabled=true channel_importance=4`
+
+No permission/channel issue. The fix track is purely about notification *policy* (per-conversation vs per-message id, InboxStyle, unread summary, clear-on-chat-open), not pipeline plumbing.
+
+**Discipline checkpoint.** Fourth PR end-to-end under `docs/WORKING_RULES.md` (REC3 → PR-DOC-HONESTY → REC-FOLLOWUP → NOTIF-DIAG). Mini-lock authored before code per rule 3; v2 round of feedback applied before merging the mini-lock. Held scope strictly: didn't change `notificationId` strategy / channel config / `NotificationCompat.Builder` visuals / permission re-ask UX / FG-service notification, even though the finding stared us in the face. The right place for those changes is PR-NOTIF-POLICY1, not this PR.
+
+**Open follow-ups generated by this track:**
+
+1. **PR-NOTIF-POLICY1** — conversation-level notification with `InboxStyle`, unread summary, clear-on-chat-open. Mini-lock authored same day as this close. **Variant A (architect-recommended):** keep `notificationId = conversationId.hashCode()`, but add `InboxStyle` with last 3–5 messages + `subtext = "N new messages"`. Plus clear notification on `ChatScreen` enter. **Variant B:** `notificationId = messageId.hashCode()` + `groupKey = conversationId.hashCode()` + summary notification. Decide A vs B at mini-lock review time.
+2. **PR-UI-CHAT-AUTOSCROLL1** — fix `ChatScreen` not scrolling to bottom on open when there are unread messages. Separate concern, separate UI PR. Mini-lock authored same day as this close.
