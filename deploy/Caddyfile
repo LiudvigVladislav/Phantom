@@ -225,6 +225,22 @@ phntm.pro, www.phntm.pro {
         file_server
     }
 
+    # funding.json — fundingjson.org / FLOSS-fund machine-readable funding
+    # manifest. Source of truth is the repo-root `funding.json` (mounted
+    # read-only into the caddy container at /srv/funding/ — see
+    # docker-compose.yml). Served with `application/json` content type,
+    # `Access-Control-Allow-Origin: *` (open manifest is meant to be read
+    # cross-origin by crawlers and funding-aggregator UIs), and a 1-hour
+    # cache TTL (manifest changes are rare; a stale-by-an-hour fetch is
+    # acceptable and reduces hits on every aggregator scan).
+    handle /funding.json {
+        root * /srv/funding
+        header Content-Type "application/json; charset=utf-8"
+        header Access-Control-Allow-Origin "*"
+        header Cache-Control "public, max-age=3600"
+        file_server
+    }
+
     # Russian-locale routes MUST come before the generic English routes —
     # Caddy matches `handle_path` blocks in source order, and `/terms*`
     # would otherwise swallow `/terms/ru` before this block sees it.

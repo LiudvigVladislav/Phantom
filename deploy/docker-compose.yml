@@ -79,6 +79,18 @@ services:
       # /terms and /privacy on phntm.pro. Source of truth: /legal at the
       # repository root, mounted read-only.
       - ../legal:/srv/legal:ro
+      # funding.json (fundingjson.org / FLOSS-fund machine-readable
+      # funding manifest) served at https://phntm.pro/funding.json.
+      # Source of truth: repo-root `funding.json`, mounted read-only as
+      # a single file into /srv/funding/. Single-file bind-mount (not
+      # the whole repo root) so we don't accidentally expose any other
+      # repo file via Caddy if a future route is added with the wrong
+      # root path. To update the served content: edit the repo-root
+      # file, commit + push, then on the VPS run `git pull` followed
+      # by `docker compose -f deploy/docker-compose.yml up -d caddy`
+      # (NOT `restart caddy` — restart keeps the old mounts; up -d
+      # recreates the container with the new bind-mount if needed).
+      - ../funding.json:/srv/funding/funding.json:ro
       - caddy-data:/data        # Let's Encrypt certs + keys
       - caddy-config:/config
     environment:
