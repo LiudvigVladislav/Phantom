@@ -397,7 +397,17 @@ fun ChatScreen(
                         ).show()
                     } else {
                         reloadMessages()
-                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                        if (messages.isNotEmpty()) {
+                            // PR-UI-CHAT-AUTOSCROLL1 — unified log; behaviour
+                            // unchanged (voice send already animated to bottom
+                            // before this PR, this is observability only).
+                            Log.i(
+                                "PhantomUI",
+                                "CHAT_SCROLL source=voice_send conv=${conversationId.take(24)} " +
+                                    "targetIndex=${messages.lastIndex} total=${messages.size}",
+                            )
+                            listState.animateScrollToItem(messages.lastIndex)
+                        }
                     }
                 } finally {
                     voiceSendInProgress = false
@@ -415,6 +425,26 @@ fun ChatScreen(
             "ChatScreen subscribed to conv=${conversationId.take(24)}… theirUsername=$theirUsername",
         )
         reloadMessages()
+        // PR-UI-CHAT-AUTOSCROLL1 — land the LazyColumn at the latest message
+        // immediately on chat open. Without this, opening a chat that has
+        // unread messages from the background leaves the user looking at the
+        // middle of the conversation and forces a manual scroll down. Uses
+        // scrollToItem (not animate) so there's no visible top-to-bottom
+        // sweep — the user sees the latest message from the first frame.
+        if (messages.isNotEmpty()) {
+            Log.i(
+                "PhantomUI",
+                "CHAT_SCROLL source=initial_open conv=${conversationId.take(24)} " +
+                    "targetIndex=${messages.lastIndex} total=${messages.size}",
+            )
+            listState.scrollToItem(messages.lastIndex)
+        } else {
+            Log.i(
+                "PhantomUI",
+                "CHAT_SCROLL source=initial_open conv=${conversationId.take(24)} " +
+                    "skipped reason=no_messages",
+            )
+        }
         val conv = container.conversationRepo.getConversation(conversationId)
         if (conv != null) {
             // Privacy Mode: Standard sends read receipts; Private/Ghost suppress
@@ -523,6 +553,14 @@ fun ChatScreen(
                         conversationId, conv.theirPublicKeyHex, sendReceipts,
                     )
                 }
+                // PR-UI-CHAT-AUTOSCROLL1 — unified log; behaviour unchanged
+                // (incoming-in-active-chat already animated to bottom before
+                // this PR, this is observability only).
+                Log.i(
+                    "PhantomUI",
+                    "CHAT_SCROLL source=incoming_active conv=${conversationId.take(24)} " +
+                        "targetIndex=${messages.lastIndex.coerceAtLeast(0)} total=${messages.size}",
+                )
                 listState.animateScrollToItem(messages.lastIndex.coerceAtLeast(0))
             }
         }
@@ -1029,7 +1067,17 @@ fun ChatScreen(
                                     )
                                 )
                                 reloadMessages()
-                                if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                if (messages.isNotEmpty()) {
+                                    // PR-UI-CHAT-AUTOSCROLL1 — unified log;
+                                    // behaviour unchanged (text send already
+                                    // animated to bottom before this PR).
+                                    Log.i(
+                                        "PhantomUI",
+                                        "CHAT_SCROLL source=text_send conv=${conversationId.take(24)} " +
+                                            "targetIndex=${messages.lastIndex} total=${messages.size}",
+                                    )
+                                    listState.animateScrollToItem(messages.lastIndex)
+                                }
                             }
                         }
                     }
