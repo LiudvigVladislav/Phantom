@@ -401,6 +401,7 @@ This is the next-session locked queue, refreshed after PR-NOTIF-DIAG closed on 2
 7. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact.
 8. **Calls testing — C-track sequence.** C1 typed `TransportCapabilities` gate → C2 Reality endpoint pool + realistic probe → C3 TURN-over-TLS on 443 or custom Opus-over-Reality.
 9. **Voice quality A/B** — 24 kbps OPUS mono 16 kHz confirmed as production floor; a future "Data Saver" 16 kbps toggle is gated behind this A/B.
+10. **PR-UI-SUPPORT-SCREEN — Settings → Support PHANTOM** (Vladislav 2026-05-24, "это потом"). New Settings section / dedicated screen with donation channels surfaced from `funding.json`: Liberapay + Buy Me a Coffee as deep-links opening in browser; BTC / XMR / ETH as copy-to-clipboard + QR-code for the user's wallet camera. Source of truth = `funding.json` (either hard-coded mirror or fetched from `https://phntm.pro/funding.json` — pick at mini-lock review). Foundation already in place after 2026-05-24: funding.json in repo (PR #215) + on the domain (PR #218 + #219 hotfix). No mini-lock yet — Vladislav said "это потом".
 4. **PR-D1e first-message bootstrap fast path** — yellow-dot 10–20 s on first text after `add contact` (`PREKEY_TRACE upload_fail SocketTimeoutException elapsedMs=8021`); same class as the H1e half-open WS pattern but on the prekey path. See `KNOWN_ISSUES.md` ISSUE-022.
 5. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact promised in `feedback_strategy_decisions_2026_05_14.md`.
 6. **Calls testing — C-track sequence.** C1 typed `TransportCapabilities` gate (replace `state == WsActive` shorthand) → C2 Reality endpoint pool + realistic probe (current `/health` probe doesn't catch the Tele2 Layer A silent WS-drop pattern) → C3 TURN-over-TLS on 443 or custom Opus-over-Reality (decide after C2 measures what Tele2 actually allows).
@@ -561,6 +562,33 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-24 (sun, late) · Out-of-queue: serve funding.json on phntm.pro + email-placeholder hotfix
+
+Two related PRs merged + deployed end-to-end during the same session. Out-of-queue (FLOSS/fund unblock continuation from PR #215).
+
+**PR #218 (master `14236dd0`) — Caddy route + bind-mount.** Added explicit `handle /funding.json` block on the `phntm.pro` vhost (placed before `/terms`/`/privacy`/catch-all so it matches first) plus a single-file bind-mount of the repo-root `funding.json` into the caddy container at `/srv/funding/funding.json`. Headers per `fundingjson.org` spec: `Content-Type: application/json; charset=utf-8`, `Access-Control-Allow-Origin: *`, `Cache-Control: public, max-age=3600`. Single source of truth at repo root — no duplicate copies in `deploy/landing/` that would silently drift.
+
+Deploy on VPS (Vladislav-side, found prod repo via `docker compose ls` → `/home/phantom/Phantom`):
+```
+cd /home/phantom/Phantom && git pull origin master && \
+docker compose -f deploy/docker-compose.yml up -d caddy
+```
+Only caddy recreated; relay / tor / ntfy / xray / webtunnel-bridge untouched. `curl -I https://phntm.pro/funding.json` returned `HTTP/1.1 200 OK`, `Content-Type: application/json; charset=utf-8`, `Content-Length: 6378`, `Access-Control-Allow-Origin: *`, `Cache-Control: public, max-age=3600`, `cf-cache-status: DYNAMIC`. End-to-end JSON validate passed.
+
+**PR #219 (master `073bc70f`) — email-placeholder hotfix.** PR #215's `funding.json` landed with literal `[email protected]` strings in two places (`entity.email` and `bank-wire.address`). Initially suspected Anthropic PII redaction in my tool I/O, but byte-level dump (`python` + `open('rb')`) showed `funding.json` physically contained the 17-character ASCII string `[email protected]` at the relevant offsets (hex `5b656d61696c2070726f7465637465645d`). Root cause: the source `D:\VL Stories Studio\funding.json` that seeded PR #215 was copy-pasted from HTML where Cloudflare's email-protection feature wrapped the original address in a JavaScript decoder tag. Copy-as-plain-text strips the decoder and leaves the placeholder.
+
+Fix: byte-level `replace` via Python (Edit tool failed because Anthropic's PII filter masks `<localpart>@phntm.pro` strings in my tool inputs as identical to `[email protected]`, so `old_string != new_string` check failed). CRLF line endings preserved — exact 2-line diff. JSON re-parsed OK.
+
+Deploy on VPS — first attempt with `docker compose up -d caddy` showed `STATUS: Up 19 minutes` (NOT recreated). Caddy continued to serve the old funding.json. Root cause: **single-file Docker bind-mount + `git pull`**. `git pull` updates the host file via `mv`, which creates a NEW inode at the same path. The container's mount-point still points to the OLD inode (now unlinked from the path). `docker compose up -d` without `--force-recreate` does NOT recreate the container if compose.yaml is unchanged — it just checks the config diff. So the container's mount stays bound to the old inode forever, until explicitly recreated.
+
+Second attempt: `docker compose up -d --force-recreate caddy`. New container, new inode mapping. `curl https://phntm.pro/funding.json` then confirmed: `Content-Length: 6374` (was 6378; difference is exactly 2 × (17-15) bytes), `entity.email` length 15, `bank-wire.address` length 77, zero literal `[email protected]` substrings, 3 "legal" matches (2 email + 1 plan guid/name).
+
+**Lesson hardened in agent memory:** any future `git pull` on the VPS that updates `funding.json` or any other single-file bind-mounted asset MUST be followed by `--force-recreate` on the affected service, NOT just `up -d`. Captured as `feedback_single_file_bind_mount_recreate.md`.
+
+**Source-of-truth follow-up (Vladislav-side, NOT in this PR):** the local copy at `D:\VL Stories Studio\funding.json` that seeded PR #215 still contains the same Cloudflare placeholders. Vladislav to copy the post-PR-#219 master `funding.json` back over the local file so the next manual edit doesn't reintroduce the bug.
+
+**Open follow-up generated during this session: row 10 in consolidated queue — PR-UI-SUPPORT-SCREEN.** Vladislav 2026-05-24: "нам еще в дальнейшем надо будет добавить возможность поддержки нас (то есть указать ссылки на все эти сервисы Buy Me A Coffee и другие варианты включая криптокошельки. но это потом". Working sketch (not a mini-lock yet — Vladislav said "потом"): new section in Settings → "Support PHANTOM" with cards per channel — Liberapay + Buy Me a Coffee as deep-links opening in browser; BTC/XMR/ETH as copy-to-clipboard + QR. Source of truth = `funding.json` (either hard-coded mirror in Android resources, or fetched from `https://phntm.pro/funding.json` at runtime). Optional short "why we accept these channels" rationale per channel for transparency. Foundation in place after today: funding.json in repo (PR #215) + on the domain (PR #218 + #219).
 
 ### 2026-05-24 (sun) · Out-of-queue: funding.json + README Funding section
 
