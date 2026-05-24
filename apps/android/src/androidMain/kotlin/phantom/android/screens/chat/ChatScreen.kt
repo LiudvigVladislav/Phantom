@@ -8,6 +8,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onEach
 import org.json.JSONException
 import org.json.JSONObject
@@ -398,15 +399,21 @@ fun ChatScreen(
                     } else {
                         reloadMessages()
                         if (messages.isNotEmpty()) {
-                            // PR-UI-CHAT-AUTOSCROLL1 — unified log; behaviour
-                            // unchanged (voice send already animated to bottom
-                            // before this PR, this is observability only).
+                            // PR-UI-CHAT-AUTOSCROLL1.1 — target the real
+                            // LazyColumn last item, not messages.lastIndex.
+                            // Wait one frame for LazyColumn to lay out the
+                            // newly-added row before reading layoutInfo;
+                            // otherwise totalItemsCount might still hold
+                            // the pre-reload value.
+                            withFrameNanos { }
+                            val total = listState.layoutInfo.totalItemsCount
+                            val target = (total - 1).coerceAtLeast(0)
                             Log.i(
                                 "PhantomUI",
-                                "CHAT_SCROLL source=voice_send conv=${conversationId.take(24)} " +
-                                    "targetIndex=${messages.lastIndex} total=${messages.size}",
+                                "CHAT_SCROLL source=voice_send conv=${conversationId.take(8)} " +
+                                    "targetIndex=$target total=$total",
                             )
-                            listState.animateScrollToItem(messages.lastIndex)
+                            listState.scrollToItem(target)
                         }
                     }
                 } finally {
@@ -425,26 +432,14 @@ fun ChatScreen(
             "ChatScreen subscribed to conv=${conversationId.take(24)}… theirUsername=$theirUsername",
         )
         reloadMessages()
-        // PR-UI-CHAT-AUTOSCROLL1 — land the LazyColumn at the latest message
-        // immediately on chat open. Without this, opening a chat that has
-        // unread messages from the background leaves the user looking at the
-        // middle of the conversation and forces a manual scroll down. Uses
-        // scrollToItem (not animate) so there's no visible top-to-bottom
-        // sweep — the user sees the latest message from the first frame.
-        if (messages.isNotEmpty()) {
-            Log.i(
-                "PhantomUI",
-                "CHAT_SCROLL source=initial_open conv=${conversationId.take(24)} " +
-                    "targetIndex=${messages.lastIndex} total=${messages.size}",
-            )
-            listState.scrollToItem(messages.lastIndex)
-        } else {
-            Log.i(
-                "PhantomUI",
-                "CHAT_SCROLL source=initial_open conv=${conversationId.take(24)} " +
-                    "skipped reason=no_messages",
-            )
-        }
+        // PR-UI-CHAT-AUTOSCROLL1.1 — initial scroll moved out of this
+        // LaunchedEffect; see the dedicated LaunchedEffect below
+        // `val initialIds = …` inside the Scaffold body. It needs
+        // `chatItems` and `listState.layoutInfo` to be in scope to land
+        // on the real LazyColumn last index (not messages.lastIndex,
+        // which undershoots because LazyColumn has an E2EE prefix row,
+        // optional pinned banner, and day separators that chatItems
+        // already includes).
         val conv = container.conversationRepo.getConversation(conversationId)
         if (conv != null) {
             // Privacy Mode: Standard sends read receipts; Private/Ghost suppress
@@ -553,15 +548,21 @@ fun ChatScreen(
                         conversationId, conv.theirPublicKeyHex, sendReceipts,
                     )
                 }
-                // PR-UI-CHAT-AUTOSCROLL1 — unified log; behaviour unchanged
-                // (incoming-in-active-chat already animated to bottom before
-                // this PR, this is observability only).
+                // PR-UI-CHAT-AUTOSCROLL1.1 — target the real LazyColumn
+                // last item, not messages.lastIndex. Instant scrollToItem
+                // (not animate) so rapid incoming messages don't pile up
+                // overlapping animations — Vladislav Test #79 surfaced
+                // the jerk on rapid messages. Smooth-when-near-bottom
+                // policy is a follow-up (AUTOSCROLL2).
+                withFrameNanos { }
+                val total = listState.layoutInfo.totalItemsCount
+                val target = (total - 1).coerceAtLeast(0)
                 Log.i(
                     "PhantomUI",
-                    "CHAT_SCROLL source=incoming_active conv=${conversationId.take(24)} " +
-                        "targetIndex=${messages.lastIndex.coerceAtLeast(0)} total=${messages.size}",
+                    "CHAT_SCROLL source=incoming_active conv=${conversationId.take(8)} " +
+                        "targetIndex=$target total=$total",
                 )
-                listState.animateScrollToItem(messages.lastIndex.coerceAtLeast(0))
+                listState.scrollToItem(target)
             }
         }
     }
@@ -1068,15 +1069,21 @@ fun ChatScreen(
                                 )
                                 reloadMessages()
                                 if (messages.isNotEmpty()) {
-                                    // PR-UI-CHAT-AUTOSCROLL1 — unified log;
-                                    // behaviour unchanged (text send already
-                                    // animated to bottom before this PR).
+                                    // PR-UI-CHAT-AUTOSCROLL1.1 — target real
+                                    // LazyColumn last item, not
+                                    // messages.lastIndex. Instant scroll
+                                    // (no animate) for consistency with
+                                    // other paths after Test #79 jerk
+                                    // observation.
+                                    withFrameNanos { }
+                                    val total = listState.layoutInfo.totalItemsCount
+                                    val target = (total - 1).coerceAtLeast(0)
                                     Log.i(
                                         "PhantomUI",
-                                        "CHAT_SCROLL source=text_send conv=${conversationId.take(24)} " +
-                                            "targetIndex=${messages.lastIndex} total=${messages.size}",
+                                        "CHAT_SCROLL source=text_send conv=${conversationId.take(8)} " +
+                                            "targetIndex=$target total=$total",
                                     )
-                                    listState.animateScrollToItem(messages.lastIndex)
+                                    listState.scrollToItem(target)
                                 }
                             }
                         }
@@ -1130,6 +1137,41 @@ fun ChatScreen(
                 .filterIsInstance<ChatItem.Msg>()
                 .map { it.entity.id }
                 .toHashSet()
+        }
+
+        // PR-UI-CHAT-AUTOSCROLL1.1 — initial scroll to the REAL LazyColumn
+        // last item. The previous attempt used `messages.lastIndex`, which
+        // undershoots because LazyColumn = E2EE prefix row (1) + optional
+        // pinned banner (0/1) + chatItems (messages + day separators).
+        // On a multi-day chat with 34 messages, messages.lastIndex was 33
+        // but the actual LazyColumn last index was 39+, so scrollToItem
+        // landed in the middle.
+        //
+        // Two-stage gate:
+        //  - LaunchedEffect keyed on `chatItems.size` + pinned-state so it
+        //    re-evaluates on each chat-open recomposition without firing
+        //    for every incoming message after the initial scroll.
+        //  - `initialScrollDone` flag (reset per-conversation via
+        //    `remember(conversationId)`) guarantees the scroll fires
+        //    exactly once per conversation entry.
+        //  - `snapshotFlow { totalItemsCount }.first { it > 0 }` waits
+        //    until LazyColumn has actually laid out at least one item
+        //    before we read totalItemsCount — without this, the read
+        //    races layout and we'd target index -1.
+        var initialScrollDone by remember(conversationId) { mutableStateOf(false) }
+        LaunchedEffect(conversationId, chatItems.size, pinnedMessages.isNotEmpty()) {
+            if (initialScrollDone || chatItems.isEmpty()) return@LaunchedEffect
+            snapshotFlow { listState.layoutInfo.totalItemsCount }
+                .first { it > 0 }
+            val total = listState.layoutInfo.totalItemsCount
+            val target = (total - 1).coerceAtLeast(0)
+            listState.scrollToItem(target)
+            initialScrollDone = true
+            Log.i(
+                "PhantomUI",
+                "CHAT_SCROLL source=initial_open conv=${conversationId.take(8)} " +
+                    "targetIndex=$target total=$total chatItems=${chatItems.size}",
+            )
         }
 
         LazyColumn(
