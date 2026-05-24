@@ -563,6 +563,31 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-24 (sun, very late) · Out-of-queue: FLOSS/fund schema hotfix — crypto type 'cryptocurrency' → 'other'
+
+PR #221 merged + deployed end-to-end during the same session. Out-of-queue continuation of the funding track.
+
+**Cause.** FLOSS/fund submission flow rejected `funding.json` on the `type` field of the three crypto channels (`bitcoin`, `monero`, `ethereum`). The schema they validate against does NOT include `cryptocurrency` as a permitted enum value; the closest legal value is `other`. Source: Vladislav's locally-corrected `D:\VL Stories Studio\funding.json` brought back from the failed submission.
+
+**Diagnosis.** Compared the locally-corrected source with `master/funding.json` byte-level + structurally. **Only 3 fields changed** — all `type: cryptocurrency` → `type: other` for the three crypto channels. Wallet addresses, descriptions, plans, entity, projects — all unchanged. Size diff: -27 bytes (3 × 9 byte saving from `cryptocurrency` → `other`). Source file was LF-only; CRLF preserved in master via byte-level Python `replace` instead of file copy.
+
+**PR #221 (master `a938ce6d`).** Exactly 3-line diff. CRLF preserved. JSON re-validated.
+
+**Deploy on VPS.** Same one-liner used since the `--force-recreate` lesson:
+```
+cd /home/phantom/Phantom && git pull origin master && \
+  docker compose -f deploy/docker-compose.yml up -d --force-recreate caddy
+```
+`Container phantom-caddy Started` (not `Running`), confirming the container was recreated and picked up the new file inode.
+
+**Verified live.** `curl -s https://phntm.pro/funding.json | python -c '...'` confirms all six channel types as expected: liberapay/buy-me-a-coffee `payment-provider`, bitcoin/monero/ethereum **`other`**, bank-wire `bank`. JSON valid. `grep -c '"cryptocurrency"' = 0`, `grep -c '"other"' = 3`. Content-Length 6347 (LF on VPS via git autocrlf=input behaviour — does not affect JSON parsing or download size for crawlers).
+
+**FLOSS/fund unblocked again.** Vladislav can re-submit the manifest URL.
+
+**Lesson hardened in agent memory:** `feedback_floss_fund_schema_other.md` — fundingjson.org / FLOSS-fund schema enum for `funding.channels[].type` does NOT include `cryptocurrency` (the obvious value). For crypto channels use `other` (or another permitted enum value if the spec evolves). When adding a new channel type to `funding.json`, look up the current spec first; don't guess from the friendly name.
+
+**Source-of-truth follow-up (Vladislav-side, NOT in this PR):** the local `D:\VL Stories Studio\funding.json` now matches master (Vladislav already corrected it locally before re-submitting). Cloudflare placeholder issue from PR #219 is also still resolved in master. The local file is the canonical "next edit starts here" copy; future edits should start from a fresh `git pull` of the repo version to keep them in sync.
+
 ### 2026-05-24 (sun, late) · Out-of-queue: serve funding.json on phntm.pro + email-placeholder hotfix
 
 Two related PRs merged + deployed end-to-end during the same session. Out-of-queue (FLOSS/fund unblock continuation from PR #215).
