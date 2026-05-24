@@ -55,19 +55,19 @@
       },
       {
         "guid": "bitcoin",
-        "type": "cryptocurrency",
+        "type": "other",
         "address": "bc1qrkufy97gv88cz80fqak9f5q7vcjpvr547aru6j",
         "description": "Bitcoin donations. Native SegWit (P2WPKH) address. Self-custody wallet held by the maintainer."
       },
       {
         "guid": "monero",
-        "type": "cryptocurrency",
+        "type": "other",
         "address": "832MyHXv8KpZxL1ZAwkfTUEPc8ghnJbCxH1YHaXLy4Hw6oG1wfF9xa91XbpMyy7nKmfpzduv1FBie3JL5cZ7qz6r9N7AzaU",
         "description": "Monero donations for privacy-aligned contributors. Self-custody wallet held by the maintainer. Subaddress used for public donations."
       },
       {
         "guid": "ethereum",
-        "type": "cryptocurrency",
+        "type": "other",
         "address": "0x9De87C1955a5772c2411D86504962eb581d852D5",
         "description": "Ethereum donations. Native ETH only; stablecoins are not accepted. Self-custody wallet held by the maintainer. Address is valid across EVM-compatible networks."
       },
