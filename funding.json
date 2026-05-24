@@ -4,105 +4,130 @@
     "type": "organisation",
     "role": "owner",
     "name": "Willen LLC",
-    "email": "hello@phntm.pro",
+    "email": "[email protected]",
     "phone": "",
-    "description": "Single-founder Delaware LLC operating PHANTOM, an AGPL-3.0-or-later end-to-end encrypted messenger built for restrictive networks. Production-validated 2026-05-07: works on Russian mobile carriers without a VPN, without Orbot, without any third-party app, by way of an embedded Xray VLESS+REALITY transport that masquerades the wire as a TLS handshake to www.microsoft.com.",
+    "description": "Willen LLC is a Wyoming, USA company that maintains PHANTOM, an AGPL-3.0-or-later end-to-end encrypted, censorship-resistant messenger. The company exists to develop and steward PHANTOM as public-interest software infrastructure.",
     "webpageUrl": {
-      "url": "https://phntm.pro"
+      "url": "https://github.com/LiudvigVladislav/Phantom"
     }
   },
   "projects": [
     {
       "guid": "phantom-messenger",
       "name": "PHANTOM",
-      "description": "End-to-end encrypted messenger that works in censored networks (Russia confirmed; Iran and China by architectural design) without any VPN or third-party app. Built on the Signal protocol primitives (Double Ratchet, Sealed Sender) with an embedded Xray VLESS+REALITY outer transport for censorship resistance and a Tor v3 onion service as a fallback data plane. Kotlin Multiplatform shared core; Android client today, iOS port in active planning (post-Alpha-2). Self-hostable Rust + Axum relay licensed under AGPL-3.0-or-later — §13 (Remote Network Interaction) makes the relay's privacy promise enforceable against silently-modified hosted forks.",
+      "description": "An open-source, end-to-end encrypted, censorship-resistant messenger production-validated against Russia's TSPU DPI filtering. Built with Kotlin Multiplatform (one codebase across Android, iOS, web), Compose Multiplatform UI, custom Double Ratchet implementation over libsodium, and custom Rust relay server. Currently in Alpha 2 with live production relay in Hetzner Helsinki. Designed for journalists, activists, and dissidents in restricted internet environments.",
       "webpageUrl": {
         "url": "https://github.com/LiudvigVladislav/Phantom"
       },
       "repositoryUrl": {
-        "url": "https://github.com/LiudvigVladislav/Phantom",
-        "wellKnown": "https://github.com/LiudvigVladislav/Phantom/blob/master/funding.json"
+        "url": "https://github.com/LiudvigVladislav/Phantom"
       },
-      "licenses": ["spdx:AGPL-3.0-or-later"],
+      "licenses": [
+        "spdx:AGPL-3.0-or-later"
+      ],
       "tags": [
         "messaging",
+        "encryption",
         "privacy",
-        "e2ee",
-        "cryptography",
         "censorship-resistance",
-        "mobile",
         "kotlin-multiplatform",
-        "android",
-        "tor",
-        "signal-protocol"
+        "rust",
+        "double-ratchet",
+        "libsodium",
+        "end-to-end-encryption",
+        "open-source"
       ]
     }
   ],
   "funding": {
     "channels": [
       {
-        "guid": "github-sponsors",
+        "guid": "liberapay",
         "type": "payment-provider",
-        "address": "https://github.com/sponsors/LiudvigVladislav",
-        "description": "GitHub Sponsors — direct support to the maintainer. Please use this channel if your organisation prefers GitHub-native billing."
+        "address": "https://liberapay.com/phantom-messenger",
+        "description": "Liberapay is a French non-profit platform for recurring weekly/monthly/yearly micro-donations. Zero platform fee. Donor anonymity by default. Best for FOSS-aligned recurring contributions."
       },
       {
         "guid": "buy-me-a-coffee",
         "type": "payment-provider",
-        "address": "https://www.buymeacoffee.com/phantom",
-        "description": "One-time donations of any size."
+        "address": "https://www.buymeacoffee.com/phantommessenger",
+        "description": "Low-friction one-time and membership donation platform. Accepts credit/debit cards and PayPal. For one-time contributions from blog readers and social audiences."
       },
       {
-        "guid": "open-collective",
-        "type": "payment-provider",
-        "address": "https://opencollective.com/phantom-messenger",
-        "description": "Fiscal-host backed transparent budgeting. (Registration in progress 2026-05; URL becomes live within Week 1 of the council-revised plan.)"
+        "guid": "bitcoin",
+        "type": "cryptocurrency",
+        "address": "bc1qrkufy97gv88cz80fqak9f5q7vcjpvr547aru6j",
+        "description": "Bitcoin donations. Native SegWit (P2WPKH) address. Self-custody wallet held by the maintainer."
       },
       {
-        "guid": "liberapay",
-        "type": "payment-provider",
-        "address": "https://liberapay.com/phantom-messenger",
-        "description": "Recurring weekly / monthly donations. (Registration in progress 2026-05.)"
+        "guid": "monero",
+        "type": "cryptocurrency",
+        "address": "832MyHXv8KpZxL1ZAwkfTUEPc8ghnJbCxH1YHaXLy4Hw6oG1wfF9xa91XbpMyy7nKmfpzduv1FBie3JL5cZ7qz6r9N7AzaU",
+        "description": "Monero donations for privacy-aligned contributors. Self-custody wallet held by the maintainer. Subaddress used for public donations."
       },
       {
-        "guid": "polar",
-        "type": "payment-provider",
-        "address": "https://polar.sh/phantom-messenger",
-        "description": "Subscription support tier with optional milestone-based bounties. (Registration in progress 2026-05.)"
+        "guid": "ethereum",
+        "type": "cryptocurrency",
+        "address": "0x9De87C1955a5772c2411D86504962eb581d852D5",
+        "description": "Ethereum donations. Native ETH only; stablecoins are not accepted. Self-custody wallet held by the maintainer. Address is valid across EVM-compatible networks."
       },
       {
-        "guid": "operator-email",
-        "type": "other",
-        "address": "hello@phntm.pro",
-        "description": "Direct contact for grant programs, large institutional donors, and dual-licensing inquiries."
+        "guid": "bank-wire",
+        "type": "bank",
+        "address": "Coordinate via [email protected] for gifts of $10,000 USD equivalent and above.",
+        "description": "Direct bank wire to Willen LLC's USD operating account. Used for large gifts and grant disbursements, where formal documentation and sanctions screening are coordinated in writing."
       }
     ],
     "plans": [
       {
-        "guid": "milestone-1-ios-port",
-        "status": "proposed",
-        "name": "Milestone 1 — iOS port and adaptive transport",
-        "description": "Twelve months of single-developer work covering: (a) Compose Multiplatform iOS XCFramework build for the existing :shared:core:* modules so PHANTOM ships on iOS at parity with Android; (b) ADR-020 Adaptive Transport Selection — runtime probe-and-pick state machine across direct WSS, Xray REALITY, and Tor (today's choice is build-time only); (c) ADR-021 Multi-server Xray fan-out — closes the single-Hetzner-VPS point-of-failure with two or three operator-controlled servers in different jurisdictions; (d) closure of the four NLnet-blocking security findings (F22 SPK/OPK keystore-wrap, F19+F20 call signalling E2EE, F8 RatchetState wrap, F2+F13 SenderKey signing removal) per the security roadmap.",
-        "amount": 30000,
-        "currency": "EUR",
+        "guid": "ios-port-unblock",
+        "status": "active",
+        "name": "iOS port hardware unblock",
+        "description": "Apple Silicon Mac (Mac mini M4) for iOS development on Kotlin Multiplatform. The iOS port is the single binding constraint preventing PHANTOM from being a true cross-platform alternative to centralized messengers.",
+        "amount": 2000,
+        "currency": "USD",
         "frequency": "one-time",
-        "channels": ["operator-email"]
+        "channels": ["bank-wire", "bitcoin", "ethereum", "monero"]
       },
       {
-        "guid": "ongoing-relay-and-bridge-hosting",
+        "guid": "external-cryptographic-audit",
         "status": "active",
-        "name": "Operational hosting (relay + Xray + future bridges)",
-        "description": "Recurring infrastructure cost of running the production relay, the Xray REALITY server, the Tor onion service, the WebTunnel bridge, and self-hosted ntfy — all on operator-controlled VPSes. Today this is one Hetzner CPX22 (~€8/month) and one Hetzner CPX21 (~€7/month). Multi-region rollout (ADR-021) raises this proportionally.",
-        "amount": 50,
-        "currency": "EUR",
-        "frequency": "monthly",
-        "channels": [
-          "github-sponsors",
-          "buy-me-a-coffee",
-          "open-collective",
-          "liberapay",
-          "polar"
-        ]
+        "name": "External cryptographic audit",
+        "description": "Independent third-party audit of the custom Double Ratchet implementation, Sealed Sender envelope construction, X25519 key derivation, and relay protocol against the formal threat model. Scheduled post-Beta, pre-v1.0.",
+        "amount": 15000,
+        "currency": "USD",
+        "frequency": "one-time",
+        "channels": ["bank-wire"]
+      },
+      {
+        "guid": "12-month-maintainer-runway",
+        "status": "active",
+        "name": "12-month maintainer runway",
+        "description": "Solo maintainer compensation at below-market open-source rate for 12 months of full-time PHANTOM development. Covers iOS port completion, Beta release, group chat foundation, pluggable censorship-resistant transports, and external audit liaison.",
+        "amount": 60000,
+        "currency": "USD",
+        "frequency": "yearly",
+        "channels": ["liberapay", "buy-me-a-coffee", "bitcoin", "ethereum", "monero", "bank-wire"]
+      },
+      {
+        "guid": "production-infrastructure",
+        "status": "active",
+        "name": "Production infrastructure",
+        "description": "Hetzner Helsinki VPS for production relay, domain registration (phntm.pro), TLS certificates via Let's Encrypt, CI/CD costs, error monitoring, transactional email for security disclosures. EU jurisdiction by design.",
+        "amount": 1200,
+        "currency": "USD",
+        "frequency": "yearly",
+        "channels": ["liberapay", "buy-me-a-coffee", "bitcoin", "ethereum", "monero"]
+      },
+      {
+        "guid": "legal-compliance",
+        "status": "active",
+        "name": "Legal and compliance baseline",
+        "description": "Annual minimum required to maintain Willen LLC in good standing: Wyoming registered agent, annual report, federal tax filings via U.S. CPA (Form 5472 + 1120 for foreign-owned single-member LLC), domain registrar, FinCEN BOI filing.",
+        "amount": 1500,
+        "currency": "USD",
+        "frequency": "yearly",
+        "channels": ["bank-wire"]
       }
     ],
     "history": []

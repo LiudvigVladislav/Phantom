@@ -201,13 +201,11 @@ Before contributing code, please open an issue to discuss the change.
 
 ---
 
-## Funding & sustainability
+## Funding
 
-The core messenger — including all privacy guarantees, the full Double Ratchet implementation, the relay stack, and the censorship-resistance transport layer — remains free, open-source, and uncrippled for individual users, forever. Long-term sustainability is funded by a separate optional commercial track of value-added services for organisations: managed relay deployments, priority support contracts, encrypted backup-and-recovery convenience features, and specialised integrations. None of these services restrict access to or affect the privacy guarantees of the core open-source software.
+PHANTOM's funding channels and sustainability plans are documented in machine-readable form in [`funding.json`](funding.json) at the repository root. The project accepts donations via Liberapay, Buy Me a Coffee, and cryptocurrency (BTC, XMR, ETH).
 
-**Donations:** see the **Sponsor** button at the top of this repository for direct support channels. Public-interest funding programmes that align with the project's privacy mission are also pursued from time to time; the canonical funding-channel list lives in [`funding.json`](funding.json).
-
-PHANTOM is being developed by a solo founder operating through Willen LLC (Delaware, USA).
+PHANTOM is maintained by Willen LLC, a company registered in Wyoming, USA.
 
 ---
 
