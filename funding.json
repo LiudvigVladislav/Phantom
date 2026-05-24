@@ -1,5 +1,6 @@
 {
-  "version": "v1.0.0",
+  "$schema": "https://fundingjson.org/schema/v1.1.0.json",
+  "version": "v1.1.0",
   "entity": {
     "type": "organisation",
     "role": "owner",
@@ -8,7 +9,7 @@
     "phone": "",
     "description": "Willen LLC is a Wyoming, USA company that maintains PHANTOM, an AGPL-3.0-or-later end-to-end encrypted, censorship-resistant messenger. The company exists to develop and steward PHANTOM as public-interest software infrastructure.",
     "webpageUrl": {
-      "url": "https://github.com/LiudvigVladislav/Phantom"
+      "url": "https://phntm.pro"
     }
   },
   "projects": [
@@ -17,10 +18,11 @@
       "name": "PHANTOM",
       "description": "An open-source, end-to-end encrypted, censorship-resistant messenger production-validated against Russia's TSPU DPI filtering. Built with Kotlin Multiplatform (one codebase across Android, iOS, web), Compose Multiplatform UI, custom Double Ratchet implementation over libsodium, and custom Rust relay server. Currently in Alpha 2 with live production relay in Hetzner Helsinki. Designed for journalists, activists, and dissidents in restricted internet environments.",
       "webpageUrl": {
-        "url": "https://github.com/LiudvigVladislav/Phantom"
+        "url": "https://phntm.pro"
       },
       "repositoryUrl": {
-        "url": "https://github.com/LiudvigVladislav/Phantom"
+        "url": "https://github.com/LiudvigVladislav/Phantom",
+        "wellKnown": "https://github.com/LiudvigVladislav/Phantom/blob/master/.well-known/funding-manifest-urls"
       },
       "licenses": [
         "spdx:AGPL-3.0-or-later"
@@ -87,7 +89,12 @@
         "amount": 2000,
         "currency": "USD",
         "frequency": "one-time",
-        "channels": ["bank-wire", "bitcoin", "ethereum", "monero"]
+        "channels": [
+          "bank-wire",
+          "bitcoin",
+          "ethereum",
+          "monero"
+        ]
       },
       {
         "guid": "external-cryptographic-audit",
@@ -97,7 +104,9 @@
         "amount": 15000,
         "currency": "USD",
         "frequency": "one-time",
-        "channels": ["bank-wire"]
+        "channels": [
+          "bank-wire"
+        ]
       },
       {
         "guid": "12-month-maintainer-runway",
@@ -107,7 +116,14 @@
         "amount": 60000,
         "currency": "USD",
         "frequency": "yearly",
-        "channels": ["liberapay", "buy-me-a-coffee", "bitcoin", "ethereum", "monero", "bank-wire"]
+        "channels": [
+          "liberapay",
+          "buy-me-a-coffee",
+          "bitcoin",
+          "ethereum",
+          "monero",
+          "bank-wire"
+        ]
       },
       {
         "guid": "production-infrastructure",
@@ -117,7 +133,13 @@
         "amount": 1200,
         "currency": "USD",
         "frequency": "yearly",
-        "channels": ["liberapay", "buy-me-a-coffee", "bitcoin", "ethereum", "monero"]
+        "channels": [
+          "liberapay",
+          "buy-me-a-coffee",
+          "bitcoin",
+          "ethereum",
+          "monero"
+        ]
       },
       {
         "guid": "legal-compliance",
@@ -127,7 +149,9 @@
         "amount": 1500,
         "currency": "USD",
         "frequency": "yearly",
-        "channels": ["bank-wire"]
+        "channels": [
+          "bank-wire"
+        ]
       }
     ],
     "history": []
