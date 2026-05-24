@@ -562,6 +562,40 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-24 (sun) · Out-of-queue: funding.json + README Funding section
+
+Closed PR #215 (`feat/funding-json-update` → master `789c3c9e`). Two commits, two files (`funding.json` + `README.md`). Out-of-queue task per Vladislav, not part of the locked sequence — explicitly inserted to unblock the FLOSS/fund submission flow.
+
+**What landed:**
+
+- **`funding.json` replaced** with the post-pivot canonical version (was the Delaware/NLnet-era manifest from 2026-05). New manifest:
+  - `entity.name = Willen LLC`, jurisdiction = Wyoming USA (confirmed by Vladislav 2026-05-24 against Articles of Organization — see memory entry `project_willen_llc_wyoming_2026_05_24.md`).
+  - Channels: Liberapay, Buy Me a Coffee, Bitcoin, Monero, Ethereum, bank wire. Replaces the older GitHub Sponsors / Open Collective / Polar / operator-email set.
+  - Plans: iOS port hardware unblock $2 000, external cryptographic audit $15 000, 12-month maintainer runway $60 000, production infrastructure $1 200/yr, legal/compliance baseline $1 500/yr (Wyoming registered agent + annual report + 5472+1120 federal filing + FinCEN BOI).
+  - `history: []` (intentionally empty per fundingjson.org spec until first disclosure).
+  - Validated: `python -m json.tool funding.json` → Valid JSON.
+- **`README.md` Funding section rewrite.** Old `## Funding & sustainability` (philosophy paragraph about commercial managed deployments + priority support + encrypted backup as a sustainability track) was **dropped intentionally** — Vladislav's reasoning: that paragraph contradicts the way PHANTOM is positioned in every active grant application (FLOSS/fund, FUTO, Sovereign Tech all fund non-commercial FOSS, and the commercial-track paragraph created dissonance for grant reviewers). New `## Funding` section is the exact three-line text Vladislav specified: pointer to `funding.json`, list of donation channels (Liberapay, BMAC, BTC/XMR/ETH), and the maintainer/jurisdiction line "PHANTOM is maintained by Willen LLC, a company registered in Wyoming, USA." The previous "Willen LLC (Delaware, USA)" line — which was a historical typo from early-stage docs and never matched reality — is gone for good.
+- **License badge already AGPL-3.0-or-later** (no change needed).
+- **No NLnet references in README** to remove (already clean in master).
+
+**Verification:** `curl -I https://raw.githubusercontent.com/LiudvigVladislav/Phantom/master/funding.json` → `HTTP/1.1 200 OK`, `Content-Length: 6378`, `Content-Type: text/plain; charset=utf-8`, `ETag: "2f05602cdcd74…"`. URL ready to paste into FLOSS/fund submission form.
+
+**Branch protection note.** The original task brief said `git push origin main`. Direct push to the protected `master` branch is blocked by branch protection (would require admin-merge bypass + `--no-verify` skipping hooks, both forbidden by default policy). Landed via standard PR + squash-merge workflow — content-identical result, just respects the protection rules. Future tasks of the same shape should default to `gh pr create + gh pr merge --squash` rather than direct push.
+
+**Discipline note.** The original session ended without a journal entry for PR #215 — Vladislav caught the omission ("ты внес в наш лог и документацию, то, что мы сделали…") and asked explicitly before authorising the next track. This entry is the catch-up. Out-of-queue tasks still need durable fixation per `feedback_durable_log.md` (2026-05-07). Adding a memory entry to harden this for future sessions.
+
+**Locked queue unchanged:**
+
+1. ✅ PR-DOC-HONESTY
+2. ✅ PR-UI-REC-FOLLOWUP
+3. ✅ PR-NOTIF-DIAG
+4. 🟢 PR-UI-CHAT-AUTOSCROLL1 — **next**, Vladislav greenlit 2026-05-24 in the same message that flagged the missing journal entry. Mini-lock at `docs/tracks/chat-autoscroll.md`.
+5. PR-NOTIF-POLICY1 — Variant A vs B decision at mini-lock review.
+6. PR-D1e — first-message bootstrap.
+7. Network matrix Standard / Private / Ghost.
+8. Calls (C-track).
+9. Voice quality A/B.
+
 ### 2026-05-23 (sat) · PR-NOTIF-DIAG — incoming-message notification path observability
 
 Closed PR #213 (`feat/pr-notif-diag` → master `a0484602`). One commit, four files (`PhantomNotificationManager.kt` + `PhantomApplication.kt` + `AppContainer.kt` + `DefaultMessagingService.kt`), +295 / −39 lines. Test #78 PASS per architect verdict. Fourth PR end-to-end under `docs/WORKING_RULES.md` (REC3 → PR-DOC-HONESTY → REC-FOLLOWUP → NOTIF-DIAG).
