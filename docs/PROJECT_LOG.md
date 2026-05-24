@@ -563,6 +563,35 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-24 (sun, night) · Out-of-queue: FLOSS/fund hybrid verification — well-known proof + schema bump v1.1.0 + webpage URLs to phntm.pro
+
+PR #223 merged + deployed + Cloudflare-purged end-to-end. **FLOSS/fund verification badges went green** per Vladislav verdict ("Да, все ок"). This is the third and final iteration on the FLOSS/fund submission today; the funding-track block of the day closes here.
+
+**Cause.** Even with the type-`other` fix from PR #221, FLOSS/fund directory page showed the manifest as "verified at submission time" but with red badges next to `webpage` and `repository` — those URLs are only auto-verifiable if either (a) the URL hostname matches the manifest URL hostname, or (b) there's a well-known proof file at the URL endpoint pointing back at the manifest. PHANTOM's master at the start of the day had `webpageUrl.url = https://github.com/.../Phantom` (which can't be auto-verified because the manifest is hosted on `phntm.pro`, not `github.com`) and no `wellKnown` field on `repositoryUrl`.
+
+**Hybrid fix (Vladislav-designed, simplest minimal-files approach):**
+1. Point both `webpageUrl` fields at `https://phntm.pro` — hostname now matches the manifest URL hostname → auto-verified, zero extra files needed.
+2. Keep `repositoryUrl.url = https://github.com/...` (real source code IS on GitHub) but add `wellKnown` sub-field pointing at a new well-known proof file in the repo.
+3. New `.well-known/funding-manifest-urls` file in the repo root, one line `https://phntm.pro/funding.json` + UNIX trailing LF. Reachable via GitHub raw/blob.
+
+**PR #223 (master `247e3924`).** Two files: `funding.json` (5 semantic changes + pretty-print of `plans.channels` arrays from source) and `.well-known/funding-manifest-urls` (new, 31 bytes). CRLF preserved for `funding.json`, LF preserved for `.well-known/funding-manifest-urls` (`git ls-files --eol` confirmed `i/lf w/lf` — no autocrlf conversion). Side-effect: schema bumped to v1.1.0 with `$schema` URL `https://fundingjson.org/schema/v1.1.0.json` added at the top.
+
+**Deploy on VPS.** Same canonical one-liner used since PR #221: `git pull && docker compose up -d --force-recreate caddy`. Plus Cloudflare cache purge (Custom Purge → `https://phntm.pro/funding.json`) because we'd set `Cache-Control: max-age=3600` and the previous PR #221 content might have been edge-cached. Cloudflare `cf-cache-status: DYNAMIC` on the post-purge fetch confirmed origin was tapped.
+
+**Live verified (this entry's curl):**
+- HTTP 200, Content-Length 6688 (was 6482; +206 = `$schema` URL + `wellKnown` URL + webpage URL changes + pretty-print expansion).
+- `$schema` = `https://fundingjson.org/schema/v1.1.0.json`.
+- `version` = `v1.1.0`.
+- Both webpageUrl values = `https://phntm.pro`.
+- `repositoryUrl.wellKnown` present and points at the GitHub blob URL.
+- 5 occurrences of `phntm.pro` in JSON (2 webpage + 2 email + 1 plan description mentioning domain registration).
+- Well-known file on GitHub raw: HTTP 200, 31 bytes, hex ends with `0a` (LF), content `https://phntm.pro/funding.json\n`.
+- FLOSS/fund badges green per Vladislav.
+
+**Funding-track day total:** 9 PRs merged (#215 → #216 → #218 → #219 → #220 → #221 → #222 → #223 → this close-PR), 3 VPS deploys, 4 memory entries hardened (Wyoming, single-file bind-mount, FLOSS/fund crypto=other, FLOSS/fund hybrid verification). All FLOSS/fund verification problems closed.
+
+**Lesson hardened in agent memory:** `feedback_floss_fund_hybrid_verification.md` — the hybrid verification pattern (own-domain hostname for `webpageUrl` + well-known proof file for `repositoryUrl`) is the cheapest way to get all-green FLOSS/fund badges when the project's webpage is on a domain you control AND the repository is on GitHub. Don't try to verify GitHub-hosted webpage URLs by adding well-known there (GitHub raw plain-text files work, but it's two well-known files instead of one).
+
 ### 2026-05-24 (sun, very late) · Out-of-queue: FLOSS/fund schema hotfix — crypto type 'cryptocurrency' → 'other'
 
 PR #221 merged + deployed end-to-end during the same session. Out-of-queue continuation of the funding track.
