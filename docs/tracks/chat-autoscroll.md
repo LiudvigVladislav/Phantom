@@ -52,4 +52,25 @@ That is the entire scope. The behaviour switch is: **on chat open, on incoming m
 
 ## Last hand-off
 
-(empty — track queued, not yet active)
+**PARKED 2026-05-24.** PR #217 closed without merge per `docs/WORKING_RULES.md` rule 4 (two architectural attempts in a row failed → park and redesign). Track replaced by **PR-UI-CHAT-BOTTOM-ANCHOR1** — mini-lock at `docs/tracks/chat-bottom-anchor.md`.
+
+**Two attempts made on this track:**
+
+1. **PR #217 v1 (commit `14c7f2aa`)** — `LaunchedEffect(conversationId)` after `reloadMessages()` calls `listState.scrollToItem(messages.lastIndex)`. Tested in Test #79.
+   - **Failed:** wrong target index. `messages.lastIndex` undershoots the real LazyColumn last index because the column also contains an E2EE prefix row, an optional pinned banner, and day separators that `chatItems` already includes. On a 34-message multi-day chat, `messages.lastIndex` was 33 but the real LazyColumn last index was ~39 — `scrollToItem(33)` landed 6 items above the bottom.
+   - Also pre-Test #79: an APK/install mismatch on Tecno was caught — phone had an old APK (from PR #213 NOTIF-DIAG); reinstall produced the correct MD5 but the scroll still didn't reach the bottom, which then exposed the index bug above.
+
+2. **PR #217 v1.1 (commit `3d15615a`)** — moved initial scroll out of `LaunchedEffect(conversationId)` into a new `LaunchedEffect(conversationId, chatItems.size, pinnedMessages.isNotEmpty())` inside the Scaffold body where `chatItems` and `listState.layoutInfo` are in scope. Used `snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it > 0 }` to wait until LazyColumn laid out at least one item, then `scrollToItem(layoutInfo.totalItemsCount - 1)` — the real last LazyColumn index. The 3 send/incoming paths (voice, text, incoming-active) refactored to the same shape with `withFrameNanos { }` + instant `scrollToItem`. Tested in Test #79.1.1.
+   - **Failed on UX, not correctness:** the scroll did fire at the right index (`targetIndex=43 total=44` and `targetIndex=48 total=49`), but **1.8–2.3 seconds AFTER** `reloadMessages` and the initial LazyColumn paint. The user saw mid-history or a black screen first, then a jumpy scroll-to-bottom. Plus rapid incoming messages still felt jerky because each new message triggered an instant scroll on top of the previous one.
+
+**Architectural lesson (Vladislav-architect, 2026-05-24, captured in agent memory):** `scrollToItem`-after-layout cannot match real messenger UX. Mainstream chat apps (Telegram, WhatsApp, Signal) don't scroll-to-bottom — they use a **bottom-anchored** list (`LazyColumn(reverseLayout = true)`), so the natural rendering position is already at the latest message. New incoming messages appear at the bottom without any scroll correction. Initial open requires zero scroll logic. This is the architectural fix, not the bandaid fix.
+
+**Replacement track:** `PR-UI-CHAT-BOTTOM-ANCHOR1` (`docs/tracks/chat-bottom-anchor.md`). Mini-lock authored same session. Scope is bigger than this track (LazyColumn refactor with `reverseLayout = true` + chatItems reversal + verify date separators / pinned banner / E2EE row / scroll-to-pinned still work) but the result is correct chat UX, not patched chat UX. Vladislav-architect verdict: "если мы сейчас продолжим накручивать задержки, awaitFrame, scrollToItem, animateScrollToItem, мы будем всё время лечить симптомы. Лучше один раз сделать список как настоящий chat list."
+
+**Diagnostic value retained.** PR #217 commits stay closed-but-visible on GitHub for the diagnostic trail (`14c7f2aa` + `3d15615a`). Future bug-hunting on the chat-list rendering can grep for `CHAT_SCROLL` and the `messages.lastIndex` vs `layoutInfo.totalItemsCount` distinction is documented here.
+
+**Out-of-scope items inherited by BOTTOM-ANCHOR1:**
+
+- preserve-scroll-position when user scrolls up to read history (this was already out-of-scope for AUTOSCROLL1)
+- "↓ N new messages" floating chip with tap-to-jump
+- `NotificationManager.cancel` on chat open (PR-NOTIF-POLICY1's responsibility)
