@@ -128,4 +128,29 @@ With `reverseLayout = true`, `LazyColumn` starts with `firstVisibleItemIndex = 0
 
 ## Last hand-off
 
-(empty — track queued, not yet active)
+**PARKED 2026-05-25.** PR #226 closed without merge per `docs/WORKING_RULES.md` rule 4. Three implementation attempts (v1, v1.1, v1.2) all FAIL on Test #80, #80.1, #80.2 UX criteria. The `reverseLayout = true` direction was architecturally **not wrong** — it solved item-ordering. But it could not solve the underlying root cause: `ChatScreen` starts from an empty local `messages` state and only loads history AFTER first render. Anchoring an empty LazyColumn at "visual bottom" still produces black wait + delayed materialization + jerky history scroll. **Track replaced by PR-UI-CHAT-THREAD-STATE1** (`docs/tracks/chat-thread-state.md`).
+
+**Three attempts and what each proved:**
+
+1. **PR #226 v1 (`14307829`)** — `LazyColumn(reverseLayout = true)` + `displayItems = chatItems.asReversed()` + E2EE row last-in-source + pinned banner outside LazyColumn + `scrollToItem(0)` for own send + no scroll for incoming. **Test #80 FAIL:** "опен сразу не внизу, не показывает сразу последнее сообщение, новые сообщения появляются снизу но рывками, видны не полностью". Logs showed `CHAT_LIST bottom_anchor_enabled total=1 sourceFirst=empty sourceLast=__e2ee__` — the LazyColumn anchored to the empty state, before reloadMessages() returned.
+
+2. **PR #226 v1.1 (`4ae6f8ba`)** — added `initialMessagesLoaded` gate (hide LazyColumn behind `Box(BgDeep)` until reloadMessages finishes) + `initialMessageIds` snapshot after load + 72dp `__bottom_input_spacer__` for composer clearance + logs moved after gate. **Test #80.1 FAIL:** "так же когда заходишь в чат, черный экран, идет прогрузка, а потом в самый низ прокручивает. Так же рывками листается чат. И появилось пустое пространство после полученного сообщения". Gate replaced "mid-history flash" with "black wait"; 72dp spacer created visible blank gap.
+
+3. **PR #226 v1.2 (`813484dc`)** — removed black gate (LazyColumn renders immediately) + shrunk spacer 72dp → 8dp + renamed `__bottom_input_spacer__` → `__bottom_anchor__` + `initialMessageIds` used only for animation suppression (not gate). **Test #80.2 FAIL:** "Уже лучше, скрол есть, но все так же черный экран и скрол по истории так же рывками". Log-side bug fixed (`total=1 sourceFirst=empty` gone), spacer no longer over-correcting, but **the black wait persisted** because Compose still rendered LazyColumn first with `messages = emptyList()` for ~1 frame, then animated all 23+ loaded messages in as "new" via the AnimatedVisibility slide-in wrapper.
+
+**Architectural lesson (Vladislav-architect, 2026-05-25, captured in agent memory as `feedback_chatscreen_pull_style_root_cause.md`):**
+
+`scrollToItem`-after-load AND `reverseLayout = true` are both **symptom-level fixes**. The real root cause is **`ChatScreen` opening with empty local `messages` state and pulling history via `reloadMessages()` in `LaunchedEffect(conversationId)` AFTER first composition.** Compose anchors LazyColumn's `firstVisibleItemIndex` to the empty / e2ee-only state on the first frame; when messages stream in later, the anchor either refuses to follow (mid-history opening) OR Compose animates all history items as if they were brand-new (slide-in pile-up). No amount of LazyColumn-layer tweaks can fix this — the data source has to be reactive (Flow-backed), not pull-style.
+
+**Architectural decision: Variant A+ (Vladislav 2026-05-25).** Replace pull-style `var messages by remember + reloadMessages()` with `MessageRepository.observeMessages(conversationId): Flow<List<MessageEntity>>` (SQLDelight `asFlow().mapToList`, infrastructure already in repo via `sqldelight-coroutines-extensions`). ChatScreen `collectAsState`. Combined with bottom-anchored render in the same PR (because data-source fix alone doesn't guarantee bottom-anchor placement; both are needed together).
+
+**Replacement track: PR-UI-CHAT-THREAD-STATE1.** Mini-lock at `docs/tracks/chat-thread-state.md`. Scope: observeMessages Flow source + bottom-anchored render + initial-history animation suppression + removal of 12 `reloadMessages()` call-sites (where they only refresh the list) with preservation of separate side-effects (markRead, sendProfile, anchor-after-own-send).
+
+**Diagnostic value retained.** PR #226 commits stay closed-but-visible on GitHub (`14307829`, `4ae6f8ba`, `813484dc`) for the diagnostic trail. Future LazyColumn / chat-list work can grep for `CHAT_LIST bottom_anchor_enabled` + the `__bottom_anchor__` pattern.
+
+**Out-of-scope items inherited by THREAD-STATE1:**
+
+- "↓ N new messages" floating chip (still deferred, separate track when needed).
+- Preserve-scroll-position when user scrolls up to read history (same deferral).
+- `NotificationManager.cancel` on chat open (PR-NOTIF-POLICY1's responsibility, unchanged).
+- ChatListScreen Flow migration (kept as pull-style; can migrate in a follow-up after THREAD-STATE1 proves the pattern).

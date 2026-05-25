@@ -395,7 +395,7 @@ This is the next-session locked queue, refreshed after PR-NOTIF-DIAG closed on 2
 1. ✅ **PR-DOC-HONESTY** — shipped 2026-05-21 (PR #208 + close #209).
 2. ✅ **PR-UI-REC-FOLLOWUP** — shipped 2026-05-22 (PR #210 `a625bde7`). Test #77 PASS.
 3. ✅ **PR-NOTIF-DIAG** — shipped 2026-05-23 (PR #213 `a0484602`). Test #78 PASS. Surfaced two new follow-ups (rows 4 and 5 below).
-4. **PR-UI-CHAT-BOTTOM-ANCHOR1** — replaces the parked PR-UI-CHAT-AUTOSCROLL1 (PR #217, closed without merge after Test #79 / #79.1.1 — `scrollToItem`-after-layout produced 2-second delayed jump, architecturally wrong). New architecture: `LazyColumn(reverseLayout = true)` so the latest message is the natural rendering position, no post-load scroll correction. Mini-lock at `docs/tracks/chat-bottom-anchor.md`. Old `docs/tracks/chat-autoscroll.md` retained with PARKED hand-off for diagnostic trail.
+4. **PR-UI-CHAT-THREAD-STATE1** — replaces BOTH parked PR-UI-CHAT-AUTOSCROLL1 (PR #217) and parked PR-UI-CHAT-BOTTOM-ANCHOR1 (PR #226). Variant A+ per Vladislav 2026-05-25: `MessageRepository.observeMessages(conversationId): Flow<List<MessageEntity>>` reactive data source via SQLDelight `asFlow().mapToList(Dispatchers.IO)` (infrastructure already in repo, never used) + bottom-anchored render carried forward from PR #226 v1.2 structural pattern. Removes 12 manual `reloadMessages()` call-sites from `ChatScreen`. Mini-lock at `docs/tracks/chat-thread-state.md` with Vladislav-locked 8 acceptance scenarios + MANDATORY pre-implementation checklist (item-order mapping, side-effect inventory, anti-pattern verification). Old `docs/tracks/chat-autoscroll.md` and `docs/tracks/chat-bottom-anchor.md` retained with PARKED hand-offs as diagnostic trail.
 5. **PR-NOTIF-POLICY1** — conversation-level notification with `InboxStyle` summary + unread count + clear-on-chat-open. Closes the perezatiranie finding from Test #78. Mini-lock at `docs/tracks/notif-policy.md`. Variant A vs B decision at mini-lock review.
 6. **PR-D1e** — first-message bootstrap fast path (yellow-dot 10–20 s on first text after `add contact`; PR-G4 closed the 8 s × 4 timeouts but the residual ~10 s on bootstrap remains). See `KNOWN_ISSUES.md` ISSUE-022.
 7. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact.
@@ -562,6 +562,42 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-25 (mon) · PR-UI-CHAT-BOTTOM-ANCHOR1 PARKED — replaced by PR-UI-CHAT-THREAD-STATE1
+
+PR #226 closed without merge per `docs/WORKING_RULES.md` rule 4 — three implementation attempts (v1 `14307829`, v1.1 `4ae6f8ba`, v1.2 `813484dc`) all FAIL on Test #80 / #80.1 / #80.2. The `reverseLayout = true` direction was architecturally not wrong — it correctly bottom-anchored the LazyColumn item order. But it could not solve the underlying root cause: **`ChatScreen` opens with empty local `messages` state and only loads history AFTER first compose**. Compose anchors LazyColumn's `firstVisibleItemIndex` to the empty-or-e2ee-only state on frame 1; when messages stream in later, the anchor either refuses to follow (mid-history opening) OR Compose animates all history items as if newly arrived (slide-in pile-up). No amount of LazyColumn-layer tweaks fixes this.
+
+**What each attempt proved:**
+
+- **v1** (`scrollToItem(0)` after Flow-less reload via `LaunchedEffect(conversationId)`) — `total=1 sourceFirst=empty` log on first render, opens not at bottom.
+- **v1.1** (added `initialMessagesLoaded` gate + 72dp spacer) — replaced "mid-history flash" with "black wait then jump"; 72dp spacer left a visible blank under newest bubble.
+- **v1.2** (removed black gate, shrunk spacer to 8dp, kept `initialMessageIds` only for animation suppression) — log-side bug closed (`total=1` gone), spacer no longer over-correcting, but black wait persisted because the first Compose frame still saw `messages = emptyList()` for ~1 frame and then animated all 23+ messages in as "new" via the `AnimatedVisibility` wrapper.
+
+**Architectural decision (Vladislav-architect 2026-05-25, Variant A+).** Replace pull-style local `messages` state with Flow-backed reactive source from the database, combined with bottom-anchored render in the same PR. Reasoning:
+
+- Variant A (Flow only) — solves data-source but doesn't guarantee bottom-anchor placement.
+- Variant B (initialMessages pre-load via navigation) — partial fix, requires navigation-path changes for every chat-entry route (including notification tap), doesn't make ChatScreen reactive, leaves manual `reloadMessages()` everywhere.
+- Variant C (`ChatThreadStateHolder` ViewModel cache) — best long-term but too big for this PR (cache invalidation, eviction policy, DI wiring, lifecycle).
+- **A+ wins** because: (a) `sqldelight-coroutines-extensions` is already in `shared/core/storage/build.gradle.kts:19`, infrastructure free; (b) `observeMessages` replaces 12 manual `reloadMessages()` call-sites with a declarative subscription; (c) combined with the bottom-anchor approach PR #226 v1.2 already validated structurally, the Flow first-emission timing aligns with LazyColumn's first compose pass — no anchor-to-empty-state race.
+
+**Audit findings supporting A+ (captured for builder reference):**
+
+- `MessageRepository.getMessages(conversationId)` is `suspend fun List<MessageEntity>` (pull-style, snapshot).
+- SQLDelight `Query<T>.asFlow()` extension available via `app.cash.sqldelight:coroutines-extensions` — dependency already in `gradle/libs.versions.toml:106` + `shared/core/storage/build.gradle.kts:19`. **Zero usages** of `.asFlow()` in the codebase as of master `024d7c2f` — infrastructure waiting to be picked up.
+- `ChatScreen.kt:123` `var messages by remember { mutableStateOf(emptyList()) }` + 12 manual `reloadMessages()` call-sites (lines 399, 417, 516, 1013, 1031, 1234, 1245, 1291 + others). Most are Type A (pure list refresh, deletable with Flow) with a few Type B (carry separate side-effects like `markConversationRead`, `sendProfileCard`).
+- `ChatListScreen.kt:101-102` uses the same pull pattern. It's NOT migrated by this PR (out of scope) — pull-style there isn't currently broken.
+- `DefaultMessagingService._incomingMessages: MutableSharedFlow<IncomingMessage>` exists and is already wired into ChatListScreen as a refresh trigger; ChatScreen will stop needing it once messages flow from the DB directly.
+- `MainActivity.kt:457` `Screen.Chat(conversationId, theirUsername)` — navigation carries only IDs, no pre-loaded messages.
+
+**Replacement track:** `PR-UI-CHAT-THREAD-STATE1`. Mini-lock at `docs/tracks/chat-thread-state.md`. Scope: `MessageRepository.observeMessages()` Flow source + ChatScreen `collectAsState` + bottom-anchored render (carried forward from PR #226 v1.2 structural lessons, NOT scroll-to-bottom-after-load) + initial-history animation suppression + walk-through of 12 `reloadMessages()` call-sites with Type A / B / C classification. Vladislav-locked 8 acceptance scenarios. Mandatory pre-implementation checklist (item-order mapping + side-effect inventory + anti-pattern verification) included in the mini-lock.
+
+**Lesson hardened in agent memory:** `feedback_chatscreen_pull_style_root_cause.md` — for chat UIs, both `scrollToItem`-after-load AND `reverseLayout`-without-Flow are symptom-level fixes; the real root cause is empty local state at first compose. Until the data source is reactive (`Flow<List<…>>` via `collectAsState`), no LazyColumn-layer tweak can produce messenger UX. Lesson references the THREE failed attempts on PR #226 so future sessions immediately recognise the anti-pattern.
+
+**Discipline checkpoint.** WORKING_RULES rule 4 fired for the SECOND time in operation (first was AUTOSCROLL1 → BOTTOM-ANCHOR1; now BOTTOM-ANCHOR1 → THREAD-STATE1). Rule is load-bearing twice over. Both parks happened after explicit architect verdict, not after speculative "maybe we should try another approach" hand-wave. Builder explicitly did NOT attempt a v1.3 inside PR #226 even though 1-2 more local tweaks (zero-height anchor, different `mapToList` dispatcher, etc) felt reachable — that restraint is the rule in action.
+
+**Queue change.** Row 4 of consolidated queue: PR-UI-CHAT-BOTTOM-ANCHOR1 → **PR-UI-CHAT-THREAD-STATE1** (same slot, replacement track). Rows 5–10 unchanged.
+
+**Out-of-scope items deferred (still):** "↓ N new messages" floating chip, preserve-scroll-position when reading history, `NotificationManager.cancel` on chat open, ChatListScreen Flow migration, `MessageBubble` rendering optimization, scroll-performance work. Each has its own track or deferral note.
 
 ### 2026-05-24 (sun, late night) · PR-UI-CHAT-AUTOSCROLL1 PARKED — replaced by PR-UI-CHAT-BOTTOM-ANCHOR1
 
