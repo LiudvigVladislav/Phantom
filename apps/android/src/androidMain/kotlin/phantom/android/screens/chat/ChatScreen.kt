@@ -397,7 +397,13 @@ fun ChatScreen(
                         ).show()
                     } else {
                         reloadMessages()
-                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                        // PR-UI-CHAT-BOTTOM-ANCHOR1 — with reverseLayout=true
+                        // and newest-first displayItems, source index 0 is the
+                        // newest item = visual BOTTOM. Scrolling to index 0
+                        // ensures the user sees their just-sent voice even if
+                        // they had scrolled up to read history. Instant
+                        // scrollToItem (not animate) — no jerk.
+                        if (messages.isNotEmpty()) listState.scrollToItem(0)
                     }
                 } finally {
                     voiceSendInProgress = false
@@ -523,7 +529,17 @@ fun ChatScreen(
                         conversationId, conv.theirPublicKeyHex, sendReceipts,
                     )
                 }
-                listState.animateScrollToItem(messages.lastIndex.coerceAtLeast(0))
+                // PR-UI-CHAT-BOTTOM-ANCHOR1 — NO forced scroll on incoming.
+                // With reverseLayout=true and newest-first displayItems,
+                // a new incoming message takes source index 0 (= visual
+                // bottom). Compose's item-key-based anchor keeps the user's
+                // logical position: if they were at the bottom, the new
+                // message appears at the bottom naturally; if they had
+                // scrolled up to read history, the new message lives at
+                // index 0 off-screen below them and they stay put.
+                // The "↓ N new messages" chip for scrolled-up case is
+                // OUT-OF-SCOPE for this PR (deferred per Vladislav
+                // 2026-05-24 to keep the scope tight).
             }
         }
     }
@@ -1029,7 +1045,13 @@ fun ChatScreen(
                                     )
                                 )
                                 reloadMessages()
-                                if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                // PR-UI-CHAT-BOTTOM-ANCHOR1 — scrollToItem(0)
+                                // ensures the user sees their just-sent text
+                                // even if they had scrolled up. With
+                                // reverseLayout=true and newest-first
+                                // displayItems, source index 0 = visual
+                                // bottom (the newly-sent message).
+                                if (messages.isNotEmpty()) listState.scrollToItem(0)
                             }
                         }
                     }
@@ -1075,8 +1097,78 @@ fun ChatScreen(
             }
         }
 
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 — Item-order mapping (mandatory per
+        // docs/WORKING_RULES.md rule 3 + Vladislav 2026-05-24).
+        //
+        // DATA LAYER (unchanged from master):
+        //   DB query → `messages: List<MessageEntity>` ordered by createdAt ASC
+        //   (oldest → newest, chronological).
+        //
+        // LOGICAL CHAT ITEMS (unchanged from master, built just above):
+        //   chatItems: List<ChatItem> = oldest → newest, with ChatItem.DateSep
+        //   inserted BEFORE the first message of each day.
+        //   Shape: [DateSep(d1), Msg(d1.morning), Msg(d1.evening),
+        //           DateSep(d2), Msg(d2), ..., DateSep(dN), Msg(dN.latest)]
+        //
+        // DISPLAY LAYER (this PR introduces — sourceItems for LazyColumn):
+        //   displayItems = chatItems.asReversed()
+        //   Shape: [Msg(dN.latest), DateSep(dN), Msg(dN-1), ..., DateSep(d2),
+        //           Msg(d1.evening), Msg(d1.morning), DateSep(d1)]
+        //   Source index 0 = newest message.
+        //   Source last = oldest day's DateSep.
+        //
+        // LAZYCOLUMN VISUAL MAPPING:
+        //   LazyColumn(reverseLayout = true) maps source index 0 → visual BOTTOM,
+        //   source last → visual TOP. So reading the screen top-to-bottom equals
+        //   reading the source last-to-first.
+        //
+        //   Visual top → bottom:
+        //     E2EE row (added LAST in LazyColumn source order = visual TOP)
+        //     DateSep(d1)            ← above d1 messages (correct: separator
+        //     Msg(d1.morning)          appears above its day)
+        //     Msg(d1.evening)
+        //     DateSep(d2)            ← above d2 messages
+        //     ...
+        //     DateSep(dN)            ← above dN messages
+        //     Msg(dN.latest)         ← visual BOTTOM (newest, source index 0)
+        //
+        // Why `chatItems.asReversed()` works for date separators (verified by
+        // hand-tracing the reverse): in chatItems DateSep is BEFORE its day's
+        // messages. After reverse, DateSep ends up AFTER its day's messages in
+        // source order. With reverseLayout=true, "after in source" = "above
+        // visually", so the separator appears visually above the day's messages.
+        // ✓ Date separator semantics preserved.
+        //
+        // EXTRA ITEMS:
+        //   - E2EE row: rendered LAST in LazyColumn source order via the
+        //     `item("__e2ee__")` block AFTER the displayItems loop. With
+        //     reverseLayout=true this places it at the very TOP visually.
+        //   - Pinned banner: moved OUTSIDE LazyColumn into the parent Column,
+        //     above the LazyColumn. It is a persistent UI element, not a chat
+        //     row, so it must not participate in LazyColumn index math.
+        //
+        // SCROLL SEMANTICS:
+        //   - Initial open: no scroll command needed. LazyColumn with
+        //     reverseLayout=true and `firstVisibleItemIndex = 0` (default)
+        //     renders source[0] = latest message at the visual bottom from
+        //     the first frame. Zero black-wait, zero mid-history flash.
+        //   - Own send / voice send: scrollToItem(0) to ensure the user
+        //     sees their just-sent message even if they had scrolled up
+        //     to read history.
+        //   - Incoming-active: NO scroll command — Compose item-key anchor
+        //     keeps the user's logical position. If they were at the bottom
+        //     (firstVisibleItemIndex=0), the new message takes index 0 and
+        //     appears naturally at the visual bottom. If they had scrolled
+        //     up, the new message lives at index 0 off-screen below; user
+        //     stays put. Floating "↓ N new messages" chip is OUT-OF-SCOPE
+        //     for this PR.
+        //   - Scroll-to-pinned: pinnedIndex recomputed against displayItems
+        //     (not chatItems) since LazyColumn now indexes into displayItems.
+        val displayItems = chatItems.asReversed()
+
         // Snapshot of message IDs present at first composition — used to skip animation for
-        // messages that were already in the list when the screen opened.
+        // messages that were already in the list when the screen opened. Source list reversed
+        // doesn't affect membership.
         val initialIds = remember {
             chatItems
                 .filterIsInstance<ChatItem.Msg>()
@@ -1084,42 +1176,65 @@ fun ChatScreen(
                 .toHashSet()
         }
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 12.dp),
-            contentPadding = PaddingValues(vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 — log the chosen orientation exactly once
+        // per chat-open so future logs unambiguously confirm bottom-anchor is
+        // live. Keyed on conversationId so this fires only on entry, not on
+        // every recomposition.
+        LaunchedEffect(conversationId) {
+            val sourceFirstLabel = (displayItems.firstOrNull() as? ChatItem.Msg)
+                ?.entity?.id?.take(8)
+                ?: ((displayItems.firstOrNull() as? ChatItem.DateSep)?.dateKey ?: "empty")
+            Log.i(
+                "PhantomUI",
+                "CHAT_LIST bottom_anchor_enabled conv=${conversationId.take(8)} " +
+                    "total=${displayItems.size + 1} " +
+                    "sourceFirst=$sourceFirstLabel sourceLast=__e2ee__",
+            )
+            Log.i(
+                "PhantomUI",
+                "CHAT_LIST item_order logical=oldest_to_newest " +
+                    "source=newest_to_oldest reverseLayout=true",
+            )
+            Log.i(
+                "PhantomUI",
+                "CHAT_SCROLL source=initial_open_skipped reason=bottom_anchor " +
+                    "conv=${conversationId.take(8)}",
+            )
+        }
 
-            // Pinned message banner — shown when at least one message is pinned
-            if (pinnedMessages.isNotEmpty()) {
-                item(key = "pinned_banner") {
-                    val msg = pinnedMessages.last() // most recently pinned
-                    val pinnedIndex = remember(msg.id, chatItems) {
-                        chatItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == msg.id }
-                    }
-                    val selfPubKey = container.identityState.value?.publicKeyHex
-                    val pinnerLabel = when (msg.pinnedByPubkey) {
-                        null -> "Pinned"
-                        selfPubKey -> "Pinned by you"
-                        theirPublicKeyHex -> "Pinned by $theirUsername"
-                        else -> "Pinned"
-                    }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Surface2.copy(alpha = 0.78f))
-                            .clickable {
-                                if (pinnedIndex >= 0) {
-                                    scope.launch { listState.animateScrollToItem(pinnedIndex) }
-                                }
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 — pinned banner moved OUTSIDE LazyColumn
+        // (Option 2 per mini-lock review). It is a persistent UI element above
+        // the scrollable chat, not a row inside the history. Keeping it inside
+        // LazyColumn would force it into the reverseLayout index space, which
+        // would either put it at the visual bottom (wrong) or require special
+        // first-in-source-then-display-top math (fragile).
+        if (pinnedMessages.isNotEmpty()) {
+            val msg = pinnedMessages.last() // most recently pinned
+            // Pinned index recomputed against displayItems (the actual
+            // LazyColumn source) instead of chatItems.
+            val pinnedIndex = remember(msg.id, displayItems) {
+                displayItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == msg.id }
+            }
+            val selfPubKey = container.identityState.value?.publicKeyHex
+            val pinnerLabel = when (msg.pinnedByPubkey) {
+                null -> "Pinned"
+                selfPubKey -> "Pinned by you"
+                theirPublicKeyHex -> "Pinned by $theirUsername"
+                else -> "Pinned"
+            }
+            Column {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Surface2.copy(alpha = 0.78f))
+                        .clickable {
+                            if (pinnedIndex >= 0) {
+                                scope.launch { listState.animateScrollToItem(pinnedIndex) }
                             }
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
+                        }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                         Canvas(modifier = Modifier.size(16.dp)) {
                             drawLine(
                                 color = CyanAccent,
@@ -1191,7 +1306,24 @@ fun ChatScreen(
                 }
             }
 
-            lazyItems(chatItems, key = {
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 — LazyColumn with `reverseLayout = true`.
+        // See the item-order mapping comment block above for the full
+        // visual ↔ source index semantics. Briefly:
+        //   - source index 0 (first lazyItems entry) → visual BOTTOM
+        //   - source last (the trailing item("__e2ee__") block) → visual TOP
+        //   - displayItems = chatItems.asReversed(), newest message at index 0
+        //   - no initial-open scroll command needed; firstVisibleItemIndex=0
+        //     (default) IS the latest message in this layout
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 12.dp),
+            reverseLayout = true,
+            contentPadding = PaddingValues(vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            lazyItems(displayItems, key = {
                 when (it) {
                     is ChatItem.DateSep -> "__date_${it.dateKey}"
                     is ChatItem.Msg -> it.entity.id
@@ -1295,6 +1427,12 @@ fun ChatScreen(
                     }
                 }
             }
+
+            // PR-UI-CHAT-BOTTOM-ANCHOR1 — E2EE row rendered LAST in source
+            // order. With reverseLayout = true, last-in-source = visual TOP,
+            // so the E2EE indicator appears at the very top of the chat
+            // history view, above the oldest day's first message.
+            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
         }
         } // end back-swipe Box
     }
