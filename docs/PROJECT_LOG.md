@@ -395,7 +395,7 @@ This is the next-session locked queue, refreshed after PR-NOTIF-DIAG closed on 2
 1. ✅ **PR-DOC-HONESTY** — shipped 2026-05-21 (PR #208 + close #209).
 2. ✅ **PR-UI-REC-FOLLOWUP** — shipped 2026-05-22 (PR #210 `a625bde7`). Test #77 PASS.
 3. ✅ **PR-NOTIF-DIAG** — shipped 2026-05-23 (PR #213 `a0484602`). Test #78 PASS. Surfaced two new follow-ups (rows 4 and 5 below).
-4. **PR-UI-CHAT-AUTOSCROLL1** — fix `ChatScreen` not scrolling to bottom on open when unread messages arrived in the background. Mini-lock at `docs/tracks/chat-autoscroll.md`. Architect recommends doing this BEFORE PR-NOTIF-POLICY1 because it's the more user-visible bug Vladislav noticed by hand.
+4. **PR-UI-CHAT-BOTTOM-ANCHOR1** — replaces the parked PR-UI-CHAT-AUTOSCROLL1 (PR #217, closed without merge after Test #79 / #79.1.1 — `scrollToItem`-after-layout produced 2-second delayed jump, architecturally wrong). New architecture: `LazyColumn(reverseLayout = true)` so the latest message is the natural rendering position, no post-load scroll correction. Mini-lock at `docs/tracks/chat-bottom-anchor.md`. Old `docs/tracks/chat-autoscroll.md` retained with PARKED hand-off for diagnostic trail.
 5. **PR-NOTIF-POLICY1** — conversation-level notification with `InboxStyle` summary + unread count + clear-on-chat-open. Closes the perezatiranie finding from Test #78. Mini-lock at `docs/tracks/notif-policy.md`. Variant A vs B decision at mini-lock review.
 6. **PR-D1e** — first-message bootstrap fast path (yellow-dot 10–20 s on first text after `add contact`; PR-G4 closed the 8 s × 4 timeouts but the residual ~10 s on bootstrap remains). See `KNOWN_ISSUES.md` ISSUE-022.
 7. **Network matrix Standard / Private / Ghost** — systematic re-verification of each transport on (a) clean Wi-Fi, (b) Tele2 LTE, (c) МТС Wi-Fi (no SIM cellular today), (d) emu-on-dev-Wi-Fi. Multi-session, multi-time-of-day; produces the `docs/project/CONNECTIVITY_MATRIX.md` public artifact.
@@ -562,6 +562,27 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-24 (sun, late night) · PR-UI-CHAT-AUTOSCROLL1 PARKED — replaced by PR-UI-CHAT-BOTTOM-ANCHOR1
+
+PR-UI-CHAT-AUTOSCROLL1 was parked after Test #79 / #79.1.1. Both attempts proved that post-load `scrollToItem` is not acceptable messenger UX:
+
+- First attempt (PR #217 v1, `14c7f2aa`) used `messages.lastIndex` and missed real LazyColumn indices because the LazyColumn contains an E2EE prefix row + optional pinned banner + day separators on top of the messages. On a 34-message multi-day chat, `messages.lastIndex` was 33 but the real LazyColumn last index was ~39 — `scrollToItem(33)` landed 6 rows above the bottom.
+- Second attempt (PR #217 v1.1, `3d15615a`) used `listState.layoutInfo.totalItemsCount - 1` (correct index) gated by `snapshotFlow + first { it > 0 }` to wait for layout, but still produced a 1.8–2.3 second delayed jump — user saw black wait / mid-history flash before the chat snapped to the bottom. Architectural, not bandaid-fixable.
+
+**Decision:** replace autoscroll-after-load with bottom-anchored chat list architecture. Mainstream chat apps (Telegram, WhatsApp, Signal) don't scroll-to-bottom; they use `LazyColumn(reverseLayout = true)` with reversed item order so the natural rendering position is already at the latest message. Initial open requires zero scroll logic.
+
+**PR #217 closed without merge** per `docs/WORKING_RULES.md` rule 4 (two architectural attempts on the same track → park and redesign). Commits stay closed-but-visible on GitHub (`14c7f2aa` + `3d15615a`) for diagnostic trail. Local + remote `feat/pr-ui-chat-autoscroll1` branch deleted.
+
+**Replacement track: PR-UI-CHAT-BOTTOM-ANCHOR1.** Mini-lock at `docs/tracks/chat-bottom-anchor.md` (authored same session). Scope: LazyColumn `reverseLayout = true` + reversed item order, E2EE row + pinned banner repositioning, date separators re-derived for reverseLayout, scroll-to-pinned recomputed, all AUTOSCROLL1 plumbing (`LaunchedEffect + scrollToItem + snapshotFlow + withFrameNanos` chain) DELETED not migrated. Mini-lock requires builder to write down chosen item-order mapping BEFORE implementation (which collection is oldest-first, which is newest-first, `reverseLayout` true/false, which item appears at visual bottom) to avoid reversed-date-separator class bugs.
+
+**Out-of-scope (deferred again):** "↓ N new messages" floating chip, preserve-scroll-position when reading history, `NotificationManager.cancel` on chat open (PR-NOTIF-POLICY1), pagination / history loading. "↓ N new messages" chip explicitly OUT of first PR to keep scope tight per Vladislav 2026-05-24.
+
+**Lesson hardened in agent memory:** `feedback_scroll_to_bottom_not_chat_ux.md` — for chat UIs, delayed `scrollToItem` after loading is NOT equivalent to bottom anchoring. If the user can see mid-history / black wait / delayed jump, the architecture is wrong, not the index math. Use `reverseLayout = true` from the start.
+
+**Discipline checkpoint.** First time WORKING_RULES rule 4 actually fired in real operation (two architectural attempts → park, not third attempt). The rule is load-bearing, not theatre.
+
+**Queue change.** Row 4 of consolidated queue: PR-UI-CHAT-AUTOSCROLL1 → **PR-UI-CHAT-BOTTOM-ANCHOR1** (same slot, replacement track). Rows 5–10 unchanged.
 
 ### 2026-05-24 (sun, night) · Out-of-queue: FLOSS/fund hybrid verification — well-known proof + schema bump v1.1.0 + webpage URLs to phntm.pro
 
