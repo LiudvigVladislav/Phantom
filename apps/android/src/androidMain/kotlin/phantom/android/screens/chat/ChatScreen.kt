@@ -121,6 +121,33 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var messages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
+
+    // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — first-load gate.
+    //
+    // The previous v1 rendered LazyColumn(reverseLayout=true) immediately
+    // on entry, before reloadMessages() had populated `messages`. At that
+    // point displayItems = emptyList(), so the only LazyColumn item was the
+    // E2EE row. Compose anchored firstVisibleItemIndex to that single-item
+    // state; when reloadMessages then inserted 43 messages, Compose tried
+    // to keep the existing anchor, which produced the "opens mid-history"
+    // symptom in Test #80.
+    //
+    // The fix: defer LazyColumn rendering until the first reloadMessages()
+    // for this conversation finishes. Until then, show a blank Box placeholder
+    // (avoids the empty LazyColumn anchor). Per-conversation `remember`-key
+    // so switching to a different chat resets the flag and re-gates the
+    // initial load for the new conversation.
+    var initialMessagesLoaded by remember(conversationId) { mutableStateOf(false) }
+
+    // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — initialIds snapshot computed AFTER
+    // the first reloadMessages() (not on first composition with an empty
+    // list). Previously `val initialIds = remember { chatItems… }` captured
+    // emptySet() because chatItems was empty on first composition, then
+    // every loaded history message had `id !in initialIds = true` and
+    // animated in via slideInHorizontally — entire history sliding in on
+    // chat open. This nullable state lets `isNew` resolve to `false` until
+    // the snapshot is filled, then to "is this message new since open" after.
+    var initialMessageIds by remember(conversationId) { mutableStateOf<Set<String>?>(null) }
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     var showEmojiPanel by remember { mutableStateOf(false) }
@@ -420,7 +447,31 @@ fun ChatScreen(
             "PhantomUI",
             "ChatScreen subscribed to conv=${conversationId.take(24)}… theirUsername=$theirUsername",
         )
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — reset the gate explicitly before
+        // first load. `remember(conversationId)` already initialises it to
+        // false on conversation switch, but the LaunchedEffect can also
+        // re-key on the same conversationId if Compose drops the body
+        // (process death, recompose-restart). Explicit reset keeps the
+        // logic robust.
+        initialMessagesLoaded = false
+        initialMessageIds = null
         reloadMessages()
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — snapshot the IDs of every message
+        // present in this conversation right after the first reloadMessages()
+        // completes. This is the "history at open" set; subsequent incoming
+        // messages will NOT be in this set and the AnimatedVisibility wrapper
+        // will treat them as new (slide-in animation). Without this snapshot
+        // (the old `val initialIds = remember { chatItems… }` pattern), the
+        // snapshot was taken at first composition with an empty list, so the
+        // full history animated in on chat open.
+        initialMessageIds = messages
+            .filter { msg -> !(msg.plaintextCache?.startsWith(PROFILE_MSG_PREFIX) ?: false) }
+            .map { it.id }
+            .toSet()
+        // Flipping this last opens the LazyColumn gate below in the Scaffold
+        // body. Order matters: snapshot first, then gate-open, so the very
+        // first LazyColumn composition reads the correct initialMessageIds.
+        initialMessagesLoaded = true
         val conv = container.conversationRepo.getConversation(conversationId)
         if (conv != null) {
             // Privacy Mode: Standard sends read receipts; Private/Ghost suppress
@@ -1166,29 +1217,42 @@ fun ChatScreen(
         //     (not chatItems) since LazyColumn now indexes into displayItems.
         val displayItems = chatItems.asReversed()
 
-        // Snapshot of message IDs present at first composition — used to skip animation for
-        // messages that were already in the list when the screen opened. Source list reversed
-        // doesn't affect membership.
-        val initialIds = remember {
-            chatItems
-                .filterIsInstance<ChatItem.Msg>()
-                .map { it.entity.id }
-                .toHashSet()
-        }
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — `initialIds` is sourced from
+        // `initialMessageIds` snapshot, which is filled AFTER reloadMessages()
+        // in LaunchedEffect(conversationId) above. The LazyColumn below is
+        // gated by `if (initialMessagesLoaded)` so it never renders while
+        // `initialMessageIds == null`; by the time the LazyColumn is alive,
+        // the snapshot reflects the real "history at chat open" set. History
+        // messages will be in the set → `isNew=false` → no animation on
+        // initial display. New incoming messages will NOT be in the set →
+        // `isNew=true` → slide-in animation.
+        val initialIds: Set<String> = initialMessageIds ?: emptySet()
 
-        // PR-UI-CHAT-BOTTOM-ANCHOR1 — log the chosen orientation exactly once
-        // per chat-open so future logs unambiguously confirm bottom-anchor is
-        // live. Keyed on conversationId so this fires only on entry, not on
-        // every recomposition.
-        LaunchedEffect(conversationId) {
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — log the chosen orientation once
+        // per chat-open AFTER the initial load gate flips, not before.
+        // The v1 version logged on entry (with displayItems still empty),
+        // which gave the misleading `total=1 sourceFirst=empty` line in
+        // Test #80 logs. With this gate, the log shows the real loaded
+        // total + the actual newest message at sourceFirst-ish position
+        // (offset by 1 because source[0] is now the bottom input spacer
+        // — see the LazyColumn body below).
+        LaunchedEffect(conversationId, initialMessagesLoaded) {
+            if (!initialMessagesLoaded) return@LaunchedEffect
+            // sourceFirst label after the v1.1 source layout:
+            //   index 0 = __bottom_input_spacer__   (visual bottom gap)
+            //   index 1 = newest displayItem        (visual just-above-composer)
+            //   index N = E2EE row                  (visual top)
             val sourceFirstLabel = (displayItems.firstOrNull() as? ChatItem.Msg)
                 ?.entity?.id?.take(8)
                 ?: ((displayItems.firstOrNull() as? ChatItem.DateSep)?.dateKey ?: "empty")
             Log.i(
                 "PhantomUI",
                 "CHAT_LIST bottom_anchor_enabled conv=${conversationId.take(8)} " +
-                    "total=${displayItems.size + 1} " +
-                    "sourceFirst=$sourceFirstLabel sourceLast=__e2ee__",
+                    "total=${displayItems.size + 2} " + // +2 = bottom spacer + e2ee
+                    "sourceFirst=__bottom_input_spacer__ " +
+                    "sourceSecond=$sourceFirstLabel " +
+                    "sourceLast=__e2ee__ " +
+                    "displayItems=${displayItems.size}",
             )
             Log.i(
                 "PhantomUI",
@@ -1306,14 +1370,33 @@ fun ChatScreen(
                 }
             }
 
+        // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — first-load gate. The LazyColumn
+        // is NOT rendered until reloadMessages() for this conversation has
+        // populated `messages` (and `displayItems` is therefore real).
+        // Otherwise Compose would anchor firstVisibleItemIndex to the empty
+        // / e2ee-only state and then refuse to follow when messages stream
+        // in — exactly the Test #80 "opens mid-history" symptom.
+        if (!initialMessagesLoaded) {
+            // Empty placeholder while messages load. BgDeep matches the
+            // chat-screen background so there is no flash of contrasting
+            // colour during the very short pre-load window.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(BgDeep),
+            )
+        } else {
         // PR-UI-CHAT-BOTTOM-ANCHOR1 — LazyColumn with `reverseLayout = true`.
         // See the item-order mapping comment block above for the full
-        // visual ↔ source index semantics. Briefly:
-        //   - source index 0 (first lazyItems entry) → visual BOTTOM
-        //   - source last (the trailing item("__e2ee__") block) → visual TOP
-        //   - displayItems = chatItems.asReversed(), newest message at index 0
-        //   - no initial-open scroll command needed; firstVisibleItemIndex=0
-        //     (default) IS the latest message in this layout
+        // visual ↔ source index semantics. After v1.1, source layout is:
+        //   - source index 0 = __bottom_input_spacer__   → visual BOTTOM gap
+        //   - source index 1 = newest displayItem         → visually just
+        //                                                   above the composer
+        //   - source last    = item __e2ee__              → visual TOP
+        //   - displayItems   = chatItems.asReversed(), newest at index 0
+        //   - no initial-open scroll command; firstVisibleItemIndex=0
+        //     (default) IS the bottom spacer with the newest message right
+        //     above it = fully visible above the composer.
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -1323,6 +1406,20 @@ fun ChatScreen(
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
+            // PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 — visual-bottom spacer. With
+            // reverseLayout=true, source index 0 maps to the VISUAL BOTTOM
+            // of the LazyColumn. Putting an empty Spacer here keeps the
+            // newest displayItem (now at source index 1) visually above
+            // the composer / input bar that overlays the Scaffold body
+            // from the bottomBar slot. Without this spacer the newest
+            // bubble was partly hidden under the composer (Test #80
+            // FAIL: "bottom bubble cut off"). 72.dp is a generous initial
+            // value chosen to clear the composer + a few dp of breathing
+            // room; fine-tune later if real-device test shows excess gap.
+            item(key = "__bottom_input_spacer__") {
+                Spacer(Modifier.height(72.dp))
+            }
+
             lazyItems(displayItems, key = {
                 when (it) {
                     is ChatItem.DateSep -> "__date_${it.dateKey}"
@@ -1434,6 +1531,7 @@ fun ChatScreen(
             // history view, above the oldest day's first message.
             item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
         }
+        } // end `else` branch of `if (!initialMessagesLoaded)` — PR-UI-CHAT-BOTTOM-ANCHOR1 v1.1 gate
         } // end back-swipe Box
     }
 }
