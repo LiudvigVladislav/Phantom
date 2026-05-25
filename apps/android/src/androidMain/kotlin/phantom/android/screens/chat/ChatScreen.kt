@@ -7,6 +7,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.onEach
 import org.json.JSONException
@@ -120,7 +121,95 @@ fun ChatScreen(
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    var messages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
+
+    // PR-UI-CHAT-THREAD-STATE1 (2026-05-25) — reactive message source.
+    //
+    // Replaces the old `var messages by remember { mutableStateOf(emptyList()) }`
+    // + `suspend fun reloadMessages()` + 9 manual call-sites pattern that caused
+    // the chat-open UX bugs (see docs/tracks/chat-bottom-anchor.md PARKED hand-off
+    // and feedback_chatscreen_pull_style_root_cause.md in agent memory).
+    //
+    // `observeMessages` returns a cold SQLDelight Flow that emits the current
+    // DB snapshot on subscribe (first emission lands on the same frame as
+    // first Compose) and re-emits on every write to the `messages` table for
+    // this conversation. `collectAsState(initial = emptyList())` lifts that
+    // Flow to a Compose `State<List<MessageEntity>>` that the rest of this
+    // function treats exactly like the old `var messages` — but now
+    // declarative, never empty after first emission, never out-of-sync after
+    // a DB write.
+    //
+    // ITEM-ORDER MAPPING (mandatory per WORKING_RULES rule 3 + Vladislav
+    // 2026-05-25, captured in code so future readers see it next to the
+    // collectAsState call):
+    //
+    //   messages (Flow from DB)                         = oldest → newest
+    //   chatItems (built below)                          = oldest → newest, DateSep BEFORE day
+    //   displayItems = chatItems.asReversed()           = newest → oldest
+    //   LazyColumn(reverseLayout = true) source mapping:
+    //     index 0    = item("__bottom_anchor__") 8.dp  → VISUAL BOTTOM (small gap)
+    //     index 1    = displayItems[0] (newest)        → visually above anchor
+    //     index last = item("__e2ee__") (E2EE row)     → VISUAL TOP
+    //   Pinned banner: OUTSIDE LazyColumn (carried forward from PR #226 v1.2).
+    //
+    // PERFORMANCE: wrap the Flow in `remember(conversationId)` so a new Flow
+    // is created only when the conversation changes, not on every Compose
+    // recomposition. Per Vladislav 2026-05-25 — without `remember`,
+    // `collectAsState` would re-subscribe to a fresh Flow on every recompose,
+    // re-emitting the initial snapshot and (worse) potentially causing
+    // listState anchor flicker on every UI state change.
+    val messagesFlow: Flow<List<MessageEntity>> = remember(conversationId) {
+        container.messageRepo.observeMessages(conversationId)
+    }
+    val messages: List<MessageEntity> by messagesFlow.collectAsState(initial = emptyList())
+
+    // PR-UI-CHAT-THREAD-STATE1 — initial-history animation suppression.
+    //
+    // Snapshot of the message IDs present at chat open. Filled by the
+    // LaunchedEffect below the first time `messages` becomes non-empty for
+    // this conversation. Used by the per-row `AnimatedVisibility` wrapper:
+    // messages whose id IS in the snapshot don't animate (they were here
+    // when we opened); messages whose id is NOT in the snapshot animate via
+    // slideInHorizontally (they arrived after open).
+    //
+    // Nullable + `remember(conversationId)` so switching to another chat
+    // resets the snapshot and re-arms suppression for the new conversation.
+    // Pre-snapshot, `isNew` evaluates to false (no animation) — the
+    // conservative default during the very-short pre-first-emission window.
+    var initialMessageIds by remember(conversationId) { mutableStateOf<Set<String>?>(null) }
+
+    LaunchedEffect(conversationId, messages) {
+        if (initialMessageIds == null && messages.isNotEmpty()) {
+            initialMessageIds = messages
+                .filter { msg -> !(msg.plaintextCache?.startsWith(PROFILE_MSG_PREFIX) ?: false) }
+                .map { it.id }
+                .toSet()
+            Log.i(
+                "PhantomUI",
+                "CHAT_THREAD observe_started conv=${conversationId.take(8)} " +
+                    "initialMessageIdsSize=${initialMessageIds?.size}",
+            )
+        }
+    }
+
+    // PR-UI-CHAT-THREAD-STATE1 — Flow-emission observability.
+    //
+    // Fires every time `observeMessages` Flow re-emits (any DB write to the
+    // messages table for this conversation). Keyed on `messages` so the
+    // LaunchedEffect re-runs per emission. Test #81 PASS criterion #6
+    // ("incoming while chat open updates automatically from DB") is verified
+    // by seeing this log without any manual `reloadMessages()` trigger.
+    LaunchedEffect(conversationId, messages.size) {
+        if (messages.isNotEmpty()) {
+            Log.i(
+                "PhantomUI",
+                "CHAT_THREAD observe_emit conv=${conversationId.take(8)} " +
+                    "count=${messages.size} " +
+                    "firstId=${messages.firstOrNull()?.id?.take(8) ?: "—"} " +
+                    "lastId=${messages.lastOrNull()?.id?.take(8) ?: "—"}",
+            )
+        }
+    }
+
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     var showEmojiPanel by remember { mutableStateOf(false) }
@@ -296,13 +385,15 @@ fun ChatScreen(
     val transportState by container.transport.state.collectAsState()
     val isConnected = transportState is TransportState.Connected
 
-    suspend fun reloadMessages() {
-        messages = container.messageRepo.getMessages(conversationId)
-        Log.i(
-            "PhantomUI",
-            "ChatScreen reloadMessages: conv=${conversationId.take(24)}… loaded=${messages.size}",
-        )
-    }
+    // PR-UI-CHAT-THREAD-STATE1 — `reloadMessages()` helper deleted. The
+    // 9 former call-sites have been classified Type A/B/C in the PR
+    // description (none were Type C, so none needed migration). All Type A
+    // sites just `// Flow auto-refresh` after a DB write; the 2 Type B sites
+    // (LaunchedEffect chat-open at line ~417 and incoming-active collector at
+    // line ~516) kept their non-list side-effects (`markConversationRead`,
+    // profile-card-send) as standalone calls. No code path in this file
+    // calls `messageRepo.getMessages(conversationId)` for "what's in the
+    // chat right now" anymore — that is the Flow's job.
 
     // PR-UI-REC2: shared finalise-and-send path. Two entry points reach it:
     //   1. The in-panel Send tap and the legacy tap-to-toggle path (via
@@ -396,8 +487,15 @@ fun ChatScreen(
                             android.widget.Toast.LENGTH_SHORT,
                         ).show()
                     } else {
-                        reloadMessages()
-                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                        // PR-UI-CHAT-THREAD-STATE1 site #1 (voice send) —
+                        // Type A: list refresh happens via observeMessages
+                        // Flow after sendAudio writes to DB. Side-effect:
+                        // scroll to the user's just-sent message. With
+                        // reverseLayout=true source index 0 is the visual
+                        // bottom; `scrollToItem(0)` (instant, not animate)
+                        // ensures the user sees their own voice even if
+                        // they had scrolled up to read history.
+                        if (messages.isNotEmpty()) listState.scrollToItem(0)
                     }
                 } finally {
                     voiceSendInProgress = false
@@ -414,7 +512,9 @@ fun ChatScreen(
             "PhantomUI",
             "ChatScreen subscribed to conv=${conversationId.take(24)}… theirUsername=$theirUsername",
         )
-        reloadMessages()
+        // PR-UI-CHAT-THREAD-STATE1 site #2 (chat-open) — Type B: refresh
+        // via observeMessages Flow (no manual reload); KEEP non-list
+        // side-effects below: markConversationRead + profile-card-send.
         val conv = container.conversationRepo.getConversation(conversationId)
         if (conv != null) {
             // Privacy Mode: Standard sends read receipts; Private/Ghost suppress
@@ -513,7 +613,17 @@ fun ChatScreen(
                     return@collect
                 }
 
-                reloadMessages()
+                // PR-UI-CHAT-THREAD-STATE1 site #3 (incoming-active) —
+                // Type B: list refresh via observeMessages Flow (the DB
+                // insert that produced this IncomingMessage event already
+                // emits to the Flow). KEEP markConversationRead.
+                // DELETE the previous animateScrollToItem call: with
+                // reverseLayout=true and the bottom-anchor, a new message
+                // arriving while the user is at the bottom naturally
+                // appears at the visual bottom; if the user scrolled up
+                // to read history, Compose's item-key anchor keeps them
+                // in place (floating "↓ N new messages" chip for that
+                // case is OUT-OF-SCOPE for this PR per Vladislav 2026-05-25).
                 val conv = container.conversationRepo.getConversation(conversationId)
                 if (conv != null) {
                     // Honor Privacy Mode (see top of LaunchedEffect above for explanation).
@@ -523,7 +633,6 @@ fun ChatScreen(
                         conversationId, conv.theirPublicKeyHex, sendReceipts,
                     )
                 }
-                listState.animateScrollToItem(messages.lastIndex.coerceAtLeast(0))
             }
         }
     }
@@ -1010,7 +1119,9 @@ fun ChatScreen(
                                     conversationId = conversationId,
                                     recipientPublicKeyHex = conversation.theirPublicKeyHex,
                                 )
-                                reloadMessages()
+                                // PR-UI-CHAT-THREAD-STATE1 site #4 (edit send)
+                                // — Type A: observeMessages Flow auto-refreshes
+                                // after the DB UPDATE.
                             } else {
                                 // Send new message (with optional reply prefix)
                                 val finalText = if (replyMsg != null) {
@@ -1028,8 +1139,14 @@ fun ChatScreen(
                                         text = finalText,
                                     )
                                 )
-                                reloadMessages()
-                                if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                // PR-UI-CHAT-THREAD-STATE1 site #5 (text send)
+                                // — Type A + scroll side-effect: Flow refreshes
+                                // automatically. Scroll to source[0] = visual
+                                // bottom (reverseLayout=true) so the user sees
+                                // their just-sent message even if they had
+                                // scrolled up to read history. Instant
+                                // (not animate) — no jerk.
+                                if (messages.isNotEmpty()) listState.scrollToItem(0)
                             }
                         }
                     }
@@ -1075,123 +1192,190 @@ fun ChatScreen(
             }
         }
 
-        // Snapshot of message IDs present at first composition — used to skip animation for
-        // messages that were already in the list when the screen opened.
-        val initialIds = remember {
-            chatItems
-                .filterIsInstance<ChatItem.Msg>()
-                .map { it.entity.id }
-                .toHashSet()
+        // PR-UI-CHAT-THREAD-STATE1 — display layer for bottom-anchored render.
+        // `chatItems` is oldest→newest with DateSep BEFORE its day; reverse-listing
+        // produces newest→oldest with DateSep AFTER its day in source order, which
+        // with `reverseLayout = true` puts DateSep visually ABOVE its day's
+        // messages (correct chat-UI semantics). Verified by hand-tracing in
+        // docs/tracks/chat-thread-state.md mapping section.
+        val displayItems = chatItems.asReversed()
+
+        // PR-UI-CHAT-THREAD-STATE1 — `initialIds` is sourced from
+        // `initialMessageIds` snapshot filled by the LaunchedEffect near the
+        // top of this function AFTER the Flow's first non-empty emission.
+        // Replaces the old `remember { chatItems… }` pattern that captured
+        // emptySet() on first composition (when chatItems was empty because
+        // reloadMessages hadn't run yet) and then made every loaded history
+        // message animate in as "new". With this state-based snapshot,
+        // history at chat open never animates; only messages arriving AFTER
+        // the snapshot is taken animate via the per-row AnimatedVisibility
+        // slide-in.
+        val initialIds: Set<String> = initialMessageIds ?: emptySet()
+
+        // PR-UI-CHAT-THREAD-STATE1 — `CHAT_LIST bottom_anchor_enabled` log,
+        // once per chat open AFTER `initialMessageIds` settles (i.e. after
+        // the Flow has emitted at least one non-empty list). sourceFirst
+        // is fixed to `__bottom_anchor__` because that item is always at
+        // source index 0; sourceSecond is the newest displayItem id or
+        // `empty` if the conversation has no messages yet.
+        LaunchedEffect(conversationId, initialMessageIds, displayItems.size) {
+            if (initialMessageIds == null) return@LaunchedEffect
+            val sourceSecondLabel = (displayItems.firstOrNull() as? ChatItem.Msg)
+                ?.entity?.id?.take(8)
+                ?: ((displayItems.firstOrNull() as? ChatItem.DateSep)?.dateKey ?: "empty")
+            Log.i(
+                "PhantomUI",
+                "CHAT_LIST bottom_anchor_enabled conv=${conversationId.take(8)} " +
+                    "total=${displayItems.size + 2} " + // +2 = bottom anchor + e2ee
+                    "sourceFirst=__bottom_anchor__ " +
+                    "sourceSecond=$sourceSecondLabel " +
+                    "sourceLast=__e2ee__ " +
+                    "displayItems=${displayItems.size}",
+            )
+            Log.i(
+                "PhantomUI",
+                "CHAT_LIST item_order logical=oldest_to_newest " +
+                    "source=newest_to_oldest reverseLayout=true",
+            )
+            Log.i(
+                "PhantomUI",
+                "CHAT_SCROLL source=initial_open_skipped reason=bottom_anchor " +
+                    "conv=${conversationId.take(8)}",
+            )
         }
 
+        // PR-UI-CHAT-THREAD-STATE1 — pinned banner moved OUTSIDE LazyColumn
+        // (Option 2 carried forward from PR #226). Persistent UI element
+        // above the scrollable chat; doesn't participate in reverseLayout
+        // index math.
+        if (pinnedMessages.isNotEmpty()) {
+            val msg = pinnedMessages.last() // most recently pinned
+            // pinnedIndex recomputed against `displayItems` (the actual
+            // LazyColumn source after reverse), not `chatItems`.
+            val pinnedIndex = remember(msg.id, displayItems) {
+                displayItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == msg.id }
+            }
+            val selfPubKey = container.identityState.value?.publicKeyHex
+            val pinnerLabel = when (msg.pinnedByPubkey) {
+                null -> "Pinned"
+                selfPubKey -> "Pinned by you"
+                theirPublicKeyHex -> "Pinned by $theirUsername"
+                else -> "Pinned"
+            }
+            Column {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Surface2.copy(alpha = 0.78f))
+                        .clickable {
+                            if (pinnedIndex >= 0) {
+                                scope.launch { listState.animateScrollToItem(pinnedIndex) }
+                            }
+                        }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Canvas(modifier = Modifier.size(16.dp)) {
+                        drawLine(
+                            color = CyanAccent,
+                            start = Offset(size.width / 2, 0f),
+                            end = Offset(size.width / 2, size.height * 0.6f),
+                            strokeWidth = 2.dp.toPx(),
+                        )
+                        drawCircle(
+                            color = CyanAccent,
+                            radius = size.width * 0.35f,
+                            center = Offset(size.width / 2, size.height * 0.3f),
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = pinnerLabel,
+                            color = CyanAccent,
+                            fontSize = 10.sp,
+                            fontFamily = PhantomFontMono,
+                        )
+                        Text(
+                            text = msg.plaintextCache?.take(60) ?: "•••",
+                            color = TextDim,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        )
+                    }
+                    // Quick-unpin (local-only). Tapping the X removes the
+                    // banner without notifying the peer; for an unpin that
+                    // syncs both sides, use the message's long-press menu.
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .clickable {
+                                scope.launch {
+                                    container.messageRepo.pinMessage(
+                                        messageId = msg.id,
+                                        pinned = false,
+                                        pinnedByPubkey = null,
+                                    )
+                                    pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+                                }
+                            }
+                            .padding(8.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Canvas(modifier = Modifier.size(12.dp)) {
+                            val sw = 1.5.dp.toPx()
+                            drawLine(
+                                color = TextDim,
+                                start = Offset(0f, 0f),
+                                end = Offset(size.width, size.height),
+                                strokeWidth = sw,
+                                cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                            )
+                            drawLine(
+                                color = TextDim,
+                                start = Offset(size.width, 0f),
+                                end = Offset(0f, size.height),
+                                strokeWidth = sw,
+                                cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                            )
+                        }
+                    }
+                }
+                HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+            }
+        }
+
+        // PR-UI-CHAT-THREAD-STATE1 — LazyColumn with `reverseLayout = true`.
+        // Renders immediately (no `initialMessagesLoaded` gate per PR #226
+        // v1.1 lesson). The Flow's first emission lands on the same frame
+        // as first compose, so `displayItems` is already populated when
+        // LazyColumn lays out — no anchor-to-empty-state race.
+        //
+        // Source layout (reverseLayout = true):
+        //   index 0    = item __bottom_anchor__   → VISUAL BOTTOM (8dp gap)
+        //   index 1    = displayItems[0] newest   → visually above anchor
+        //   index last = item __e2ee__            → VISUAL TOP
         LazyColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 12.dp),
+            reverseLayout = true,
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
-
-            // Pinned message banner — shown when at least one message is pinned
-            if (pinnedMessages.isNotEmpty()) {
-                item(key = "pinned_banner") {
-                    val msg = pinnedMessages.last() // most recently pinned
-                    val pinnedIndex = remember(msg.id, chatItems) {
-                        chatItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == msg.id }
-                    }
-                    val selfPubKey = container.identityState.value?.publicKeyHex
-                    val pinnerLabel = when (msg.pinnedByPubkey) {
-                        null -> "Pinned"
-                        selfPubKey -> "Pinned by you"
-                        theirPublicKeyHex -> "Pinned by $theirUsername"
-                        else -> "Pinned"
-                    }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Surface2.copy(alpha = 0.78f))
-                            .clickable {
-                                if (pinnedIndex >= 0) {
-                                    scope.launch { listState.animateScrollToItem(pinnedIndex) }
-                                }
-                            }
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Canvas(modifier = Modifier.size(16.dp)) {
-                            drawLine(
-                                color = CyanAccent,
-                                start = Offset(size.width / 2, 0f),
-                                end = Offset(size.width / 2, size.height * 0.6f),
-                                strokeWidth = 2.dp.toPx(),
-                            )
-                            drawCircle(
-                                color = CyanAccent,
-                                radius = size.width * 0.35f,
-                                center = Offset(size.width / 2, size.height * 0.3f),
-                            )
-                        }
-                        Spacer(Modifier.width(10.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = pinnerLabel,
-                                color = CyanAccent,
-                                fontSize = 10.sp,
-                                fontFamily = PhantomFontMono,
-                            )
-                            Text(
-                                text = msg.plaintextCache?.take(60) ?: "•••",
-                                color = TextDim,
-                                fontSize = 12.sp,
-                                maxLines = 1,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                            )
-                        }
-                        // Quick-unpin (local-only). Tapping the X removes the
-                        // banner without notifying the peer; for an unpin that
-                        // syncs both sides, use the message's long-press menu.
-                        Box(
-                            modifier = Modifier
-                                .clip(CircleShape)
-                                .clickable {
-                                    scope.launch {
-                                        container.messageRepo.pinMessage(
-                                            messageId = msg.id,
-                                            pinned = false,
-                                            pinnedByPubkey = null,
-                                        )
-                                        pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
-                                    }
-                                }
-                                .padding(8.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Canvas(modifier = Modifier.size(12.dp)) {
-                                val sw = 1.5.dp.toPx()
-                                drawLine(
-                                    color = TextDim,
-                                    start = Offset(0f, 0f),
-                                    end = Offset(size.width, size.height),
-                                    strokeWidth = sw,
-                                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
-                                )
-                                drawLine(
-                                    color = TextDim,
-                                    start = Offset(size.width, 0f),
-                                    end = Offset(0f, size.height),
-                                    strokeWidth = sw,
-                                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
-                                )
-                            }
-                        }
-                    }
-                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                }
+            // PR-UI-CHAT-THREAD-STATE1 — stable visual-bottom anchor. 8dp gap
+            // between the newest bubble and the composer (Scaffold's bottomBar
+            // padding already covers composer clearance, so this is just
+            // breathing-space). Always present, before any messages load, so
+            // Compose's firstVisibleItemIndex pins to this item from frame 1.
+            item(key = "__bottom_anchor__") {
+                Spacer(Modifier.height(8.dp))
             }
 
-            lazyItems(chatItems, key = {
+
+            lazyItems(displayItems, key = {
                 when (it) {
                     is ChatItem.DateSep -> "__date_${it.dateKey}"
                     is ChatItem.Msg -> it.entity.id
@@ -1231,7 +1415,10 @@ fun ChatScreen(
                             onDeleteForMe = {
                                 scope.launch {
                                     container.messageRepo.deleteMessage(msg.id)
-                                    reloadMessages()
+                                    // PR-UI-CHAT-THREAD-STATE1 site #6 — Type A:
+                                    // observeMessages Flow auto-refreshes after
+                                    // the DB DELETE; bubble disappears on the
+                                    // next emission.
                                 }
                             },
                             onDeleteForBoth = {
@@ -1242,7 +1429,8 @@ fun ChatScreen(
                                     } else {
                                         container.messageRepo.deleteMessage(msg.id)
                                     }
-                                    reloadMessages()
+                                    // PR-UI-CHAT-THREAD-STATE1 site #7 — Type A:
+                                    // Flow auto-refresh after DB write.
                                 }
                             },
                             onCopy = { text ->
@@ -1287,14 +1475,33 @@ fun ChatScreen(
                             // the repo; the bubble needs the parent to
                             // re-read messages so the LazyColumn loses
                             // the cancelled entry.
+                            //
+                            // PR-UI-CHAT-THREAD-STATE1 site #8 — Type A,
+                            // no-op: Flow-backed ChatScreen subscribes to
+                            // observeMessages. DB writes (incl. the
+                            // upload-cancel row deletion) invalidate the
+                            // Query and the Flow re-emits automatically,
+                            // so MessageBubble's `onReloadMessages` callback
+                            // has nothing to do. Kept as `{}` for API
+                            // stability — MessageBubble's signature stays
+                            // unchanged; a follow-up PR can remove the
+                            // parameter from the bubble's interface.
                             onReloadMessages = {
-                                scope.launch { reloadMessages() }
+                                /* no-op — observeMessages auto-refreshes
+                                   after the DB write that produced the
+                                   need-to-refresh signal. */
                             },
                         )
                         } // end AnimatedVisibility
                     }
                 }
             }
+
+            // PR-UI-CHAT-THREAD-STATE1 — E2EE row rendered LAST in source.
+            // With reverseLayout = true, last-in-source = visual TOP, so the
+            // E2EE indicator appears above the oldest day's first message
+            // at the very top of the scrollable chat history.
+            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
         }
         } // end back-swipe Box
     }

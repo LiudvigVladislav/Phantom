@@ -3,8 +3,33 @@
 
 package phantom.core.storage
 
+import kotlinx.coroutines.flow.Flow
+
 interface MessageRepository {
     suspend fun getMessages(conversationId: String): List<MessageEntity>
+
+    /**
+     * PR-UI-CHAT-THREAD-STATE1 (2026-05-25) — reactive message stream for a
+     * conversation. Cold Flow: subscribes on collect; emits once immediately
+     * with the current snapshot, then re-emits on every database write to the
+     * `messages` table affecting this conversation (insert / update / delete
+     * via SQLDelight's `Query<T>.asFlow()` extension).
+     *
+     * Purpose: replaces the pull-style `var messages by remember + suspend
+     * reloadMessages()` pattern in `ChatScreen` which caused the chat-open
+     * UX bugs documented in `docs/tracks/chat-bottom-anchor.md` and the
+     * agent-memory entry `feedback_chatscreen_pull_style_root_cause.md`.
+     * With `observeMessages(...).collectAsState(...)`, ChatScreen has the
+     * loaded list on the first Compose frame — no empty initial state,
+     * no anchor-to-empty-list race, no manual `reloadMessages()` after
+     * every DB write.
+     *
+     * The existing `suspend fun getMessages` stays for one-shot pulls
+     * (preview generation, archive screens, tests, anywhere a Flow
+     * subscription is overkill).
+     */
+    fun observeMessages(conversationId: String): Flow<List<MessageEntity>>
+
     suspend fun getMessageById(id: String): MessageEntity?
     suspend fun insertMessage(entity: MessageEntity)
     suspend fun updateStatus(messageId: String, status: MessageStatus)
