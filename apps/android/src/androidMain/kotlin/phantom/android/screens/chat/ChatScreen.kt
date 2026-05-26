@@ -8,6 +8,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import org.json.JSONException
 import org.json.JSONObject
@@ -157,6 +159,27 @@ fun ChatScreen(
             firstVisibleItemScrollOffset = 0,
         )
     }
+
+    // PR-UI-CHAT-NEW-MSG-CHIP1 — incoming-id stream filtered to this
+    // conversation. The state holder uses this to bump the badge count when
+    // the user is scrolled up. We map from the IncomingMessage event so the
+    // holder doesn't need to know about the IncomingMessage shape.
+    val chipIncomingFlow = remember(conversationId, container.messagingService) {
+        val svc = container.messagingService
+        if (svc == null) {
+            kotlinx.coroutines.flow.emptyFlow<String>()
+        } else {
+            svc.incomingMessages
+                .filter { it.conversationId == conversationId }
+                .map { it.id }
+        }
+    }
+    val scrollToBottomState = rememberScrollToBottomState(
+        conversationId = conversationId,
+        listState = listState,
+        incomingFlow = chipIncomingFlow,
+    )
+
     var showEmojiPanel by remember { mutableStateOf(false) }
 
     // PR-UI-REC1 (2026-05-20) — Voice recording state machine.
@@ -438,7 +461,12 @@ fun ChatScreen(
                         ).show()
                     } else {
                         reloadMessages()
-                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                        // PR-UI-CHAT-NEW-MSG-CHIP1 — own voice send clears the
+                        // new-messages count + auto-scrolls to visual bottom
+                        // (source index 0 in reverseLayout=true). Vladislav-
+                        // locked behaviour: user's own send = "I want to be
+                        // at the latest". Matches Telegram + Signal.
+                        scrollToBottomState.onOwnSend()
                     }
                 } finally {
                     voiceSendInProgress = false
@@ -1070,7 +1098,8 @@ fun ChatScreen(
                                     )
                                 )
                                 reloadMessages()
-                                if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                // PR-UI-CHAT-NEW-MSG-CHIP1 — own text send.
+                                scrollToBottomState.onOwnSend()
                             }
                         }
                     }
@@ -1387,11 +1416,33 @@ fun ChatScreen(
                 item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
             } // end LazyColumn (PR-UI-CHAT-THREAD-CACHE1 v1.1)
         } // end Column wrap (pinned banner OUTSIDE LazyColumn)
+
+        // PR-UI-CHAT-NEW-MSG-CHIP1 — floating scroll-to-bottom button.
+        // Anchored to the lower-trailing corner of the back-swipe Box,
+        // 14 dp above the 56 dp composer (= 70 dp from bottom) and
+        // 14 dp from the trailing edge. Visible only when scrolled away
+        // from the visual bottom; survives recording-panel changes
+        // (composer and recording panel occupy the same 56 dp slot).
+        ScrollToBottomButton(
+            state = scrollToBottomState,
+            onClick = {
+                scope.launch {
+                    scrollToBottomState.onTap(displayItems = chatItems.asReversed())
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 14.dp, bottom = 70.dp),
+        )
         } // end back-swipe Box
     }
 }
 
-private sealed class ChatItem {
+// PR-UI-CHAT-NEW-MSG-CHIP1 — visibility lifted from `private` to `internal`
+// so neighbouring files in the same package (`ScrollToBottomState`) can
+// resolve the "first unread message → LazyColumn source index" mapping
+// without copying the type. No behavioural change.
+internal sealed class ChatItem {
     data class DateSep(val dateKey: String, val millis: Long) : ChatItem()
     data class Msg(val entity: MessageEntity) : ChatItem()
 }
