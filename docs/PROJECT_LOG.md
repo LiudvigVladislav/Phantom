@@ -563,6 +563,46 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-26 (tue) · PR-UI-CHAT-THREAD-STATE1 PARKED — replaced by PR-UI-CHAT-THREAD-CACHE1 (Variant C escalation)
+
+PR #228 closed without merge per `docs/WORKING_RULES.md` rule 4 — two implementation attempts (v1 `e2700f82`, v1.1 `c0fab2b4`) both FAIL on Test #81 / #81.1 on Tecno real device. The Flow-backed migration was architecturally correct (`MessageRepository.observeMessages` → `SqlDelightMessageRepository.observeMessages` via `asFlow().mapToList(Dispatchers.IO)`; ChatScreen `collectAsState(initial = emptyList())` wrap with `remember(conversationId)`; all 9 reloadMessages call-sites walked + classified Type A/B/C; reloadMessages helper deleted; LazyColumn `reverseLayout = true` + `__bottom_anchor__` 8dp spacer + `asReversed()`; `initialMessageIds` snapshot for animation suppression; v1.1 added `firstFlowEmitReceived` defer for markConversationRead + profile-card-send via a separate `LaunchedEffect`). CI green. Anti-pattern grep clean. Side-effect order correct in v1.1 — `SEND_TRACE` ran AFTER `observe_emit`.
+
+**But** the SqlDelight cold-Flow first emission itself takes **0.8–1.3 s on Tecno with 30+ messages**, and that IS the black wait Vladislav reports. Tecno log from Test #81.1:
+
+```
+23:48:20.495  ChatScreen subscribed
+23:48:20.517  CHAT_THREAD observe_started        (+22 ms)
+23:48:21.858  CHAT_THREAD observe_emit count=34  (+1.341 s)   ← black wait window
+
+23:48:44.659  …observe_started +26 ms …observe_emit cnt=37 +1.054 s
+23:50:43.794  …observe_started +21 ms …observe_emit cnt=38 +0.810 s
+```
+
+`collectAsState(initial = emptyList())` means ChatScreen renders the empty list first; `LazyColumn(reverseLayout = true)` anchors to that empty state until Flow emits. No amount of `LaunchedEffect` ordering inside Compose can fix this — Compose has already painted the empty frame by the time effects run.
+
+**Architectural decision (Vladislav-architect 2026-05-26, Variant C escalation).** Replace cold-Flow + empty-initial with a hot `StateFlow<List<MessageEntity>>` held by an AppContainer-scoped `ChatThreadStateHolder`. ChatScreen reads `holder.snapshot(conversationId)` synchronously as the initial value (already populated by ChatList row tap → `holder.preload(conversationId)` BEFORE navigation). The cold `observeMessages` Flow from PR #228 carries forward as the wire feeding the holder's StateFlow on DB changes — none of the storage-layer work is wasted.
+
+**Rule 4 fires for the THIRD time on chat-list lifecycle:**
+- PR #217 PR-UI-CHAT-AUTOSCROLL1 — 2 attempts, FAIL (scrollToItem timing).
+- PR #226 PR-UI-CHAT-BOTTOM-ANCHOR1 — 3 attempts, FAIL (LazyColumn layer alone).
+- PR #228 PR-UI-CHAT-THREAD-STATE1 — 2 attempts, FAIL (cold Flow + empty initial).
+
+→ Variant C escalation locked. Three is the limit. NO fourth architectural shot at this lifecycle without explicit Vladislav approval.
+
+**Salvageable artefacts from `feat/pr-ui-chat-thread-state1`** (referenced by THREAD-CACHE1, branch kept for cherry-pick):
+- `MessageRepository.observeMessages(conversationId): Flow<List<MessageEntity>>` interface method.
+- `SqlDelightMessageRepository.observeMessages` implementation.
+- `LazyColumn(reverseLayout = true)` + bottom anchor spacer + `asReversed()` rendering.
+- `firstFlowEmitReceived` + deferred side-effects pattern.
+- `initialMessageIds` animation suppression snapshot.
+- Test-fake updates for the new interface method.
+
+**Replacement track:** `PR-UI-CHAT-THREAD-CACHE1`. Mini-lock at `docs/tracks/chat-thread-cache.md` with the architect's 6 questions answered (location: AppContainer singleton in `shared/core/messaging`; API: `observe / snapshot / preload / evict / clear`; preload sites: ChatList tap + incoming-message + notification tap; cache policy: LRU 8 conversations; zero DB/schema changes; minimum first-PR scope). Out-of-scope: floating "↓ N new messages" chip (separate PR-UI-CHAT-NEW-MSG-CHIP1 after CACHE1 lands), scroll-perf, group chat, multi-account.
+
+**Side-issue surfaced by Vladislav during Test #81.1:** when user scrolls up to read history and an incoming arrives, no auto-scroll (correct UX, Vladislav-locked 2026-05-25), but no "↓ new messages" indicator either. Track as separate PR after CACHE1.
+
+**Lesson hardened in agent memory:** `feedback_chat_list_lifecycle_three_fails.md` — supersedes the two previous chat-list memories (`scroll_to_bottom_not_chat_ux`, `chatscreen_pull_style_root_cause`) as primary guidance. Durable rule: ChatScreen MUST render against a hot StateFlow whose `.value` is pre-populated, NOT cold Flow + emptyList initial.
+
 ### 2026-05-25 (mon) · PR-UI-CHAT-BOTTOM-ANCHOR1 PARKED — replaced by PR-UI-CHAT-THREAD-STATE1
 
 PR #226 closed without merge per `docs/WORKING_RULES.md` rule 4 — three implementation attempts (v1 `14307829`, v1.1 `4ae6f8ba`, v1.2 `813484dc`) all FAIL on Test #80 / #80.1 / #80.2. The `reverseLayout = true` direction was architecturally not wrong — it correctly bottom-anchored the LazyColumn item order. But it could not solve the underlying root cause: **`ChatScreen` opens with empty local `messages` state and only loads history AFTER first compose**. Compose anchors LazyColumn's `firstVisibleItemIndex` to the empty-or-e2ee-only state on frame 1; when messages stream in later, the anchor either refuses to follow (mid-history opening) OR Compose animates all history items as if newly arrived (slide-in pile-up). No amount of LazyColumn-layer tweaks fixes this.
