@@ -106,17 +106,22 @@ class ChatThreadStateHolder(
 
 ### Q3: Who calls `preload(conversationId)`?
 
-Three eager call-sites at minimum (Vladislav-confirm before code):
+**Vladislav-locked 2026-05-26: CACHE1 wires ONLY one preload call-site — `ChatList row tap`. Other sites deferred to follow-up tracks.**
 
-1. **ChatList row tap** — in `ChatListScreen` row click handler, immediately before `navController.navigate(ChatScreen(conversationId))`. By the time ChatScreen's `LaunchedEffect` runs, the holder's `.value` is already populated.
+Rationale (Vladislav 2026-05-26): "если сразу добавим ChatList + notification + incoming, снова появится много входных путей и сложно понять, что реально помогло." Keep CACHE1 minimal and falsifiable — measure black-wait elimination on a single, instrumented entry point.
 
-2. **Incoming message event** — in `DefaultMessagingService.processIncomingMessage` (or wherever the DB insert for an incoming message happens), call `holder.preload(conversationId)` AFTER the DB insert. This ensures that if the user taps the notification or opens the chat from a different entry point, the cache is warm.
+**CACHE1 (this PR) — single preload site:**
 
-3. **Notification tap** — in `MainActivity.onCreate` / `onNewIntent` when the notification deep-link is resolved to a `conversationId`, call `holder.preload(conversationId)` BEFORE the navigation event. Same as ChatList tap.
+1. **ChatList row tap** — in `ChatListScreen` row click handler, immediately before `navController.navigate(ChatScreen(conversationId))`. By the time ChatScreen's `LaunchedEffect` runs, `holder.snapshot(conversationId)` already returns the loaded list.
 
-NOT eager for: every conversation in ChatList (would defeat the cache size limit and waste DB queries for chats the user won't open). Only the conversation the user is about to navigate to or has just received from.
+**CACHE2 (follow-up track, NOT this PR) — expanded preload sites:**
 
-If `preload` was not called for some entry point (e.g. a new entry we forgot to wire), `observe()` still works — it just takes the same 0.8–1.3 s on first observe. Worst-case fallback is no worse than PR #228.
+2. **Incoming message event** — in `DefaultMessagingService.processIncomingMessage`, call `holder.preload(conversationId)` AFTER the DB insert. Keeps cache warm if user navigates from a non-ChatList entry.
+3. **Notification tap** — in `MainActivity.onCreate` / `onNewIntent` when the notification deep-link is resolved to a `conversationId`, call `holder.preload(conversationId)` BEFORE the navigation event.
+
+If a non-ChatList entry-point is used (notification tap in CACHE1's lifetime), `observe()` still works — first observe takes 0.8–1.3 s same as today. Acceptable known non-blocker until CACHE2 lands.
+
+NOT eager for: every conversation in ChatList (would defeat the cache size limit and waste DB queries for chats the user won't open). Only the conversation the user is about to navigate to.
 
 ### Q4: Cache policy
 
@@ -143,8 +148,8 @@ No new SqlDelight queries. No new tables. No new columns. No new migration step.
 
 1. `ChatThreadStateHolder` class — new file, ~150 LoC including KDoc.
 2. `AppContainer` wire-up — instantiate the holder once, expose as `container.chatThreadStateHolder` (read-only val).
-3. `ChatScreen` migration — replace the PR #228 `collectAsState(initial = emptyList())` wrap with `collectAsStateWithLifecycle(initial = container.chatThreadStateHolder.snapshot(conversationId))`. Bottom-anchor render + `firstFlowEmitReceived` defer pattern + `initialMessageIds` animation suppression — ALL carry forward unchanged from PR #228's last working state. The diff against `feat/pr-ui-chat-thread-state1` is small.
-4. `ChatListScreen` row tap — single-line `container.chatThreadStateHolder.preload(conversationId)` immediately before navigation.
+3. `ChatScreen` migration — replace the PR #228 `collectAsState(initial = emptyList())` wrap with the Vladislav-locked pattern (see "ChatScreen wiring pattern" below). Bottom-anchor render + `firstFlowEmitReceived` defer pattern + `initialMessageIds` animation suppression — ALL carry forward unchanged from PR #228's last working state.
+4. `ChatListScreen` row tap — single-line `container.chatThreadStateHolder.preload(conversationId)` immediately before navigation. **ONLY this one preload site for CACHE1** (see Q3 above).
 5. `MessageRepository.observeMessages` + `SqlDelightMessageRepository.observeMessages` — copy the implementation from `feat/pr-ui-chat-thread-state1` (already shipped on that closed branch, just not merged). 1 interface method + ~5 LoC implementation.
 6. Test fake updates: same as PR #228 v1.1 (storage `InMemoryRepositoryTest.FakeMessageRepository` MutableStateFlow tick; messaging `DefaultMessagingServiceTest.FakeMessageRepository` emptyFlow).
 7. New holder-level unit tests in `shared/core/messaging/src/commonTest/.../ChatThreadStateHolderTest.kt`:
@@ -155,7 +160,74 @@ No new SqlDelight queries. No new tables. No new columns. No new migration step.
    - `observe_emitsOnRepositoryChange`
    - `lru_evictsLeastRecentlyTouchedWhenAtCapacity`
    - `clear_dropsAllCached`
-8. New logs (Test #82 verification): `CHAT_CACHE preload_start conv=<8>`, `CHAT_CACHE preload_complete conv=<8> count=<n> dur_ms=<n>`, `CHAT_CACHE observe_attach conv=<8>`, `CHAT_CACHE evict conv=<8> reason=<lru|logout|delete>`.
+8. New logs (Test #82 verification — Vladislav-locked 2026-05-26):
+   ```
+   CHAT_CACHE preload_start    conv=<8>
+   CHAT_CACHE preload_done     conv=<8> count=<n> ms=<n>
+   CHAT_CACHE snapshot_hit     conv=<8> count=<n>
+   CHAT_CACHE snapshot_miss    conv=<8>
+   CHAT_CACHE observe_start    conv=<8>
+   CHAT_CACHE emit             conv=<8> count=<n> source=<cache|db>
+   CHAT_CACHE evict            conv=<8> reason=<lru|logout|delete>
+   CHAT_CACHE clear            total_evicted=<n>
+   ```
+   `source=cache` means the emit was the immediate StateFlow `.value` read; `source=db` means it came from the underlying `messageRepo.observeMessages` Flow collector. The split makes it trivial to verify in Test #82 that ChatScreen reads cache first and DB updates layer on top.
+
+## ChatScreen wiring pattern (Vladislav-locked 2026-05-26)
+
+```kotlin
+// In ChatScreen composable body:
+
+// Snapshot seed — synchronous read from the holder's hot cache.
+// `remember(conversationId)` ensures this runs ONCE per chat open,
+// not on every recomposition.
+val initialSnapshot = remember(conversationId) {
+    container.chatThreadStateHolder.snapshot(conversationId)
+}
+
+// Hot StateFlow + initial seed — Compose paints `initialSnapshot`
+// on the very first frame, then layers DB updates on top as they
+// arrive via the holder's observer.
+val messages: List<MessageEntity> by container.chatThreadStateHolder
+    .observe(conversationId)
+    .collectAsState(initial = initialSnapshot)
+```
+
+If `snapshot()` returns the cached list — happy path after a ChatList tap — ChatScreen paints with messages on frame 1. Black wait gone.
+
+If `snapshot()` returns `emptyList()` — cache miss (notification tap entry-path before CACHE2 lands, or app cold-start to a notification deep-link) — ChatScreen still works, just with the same 0.8–1.3 s first-emit gap as PR #228. Acceptable known non-blocker for CACHE1.
+
+## Cherry-pick guide — what to take from `feat/pr-ui-chat-thread-state1`
+
+**Take (cherry-pick or re-apply by hand):**
+
+- `MessageRepository.observeMessages` interface method.
+- `SqlDelightMessageRepository.observeMessages` implementation (`asFlow().mapToList(Dispatchers.IO)`).
+- `LazyColumn(reverseLayout = true)` + `__bottom_anchor__` 8dp Spacer + `displayItems = chatItems.asReversed()` rendering pattern.
+- `initialMessageIds` snapshot for per-row animation suppression.
+- `firstFlowEmitReceived` boolean + deferred-side-effects `LaunchedEffect` pattern (markConversationRead + profile-card-send post-first-emit).
+- Side-effect inventory + Type A / B / C classification comments at each former `reloadMessages()` call-site.
+- Test-fake `observeMessages` overrides in `InMemoryRepositoryTest` + `DefaultMessagingServiceTest`.
+
+**Do NOT carry forward:**
+
+- ❌ `collectAsState(initial = emptyList())` as ChatScreen's top-level wiring — replaced by the snapshot-seed pattern above.
+- ❌ `messagesFlow.first()` separate collector trick for setting `firstFlowEmitReceived` — under the holder model, `firstFlowEmitReceived` becomes `holder.observe(conversationId).first { ... }` OR is replaced by a derived state from cache hit/miss. Simplify on re-apply.
+- ❌ Any `Box(BgDeep)` placeholder gate / `initialMessagesLoaded` boolean / large bottom spacer (>16dp). Anti-pattern signatures stay banned.
+- ❌ `LaunchedEffect + scrollToItem(0)` for initial open positioning. Bottom anchor handles it.
+
+## Implementation order (Vladislav-locked 2026-05-26)
+
+1. Merge docs PR #229.
+2. Fresh branch `feat/pr-ui-chat-thread-cache1` cut from `master` AFTER #229 merges.
+3. Implement `ChatThreadStateHolder` + LRU policy + holder-level unit tests.
+4. Wire `AppContainer` singleton (`container.chatThreadStateHolder` val).
+5. Wire ChatList row tap `preload(conversationId)` — single line, immediately before navigation.
+6. Migrate ChatScreen to snapshot-seed + hot StateFlow pattern (replace #228 `collectAsState(initial = emptyList())` wiring). Carry forward bottom-anchor render + side-effect defer + animation suppression.
+7. Re-apply `MessageRepository.observeMessages` + `SqlDelightMessageRepository` impl + test fakes from #228 branch (cherry-pick or re-apply by hand per cherry-pick guide above).
+8. Wire all 8 new logs.
+9. `./gradlew :apps:android:assembleDebug` + `:shared:core:storage:jvmTest` + `:shared:core:messaging:jvmTest` green.
+10. Vladislav Test #82 on Tecno real device.
 
 **Out of scope (defer to separate PRs):**
 
@@ -181,37 +253,74 @@ Repeat from PR #226 / #228 mini-locks plus one new entry specific to this track:
 - ❌ `initialMessagesLoaded` gate that hides LazyColumn behind a `Box` placeholder.
 - ❌ Large spacer (>16dp) at the visual bottom to "make room for composer".
 - ❌ `var messages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }` — Compose-local state replacing the holder's hot StateFlow. Defeats the entire point.
-- ❌ `collectAsState(initial = emptyList())` without a `holder.snapshot()` seed. **NEW** — this is the THREAD-STATE1 anti-pattern.
+- ❌ `collectAsState(initial = emptyList())` without a `holder.snapshot()` seed. **NEW (Vladislav-locked 2026-05-26):** "Это прямо новый anti-pattern" — this is the THREAD-STATE1 root cause encoded as a banned pattern.
 - ❌ `holder.observe(...).first()` inside ChatScreen to "wait" for cache fill before render. Renders synchronously from `.value` or not at all.
 
-## Test acceptance (Test #82 — Vladislav to refine)
+## Test acceptance (Test #82 — Vladislav-locked 2026-05-26)
 
 `assembleDebug` green. APK SHA256 + MD5 in PR body. MANDATORY: Vladislav verifies MD5 on the installed device before running tests.
 
-**Critical-path scenarios (must PASS):**
+**Critical (must PASS — these are the UX goals):**
 
-1. **Cold open (first chat in session)** — ChatList → tap row → ChatScreen renders. Expected: `CHAT_CACHE preload_start` immediately on tap, `CHAT_CACHE preload_complete count=N dur_ms=…` before ChatScreen's `LaunchedEffect`, ChatScreen renders with N messages visible at the visual bottom in the same frame. Black wait <50 ms (one Compose frame budget).
-2. **Warm open (returning to a recent chat)** — back out of ChatScreen, tap same row in ChatList → expected: holder.snapshot returns the cached value, NO `preload_start` log (already cached), ChatScreen renders instantly.
-3. **Incoming while chat is open** — emu sends a message → expected: holder's observer collects the DB change, StateFlow emits, ChatScreen recomposes with the new row at visual bottom (if user is at bottom).
-4. **Send text** — type & send → expected: DB insert → holder collector emits → ChatScreen updates → `scrollToItem(0)` lands the user at the new message.
-5. **Voice send** — short voice → DB insert (and chunk uploads) → cache updates → bubble appears.
-6. **Open a brand-new conversation (zero history)** — expected: `preload_complete count=0`, ChatScreen renders the empty thread (only the E2EE header + the composer); profile-card-send fires via the deferred LaunchedEffect.
-7. **Open 9th distinct conversation in one session** — expected: cache at capacity, LRU evicts the least-recently-touched, `CHAT_CACHE evict reason=lru` log. Opening that evicted conversation later behaves like a cold open (`preload_start` log fires again).
-8. **Logout / account switch** — `clear()` empties the cache; opening any chat afterwards is a cold open.
+1. **Open chat from ChatList with existing history** — messages visible **immediately** (within one Compose frame, ~16 ms; ≤50 ms acceptable). NO black wait. Expected log order:
+   ```
+   CHAT_CACHE preload_start conv=<8>          ← fired by ChatList row tap
+   CHAT_CACHE preload_done conv=<8> count=N ms=<n>   ← BEFORE navigate
+   (navigation)
+   CHAT_CACHE snapshot_hit conv=<8> count=N   ← ChatScreen reads cache
+   ChatScreen subscribed
+   CHAT_CACHE observe_start conv=<8>
+   CHAT_CACHE emit conv=<8> count=N source=cache   ← initial snapshot
+   ```
+2. **Receive 3+ messages while outside chat, then open from ChatList** — latest messages visible immediately on chat open. Preload picks up the freshly-written messages from DB.
+3. **Open same chat a second time** — instant render from cache snapshot. NO `preload_start` log on the second open (already cached). `snapshot_hit count=N` fires immediately.
+4. **Log invariants** — across all chat opens via ChatList tap:
+   - `preload_done` precedes ChatScreen `subscribed`.
+   - `snapshot_hit` precedes `observe_start` (cache read before observer attach).
+   - `emit source=cache` appears as the very first emit; subsequent emits use `source=db`.
+
+**Regression (must continue to PASS):**
+
+5. **Send text** — composer → tap send → bubble appears at visual bottom. Cache emits with new message. `scrollToItem(0)` lands user on the new message.
+6. **Send voice** — short hold-to-record → bubble appears.
+7. **Receive voice** — emu sends voice → cache updates → bubble appears.
+8. **Date separators / E2EE row** — multi-day chat shows separator above each day; E2EE row at the very top of the history view (above the oldest day); pinned banner above the scroll area.
+
+**Edge cases (must PASS but not the headline):**
+
+9. **Open a brand-new conversation (zero history)** — `preload_done count=0`, `snapshot_hit count=0`, ChatScreen renders the empty thread (only E2EE header + composer); profile-card-send fires via the deferred LaunchedEffect once `observe_start` lands.
+10. **Open 9th distinct conversation in one session** — cache at capacity, LRU evicts least-recently-touched, `CHAT_CACHE evict reason=lru` log fires. Opening the evicted conversation later behaves like a cold open (`preload_start` fires again).
+11. **Logout / account switch** — `clear()` empties the cache; opening any chat afterwards is a cold open.
+
+**Known non-blockers (NOT required to PASS for CACHE1):**
+
+- Notification tap entry-path may still show 0.8–1.3 s black wait — preload not wired for that path until CACHE2.
+- Incoming-while-scrolled-up has no "↓ new messages" chip — separate `PR-UI-CHAT-NEW-MSG-CHIP1`.
+- Manual scroll jerkiness through history — separate `PR-UI-CHAT-SCROLL-PERF1`.
 
 **PASS only if NO:**
-- Black wait > 50 ms on chat open after preload completes.
+- Black wait > 50 ms on chat open from ChatList tap (the primary path).
 - `var messages by remember` or `collectAsState(initial = emptyList())` in the diff.
 - Cache-miss path that hangs ChatScreen on `holder.observe().first()`.
 - Eviction during the active chat (cache MUST never evict the currently-viewing conversation).
 - Memory growth unbounded across many chat opens (eviction must actually drop refs).
+- Any anti-pattern signature from the list above present in the diff.
 
 ## Parking conditions
 
-- If after THREAD-CACHE1 lands the chat STILL shows >50 ms black wait → diagnose whether the bottleneck is `holder.snapshot()` returning stale-empty (preload not wired for the entry point used by the test), Compose recomposition cost, or LazyColumn `reverseLayout` re-measure — DO NOT immediately escalate to a fourth architectural variant. The cache approach is fundamentally correct; sub-bugs are fixable in-track.
-- If the holder Flow collector leaks (Job not cancelled on `evict`) and crashes / hangs → fix the collector lifecycle within the track, do not park.
-- If the LRU policy turns out to evict the wrong thing (e.g. the open conversation) → fix the touch-tracking, do not park.
-- Park ONLY if a fundamentally new architectural problem surfaces (e.g. SQLCipher write-lock contention with the holder's eager loader causing send-path delays — then we'd need a separate write-queue mini-lock).
+**Stay in track (in-PR fixes, NOT a fourth architectural variant):**
+
+- If `holder.snapshot()` returns empty for a path that should have been preloaded → debug the preload wiring on that entry-point. Stays in CACHE1 if the path is ChatList tap; deferred to CACHE2 if it's notification tap or another entry.
+- If the holder Flow collector leaks (Job not cancelled on `evict`) and crashes / hangs → fix the collector lifecycle within the track.
+- If the LRU policy turns out to evict the wrong thing (e.g. the currently-active conversation) → fix the touch-tracking.
+
+**Escalate to a NEW track (Vladislav-locked 2026-05-26):**
+
+- **If preload + snapshot-seed are verified WORKING (`snapshot_hit count=N` lands BEFORE first Compose frame) but Test #82 STILL shows >50 ms black wait** → the bottleneck is no longer data availability, it's **render cost**. Next track: `PR-UI-CHAT-RENDER-PERF1` (LazyColumn / MessageBubble / AnimatedVisibility / Canvas-gradient measurement and optimisation). Do NOT spin a 5th architectural variant on the data lifecycle.
+- If SQLCipher write-lock contention with the holder's eager loader causes send-path delays → separate write-queue mini-lock.
+- If a fundamentally new architectural problem surfaces (e.g. Compose-runtime / SQLCipher) → escalate.
+
+**Park ONLY** in the last two bullets — and only with explicit Vladislav confirmation. Three architectural parks on the chat-list lifecycle is the locked ceiling.
 
 ## Logs (new)
 
