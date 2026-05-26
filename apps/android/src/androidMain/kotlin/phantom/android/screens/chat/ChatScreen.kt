@@ -1215,8 +1215,27 @@ fun ChatScreen(
             val firstOff = listState.firstVisibleItemScrollOffset
             val scrolledUp = firstIdx > 0 || firstOff > 0
 
+            // v1.3 diagnostic — unconditional eval log so we can see every
+            // single time the effect runs, what state it sees, and which
+            // branch it takes. Removes the previous-test mystery where
+            // CHAT_VIEWPORT preserve_start never appeared (Test #83.1 +
+            // #83.2 logs).
+            Log.i(
+                "PhantomUI",
+                "CHAT_VIEWPORT eval conv=${conversationId.take(8)} " +
+                    "savedKey=${savedKey?.take(8) ?: "null"} " +
+                    "savedOffset=$savedOffset prevSize=${prev.size} " +
+                    "firstIdx=$firstIdx firstOff=$firstOff scrolledUp=$scrolledUp " +
+                    "newSize=${sourceKeys.size}",
+            )
+
             if (savedKey != null && scrolledUp && prev.isNotEmpty()) {
                 val newIndex = sourceKeys.indexOf(savedKey)
+                Log.i(
+                    "PhantomUI",
+                    "CHAT_VIEWPORT lookup conv=${conversationId.take(8)} " +
+                        "key=${savedKey.take(8)} newIndex=$newIndex",
+                )
                 if (newIndex >= 0 && (newIndex != firstIdx || savedOffset != firstOff)) {
                     Log.i(
                         "PhantomUI",
