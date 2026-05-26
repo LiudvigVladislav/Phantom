@@ -120,7 +120,28 @@ fun ChatScreen(
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    var messages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
+
+    // PR-UI-CHAT-THREAD-CACHE1 — snapshot-seed + hot StateFlow pattern
+    // (Vladislav-locked 2026-05-26). ChatScreen reads `holder.snapshot(...)`
+    // synchronously on first compose so the LazyColumn never anchors to
+    // emptyList — happy path after ChatList tap preload. The hot StateFlow
+    // from `holder.observe(...)` then layers DB updates on top via
+    // `collectAsState(initial = initialSnapshot)`.
+    //
+    // Anti-pattern banned by this PR (see docs/tracks/chat-thread-cache.md):
+    //   collectAsState(initial = emptyList())  // ← the PR #228 root cause
+    //
+    // The variable name `messages` is intentionally kept so the existing
+    // 7 `reloadMessages()` call-sites (now no-ops, see below) and ~40
+    // direct reads of `messages` continue to compile without a refactor
+    // pass. The holder's hot StateFlow drives state.
+    val initialSnapshot = remember(conversationId) {
+        container.chatThreadStateHolder.snapshot(conversationId)
+    }
+    val messages: List<MessageEntity> by container.chatThreadStateHolder
+        .observe(conversationId)
+        .collectAsState(initial = initialSnapshot)
+
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     var showEmojiPanel by remember { mutableStateOf(false) }
@@ -296,12 +317,19 @@ fun ChatScreen(
     val transportState by container.transport.state.collectAsState()
     val isConnected = transportState is TransportState.Connected
 
+    // PR-UI-CHAT-THREAD-CACHE1 — no-op stub. Kept for source-compat with
+    // the 7 existing call-sites (lines ~399, 417, 516, 1013, 1031, 1234,
+    // 1245, 1291). The holder's hot StateFlow now drives `messages`
+    // automatically when the DB write that each former reload was
+    // chasing actually lands (`MessageRepository.observeMessages` fires
+    // `CHAT_CACHE emit source=db` and recomposes ChatScreen). Removing
+    // the helper entirely would force a 9-site walk; keeping it as a
+    // suspend no-op preserves the call-site shape with zero behavioural
+    // change. Cleanup deferred to a follow-up (no scope expansion here
+    // per Stabilization Sprint rules).
+    @Suppress("RedundantSuspendModifier", "unused")
     suspend fun reloadMessages() {
-        messages = container.messageRepo.getMessages(conversationId)
-        Log.i(
-            "PhantomUI",
-            "ChatScreen reloadMessages: conv=${conversationId.take(24)}… loaded=${messages.size}",
-        )
+        // intentionally empty
     }
 
     // PR-UI-REC2: shared finalise-and-send path. Two entry points reach it:

@@ -26,6 +26,7 @@ import phantom.core.crypto.LibsodiumX3DH
 import phantom.core.identity.IdentityManager
 import phantom.core.identity.IdentityRecord
 import phantom.core.identity.IdentityRepository
+import phantom.core.messaging.ChatThreadStateHolder
 import phantom.core.messaging.DefaultGroupMessagingService
 import phantom.core.messaging.DefaultMessagingService
 import phantom.core.messaging.GroupMessagingService
@@ -108,6 +109,24 @@ class AppContainer(private val context: Context) {
     )
     val conversationRepo = SqlDelightConversationRepository(dbHolder.database)
     val messageRepo      = SqlDelightMessageRepository(dbHolder.database)
+
+    /**
+     * PR-UI-CHAT-THREAD-CACHE1 — hot, in-memory `StateFlow<List<MessageEntity>>`
+     * cache keyed by `conversationId`. Owns the long-lived observer Jobs that
+     * pump SqlDelight DB-change emissions into the cached StateFlows. Read
+     * by `ChatScreen` (`holder.snapshot(...)` + `holder.observe(...)`) and
+     * preloaded by `ChatListScreen` row-tap. See
+     * `docs/tracks/chat-thread-cache.md` for the mini-lock + 8 acceptance
+     * scenarios. Lives on `appScope` so cache entries survive Compose
+     * disposal — the entire point of moving message state out of the
+     * Composable lifecycle after THREAD-STATE1's first-emit gap proved
+     * fatal on Tecno (PR #228 park, Tests #81 / #81.1).
+     */
+    val chatThreadStateHolder = ChatThreadStateHolder(
+        messageRepo = messageRepo,
+        scope = appScope,
+        log = { line -> android.util.Log.i("PhantomUI", line) },
+    )
     private val ratchetRepo = SqlDelightRatchetStateRepository(
         db = dbHolder.database,
         blobCipher = phantom.core.storage.createAndroidRatchetKeystoreCipher(),
