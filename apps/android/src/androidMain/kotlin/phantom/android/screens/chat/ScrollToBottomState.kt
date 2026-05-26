@@ -114,27 +114,35 @@ class ScrollToBottomState internal constructor(
      * on Tecno).
      */
     internal suspend fun onTap(displayItems: List<ChatItem>) {
+        // PR-UI-CHAT-NEW-MSG-CHIP1 v1.1 — source-index off-by-one fix
+        // (Vladislav-architect Test #83 verdict). LazyColumn source =
+        // [__bottom_anchor__, displayItems[0], displayItems[1], ...,
+        //  displayItems[last], __e2ee__]. The `displayItems.indexOfFirst`
+        // returns a displayIdx that maps to sourceIdx = displayIdx + 1.
+        // Without the +1, tap-to-first-unread lands one item too far
+        // toward the bottom — visually "close but not on the right
+        // message". Logged with both indices so the fix is verifiable.
         val target = if (countState == 0) {
             Log.i(
                 "PhantomUI",
-                "CHAT_CHIP tap conv=${conversationId.take(8)} count=0 target=latest",
+                "CHAT_CHIP tap conv=${conversationId.take(8)} count=0 " +
+                    "target=latest sourceIdx=0",
             )
             0
         } else {
             val firstUnreadId = unread.firstOrNull()
-            val idx = if (firstUnreadId != null) {
+            val displayIdx = if (firstUnreadId != null) {
                 displayItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == firstUnreadId }
             } else {
                 -1
             }
+            val sourceIdx = if (displayIdx >= 0) displayIdx + 1 else 0
             Log.i(
                 "PhantomUI",
                 "CHAT_CHIP tap conv=${conversationId.take(8)} count=$countState " +
-                    "target=first_unread idx=$idx",
+                    "target=first_unread displayIdx=$displayIdx sourceIdx=$sourceIdx",
             )
-            // Fallback to latest if the first-unread id is no longer in the
-            // displayItems list (rare — e.g. expired/deleted message).
-            if (idx >= 0) idx else 0
+            sourceIdx
         }
         listState.animateScrollToItem(target)
         unread.clear()

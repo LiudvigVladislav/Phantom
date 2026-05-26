@@ -1163,6 +1163,96 @@ fun ChatScreen(
         // history view (above the oldest day separator).
         val displayItems = remember(chatItems) { chatItems.asReversed() }
 
+        // PR-UI-CHAT-NEW-MSG-CHIP1 v1.1 — viewport preservation
+        // (Vladislav-architect Test #83 verdict). With reverseLayout = true,
+        // incoming messages insert at source[1] (newest), shifting every
+        // OTHER message's source index by +1. While the user is reading
+        // history, Compose's automatic key-tracking SHOULD keep the
+        // viewport on the same key, but Tecno-side behaviour shows the
+        // list drifts anyway. We explicitly save the visible source key +
+        // its scroll offset on every scroll change and re-apply it the
+        // moment `sourceKeys` change (i.e. a message was added /
+        // removed / edited) AS LONG AS the user is scrolled-up — that
+        // way new incoming messages bump the badge without dragging
+        // the viewport.
+        //
+        // Source-key vector EXACTLY mirrors the LazyColumn body order
+        // below, so `previousKeys[firstVisibleIndex]` resolves to the
+        // same key that LazyColumn used. Kept synthetic anchors named
+        // verbatim so the lookup is trivial.
+        val sourceKeys: List<String> = remember(displayItems) {
+            buildList(displayItems.size + 2) {
+                add("__bottom_anchor__")
+                displayItems.forEach { item ->
+                    add(
+                        when (item) {
+                            is ChatItem.DateSep -> "__date_${item.dateKey}"
+                            is ChatItem.Msg -> item.entity.id
+                        }
+                    )
+                }
+                add("__e2ee__")
+            }
+        }
+
+        // Continuously remember the key + offset the user is currently
+        // looking at, gated to "scrolled away from visual bottom" so we
+        // don't accidentally pin the viewport off-bottom when the user
+        // IS at the bottom (their natural position should follow new
+        // messages).
+        val viewportKeyRef = remember(conversationId) { mutableStateOf<String?>(null) }
+        val viewportOffsetRef = remember(conversationId) { mutableIntStateOf(0) }
+        val previousKeysRef = remember(conversationId) { mutableStateOf<List<String>>(emptyList()) }
+
+        LaunchedEffect(listState, sourceKeys) {
+            // sourceKeys just changed — restore the viewport IF the user
+            // is scrolled-up and we have a saved key from before the
+            // change. We do this BEFORE updating previousKeysRef.
+            val savedKey = viewportKeyRef.value
+            val savedOffset = viewportOffsetRef.intValue
+            val prev = previousKeysRef.value
+            val firstIdx = listState.firstVisibleItemIndex
+            val firstOff = listState.firstVisibleItemScrollOffset
+            val scrolledUp = firstIdx > 0 || firstOff > 0
+
+            if (savedKey != null && scrolledUp && prev.isNotEmpty()) {
+                val newIndex = sourceKeys.indexOf(savedKey)
+                if (newIndex >= 0 && (newIndex != firstIdx || savedOffset != firstOff)) {
+                    Log.i(
+                        "PhantomUI",
+                        "CHAT_VIEWPORT preserve_start conv=${conversationId.take(8)} " +
+                            "key=${savedKey.take(8)} oldIndex=$firstIdx oldOffset=$firstOff",
+                    )
+                    listState.scrollToItem(newIndex, savedOffset)
+                    Log.i(
+                        "PhantomUI",
+                        "CHAT_VIEWPORT preserve_apply conv=${conversationId.take(8)} " +
+                            "key=${savedKey.take(8)} newIndex=$newIndex offset=$savedOffset",
+                    )
+                }
+            }
+            previousKeysRef.value = sourceKeys
+        }
+
+        // Track scroll state continuously. snapshotFlow batches per-frame
+        // updates so we don't burn cycles on every scroll pixel; the
+        // collector emits only when the (index, offset) pair changes.
+        // `sourceKeys` is captured in the closure — when it changes, the
+        // outer LaunchedEffect re-launches and the new sourceKeys is used.
+        LaunchedEffect(listState, sourceKeys) {
+            androidx.compose.runtime.snapshotFlow {
+                listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+            }.collect { (idx, off) ->
+                if (idx == 0 && off == 0) {
+                    viewportKeyRef.value = null
+                    viewportOffsetRef.intValue = 0
+                } else {
+                    viewportKeyRef.value = sourceKeys.getOrNull(idx)
+                    viewportOffsetRef.intValue = off
+                }
+            }
+        }
+
         // PR-UI-CHAT-THREAD-CACHE1 v1.1 — `CHAT_LIST open_state` log per
         // Vladislav-architect Test #82 verdict (need to see where
         // LazyColumn actually opens). Fires once per chat open AFTER
