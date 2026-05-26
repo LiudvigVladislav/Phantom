@@ -112,7 +112,7 @@ Rationale (Vladislav 2026-05-26): "если сразу добавим ChatList +
 
 **CACHE1 (this PR) — single preload site:**
 
-1. **ChatList row tap** — in `ChatListScreen` row click handler, immediately before `navController.navigate(ChatScreen(conversationId))`. By the time ChatScreen's `LaunchedEffect` runs, `holder.snapshot(conversationId)` already returns the loaded list.
+1. **ChatList row tap** — in `ChatListScreen` row click handler, **call `holder.preload(conversationId)` immediately before `navController.navigate(ChatScreen(conversationId))`. `preload` is NON-SUSPEND and fire-and-forget** — the holder's own `scope` owns the load coroutine. Navigation MUST NOT wait for the load to finish (Vladislav-locked 2026-05-26: "если `preload()` suspend и мы ждём его полностью, может появиться микропаузa на клике" — anti-pattern). Best case: preload completes before ChatScreen's first `remember { snapshot(...) }` runs → `snapshot_hit`. Worst case: preload still in flight → `snapshot_miss`, ChatScreen renders empty for the same ~1 s the THREAD-STATE1 cold-Flow path would, then the holder's StateFlow emits when the load completes. The worst case is no worse than today's behaviour; the best case (and the happy path on warm starts after the first chat open) is the UX target.
 
 **CACHE2 (follow-up track, NOT this PR) — expanded preload sites:**
 

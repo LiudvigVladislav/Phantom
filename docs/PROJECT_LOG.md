@@ -563,6 +563,43 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-26 (tue, late) · Android Stabilization Sprint mode ENGAGED + 5-PR queue locked
+
+Vladislav explicit decision after three chat-list lifecycle FAILs in the same week (AUTOSCROLL1 + BOTTOM-ANCHOR1 + THREAD-STATE1). New operating mode: **feature freeze on Android core**, only stabilization work in a locked 5-PR queue, no new feature proposals until the queue exits with verified PASS on Tecno real device.
+
+**Out for the duration of the sprint** (Vladislav-explicit):
+- iOS port (still beta-tier per 2026-05-14 strategy lock).
+- Calls feature expansion (C-track stays in `Open follow-ups` but is not active).
+- Groups beyond current Alpha-0 scope (no channels, no broadcast, no admin UI).
+- New transports beyond WSS + REALITY + Tor + REST.
+- Attachments, username directory, file send.
+- "While we're here" cleanups outside the active queue item.
+
+**Locked queue:**
+1. PR-UI-CHAT-THREAD-CACHE1 (next to start) — hot `StateFlow` holder; eliminates the 0.8–1.3 s chat-open black wait. Mini-lock at `docs/tracks/chat-thread-cache.md`. Cherry-picks the salvageable artefacts from the closed `feat/pr-ui-chat-thread-state1` branch (observeMessages, bottom-anchor render, side-effect defer, animation suppression, test fakes).
+2. PR-UI-CHAT-RENDER-PERF1 (CONDITIONAL) — only if CACHE1 ships with verified `CHAT_CACHE snapshot_hit count=N` log BEFORE first Compose frame AND Test #82 still shows >50 ms black wait. Then bottleneck is render cost (MessageBubble / AnimatedVisibility / Canvas / reverseLayout re-measure), NOT a 4th architectural data-lifecycle variant. Vladislav-locked escalation path.
+3. PR-UI-CHAT-NEW-MSG-CHIP1 — floating "↓ N new messages" chip when user is scrolled up and incoming arrives. Side-issue surfaced during Test #81.1 — deferred until base chat list is stable.
+4. PR-NOTIF-POLICY1 — conversation-level notification with InboxStyle + unread count + clear-on-chat-open. Closes the "уведомления исчезают" finding from PR-NOTIF-DIAG #213 (one `notificationId = conversationId.hashCode()` caused notification replacement). Mini-lock at `docs/tracks/notif-policy.md`.
+5. PR-D1e first-message bootstrap — close the 10–20 s delay + yellow-dot after Add Contact (prekey_fetch timeout pattern from `project_open_followups_2026_05_17.md`).
+
+**Sprint exit criterion.** All 5 queue items must PASS on Tecno real device:
+- CACHE1: chat opens within one Compose frame on ChatList tap, no black wait.
+- RENDER-PERF1: either not needed (CACHE1 alone sufficient) OR ships with smooth-scroll verdict.
+- NEW-MSG-CHIP1: chip appears when scrolled up + incoming arrives, tap → jump-to-bottom works.
+- NOTIF-POLICY1: notifications no longer overwrite; conversation-level grouping verified.
+- D1e: first message after Add Contact arrives within 5 s on a healthy network.
+
+At that point we re-open feature roadmap discussion. Until then: queue only.
+
+**Direct Vladislav quotes 2026-05-26:**
+- "Feature freeze на Android core. Никаких новых крупных фич: calls, groups, iOS, new transports. Только стабилизация."
+- "Пока базовый ChatScreen открывается плохо, любые новые UX-слои будут стоять на нестабильной основе."
+- "Не надо начинать сразу NEW-MSG-CHIP, NOTIF-POLICY, D1e или iOS. Сначала: CACHE1."
+
+**Funding-track / external work** (README polish, funding.json updates, well-known) is allowed out-of-queue but only on explicit per-PR Vladislav greenlight — it's orthogonal to Android stabilization and doesn't burn Android-PR budget.
+
+**Memory entry hardened:** `feedback_android_stabilization_sprint.md` — top-pinned in `MEMORY.md` index (triple-🔥). To be read FIRST before proposing any new feature work on Android until the queue exit criterion is met.
+
 ### 2026-05-26 (tue) · PR-UI-CHAT-THREAD-STATE1 PARKED — replaced by PR-UI-CHAT-THREAD-CACHE1 (Variant C escalation)
 
 PR #228 closed without merge per `docs/WORKING_RULES.md` rule 4 — two implementation attempts (v1 `e2700f82`, v1.1 `c0fab2b4`) both FAIL on Test #81 / #81.1 on Tecno real device. The Flow-backed migration was architecturally correct (`MessageRepository.observeMessages` → `SqlDelightMessageRepository.observeMessages` via `asFlow().mapToList(Dispatchers.IO)`; ChatScreen `collectAsState(initial = emptyList())` wrap with `remember(conversationId)`; all 9 reloadMessages call-sites walked + classified Type A/B/C; reloadMessages helper deleted; LazyColumn `reverseLayout = true` + `__bottom_anchor__` 8dp spacer + `asReversed()`; `initialMessageIds` snapshot for animation suppression; v1.1 added `firstFlowEmitReceived` defer for markConversationRead + profile-card-send via a separate `LaunchedEffect`). CI green. Anti-pattern grep clean. Side-effect order correct in v1.1 — `SEND_TRACE` ran AFTER `observe_emit`.
