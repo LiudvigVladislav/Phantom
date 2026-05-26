@@ -1237,35 +1237,42 @@ fun ChatScreen(
                         "key=${savedKey.take(8)} newIndex=$newIndex",
                 )
                 if (newIndex >= 0) {
-                    // v1.4 (Test #83.3 verdict) — restore UNCONDITIONALLY when
-                    // scrolledUp + key found, even if newIndex == firstIdx.
-                    // The previous gate `newIndex != firstIdx || savedOffset
-                    // != firstOff` skipped when Compose's automatic
-                    // key-preservation kept the index stable, but the layout
-                    // sub-position (offset) still drifted by a few pixels
-                    // because new MessageBubble inserted at source[1] could
-                    // resize neighbouring rows or shift sub-item baselines.
-                    // `scrollToItem(newIndex, savedOffset)` is idempotent —
-                    // no visual jump if we're already there; corrects the
-                    // sub-pixel drift if we're not. Vladislav-architect
-                    // 2026-05-27 explicit verdict.
+                    // v1.5 (Test #83.4 verdict) — use `requestScrollToItem`
+                    // (PRE-measure) instead of `scrollToItem` (POST-measure).
+                    //
+                    // Test #83.4 logs proved:
+                    //   - preservation runs (CHAT_VIEWPORT eval / preserve_apply)
+                    //   - cache is clean (count monotonic 73→74→75→76)
+                    //   - newIndex == firstIdx every time (Compose auto-preserve OK)
+                    //   - BUT user sees the first incoming visibly shift the
+                    //     history before preservation runs (~386ms gap from
+                    //     cache emit to preserve_apply)
+                    //
+                    // `scrollToItem` is a suspending corrective scroll that
+                    // runs in a LaunchedEffect AFTER LazyColumn has already
+                    // re-measured with the new source list — too late to
+                    // prevent the visible jump.
+                    //
+                    // `requestScrollToItem` (compose-foundation 1.7+) is
+                    // non-suspend and schedules the scroll position to be
+                    // applied on the NEXT measure pass. The LazyColumn
+                    // measures with the desired viewport position
+                    // immediately, so the user never sees the jump.
+                    //
+                    // Vladislav-architect 2026-05-27: "это допустимо в CHIP1
+                    // scope; не initial open, не scroll-to-bottom, а
+                    // viewport preservation after incoming while scrolled-up".
                     val reason = when {
                         newIndex != firstIdx -> "index_shift"
                         savedOffset != firstOff -> "offset_restore"
-                        else -> "noop_idempotent"
+                        else -> "idempotent"
                     }
+                    listState.requestScrollToItem(newIndex, savedOffset)
                     Log.i(
                         "PhantomUI",
-                        "CHAT_VIEWPORT preserve_start conv=${conversationId.take(8)} " +
-                            "key=${savedKey.take(8)} oldIndex=$firstIdx oldOffset=$firstOff " +
-                            "reason=$reason",
-                    )
-                    listState.scrollToItem(newIndex, savedOffset)
-                    Log.i(
-                        "PhantomUI",
-                        "CHAT_VIEWPORT preserve_apply conv=${conversationId.take(8)} " +
+                        "CHAT_VIEWPORT preserve_request conv=${conversationId.take(8)} " +
                             "key=${savedKey.take(8)} newIndex=$newIndex offset=$savedOffset " +
-                            "reason=$reason",
+                            "oldIndex=$firstIdx oldOffset=$firstOff reason=$reason",
                     )
                 }
             }
