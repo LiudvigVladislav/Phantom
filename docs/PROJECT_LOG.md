@@ -563,6 +563,38 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-26 (tue, very late) · PR-UI-CHAT-THREAD-CACHE1 MERGED — chat-list lifecycle FINALLY PASS
+
+PR #231 `d933b0b6` merged after Test #82.1 PASS on Tecno real device. **First chat-list lifecycle track to PASS** after three architectural PARKs (#217 AUTOSCROLL1, #226 BOTTOM-ANCHOR1, #228 THREAD-STATE1). The Variant C escalation worked: hot `ChatThreadStateHolder` (in-memory `StateFlow<List<MessageEntity>>` cache per conversation) + ChatList row-tap preload + ChatScreen snapshot-seed pattern eliminates the cold-Flow first-emit gap that defeated #228.
+
+**v1 (commit `3ae54bb3`) data-lifecycle landed:**
+- `ChatThreadStateHolder` (shared/core/messaging) with LRU 8, observer/preload jobs on `appScope`.
+- `MessageRepository.observeMessages` + SqlDelight impl cherry-picked from the parked `feat/pr-ui-chat-thread-state1` branch.
+- ChatListScreen row-tap + AddContact onAdded → fire-and-forget `holder.preload(conversationId)` immediately before navigation (Vladislav-locked: NON-SUSPEND on purpose — suspend-await would produce a visible micro-pause).
+- ChatScreen `remember(conversationId) { holder.snapshot(...) }` + `holder.observe(...).collectAsState(initial = initialSnapshot)`. Anti-pattern `collectAsState(initial = emptyList())` (the #228 root cause) banned.
+- 9 holder unit tests in shared/core/messaging, all pass on `jvmTest`.
+- 8 `CHAT_CACHE` logs (preload_start/done, snapshot_hit/miss, observe_start, emit source=db, evict reason=lru|manual, clear).
+
+**Test #82 verdict (v1 partial pass):** data lifecycle PASS — `preload_done count=N ms=<n>` + `snapshot_hit count=N` BEFORE `ChatScreen subscribed` verified on Tecno. But opening position FAIL — chat opens with data but not on newest messages (LazyColumn still oldest-first, source[0] = oldest). Vladislav-architect verdict: in-track v1.1 fix, NOT a 4th data-lifecycle variant.
+
+**v1.1 (commit `3b334635`) bottom-anchor landed:**
+- `displayItems = chatItems.asReversed()` (newest-first source order).
+- `LazyColumn(reverseLayout = true)`: source[0] = `__bottom_anchor__` 8dp Spacer (visual bottom), source[1] = newest message, source[last] = `__e2ee__` E2EENoteRow (visual top).
+- `listState = remember(conversationId) { LazyListState(0, 0) }` — every chat-open starts fresh at visual bottom (source index 0) without a delayed `scrollToItem`.
+- Pinned banner moved OUTSIDE LazyColumn into a Column wrap so it does not participate in reverseLayout source ordering.
+- New `CHAT_LIST open_state` log: `reverseLayout=true total=<N+2> firstVisible=<i> firstOffset=<px> sourceFirst=__bottom_anchor__ sourceLast=__e2ee__`.
+- Carried forward from CACHE1 v1 scope; cherry-picked from #228 branch but rewired around the holder rather than a cold Flow.
+
+**Test #82.1 verdict (v1.1 PASS):** Tecno log shows `preload_done count=46 ms=27` → `snapshot_hit count=46` → `ChatScreen subscribed` → `open_state reverseLayout=true total=50 firstVisible=0`. Visual verdict from Vladislav: "Ура, вроде работает. Открывается сразу вниз, всё ок." Side notes (NOT blockers for this PR):
+- Manual scroll through history still slightly jerky → `PR-UI-CHAT-RENDER-PERF1` (queue item #2, now CONDITIONAL).
+- No in-chat "↓ new messages" indicator when user is scrolled up and incoming arrives → `PR-UI-CHAT-NEW-MSG-CHIP1` (queue item #3, design handoff provided by Vladislav, next track).
+
+**Anti-pattern signatures verified absent from the merged diff:** `collectAsState(initial = emptyList())`, `var messages by remember`, `LaunchedEffect + scrollToItem`, `snapshotFlow.first { > 0 }`, `withFrameNanos + scrollToItem`, `initialMessagesLoaded` placeholder gate, large bottom spacer >16dp.
+
+**Stabilization Sprint queue advances.** Item #1 (CACHE1) ✅ DONE. Item #2 (RENDER-PERF1) was conditional and is NOT currently being escalated — CACHE1 alone closed the data lifecycle. Item #3 (NEW-MSG-CHIP1) is next, with a Vladislav-designer handoff bundle providing full 1:1 spec (button geometry, badge tokens, animation curves, tap behaviour). Mini-lock authored as `docs/tracks/chat-new-msg-chip.md`.
+
+**Vladislav explicit lock 2026-05-26:** "только этот дизайнерский вариант должен быть 1 в 1 с анимацией" — implementation MUST be pixel-perfect / animation-perfect against the handoff. Mini-lock encodes this as a banned-deviation constraint with token tables for geometry / typography / colours / durations / easing curves.
+
 ### 2026-05-26 (tue, late) · Android Stabilization Sprint mode ENGAGED + 5-PR queue locked
 
 Vladislav explicit decision after three chat-list lifecycle FAILs in the same week (AUTOSCROLL1 + BOTTOM-ANCHOR1 + THREAD-STATE1). New operating mode: **feature freeze on Android core**, only stabilization work in a locked 5-PR queue, no new feature proposals until the queue exits with verified PASS on Tecno real device.
