@@ -50,6 +50,9 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun getMessages(conversationId: String) =
         messages.filter { it.conversationId == conversationId }
 
+    override fun observeMessages(conversationId: String): Flow<List<MessageEntity>> =
+        emptyFlow()
+
     override suspend fun getMessageById(id: String): MessageEntity? =
         messages.firstOrNull { it.id == id }
 

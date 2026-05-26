@@ -207,4 +207,33 @@ CHAT_LIST bottom_anchor_enabled …
 
 ## Last hand-off
 
-(empty — track queued, not yet active)
+### 2026-05-26 — v1.1: defer chat-open side-effects past first Flow emit
+
+**Test #81 FAIL (v1).** Tecno log order on chat open:
+```
+22:41:56.079  ChatScreen subscribed
+22:41:57.420  SEND_TRACE encrypt_lock_wait        ← +1.341 s
+22:41:57.423  CHAT_THREAD observe_started        ← +0.003 s
+22:41:57.424  CHAT_THREAD observe_emit count=30  ← +0.001 s  (Flow itself is fast)
+```
+Vladislav report: "Тест 81. Пока вроде все так же, черный экран есть, и листание истории сообщений так же идет рывками". Architect root-cause (independent reading of the same logs): the `LaunchedEffect(conversationId)` ran `markConversationRead` + `sendMessage(profileCard)` IMMEDIATELY on chat open. Both take the ratchet `session_lookup` + DB write/encrypt locks; on a writer-priority SQLCipher these serialised AHEAD of the SQLDelight `observeMessages` Flow's first query. ~1.3 s of black wait between Compose entering ChatScreen and the bottom-anchored list painting.
+
+**v1.1 fix.** Split the original `LaunchedEffect(conversationId)`:
+- KEEP the immediate `ChatScreen subscribed` log (still runs the moment Compose enters the screen — for log-order traceability).
+- MOVE both heavy side-effects (markConversationRead + profile-card-send) into a separate `LaunchedEffect(conversationId, firstFlowEmitReceived)` that early-returns until the Flow has actually emitted.
+- INTRODUCE `firstFlowEmitReceived` boolean state — distinct from `initialMessageIds != null` because a brand-new conversation legitimately emits `emptyList()` (no messages yet) and the profile-card-send must still fire in that case. The flag is set by a separate `messagesFlow.first()` collector that subscribes, captures the very first emission, and exits (one extra cheap SqlDelight SELECT at chat open — acceptable for unblocking first-paint).
+
+**Required log order after v1.1:**
+```
+ChatScreen subscribed
+CHAT_THREAD observe_started conv=<8> initialMessageIdsSize=<n>
+CHAT_LIST bottom_anchor_enabled …
+CHAT_THREAD deferred_side_effects_start conv=<8>     ← new log; v1.1
+PROFILE_CARD send_attempt / SEND_TRACE …             ← only after this point
+```
+
+**CI fix.** `:shared:core:storage:compileTestKotlinJvm` failed in v1 because two test fakes (`InMemoryRepositoryTest.FakeMessageRepository` and `DefaultMessagingServiceTest.FakeMessageRepository`) didn't override the new `observeMessages` interface method. v1.1 adds:
+- Storage fake: `MutableStateFlow<Int>` tick bumped on every write, `observeMessages` maps tick → filtered list (real reactive behaviour, lets tests exercise the Flow path).
+- Messaging fake: `emptyFlow()` (existing tests don't exercise the Flow path, only one-shot `getMessages`).
+
+APK MD5 (Test #81.1): `5d471fb1e15973f1bdbca2c00f465abe`.

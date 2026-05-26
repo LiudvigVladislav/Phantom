@@ -9,6 +9,7 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onEach
 import org.json.JSONException
 import org.json.JSONObject
@@ -177,18 +178,33 @@ fun ChatScreen(
     // conservative default during the very-short pre-first-emission window.
     var initialMessageIds by remember(conversationId) { mutableStateOf<Set<String>?>(null) }
 
-    LaunchedEffect(conversationId, messages) {
-        if (initialMessageIds == null && messages.isNotEmpty()) {
-            initialMessageIds = messages
-                .filter { msg -> !(msg.plaintextCache?.startsWith(PROFILE_MSG_PREFIX) ?: false) }
-                .map { it.id }
-                .toSet()
-            Log.i(
-                "PhantomUI",
-                "CHAT_THREAD observe_started conv=${conversationId.take(8)} " +
-                    "initialMessageIdsSize=${initialMessageIds?.size}",
-            )
-        }
+    // PR-UI-CHAT-THREAD-STATE1.1 — separate "Flow has emitted at least once"
+    // signal. We need this distinct from "messages.isNotEmpty()" because a
+    // brand-new conversation legitimately emits emptyList() as its first
+    // value, and the deferred profile-card-send LaunchedEffect below still
+    // has to fire in that case (else first-contact profile sync breaks).
+    var firstFlowEmitReceived by remember(conversationId) { mutableStateOf(false) }
+
+    LaunchedEffect(conversationId) {
+        // Subscribe a separate, short-lived collector that captures only the
+        // first emission of the SqlDelight Flow and exits. SqlDelight asFlow
+        // is cold per-subscriber, so `first()` opens a fresh subscription,
+        // reads the first row-set, and cancels — costs one extra SELECT at
+        // chat open; collectAsState owns the long-lived subscription
+        // separately. Required (not redundant) because the deferred
+        // side-effects gate below must distinguish "Flow hasn't emitted
+        // yet" from "Flow emitted an empty list for a brand-new chat".
+        val emitted = messagesFlow.first()
+        initialMessageIds = emitted
+            .filter { msg -> !(msg.plaintextCache?.startsWith(PROFILE_MSG_PREFIX) ?: false) }
+            .map { it.id }
+            .toSet()
+        firstFlowEmitReceived = true
+        Log.i(
+            "PhantomUI",
+            "CHAT_THREAD observe_started conv=${conversationId.take(8)} " +
+                "initialMessageIdsSize=${initialMessageIds?.size}",
+        )
     }
 
     // PR-UI-CHAT-THREAD-STATE1 — Flow-emission observability.
@@ -511,6 +527,30 @@ fun ChatScreen(
         Log.i(
             "PhantomUI",
             "ChatScreen subscribed to conv=${conversationId.take(24)}… theirUsername=$theirUsername",
+        )
+    }
+
+    // PR-UI-CHAT-THREAD-STATE1.1 (2026-05-26) — defer chat-open side-effects.
+    //
+    // Test #81 root cause: the previous LaunchedEffect ran
+    // `markConversationRead` + profile-card `sendMessage` immediately on
+    // chat open. Both take the ratchet session lookup + DB write/encrypt
+    // locks (~1.3 s on Tecno), which serialised AHEAD of the SQLDelight
+    // `observeMessages` Flow's first query. Result: black wait between
+    // `ChatScreen subscribed` and `CHAT_THREAD observe_started`, exactly
+    // the UX bug Vladislav reported.
+    //
+    // Fix: keyed on `firstFlowEmitReceived` (set by the snapshot
+    // LaunchedEffect above the moment the Flow's first emission lands —
+    // regardless of whether that emission is empty or non-empty). Returns
+    // early until the Flow has actually emitted, so the message list
+    // paints first and the lock contention happens AFTER the
+    // bottom-anchored render.
+    LaunchedEffect(conversationId, firstFlowEmitReceived) {
+        if (!firstFlowEmitReceived) return@LaunchedEffect
+        Log.i(
+            "PhantomUI",
+            "CHAT_THREAD deferred_side_effects_start conv=${conversationId.take(8)}",
         )
         // PR-UI-CHAT-THREAD-STATE1 site #2 (chat-open) — Type B: refresh
         // via observeMessages Flow (no manual reload); KEEP non-list

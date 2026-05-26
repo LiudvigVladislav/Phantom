@@ -3,6 +3,10 @@
 
 package phantom.core.storage
 
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -117,9 +121,17 @@ private class FakeConversationRepository : ConversationRepository {
 
 private class FakeMessageRepository : MessageRepository {
     private val store = mutableListOf<MessageEntity>()
+    private val tick = MutableStateFlow(0)
+
+    private fun bump() { tick.value = tick.value + 1 }
 
     override suspend fun getMessages(conversationId: String): List<MessageEntity> =
         store.filter { it.conversationId == conversationId }.sortedBy { it.createdAt }
+
+    override fun observeMessages(conversationId: String): Flow<List<MessageEntity>> =
+        tick.asStateFlow().map {
+            store.filter { msg -> msg.conversationId == conversationId }.sortedBy { it.createdAt }
+        }
 
     override suspend fun getMessageById(id: String): MessageEntity? =
         store.firstOrNull { it.id == id }
@@ -127,6 +139,7 @@ private class FakeMessageRepository : MessageRepository {
     override suspend fun insertMessage(entity: MessageEntity) {
         if (store.any { it.id == entity.id }) return
         store.add(entity)
+        bump()
     }
 
     override suspend fun updateStatus(messageId: String, status: MessageStatus) {
