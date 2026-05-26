@@ -193,6 +193,12 @@ fun ChatListScreen(
                 showAddDialog = false
                 prefillContactString = ""
                 reloadKey++
+                // PR-UI-CHAT-THREAD-CACHE1 — same preload semantics as the
+                // row-tap path. For a brand-new conversation getMessages
+                // will return emptyList, but the cache entry is still
+                // created so the holder's StateFlow observer is wired
+                // and ChatScreen avoids the cold-Flow subscribe gap.
+                container.chatThreadStateHolder.preload(convId)
                 onNavigate(Screen.Chat(convId, username))
             },
         )
@@ -311,7 +317,18 @@ private fun ChatsTab(
         items(filtered, key = { it.id }) { conv ->
             ChatRow(
                 conv = conv,
-                onClick = { onNavigate(Screen.Chat(conv.id, conv.theirUsername)) },
+                onClick = {
+                    // PR-UI-CHAT-THREAD-CACHE1 — fire-and-forget preload before
+                    // navigation. NON-SUSPEND on purpose: navigation must not
+                    // wait (Vladislav-locked 2026-05-26 — suspend-await on tap
+                    // produces a visible micro-pause). Holder's appScope owns
+                    // the actual DB read; ChatScreen races against completion.
+                    // Best case: snapshot_hit on first compose. Worst case:
+                    // snapshot_miss + same ~1s as PR #228 (acceptable known
+                    // non-blocker for CACHE1).
+                    container.chatThreadStateHolder.preload(conv.id)
+                    onNavigate(Screen.Chat(conv.id, conv.theirUsername))
+                },
                 onArchive = {
                     scope.launch {
                         container.conversationRepo.archiveConversation(conv.id)

@@ -3,7 +3,11 @@
 
 package phantom.core.storage
 
+import app.cash.sqldelight.coroutines.asFlow
+import app.cash.sqldelight.coroutines.mapToList
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import phantom.core.storage.db.PhantomDatabase
 
@@ -15,6 +19,33 @@ class SqlDelightMessageRepository(
         withContext(Dispatchers.IO) {
             db.messageQueries.getMessages(conversationId).executeAsList().map { it.toEntity() }
         }
+
+    /**
+     * PR-UI-CHAT-THREAD-STATE1 — reactive message stream for one conversation.
+     *
+     * Backed by SQLDelight's `Query<T>.asFlow()` extension
+     * (`app.cash.sqldelight:coroutines-extensions`, already in
+     * `shared/core/storage/build.gradle.kts`). Behaviour:
+     *  - On `collect`, subscribes the underlying `Query` to the database's
+     *    write notifier and emits the current snapshot immediately.
+     *  - On every successful write to the `messages` table touched by this
+     *    query (any `INSERT`, `UPDATE`, `DELETE` on `messages`), re-runs the
+     *    query and emits the new list.
+     *  - `mapToList(Dispatchers.IO)` moves the query execution off the
+     *    main thread; the downstream `.map { it.toEntity() }` runs on the
+     *    collector's context (Compose `collectAsState` runs in main scope,
+     *    so the entity mapping happens on the main thread per row — fast
+     *    enough for the chat sizes we ship).
+     *
+     * Naming: matches the existing `getMessages` query name so a future
+     * `MessageQueries.observe(...)` direct call site could swap in without
+     * a repository change.
+     */
+    override fun observeMessages(conversationId: String): Flow<List<MessageEntity>> =
+        db.messageQueries.getMessages(conversationId)
+            .asFlow()
+            .mapToList(Dispatchers.IO)
+            .map { rows -> rows.map { it.toEntity() } }
 
     override suspend fun getMessageById(id: String): MessageEntity? =
         withContext(Dispatchers.IO) {
