@@ -91,10 +91,10 @@ class ChatThreadStateHolder(
         return if (entry != null) {
             touch(conversationId)
             val value = entry.state.value
-            log("CHAT_CACHE snapshot_hit conv=${conversationId.take(8)} count=${value.size}")
+            log("CHAT_CACHE snapshot_hit conv=${convTag(conversationId)} count=${value.size}")
             value
         } else {
-            log("CHAT_CACHE snapshot_miss conv=${conversationId.take(8)}")
+            log("CHAT_CACHE snapshot_miss conv=${convTag(conversationId)}")
             emptyList()
         }
     }
@@ -105,7 +105,7 @@ class ChatThreadStateHolder(
         if (entry.state.value.isNotEmpty()) return
         if (entry.preloadJob?.isActive == true) return
 
-        log("CHAT_CACHE preload_start conv=${conversationId.take(8)}")
+        log("CHAT_CACHE preload_start conv=${convTag(conversationId)}")
         val started = nowMillis()
         entry.preloadJob = scope.launch {
             try {
@@ -113,7 +113,7 @@ class ChatThreadStateHolder(
                 entry.state.value = messages
                 val dur = nowMillis() - started
                 log(
-                    "CHAT_CACHE preload_done conv=${conversationId.take(8)} " +
+                    "CHAT_CACHE preload_done conv=${convTag(conversationId)} " +
                         "count=${messages.size} ms=$dur",
                 )
                 // Make sure the long-lived observer is wired so DB writes
@@ -121,7 +121,7 @@ class ChatThreadStateHolder(
                 ensureObserver(conversationId, entry)
             } catch (t: Throwable) {
                 log(
-                    "CHAT_CACHE preload_error conv=${conversationId.take(8)} " +
+                    "CHAT_CACHE preload_error conv=${convTag(conversationId)} " +
                         "err=${t::class.simpleName}",
                 )
             }
@@ -132,7 +132,7 @@ class ChatThreadStateHolder(
         val entry = cache.remove(conversationId) ?: return
         entry.observerJob?.cancel()
         entry.preloadJob?.cancel()
-        log("CHAT_CACHE evict conv=${conversationId.take(8)} reason=$reason remainingSlots=${cache.size}")
+        log("CHAT_CACHE evict conv=${convTag(conversationId)} reason=$reason remainingSlots=${cache.size}")
     }
 
     fun clear() {
@@ -162,7 +162,8 @@ class ChatThreadStateHolder(
 
     private fun ensureObserver(conversationId: String, entry: Entry) {
         if (entry.observerJob?.isActive == true) return
-        log("CHAT_CACHE observe_start conv=${conversationId.take(8)}")
+        val entryTag = entry.hashCode().toString(16)
+        log("CHAT_CACHE observe_start conv=${convTag(conversationId)} entry=$entryTag")
         entry.observerJob = scope.launch {
             messageRepo.observeMessages(conversationId).collect { messages ->
                 val before = entry.state.value
@@ -171,10 +172,19 @@ class ChatThreadStateHolder(
                 // observer. `source=cache` emits are conceptual — they
                 // happen at the Compose layer when the snapshot seed is
                 // first read — so we don't double-log those here.
+                //
+                // v1.2 (Test #83.1 verdict): `entry=<hash>` lets the log
+                // distinguish two concurrent observers writing to the
+                // same conversation tag — if entry hashes differ across
+                // count=N / count=M alternating emits, we have multiple
+                // Entry instances and a cache race.
                 if (messages !== before) {
+                    val firstId = messages.firstOrNull()?.id?.take(8) ?: "—"
+                    val lastId = messages.lastOrNull()?.id?.take(8) ?: "—"
                     log(
-                        "CHAT_CACHE emit conv=${conversationId.take(8)} " +
-                            "count=${messages.size} source=db",
+                        "CHAT_CACHE emit conv=${convTag(conversationId)} " +
+                            "entry=$entryTag count=${messages.size} " +
+                            "first=$firstId last=$lastId source=db",
                     )
                 }
             }
@@ -207,6 +217,16 @@ class ChatThreadStateHolder(
     }
 
     private fun nowMillis(): Long = phantom.core.messaging.ChatThreadStateClock.nowMillis()
+
+    /**
+     * Log tag for a conversation id — 16 hex chars instead of 8. PR-UI-CHAT-
+     * NEW-MSG-CHIP1 v1.2 (Test #83.1 verdict): the previous 8-char prefix
+     * caused suspected collisions across two emu paired contacts whose ids
+     * happen to share the first 32 bits. Logs were oscillating count=1/61
+     * between two coexisting observers under the same tag. 16 hex chars =
+     * 64 bits = vanishingly small collision probability.
+     */
+    private fun convTag(conversationId: String): String = conversationId.take(16)
 
     // -------------------------------------------------------------------------
     // Policy
