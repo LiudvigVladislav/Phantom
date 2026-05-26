@@ -1,6 +1,6 @@
 # Track: PR-UI-CHAT-THREAD-STATE1 — Flow-backed thread state + bottom-anchored render
 
-**Status:** queued (mini-lock authored before code per `docs/WORKING_RULES.md` rule 3; this track replaces PR-UI-CHAT-BOTTOM-ANCHOR1 which was parked per rule 4 after THREE failed implementation attempts).
+**Status:** **PARKED 2026-05-26** per `docs/WORKING_RULES.md` rule 4 — Tests #81 (v1) and #81.1 (v1.1) FAIL on Tecno real device. PR #228 closed without merge. Superseded by `docs/tracks/chat-thread-cache.md` (PR-UI-CHAT-THREAD-CACHE1, Variant C).
 **Branch (not yet opened):** `feat/pr-ui-chat-thread-state1` (cut fresh from `origin/master` at session start).
 **Layer:** Android UI + KMP shared (MessageRepository interface + SqlDelight impl + ChatScreen).
 **Authored:** 2026-05-25, immediately after PR #226 was parked.
@@ -206,5 +206,64 @@ CHAT_LIST bottom_anchor_enabled …
 - If walk-through of the 12 `reloadMessages()` call-sites reveals a Type C site that needs the one-shot pull AND a side-effect that depends on `messages` being the just-pulled snapshot rather than the Flow's latest emission → preserve `reloadMessages()` helper for that one site, document why.
 
 ## Last hand-off
+
+### 2026-05-26 — PARKED after Test #81 v1 and Test #81.1 v1.1 BOTH FAIL
+
+**Implementation completed as scoped.** All architecturally-defined work landed on `feat/pr-ui-chat-thread-state1`:
+- `MessageRepository.observeMessages(conversationId): Flow<List<MessageEntity>>` interface method ✅
+- `SqlDelightMessageRepository` implementation via `asFlow().mapToList(Dispatchers.IO)` ✅
+- `ChatScreen.collectAsState(initial = emptyList())` wrap with `remember(conversationId)` ✅
+- All 12 `reloadMessages()` call-sites walked, classified Type A/B/C ✅
+- `reloadMessages()` helper deleted ✅
+- `LazyColumn(reverseLayout = true)` + `__bottom_anchor__` 8dp spacer + `asReversed()` ✅
+- `initialMessageIds` snapshot for animation suppression ✅
+- New logs (`observe_started`, `observe_emit`, `bottom_anchor_enabled`) ✅
+- Anti-pattern grep clean ✅
+- v1.1 defer fix: `firstFlowEmitReceived` boolean gates a separate `LaunchedEffect` for markConversationRead + profile-card-send ✅
+- CI green (storage + messaging test fakes updated for new interface method) ✅
+
+**Test #81 v1 FAIL (Tecno).** Black wait remained on chat open. Architect log analysis: `SEND_TRACE encrypt_lock_wait` ran ~1.34 s before `CHAT_THREAD observe_started` — heavy side-effects (markConversationRead + profile-card sendMessage) inside the original `LaunchedEffect(conversationId)` held ratchet session_lookup + encrypt locks AHEAD of SqlDelight Flow's first query.
+
+**v1.1 fix.** Defer side-effects past first Flow emission via `firstFlowEmitReceived` flag set by a one-shot `messagesFlow.first()` collector. Pushed as commit `c0fab2b4` on `feat/pr-ui-chat-thread-state1`.
+
+**Test #81.1 v1.1 FAIL (Tecno).** SEND_TRACE no longer the bottleneck — defer worked. NEW bottleneck identified:
+
+```
+23:48:20.495  ChatScreen subscribed
+23:48:20.517  CHAT_THREAD observe_started     (+22 ms — Compose entered effects)
+23:48:21.858  CHAT_THREAD observe_emit cnt=34 (+1.341 s — Flow's first emit)
+
+23:48:44.659  ChatScreen subscribed
+23:48:44.685  CHAT_THREAD observe_started     (+26 ms)
+23:48:45.739  CHAT_THREAD observe_emit cnt=37 (+1.054 s)
+
+23:50:43.794  ChatScreen subscribed
+23:50:43.815  CHAT_THREAD observe_started     (+21 ms)
+23:50:44.625  CHAT_THREAD observe_emit cnt=38 (+0.810 s)
+```
+
+**0.8–1.3 s gap from cold-Flow subscribe to first emit on Tecno with 30–38 messages.** `collectAsState(initial = emptyList())` means ChatScreen renders the empty list first; `LazyColumn(reverseLayout = true)` anchors to that empty state until Flow emits.
+
+**Architectural conclusion:** the source-of-truth migration was correct (Flow > pull-style, all secondary acceptance scenarios PASS — incoming auto-updates, send auto-refreshes, no manual reload required). But for the chat-open UX, **cold Flow + empty initial is not enough**. ChatScreen needs a hot `StateFlow<List<MessageEntity>>` whose `.value` is already populated by the time Compose enters the screen — i.e. an in-memory message cache living OUTSIDE the Composable lifecycle.
+
+**Rule 4 fires for the third time on chat-list lifecycle:**
+- PR #217 PR-UI-CHAT-AUTOSCROLL1 — 2 attempts FAIL (scrollToItem timing)
+- PR #226 PR-UI-CHAT-BOTTOM-ANCHOR1 — 3 attempts FAIL (LazyColumn layer alone)
+- PR #228 PR-UI-CHAT-THREAD-STATE1 — 2 attempts FAIL (Flow + empty initial)
+
+→ Variant C escalation locked. Next: `PR-UI-CHAT-THREAD-CACHE1` (hot StateFlow holder).
+
+**Salvageable artefacts from `feat/pr-ui-chat-thread-state1`** (referenced by THREAD-CACHE1, not deleted):
+- `MessageRepository.observeMessages` Flow surface — keep, becomes the DB-change wire feeding the cache holder.
+- `SqlDelightMessageRepository.observeMessages` impl — keep, same reason.
+- `LazyColumn(reverseLayout = true)` + bottom anchor spacer + `asReversed()` — keep, this part works.
+- `firstFlowEmitReceived` + deferred side-effects pattern — keep, the side-effect defer is a real win.
+- `initialMessageIds` animation suppression — keep, semantics correct.
+
+What does NOT carry forward: `collectAsState(initial = emptyList())` as the top-level wiring of `messages` in ChatScreen. The new track replaces it with `holder.observe(conversationId).collectAsStateWithLifecycle(initial = holder.snapshot(conversationId))` where `snapshot` is a synchronous read of the hot cache.
+
+**Side-issue surfaced by Vladislav (out of scope for both tracks, separate PR):** when user scrolls up to read history and a new message arrives, no auto-scroll is correct UX (Vladislav-locked 2026-05-25), but no "↓ new messages" chip either. New track candidate: `PR-UI-CHAT-NEW-MSG-CHIP1` after THREAD-CACHE1 lands.
+
+APK MD5 of last v1.1 build (for reference / re-test if needed): `5d471fb1e15973f1bdbca2c00f465abe`.
 
 (empty — track queued, not yet active)
