@@ -143,7 +143,20 @@ fun ChatScreen(
         .collectAsState(initial = initialSnapshot)
 
     var inputText by remember { mutableStateOf("") }
-    val listState = rememberLazyListState()
+    // PR-UI-CHAT-THREAD-CACHE1 v1.1 — `LazyListState` keyed to `conversationId`
+    // so every chat-open starts fresh at the visual bottom. With
+    // `reverseLayout = true` the visual bottom = source index 0, so
+    // `initialFirstVisibleItemIndex = 0`. This is what Vladislav-architect
+    // requested in the Test #82 verdict: "ensure ChatScreen initial
+    // LazyListState starts at visual bottom" — implemented via initial
+    // state, NOT via a delayed `scrollToItem(...)` (that path was the
+    // PR #217 AUTOSCROLL1 anti-pattern; do not re-introduce).
+    val listState = remember(conversationId) {
+        androidx.compose.foundation.lazy.LazyListState(
+            firstVisibleItemIndex = 0,
+            firstVisibleItemScrollOffset = 0,
+        )
+    }
     var showEmojiPanel by remember { mutableStateOf(false) }
 
     // PR-UI-REC1 (2026-05-20) — Voice recording state machine.
@@ -1112,119 +1125,164 @@ fun ChatScreen(
                 .toHashSet()
         }
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 12.dp),
-            contentPadding = PaddingValues(vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
+        // PR-UI-CHAT-THREAD-CACHE1 v1.1 — `displayItems` is the newest-first
+        // SOURCE order for `LazyColumn(reverseLayout = true)`. With
+        // reverseLayout, source index 0 = visual bottom; we put a tiny
+        // `__bottom_anchor__` Spacer there so the freshest message bubble
+        // doesn't sit flush against the composer. `__e2ee__` is the LAST
+        // source item, which means it lands at the visual top of the
+        // history view (above the oldest day separator).
+        val displayItems = remember(chatItems) { chatItems.asReversed() }
 
-            // Pinned message banner — shown when at least one message is pinned
+        // PR-UI-CHAT-THREAD-CACHE1 v1.1 — `CHAT_LIST open_state` log per
+        // Vladislav-architect Test #82 verdict (need to see where
+        // LazyColumn actually opens). Fires once per chat open AFTER
+        // displayItems is non-empty (the snapshot seed delivered).
+        LaunchedEffect(conversationId, displayItems.size) {
+            if (displayItems.isNotEmpty()) {
+                Log.i(
+                    "PhantomUI",
+                    "CHAT_LIST open_state conv=${conversationId.take(8)} " +
+                        "reverseLayout=true " +
+                        "total=${displayItems.size + 2} " + // +2 = bottom anchor + e2ee
+                        "firstVisible=${listState.firstVisibleItemIndex} " +
+                        "firstOffset=${listState.firstVisibleItemScrollOffset} " +
+                        "sourceFirst=__bottom_anchor__ " +
+                        "sourceLast=__e2ee__",
+                )
+            }
+        }
+
+        // PR-UI-CHAT-THREAD-CACHE1 v1.1 — pinned banner moved OUTSIDE
+        // LazyColumn (Vladislav-locked 2026-05-26 in mini-lock §E + Test #82
+        // verdict). Sits above the scrollable chat in a Column wrap so it
+        // does NOT participate in reverseLayout source ordering. Renders
+        // when at least one message is pinned.
+        Column(modifier = Modifier.fillMaxSize()) {
             if (pinnedMessages.isNotEmpty()) {
-                item(key = "pinned_banner") {
-                    val msg = pinnedMessages.last() // most recently pinned
-                    val pinnedIndex = remember(msg.id, chatItems) {
-                        chatItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == msg.id }
-                    }
-                    val selfPubKey = container.identityState.value?.publicKeyHex
-                    val pinnerLabel = when (msg.pinnedByPubkey) {
-                        null -> "Pinned"
-                        selfPubKey -> "Pinned by you"
-                        theirPublicKeyHex -> "Pinned by $theirUsername"
-                        else -> "Pinned"
-                    }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Surface2.copy(alpha = 0.78f))
-                            .clickable {
-                                if (pinnedIndex >= 0) {
-                                    scope.launch { listState.animateScrollToItem(pinnedIndex) }
-                                }
-                            }
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Canvas(modifier = Modifier.size(16.dp)) {
-                            drawLine(
-                                color = CyanAccent,
-                                start = Offset(size.width / 2, 0f),
-                                end = Offset(size.width / 2, size.height * 0.6f),
-                                strokeWidth = 2.dp.toPx(),
-                            )
-                            drawCircle(
-                                color = CyanAccent,
-                                radius = size.width * 0.35f,
-                                center = Offset(size.width / 2, size.height * 0.3f),
-                            )
-                        }
-                        Spacer(Modifier.width(10.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = pinnerLabel,
-                                color = CyanAccent,
-                                fontSize = 10.sp,
-                                fontFamily = PhantomFontMono,
-                            )
-                            Text(
-                                text = msg.plaintextCache?.take(60) ?: "•••",
-                                color = TextDim,
-                                fontSize = 12.sp,
-                                maxLines = 1,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                            )
-                        }
-                        // Quick-unpin (local-only). Tapping the X removes the
-                        // banner without notifying the peer; for an unpin that
-                        // syncs both sides, use the message's long-press menu.
-                        Box(
-                            modifier = Modifier
-                                .clip(CircleShape)
-                                .clickable {
-                                    scope.launch {
-                                        container.messageRepo.pinMessage(
-                                            messageId = msg.id,
-                                            pinned = false,
-                                            pinnedByPubkey = null,
-                                        )
-                                        pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
-                                    }
-                                }
-                                .padding(8.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Canvas(modifier = Modifier.size(12.dp)) {
-                                val sw = 1.5.dp.toPx()
-                                drawLine(
-                                    color = TextDim,
-                                    start = Offset(0f, 0f),
-                                    end = Offset(size.width, size.height),
-                                    strokeWidth = sw,
-                                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
-                                )
-                                drawLine(
-                                    color = TextDim,
-                                    start = Offset(size.width, 0f),
-                                    end = Offset(0f, size.height),
-                                    strokeWidth = sw,
-                                    cap = androidx.compose.ui.graphics.StrokeCap.Round,
-                                )
-                            }
-                        }
-                    }
-                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
+                val pinnedMsg = pinnedMessages.last() // most recently pinned
+                val pinnedIndex = remember(pinnedMsg.id, displayItems) {
+                    displayItems.indexOfFirst { it is ChatItem.Msg && it.entity.id == pinnedMsg.id }
                 }
+                val selfPubKey = container.identityState.value?.publicKeyHex
+                val pinnerLabel = when (pinnedMsg.pinnedByPubkey) {
+                    null -> "Pinned"
+                    selfPubKey -> "Pinned by you"
+                    theirPublicKeyHex -> "Pinned by $theirUsername"
+                    else -> "Pinned"
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Surface2.copy(alpha = 0.78f))
+                        .clickable {
+                            if (pinnedIndex >= 0) {
+                                scope.launch { listState.animateScrollToItem(pinnedIndex) }
+                            }
+                        }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Canvas(modifier = Modifier.size(16.dp)) {
+                        drawLine(
+                            color = CyanAccent,
+                            start = Offset(size.width / 2, 0f),
+                            end = Offset(size.width / 2, size.height * 0.6f),
+                            strokeWidth = 2.dp.toPx(),
+                        )
+                        drawCircle(
+                            color = CyanAccent,
+                            radius = size.width * 0.35f,
+                            center = Offset(size.width / 2, size.height * 0.3f),
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = pinnerLabel,
+                            color = CyanAccent,
+                            fontSize = 10.sp,
+                            fontFamily = PhantomFontMono,
+                        )
+                        Text(
+                            text = pinnedMsg.plaintextCache?.take(60) ?: "•••",
+                            color = TextDim,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        )
+                    }
+                    // Quick-unpin (local-only). Tapping the X removes the
+                    // banner without notifying the peer; for an unpin that
+                    // syncs both sides, use the message's long-press menu.
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .clickable {
+                                scope.launch {
+                                    container.messageRepo.pinMessage(
+                                        messageId = pinnedMsg.id,
+                                        pinned = false,
+                                        pinnedByPubkey = null,
+                                    )
+                                    pinnedMessages = container.messageRepo.getPinnedMessages(conversationId)
+                                }
+                            }
+                            .padding(8.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Canvas(modifier = Modifier.size(12.dp)) {
+                            val sw = 1.5.dp.toPx()
+                            drawLine(
+                                color = TextDim,
+                                start = Offset(0f, 0f),
+                                end = Offset(size.width, size.height),
+                                strokeWidth = sw,
+                                cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                            )
+                            drawLine(
+                                color = TextDim,
+                                start = Offset(size.width, 0f),
+                                end = Offset(0f, size.height),
+                                strokeWidth = sw,
+                                cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                            )
+                        }
+                    }
+                }
+                HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
             }
 
-            lazyItems(chatItems, key = {
-                when (it) {
-                    is ChatItem.DateSep -> "__date_${it.dateKey}"
-                    is ChatItem.Msg -> it.entity.id
+            // PR-UI-CHAT-THREAD-CACHE1 v1.1 — LazyColumn(reverseLayout = true)
+            // with source order (newest-first) + __bottom_anchor__ at index 0
+            // (visual bottom) + __e2ee__ as last source item (visual top).
+            //
+            // Source mapping (Vladislav-locked 2026-05-26):
+            //   source[0]    = item("__bottom_anchor__") 8.dp     → VISUAL BOTTOM (small gap)
+            //   source[1]    = displayItems[0] (newest)           → just above bottom anchor
+            //   source[last] = item("__e2ee__")                   → VISUAL TOP
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(horizontal = 12.dp),
+                contentPadding = PaddingValues(vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                reverseLayout = true,
+            ) {
+                // VISUAL BOTTOM — tiny gap so the newest bubble doesn't sit
+                // flush against the composer.
+                item(key = "__bottom_anchor__") {
+                    Spacer(modifier = Modifier.height(8.dp))
                 }
-            }) { chatItem ->
+
+                lazyItems(displayItems, key = {
+                    when (it) {
+                        is ChatItem.DateSep -> "__date_${it.dateKey}"
+                        is ChatItem.Msg -> it.entity.id
+                    }
+                }) { chatItem ->
                 when (chatItem) {
                     is ChatItem.DateSep -> ChatDateSep(chatItem.millis, dayStartMillis)
                     is ChatItem.Msg -> {
@@ -1323,7 +1381,12 @@ fun ChatScreen(
                     }
                 }
             }
-        }
+
+                // VISUAL TOP (with reverseLayout = true, last source = top of
+                // history view). Sits above the oldest day separator.
+                item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
+            } // end LazyColumn (PR-UI-CHAT-THREAD-CACHE1 v1.1)
+        } // end Column wrap (pinned banner OUTSIDE LazyColumn)
         } // end back-swipe Box
     }
 }
