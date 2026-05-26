@@ -1236,17 +1236,36 @@ fun ChatScreen(
                     "CHAT_VIEWPORT lookup conv=${conversationId.take(8)} " +
                         "key=${savedKey.take(8)} newIndex=$newIndex",
                 )
-                if (newIndex >= 0 && (newIndex != firstIdx || savedOffset != firstOff)) {
+                if (newIndex >= 0) {
+                    // v1.4 (Test #83.3 verdict) — restore UNCONDITIONALLY when
+                    // scrolledUp + key found, even if newIndex == firstIdx.
+                    // The previous gate `newIndex != firstIdx || savedOffset
+                    // != firstOff` skipped when Compose's automatic
+                    // key-preservation kept the index stable, but the layout
+                    // sub-position (offset) still drifted by a few pixels
+                    // because new MessageBubble inserted at source[1] could
+                    // resize neighbouring rows or shift sub-item baselines.
+                    // `scrollToItem(newIndex, savedOffset)` is idempotent —
+                    // no visual jump if we're already there; corrects the
+                    // sub-pixel drift if we're not. Vladislav-architect
+                    // 2026-05-27 explicit verdict.
+                    val reason = when {
+                        newIndex != firstIdx -> "index_shift"
+                        savedOffset != firstOff -> "offset_restore"
+                        else -> "noop_idempotent"
+                    }
                     Log.i(
                         "PhantomUI",
                         "CHAT_VIEWPORT preserve_start conv=${conversationId.take(8)} " +
-                            "key=${savedKey.take(8)} oldIndex=$firstIdx oldOffset=$firstOff",
+                            "key=${savedKey.take(8)} oldIndex=$firstIdx oldOffset=$firstOff " +
+                            "reason=$reason",
                     )
                     listState.scrollToItem(newIndex, savedOffset)
                     Log.i(
                         "PhantomUI",
                         "CHAT_VIEWPORT preserve_apply conv=${conversationId.take(8)} " +
-                            "key=${savedKey.take(8)} newIndex=$newIndex offset=$savedOffset",
+                            "key=${savedKey.take(8)} newIndex=$newIndex offset=$savedOffset " +
+                            "reason=$reason",
                     )
                 }
             }
