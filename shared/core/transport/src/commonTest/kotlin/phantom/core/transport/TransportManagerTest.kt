@@ -72,7 +72,12 @@ class TransportManagerTest {
         val connected = mgr.connect()
         assertEquals(TransportKind.Tor, connected.kind)
         assertEquals(9050, connected.socksPort)
-        assertEquals(TransportKind.Tor, prefs.lastWorkingTransport)
+        // PR-RECV-DIAG1 v1.7: Tor is fallback (Private chain = [Reality, Tor]),
+        // not primary, so onSuccess must NOT save it as a sticky hint. The
+        // hint stays null and next connect attempt will walk the chain
+        // starting from Reality again instead of locking into Tor.
+        assertNull(prefs.lastWorkingTransport)
+        assertNull(prefs.lastSuccessAt)
     }
 
     @Test
@@ -111,9 +116,21 @@ class TransportManagerTest {
     }
 
     @Test
-    fun lastWorkingHintReordersChain() = runTest {
+    fun fallbackHintIsClearedAndDoesNotHoistOverPrimary() = runTest {
+        // PR-RECV-DIAG1 v1.7 (Vladislav-architect 2026-05-27, replaces the
+        // old `lastWorkingHintReordersChain` test which asserted the
+        // OPPOSITE behaviour). A previously-successful FALLBACK transport
+        // (Reality in the Standard chain — primary is Direct) must NOT be
+        // hoisted to the front of the chain. The hint is cleared on the
+        // very first reorderChain call, and the walk starts from the
+        // strategy's declared primary.
+        //
+        // Test #84.8 reproduced the broken-by-old-semantics case: Tor was
+        // saved as the hint after one network glitch, and every
+        // subsequent app start for 24h started with Tor — Direct was
+        // never even attempted. New semantics close that lock-in.
         val prefs = InMemoryTransportPreferences(PrivacyMode.Standard).apply {
-            lastWorkingTransport = TransportKind.Reality
+            lastWorkingTransport = TransportKind.Reality // a fallback, not primary
             lastSuccessAt = 0L
         }
         val probedKinds = mutableListOf<TransportKind>()
@@ -123,15 +140,47 @@ class TransportManagerTest {
             preferences = prefs,
             probe = TransportProbe { kind, _ ->
                 probedKinds += kind
-                kind == TransportKind.Reality
+                kind == TransportKind.Direct
             },
             nowMs = { TransportPreferences.LAST_SUCCESS_TTL_MS / 2 }, // hint is fresh
         )
         val connected = mgr.connect()
-        assertEquals(TransportKind.Reality, connected.kind)
-        // Reality should be the FIRST probed kind even though the chain
-        // would naturally start with Direct.
-        assertEquals(TransportKind.Reality, probedKinds.first())
+        assertEquals(TransportKind.Direct, connected.kind)
+        // First probed must be the strategy's primary (Direct), NOT the
+        // fallback hint. The hint was cleared by reorderChain.
+        assertEquals(TransportKind.Direct, probedKinds.first())
+        // After clearing, primary success re-saves the hint as Direct
+        // (the steady state — primary hints ARE allowed to stick).
+        assertEquals(TransportKind.Direct, prefs.lastWorkingTransport)
+    }
+
+    @Test
+    fun primaryHintIsKeptAndPrimaryProbesFirst() = runTest {
+        // PR-RECV-DIAG1 v1.7: when the hint matches the strategy primary
+        // (Direct for Standard), it's a valid steady-state hint and the
+        // chain is walked in declared order. This is the fast-path that
+        // doesn't change behavior — primary is always first anyway, so
+        // the hint just confirms what we'd do anyway, no reorder needed.
+        val prefs = InMemoryTransportPreferences(PrivacyMode.Standard).apply {
+            lastWorkingTransport = TransportKind.Direct // primary
+            lastSuccessAt = 0L
+        }
+        val probedKinds = mutableListOf<TransportKind>()
+        val mgr = TransportManager(
+            torServiceProvider = { fakeTor() },
+            xrayServiceProvider = { fakeXray() },
+            preferences = prefs,
+            probe = TransportProbe { kind, _ ->
+                probedKinds += kind
+                kind == TransportKind.Direct
+            },
+            nowMs = { TransportPreferences.LAST_SUCCESS_TTL_MS / 2 },
+        )
+        val connected = mgr.connect()
+        assertEquals(TransportKind.Direct, connected.kind)
+        assertEquals(TransportKind.Direct, probedKinds.first())
+        // Hint preserved across the cycle.
+        assertEquals(TransportKind.Direct, prefs.lastWorkingTransport)
     }
 
     @Test

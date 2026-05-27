@@ -133,7 +133,7 @@ class TransportManager(
             }
             if (probeOk) {
                 val totalMs = nowMs() - prepareStartMs
-                onSuccess(kind)
+                onSuccess(kind, strategy)
                 _state.value = ManagerState.Connected(kind)
                 log.info("PROBE_TRACE chain_attempt_success kind=$kind socksPort=$socksPort totalMs=$totalMs")
                 return ConnectedTransport(kind, socksPort)
@@ -160,23 +160,74 @@ class TransportManager(
     // ── Chain ordering ────────────────────────────────────────────────────────
 
     /**
-     * If a recent (`< LAST_SUCCESS_TTL_MS`) hint exists AND it is part of the
-     * strategy's chain, hoist it to the front. Otherwise return the chain as
-     * declared on [TransportStrategy]. Stale or out-of-chain hints are
-     * ignored (and cleared, so they do not pile up).
+     * Recover the strategy's preferred chain order, optionally honouring a
+     * recent successful-transport hint.
+     *
+     * PR-RECV-DIAG1 v1.7 (Vladislav-architect 2026-05-27): hint hoisting is
+     * RESTRICTED to the primary transport for the active strategy. A fallback
+     * transport that previously succeeded must NOT become sticky-primary,
+     * because that turns a single network glitch into a 24h Tor lock-in:
+     *
+     *   1. Wi-Fi has a transient issue → Direct fails → Reality fails → Tor wins.
+     *   2. onSuccess saves `lastWorkingTransport=Tor`, `lastSuccessAt=now`.
+     *   3. Network recovers (or user switches back to a healthy Wi-Fi).
+     *   4. Next app start: reorderChain hoists Tor to the front of the
+     *      Standard chain → ordered=[Tor, Direct, Reality] → Tor probe
+     *      succeeds (it always does) → Direct is never attempted.
+     *   5. onSuccess re-saves Tor → cycle repeats for up to 24 hours.
+     *
+     * Test #84.8 reproduced this exactly: Tecno on a Wi-Fi where Direct
+     * worked yesterday went immediately to Tor onion today because the
+     * previous test session had left Tor as the cached hint.
+     *
+     * New rule: a hint is only kept if it matches the strategy's primary
+     * (chain[0]). A primary-success hint just skips the no-op of probing
+     * something we already know works. Any non-primary hint (fallback)
+     * is treated as stale and cleared, so the next attempt always walks
+     * the policy chain from its declared primary.
      */
     private fun reorderChain(strategy: TransportStrategy): List<TransportKind> {
         val baseChain = strategy.chain
-        val hint = preferences.lastWorkingTransport ?: return baseChain
-        val hintAt = preferences.lastSuccessAt ?: return baseChain
-        val isFresh = nowMs() - hintAt < TransportPreferences.LAST_SUCCESS_TTL_MS
+        val primary = baseChain.first()
+        val hint = preferences.lastWorkingTransport
+        val hintAt = preferences.lastSuccessAt
+        log.info(
+            "PROBE_TRACE hint_read hint=$hint hintAt=$hintAt primary=$primary " +
+                "privacyMode=${preferences.privacyMode} base=$baseChain",
+        )
+        if (hint == null || hintAt == null) return baseChain
+
+        val ageMs = nowMs() - hintAt
+        val isFresh = ageMs in 0 until TransportPreferences.LAST_SUCCESS_TTL_MS
         if (!isFresh) {
+            log.info(
+                "PROBE_TRACE hint_ignored hint=$hint reason=stale ageMs=$ageMs",
+            )
             preferences.lastWorkingTransport = null
             preferences.lastSuccessAt = null
             return baseChain
         }
-        if (hint !in baseChain) return baseChain
-        return listOf(hint) + baseChain.filter { it != hint }
+        if (hint !in baseChain) {
+            log.info(
+                "PROBE_TRACE hint_ignored hint=$hint reason=out_of_chain base=$baseChain",
+            )
+            preferences.lastWorkingTransport = null
+            preferences.lastSuccessAt = null
+            return baseChain
+        }
+        if (hint != primary) {
+            log.info(
+                "PROBE_TRACE hint_ignored hint=$hint reason=fallback_hint " +
+                    "primary=$primary ageMs=$ageMs",
+            )
+            preferences.lastWorkingTransport = null
+            preferences.lastSuccessAt = null
+            return baseChain
+        }
+        log.info(
+            "PROBE_TRACE hint_kept hint=$hint reason=primary_match ageMs=$ageMs",
+        )
+        return baseChain
     }
 
     // ── Subsystem lifecycle ───────────────────────────────────────────────────
@@ -528,9 +579,30 @@ class TransportManager(
 
     // ── Hint maintenance ──────────────────────────────────────────────────────
 
-    private fun onSuccess(kind: TransportKind) {
-        preferences.lastWorkingTransport = kind
-        preferences.lastSuccessAt = nowMs()
+    /**
+     * Persist a hint about the just-succeeded transport — but ONLY if it
+     * matches the strategy's primary. PR-RECV-DIAG1 v1.7
+     * (Vladislav-architect 2026-05-27): a fallback success must not
+     * become sticky-primary on subsequent app starts; see [reorderChain]
+     * KDoc for the full Tor-lock-in cycle this prevents.
+     *
+     * Always resets `transportFailureCount` regardless of which transport
+     * succeeded — any working transport is proof that we recovered from
+     * whatever the failure streak was tracking.
+     */
+    private fun onSuccess(kind: TransportKind, strategy: TransportStrategy) {
+        val primary = strategy.chain.first()
+        if (kind == primary) {
+            preferences.lastWorkingTransport = kind
+            preferences.lastSuccessAt = nowMs()
+            log.info("PROBE_TRACE hint_saved kind=$kind reason=primary_success")
+        } else {
+            preferences.lastWorkingTransport = null
+            preferences.lastSuccessAt = null
+            log.info(
+                "PROBE_TRACE hint_not_saved kind=$kind reason=fallback_success primary=$primary",
+            )
+        }
         preferences.transportFailureCount = 0
     }
 
