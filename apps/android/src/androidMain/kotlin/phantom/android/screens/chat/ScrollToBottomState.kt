@@ -58,6 +58,16 @@ class ScrollToBottomState internal constructor(
 
     val count: Int get() = countState
 
+    /**
+     * PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — first unread id from arrival-order
+     * LinkedHashSet. Used by ChatScreen's chip-tap handler to (1) unfreeze
+     * the displayed timeline, then (2) on next recomposition scroll the
+     * LazyColumn to this id's new source index. Read-only getter; no side
+     * effects. Returns null when count == 0 (chip tap with empty unread
+     * → scroll to latest source[0]).
+     */
+    val firstUnreadId: String? get() = unread.firstOrNull()
+
     val visible: Boolean by derivedStateOf {
         listState.firstVisibleItemIndex > 0 ||
             listState.firstVisibleItemScrollOffset > 0
@@ -96,6 +106,25 @@ class ScrollToBottomState internal constructor(
             )
         }
         listState.animateScrollToItem(0)
+    }
+
+    /**
+     * PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — pure state reset for the chip after
+     * a tap has been initiated. ChatScreen handles the actual scroll
+     * (because it needs to unfreeze displayedMessages first then scroll
+     * once Compose has re-composed with the new source list). This
+     * method is the side-effect of the tap that doesn't depend on
+     * post-unfreeze layout.
+     */
+    fun clearAfterTap() {
+        if (unread.isNotEmpty() || countState != 0) {
+            unread.clear()
+            countState = 0
+            Log.i(
+                "PhantomUI",
+                "CHAT_CHIP hidden conv=${conversationId.take(8)} reason=tap",
+            )
+        }
     }
 
     /**

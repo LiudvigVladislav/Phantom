@@ -144,6 +144,42 @@ fun ChatScreen(
         .observe(conversationId)
         .collectAsState(initial = initialSnapshot)
 
+    // PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — FREEZE displayed timeline while
+    // user is scrolled-up. Vladislav-architect 2026-05-27 verdict on
+    // Test #83.5: post-factum viewport preservation (whether via
+    // scrollToItem or requestScrollToItem) consistently arrives AFTER
+    // LazyColumn has re-measured with the new source list, so the
+    // user sees the visible drift before our correction kicks in.
+    //
+    // Architecturally cleaner alternative: when the user is reading
+    // history, the rendered LazyColumn source must NOT change. New
+    // incoming messages still arrive in `messages` (cache + holder),
+    // and the chip badge counter still increments via the chipIncoming
+    // flow — but the LazyColumn keeps showing the FROZEN snapshot
+    // until the user explicitly returns to the bottom or taps the
+    // chip. With frozen source, indices don't shift and no jump can
+    // happen.
+    //
+    // `frozenMessages` captures `messages` at the moment the user
+    // scrolls away from the visual bottom. While non-null,
+    // `displayedMessages = frozenMessages`. On chip tap or
+    // return-to-bottom or own-send, ChatScreen sets frozenMessages =
+    // null, which lets the LazyColumn re-render with the live latest
+    // list.
+    var frozenMessages by remember(conversationId) {
+        mutableStateOf<List<MessageEntity>?>(null)
+    }
+    val displayedMessages: List<MessageEntity> = frozenMessages ?: messages
+
+    // Pending scroll target id for the "tap chip → unfreeze → scroll to
+    // first unread" flow. Setting this in the tap onClick handler kicks
+    // a LaunchedEffect that waits for frozenMessages = null then resolves
+    // the target id to its new source index in the post-unfreeze
+    // sourceKeys list.
+    var pendingFirstUnread by remember(conversationId) {
+        mutableStateOf<String?>(null)
+    }
+
     var inputText by remember { mutableStateOf("") }
     // PR-UI-CHAT-THREAD-CACHE1 v1.1 — `LazyListState` keyed to `conversationId`
     // so every chat-open starts fresh at the visual bottom. With
@@ -461,11 +497,11 @@ fun ChatScreen(
                         ).show()
                     } else {
                         reloadMessages()
-                        // PR-UI-CHAT-NEW-MSG-CHIP1 — own voice send clears the
-                        // new-messages count + auto-scrolls to visual bottom
-                        // (source index 0 in reverseLayout=true). Vladislav-
-                        // locked behaviour: user's own send = "I want to be
-                        // at the latest". Matches Telegram + Signal.
+                        // PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — unfreeze BEFORE
+                        // scroll so the LazyColumn renders the latest list
+                        // including this just-sent voice. onOwnSend()
+                        // then scrolls to source[0] (visual bottom).
+                        frozenMessages = null
                         scrollToBottomState.onOwnSend()
                     }
                 } finally {
@@ -1098,7 +1134,11 @@ fun ChatScreen(
                                     )
                                 )
                                 reloadMessages()
-                                // PR-UI-CHAT-NEW-MSG-CHIP1 — own text send.
+                                // PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — own text send.
+                                // Unfreeze first so LazyColumn renders this
+                                // new message; then onOwnSend() scrolls to
+                                // source[0].
+                                frozenMessages = null
                                 scrollToBottomState.onOwnSend()
                             }
                         }
@@ -1130,11 +1170,16 @@ fun ChatScreen(
         // "TODAY" → "YESTERDAY" without requiring a navigation refresh.
         val dayStartMillis = rememberDayStartMillis()
 
-        // Pre-process: filter out invisible profile cards, then inject date separators
-        val chatItems = remember(messages) {
+        // Pre-process: filter out invisible profile cards, then inject date separators.
+        // PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — keyed on `displayedMessages`
+        // (= `frozenMessages ?: messages`). While the user is scrolled-up
+        // and frozenMessages is non-null, this list does NOT rebuild on
+        // every incoming — the LazyColumn source stays put, the chip
+        // badge counter is the only thing that updates.
+        val chatItems = remember(displayedMessages) {
             buildList<ChatItem> {
                 var lastDate = ""
-                messages
+                displayedMessages
                     .filter { msg -> !(msg.plaintextCache?.startsWith(PROFILE_MSG_PREFIX) ?: false) }
                     .forEach { msg ->
                         val dk = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
@@ -1295,6 +1340,80 @@ fun ChatScreen(
                     viewportKeyRef.value = sourceKeys.getOrNull(idx)
                     viewportOffsetRef.intValue = off
                 }
+            }
+        }
+
+        // PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — FREEZE / UNFREEZE displayed
+        // timeline. Architect-mandated mechanism after Test #83.5.
+        //
+        // FREEZE trigger: user scrolls away from visual bottom while
+        //   frozenMessages is null. We capture the CURRENT messages list
+        //   (snapshot of what the LazyColumn was showing) and pin it as
+        //   displayedMessages. Subsequent live messages updates from
+        //   the holder DO update `messages`, but `displayedMessages =
+        //   frozenMessages` doesn't see them, so chatItems/displayItems/
+        //   sourceKeys do not rebuild — LazyColumn renders unchanged.
+        //
+        // UNFREEZE trigger: user returns to visual bottom (firstVisible
+        //   == 0 && offset == 0) — chip is supposed to hide here anyway.
+        //   We set frozenMessages = null and the next recomposition
+        //   picks up the latest live messages.
+        //
+        // Tap and own-send paths unfreeze imperatively from their
+        // respective handlers (see chip onClick below + onOwnSend send
+        // paths). The LaunchedEffect below only handles the scroll-back-
+        // to-bottom case.
+        LaunchedEffect(listState, conversationId) {
+            androidx.compose.runtime.snapshotFlow {
+                listState.firstVisibleItemIndex == 0 &&
+                    listState.firstVisibleItemScrollOffset == 0
+            }.collect { atBottom ->
+                if (!atBottom && frozenMessages == null) {
+                    // User just left the bottom — freeze the current list.
+                    frozenMessages = messages
+                    Log.i(
+                        "PhantomUI",
+                        "CHAT_FREEZE start conv=${conversationId.take(8)} " +
+                            "count=${messages.size} reason=scroll_up",
+                    )
+                } else if (atBottom && frozenMessages != null) {
+                    // User scrolled back to bottom — unfreeze.
+                    val frozen = frozenMessages
+                    frozenMessages = null
+                    Log.i(
+                        "PhantomUI",
+                        "CHAT_FREEZE end conv=${conversationId.take(8)} " +
+                            "wasCount=${frozen?.size} nowCount=${messages.size} " +
+                            "reason=at_bottom",
+                    )
+                }
+            }
+        }
+
+        // PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — handle the "tap chip → unfreeze
+        // → scroll to first unread" two-step flow. The chip onClick
+        // handler sets pendingFirstUnread and zeroes frozenMessages.
+        // This LaunchedEffect waits for both conditions then computes
+        // the source index of the first-unread id IN THE NEW sourceKeys
+        // (post-unfreeze) and animates the scroll. sourceKeys is the
+        // post-recomposition value because we depend on `sourceKeys`
+        // in the keys list.
+        LaunchedEffect(pendingFirstUnread, frozenMessages, sourceKeys) {
+            val target = pendingFirstUnread
+            if (target != null && frozenMessages == null) {
+                // displayedMessages = messages now; sourceKeys reflects latest.
+                val sourceIdx = sourceKeys.indexOf(target)
+                Log.i(
+                    "PhantomUI",
+                    "CHAT_FREEZE unfreeze_scroll conv=${conversationId.take(8)} " +
+                        "key=${target.take(8)} sourceIdx=$sourceIdx",
+                )
+                if (sourceIdx >= 0) {
+                    listState.animateScrollToItem(sourceIdx)
+                } else {
+                    listState.animateScrollToItem(0)
+                }
+                pendingFirstUnread = null
             }
         }
 
@@ -1561,9 +1680,33 @@ fun ChatScreen(
         ScrollToBottomButton(
             state = scrollToBottomState,
             onClick = {
-                scope.launch {
-                    scrollToBottomState.onTap(displayItems = chatItems.asReversed())
-                }
+                // PR-UI-CHAT-NEW-MSG-CHIP1 v1.6 — two-step tap flow with
+                // freeze unwind. Sequence:
+                //   1. Capture firstUnreadId BEFORE clearing the chip's
+                //      unread set. If null (count was 0), we just want
+                //      to scroll to latest (source[0]).
+                //   2. Set pendingFirstUnread + unfreeze frozenMessages.
+                //   3. The CHAT_FREEZE unfreeze_scroll LaunchedEffect
+                //      reacts to (pendingFirstUnread, frozenMessages=null,
+                //      sourceKeys) by computing the target's new source
+                //      index and animating the scroll.
+                //   4. ScrollToBottomState.clearAfterTap() clears the
+                //      chip count + logs CHAT_CHIP hidden reason=tap.
+                //   5. The chip animatedVisibility exits because
+                //      `visible` (derivedStateOf on listState) flips to
+                //      false once the scroll lands the user back at
+                //      source[0] OR onto the first unread message.
+                val firstUnread = scrollToBottomState.firstUnreadId
+                Log.i(
+                    "PhantomUI",
+                    "CHAT_CHIP tap conv=${conversationId.take(8)} " +
+                        "count=${scrollToBottomState.count} " +
+                        "target=${if (firstUnread != null) "first_unread" else "latest"} " +
+                        "firstUnreadId=${firstUnread?.take(8) ?: "—"}",
+                )
+                pendingFirstUnread = firstUnread ?: "__bottom_anchor__"
+                frozenMessages = null
+                scrollToBottomState.clearAfterTap()
             },
             modifier = Modifier
                 .align(Alignment.BottomEnd)
