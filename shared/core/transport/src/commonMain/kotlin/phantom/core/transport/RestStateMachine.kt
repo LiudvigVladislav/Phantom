@@ -84,6 +84,7 @@ class RestStateMachine(
             is Event.WsOutboundAckReceived -> onWsOutboundAck()
             is Event.WsAliveTickElapsed -> onAliveTick()
             is Event.ActiveOutboundAckTimeout -> onActiveOutboundAckTimeout(event)
+            is Event.InboundIdleTimeout -> onInboundIdleTimeout(event)
         }
     }
 
@@ -198,6 +199,35 @@ class RestStateMachine(
         }
     }
 
+    /**
+     * PR-RECV-DIAG1 v1.6 — inbound-stall fallback. Test #84.7 proved a
+     * real production-class gap: Tecno-side WS handshake succeeds, but
+     * NO server-pushed frames arrive (no ack, no pong, no deliver). The
+     * existing fallback triggers (WsSessionEnded count, outbound ACK
+     * deadline) only fire after the user TRIES to send. If the user
+     * only WAITS for incoming, the device stays stuck in WsActive
+     * forever — for 60+120+180+ seconds with `inbound_frames=0`,
+     * confirmed in test84_7-tecno.log idle_watchdog lines.
+     *
+     * This event is emitted by [KtorRelayTransport.startIdleWatchdog]
+     * once per session when `sinceLastInbound >= INBOUND_STALL_THRESHOLD_MS`.
+     * The handler forces the same WsActive → RestActive transition the
+     * outbound ack timeout uses, so REST poll picks up the envelope
+     * relay already mirrored via `mirror_envelope_to_rest_store`.
+     *
+     * In RestActive or WsCandidate it's a no-op: those modes already
+     * have an active poll loop or are transitioning out, so the
+     * inbound-stall signal carries no additional information.
+     */
+    private fun onInboundIdleTimeout(event: Event.InboundIdleTimeout) {
+        when (_state.value) {
+            RestMode.WsActive -> transitionToRest("inbound_idle_timeout")
+            RestMode.RestActive, RestMode.WsCandidate -> {
+                // Already migrated or in candidate — no-op.
+            }
+        }
+    }
+
     // ── Transition helpers ───────────────────────────────────────────────────
 
     private fun transitionToRest(reason: String) {
@@ -293,6 +323,24 @@ class RestStateMachine(
          * accumulating independently as a safety net.
          */
         data class ActiveOutboundAckTimeout(val msgId: String, val ageMs: Long) : Event()
+
+        /**
+         * PR-RECV-DIAG1 v1.6 — WS is open and was healthy enough for
+         * handshake, but no inbound Frame.Text has been received for
+         * [sinceLastInboundMs] >= [INBOUND_STALL_THRESHOLD_MS] (60 s).
+         * This is the "half-dead inbound" production case observed in
+         * test #84.7: Tecno's WS stays connected indefinitely, but
+         * relay→Tecno frames (ack, pong, deliver) never arrive. The
+         * existing fail-counter and outbound-ack-timeout paths can't
+         * detect this case because no session-end happens and no
+         * outbound is in flight.
+         *
+         * Emitted by [KtorRelayTransport.startIdleWatchdog] once per WS
+         * session (re-armed on each new session via the per-session
+         * pingJob restart). Forwarded by [HybridRelayTransport] into
+         * the state machine. Handler: see [onInboundIdleTimeout].
+         */
+        data class InboundIdleTimeout(val sinceLastInboundMs: Long) : Event()
     }
 
     companion object {

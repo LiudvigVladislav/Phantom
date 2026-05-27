@@ -420,6 +420,31 @@ class HybridRelayTransport(
                 )
             }
         }
+
+        // PR-RECV-DIAG1 v1.6 — inbound-stall fast-path. Forwards the new
+        // half-dead-inbound signal from KtorRelayTransport.startIdleWatchdog
+        // into the state machine. Without this, a WS session that
+        // hand-shook successfully but receives no server-pushed frames
+        // (test #84.7 case) keeps the device stuck in WsActive
+        // indefinitely — REST poll never starts, queued envelopes in
+        // mirror_envelope_to_rest_store never get pulled.
+        //
+        // Same short-circuits as the outboundAckDeadlineExpired path:
+        // skip when REST capability not yet bootstrapped, skip when
+        // state has already moved away from WsActive (state machine
+        // would no-op anyway, but cheap fast-path here avoids
+        // submitStateEvent's lock acquisition).
+        scope.launch {
+            wsTransport.inboundStalled.collect { event ->
+                if (!restCapabilityActive) return@collect
+                if (stateMachine.current != RestMode.WsActive) return@collect
+                submitStateEvent(
+                    RestStateMachine.Event.InboundIdleTimeout(
+                        sinceLastInboundMs = event.sinceLastInboundMs,
+                    )
+                )
+            }
+        }
     }
 
     /**

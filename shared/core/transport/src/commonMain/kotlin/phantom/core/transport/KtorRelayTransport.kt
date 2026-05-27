@@ -86,6 +86,15 @@ data class WsSessionEndedEvent(
  */
 data class OutboundAckDeadlineExpiredEvent(val msgId: String, val ageMs: Long)
 
+/**
+ * PR-RECV-DIAG1 v1.6 — emitted by [KtorRelayTransport.startIdleWatchdog]
+ * once per WS session when `sinceLastInbound >=
+ * [RelayTransportConfig.INBOUND_STALL_THRESHOLD_MS]` (60 s by default).
+ * Signals the "half-dead inbound" case where WS handshake succeeded but
+ * no server-pushed frames arrive.
+ */
+data class InboundStalledEvent(val sinceLastInboundMs: Long)
+
 class KtorRelayTransport(
     /**
      * Factory that builds a fresh [HttpClient] each call, optionally
@@ -161,6 +170,18 @@ class KtorRelayTransport(
         )
     val outboundAckDeadlineExpired: SharedFlow<OutboundAckDeadlineExpiredEvent> =
         _outboundAckDeadlineExpired.asSharedFlow()
+
+    // PR-RECV-DIAG1 v1.6 — emitted once per WS session when the read
+    // loop has not seen any Frame.Text for INBOUND_STALL_THRESHOLD_MS
+    // (60 s). The orchestrator forwards this into the state machine
+    // as Event.InboundIdleTimeout, which transitions WsActive → REST
+    // even though no outbound is in flight. Re-armed at each new
+    // session via the per-session pingJob restart.
+    private val _inboundStalled = MutableSharedFlow<InboundStalledEvent>(
+        replay = 0,
+        extraBufferCapacity = 4,
+    )
+    val inboundStalled: SharedFlow<InboundStalledEvent> = _inboundStalled.asSharedFlow()
 
     private val _typingEvents = MutableSharedFlow<String>(
         replay = 0,
@@ -963,6 +984,15 @@ class KtorRelayTransport(
     private fun startIdleWatchdog(scope: CoroutineScope, mySession: Long) {
         pingJob = scope.launch {
             var lastLoggedAt = TimeSource.Monotonic.markNow()
+            // PR-RECV-DIAG1 v1.6 — emit-once flag per session. The
+            // half-dead-inbound condition is sticky: once we cross the
+            // threshold we want to fire ONE InboundStalledEvent and let
+            // the state machine handle it. If we kept emitting every
+            // 10 s, the state machine would log redundant transitions
+            // and the REST poll loop would get noisier than necessary.
+            // Re-armed automatically when a new session calls
+            // startIdleWatchdog because pingJob is replaced.
+            var inboundStallEmitted = false
             while (isActive) {
                 delay(RelayTransportConfig.PING_INTERVAL_MS)  // 10 s poll cadence
                 val sinceLastInbound = lastInboundFrameMark.elapsedNow().inWholeMilliseconds
@@ -980,6 +1010,35 @@ class KtorRelayTransport(
                             "sinceLastPong=${sinceLastPong}ms " +
                             "pendingAcks=${pending} — no reconnect action (R0.4b)",
                     )
+                }
+
+                // PR-RECV-DIAG1 v1.6 — fire InboundStalledEvent once per
+                // session when the read loop has not seen any Frame.Text
+                // for INBOUND_STALL_THRESHOLD_MS. This is the real
+                // production-class trigger that test #84.7 isolated:
+                // WS open, outbound works, but inbound silently dropped.
+                // The orchestrator forwards this into the state machine.
+                if (!inboundStallEmitted &&
+                    sinceLastInbound >= RelayTransportConfig.INBOUND_STALL_THRESHOLD_MS
+                ) {
+                    inboundStallEmitted = true
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "${genTag(mySession)} inbound_stall_detected " +
+                            "sinceLastInbound=${sinceLastInbound}ms — emitting " +
+                            "InboundStalledEvent (REST fallback should activate)",
+                    )
+                    _inboundStalled.tryEmit(InboundStalledEvent(sinceLastInbound))
+                }
+
+                // Reset emit flag if traffic resumes mid-session (e.g. WS
+                // recovers without a session-end + reconnect). Lets us
+                // re-fire on the next stall window if the WS goes
+                // half-dead again later.
+                if (inboundStallEmitted &&
+                    sinceLastInbound < RelayTransportConfig.INBOUND_STALL_THRESHOLD_MS / 2
+                ) {
+                    inboundStallEmitted = false
                 }
                 // No forceReconnect here. OkHttp Ping onFailure handles real
                 // dead sockets. ACK watchdog handles the pending-ack timeout.

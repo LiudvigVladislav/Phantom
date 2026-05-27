@@ -54,45 +54,28 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // The relay's Message::Ping arm in routes.rs (PR-F2-relay) already
         // handles WS-protocol Ping correctly: pong on the same socket.
         //
-        // PR-RECV-DIAG1 v1.3 (Test #84.3 verdict, 2026-05-27) — A/B disable.
-        // Tecno-side WS sessions die every ~31s with
-        // `SocketTimeoutException: sent ping but didn't receive pong
-        // within 15000ms`. session_summary shows `inbound_frames=0,
-        // delivers_received=0, pings_sent=0, pongs_received=0` across
-        // every session — so OkHttp's WS-protocol Ping doesn't actually
-        // see a Pong back from the relay (or it's being eaten by an
-        // intermediate proxy / CDN / OEM Wi-Fi). Disabling the OkHttp
-        // ping is a diagnostic: if Tecno WS stays connected for >30s
-        // after this change, the killer was the ping/pong cycle itself
-        // and the fix needs a different heartbeat strategy. If WS
-        // still dies, the issue is below WS-control-frame level (TCP
-        // idle / nat / proxy timeout).
+        // PR-RECV-DIAG1 v1.6 (2026-05-27) — REVERTED back to 15s.
+        // v1.3 disabled this to 0L as a diagnostic A/B. Test #84.4 proved
+        // disabling ping made things WORSE: with no ping, WS never dies
+        // → WsSessionEnded events never fire → ACTIVE_FAIL_THRESHOLD
+        // counter never increments → automatic REST fallback never
+        // activates. The "31s ping/pong cycle" we saw was actually a
+        // useful failover signal that we accidentally suppressed.
         //
-        // 0L is OkHttp's documented "no automatic ping" value.
-        .pingInterval(0L, TimeUnit.MILLISECONDS)
-        // PR-RECV-DIAG1 v1.4 (Test #84.4 verdict 2026-05-27) — A/B
-        // disable read timeout. With ping disabled at v1.3, the next
-        // killer surfaced: a plain `SocketTimeoutException: timeout`
-        // exactly ~61 s after WS connect, session_summary
-        // `inbound_frames=0 pings_sent=0`. That's THIS readTimeout
-        // firing on an idle WS socket. With pingInterval(0) there's
-        // no traffic for OkHttp's read pipeline to see, so the read
-        // pump hits the 60s mark and aborts.
-        //
-        // 0L = "no timeout". For a WS client this is the standard
-        // configuration — the connection is long-lived idle and
-        // explicit close from either side is the only termination
-        // signal we want.
-        //
-        // Risk note: this OkHttpClient is shared by the Ktor HttpClient
-        // factory that also handles REST short-poll fallback (PR-D0r/
-        // D1d). REST requests have their own per-request timeout via
-        // Ktor's HttpRequestBuilder.timeout, so removing the OkHttp
-        // read backstop here does NOT make REST hang forever on a
-        // broken connection. Confirmed by inspecting RestPoller in
-        // shared/core/transport — every poll attempt sets its own
-        // requestTimeoutMillis.
-        .readTimeout(0L, TimeUnit.MILLISECONDS)
+        // 15s is the baseline that worked during CHIP1 testing (test83)
+        // when messages were flowing both ways. The real fix for the
+        // half-dead-inbound case is the new InboundIdleTimeout event
+        // added to RestStateMachine — it gives a fast-path to REST
+        // even when WS keeps reconnecting on ping timeout, AND covers
+        // the case where WS connects but inbound is silent.
+        .pingInterval(15_000L, TimeUnit.MILLISECONDS)
+        // PR-RECV-DIAG1 v1.6 (2026-05-27) — REVERTED back to 60s.
+        // v1.4 set this to 0L as a follow-up A/B after v1.3 disabled
+        // pingInterval. Re-enabling pingInterval(15s) in v1.6 makes
+        // readTimeout the OS-level backstop again, exactly as ADR-010
+        // intended. Restoring this also restores predictable
+        // session-end behavior on truly broken connections.
+        .readTimeout(60, TimeUnit.SECONDS)
         // connectTimeout is per-path. Direct WSS keeps the OkHttp default
         // (10 s) — relay.phntm.pro resolves and connects in <500 ms on a
         // healthy network, longer means real outage. SOCKS-proxied paths

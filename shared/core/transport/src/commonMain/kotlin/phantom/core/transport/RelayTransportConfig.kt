@@ -90,6 +90,16 @@ object RelayTransportConfig {
      */
     const val ACK_DEADLINE_MS = 10_000L
 
+    /**
+     * PR-RECV-DIAG1 v1.6 — inbound-stall threshold. If the WS read loop
+     * has not seen any Frame.Text for this duration, the idle watchdog
+     * emits an `InboundStalledEvent` and the state machine transitions
+     * WsActive → RestActive. 60 s is the same threshold the idle
+     * watchdog already uses for its diagnostic log, so this is just
+     * promoting that log into an actionable signal.
+     */
+    const val INBOUND_STALL_THRESHOLD_MS = 60_000L
+
     // PR-H1e (2026-05-14) — app-level Ping disabled in production.
     //
     // The diagnostic sprint isolated each heartbeat layer (app Ping,
