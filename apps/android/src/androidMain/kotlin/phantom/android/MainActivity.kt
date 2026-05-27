@@ -90,6 +90,30 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // PR-RECV-DIAG1 v1.1 — re-request the foreground service on every
+        // onResume. On aggressive OEM kills (HiOS / MIUI / OneUI) the
+        // service can be reaped between onCreate and the user returning
+        // to the app, so a defensive `startForegroundService` here is
+        // idempotent (Android merges concurrent intents) and ensures we
+        // recover. Service-side `RECV_DIAG service_onStartCommand` will
+        // show whether the call actually woke the service.
+        Log.i(
+            "PhantomMessaging",
+            "RECV_DIAG mainActivity_onResume service_start_request source=onResume",
+        )
+        try {
+            startForegroundService(Intent(this, PhantomMessagingService::class.java))
+            Log.i(
+                "PhantomMessaging",
+                "RECV_DIAG mainActivity_service_start_ok source=onResume",
+            )
+        } catch (t: Throwable) {
+            Log.e(
+                "PhantomMessaging",
+                "RECV_DIAG mainActivity_service_start_fail source=onResume " +
+                    "err=${t::class.simpleName} msg=${t.message}",
+            )
+        }
         val prefs = getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
         if (prefs.getBoolean("app_lock_enabled", false)) {
             // User-configurable threshold — see Settings → App Lock → Auto-lock.
@@ -114,6 +138,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.d("PHANTOM_INIT", "MainActivity onCreate")
+        // PR-RECV-DIAG1 v1.1 — mirror MainActivity lifecycle into the
+        // PhantomMessaging tag so Test #84 can prove (a) MainActivity
+        // is actually running on Tecno (where we suspect the OS is
+        // killing the service silently) and (b) startForegroundService
+        // returned without throwing. The corresponding service_onCreate
+        // log lives in PhantomMessagingService.
+        Log.i(
+            "PhantomMessaging",
+            "RECV_DIAG mainActivity_onCreate pid=${android.os.Process.myPid()}",
+        )
         // Block screenshots, screen recording, and the recents-thumbnail preview.
         // FLAG_SECURE on the only Activity in the app is sufficient — there are
         // no other Activity classes (one ComponentActivity, all screens are
@@ -125,7 +159,23 @@ class MainActivity : ComponentActivity() {
         )
         // Start the foreground service that owns the WebSocket connection lifetime.
         // The service awaits app.ready internally, so it is safe to launch before init completes.
-        startForegroundService(Intent(this, PhantomMessagingService::class.java))
+        Log.i(
+            "PhantomMessaging",
+            "RECV_DIAG mainActivity_service_start_request source=onCreate",
+        )
+        try {
+            startForegroundService(Intent(this, PhantomMessagingService::class.java))
+            Log.i(
+                "PhantomMessaging",
+                "RECV_DIAG mainActivity_service_start_ok source=onCreate",
+            )
+        } catch (t: Throwable) {
+            Log.e(
+                "PhantomMessaging",
+                "RECV_DIAG mainActivity_service_start_fail source=onCreate " +
+                    "err=${t::class.simpleName} msg=${t.message}",
+            )
+        }
         val app = application as PhantomApplication
         // Read notification extras once — intent is immutable after activity creation.
         val notifConversationId = intent.getStringExtra(PhantomNotificationManager.EXTRA_CONVERSATION_ID)
