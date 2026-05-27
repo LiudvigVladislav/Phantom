@@ -78,15 +78,34 @@ Discoveries that surface during current work go straight into `PROJECT_LOG.md`. 
 
 Logging a finding takes 30 seconds. Building a fix for it takes hours, and worse, drags the current track off-course. The current track closes first; the new finding gets its own mini-lock and its own slot in the track queue.
 
+## 8. Transport regression gate
+
+Any Android transport PR that changes **chain selection, reconnect lifecycle, network-change handling, probes, or WS/REST fallback behaviour** must include a real-device Tele2 LTE smoke test before merge, or explicitly document in the mini-lock why that gate is not applicable.
+
+A Wi-Fi-only PASS is **not sufficient** for these PRs. Wi-Fi is too permissive — Direct WS succeeds, the chain never falls through, and the REST fallback path that exists precisely *for* hostile carriers is never exercised. Tele2 LTE Иркутская is the closest carrier we test against on a regular basis; a Tele2 PASS proves that the fallback machinery actually runs.
+
+This rule is **deliberately narrow**. It does NOT apply to:
+
+- Docs / mini-lock / WORKING_RULES PRs that only describe transport (no behaviour change).
+- UI PRs that don't touch the transport surface.
+- Crypto PRs whose only transport touch is reading session state.
+- Test refactors / fixture cleanups that don't change runtime paths.
+- Trivial transport-adjacent fixes (typo in a log line, dead-code removal, renaming a private field).
+
+The author of a transport-touching PR makes the call in the mini-lock: either "Test #N on Tele2 LTE is the acceptance test", or "this PR does not exercise Tele2-relevant paths because <reason>". Reviewers verify that explanation matches the actual diff.
+
+Why this rule exists: PR-RECV-DIAG1 (#234) shipped after Test #86 PASS on Wi-Fi only. On Tele2 LTE the same APK could not deliver messages — a regression that an explicit Tele2 gate would have caught before merge. The fix for that regression is `PR-LTE-NETCHANGE1` (mini-lock at `docs/tracks/lte-netchange.md`).
+
 ---
 
 ## How these rules interact
 
-Together the seven rules form a single flow:
+Together the eight rules form a single flow:
 
 1. New track → write a mini-lock (rule 3) → feature branch → one-layer PR (rule 2) → merge → log entry (rule 6) → track closes.
 2. New finding during the track → log entry only (rule 7), no parallel work (rule 1).
 3. Track stuck twice on architecture → park (rule 4) → log the parking reason (rule 6) → restart with new mini-lock (rule 3).
 4. Track interrupted → hand-off note in the mini-lock (rule 5) → resume later.
+5. PR touches Android transport behaviour → Tele2 LTE smoke test (rule 8) before merge, or documented carve-out in the mini-lock.
 
 The rules are simple. The discipline is in applying them every time, especially under pressure.
