@@ -47,13 +47,18 @@ jobs:
             exit 1
           fi
 
-      # Full clone with all branches + tags so the mirror is complete,
-      # not just a single-commit shallow snapshot.
-      - name: Checkout full history
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
+      # Bare mirror clone of the GitHub repo. Using `git clone --mirror`
+      # instead of `actions/checkout@v4` matters because a non-bare clone
+      # stores fetched branches under `refs/remotes/origin/*` locally, and
+      # `git push --mirror` then pushes them to the destination under that
+      # same namespace — so Codeberg's web UI (which only displays
+      # `refs/heads/*` as branches) sees only `master` and the feature
+      # branches "disappear". A bare mirror clone places all refs under
+      # `refs/heads/*` locally; `git push --mirror` then sends them as
+      # proper branches on the destination side. Tags + branch deletion
+      # propagation are unchanged.
+      - name: Bare mirror clone of GitHub repo
+        run: git clone --mirror "https://github.com/${{ github.repository }}.git" phantom-mirror
 
       - name: Set up SSH for Codeberg
         run: |
@@ -70,6 +75,7 @@ jobs:
           chmod 600 ~/.ssh/config
 
       - name: Push to Codeberg mirror
+        working-directory: phantom-mirror
         run: |
           git remote add codeberg "${{ vars.CODEBERG_REPO_URL }}"
           # --mirror sends every ref (branches, tags) and removes anything
