@@ -50,61 +50,85 @@ Log on every accepted (post-debounce) change:
 NETWORK_TRACE changed old=<wifi|cellular|vpn|none> new=<wifi|cellular|vpn|none> validated=<bool> vpnActive=<bool>
 ```
 
-### Step 3 — On meaningful change, do the rewalk
+### Step 3 — On meaningful change, run the `TransportRewalkCoordinator` (lives outside HybridRelayTransport)
 
-In order, all in the same coroutine block:
+Introduce a named component **`TransportRewalkCoordinator`** that lives in `PhantomMessagingService` or `AppContainer` — whichever already holds references to `TransportManager` + `TransportPreferences` + the foreground-service connect-generation lifecycle. `HybridRelayTransport` is the WS+REST wrapper; it does NOT own the chain walker, the sticky-hint preferences, or the service lifecycle (verified 2026-05-28: zero references to `TransportManager` or `TransportPreferences` in `HybridRelayTransport.kt`).
 
-1. Clear `TransportPreferences.lastWorkingTransport` and `lastSuccessAt` (sticky hint reset).
-2. `transport.disconnect()` — tears down the current WS generation.
-3. `transportManager.release()` — releases the cached probe/select state.
-4. Restart one clean foreground-service connect generation so `TransportManager.connect()` walks Standard as `[Direct, Reality, Tor]` fresh against the new network.
+`NetworkChangeObserver` fires the coordinator. The coordinator drives the rewalk:
 
-Rate-limit: minimum interval between two consecutive rewalk attempts (e.g. `NETWORK_REWALK_MIN_INTERVAL_MS = 5_000L`) so a chronically-flapping interface doesn't loop the chain walker.
+1. **Rate-limit gate.** If `nowMs() - lastRewalkAtMs < NETWORK_REWALK_MIN_INTERVAL_MS` (5_000 ms), log `NETWORK_TRACE rate_limited reason=interval ageMs=<n>` and return. Otherwise continue.
+2. **Log start.** `NETWORK_TRACE rewalk_start reason=<wifi_to_cellular|cellular_to_wifi|vpn_added|vpn_removed|validated_changed|network_lost|network_available>`.
+3. **Clear sticky hint.** `TransportPreferences.lastWorkingTransport = null; lastSuccessAt = null`.
+4. **Notify state machine.** Call `hybridTransport.submitNetworkChangedEvent()` — the single narrow method the Hybrid layer exposes for this flow (see Step 4). State machine logic at `RestStateMachine.kt:83/149/294` runs the existing `NetworkChanged` transition.
+5. **Tear down current generation.** `hybridTransport.disconnect()`.
+6. **Release outer subsystems.** `transportManager.release()`.
+7. **Restart service connect generation.** Coordinator triggers a fresh foreground-service connect generation so `TransportManager.connect()` walks Standard as `[Direct, Reality, Tor]` against the new network.
+8. **Log done.** `NETWORK_TRACE rewalk_done elapsedMs=<n>`.
 
-### Step 4 — Expose `notifyNetworkChanged()` on `HybridRelayTransport`
+All eight steps run in one coroutine block. The `lastRewalkAtMs` mark is updated on step 1 once we commit to running, so concurrent NetworkCallback fires inside the rate-limit window are dropped at step 1 with the `rate_limited` log line.
 
-The NetworkCallback owner (service / container) does NOT directly clear preferences or call `disconnect()` — it submits an event. Add a small app-layer method:
+The constant `NETWORK_REWALK_MIN_INTERVAL_MS = 5_000L` lives in `RelayTransportConfig.kt` for visibility alongside the existing transport timers.
+
+### Step 4 — Expose `submitNetworkChangedEvent()` on `HybridRelayTransport` (narrow contract)
+
+`HybridRelayTransport` exposes exactly one new method, and only that:
 
 ```kotlin
-fun notifyNetworkChanged(reason: NetworkChangeReason) {
+fun submitNetworkChangedEvent() {
     submitStateEvent(RestStateMachine.Event.NetworkChanged)
-    // additional Hybrid-layer cleanup: clear hint, disconnect, release
 }
 ```
 
-This keeps the existing `RestStateMachine.Event.NetworkChanged` dispatch contract intact (the state machine logic already implements the right transitions per the existing docstring at `RestStateMachine.kt:32`/`:37`) and lets the actual wiring live in the Android-only layer.
+**Deliberately narrow.** Hybrid does NOT clear preferences, does NOT call `disconnect()`, does NOT call `TransportManager.release()`, does NOT restart the connect generation. Those five actions belong to `TransportRewalkCoordinator` in Step 3 because that is where the lifecycle ownership sits. Hybrid only has the state-machine handle, so it only does the state-machine handoff.
+
+This keeps the existing `RestStateMachine.Event.NetworkChanged` dispatch contract intact (the state machine logic already implements the right transitions per the existing docstring at `RestStateMachine.kt:32`/`:37`) without bloating Hybrid into a god-object that owns chain selection, preferences, and service lifecycle.
+
+The coordinator in Step 3 calls this method as item #4 of the rewalk sequence. If a future refactor moves the state machine out of Hybrid, the same one-line method moves with it; the coordinator-side rewalk stays unchanged.
 
 ### Step 5 — LTE diagnostics hardening
 
-Independent of the network-change rewire, the chain walk on cold-start LTE needs better attribution:
+Independent of the network-change rewire, the chain walk on cold-start LTE needs better attribution.
 
-1. **Log the VPN-detector input.** `TransportManager.connect()` consults the VPN detector to decide whether to filter Reality out of the chain. Log:
-   ```
-   PROBE_TRACE chain_start ordered=[Direct, Reality, Tor] vpnActive=<bool> realityFiltered=<bool>
-   ```
-   The current log shows `ordered=[...]` but not whether the order *was modified* due to VPN. After this PR, the answer to "did Reality fail or was it filtered out?" is one logcat line.
+**Already present in master `3e73d776`** (verified 2026-05-28 via grep on `TransportManager.kt`):
 
-2. **Add direct-probe phase details to `AndroidNativeOkHttpDirectProbe`.** The Ktor-based Reality probe already has a phase listener; the OkHttp-based Direct probe does not. Mirror the same pattern: emit `PROBE_TRACE direct dns_start/done`, `tcp_connect_start/done`, `tls_start/done`, `request_start/done`, `failure errorClass=<...>`. Without these, "Direct probe failed on Tele2" leaves no signal of *which phase* failed (DNS / TCP / TLS / request / response).
+```
+PROBE_TRACE chain_start ordered=[Direct, Reality, Tor] vpnActive=<bool> realityFiltered=<bool>
+```
 
-3. **Log Reality filter reason explicitly.** When Reality is removed from the chain due to `vpnActive=true`, log:
+`vpnActive` and `realityFiltered` are already logged in `chain_start` (lines 84/88 of `TransportManager.kt`). The earlier draft of this mini-lock was wrong to claim otherwise — verified against the actual source on 2026-05-28 by the external transport architect. Do NOT re-add what is already there.
+
+**Remaining diagnostics gaps this PR closes:**
+
+1. **Add direct-probe phase details to `AndroidNativeOkHttpDirectProbe`.** The Ktor-based Reality probe already has a phase listener; the OkHttp-based Direct probe does not. Mirror the same pattern: emit `PROBE_TRACE direct dns_start/done`, `tcp_connect_start/done`, `tls_start/done`, `request_start/done`, `failure errorClass=<...>`. Without these, "Direct probe failed on Tele2" leaves no signal of *which phase* failed (DNS / TCP / TLS / request / response).
+
+2. **Log Reality filter reason explicitly.** When Reality is removed from the chain due to `vpnActive=true`, log:
    ```
    PROBE_TRACE reality_filtered reason=vpn_active
    ```
-   So the chain ordering log alone is enough to explain why `[Direct, Tor]` was the actual probe order.
+   So the chain ordering log alone is enough to explain why `[Direct, Tor]` was the actual probe order. The boolean `realityFiltered=true` already appears in `chain_start`, but a dedicated line with the reason makes the cause obvious (today the reason is always `vpn_active`; if more reasons emerge, the same line format extends).
 
 ## In scope (this PR only)
 
-1. New Android source: `NetworkChangeObserver.kt` (or extension on `AppContainer` / `PhantomMessagingService`) — `ConnectivityManager.NetworkCallback` registration + meaningful-change classification + debounce.
-2. New constant `NETWORK_REWALK_MIN_INTERVAL_MS` in `RelayTransportConfig.kt`.
-3. New method `HybridRelayTransport.notifyNetworkChanged(reason: NetworkChangeReason)` (or equivalent) — clears hint, calls `disconnect()` + `release()`, restarts the connect generation, submits `Event.NetworkChanged` to the state machine.
-4. `TransportManager.kt` — extra log lines: `vpnActive`, `realityFiltered`, `reality_filtered reason=...`.
-5. `AndroidNativeOkHttpDirectProbe` — phase logging mirroring the Ktor probe.
-6. Unit tests in `shared/core/transport/src/commonTest`:
+1. **`NetworkChangeObserver`** (new Android source) — owns the single `ConnectivityManager.NetworkCallback` registration, classifies meaningful changes (`transportType`, `vpnActive`, `validated`, `networkPresent`), debounces 1500 ms, fires `TransportRewalkCoordinator` on accepted change.
+2. **`TransportRewalkCoordinator`** (new Android source) — lives in `PhantomMessagingService` or `AppContainer` (whichever already holds `TransportManager` + `TransportPreferences`). Owns the 8-step rewalk in Step 3 above. Rate-limits via `NETWORK_REWALK_MIN_INTERVAL_MS`.
+3. `RelayTransportConfig.kt` — new constant `NETWORK_REWALK_MIN_INTERVAL_MS = 5_000L`.
+4. `HybridRelayTransport.submitNetworkChangedEvent()` — narrow one-line method that submits `RestStateMachine.Event.NetworkChanged` and does nothing else. Hint-clear / `disconnect()` / `TransportManager.release()` / connect-generation restart all live in `TransportRewalkCoordinator`.
+5. `TransportManager.kt` — add ONE new log line `PROBE_TRACE reality_filtered reason=vpn_active` when Reality is dropped from the chain (today the only filter reason). `vpnActive` + `realityFiltered` in `chain_start` are ALREADY logged at `TransportManager.kt:84` — do NOT re-add what's there.
+6. `AndroidNativeOkHttpDirectProbe` — phase logging mirroring the Ktor probe (`dns_start/done`, `tcp_connect_start/done`, `tls_start/done`, `request_start/done`, `failure errorClass=...`).
+7. **Structured log keys** (verified absent in master `3e73d776`, all to be added):
+   - `NETWORK_TRACE changed old=<...> new=<...> validated=<bool> vpnActive=<bool>`
+   - `NETWORK_TRACE rewalk_start reason=<wifi_to_cellular|cellular_to_wifi|vpn_added|vpn_removed|validated_changed|network_lost|network_available>`
+   - `NETWORK_TRACE rate_limited reason=interval ageMs=<n>`
+   - `NETWORK_TRACE rewalk_done elapsedMs=<n>`
+   - `PROBE_TRACE reality_filtered reason=vpn_active`
+   - `PROBE_TRACE direct <phase>_<start|done|fail> errorClass=<...>`
+8. Unit tests in `shared/core/transport/src/commonTest` (commonTest if abstract enough, otherwise `androidTest`):
    - `network_change_triggers_chain_rewalk_and_clears_hint`.
-   - `network_change_rate_limited_within_min_interval`.
-   - `vpn_active_filters_reality_from_chain_and_logs_reason`.
-7. Android integration test (if feasible without real network swap; otherwise documented manual test plan).
-8. Test #88 acceptance scenarios on Tecno real device with logcat capture.
+   - `network_change_rate_limited_within_min_interval` — verifies the `rate_limited` log + no second rewalk inside the window.
+   - `vpn_active_filters_reality_from_chain_and_logs_reason` — verifies `reality_filtered reason=vpn_active` fires when VPN is up.
+   - `coordinator_does_not_call_disconnect_when_already_disconnected` — guards against double-disconnect on rapid sequential changes.
+9. Android instrumented test (if feasible without real network swap; otherwise documented manual test plan in this file under Test #88).
+10. Test #88 acceptance scenarios on Tecno real device with logcat capture (`PhantomMessaging:V PhantomTransport:V PhantomHybrid:V PhantomRelay:V TransportManager:V RestStateMachine:V *:S`).
 
 ## Out of scope (NOT in this PR)
 
@@ -149,13 +173,16 @@ PASS = either Direct succeeds AND messages flow, OR Tor lands AND all earlier ch
 
 1. Connect on Wi-Fi at home; verify `chain_attempt_success kind=Direct`.
 2. Disable Wi-Fi (phone falls to LTE).
-3. Within `~2 s` (debounce + meaningful-change classification), log must show:
+3. Within `~2 s` (debounce + meaningful-change classification), log must show in this order:
    ```
    NETWORK_TRACE changed old=wifi new=cellular validated=<bool> vpnActive=false
+   NETWORK_TRACE rewalk_start reason=wifi_to_cellular
+   ...
+   NETWORK_TRACE rewalk_done elapsedMs=<n>
    ```
 4. Old WS generation must disconnect (`WsSessionEnded` from the old connection).
-5. `TransportManager.connect()` must run again with fresh chain walk on the LTE network.
-6. PASS = chain walk re-runs; sticky hint from Wi-Fi is cleared; LTE-appropriate chain outcome (per Scenario 1).
+5. **CRITICAL:** A new `PROBE_TRACE chain_start ordered=[Direct, Reality, Tor] vpnActive=<bool> realityFiltered=<bool>` line must appear AFTER the `NETWORK_TRACE` block. If `NETWORK_TRACE changed` is logged but no new `chain_start` follows, the fix is INCOMPLETE — the coordinator did not actually trigger `TransportManager.connect()` again. (Architect-explicit checkpoint 2026-05-28.)
+6. PASS = the full sequence above appears + chain walk re-runs against the LTE network + sticky hint from Wi-Fi is cleared + LTE-appropriate chain outcome (per Scenario 1).
 
 ### Scenario 3 — LTE with VPN active
 
@@ -189,7 +216,7 @@ PASS = either Direct succeeds AND messages flow, OR Tor lands AND all earlier ch
 
 Stay in track if:
 - Debounce window needs adjustment based on Test #88 timing — change within the PR (1–2 s window already approved).
-- `notifyNetworkChanged()` ends up as an extension on `AppContainer` rather than a method on `HybridRelayTransport` — minor refactor decision within the PR, no scope change.
+- The rewalk coordinator lives on `PhantomMessagingService` rather than `AppContainer` (or vice versa) — minor refactor decision within the PR, no scope change. Constraint: the coordinator MUST hold the `TransportManager` + `TransportPreferences` references, so the choice is between the two existing components that already do.
 - Direct probe phase log field names need refinement — change within the PR.
 
 Escalate to a NEW track only if:

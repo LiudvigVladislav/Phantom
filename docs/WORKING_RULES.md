@@ -96,16 +96,36 @@ The author of a transport-touching PR makes the call in the mini-lock: either "T
 
 Why this rule exists: PR-RECV-DIAG1 (#234) shipped after Test #86 PASS on Wi-Fi only. On Tele2 LTE the same APK could not deliver messages — a regression that an explicit Tele2 gate would have caught before merge. The fix for that regression is `PR-LTE-NETCHANGE1` (mini-lock at `docs/tracks/lte-netchange.md`).
 
+## 9. No merge without verification
+
+A PR is not mergeable until **at least one** of the following has happened:
+
+1. **External architect (or designated reviewer) has approved** the PR explicitly, after reading the diff.
+2. **Every concrete code-state claim in the PR description, mini-lock, or commit message has been verified against the source** by `grep` / `git log -p` / file read. "X exists at line N", "Y is wired", "Z is enabled", "the current log already shows W" — each such claim earns its own verification line in the PR description (file:line + grep output snippet, or "verified against `master <sha>` by reading `<file>`").
+
+The second path exists so a docs-only / process-only PR doesn't have to wait for human review hours. The first path is required as soon as the PR touches behaviour. Both paths can apply to the same PR; that is the safest case.
+
+This rule is also **deliberately narrow**. It does NOT apply to:
+
+- Trivial typo / comment / formatting PRs whose diff contains no factual claim about other code.
+- Auto-generated changelog / version-bump PRs whose only "claim" is "the version is now N+1".
+- Reverts of a previously verified PR (the previous verification carries through).
+
+Why this rule exists: today (2026-05-28) the LTE-NETCHANGE1 prep docs PR (#238) was merged after Wi-Fi-only verification by the author, before the external transport architect's review arrived. The architect found three P2 issues — one factual error ("the current log shows `ordered=[...]` but not `vpnActive/realityFiltered`" — actually those fields *are* already in the log at `TransportManager.kt:84`), one architectural ambiguity (`HybridRelayTransport` proposed as `notifyNetworkChanged` owner despite having zero references to `TransportManager` / `TransportPreferences`), and one stale queue (`PROJECT_LOG.md` upper "Consolidated queue (2026-05-23)" still listed already-shipped tracks at the top). Each of those would have been caught by a 30-second `grep` against the source, but the PR shipped before the check happened. The follow-up docs fix PR is the cost of that omission. This rule formalises the verification step so the same omission cannot repeat.
+
+The discipline: before clicking "merge", paste the verification evidence into the PR description (architect approval ID, or file:line + grep output for each concrete claim). The cost is 30 seconds per claim; the cost of an unverified merge is hours of follow-up.
+
 ---
 
 ## How these rules interact
 
-Together the eight rules form a single flow:
+Together the nine rules form a single flow:
 
 1. New track → write a mini-lock (rule 3) → feature branch → one-layer PR (rule 2) → merge → log entry (rule 6) → track closes.
 2. New finding during the track → log entry only (rule 7), no parallel work (rule 1).
 3. Track stuck twice on architecture → park (rule 4) → log the parking reason (rule 6) → restart with new mini-lock (rule 3).
 4. Track interrupted → hand-off note in the mini-lock (rule 5) → resume later.
 5. PR touches Android transport behaviour → Tele2 LTE smoke test (rule 8) before merge, or documented carve-out in the mini-lock.
+6. Before clicking merge → either architect approval is on the PR, or every concrete code-state claim has been grep-verified and the evidence is in the PR description (rule 9).
 
 The rules are simple. The discipline is in applying them every time, especially under pressure.
