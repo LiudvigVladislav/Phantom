@@ -53,7 +53,23 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // do not double-up Pong handling — only OkHttp engine emits Ping.
         // The relay's Message::Ping arm in routes.rs (PR-F2-relay) already
         // handles WS-protocol Ping correctly: pong on the same socket.
-        .pingInterval(15_000L, TimeUnit.MILLISECONDS)
+        //
+        // PR-RECV-DIAG1 v1.3 (Test #84.3 verdict, 2026-05-27) — A/B disable.
+        // Tecno-side WS sessions die every ~31s with
+        // `SocketTimeoutException: sent ping but didn't receive pong
+        // within 15000ms`. session_summary shows `inbound_frames=0,
+        // delivers_received=0, pings_sent=0, pongs_received=0` across
+        // every session — so OkHttp's WS-protocol Ping doesn't actually
+        // see a Pong back from the relay (or it's being eaten by an
+        // intermediate proxy / CDN / OEM Wi-Fi). Disabling the OkHttp
+        // ping is a diagnostic: if Tecno WS stays connected for >30s
+        // after this change, the killer was the ping/pong cycle itself
+        // and the fix needs a different heartbeat strategy. If WS
+        // still dies, the issue is below WS-control-frame level (TCP
+        // idle / nat / proxy timeout).
+        //
+        // 0L is OkHttp's documented "no automatic ping" value.
+        .pingInterval(0L, TimeUnit.MILLISECONDS)
         // readTimeout is the OS-level backstop only. After ADR-010
         // "Updated 2026-05-01" the primary teardown path on pong/ack
         // timeout is `generationClient.close()` which destroys the
