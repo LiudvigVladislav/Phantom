@@ -436,7 +436,31 @@ class HybridRelayTransport(
         // submitStateEvent's lock acquisition).
         scope.launch {
             wsTransport.inboundStalled.collect { event ->
-                if (!restCapabilityActive) return@collect
+                if (!restCapabilityActive) {
+                    // PR-RECV-DIAG1 v1.8 (Vladislav-architect 2026-05-27).
+                    // Test #84.9 exposed a v1.6/v1.7 dead-end: if REST
+                    // bootstrap failed at app start (e.g. /auth/session
+                    // SocketTimeoutException), restCapabilityActive stays
+                    // false forever and this collector previously silently
+                    // returned. So a WS session that connected but
+                    // received no inbound frames was stuck — neither REST
+                    // poll started (no capability) nor was bootstrap
+                    // re-attempted. The chip emit was wasted.
+                    //
+                    // Now: when inbound stalls without REST capability,
+                    // trigger maybeRetryBootstrap() — the same recovery
+                    // path the wsSessionEnded branch uses. Rate-limited
+                    // inside maybeRetryBootstrap via
+                    // BOOTSTRAP_RETRY_MIN_INTERVAL_MS so a chronically-
+                    // silent socket doesn't hammer /auth/session.
+                    Log.i(
+                        "PhantomHybrid",
+                        "REST_TRACE inbound_stall_bootstrap_retry " +
+                            "sinceLastInboundMs=${event.sinceLastInboundMs}",
+                    )
+                    maybeRetryBootstrap()
+                    return@collect
+                }
                 if (stateMachine.current != RestMode.WsActive) return@collect
                 submitStateEvent(
                     RestStateMachine.Event.InboundIdleTimeout(
