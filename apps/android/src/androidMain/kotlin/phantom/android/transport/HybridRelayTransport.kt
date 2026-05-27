@@ -336,8 +336,24 @@ class HybridRelayTransport(
     private fun startWsPassthroughCollectors() {
         if (wsPassthroughStarted) return
         wsPassthroughStarted = true
+        android.util.Log.i(
+            "PhantomMessaging",
+            "RECV_DIAG ws_passthrough_started",
+        )
         scope.launch {
             wsTransport.incoming.collect { deliver ->
+                // PR-RECV-DIAG1 v1.2 — log every WS frame BEFORE it crosses
+                // into the messaging-service's _incoming SharedFlow. If we
+                // see `ws_deliver_in` but no `envelope_seen` downstream
+                // (DefaultMessagingService), the SharedFlow subscription
+                // is broken. If we see neither, WS isn't delivering at
+                // all and the diagnostic narrows to wsTransport itself.
+                android.util.Log.i(
+                    "PhantomMessaging",
+                    "RECV_DIAG ws_deliver_in id=${deliver.messageId.take(8)} " +
+                        "sealed=${deliver.sealedSender.isNotEmpty()} " +
+                        "payloadBytes=${deliver.payload.length}",
+                )
                 _incoming.emit(deliver)
                 submitStateEvent(RestStateMachine.Event.WsFrameTextReceived)
             }
@@ -400,6 +416,55 @@ class HybridRelayTransport(
                     RestStateMachine.Event.ActiveOutboundAckTimeout(
                         msgId = event.msgId,
                         ageMs = event.ageMs,
+                    )
+                )
+            }
+        }
+
+        // PR-RECV-DIAG1 v1.6 — inbound-stall fast-path. Forwards the new
+        // half-dead-inbound signal from KtorRelayTransport.startIdleWatchdog
+        // into the state machine. Without this, a WS session that
+        // hand-shook successfully but receives no server-pushed frames
+        // (test #84.7 case) keeps the device stuck in WsActive
+        // indefinitely — REST poll never starts, queued envelopes in
+        // mirror_envelope_to_rest_store never get pulled.
+        //
+        // Same short-circuits as the outboundAckDeadlineExpired path:
+        // skip when REST capability not yet bootstrapped, skip when
+        // state has already moved away from WsActive (state machine
+        // would no-op anyway, but cheap fast-path here avoids
+        // submitStateEvent's lock acquisition).
+        scope.launch {
+            wsTransport.inboundStalled.collect { event ->
+                if (!restCapabilityActive) {
+                    // PR-RECV-DIAG1 v1.8 (Vladislav-architect 2026-05-27).
+                    // Test #84.9 exposed a v1.6/v1.7 dead-end: if REST
+                    // bootstrap failed at app start (e.g. /auth/session
+                    // SocketTimeoutException), restCapabilityActive stays
+                    // false forever and this collector previously silently
+                    // returned. So a WS session that connected but
+                    // received no inbound frames was stuck — neither REST
+                    // poll started (no capability) nor was bootstrap
+                    // re-attempted. The chip emit was wasted.
+                    //
+                    // Now: when inbound stalls without REST capability,
+                    // trigger maybeRetryBootstrap() — the same recovery
+                    // path the wsSessionEnded branch uses. Rate-limited
+                    // inside maybeRetryBootstrap via
+                    // BOOTSTRAP_RETRY_MIN_INTERVAL_MS so a chronically-
+                    // silent socket doesn't hammer /auth/session.
+                    Log.i(
+                        "PhantomHybrid",
+                        "REST_TRACE inbound_stall_bootstrap_retry " +
+                            "sinceLastInboundMs=${event.sinceLastInboundMs}",
+                    )
+                    maybeRetryBootstrap()
+                    return@collect
+                }
+                if (stateMachine.current != RestMode.WsActive) return@collect
+                submitStateEvent(
+                    RestStateMachine.Event.InboundIdleTimeout(
+                        sinceLastInboundMs = event.sinceLastInboundMs,
                     )
                 )
             }

@@ -32,6 +32,17 @@ class PhantomApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // PR-RECV-DIAG1 v1.1 — confirm Application process actually
+        // started on Tecno. Test #84 showed only PREKEY_TRACE on
+        // Tecno-side, which could mean: (a) the app's Application
+        // class never ran, and PREKEY_TRACE comes from some other
+        // process / WorkManager job; OR (b) Application ran but
+        // service didn't start. This log disambiguates.
+        Log.i(
+            "PhantomMessaging",
+            "RECV_DIAG app_onCreate pid=${android.os.Process.myPid()} " +
+                "package=${packageName}",
+        )
         // SQLCipher native lib must be loaded before any database access.
         System.loadLibrary("sqlcipher")
         // Channel must exist before the first notification — idempotent, safe to call here.

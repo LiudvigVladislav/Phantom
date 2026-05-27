@@ -53,12 +53,28 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // do not double-up Pong handling — only OkHttp engine emits Ping.
         // The relay's Message::Ping arm in routes.rs (PR-F2-relay) already
         // handles WS-protocol Ping correctly: pong on the same socket.
+        //
+        // PR-RECV-DIAG1 v1.6 (2026-05-27) — REVERTED back to 15s.
+        // v1.3 disabled this to 0L as a diagnostic A/B. Test #84.4 proved
+        // disabling ping made things WORSE: with no ping, WS never dies
+        // → WsSessionEnded events never fire → ACTIVE_FAIL_THRESHOLD
+        // counter never increments → automatic REST fallback never
+        // activates. The "31s ping/pong cycle" we saw was actually a
+        // useful failover signal that we accidentally suppressed.
+        //
+        // 15s is the baseline that worked during CHIP1 testing (test83)
+        // when messages were flowing both ways. The real fix for the
+        // half-dead-inbound case is the new InboundIdleTimeout event
+        // added to RestStateMachine — it gives a fast-path to REST
+        // even when WS keeps reconnecting on ping timeout, AND covers
+        // the case where WS connects but inbound is silent.
         .pingInterval(15_000L, TimeUnit.MILLISECONDS)
-        // readTimeout is the OS-level backstop only. After ADR-010
-        // "Updated 2026-05-01" the primary teardown path on pong/ack
-        // timeout is `generationClient.close()` which destroys the
-        // OkHttp engine entirely, releasing the active WS socket. 60 s
-        // is generous because it never has to fire in normal recovery.
+        // PR-RECV-DIAG1 v1.6 (2026-05-27) — REVERTED back to 60s.
+        // v1.4 set this to 0L as a follow-up A/B after v1.3 disabled
+        // pingInterval. Re-enabling pingInterval(15s) in v1.6 makes
+        // readTimeout the OS-level backstop again, exactly as ADR-010
+        // intended. Restoring this also restores predictable
+        // session-end behavior on truly broken connections.
         .readTimeout(60, TimeUnit.SECONDS)
         // connectTimeout is per-path. Direct WSS keeps the OkHttp default
         // (10 s) — relay.phntm.pro resolves and connects in <500 ms on a
