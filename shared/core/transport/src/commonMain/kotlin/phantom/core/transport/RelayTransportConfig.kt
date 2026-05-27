@@ -114,5 +114,25 @@ object RelayTransportConfig {
     // loop is disabled; the renamed startIdleWatchdog loop continues to
     // tick on PING_INTERVAL_MS emitting passive diagnostic logs only
     // (PR-R0.4b — no forceReconnect from the idle watchdog).
-    const val APP_LEVEL_PING_ENABLED = false
+    // PR-RECV-DIAG1 v1.5 (Test #84.4 verdict 2026-05-27 + my own analysis):
+    // re-enable app-level Ping for diagnostic isolation.
+    //
+    // Test #84.4 showed Tecno WS connecting successfully but `inbound_frames=0`
+    // across multiple 60s sessions, even when emu sent an envelope during a
+    // confirmed-active session and the relay Ack'd it as `delivered`. With
+    // both OkHttp WS-Ping AND app-level Ping disabled, we have ZERO inbound
+    // traffic from the relay to test the return-channel health.
+    //
+    // Re-enabling app-level Ping creates a probe every PING_INTERVAL_MS:
+    //   - if relay's Pong reaches Tecno's reader: return-channel WORKS, so
+    //     the missing Deliver frames are a relay-side delivery / routing /
+    //     mailbox bug. Next diagnostic moves to relay-side logs.
+    //   - if Pong does NOT reach Tecno: return-channel is broken at the
+    //     network layer (Tecno Wi-Fi NAT / ISP / Cloudflare timeout).
+    //     The fix is connectivity / proxy, not relay code.
+    //
+    // This is a diagnostic toggle — when we know which side is at fault,
+    // we'll either keep app-level Ping as the production heartbeat OR
+    // switch back to WS-protocol Ping with the routing fix.
+    const val APP_LEVEL_PING_ENABLED = true
 }
