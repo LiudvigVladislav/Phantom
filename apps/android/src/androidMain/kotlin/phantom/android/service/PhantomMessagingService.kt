@@ -102,6 +102,11 @@ class PhantomMessagingService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate")
+        // PR-RECV-DIAG1 — mirror under PhantomMessaging tag so the
+        // standard logcat filter `PhantomMessaging:V` catches service
+        // lifecycle. Test #83.6c proved that PhantomMessagingService
+        // tag is exact-match invisible to that filter.
+        Log.i("PhantomMessaging", "RECV_DIAG service_onCreate pid=${android.os.Process.myPid()}")
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(DEFAULT_STATUS_TEXT))
         acquireKeepAliveLocks()
@@ -259,32 +264,50 @@ class PhantomMessagingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "onStartCommand")
+        // PR-RECV-DIAG1 — mirror service-lifecycle milestones under
+        // PhantomMessaging tag so they show up in the standard log
+        // filter Vladislav uses (PhantomMessaging:V exact-match).
+        Log.i("PhantomMessaging", "RECV_DIAG service_onStartCommand startId=$startId flags=$flags")
         serviceScope.launch {
             val app = application as PhantomApplication
             // Wait for libsodium + AppContainer to be fully initialised before using them.
             runCatching { app.ready.await() }.onFailure { t ->
                 Log.e(TAG, "App init failed — service cannot start: ${t.message}")
+                Log.e("PhantomMessaging", "RECV_DIAG service_app_init_failed err=${t::class.simpleName}")
                 stopSelf()
                 return@launch
             }
+            Log.i("PhantomMessaging", "RECV_DIAG service_app_ready")
 
             val container = app.container
 
             // Ensure messaging is wired (no-op if already done by Activity on warm start).
             runCatching { container.initMessagingFromStorage() }
-                .onFailure { e -> Log.e(TAG, "initMessagingFromStorage failed: ${e.message}") }
+                .onSuccess { Log.i("PhantomMessaging", "RECV_DIAG container_init_ok") }
+                .onFailure { e ->
+                    Log.e(TAG, "initMessagingFromStorage failed: ${e.message}")
+                    Log.e("PhantomMessaging", "RECV_DIAG container_init_fail err=${e::class.simpleName}")
+                }
 
             val service = container.messagingService
             if (service == null) {
                 Log.w(TAG, "messagingService is null after init — no identity yet, stopping")
+                Log.w("PhantomMessaging", "RECV_DIAG service_messagingService_null reason=no_identity")
                 stopSelf()
                 return@launch
             }
+            Log.i("PhantomMessaging", "RECV_DIAG messagingService_acquired")
 
             // startReceiving is idempotent; safe to call even if Activity already called it.
             runCatching { service.startReceiving() }
-                .onSuccess { Log.d(TAG, "startReceiving OK") }
-                .onFailure { e -> Log.e(TAG, "startReceiving failed: ${e.message}") }
+                .onSuccess {
+                    Log.d(TAG, "startReceiving OK")
+                    Log.i("PhantomMessaging", "RECV_DIAG startReceiving_ok")
+                }
+                .onFailure { e ->
+                    Log.e(TAG, "startReceiving failed: ${e.message}")
+                    Log.e("PhantomMessaging", "RECV_DIAG startReceiving_fail err=${e::class.simpleName}")
+                }
 
             // connect() runs an infinite suspend loop with internal reconnect — it only
             // returns on unrecoverable failure or when disconnect() is called.

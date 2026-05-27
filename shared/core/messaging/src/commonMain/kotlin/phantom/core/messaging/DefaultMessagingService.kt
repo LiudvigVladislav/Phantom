@@ -1184,12 +1184,25 @@ class DefaultMessagingService(
     }
 
     override suspend fun startReceiving() {
+        // PR-RECV-DIAG1 — log entry + early-return path. If we see
+        // `startReceiving_called` without a matching `subscription_setup`,
+        // it means a previous startReceiving already wired the flow and
+        // we returned early (idempotent path). If we see neither, the
+        // service-side path never reached startReceiving at all.
+        messagingLog(MessagingLogLevel.INFO, "RECV_DIAG startReceiving_called")
         // compareAndSet under the lock: two concurrent callers cannot both see
         // receiving == false, preventing duplicate flow collectors.
         val alreadyStarted = startReceivingLock.withLock {
             if (receiving) true else { receiving = true; false }
         }
-        if (alreadyStarted) return
+        if (alreadyStarted) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "RECV_DIAG startReceiving_idempotent_skip",
+            )
+            return
+        }
+        messagingLog(MessagingLogLevel.INFO, "RECV_DIAG startReceiving_first_call")
 
         // PR-D2b.1 (2026-05-17): durable voice finalizer. Runs once per
         // startReceiving, before the live chunk subscription, so any voice
@@ -1262,9 +1275,36 @@ class DefaultMessagingService(
             }
         }
 
+        // PR-RECV-DIAG1 — log entry/exit of the transport.incoming
+        // subscription. Test #83.6c showed Tecno-side has NO handleDeliver
+        // events even when the emulator's relay_send_return ok=true. To
+        // disambiguate "subscription never wired" vs "transport never
+        // emits" vs "envelope arrived but handleDeliver dropped it", we
+        // log the subscription setup AND every envelope that crosses
+        // this onEach BEFORE handleDeliver runs. `handleDeliver start`
+        // already logs from inside the handler, so two adjacent log
+        // lines per envelope = onEach is wired correctly; one
+        // `envelope_seen` without a matching `handleDeliver start` =
+        // handler aborted; nothing at all = upstream silence.
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "RECV_DIAG transport_incoming_subscribed",
+        )
         transport.incoming
-            .onEach { deliver -> handleDeliver(deliver) }
+            .onEach { deliver ->
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "RECV_DIAG envelope_seen id=${deliver.messageId.take(8)} " +
+                        "sealed=${deliver.sealedSender.isNotEmpty()} " +
+                        "payloadBytes=${deliver.payload.length}",
+                )
+                handleDeliver(deliver)
+            }
             .launchIn(scope)
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "RECV_DIAG acks_subscribed",
+        )
 
         transport.acks
             .onEach { ack ->
