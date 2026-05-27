@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
@@ -985,16 +986,50 @@ class AppContainer(private val context: Context) {
      * Idempotent: no-op if [messagingService] is already initialised (e.g. by the foreground
      * service before the Activity's LaunchedEffect fires).
      */
+    // PR-RECV-DIAG1 v1.2 — Mutex guard against the check-then-act race
+    // observed in Test #84.1. Tecno log showed two coroutines (MainActivity
+    // LaunchedEffect + PhantomMessagingService onStartCommand) calling
+    // initMessagingFromStorage concurrently, BOTH passing the
+    // `if (messagingService != null) return` gate before either wrote,
+    // BOTH calling initMessaging, BOTH installing transport.incoming
+    // subscriptions. Result: two `startReceiving_first_call` lines and
+    // duplicate observer infrastructure. Mutex closes the race; second
+    // caller waits for first to finish, then sees the populated
+    // messagingService and returns early.
+    private val initMessagingMutex = kotlinx.coroutines.sync.Mutex()
+
     suspend fun initMessagingFromStorage() {
-        if (messagingService != null) return
-        val record = _identityState.value
-            ?: identityRepo.loadIdentity()?.also { _identityState.value = it }
-            ?: return
-        val dhKeyPair = phantom.core.crypto.DhKeyPair(
-            phantom.core.crypto.DhPublicKey(record.publicKeyHex.hexToByteArray()),
-            phantom.core.crypto.DhPrivateKey(record.dhPrivateKeyHex.hexToByteArray()),
-        )
-        initMessaging(record, dhKeyPair)
+        initMessagingMutex.withLock {
+            if (messagingService != null) {
+                android.util.Log.i(
+                    "PhantomMessaging",
+                    "RECV_DIAG initMessagingFromStorage_already_initialized",
+                )
+                return@withLock
+            }
+            val record = _identityState.value
+                ?: identityRepo.loadIdentity()?.also { _identityState.value = it }
+                ?: run {
+                    android.util.Log.i(
+                        "PhantomMessaging",
+                        "RECV_DIAG initMessagingFromStorage_no_identity",
+                    )
+                    return@withLock
+                }
+            android.util.Log.i(
+                "PhantomMessaging",
+                "RECV_DIAG initMessagingFromStorage_creating",
+            )
+            val dhKeyPair = phantom.core.crypto.DhKeyPair(
+                phantom.core.crypto.DhPublicKey(record.publicKeyHex.hexToByteArray()),
+                phantom.core.crypto.DhPrivateKey(record.dhPrivateKeyHex.hexToByteArray()),
+            )
+            initMessaging(record, dhKeyPair)
+            android.util.Log.i(
+                "PhantomMessaging",
+                "RECV_DIAG initMessagingFromStorage_done",
+            )
+        }
     }
 }
 

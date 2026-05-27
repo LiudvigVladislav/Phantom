@@ -336,8 +336,24 @@ class HybridRelayTransport(
     private fun startWsPassthroughCollectors() {
         if (wsPassthroughStarted) return
         wsPassthroughStarted = true
+        android.util.Log.i(
+            "PhantomMessaging",
+            "RECV_DIAG ws_passthrough_started",
+        )
         scope.launch {
             wsTransport.incoming.collect { deliver ->
+                // PR-RECV-DIAG1 v1.2 — log every WS frame BEFORE it crosses
+                // into the messaging-service's _incoming SharedFlow. If we
+                // see `ws_deliver_in` but no `envelope_seen` downstream
+                // (DefaultMessagingService), the SharedFlow subscription
+                // is broken. If we see neither, WS isn't delivering at
+                // all and the diagnostic narrows to wsTransport itself.
+                android.util.Log.i(
+                    "PhantomMessaging",
+                    "RECV_DIAG ws_deliver_in id=${deliver.messageId.take(8)} " +
+                        "sealed=${deliver.sealedSender.isNotEmpty()} " +
+                        "payloadBytes=${deliver.payload.length}",
+                )
                 _incoming.emit(deliver)
                 submitStateEvent(RestStateMachine.Event.WsFrameTextReceived)
             }
