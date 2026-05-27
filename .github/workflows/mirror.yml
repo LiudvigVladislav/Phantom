@@ -78,7 +78,23 @@ jobs:
         working-directory: phantom-mirror
         run: |
           git remote add codeberg "${{ vars.CODEBERG_REPO_URL }}"
-          # --mirror sends every ref (branches, tags) and removes anything
-          # on the destination that no longer exists locally. This keeps
-          # Codeberg byte-for-byte identical to GitHub.
-          git push --mirror codeberg
+          # Explicit refspecs instead of --mirror.
+          #
+          # `git clone --mirror` from a GitHub repo brings GitHub-internal
+          # `refs/pull/<n>/head` (and on some flows `refs/pull/<n>/merge`)
+          # refs along with branches and tags. Codeberg (and Forgejo
+          # generally) reserves the `refs/pull/*` namespace for its OWN
+          # pull-request refs and rejects any external push into it with
+          # "deny updating a hidden ref". The previous `git push --mirror`
+          # consequently exited 1 on every run — branches and tags were
+          # pushed successfully, but the workflow status was permanently
+          # red because of the pull-ref rejections.
+          #
+          # Explicit refspecs push only `refs/heads/*` and `refs/tags/*`,
+          # which is exactly the surface Codeberg cares about. `--prune`
+          # preserves the `--mirror` semantic of deleting destination refs
+          # whose source counterpart no longer exists, so byte-for-byte
+          # consistency with GitHub is unchanged.
+          git push codeberg --prune \
+            'refs/heads/*:refs/heads/*' \
+            'refs/tags/*:refs/tags/*'
