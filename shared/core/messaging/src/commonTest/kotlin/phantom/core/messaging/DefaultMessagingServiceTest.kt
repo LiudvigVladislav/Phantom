@@ -467,6 +467,20 @@ class DefaultMessagingServiceTest {
         // finalizer. When null, the legacy in-memory path is used (same
         // behaviour every voice test before D2b.1 saw).
         voiceChunkRepo: phantom.core.storage.VoiceChunkRepository? = null,
+        // PR-CRYPTO-SESSION-REPAIR1 commit 3b (2026-05-30): allow tests
+        // to substitute the DoubleRatchet so MAC-error paths can be
+        // exercised via [MacFailingDoubleRatchet]. Default preserves
+        // existing call-sites + pre-PR receive semantics.
+        ratchet: phantom.core.crypto.DoubleRatchet = PassthroughDoubleRatchet(),
+        // PR-CRYPTO-SESSION-REPAIR1 commit 3b: optional held-envelope
+        // repo. When null, hold-on-MAC is unavailable regardless of
+        // [holdMacFailures] (the gate is `holdMacFailures && repo !=
+        // null`). When non-null, [holdMacFailures] picks between hold
+        // (true) and ack (false).
+        decryptFailedRepo: phantom.core.storage.DecryptFailedEnvelopeRepository? = null,
+        // PR-CRYPTO-SESSION-REPAIR1 commit 3b: semantic flag matching the
+        // production constructor param. Tests set this per scenario.
+        holdMacFailures: Boolean = false,
     ): DefaultMessagingService {
         // sendMessage paths reach SealedSender.seal which uses libsodium.
         // On JVM the lib is loaded via JNA; calling Box.keypair() before
@@ -507,7 +521,7 @@ class DefaultMessagingServiceTest {
         return DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
-            ratchet = PassthroughDoubleRatchet(),
+            ratchet = ratchet,
             sessionManager = sessionManager,
             transport = transport,
             messageRepository = msgRepo,
@@ -522,6 +536,8 @@ class DefaultMessagingServiceTest {
             preKeyApi = ThrowingPreKeyApi,
             signingKeyProvider = { ThrowingSigningKey },
             voiceChunkRepository = voiceChunkRepo,
+            decryptFailedEnvelopeRepository = decryptFailedRepo,
+            holdMacFailures = holdMacFailures,
         )
     }
 
@@ -1412,6 +1428,116 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 3b (2026-05-30) — first test of
+    // the architect-locked 5-matrix. This single test proves invariants
+    // 1 + 2: when `holdMacFailures=true` AND repo is non-null AND the
+    // ratchet throws MAC, the receive path:
+    //   - does NOT call transport.sendDeliveryAck (invariant 1);
+    //   - does NOT write to processed_envelopes (invariant 2);
+    //   - writes a row to decrypt_failed_envelopes with error_type=mac;
+    //   - marks conversationRepository session_suspect = true.
+    //
+    // Pattern reviewable by architect on the PR thread; remaining 4
+    // tests (decrypt_mac_error_acks_on_release, normal_path × 2,
+    // wireFrameJson round-trip) follow as commit 3c after pattern ACK.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun decrypt_mac_error_holds_in_debug() = runTest {
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        // Pre-seed conversation row so setSessionSuspect can update it.
+        // conv id = sorted([identity.publicKeyHex="aabb", senderHex="ccdd"]).join("_") = "aabb_ccdd",
+        // which buildService's sessionManager pre-seeds.
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            scope = backgroundScope,
+            // Hold-path enablers:
+            ratchet = MacFailingDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = true,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Build a Deliver whose payload IS valid (parses past the
+        // unpad + WireFrame JSON decode), but whose ratchet.decrypt
+        // throws MAC. MacFailingDoubleRatchet throws regardless of
+        // ciphertext bytes, so the inner EncryptedMessage can be
+        // arbitrary.
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x00, 0x01, 0x02),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-debug-mac",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // ── Invariant 1: no ack ────────────────────────────────────────
+        assertTrue(
+            "env-debug-mac" !in transport.ackedDelivers,
+            "hold path MUST NOT call sendDeliveryAck; transport.ackedDelivers=${transport.ackedDelivers}",
+        )
+        // ── Invariant 2: no FAILED_MAC ledger entry ────────────────────
+        assertEquals(
+            false,
+            processedRepo.exists("env-debug-mac"),
+            "hold path MUST NOT call markProcessed; processedRepo has the envelope",
+        )
+        // ── Held row exists in decrypt_failed_envelopes ────────────────
+        val held = decryptFailedRepo.listByConversation("aabb_ccdd")
+        assertEquals(1, held.size, "exactly one held envelope expected; got $held")
+        assertEquals("env-debug-mac", held[0].envelopeId)
+        assertEquals("mac", held[0].errorType)
+        // wireFrameJson stored is non-empty + decodes back into WireFrame.
+        assertTrue(held[0].wireFrameJson.isNotEmpty(), "wireFrameJson must be persisted")
+        val decoded = json.decodeFromString(WireFrame.serializer(), held[0].wireFrameJson)
+        assertEquals(
+            wireFrame.encryptedMessage.messageIndex,
+            decoded.encryptedMessage.messageIndex,
+            "round-trip messageIndex",
+        )
+        // ── Conversation marked session_suspect ────────────────────────
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertTrue(
+            updatedConv?.sessionSuspect == true,
+            "session_suspect MUST be true after hold path runs; got $updatedConv",
+        )
+    }
+
     @Test
     fun handleDeliver_unknownEnvelopeId_passesGuard_andReachesDecryptPath() = runTest {
         // Symmetry check: an envelope id NOT in the ledger must pass the
@@ -1964,5 +2090,92 @@ private class FakeVoiceChunkLedger : phantom.core.storage.VoiceChunkRepository {
 
     override suspend fun deleteAll() {
         store.clear()
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// PR-CRYPTO-SESSION-REPAIR1 commit 3b (2026-05-30) — test infrastructure
+//   - MacFailingDoubleRatchet: forces the MAC-error catch on every
+//     decrypt so the hold/ack branching can be exercised by the test
+//     matrix below.
+//   - FakeDecryptFailedEnvelopeLedger: in-memory
+//     DecryptFailedEnvelopeRepository matching the production
+//     repository contract.
+// ═════════════════════════════════════════════════════════════════════════
+
+private class MacFailingDoubleRatchet : phantom.core.crypto.DoubleRatchet {
+    override fun encrypt(
+        state: phantom.core.crypto.RatchetState,
+        plaintext: ByteArray,
+    ): Pair<phantom.core.crypto.RatchetState, phantom.core.crypto.EncryptedMessage> =
+        state to phantom.core.crypto.EncryptedMessage(
+            ratchetPublicKey = state.sendingRatchetPublicKey,
+            messageIndex = state.sendCount,
+            ciphertext = plaintext,
+            nonce = ByteArray(24),
+        )
+
+    override fun decrypt(
+        state: phantom.core.crypto.RatchetState,
+        message: phantom.core.crypto.EncryptedMessage,
+    ): Pair<phantom.core.crypto.RatchetState, ByteArray> =
+        throw IllegalArgumentException("MAC verification failed")
+}
+
+private class FakeDecryptFailedEnvelopeLedger : phantom.core.storage.DecryptFailedEnvelopeRepository {
+    val rows = mutableMapOf<String, phantom.core.storage.DecryptFailedEnvelopeRepository.Entry>()
+
+    override suspend fun insert(
+        envelopeId: String,
+        conversationId: String,
+        senderPubKeyHex: String,
+        errorType: String,
+        receivedAtMs: Long,
+        x3dhInitPresent: Boolean,
+        wireFrameJson: String,
+    ) {
+        if (envelopeId !in rows) {
+            rows[envelopeId] = phantom.core.storage.DecryptFailedEnvelopeRepository.Entry(
+                envelopeId = envelopeId,
+                conversationId = conversationId,
+                senderPubKeyHex = senderPubKeyHex,
+                errorType = errorType,
+                receivedAtMs = receivedAtMs,
+                x3dhInitPresent = x3dhInitPresent,
+                wireFrameJson = wireFrameJson,
+                replayAttemptCount = 0L,
+                lastReplayAtMs = null,
+            )
+        }
+    }
+
+    override suspend fun listByConversation(conversationId: String) =
+        rows.values.filter { it.conversationId == conversationId }
+            .sortedBy { it.receivedAtMs }
+
+    override suspend fun deleteByEnvelopeId(envelopeId: String) {
+        rows.remove(envelopeId)
+    }
+
+    override suspend fun recordReplayAttempt(envelopeId: String, nowMs: Long) {
+        val existing = rows[envelopeId] ?: return
+        rows[envelopeId] = existing.copy(
+            replayAttemptCount = existing.replayAttemptCount + 1,
+            lastReplayAtMs = nowMs,
+        )
+    }
+
+    override suspend fun deleteOlderThan(olderThanMs: Long) {
+        rows.entries.removeAll { it.value.receivedAtMs < olderThanMs }
+    }
+
+    override suspend fun count(): Long = rows.size.toLong()
+
+    override suspend fun countByConversation(): Map<String, Long> =
+        rows.values.groupingBy { it.conversationId }.eachCount()
+            .mapValues { it.value.toLong() }
+
+    override suspend fun deleteAll() {
+        rows.clear()
     }
 }
