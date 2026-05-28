@@ -589,6 +589,37 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-28 (thu) · Tele2 LTE baseline diagnostic — verdicts confirm PR-LTE-NETCHANGE1 scope, do NOT alter mini-lock
+
+Pre-implementation baseline gathered on master `6919b91a` (APK MD5 `d3b7880dc37516ce49330fceda574316` — byte-identical to PR-RECV-DIAG1 Test #86 APK, no source changes since `684c2be6`). Four scenarios on Tecno `103603734A004351` (real device, Tele2 LTE Иркутская) paired with `emulator-5554` on dev Wi-Fi.
+
+**Goal.** Empirically verify the external transport architect's three code-state diagnoses against actual hardware on Tele2 LTE BEFORE coding PR-LTE-NETCHANGE1, so the implementation targets real bugs and not assumed ones. The diagnostic was authored as a runbook with explicit logcat tag coverage (`PhantomMessaging:V PhantomMessagingService:V PhantomTransport:V PhantomHybrid:V PhantomRelay:V PhantomWakeup:V TransportManager:V TransportProbe:V RestStateMachine:V`) after a Rule 9 grep verified that `TransportProbe` + `PhantomMessagingService` + `PhantomWakeup` (note: tag is `PhantomWakeup`, not `PhantomWakeupReceiver`) were missing from the previous canonical command. Spot-check of the four log files by independent grep on this end confirmed the architect's findings line-by-line.
+
+**Scenario A — cold-start raw Tele2 LTE, no Wi-Fi, no VPN.** PASS. Direct probe succeeded in ~0.9 s, `Online via Direct · Standard`, `setup-*` message delivered + `Decrypt OK`. But WS subsequently died several times via `sent ping but didn't receive pong` (24 instances in the log) — app survived via REST fallback (PR-RECV-DIAG1 v1.6 InboundIdleTimeout path doing its job). Verdict: **Tele2 LTE does NOT fundamentally kill Direct**; it makes Direct WS intermittently flap, and the existing REST fallback machinery is what keeps the channel alive.
+
+**Scenario B — Wi-Fi → LTE mid-session swap.** Architect-explicit critical scenario. Direct on Wi-Fi worked; pre-swap message delivered. After Wi-Fi off, **zero `NETWORK_TRACE` lines and zero new `PROBE_TRACE chain_start`** in the log (independently grep-confirmed: `count=0`). Post-swap message still got through, but via REST fallback rather than a fresh chain walk. **Confirmed empirically:** `Event.NetworkChanged` is a dead handler exactly as architect diagnosed. This is the load-bearing reproducer that justifies `PR-LTE-NETCHANGE1`.
+
+**Scenario C — LTE + VPN active.** Reality correctly filtered: `ordered=[Direct, Tor] vpnActive=true realityFiltered=true` (verified at `diag-tele2-C-tecno.log:45-46`). First Direct probe timed out, second succeeded, message delivered via Direct. **Confirmed expected behaviour.** The `realityFiltered=true` already in master is correct; the gap is the additional explicit `PROBE_TRACE reality_filtered reason=vpn_active` line (which the mini-lock already calls for).
+
+**Scenario D — force-stop cycle, LTE no VPN.** Direct timed out twice, Reality timed out, **Tor eventually succeeded after `totalMs=348946` ≈ 5.8 minutes** (`chain_start` at `01:18:05.468` → `chain_attempt_success kind=Tor` at `01:24:35.333`). Message delivered immediately after Tor came up. UX during the 5.8-minute wait: `Connecting...` with no attribution. The chain-fallback behaviour is correct (Tor genuinely came up only after Direct + Reality genuinely failed — NOT a sticky-hint regression); the UX is poor because there is no probe-phase attribution log to explain why Direct/Reality failed and how far each got.
+
+**MAC error did NOT recur in any of the four scenarios.** All received messages produced `Decrypt OK`. `PR-CRYPTO-SESSION-REPAIR1` remains a valid separate track but its reproducer needs a more specific sequence than a single force-stop cycle (architect-noted: multi-cycle force-stop + reinstall + queued envelope + stale session).
+
+**Verdicts (per the decision tree from the runbook):**
+
+| Decision-tree cell | Observation | Implied action |
+|---|---|---|
+| A: cold LTE | 🟢 Direct OK (with REST fallback for WS flap) | LTE-NETCHANGE1 does NOT need to "fix Direct on LTE" |
+| B: Wi-Fi → LTE | 🔴 no NETWORK_TRACE, no new chain_start | **LTE-NETCHANGE1 is justified** by this reproducer alone |
+| C: LTE + VPN | 🟢 Reality filtered correctly | Confirms existing behaviour; mini-lock's reality_filtered reason log still useful |
+| D: force-stop LTE | 🟡 Tor fallback after 5.8 minutes, correct but opaque | LTE-NETCHANGE1's diagnostics-hardening Step 5 directly addresses this |
+
+**Queue order — unchanged:** `PR-LTE-NETCHANGE1` → `PR-CRYPTO-SESSION-REPAIR1`. Baseline confirms B is the load-bearing reproducer; D confirms attribution-hardening is genuinely needed; the mini-lock at `docs/tracks/lte-netchange.md` (post-#239) covers all three findings without rewrite. Architect-revised framing of the PR title ("при смене сети делать fresh rewalk + давать понятную attribution-диагностику + не зависать на старом WS / старом socks / старом transport decision") is a clearer summary of what the 5-step implementation actually does; the mini-lock's existing steps map onto each piece exactly.
+
+**Logs preserved at** `C:\temp\diag-tele2-{A,B,C,D}-{tecno,emu}.log` on Vladislav's Windows ПК (8 files total). Not in the repo (real-device logs are not source artifacts), but referenced from the next implementation PR description as the empirical baseline.
+
+**No code or mini-lock changes from this entry.** This entry exists only as the durable reference for "we did baseline first, the bug is real, the mini-lock matches reality" — load-bearing context the implementation PR will cite.
+
 ### 2026-05-27 (wed) · PR-RECV-DIAG1 MERGED — Direct transport restored, inbound-stall fallback, init race fix
 
 PR #234 `684c2be6` merged after Test #86 PASS on Tecno real device. Eight-commit diagnostic-to-fix arc (`e761c699` → `7e3d3c4e`) on `diag/pr-recv-diag1` that started as a "messages stopped arriving on Tecno" investigation and ended with a fix to a sticky-fallback-hint regression in `TransportManager` plus two new recovery paths in the WS data plane.
