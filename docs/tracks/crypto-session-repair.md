@@ -162,7 +162,45 @@ DECRYPT_TRACE ttl_evict      msgId=<8> conv=<8> ageMs=<n>
 
 All under PhantomMessaging tag.
 
-## Last hand-off (2026-05-29, session-pause after commit 2 — STOP before commit 3)
+## Last hand-off (2026-05-29 / 2026-05-30, session-pause after commit 3a — code only, tests = commit 3b next session)
+
+**Commit 3a shipped — `8404e9c5`** (first behaviour change in this PR).
+
+The additive `if (holdMacFailures && decryptFailedEnvelopeRepository != null)` branch is now in `DefaultMessagingService.kt` MAC-error site. All four architect-locked invariants (no ack, no markProcessed, no decrypt/encryptUnderLock change, release path completely unchanged) are grep-verifiable in the diff. Build green: `:shared:core:messaging:assemble`.
+
+**Architect line-level review on PR thread requested for `8404e9c5`** before commit 3b lands. This is the first behaviour-change checkpoint per Rule 9 path (a). Architect previously ACKed commits 1+2 (95c7aae0 → e0b61403); this is the next checkpoint.
+
+**Commit 3b = next mini-step (test matrix):**
+
+1. `decrypt_mac_error_holds_in_debug` — `holdMacFailures = true`, force ratchet to throw MAC error, verify:
+   - `transport.ackedDelivers` does NOT contain the envelope id.
+   - `processedRepo.exists(envelopeId)` returns false (no FAILED_MAC ledger row).
+   - `decryptFailedRepo.listByConversation(convId)` returns one entry with `error_type=mac` and the correct `wire_frame_json`.
+   - `convRepo.getConversation(convId).sessionSuspect` is true.
+2. `decrypt_mac_error_acks_on_release` — `holdMacFailures = false`, force MAC, verify the current behaviour: envelope IS in `transport.ackedDelivers`, processed ledger has FAILED_MAC entry, hold table is empty.
+3. `normal_path_unaffected_in_debug` — `holdMacFailures = true`, normal message (no MAC), verify ack + markProcessed PROCESSED + bubble inserted, hold table stays empty, suspect flag stays false.
+4. `normal_path_unaffected_in_release` — same with `holdMacFailures = false`.
+
+Test infrastructure to add for commit 3b:
+- `MacFailingDoubleRatchet` — variant of `PassthroughDoubleRatchet` that throws `IllegalArgumentException("MAC verification failed")` from `decrypt`. Reuse `PassthroughDoubleRatchet` (line 370) as the base.
+- `FakeDecryptFailedEnvelopeLedger` — in-memory `DecryptFailedEnvelopeRepository` mirroring `FakeProcessedEnvelopeLedger` (around line 1711 of `DefaultMessagingServiceTest.kt`). Required for tests 1, 3.
+- `buildService` helper extension (or new optional params) to accept `holdMacFailures: Boolean` + `decryptFailedRepo: DecryptFailedEnvelopeRepository?` so tests can configure both modes.
+
+**Resume sequence next session:**
+
+1. Read this hand-off + check architect's line-level review on PR #243 thread (comments on `8404e9c5`).
+2. If architect ACK on commit 3a: proceed to commit 3b (the test matrix above).
+3. If architect findings: address them in additive small commits BEFORE 3b lands, mirroring the PR #241 P1/P2 pattern (each finding → grep-verify → fix → commit message references it).
+4. After 3b green + architect ACK: commit 4 (suspect → fresh X3DH on outgoing). Architect pre-decision #1 says reuse `mutexFor(conversationId)`, pre-decision #2 says repair primitives can be a `SessionRepairService` but `ack/markProcessed` ownership stays in DMS, pre-decision-correction P2 (2026-05-29) says suspect cleared after local `saveSession`, NOT after `transport.send`.
+
+**Process learnings worth carrying forward in this PR:**
+
+- Class-property nullability checks DO NOT smart-cast through lambda boundaries. Use a local `val xCaptured: X = x` capture inside the `if (x != null)` block. Caught the first build break of commit 3 at line 1817:68.
+- Test fakes for `ConversationRepository` need to be updated in BOTH `DefaultMessagingServiceTest` AND `MigrationManagerTest` when the interface gains new methods. Pattern from commit 1 + commit 2.
+
+---
+
+## Last hand-off (2026-05-29, earlier — session-pause after commit 2 — SUPERSEDED by above)
 
 **Architect re-review checkpoint required before commit 3** (Vladislav-explicit 2026-05-29). Commit 3 introduces the FIRST behavioural change: MAC error → hold/no-ack instead of the current destructive ack. PR thread review on the diff is mandatory per WORKING_RULES Rule 9 path (a) before merge.
 
