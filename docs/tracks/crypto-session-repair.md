@@ -162,7 +162,66 @@ DECRYPT_TRACE ttl_evict      msgId=<8> conv=<8> ageMs=<n>
 
 All under PhantomMessaging tag.
 
-## Last hand-off (2026-05-29, session-pause after commit 1)
+## Last hand-off (2026-05-29, session-pause after commit 2 — STOP before commit 3)
+
+**Architect re-review checkpoint required before commit 3** (Vladislav-explicit 2026-05-29). Commit 3 introduces the FIRST behavioural change: MAC error → hold/no-ack instead of the current destructive ack. PR thread review on the diff is mandatory per WORKING_RULES Rule 9 path (a) before merge.
+
+**Commit 2 shipped — `7825fa3b`:**
+
+- `DefaultMessagingService.kt` constructor gains two trailing nullable/default-safe params: `decryptFailedEnvelopeRepository: DecryptFailedEnvelopeRepository? = null` + `holdMacFailures: Boolean = false`. Defaults preserve all existing call-sites.
+- 6 `DECRYPT_TRACE` lines added in `handleDeliver` at the decrypt decision points: `attempt`, `ok bootstrap=false`, `ok bootstrap=true`, `fail_mac action=ack`, `fail_other action=rethrow`, `fail_legacy_no_x3dh action=ack`.
+- Architect-locked log constraint enforced: NO raw key material. Only short public ids (8-char prefixes), counters, booleans, action strings. Grep evidence in commit message body.
+- `AppContainer.kt`: new top-level `decryptFailedEnvelopeRepo` val (mirrors `processedEnvelopeRepo` pattern at line 142), wired into DMS along with `holdMacFailures = BuildConfig.DEBUG`.
+- Test fakes (`DefaultMessagingServiceTest.FakeConversationRepository`, `MigrationManagerTest.InMemoryConversationRepo`) gained 3 stub methods for the new suspect-flag mutators so existing tests compile under the updated interface.
+- **Zero conditional branching on `holdMacFailures`** — the field is plumbed but unused. Grep verification in commit message.
+- Build state: `:apps:android:assembleDebug` + `:shared:core:messaging:jvmTest` green.
+
+**Vladislav-locked pre-decisions for commits 3-5 (2026-05-29):**
+
+1. **Per-conversation mutex for repair** — reuse the existing `mutexFor(conversationId)` in `DefaultMessagingService`. New `ConcurrentHashMap<String, Mutex>` ONLY if `SessionRepairService` ends up living OUTSIDE the DMS lifecycle (current plan: keep it inside or as DMS-bound extension functions). Reusing `mutexFor` keeps receive and repair paths sharing the same per-conversation serialisation; introducing a parallel map risks ordering bugs between an inflight receive and a concurrent repair.
+2. **`SessionRepairService` location** — separate Kotlin file under `shared/core/messaging/` is OK for code organisation, BUT it MUST NOT take ownership of `transport.sendDeliveryAck` or `processedEnvelopeRepository.markProcessed`. Those stay receive-path invariants in `DefaultMessagingService`. The service exposes pure repair primitives (mark-suspect, fetch-fresh-bundle, install-fresh-ratchet, replay-held), and DMS continues to drive the receive-side decision graph.
+3. **Max replay attempts per held envelope** — 3 is OK as a diagnostic guard (`replayAttemptCount >= 3 → skip without further replay attempts`), but the 24h TTL is the main limiter. **CRITICAL invariant 4**: a `replay_fail` MUST NEVER re-set `session_suspect`. Re-arming the repair loop on persistent old-ciphertext replay failures would defeat the anti-loop guarantee; the user would observe an infinite repair churn even when the next outgoing's fresh X3DH already reconverged the live session.
+
+These three pre-decisions are durable for commits 3-5. Architect can revisit during PR review but the implementation should default to them.
+
+**Next: commit 3 — first behavioural change (architect re-review required BEFORE landing).**
+
+Scope:
+- In `handleDeliver` MAC-error branch (`fail_mac` site): add `if (holdMacFailures && decryptFailedEnvelopeRepository != null)` branch BEFORE the existing ack + markProcessed path. The new branch:
+  - Calls `decryptFailedEnvelopeRepository.insert(...)` with the original `RelayMessage.Deliver` wire frame serialized to JSON via the existing `json` field.
+  - Calls `conversationRepository.setSessionSuspect(conversationId, nowMs)`.
+  - Logs `DECRYPT_TRACE fail_mac msgId=<8> action=hold` (note: action=hold, not action=ack).
+  - Does NOT call `transport.sendDeliveryAck`, does NOT call `processedEnvelopeRepository.markProcessed`.
+  - Returns null inside `mutex.withLock` like the existing ack branch does, so the outer flow skips the missing-plaintext downstream processing.
+- The existing `else` branch (release: `holdMacFailures = false`) keeps the unchanged ack + markProcessed + sendDeliveryAck flow. Verify zero deletions in the existing path — additive only.
+
+Tests for commit 3:
+- `decrypt_mac_error_holds_in_debug` — `holdMacFailures = true`, force MAC, verify: no `sendDeliveryAck` called, no `markProcessed` called, entry in fake `DecryptFailedEnvelopeRepository`, conversation flagged `sessionSuspect`. Mock `transport.sendDeliveryAck` and `processedEnvelopeRepository.markProcessed` to assert they were NOT called.
+- `decrypt_mac_error_acks_on_release` — `holdMacFailures = false`, force MAC, verify CURRENT behaviour (ack + markProcessed) preserved.
+- `normal_path_unaffected_in_debug` — `holdMacFailures = true`, normal message (no MAC), verify normal ack + markProcessed + bubble.
+- `normal_path_unaffected_in_release` — same with `holdMacFailures = false`.
+
+**Open architectural questions remaining for commits 4-5:**
+
+- Commit 4: where does the `setSessionSuspect → next-send forces X3DH` check live? Inside `encryptUnderLock` before `sessionManager.tryLoadSession`, gated by reading `conversationRepository.getConversation(conversationId).sessionSuspect`. Suspect clear inside the SAME mutex after `sessionManager.saveSession(...) + transport.send(...)` succeeds. Architect pre-decision #2 says repair primitives can live in a `SessionRepairService` but the orchestration stays in DMS.
+- Commit 5: replay loop runs immediately after the successful X3DH bootstrap+save in `encryptUnderLock` (NOT in a separate background task) so the user sees the held envelopes resurface in the conversation immediately after the next outgoing lands. Loop iterates `decryptFailedEnvelopeRepository.listByConversation(conversationId)`, attempts `ratchet.decrypt` per envelope re-decoded from `wire_frame_json`, on success processes through the normal handleDeliver tail (payload parse + insert + ack), on failure increments `replayAttemptCount`. Architect-pre-decision #3 ensures `replay_fail` does NOT re-mark suspect.
+
+**Architect process notes (carry from PR #241):**
+
+- Additive commits, never force-push. PR opens AFTER commit 3 (first behaviour-change) so architect review surfaces at the right time.
+- Commit messages include grep-verifiable invariants.
+- Per-commit APK MD5 if architect requests hardware verification.
+
+**Resume sequence next session:**
+
+1. Read this hand-off + `MEMORY.md` + `project_next_session_crypto_session_repair_2026_05_28.md`.
+2. `git checkout feat/pr-crypto-session-repair1 && git pull` (HEAD `7825fa3b` or later).
+3. Open the PR as Draft if not yet opened — architect can start reviewing commits 1+2 immediately, even before commit 3 lands. Title: `feat(crypto): PR-CRYPTO-SESSION-REPAIR1 — hold MAC errors instead of ack-and-lose; replay after fresh X3DH`.
+4. After PR is open and architect has acknowledged commits 1+2 are clean, start commit 3 per scope above.
+
+---
+
+## Last hand-off (2026-05-29, earlier — session-pause after commit 1, SUPERSEDED by above)
 
 **Track active.** Vladislav granted greenlight 2026-05-29 with 4 amendments folded into the implementation plan (see commit 1 message + chat transcript).
 
