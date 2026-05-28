@@ -203,12 +203,12 @@ Tests for commit 3:
 
 **Open architectural questions remaining for commits 4-5:**
 
-- Commit 4: where does the `setSessionSuspect → next-send forces X3DH` check live? Inside `encryptUnderLock` before `sessionManager.tryLoadSession`, gated by reading `conversationRepository.getConversation(conversationId).sessionSuspect`. Suspect clear inside the SAME mutex after `sessionManager.saveSession(...) + transport.send(...)` succeeds. Architect pre-decision #2 says repair primitives can live in a `SessionRepairService` but the orchestration stays in DMS.
+- Commit 4: where does the `setSessionSuspect → next-send forces X3DH` check live? Inside `encryptUnderLock` before `sessionManager.tryLoadSession`, gated by reading `conversationRepository.getConversation(conversationId).sessionSuspect`. **Clear `session_suspect` after the fresh X3DH bootstrap + encrypt + `sessionManager.saveSession(...)` succeed — inside the same `mutexFor(conversationId)` block.** Do NOT wait for `transport.send(...)` (which currently runs outside the encrypt mutex and outside the per-conversation mutex; gating suspect-clear on it would require extending the mutex to a network call or rewiring the send pipeline). Architect-correction 2026-05-29: the local cryptographic commit is what makes the session repaired; the relay send is a separate transport concern. Architect pre-decision #2 says repair primitives can live in a `SessionRepairService` but the orchestration stays in DMS.
 - Commit 5: replay loop runs immediately after the successful X3DH bootstrap+save in `encryptUnderLock` (NOT in a separate background task) so the user sees the held envelopes resurface in the conversation immediately after the next outgoing lands. Loop iterates `decryptFailedEnvelopeRepository.listByConversation(conversationId)`, attempts `ratchet.decrypt` per envelope re-decoded from `wire_frame_json`, on success processes through the normal handleDeliver tail (payload parse + insert + ack), on failure increments `replayAttemptCount`. Architect-pre-decision #3 ensures `replay_fail` does NOT re-mark suspect.
 
 **Architect process notes (carry from PR #241):**
 
-- Additive commits, never force-push. PR opens AFTER commit 3 (first behaviour-change) so architect review surfaces at the right time.
+- Additive commits, never force-push. **PR opens as Draft NOW (after commit 2), BEFORE commit 3**, so the architect can explicitly ACK commits 1+2 before the first behaviour change lands per WORKING_RULES Rule 9 path (a). Earlier version of this hand-off said "PR opens AFTER commit 3" — that was incorrect, architect-corrected 2026-05-29. Commit 3 only starts after the PR thread has the architect's ACK on commits 1+2.
 - Commit messages include grep-verifiable invariants.
 - Per-commit APK MD5 if architect requests hardware verification.
 
