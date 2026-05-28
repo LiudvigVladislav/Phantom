@@ -7,9 +7,10 @@
 --
 -- `wire_frame_json` SEMANTIC (architect-locked 2026-05-29, PR #243):
 -- this column stores the INNER WireFrame JSON — the object that DMS
--- already decoded from the relay's `RelayMessage.Deliver.ciphertext`
--- payload via the existing unpad / json path, and from which
--- `wireFrame.encryptedMessage` is read for `ratchet.decrypt`. Concrete
+-- already decoded from the relay's `RelayMessage.Deliver.payload`
+-- (base64-encoded, ISO 7816-4 padded ciphertext) via the existing
+-- unpad / json decode path, and from which `wireFrame.encryptedMessage`
+-- is read for `ratchet.decrypt`. Concrete
 -- write site (commit 3): `json.encodeToString(WireFrame.serializer(),
 -- wireFrame)`. The replay loop in commit 5 reads this column and
 -- decodes back into `WireFrame` so the same `wireFrame.encryptedMessage`
