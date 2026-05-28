@@ -141,6 +141,18 @@ class AppContainer(private val context: Context) {
     // the second decrypt of a re-delivered envelope after a lost ack.
     val processedEnvelopeRepo = SqlDelightProcessedEnvelopeRepository(dbHolder.database)
 
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — durable hold
+     * table for envelopes that produce MAC-error decrypt failures in
+     * debug/beta builds. Wired into [DefaultMessagingService] below.
+     *
+     * Read for commit 2: the constructor parameter exists but is NOT
+     * consumed in the receive path. Commit 3 introduces the hold
+     * branch behind `holdMacFailures = BuildConfig.DEBUG`.
+     */
+    val decryptFailedEnvelopeRepo = phantom.core.storage
+        .SqlDelightDecryptFailedEnvelopeRepository(dbHolder.database)
+
     // PR-D2b.1 (2026-05-17): durable partial-assembly buffer for chunked
     // voice receive. Backs `DefaultMessagingService` so 1:1 voices that
     // start arriving over REST short-poll (or any path) survive a process
@@ -876,6 +888,15 @@ class AppContainer(private val context: Context) {
             // excludes; the cancel diagnostic chain was invisible during
             // Test #76.5 review even though the cancel worked.
             mediaLog                    = { msg -> android.util.Log.i("PhantomMedia", msg) },
+            // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29): wire the
+            // new hold table + the semantic flag. The flag stays at
+            // `BuildConfig.DEBUG` so production builds keep the existing
+            // ack-on-MAC + processed_envelopes.FAILED_MAC path completely
+            // unchanged in this commit. Commit 3 introduces the
+            // conditional `if (holdMacFailures)` branch in
+            // DefaultMessagingService.handleDeliver.
+            decryptFailedEnvelopeRepository = decryptFailedEnvelopeRepo,
+            holdMacFailures             = phantom.android.BuildConfig.DEBUG,
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.

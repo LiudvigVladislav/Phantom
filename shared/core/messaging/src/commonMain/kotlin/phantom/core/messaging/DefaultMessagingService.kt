@@ -37,6 +37,7 @@ import phantom.core.identity.IdentityRecord
 import phantom.core.identity.IdentitySigningKeyPair
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.ConversationRepository
+import phantom.core.storage.DecryptFailedEnvelopeRepository
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
@@ -166,6 +167,35 @@ class DefaultMessagingService(
      * both to the same tag. Default is no-op for tests / non-Android.
      */
     private val mediaLog: (String) -> Unit = {},
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 (2026-05-29, commit 2/N) — durable
+     * hold table for envelopes that produce `Permanent decrypt failure
+     * (MAC error)`. NULLABLE + DEFAULT NULL for call-site compatibility
+     * with existing tests and the legacy code paths that construct DMS
+     * without storage. Production wires the SQLDelight repository
+     * through AppContainer.
+     *
+     * **Not read in commit 2** — wired through the constructor so the
+     * dependency is available when commit 3 introduces the hold path.
+     * The receive MAC branch still ack-delivers + writes
+     * `processed_envelopes.markProcessed(status=FAILED_MAC)` unchanged
+     * in this commit.
+     */
+    private val decryptFailedEnvelopeRepository: DecryptFailedEnvelopeRepository? = null,
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 (2026-05-29, commit 2/N) — semantic
+     * flag that gates the upcoming hold-on-MAC behaviour. Platform-
+     * agnostic: Android wires `BuildConfig.DEBUG`, JVM tests set per-
+     * scenario, default `false` keeps existing tests + release builds
+     * on the unchanged ack-on-MAC path.
+     *
+     * **Not branched on in commit 2** — the flag is plumbed through
+     * the constructor so commit 3 can read it without touching the
+     * constructor again. Grep evidence for invariant 2 (release
+     * preserved): no `if (holdMacFailures)` branch exists in this
+     * file in commit 2.
+     */
+    private val holdMacFailures: Boolean = false,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -1655,6 +1685,21 @@ class DefaultMessagingService(
             val mutex = mutexFor(conversationId)
             val plainBytes: ByteArray? = mutex.withLock {
                 val state = sessionManager.tryLoadSession(conversationId)
+                // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — DECRYPT_TRACE
+                // attempt marker. Emitted before EVERY ratchet.decrypt call so
+                // the next-session DECRYPT_TRACE pipeline can correlate
+                // attempt → outcome lines without ambiguity. Architect-locked
+                // log content (no raw key material): short ids only, plus
+                // boolean session/x3dhInit flags.
+                val decryptStartMs = Clock.System.now().toEpochMilliseconds()
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "DECRYPT_TRACE attempt msgId=${deliver.messageId.take(8)} " +
+                        "sender=${senderPubKeyHex.take(8)} " +
+                        "conv=${conversationId.take(8)} " +
+                        "sessionExists=${state != null} " +
+                        "x3dhInitPresent=${wireFrame.x3dhInit != null}",
+                )
                 if (state != null) {
                     // Existing session — decrypt directly. Any x3dhInit /
                     // signing pubkey that came with this frame are
@@ -1670,6 +1715,16 @@ class DefaultMessagingService(
                         messagingLog(
                             MessagingLogLevel.INFO,
                             "Decrypt OK: plaintextBytes=${decrypted.size}",
+                        )
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                        // observability-only DECRYPT_TRACE ok marker.
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
+                                "conv=${conversationId.take(8)} " +
+                                "plaintextBytes=${decrypted.size} " +
+                                "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
+                                "bootstrap=false",
                         )
                         // PR-H2b: record the envelope id BEFORE we leave
                         // the per-conversation mutex so a concurrent
@@ -1711,6 +1766,21 @@ class DefaultMessagingService(
                                     "relay store. id=${deliver.messageId.take(12)}… " +
                                     "conv=${conversationId.take(16)}… err=${e.message}",
                             )
+                            // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                            // DECRYPT_TRACE fail_mac marker. `action=ack`
+                            // reflects the CURRENT behaviour (preserved in
+                            // this commit). Commit 3 introduces conditional
+                            // `action=hold` when holdMacFailures = true; in
+                            // commit 2 the action is always ack so release
+                            // behaviour is unchanged. No raw key material.
+                            messagingLog(
+                                MessagingLogLevel.WARN,
+                                "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
+                                    "sender=${senderPubKeyHex.take(8)} " +
+                                    "conv=${conversationId.take(8)} " +
+                                    "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
+                                    "action=ack",
+                            )
                             // PR-H2b: pin this envelope id with FAILED_MAC
                             // so a future redelivery sees the ledger hit
                             // and skips the (already-doomed) decrypt
@@ -1729,6 +1799,18 @@ class DefaultMessagingService(
                             return@withLock null
                         }
                         // Other IAE — rethrow, outer onFailure handles it.
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                        // DECRYPT_TRACE fail_other for non-MAC IllegalArgument
+                        // exceptions. These don't get held under
+                        // holdMacFailures (the gate is MAC-specific by
+                        // design); their action remains `rethrow`.
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "DECRYPT_TRACE fail_other msgId=${deliver.messageId.take(8)} " +
+                                "conv=${conversationId.take(8)} " +
+                                "errorClass=${e::class.simpleName} " +
+                                "action=rethrow",
+                        )
                         throw e
                     }
                 } else {
@@ -1749,6 +1831,21 @@ class DefaultMessagingService(
                             "Legacy envelope: no session for conv=${conversationId.take(16)}… " +
                                 "and no x3dhInit header — ack-deliver'ing to clear relay store: " +
                                 "id=${deliver.messageId.take(12)}…",
+                        )
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                        // DECRYPT_TRACE fail_legacy_no_x3dh marker. This is
+                        // structurally similar to fail_mac (destructive ack)
+                        // but the root cause is different: no x3dhInit on
+                        // a no-session envelope makes recovery architecturally
+                        // impossible, whereas fail_mac is chain divergence
+                        // that fresh X3DH can repair. action=ack in this
+                        // commit and beyond — holdMacFailures only gates the
+                        // MAC class, not this one.
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "DECRYPT_TRACE fail_legacy_no_x3dh msgId=${deliver.messageId.take(8)} " +
+                                "sender=${senderPubKeyHex.take(8)} " +
+                                "conv=${conversationId.take(8)} action=ack",
                         )
                         // PR-H2b: same as the MAC-fail path above —
                         // record so a future redelivery skips immediately.
@@ -1787,6 +1884,20 @@ class DefaultMessagingService(
                     messagingLog(
                         MessagingLogLevel.INFO,
                         "Decrypt OK after bootstrap: plaintextBytes=${decrypted.size}",
+                    )
+                    // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                    // DECRYPT_TRACE ok for the bootstrap path. `bootstrap=true`
+                    // distinguishes this from the existing-session ok line so
+                    // the next-session DECRYPT_TRACE pipeline can compute
+                    // "fresh sessions per hour" diagnostics without parsing
+                    // session state.
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
+                            "conv=${conversationId.take(8)} " +
+                            "plaintextBytes=${decrypted.size} " +
+                            "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
+                            "bootstrap=true",
                     )
                     // PR-H2b: same ledger insert as the existing-session
                     // branch above. Bootstrap path lands here once per

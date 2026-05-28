@@ -153,6 +153,26 @@ class MigrationManagerTest {
                 store[id]?.let { store[id] = it.copy(needsRehandshake = true) }
             }
         }
+
+        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — suspect-flag stubs.
+        override suspend fun setSessionSuspect(conversationId: String, setAtMs: Long) {
+            store[conversationId]?.let {
+                store[conversationId] = it.copy(
+                    sessionSuspect = true,
+                    sessionSuspectSetAtMs = setAtMs,
+                )
+            }
+        }
+        override suspend fun clearSessionSuspect(conversationId: String) {
+            store[conversationId]?.let {
+                store[conversationId] = it.copy(
+                    sessionSuspect = false,
+                    sessionSuspectSetAtMs = null,
+                )
+            }
+        }
+        override suspend fun getSessionSuspectConversations(): List<ConversationEntity> =
+            store.values.filter { it.sessionSuspect }.toList()
     }
 
     private class FakePreKeyApi(
