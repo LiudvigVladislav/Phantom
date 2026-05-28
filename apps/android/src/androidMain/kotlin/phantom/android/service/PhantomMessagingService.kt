@@ -121,6 +121,21 @@ class PhantomMessagingService : Service() {
         // overlay — on recovery to WS_ACTIVE the next TransportManager state
         // emission resets the notification to its normal label.
         startRestFallbackNotificationOverlay()
+        // PR-LTE-NETCHANGE1 (2026-05-28): kick off the NetworkChangeObserver
+        // wiring once the container is ready. The observer is owned by
+        // AppContainer for process lifetime; this just triggers register().
+        serviceScope.launch {
+            val app = application as PhantomApplication
+            runCatching { app.ready.await() }
+            runCatching { app.container.networkChangeObserver?.register() }
+                .onFailure { e ->
+                    Log.w(
+                        "PhantomHybrid",
+                        "NETWORK_TRACE observer_register_throw errorClass=${e::class.simpleName} " +
+                            "message=${e.message?.take(120)}",
+                    )
+                }
+        }
     }
 
     private fun startTransportNotificationUpdater() {
@@ -268,6 +283,27 @@ class PhantomMessagingService : Service() {
         // PhantomMessaging tag so they show up in the standard log
         // filter Vladislav uses (PhantomMessaging:V exact-match).
         Log.i("PhantomMessaging", "RECV_DIAG service_onStartCommand startId=$startId flags=$flags")
+
+        // PR-LTE-NETCHANGE1 (2026-05-28): if this onStartCommand was
+        // triggered by `TransportRewalkCoordinator.requestServiceRestart`
+        // (architect-locked single re-entry path), force-reset the
+        // `connectStarted` CAS so the next connect attempt re-runs the
+        // chain walk against the new network. Without this reset, the
+        // CAS guard at line ~335 would treat the rewalk as a duplicate
+        // and short-circuit.
+        //
+        // The coordinator already executed: state-machine notify, hint
+        // clear, hybrid.disconnect(), transportManager.release(). All we
+        // do here is unblock the re-entry path.
+        if (intent?.getBooleanExtra(EXTRA_REWALK_RESTART, false) == true) {
+            val reason = intent.getStringExtra(EXTRA_REWALK_REASON) ?: "unknown"
+            Log.i(
+                "PhantomHybrid",
+                "NETWORK_TRACE service_restart_received reason=$reason — resetting connectStarted CAS",
+            )
+            connectStarted.set(false)
+        }
+
         serviceScope.launch {
             val app = application as PhantomApplication
             // Wait for libsodium + AppContainer to be fully initialised before using them.
@@ -410,6 +446,14 @@ class PhantomMessagingService : Service() {
         // ADR-011: cancel the AlarmManager wakeup so we don't keep waking
         // the device after the user has explicitly stopped the service.
         runCatching { PhantomWakeupReceiver.cancel(applicationContext) }
+        // PR-LTE-NETCHANGE1 (2026-05-28): unregister the NetworkChangeObserver
+        // so we don't leak the ConnectivityManager callback past the service
+        // lifetime. Robust to "observer not registered" via runCatching.
+        runCatching {
+            (application as PhantomApplication).container.networkChangeObserver?.unregister()
+        }.onFailure {
+            Log.w(TAG, "NetworkChangeObserver unregister failed: ${it.message}")
+        }
         releaseKeepAliveLocks()
         // ADR-020 Phase 2: a single release tears down both Tor and Xray
         // (whichever the chain walk happened to start). Bounded inline so
@@ -455,6 +499,18 @@ class PhantomMessagingService : Service() {
         private const val TAG = "PhantomMessagingService"
         const val CHANNEL_ID = "phantom_messaging"
         const val NOTIFICATION_ID = 1001
+
+        /**
+         * PR-LTE-NETCHANGE1 (2026-05-28) — boolean intent extra set by
+         * `TransportRewalkCoordinator.requestServiceRestart` when it
+         * needs the service to re-enter `onStartCommand` with a fresh
+         * connect generation. Service reads it and force-resets the
+         * `connectStarted` CAS guard. If absent, the normal CAS path
+         * runs unchanged.
+         */
+        const val EXTRA_REWALK_RESTART = "phantom.rewalk_restart"
+        /** Optional string extra: `NetworkChangeReason.name` for log attribution. */
+        const val EXTRA_REWALK_REASON = "phantom.rewalk_reason"
         // Default text when TransportManager is Idle (pre-connect) or has no
         // useful state to surface; the notification updater overwrites this
         // as soon as the manager transitions to Probing / Connected / AllFailed.

@@ -256,6 +256,72 @@ class ProbeTraceTransportManagerTest {
         assertTrue(chainStart.contains("realityFiltered=false"), "realityFiltered missing: $chainStart")
     }
 
+    // ── VPN active filters Reality and logs the reason ────────────────────────
+
+    @Test
+    fun vpnActiveFiltersRealityFromChainAndLogsReason() = runTest {
+        // PR-LTE-NETCHANGE1 (2026-05-28) — when the VPN detector reports
+        // active, Reality must be removed from the Standard chain AND a
+        // dedicated `PROBE_TRACE reality_filtered reason=vpn_active` line
+        // must follow `chain_start`, so the log alone explains why the
+        // ordered chain is `[Direct, Tor]` instead of `[Direct, Reality, Tor]`.
+        // Test #88 Scenario C depends on this attribution.
+        val log = CapturingTransportManagerLog()
+        val mgr = TransportManager(
+            torServiceProvider = { fakeTor() },
+            xrayServiceProvider = { fakeXray() },
+            preferences = InMemoryTransportPreferences(PrivacyMode.Standard),
+            probe = TransportProbe { kind, _ -> kind == TransportKind.Direct },
+            nowMs = { 0L },
+            log = log,
+            vpnDetector = { true }, // VPN ON
+        )
+
+        mgr.connect()
+
+        val traces = log.probeTraces()
+        // 1. chain_start surfaces both flags and the Reality-stripped ordering.
+        val chainStart = traces.first { it.startsWith("chain_start") }
+        assertTrue(chainStart.contains("vpnActive=true"), "vpnActive=true missing: $chainStart")
+        assertTrue(chainStart.contains("realityFiltered=true"), "realityFiltered=true missing: $chainStart")
+        assertTrue(
+            chainStart.contains("ordered=[Direct, Tor]"),
+            "expected Reality filtered out of ordered chain; got: $chainStart",
+        )
+        // 2. The dedicated reason line follows chain_start.
+        val realityFiltered = traces.firstOrNull { it == "reality_filtered reason=vpn_active" }
+        assertTrue(
+            realityFiltered != null,
+            "expected `reality_filtered reason=vpn_active`; got: $traces",
+        )
+    }
+
+    @Test
+    fun vpnInactiveDoesNotEmitRealityFilteredLine() = runTest {
+        // Sanity: when vpnDetector returns false, no reality_filtered line
+        // should appear — even though the chain still includes Reality. This
+        // guards against a future bug where the line fires for ANY chain
+        // containing Reality, regardless of VPN state.
+        val log = CapturingTransportManagerLog()
+        val mgr = TransportManager(
+            torServiceProvider = { fakeTor() },
+            xrayServiceProvider = { fakeXray() },
+            preferences = InMemoryTransportPreferences(PrivacyMode.Standard),
+            probe = TransportProbe { kind, _ -> kind == TransportKind.Direct },
+            nowMs = { 0L },
+            log = log,
+            vpnDetector = { false }, // VPN OFF
+        )
+
+        mgr.connect()
+
+        val traces = log.probeTraces()
+        assertTrue(
+            traces.none { it.startsWith("reality_filtered") },
+            "unexpected reality_filtered line when VPN off; traces=$traces",
+        )
+    }
+
     // ── Prepare_start/done ordering ───────────────────────────────────────────
 
     @Test

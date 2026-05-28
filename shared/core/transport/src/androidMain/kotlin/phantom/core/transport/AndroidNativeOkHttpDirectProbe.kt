@@ -107,6 +107,20 @@ internal class AndroidNativeOkHttpDirectProbe(
         .connectTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
         .readTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
         .writeTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+        // PR-LTE-NETCHANGE1 (2026-05-28): attach the same phase-by-phase
+        // event listener that the Ktor-based Reality/Tor probes already
+        // use. Without it, a Direct probe failure on Tele2 LTE shows up
+        // as a single `direct.okhttp_fail errorType=...` line with no
+        // signal about WHICH phase (DNS / TCP / TLS / request / response)
+        // actually died. Test #88 Scenario D in particular needs phase
+        // attribution to explain a 5.8-minute fallback to Tor.
+        //
+        // The listener emits under tag `TransportProbe` (see ProbeEvent
+        // Listener at KtorTransportProbe.kt:170-268); the existing
+        // PROBE_TRACE direct.* lines from this class remain under tag
+        // `TransportManager`. Both tags belong in any transport-diagnostic
+        // logcat capture per `feedback_logcat_tag_coverage_2026_05_27.md`.
+        .eventListener(ProbeEventListener(TransportKind.Direct))
         .build()
 
     companion object {
