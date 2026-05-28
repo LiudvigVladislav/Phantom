@@ -155,6 +155,31 @@ internal class NetworkChangeObserver(
         val current = snapshotCurrentState()
         val previous = lastAcceptedSnapshot
 
+        // PR-LTE-NETCHANGE1 P1 fix (architect 2026-05-28): the first
+        // snapshot after register() is NOT a network change. It is the
+        // initial read of the current state. Logging it as `changed
+        // old=FIRST new=...` and then triggering a rewalk would burn
+        // a `chain_start` on every cold start with no actual network
+        // transition.
+        //
+        // Correct semantics: log `NETWORK_TRACE initial_snapshot ...`,
+        // seed [lastAcceptedSnapshot] AND seed the coordinator's
+        // `lastNetworkPresent` mark via [TransportRewalkCoordinator
+        // .seedNetworkPresent] so the next real `false→true`
+        // transition can correctly bypass the rate-limit. NO call to
+        // [coordinator.onMeaningfulChange] on this path.
+        if (previous == null) {
+            Log.i(
+                TAG,
+                "NETWORK_TRACE initial_snapshot transport=${current.transportClass} " +
+                    "validated=${current.validated} vpnActive=${current.vpnActive} " +
+                    "networkPresent=${current.networkPresent} trigger=$triggerReason",
+            )
+            lastAcceptedSnapshot = current
+            coordinator.seedNetworkPresent(current.networkPresent)
+            return
+        }
+
         val (isMeaningful, reason) = classify(previous, current)
         if (!isMeaningful) {
             Log.i(
@@ -167,7 +192,7 @@ internal class NetworkChangeObserver(
 
         Log.i(
             TAG,
-            "NETWORK_TRACE changed old=${previous?.transportClass ?: "FIRST"} " +
+            "NETWORK_TRACE changed old=${previous.transportClass} " +
                 "new=${current.transportClass} validated=${current.validated} " +
                 "vpnActive=${current.vpnActive} networkPresent=${current.networkPresent} " +
                 "trigger=$triggerReason resolvedReason=$reason",
@@ -230,12 +255,14 @@ internal class NetworkChangeObserver(
      * dominant one for the rewalk log.
      */
     private fun classify(
-        previous: NetworkSnapshot?,
+        previous: NetworkSnapshot,
         current: NetworkSnapshot,
     ): Pair<Boolean, NetworkChangeReason> {
-        if (previous == null) {
-            return Pair(true, NetworkChangeReason.FIRST_SNAPSHOT)
-        }
+        // PR-LTE-NETCHANGE1 P1 fix: callers guarantee previous != null
+        // (the FIRST_SNAPSHOT case is handled in evaluate() before this
+        // function is reached). Removing the nullable parameter avoids
+        // accidentally re-introducing the destructive cold-start rewalk.
+        //
         // Dominant: network presence transitions.
         if (!previous.networkPresent && current.networkPresent) {
             return Pair(true, NetworkChangeReason.NETWORK_AVAILABLE)

@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -78,6 +79,40 @@ class PhantomMessagingService : Service() {
     // AtomicBoolean.compareAndSet(false, true) gives us the atomic
     // "first-caller-wins" semantics we need.
     private val connectStarted = AtomicBoolean(false)
+
+    /**
+     * PR-LTE-NETCHANGE1 P1 fix (architect 2026-05-28): generation token
+     * that closes the "stale-cleanup-reopens-CAS-while-new-generation-
+     * is-running" race.
+     *
+     * Race scenario without this fix:
+     * 1. Generation A is running its serviceScope.launch block.
+     * 2. Rewalk fires → coordinator runs → `EXTRA_REWALK_RESTART` intent
+     *    resets `connectStarted` CAS to false.
+     * 3. Generation B's launch starts, CAS succeeds, B is alive.
+     * 4. Generation A's `KtorRelayTransport.connect()` returns (because
+     *    `disconnect()` cancelled its internal `reconnectJob`).
+     * 5. Generation A reaches its `connectStarted.set(false)` cleanup
+     *    line (one of four sites) and naively resets the CAS — WHILE
+     *    Generation B is still holding it.
+     * 6. A third `onStartCommand` (AlarmManager, ConnectivityChange)
+     *    races past the now-open CAS and starts Generation C in
+     *    parallel with B.
+     *
+     * Fix pattern: each generation claims a unique token via
+     * `incrementAndGet()` AFTER its CAS succeeds (so failed-CAS launches
+     * do NOT consume a token). At cleanup time, only reset the CAS if
+     * `connectGeneration.get() == myGen` — the current value. If a
+     * subsequent generation has claimed a higher token, the current
+     * generation knows it is no longer the canonical owner of the CAS
+     * and skips the reset.
+     *
+     * Rewalk's `EXTRA_REWALK_RESTART` path still resets the CAS to
+     * unblock the next generation; it does not need to bump the token
+     * itself because the next launch will claim a fresh token on its
+     * own.
+     */
+    private val connectGeneration = AtomicLong(0L)
     // ADR Tier-1 (HiOS workaround): MulticastLock changes the Wi-Fi
     // radio idle profile on aggressive OEMs (Tecno HiOS, Infinix XOS,
     // Xiaomi MIUI) where battery management ignores both
@@ -319,7 +354,25 @@ class PhantomMessagingService : Service() {
 
             // Ensure messaging is wired (no-op if already done by Activity on warm start).
             runCatching { container.initMessagingFromStorage() }
-                .onSuccess { Log.i("PhantomMessaging", "RECV_DIAG container_init_ok") }
+                .onSuccess {
+                    Log.i("PhantomMessaging", "RECV_DIAG container_init_ok")
+                    // PR-LTE-NETCHANGE1 P1 fix (architect 2026-05-28): the
+                    // observer is CREATED inside initMessagingFromStorage,
+                    // not before. The onCreate-launched register call may
+                    // have raced ahead and seen `observer = null`, doing a
+                    // silent no-op. Register here as well (idempotent via
+                    // the `if (registered) return` guard on NetworkChange
+                    // Observer.register) so the observer is guaranteed
+                    // registered by the time we kick off the connect path.
+                    runCatching { container.networkChangeObserver?.register() }
+                        .onFailure { e ->
+                            Log.w(
+                                "PhantomHybrid",
+                                "NETWORK_TRACE observer_register_post_init_throw " +
+                                    "errorClass=${e::class.simpleName} message=${e.message?.take(120)}",
+                            )
+                        }
+                }
                 .onFailure { e ->
                     Log.e(TAG, "initMessagingFromStorage failed: ${e.message}")
                     Log.e("PhantomMessaging", "RECV_DIAG container_init_fail err=${e::class.simpleName}")
@@ -373,6 +426,18 @@ class PhantomMessagingService : Service() {
                 return@launch
             }
 
+            // PR-LTE-NETCHANGE1 P1 fix (architect 2026-05-28): claim a
+            // generation token AFTER CAS succeeds, so failed-CAS launches
+            // do not bump it. Every `connectStarted.set(false)` cleanup
+            // site below is wrapped in [resetConnectStartedIfCurrent] so
+            // a stale generation (cancelled by a rewalk) cannot clobber
+            // the CAS while a fresher generation is alive.
+            val myGen = connectGeneration.incrementAndGet()
+            Log.i(
+                "PhantomHybrid",
+                "NETWORK_TRACE generation_claimed gen=$myGen",
+            )
+
             // F11 + F26: signed-challenge auth requires our Ed25519 signing
             // keypair. Resolve BEFORE asking TransportManager to start an
             // outer subsystem — no point bootstrapping Tor / Xray if we
@@ -383,7 +448,7 @@ class PhantomMessagingService : Service() {
                     TAG,
                     "Cannot connect: Ed25519 signing keypair not provisioned yet (migration pending). Service will exit; foreground restart after onboarding will reconnect.",
                 )
-                connectStarted.set(false)
+                resetConnectStartedIfCurrent(myGen, "signingPair_null")
                 return@launch
             }
             val signingPubKeyHex = signingPair.publicKey.bytes
@@ -393,11 +458,11 @@ class PhantomMessagingService : Service() {
                 container.transportManager.connect()
             } catch (e: NoTransportReachableException) {
                 Log.e(TAG, "TransportManager: no path reachable — ${e.message}", e)
-                connectStarted.set(false)
+                resetConnectStartedIfCurrent(myGen, "transportManager_no_path")
                 return@launch
             } catch (t: Throwable) {
                 Log.e(TAG, "TransportManager.connect threw: ${t::class.simpleName}: ${t.message}", t)
-                connectStarted.set(false)
+                resetConnectStartedIfCurrent(myGen, "transportManager_connect_threw")
                 return@launch
             }
             val socksProxyPort: Int? = connected.socksPort
@@ -435,9 +500,31 @@ class PhantomMessagingService : Service() {
                 Log.e(TAG, "Transport connect loop exited: ${e.message}", e)
                 Log.e("PhantomRelay", "Transport connect loop exited: ${e.message}", e)
             }
-            connectStarted.set(false)
+            resetConnectStartedIfCurrent(myGen, "transport_loop_exited")
         }
         return START_STICKY
+    }
+
+    /**
+     * PR-LTE-NETCHANGE1 P1 fix (architect 2026-05-28): cleanup-time CAS
+     * reset gated by generation token. See `connectGeneration` field
+     * kdoc for race scenario. Logs the skip case so a stale-cleanup
+     * incident is visible in the future logcat without code reading.
+     */
+    private fun resetConnectStartedIfCurrent(myGen: Long, site: String) {
+        val current = connectGeneration.get()
+        if (current == myGen) {
+            connectStarted.set(false)
+            Log.i(
+                "PhantomHybrid",
+                "NETWORK_TRACE generation_cleanup gen=$myGen site=$site connectStarted=false",
+            )
+        } else {
+            Log.i(
+                "PhantomHybrid",
+                "NETWORK_TRACE generation_stale skip_cas_reset myGen=$myGen current=$current site=$site",
+            )
+        }
     }
 
     override fun onDestroy() {

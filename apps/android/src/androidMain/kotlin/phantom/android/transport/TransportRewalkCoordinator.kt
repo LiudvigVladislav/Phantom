@@ -112,6 +112,33 @@ internal class TransportRewalkCoordinator(
         }
     }
 
+    /**
+     * PR-LTE-NETCHANGE1 P1 fix (architect 2026-05-28): seed
+     * [lastNetworkPresent] from the FIRST snapshot the observer reads
+     * after `register()`, WITHOUT running the destructive rewalk path.
+     *
+     * Why: the observer would otherwise classify the first snapshot as
+     * meaningful (no previous to diff against) and call
+     * [onMeaningfulChange], which would clear the sticky hint,
+     * disconnect, release, and restart the connect generation on every
+     * cold start — burning a `chain_start` even when no network change
+     * happened. That would also pollute Test #88 Scenarios A/B/C/D
+     * with an extra rewalk attributable to nothing.
+     *
+     * Correct semantics: on `register()`, the observer reads the
+     * current snapshot, calls this method to update the coordinator's
+     * `lastNetworkPresent` mark (so future `networkPresent=false→true`
+     * detection works correctly), logs `NETWORK_TRACE initial_snapshot`,
+     * and stops — no rewalk.
+     */
+    fun seedNetworkPresent(networkPresent: Boolean) {
+        lastNetworkPresent = networkPresent
+        Log.i(
+            TAG,
+            "NETWORK_TRACE coordinator_seeded networkPresent=$networkPresent",
+        )
+    }
+
     private suspend fun performRewalk(reason: NetworkChangeReason, snapshot: NetworkSnapshot) {
         rewalkMutex.withLock {
             val now = nowMs()
@@ -233,8 +260,6 @@ internal class TransportRewalkCoordinator(
  * logs and the value the test runbook will grep for.
  */
 internal enum class NetworkChangeReason {
-    /** First snapshot since process / coordinator init. */
-    FIRST_SNAPSHOT,
     /** `networkPresent=false → true` — always forces a rewalk. */
     NETWORK_AVAILABLE,
     /** `networkPresent=true → false`. Coordinator logs and clears state but no chain walk is meaningful right now. */
@@ -251,6 +276,14 @@ internal enum class NetworkChangeReason {
     VALIDATED_CHANGED,
     /** Other meaningful change (covered by snapshot diff but not by one of the named transitions). */
     OTHER,
+    // NB: `FIRST_SNAPSHOT` was deliberately removed in the 2026-05-28
+    // P1 fix round. The first snapshot after observer registration is
+    // handled by `NetworkChangeObserver.evaluate` directly via
+    // `TransportRewalkCoordinator.seedNetworkPresent` + the
+    // `NETWORK_TRACE initial_snapshot` log; it never enters the
+    // `onMeaningfulChange` path. Adding FIRST_SNAPSHOT back would
+    // re-introduce the destructive cold-start rewalk that the architect
+    // caught in PR #241 review.
 }
 
 /**
