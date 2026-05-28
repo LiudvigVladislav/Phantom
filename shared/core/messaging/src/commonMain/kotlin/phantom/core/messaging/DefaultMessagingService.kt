@@ -366,9 +366,45 @@ class DefaultMessagingService(
         messagingLog(MessagingLogLevel.INFO, "SEND_TRACE encrypt_lock_wait conv=$convTag")
         return mutexFor(conversationId).withLock {
             messagingLog(MessagingLogLevel.INFO, "SEND_TRACE encrypt_lock_acquired conv=$convTag")
-            messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_lookup conv=$convTag")
+
+            // ═════════════════════════════════════════════════════════
+            // PR-CRYPTO-SESSION-REPAIR1 commit 4 (2026-05-30) — per-
+            // conversation suspect check inside the existing per-
+            // conversation mutex (architect pre-decision #1: reuse
+            // mutexFor, do not introduce a parallel map).
+            //
+            // When the receive path's hold-on-MAC branch flagged this
+            // conversation as `session_suspect=true`, the next outgoing
+            // message bypasses tryLoadSession and forces the fresh X3DH
+            // bootstrap branch. The flag is cleared only after the
+            // local saveSession commits — bootstrap, encrypt, or save
+            // failure leaves the flag set so the NEXT outgoing retries
+            // the repair (architect-correction 2026-05-29: clear on
+            // local crypto commit, NOT on transport.send which runs
+            // outside the mutex).
+            //
+            // Receive ack / markProcessed ownership stays in DMS receive
+            // path (architect pre-decision #2). Replay of held envelopes
+            // is OUT OF SCOPE for commit 4 — that lands in commit 5.
+            // ═════════════════════════════════════════════════════════
+            val sessionSuspect =
+                conversationRepository.getConversation(conversationId)?.sessionSuspect == true
+            if (sessionSuspect) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "DECRYPT_TRACE repair_armed trigger=outbound_send conv=$convTag",
+                )
+            }
+
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "SEND_TRACE session_lookup conv=$convTag suspect=$sessionSuspect",
+            )
             val existingState = sessionManager.tryLoadSession(conversationId)
-            if (existingState != null) {
+            // Existing-session branch runs ONLY when a session exists
+            // AND the conversation is NOT flagged suspect. Suspect flows
+            // into the bootstrap branch below regardless of existingState.
+            if (existingState != null && !sessionSuspect) {
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_existing conv=$convTag")
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE ratchet_encrypt_start conv=$convTag plaintextBytes=${plaintext.size}")
                 val (newState, encrypted) = ratchet.encrypt(existingState, plaintext)
@@ -493,6 +529,28 @@ class DefaultMessagingService(
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_start conv=$convTag")
                 sessionManager.saveSession(conversationId, newState)
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
+
+                // PR-CRYPTO-SESSION-REPAIR1 commit 4 (2026-05-30): clear
+                // session_suspect ONLY after the local crypto commit
+                // (saveSession) has succeeded — still inside mutexFor
+                // (conversationId) so the next outgoing send sees the
+                // cleared state atomically. If anything above this line
+                // throws (prekey fetch, bootstrap, encrypt, afterEncrypt
+                // callback, saveSession), the exception propagates out
+                // of the mutex and this clear DOES NOT run, leaving the
+                // flag at true so the NEXT outgoing retries the repair.
+                //
+                // Only fires when the bootstrap branch ran BECAUSE of
+                // the suspect flag — for a regular first-send
+                // (sessionSuspect=false, just a fresh peer), this is a
+                // no-op.
+                if (sessionSuspect) {
+                    conversationRepository.clearSessionSuspect(conversationId)
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "DECRYPT_TRACE repair_done conv=$convTag",
+                    )
+                }
                 wireFrame
             }
         }

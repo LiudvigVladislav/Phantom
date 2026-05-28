@@ -1917,6 +1917,320 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 4 (2026-05-30) — suspect → fresh
+    // X3DH on next outgoing. 4-test matrix from the architect mini-lock.
+    // All assertions live entirely on the send path; receive ack /
+    // markProcessed ownership stays in DMS per architect pre-decision #2.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun suspect_outgoing_forces_fresh_x3dh_and_clears_suspect_after_save() = runTest {
+        // Set sessionSuspect=true on a conversation that ALREADY has an
+        // existing session row. The outgoing send must take the fresh
+        // X3DH bootstrap branch (verified by x3dhInit != null on the
+        // wire) and clear sessionSuspect only after sessionManager
+        // .saveSession commits (architect-correction 2026-05-29: clear
+        // on local crypto commit, not on transport.send).
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+
+        // Bob has a real published bundle so the suspect-forced
+        // bootstrap branch can actually complete.
+        val real = phantom.core.crypto.LibsodiumX3DH()
+        val bobX25519 = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val bobSpkSig = phantom.core.crypto.SignedPreKeySigner.sign(
+            spkPublic = bobSpk.publicKey,
+            createdAtMs = 1_000L,
+            identityEd25519SecretKey = bobSigning.secretKey.toByteArray(),
+        )
+        val bobHex = bobX25519.publicKey.bytes.toHexStringLower()
+        val bobBundle = phantom.core.transport.PreKeyBundle(
+            identity_pubkey_hex = bobHex,
+            signing_pubkey_hex = bobSigning.publicKey.toByteArray().toHexStringLower(),
+            signed_pre_key = phantom.core.transport.WireSignedPreKey(
+                key_id = 1L,
+                public_key_hex = bobSpk.publicKey.bytes.toHexStringLower(),
+                created_at_ms = 1_000L,
+                signature_hex = bobSpkSig.toHexStringLower(),
+            ),
+            one_time_pre_key = null,
+        )
+
+        val convId = listOf(identity.publicKeyHex, bobHex).sorted().joinToString("_")
+
+        // Pre-seed an existing session for this conv — the test proves
+        // that the suspect flag overrides tryLoadSession (existingState
+        // is NOT null, but the bootstrap branch still runs).
+        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = listOf(convId))
+        // Conversation row with sessionSuspect=true.
+        convRepo.store[convId] = phantom.core.storage.ConversationEntity(
+            id = convId,
+            theirUsername = "bob",
+            theirPublicKeyHex = bobHex,
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 12_345L,
+        )
+
+        val sessionManager = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+
+        val ourSigningKp = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val ourSigning = phantom.core.identity.IdentitySigningKeyPair(
+            publicKey = phantom.core.identity.SigningPublicKey(ourSigningKp.publicKey.toByteArray()),
+            privateKey = phantom.core.identity.SigningPrivateKey(ourSigningKp.secretKey.toByteArray()),
+        )
+
+        val service = DefaultMessagingService(
+            identity = identity,
+            localKeyPair = localKeyPair,
+            ratchet = PassthroughDoubleRatchet(),
+            sessionManager = sessionManager,
+            transport = transport,
+            messageRepository = msgRepo,
+            conversationRepository = convRepo,
+            scope = this,
+            json = json,
+            preKeyApi = StubPreKeyApi(bundle = bobBundle),
+            signingKeyProvider = { ourSigning },
+        )
+
+        service.sendMessage(
+            OutgoingMessage(
+                id = "msg-suspect-1",
+                conversationId = convId,
+                recipientPublicKeyHex = bobHex,
+                text = "repair-armed payload",
+            ),
+        )
+
+        // Assertion 1: bootstrap path WAS taken (x3dhInit on wire).
+        assertEquals(1, transport.sent.size, "send must reach transport")
+        val payload = transport.sent[0].payload
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val padded = kotlin.io.encoding.Base64.decode(payload)
+        val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
+        val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
+        assertNotNull(
+            wireFrame.x3dhInit,
+            "suspect conversation MUST force fresh X3DH bootstrap → x3dhInit on wire",
+        )
+
+        // Assertion 2: sessionSuspect cleared after saveSession.
+        val updatedConv = convRepo.getConversation(convId)
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: true,
+            "sessionSuspect MUST be cleared after fresh X3DH + saveSession succeed",
+        )
+    }
+
+    @Test
+    fun non_suspect_outgoing_uses_existing_session() = runTest {
+        // Mirror baseline: when sessionSuspect=false (default), the
+        // existing-session branch runs unchanged. x3dhInit on the wire
+        // is null and no preKeyApi fetch happens (ThrowingPreKeyApi
+        // would fail the test if the bootstrap branch was reached).
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val convRepo = FakeConversationRepository()
+        // Pre-seed a conv row with sessionSuspect=false (explicit for
+        // clarity even though it's the default).
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = false,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            scope = backgroundScope,
+            // ThrowingPreKeyApi via default buildService — bootstrap
+            // branch reaching preKeyApi.fetchBundle would throw.
+        )
+
+        service.sendMessage(
+            OutgoingMessage(
+                id = "msg-nosuspect",
+                conversationId = "aabb_ccdd",
+                recipientPublicKeyHex = "ccdd",
+                text = "regular send",
+            ),
+        )
+
+        // Existing-session path: x3dhInit must be null on the wire.
+        assertEquals(1, transport.sent.size)
+        val payload = transport.sent[0].payload
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val padded = kotlin.io.encoding.Base64.decode(payload)
+        val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
+        val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
+        kotlin.test.assertNull(
+            wireFrame.x3dhInit,
+            "non-suspect outgoing MUST use existing session → x3dhInit MUST be null",
+        )
+        // Suspect stays false.
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(false, updatedConv?.sessionSuspect ?: false)
+    }
+
+    @Test
+    fun suspect_bootstrap_failure_keeps_suspect() = runTest {
+        // Architect guardrail: if any of (prekey fetch, bootstrap,
+        // encrypt, saveSession) throws, the clearSessionSuspect call
+        // does NOT execute and the flag stays true so the next outgoing
+        // retries the repair. Verified here by giving the conversation
+        // a suspect flag + ThrowingPreKeyApi (default via buildService);
+        // the fetch throws PeerBundleMissingException which propagates
+        // out of encryptUnderLock.
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 42L,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            scope = backgroundScope,
+        )
+
+        // sendMessage should NOT throw out (DMS surfaces bundle-missing
+        // as a WAITING result internally), but the conversation's
+        // sessionSuspect MUST remain true regardless.
+        runCatching {
+            service.sendMessage(
+                OutgoingMessage(
+                    id = "msg-fail-suspect",
+                    conversationId = "aabb_ccdd",
+                    recipientPublicKeyHex = "ccdd",
+                    text = "bootstrap will fail because ThrowingPreKeyApi",
+                )
+            )
+        }
+
+        // The wire MUST NOT carry a message — bootstrap failed.
+        assertEquals(
+            0,
+            transport.sent.size,
+            "bootstrap failure must NOT produce a transport.send",
+        )
+        // The suspect flag MUST remain true so the next outgoing retries.
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            true,
+            updatedConv?.sessionSuspect ?: false,
+            "sessionSuspect MUST remain true on bootstrap/encrypt/save failure",
+        )
+        // Diagnostic: the original setAtMs is also preserved (since the
+        // flag was never cleared and re-set, the timestamp does not move).
+        assertEquals(42L, updatedConv?.sessionSuspectSetAtMs)
+    }
+
+    @Test
+    fun repair_is_per_conversation_only() = runTest {
+        // Two distinct conversations. Setting sessionSuspect=true on
+        // conversation A must NOT affect conversation B. An outgoing
+        // message in B uses B's existing session (x3dhInit null on
+        // wire), and A's suspect flag remains untouched because no
+        // outgoing send in A was issued.
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val convRepo = FakeConversationRepository()
+        // Conv A (peer ccdd) is suspect.
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "ccdd-peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 9_999L,
+        )
+        // Conv B (peer eeff) is clean. Both convs are pre-seeded in the
+        // buildService ratchet repo by default.
+        convRepo.store["aabb_eeff"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_eeff",
+            theirUsername = "eeff-peer",
+            theirPublicKeyHex = "eeff",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = false,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            scope = backgroundScope,
+        )
+
+        // Send in B. The buildService ratchet repo pre-seeds "aabb_eeff"
+        // so existing-session path runs; ThrowingPreKeyApi would fail
+        // any bootstrap attempt.
+        service.sendMessage(
+            OutgoingMessage(
+                id = "msg-clean-conv",
+                conversationId = "aabb_eeff",
+                recipientPublicKeyHex = "eeff",
+                text = "regular send in clean conv",
+            ),
+        )
+
+        // B used existing session.
+        assertEquals(1, transport.sent.size)
+        val payload = transport.sent[0].payload
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val padded = kotlin.io.encoding.Base64.decode(payload)
+        val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
+        val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
+        kotlin.test.assertNull(
+            wireFrame.x3dhInit,
+            "clean conversation MUST use existing session — x3dhInit must be null",
+        )
+        // A's suspect flag is untouched.
+        val convA = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            true,
+            convA?.sessionSuspect ?: false,
+            "suspect flag on a DIFFERENT conversation MUST remain unchanged after send in another conv",
+        )
+        assertEquals(9_999L, convA?.sessionSuspectSetAtMs)
+        // B's flag stayed false.
+        val convB = convRepo.getConversation("aabb_eeff")
+        assertEquals(false, convB?.sessionSuspect ?: false)
+    }
+
     @Test
     fun handleDeliver_unknownEnvelopeId_passesGuard_andReachesDecryptPath() = runTest {
         // Symmetry check: an envelope id NOT in the ledger must pass the
