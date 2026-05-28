@@ -87,6 +87,17 @@ class TransportManager(
             "PROBE_TRACE chain_start strategy=$strategy ordered=$orderedChain " +
                 "vpnActive=$vpnActive realityFiltered=$realityFiltered",
         )
+        // PR-LTE-NETCHANGE1 (2026-05-28): explicit attribution line when
+        // Reality was removed from the chain. The chain_start log above
+        // surfaces `realityFiltered=true` as a boolean, but a dedicated
+        // line with the reason keeps Test #88 Scenario D readable: when
+        // "Tor on LTE" happens, the immediate next log line explains
+        // WHY Reality was not even attempted. Today the only reason is
+        // VPN; if more reasons emerge later (carrier-side block, ADR-
+        // motivated suspension), the same line format extends.
+        if (realityFiltered) {
+            log.info("PROBE_TRACE reality_filtered reason=vpn_active")
+        }
         _state.value = ManagerState.Probing(orderedChain.first())
 
         val failures = mutableListOf<TransportAttemptFailure>()

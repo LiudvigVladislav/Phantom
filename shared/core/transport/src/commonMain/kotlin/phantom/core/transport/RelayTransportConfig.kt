@@ -100,6 +100,40 @@ object RelayTransportConfig {
      */
     const val INBOUND_STALL_THRESHOLD_MS = 60_000L
 
+    /**
+     * PR-LTE-NETCHANGE1 (2026-05-28) — minimum interval between two
+     * consecutive `TransportRewalkCoordinator` rewalk runs, used to
+     * stop a chronically-flapping network interface from looping the
+     * chain walker. Enforced inside the coordinator BEFORE any reset
+     * work begins; on rate-limit hit the coordinator logs
+     * `NETWORK_TRACE rate_limited reason=interval ageMs=<n>` and
+     * returns.
+     *
+     * Exception (architect guardrail 3, 2026-05-28): a transition from
+     * `networkPresent=false` to `networkPresent=true` ALWAYS bypasses
+     * this rate-limit. If the network had genuinely disappeared and
+     * just came back, suppressing the rewalk would leave us stuck on
+     * stale transport decisions; that case must always re-walk the
+     * chain immediately.
+     */
+    const val NETWORK_REWALK_MIN_INTERVAL_MS = 5_000L
+
+    /**
+     * PR-LTE-NETCHANGE1 (2026-05-28) — debounce window for the Android
+     * `ConnectivityManager.NetworkCallback`. Android emits a flurry of
+     * `onCapabilitiesChanged` / `onAvailable` / `onLost` callbacks over
+     * ~500 ms during a single real network transition (entering a cell,
+     * leaving Wi-Fi range, VPN coming up). Without debounce we would
+     * fire 5–8 rewalks for one real event.
+     *
+     * Architect guardrail 2 (2026-05-28): after the debounce window
+     * elapses, the observer reads the CURRENT `ConnectivityManager`
+     * snapshot (active network + capabilities), NOT the payload of the
+     * triggering callback. That avoids deciding on stale callback data
+     * after Android has already settled on a different transport.
+     */
+    const val NETWORK_CHANGE_DEBOUNCE_MS = 1_500L
+
     // PR-H1e (2026-05-14) — app-level Ping disabled in production.
     //
     // The diagnostic sprint isolated each heartbeat layer (app Ping,

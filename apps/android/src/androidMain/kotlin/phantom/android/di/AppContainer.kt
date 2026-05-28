@@ -221,6 +221,36 @@ class AppContainer(private val context: Context) {
         private set
 
     /**
+     * PR-LTE-NETCHANGE1 (2026-05-28) — Android network-change observer.
+     * Owns the single `ConnectivityManager.NetworkCallback` for the
+     * process. Constructed inside [initMessaging] once
+     * [transportRewalkCoordinator] is available. Registered by
+     * `PhantomMessagingService.onCreate` after `app.ready` resolves.
+     *
+     * `internal` visibility because both the field and its type live in
+     * the `apps:android` module and are consumed only by
+     * `PhantomMessagingService` (same module). Exposing this as `public`
+     * would leak a module-private type across boundaries.
+     */
+    internal var networkChangeObserver: phantom.android.transport.NetworkChangeObserver? = null
+        private set
+
+    /**
+     * PR-LTE-NETCHANGE1 (2026-05-28) — owns the 4-step network-change
+     * rewalk (notify state machine, clear sticky hint, disconnect,
+     * release). Receives meaningful-change events from
+     * [networkChangeObserver]; triggers `PhantomMessagingService`
+     * re-entry via an Intent with `EXTRA_REWALK_RESTART=true` to start
+     * a fresh connect generation. Constructed inside [initMessaging]
+     * once [hybridTransport] exists.
+     *
+     * `internal` visibility for the same reason as
+     * [networkChangeObserver] — module-private implementation detail.
+     */
+    internal var transportRewalkCoordinator: phantom.android.transport.TransportRewalkCoordinator? = null
+        private set
+
+    /**
      * PR-C1 (2026-05-17): current transport capability snapshot.
      *
      * Derived from [hybridTransport]'s [RestStateMachine] and [torService]
@@ -615,6 +645,54 @@ class AppContainer(private val context: Context) {
                         )
                     }
             }
+
+            // PR-LTE-NETCHANGE1 (2026-05-28): wire the network-change
+            // rewalk pipeline. Coordinator owns reset (notify state
+            // machine + clear hint + disconnect + release); observer
+            // owns Android NetworkCallback + debounce + fresh-snapshot
+            // read; PhantomMessagingService owns the connect re-entry
+            // path via the `EXTRA_REWALK_RESTART=true` intent extra.
+            //
+            // The request-restart lambda goes through Context.startService
+            // (NOT startForegroundService — the service is already in the
+            // foreground because we're inside initMessaging, which only
+            // runs after the service is up).
+            val rewalkCoordinator = phantom.android.transport.TransportRewalkCoordinator(
+                scope = appScope,
+                transportPreferences = transportPreferences,
+                transportManager = transportManager,
+                hybridTransportProvider = { hybridTransport },
+                requestServiceRestart = { reason ->
+                    val intent = android.content.Intent(
+                        context.applicationContext,
+                        phantom.android.service.PhantomMessagingService::class.java,
+                    ).apply {
+                        putExtra(
+                            phantom.android.service.PhantomMessagingService.EXTRA_REWALK_RESTART,
+                            true,
+                        )
+                        putExtra(
+                            phantom.android.service.PhantomMessagingService.EXTRA_REWALK_REASON,
+                            reason.name,
+                        )
+                    }
+                    runCatching { context.applicationContext.startService(intent) }
+                        .onFailure { e ->
+                            android.util.Log.w(
+                                "PhantomHybrid",
+                                "NETWORK_TRACE service_restart_intent_failed " +
+                                    "errorClass=${e::class.simpleName} " +
+                                    "message=${e.message?.take(120)}",
+                            )
+                        }
+                },
+            )
+            transportRewalkCoordinator = rewalkCoordinator
+            networkChangeObserver = phantom.android.transport.NetworkChangeObserver(
+                context = context.applicationContext,
+                scope = appScope,
+                coordinator = rewalkCoordinator,
+            )
 
             // PR-C1 (2026-05-17): keep transportCapabilities in sync with
             // RestMode transitions. Emits immediately with the current mode,

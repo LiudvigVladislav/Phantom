@@ -550,6 +550,35 @@ class HybridRelayTransport(
     }
 
     /**
+     * PR-LTE-NETCHANGE1 (2026-05-28): NARROW public entry-point for
+     * submitting `Event.NetworkChanged` into the REST state machine.
+     *
+     * **Deliberately scoped to one line.** Per the mini-lock and the
+     * external transport architect's 2026-05-28 ownership guardrail,
+     * `HybridRelayTransport` does NOT own the network-change rewalk
+     * (clear preferences, `disconnect()`, `transportManager.release()`,
+     * restart connect generation). Those four actions live in
+     * `TransportRewalkCoordinator` because that is where the
+     * lifecycle / preferences / TransportManager references already
+     * sit (`HybridRelayTransport.kt` has zero references to either —
+     * verified grep, 2026-05-28).
+     *
+     * This method only forwards the event to the state machine so it
+     * can run its existing `NetworkChanged` transition path (reset
+     * counters per `RestStateMachine.kt:32`, transition to
+     * `RestMode.WsCandidate` if currently `RestActive` per :37).
+     *
+     * Short-circuits on `restCapabilityActive=false` like the rest of
+     * the `submitStateEvent` family — when REST is not active, the
+     * state-machine reaction would be a no-op anyway, and the
+     * coordinator's other reset steps still run from outside this
+     * method.
+     */
+    suspend fun submitNetworkChangedEvent() {
+        submitStateEvent(RestStateMachine.Event.NetworkChanged)
+    }
+
+    /**
      * Atomic batch variant: submits the given events under a SINGLE
      * acquisition of [stateMachineLock] so they are applied as one
      * indivisible step relative to other collectors. Use this for event
