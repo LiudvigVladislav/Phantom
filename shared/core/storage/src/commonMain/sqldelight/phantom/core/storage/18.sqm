@@ -3,9 +3,21 @@
 -- Holds incoming envelopes that produced a `Permanent decrypt failure
 -- (MAC error)` during ratchet.decrypt instead of ack-delivering them
 -- back to the relay (and losing them silently). Stored as a fully
--- replayable artefact: the deliver wire frame is preserved verbatim
--- so the held envelope can be re-fed into ratchet.decrypt after
--- session repair installs a fresh ratchet for the conversation.
+-- replayable artefact.
+--
+-- `wire_frame_json` SEMANTIC (architect-locked 2026-05-29, PR #243):
+-- this column stores the INNER WireFrame JSON — the object that DMS
+-- already decoded from the relay's `RelayMessage.Deliver.ciphertext`
+-- payload via the existing unpad / json path, and from which
+-- `wireFrame.encryptedMessage` is read for `ratchet.decrypt`. Concrete
+-- write site (commit 3): `json.encodeToString(WireFrame.serializer(),
+-- wireFrame)`. The replay loop in commit 5 reads this column and
+-- decodes back into `WireFrame` so the same `wireFrame.encryptedMessage`
+-- can be re-fed into `ratchet.decrypt` under the fresh ratchet.
+-- Storing the outer `RelayMessage.Deliver` JSON would force the replay
+-- loop to redo the deliver-frame unwrap chain, which has its own
+-- failure modes (legacy / bare-EncryptedMessage / wireFrameErr) that
+-- are unrelated to MAC recovery.
 --
 -- Lifecycle (debug/beta builds only):
 --   1. ratchet.decrypt throws MAC failure → row is inserted with

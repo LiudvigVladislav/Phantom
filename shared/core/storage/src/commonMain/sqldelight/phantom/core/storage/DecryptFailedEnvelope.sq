@@ -1,8 +1,13 @@
 -- DecryptFailedEnvelope.sq — current schema + queries for the held-
 -- envelope table introduced in 18.sqm. See 18.sqm for full design
--- rationale and replay lifecycle. Replayed payloads are stored
--- verbatim as the wire-frame JSON so the receive path can re-decode
--- and re-feed them into ratchet.decrypt after session repair.
+-- rationale and replay lifecycle.
+--
+-- `wire_frame_json` is the INNER WireFrame JSON (the object containing
+-- `encryptedMessage` fed to ratchet.decrypt), serialized via
+-- `json.encodeToString(WireFrame.serializer(), wireFrame)`. NOT the
+-- outer `RelayMessage.Deliver` JSON. Architect-locked 2026-05-29 in
+-- PR #243 to keep the replay path identical to the live decrypt path
+-- and avoid re-doing the deliver-frame unwrap chain.
 
 CREATE TABLE decrypt_failed_envelopes (
     envelope_id          TEXT    NOT NULL PRIMARY KEY,

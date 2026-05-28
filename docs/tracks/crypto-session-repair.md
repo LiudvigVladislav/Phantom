@@ -188,7 +188,7 @@ These three pre-decisions are durable for commits 3-5. Architect can revisit dur
 
 Scope:
 - In `handleDeliver` MAC-error branch (`fail_mac` site): add `if (holdMacFailures && decryptFailedEnvelopeRepository != null)` branch BEFORE the existing ack + markProcessed path. The new branch:
-  - Calls `decryptFailedEnvelopeRepository.insert(...)` with the original `RelayMessage.Deliver` wire frame serialized to JSON via the existing `json` field.
+  - Calls `decryptFailedEnvelopeRepository.insert(...)` with the **inner `WireFrame` JSON** (NOT the outer `RelayMessage.Deliver`). Concrete write: `json.encodeToString(WireFrame.serializer(), wireFrame)` — same `wireFrame` object the receive path already decoded just before the MAC-failing `ratchet.decrypt` call. Architect-locked 2026-05-29 in PR #243: storing the outer Deliver JSON would force the replay loop in commit 5 to redo the deliver-frame unwrap chain (legacy / bare-EncryptedMessage / wireFrameErr branches), which has its own failure modes unrelated to MAC recovery.
   - Calls `conversationRepository.setSessionSuspect(conversationId, nowMs)`.
   - Logs `DECRYPT_TRACE fail_mac msgId=<8> action=hold` (note: action=hold, not action=ack).
   - Does NOT call `transport.sendDeliveryAck`, does NOT call `processedEnvelopeRepository.markProcessed`.

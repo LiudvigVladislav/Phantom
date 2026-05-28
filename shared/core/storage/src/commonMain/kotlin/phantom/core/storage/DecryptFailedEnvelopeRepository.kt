@@ -63,10 +63,24 @@ interface DecryptFailedEnvelopeRepository {
      * coroutines reach handleDeliver for the same `envelope_id` before
      * either writes will no-op the second insert cleanly.
      *
-     * @param wireFrameJson the original deliver wire frame serialized
-     *   so the receive layer can re-decode and re-feed it into
-     *   `ratchet.decrypt` after session repair. NOT optional —
-     *   metadata-only rows defeat the PR's replay goal.
+     * @param wireFrameJson the **inner `WireFrame` JSON**, NOT the outer
+     *   `RelayMessage.Deliver` JSON. Produced via
+     *   `json.encodeToString(WireFrame.serializer(), wireFrame)` from
+     *   the receive path's already-decoded `wireFrame` object (the
+     *   one from which `wireFrame.encryptedMessage` is read for
+     *   `ratchet.decrypt`).
+     *
+     *   The replay loop in commit 5 reads this column and decodes back
+     *   into `WireFrame`, so the same `wireFrame.encryptedMessage` can
+     *   be re-fed into `ratchet.decrypt` under the fresh ratchet.
+     *   Storing the outer Deliver-frame JSON would force the replay
+     *   path to redo the entire deliver-frame unwrap chain (legacy /
+     *   bare-EncryptedMessage / wireFrameErr / etc), which has its own
+     *   failure modes unrelated to MAC recovery.
+     *
+     *   Architect-locked 2026-05-29 in PR #243.
+     *
+     *   NOT optional — metadata-only rows defeat the PR's replay goal.
      */
     suspend fun insert(
         envelopeId: String,
