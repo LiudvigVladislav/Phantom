@@ -426,7 +426,7 @@ The original 2026-05-23 ordering follows for reference:
 
 **Locked next-session queue order (2026-05-28, post external transport-architect review):**
 
-1. **PR-LTE-NETCHANGE1** — **inserted at the head of the next-session queue, BEFORE `PR-CRYPTO-SESSION-REPAIR1`**, because Tele2 LTE Иркутская currently blocks the daily transport test environment. External transport architect reviewed master `1d876aa5` (and re-reviewed `3e73d776` post-mini-lock) and identified `Event.NetworkChanged` as a dead handler (`RestStateMachine.kt:294` defines the event + handler, `HybridRelayTransport.kt:94` documents it as "deliberately NOT wired in D1b", `KtorRelayTransport.kt:600/677` reuses cached `socksProxyPort` on reconnect without re-walking the chain). Five steps: (1) Android `ConnectivityManager.NetworkCallback` owned by service / container, (2) debounce 1–2 s + meaningful-change classification (Wi-Fi ↔ cellular, VPN, validated capability), (3) **rewalk coordinator in `PhantomMessagingService` or `AppContainer`** (NOT in `HybridRelayTransport`) — clear sticky hint, call `hybridTransport.submitNetworkChangedEvent()`, `disconnect()`, `transportManager.release()`, restart connect generation, (4) `HybridRelayTransport.submitNetworkChangedEvent()` as a NARROW one-line method that only submits `Event.NetworkChanged` — no preferences/disconnect/release ownership leak into Hybrid, (5) LTE diagnostics hardening — `vpnActive` + `realityFiltered` are already logged in `chain_start` (`TransportManager.kt:84` 2026-05-28); the gaps this PR closes are an explicit `PROBE_TRACE reality_filtered reason=vpn_active` line + Direct probe phase logs in `AndroidNativeOkHttpDirectProbe` mirroring the Ktor probe. After this PR, "Tor on LTE" must be explainable from logs alone (Direct failed phase X, Reality filtered reason Y). Standard chain order `[Direct, Reality, Tor]` unchanged. Mini-lock at `docs/tracks/lte-netchange.md` (updated 2026-05-28 with the three architect corrections). Acceptance = Test #88 on Tecno Tele2 LTE.
+1. ✅ **PR-LTE-NETCHANGE1** — **shipped 2026-05-28** as PR #241 `899d45bd`. Three architect review rounds (direction → P1 line-level → P2 final), three additive commits (`61b4da0b` → `ea9b74a4` → `b340eba5`) preserving the verification trail. Test #88 functional PASS on Tecno Tele2 LTE; critical Scenario B verified `NETWORK_TRACE changed → rewalk_start → service_restart_received → generation_claimed → fresh PROBE_TRACE chain_start`. All five mini-lock steps shipped + three guardrails enforced. See the 2026-05-28 (late) session journal entry above for full chronicle.
 2. **PR-CRYPTO-SESSION-REPAIR1** — moved to position #2 in queue (was #1). Stale Double Ratchet state after force-stop cycles produces `Permanent decrypt failure (MAC error)` → `ack_deliver_send` → silent message loss; current only working remediation is `pm clear` (full wipe). Architect-designed 4 steps: (1) do NOT ack-deliver on MAC error in debug/beta builds, (2) add `DECRYPT_TRACE` logs covering msg id / sender / conversation / session state / x3dhInit presence / error type / action, (3) session-repair path — mark session as suspect, optionally reset local ratchet, force fresh X3DH on next outgoing, (4) a non-destructive "repair without wipe" capability so users do not lose history on the next reproducer. Mini-lock at `docs/tracks/crypto-session-repair.md`. Reordered behind LTE-NETCHANGE1 because MAC-error reproducer is rare (multi-cycle force-stop) while LTE blocks daily testing on Vladislav's primary device.
 
 ### Additional follow-ups (not in the locked head-of-queue order above)
@@ -588,6 +588,70 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-05-28 (thu, late) · PR-LTE-NETCHANGE1 MERGED — Event.NetworkChanged wired + TransportRewalkCoordinator + LTE attribution diagnostics
+
+PR #241 `899d45bd` merged after three architect review rounds (functional Test #88 PASS on Tecno Tele2 LTE) and three additive commits preserving the verification trail (`61b4da0b` initial impl → `ea9b74a4` 3 P1 fixes → `b340eba5` P2 fix + KDoc nit). Closes the dead-handler gap empirically reproduced in PR #240's baseline Scenario B (zero `NETWORK_TRACE` lines, no fresh `chain_start` after Wi-Fi → LTE).
+
+**What shipped:**
+
+- **New files** (2, ~430 lines): `NetworkChangeObserver` (single `ConnectivityManager.NetworkCallback` per process, 1500 ms debounce, then fresh `activeNetwork` snapshot read rather than callback payload, 4-axis meaningful-change classifier) and `TransportRewalkCoordinator` (8-step rewalk owned outside `HybridRelayTransport`: rate-limit gate → log start → clear hint → submit `Event.NetworkChanged` → `disconnect` → `transportManager.release` → request service restart → log done).
+- **Service re-entry contract:** new `EXTRA_REWALK_RESTART` / `EXTRA_REWALK_REASON` intent extras on `PhantomMessagingService`. Coordinator triggers re-entry via `startService(Intent(...).putExtra(EXTRA_REWALK_RESTART, true))`; service force-resets `connectStarted` CAS before the normal `onStartCommand` flow runs. Single source of truth for entering the connect lifecycle stays in `onStartCommand`.
+- **Hybrid narrow contract:** `HybridRelayTransport.submitNetworkChangedEvent()` — one-line suspend method that forwards `Event.NetworkChanged` to the state machine. Hybrid does NOT touch preferences / disconnect / release / restart. Owning all of that there would make it a god-object; the coordinator owns it instead.
+- **LTE attribution:** `PROBE_TRACE reality_filtered reason=vpn_active` line on `TransportManager` when Reality is dropped due to VPN. Direct probe phase events via `OkHttpClient.Builder().eventListener(ProbeEventListener(TransportKind.Direct))` mirroring the existing Ktor probe pattern at `KtorTransportProbe.kt:170`. Test #88 Scenario D's 5.8-minute Tor wait is now log-explainable: every phase that died is visible.
+- **Generation token for CAS race** (P1-3 architect finding): `connectGeneration: AtomicLong`. Each `serviceScope.launch` claims a token via `incrementAndGet()` after CAS succeeds; cleanup sites route through `resetConnectStartedIfCurrent(myGen, site)` that only resets `connectStarted` if the current generation matches. A cancelled stale generation cannot clobber the CAS while a fresher one is alive.
+- **Atomic register/unregister** (P2 architect finding): `synchronized(registrationLock)` block in `NetworkChangeObserver.register()` and `unregister()` closes the check-then-act race that produced duplicate `observer_registered` lines in Test #88 A/B/D. The redundant `onCreate` registration path is also removed — `onStartCommand`'s post-init success branch is now the single canonical registration entry point.
+
+**Three architect guardrails enforced in code** (locked 2026-05-28):
+
+1. **Ownership separation.** Coordinator owns reset; Service owns connect lifecycle re-entry; Hybrid owns only the state-machine event handoff.
+2. **Debounce, then fresh snapshot.** Observer reads `ConnectivityManager.activeNetwork` + capabilities after the debounce window elapses — NOT the callback payload. Trivial changes (signal jitter, MTU) dropped via 4-axis classifier with `NETWORK_TRACE callback_ignored reason=trivial_change`.
+3. **`networkPresent=false → true` bypasses rate-limit.** `isForcedReason = reason == NETWORK_AVAILABLE || (!lastNetworkPresent && snapshot.networkPresent)`. Logged as `forced=true` in `rewalk_start`.
+
+**New structured log keys** (all verified absent in master `74fc95f6` and added in this PR):
+
+```
+NETWORK_TRACE observer_registered / observer_unregistered / observer_register_post_init_throw
+NETWORK_TRACE initial_snapshot transport=<...> validated=<bool> vpnActive=<bool>
+              networkPresent=<bool> trigger=<...>
+NETWORK_TRACE coordinator_seeded networkPresent=<bool>
+NETWORK_TRACE changed old=<class> new=<class> validated=<bool> vpnActive=<bool>
+              networkPresent=<bool> trigger=<...> resolvedReason=<...>
+NETWORK_TRACE callback_ignored reason=trivial_change trigger=<...>
+NETWORK_TRACE rewalk_start reason=<...> vpnActive=<bool> validated=<bool>
+              networkPresent=<bool> forced=<bool>
+NETWORK_TRACE rate_limited reason=interval ageMs=<n> minIntervalMs=5000 skippedReason=<...>
+NETWORK_TRACE rewalk_substep_skip step=hybrid reason=hybrid_not_initialized
+NETWORK_TRACE rewalk_substep_error step=<...> errorClass=<...> message=<...>
+NETWORK_TRACE rewalk_done reason=<...> elapsedMs=<n>
+NETWORK_TRACE service_restart_received reason=<...>
+NETWORK_TRACE generation_claimed gen=<n>
+NETWORK_TRACE generation_cleanup gen=<n> site=<...> connectStarted=false
+NETWORK_TRACE generation_stale skip_cas_reset myGen=<n> current=<m> site=<...>
+PROBE_TRACE reality_filtered reason=vpn_active
+PROBE_TRACE probe_event kind=Direct event=<dnsStart|dnsEnd|connectStart|secureConnectStart|
+            secureConnectEnd|connectEnd|connectFailed|requestHeadersStart|
+            responseHeadersStart|responseHeadersEnd|callEnd|callFailed>
+```
+
+Tag distribution: `NETWORK_TRACE` under `PhantomHybrid`; `PROBE_TRACE reality_filtered` under `TransportManager`; `PROBE_TRACE probe_event` from Direct probe under `TransportProbe`.
+
+**Test #88 verdicts on Tecno Tele2 LTE** (logs at `C:\temp\test88-*.log` on Vladislav's Windows PC, 8 files total, real-device artefacts NOT in repo):
+
+- **Scenario A — cold-start raw Tele2 LTE:** PASS. Direct probe success ~0.9 s, `Online via Direct · Standard`, message delivered + `Decrypt OK`. WS still flaps via ping timeout (known LTE realtime-quality issue, not this PR's scope).
+- **Scenario B — Wi-Fi → LTE swap, THE critical gate:** PASS. Log sequence verified: `NETWORK_TRACE changed old=WIFI new=CELLULAR resolvedReason=WIFI_TO_CELLULAR` → `rewalk_start reason=WIFI_TO_CELLULAR` → `service_restart_received reason=WIFI_TO_CELLULAR — resetting connectStarted CAS` → `generation_claimed gen=2` → fresh `PROBE_TRACE chain_start ordered=[Direct, Reality, Tor]`. This is exactly what was absent in the pre-PR baseline.
+- **Scenario C — LTE + VPN:** PASS as architect-defined expected. `ordered=[Direct, Tor] vpnActive=true realityFiltered=true`, dedicated `PROBE_TRACE reality_filtered reason=vpn_active` line emitted, Direct probe succeeded second try, message delivered. Tor not attempted because Direct succeeded — this is correct fallback semantics.
+- **Scenario D — force-stop LTE no VPN:** PASS. Direct timeout × 2, Reality timeout, Tor success after `totalMs ≈ 5.8 min`, message delivered + `Decrypt OK` after Tor came up. Correct fallback. `probe_event` phase logs now make each failure attributable from logs alone.
+- **MAC error did NOT recur** in any scenario. `PR-CRYPTO-SESSION-REPAIR1` remains queued behind this PR as a separate track.
+
+**Locked process gates that fired** (durable record):
+
+- **WORKING_RULES Rule 8** (transport regression gate): Test #88 PASS on real Tecno Tele2 LTE hardware before merge. Wi-Fi-only PASS would not have been sufficient — Scenario B is the load-bearing reproducer that only exists on a real network change.
+- **WORKING_RULES Rule 9** (no merge without verification): three architect review rounds on the PR thread (direction approval → P1 line-level review → P2 final review). Each round produced grep-verified fix mappings on the PR comment thread. The previous default of "I merged on CI green before architect reviewed" (which produced PRs #238/#239) did NOT happen here.
+
+**Stabilization Sprint queue advances.** PR-LTE-NETCHANGE1 (position #1) is now ✅ DONE. **Next: PR-CRYPTO-SESSION-REPAIR1** (mini-lock at `docs/tracks/crypto-session-repair.md`, queue position #2, MAC-error session repair without `pm clear` wipe — bug at `bug_force_stop_ratchet_corruption_2026_05_27.md` in agent memory). After SESSION-REPAIR1 the rest of the Stabilization Sprint queue continues per `feedback_android_stabilization_sprint.md`: CHIP1 (resume on `feat/pr-ui-chat-new-msg-chip1` branch) → RENDER-PERF1 (conditional) → NOTIF-POLICY1 → D1e.
+
+**Three commits' verification trail preserved in PR history** (additive, not force-pushed): `61b4da0b` → `ea9b74a4` (3 P1 fixes — observer-register race, FIRST_SNAPSHOT destructive rewalk, CAS stale-cleanup) → `b340eba5` (P2 atomic register/unregister + KDoc nit). Three architect approval points on the PR thread. This is the Rule 9 pattern future PRs should follow.
 
 ### 2026-05-28 (thu) · Tele2 LTE baseline diagnostic — verdicts confirm PR-LTE-NETCHANGE1 scope, do NOT alter mini-lock
 
