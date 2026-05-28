@@ -1745,27 +1745,20 @@ class DefaultMessagingService(
                         )
                         decrypted
                     } catch (e: IllegalArgumentException) {
-                        // ADR-012 / 2026-05-01 audit finding: a MAC
-                        // verification error is a HARD cryptographic
-                        // verdict — the chain key positions on sender
-                        // and receiver have permanently diverged
-                        // (typically: pre-migration envelope still in
-                        // relay store after PR C wiped sessions; or
-                        // double-send under the same id with chain
-                        // advanced between sends). The receiver can
-                        // never recover this envelope, no matter how
-                        // many redeliveries happen. Ack so the relay
-                        // drops it. Log the id so QA can audit which
-                        // envelopes died this way.
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 3c (architect P2
+                        // 2026-05-30 on PR #243): the pre-commit-3 destructive-
+                        // ack warning ("…ack-deliver'ing to clear relay store…")
+                        // and the ADR-012 rationale that justified it both
+                        // moved INSIDE the release/ack branch below. Pre-PR
+                        // they were the only path; in commit 3a they sat in
+                        // front of BOTH the new hold branch and the existing
+                        // release branch, which made the warning lie in debug
+                        // hold mode ("ack-deliver'ing" while no ack actually
+                        // fires). The DECRYPT_TRACE `action=hold|ack` lines
+                        // remain the canonical action source for both modes.
                         if (e.message?.contains("MAC", ignoreCase = true) == true ||
                             e.message?.contains("verification", ignoreCase = true) == true
                         ) {
-                            messagingLog(
-                                MessagingLogLevel.WARN,
-                                "Permanent decrypt failure (MAC error) — ack-deliver'ing to clear " +
-                                    "relay store. id=${deliver.messageId.take(12)}… " +
-                                    "conv=${conversationId.take(16)}… err=${e.message}",
-                            )
                             // ═════════════════════════════════════════════════════════
                             // PR-CRYPTO-SESSION-REPAIR1 commit 3 (2026-05-29) —
                             // ADDITIVE hold-on-MAC branch (architect re-ACKed
@@ -1866,11 +1859,38 @@ class DefaultMessagingService(
                                 return@withLock null
                             }
                             // ═════════════════════════════════════════════════════════
-                            // RELEASE PATH — COMPLETELY UNCHANGED FROM PRE-PR.
-                            // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                            // RELEASE / ack-on-MAC PATH.
+                            //
+                            // ADR-012 / 2026-05-01 audit finding (relocated
+                            // here in commit 3c per architect P2 2026-05-30):
+                            // a MAC verification error is a HARD cryptographic
+                            // verdict — the chain key positions on sender and
+                            // receiver have permanently diverged (typically:
+                            // pre-migration envelope still in relay store
+                            // after PR C wiped sessions; or double-send under
+                            // the same id with chain advanced between sends).
+                            // The receiver can never recover THIS envelope on
+                            // the unchanged ratchet, no matter how many
+                            // redeliveries happen. Ack so the relay drops it.
+                            // Log the id so QA can audit which envelopes died
+                            // this way.
+                            //
+                            // The hold path above (debug/beta only) replaces
+                            // this destructive ack with a persistent held row
+                            // + suspect mark; under that path the relay copy
+                            // is preserved (not acked) and a future fresh
+                            // X3DH gives the held envelope a second chance.
+                            //
+                            // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29):
                             // DECRYPT_TRACE fail_mac marker. `action=ack`
                             // reflects the release-build behaviour.
                             // ═════════════════════════════════════════════════════════
+                            messagingLog(
+                                MessagingLogLevel.WARN,
+                                "Permanent decrypt failure (MAC error) — ack-deliver'ing to clear " +
+                                    "relay store. id=${deliver.messageId.take(12)}… " +
+                                    "conv=${conversationId.take(16)}… err=${e.message}",
+                            )
                             messagingLog(
                                 MessagingLogLevel.WARN,
                                 "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
