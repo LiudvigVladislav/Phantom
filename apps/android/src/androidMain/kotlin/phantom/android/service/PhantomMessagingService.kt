@@ -156,21 +156,23 @@ class PhantomMessagingService : Service() {
         // overlay — on recovery to WS_ACTIVE the next TransportManager state
         // emission resets the notification to its normal label.
         startRestFallbackNotificationOverlay()
-        // PR-LTE-NETCHANGE1 (2026-05-28): kick off the NetworkChangeObserver
-        // wiring once the container is ready. The observer is owned by
-        // AppContainer for process lifetime; this just triggers register().
-        serviceScope.launch {
-            val app = application as PhantomApplication
-            runCatching { app.ready.await() }
-            runCatching { app.container.networkChangeObserver?.register() }
-                .onFailure { e ->
-                    Log.w(
-                        "PhantomHybrid",
-                        "NETWORK_TRACE observer_register_throw errorClass=${e::class.simpleName} " +
-                            "message=${e.message?.take(120)}",
-                    )
-                }
-        }
+        // PR-LTE-NETCHANGE1 P2 fix (architect 2026-05-28): the
+        // NetworkChangeObserver registration was previously kicked off
+        // from BOTH onCreate (here) AND onStartCommand's post-init
+        // success branch. Test #88 logs A/B/D each contained two
+        // `NETWORK_TRACE observer_registered` lines because the two
+        // paths could race past the @Volatile `registered` check before
+        // either wrote it.
+        //
+        // The onCreate path is now removed entirely. Cold start sees a
+        // null observer here anyway (AppContainer constructs it inside
+        // initMessagingFromStorage, which has not yet run at onCreate
+        // time), so the path did no useful work on cold; on warm starts
+        // it just raced. The single registration point is now
+        // onStartCommand's `runCatching { container.initMessagingFromStorage() }
+        // .onSuccess { container.networkChangeObserver?.register() }`
+        // — guaranteed to run after the observer exists, and now also
+        // atomic via `synchronized` inside `register()` itself.
     }
 
     private fun startTransportNotificationUpdater() {

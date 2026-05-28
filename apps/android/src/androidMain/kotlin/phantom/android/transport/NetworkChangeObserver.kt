@@ -53,16 +53,26 @@ import phantom.core.transport.RelayTransportConfig
  *   Trivial changes — signal strength, link bandwidth jitter, MTU —
  *   do not differ on these four axes and are therefore dropped.
  *
- * - **First snapshot** is always sent as `FIRST_SNAPSHOT` so the
- *   coordinator can initialise its `lastNetworkPresent` mark and
- *   (for the very first run) bypass the rate-limit if the snapshot
- *   shows `networkPresent=true`.
+ * - **First snapshot** after [register] is NOT a network change. It is
+ *   the initial read of the current state. [evaluate] logs it as
+ *   `NETWORK_TRACE initial_snapshot`, seeds [lastAcceptedSnapshot], and
+ *   calls [TransportRewalkCoordinator.seedNetworkPresent] so the
+ *   coordinator's `lastNetworkPresent` mark is correct for the next
+ *   real transition — but [TransportRewalkCoordinator.onMeaningfulChange]
+ *   is NOT invoked on this path. Treating the first snapshot as a
+ *   meaningful change would burn a `chain_start` on every cold start
+ *   (caught by the architect 2026-05-28).
  *
  * Logs under tag `PhantomHybrid`:
  *
  * ```
+ * NETWORK_TRACE observer_registered
+ * NETWORK_TRACE observer_unregistered
+ * NETWORK_TRACE initial_snapshot transport=<...> validated=<bool> vpnActive=<bool>
+ *               networkPresent=<bool> trigger=<...>
  * NETWORK_TRACE changed old=<...> new=<...> validated=<bool> vpnActive=<bool>
- * NETWORK_TRACE callback_ignored reason=trivial_change
+ *               networkPresent=<bool> trigger=<...> resolvedReason=<...>
+ * NETWORK_TRACE callback_ignored reason=trivial_change trigger=<...>
  * ```
  */
 internal class NetworkChangeObserver(
@@ -75,6 +85,22 @@ internal class NetworkChangeObserver(
         context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     @Volatile private var registered: Boolean = false
+
+    /**
+     * PR-LTE-NETCHANGE1 P2 fix (architect 2026-05-28): lock that makes
+     * the check-then-act inside [register] / [unregister] atomic.
+     *
+     * Test #88 logs A/B/D each contained two `NETWORK_TRACE
+     * observer_registered` lines because the previous implementation
+     * relied on `@Volatile` for `registered`. Volatile gives visibility
+     * but NOT atomicity — two callers (the now-removed `onCreate`
+     * coroutine path and the `onStartCommand` post-init path) could
+     * both read `registered=false` before either wrote, then both
+     * proceed to call `cm.registerNetworkCallback(...)`. The
+     * synchronized block closes the check-then-act window so a second
+     * concurrent caller sees `registered=true` and short-circuits.
+     */
+    private val registrationLock = Any()
 
     @Volatile private var debounceJob: Job? = null
 
@@ -96,46 +122,52 @@ internal class NetworkChangeObserver(
     }
 
     /**
-     * Register the callback with [ConnectivityManager]. Idempotent — a
-     * second register call is a no-op.
+     * Register the callback with [ConnectivityManager]. Idempotent and
+     * thread-safe — the inner block is `synchronized` on
+     * [registrationLock] so a second concurrent caller observes the
+     * write to [registered] and short-circuits without re-registering.
      */
     fun register() {
-        if (registered) return
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        runCatching { cm.registerNetworkCallback(request, callback) }
-            .onSuccess {
-                registered = true
-                Log.i(TAG, "NETWORK_TRACE observer_registered")
-                // Force an initial snapshot send so the coordinator
-                // sees the network state even if no callback fires
-                // before the first send/receive attempt.
-                scheduleDebounce(triggerReason = "initial")
-            }
-            .onFailure { e ->
-                Log.w(
-                    TAG,
-                    "NETWORK_TRACE observer_register_failed errorClass=${e::class.simpleName} " +
-                        "message=${e.message?.take(120)}",
-                )
-            }
+        synchronized(registrationLock) {
+            if (registered) return
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            runCatching { cm.registerNetworkCallback(request, callback) }
+                .onSuccess {
+                    registered = true
+                    Log.i(TAG, "NETWORK_TRACE observer_registered")
+                    // Force an initial snapshot send so the coordinator
+                    // sees the network state even if no callback fires
+                    // before the first send/receive attempt.
+                    scheduleDebounce(triggerReason = "initial")
+                }
+                .onFailure { e ->
+                    Log.w(
+                        TAG,
+                        "NETWORK_TRACE observer_register_failed errorClass=${e::class.simpleName} " +
+                            "message=${e.message?.take(120)}",
+                    )
+                }
+        }
     }
 
     fun unregister() {
-        if (!registered) return
-        runCatching { cm.unregisterNetworkCallback(callback) }
-            .onFailure { e ->
-                Log.w(
-                    TAG,
-                    "NETWORK_TRACE observer_unregister_failed errorClass=${e::class.simpleName} " +
-                        "message=${e.message?.take(120)}",
-                )
-            }
-        registered = false
-        debounceJob?.cancel()
-        debounceJob = null
-        Log.i(TAG, "NETWORK_TRACE observer_unregistered")
+        synchronized(registrationLock) {
+            if (!registered) return
+            runCatching { cm.unregisterNetworkCallback(callback) }
+                .onFailure { e ->
+                    Log.w(
+                        TAG,
+                        "NETWORK_TRACE observer_unregister_failed errorClass=${e::class.simpleName} " +
+                            "message=${e.message?.take(120)}",
+                    )
+                }
+            registered = false
+            debounceJob?.cancel()
+            debounceJob = null
+            Log.i(TAG, "NETWORK_TRACE observer_unregistered")
+        }
     }
 
     /**
