@@ -162,6 +162,57 @@ DECRYPT_TRACE ttl_evict      msgId=<8> conv=<8> ageMs=<n>
 
 All under PhantomMessaging tag.
 
-## Last hand-off
+## Last hand-off (2026-05-29, session-pause after commit 1)
 
-(empty — track queued, awaiting Vladislav greenlight on this mini-lock before code begins)
+**Track active.** Vladislav granted greenlight 2026-05-29 with 4 amendments folded into the implementation plan (see commit 1 message + chat transcript).
+
+**Branch:** `feat/pr-crypto-session-repair1` from master `86729673`. Live on remote.
+
+**Architectural decisions confirmed:**
+
+- Constructor param to `DefaultMessagingService` is **`holdMacFailures: Boolean = false`** (semantic, NOT Android-specific `isDebugBuild`). Android `AppContainer` will wire `BuildConfig.DEBUG` → `holdMacFailures`. JVM tests will set per-scenario.
+- `decrypt_failed_envelopes` schema includes **replayable payload** (`wire_frame_json`) + `replay_attempt_count` + `last_replay_at_ms`. Metadata-only rows would defeat the PR's replay goal.
+- Repair uses **per-conversation mutex**: delete old ratchet → X3DH bootstrap → encrypt+save commits → clear suspect. Atomic against concurrent send/receive.
+- Suspect flag is cleared **only after** successful bootstrap+encrypt+save. Partial failure leaves the flag so the next outgoing retries.
+- Held-envelope replay is **best-effort**: old ciphertext was encrypted under the drifted chain key, so most replays will still fail. Product win is twofold — no silent destructive loss + automatic repair for future messages.
+
+**Commit 1 shipped — `94d5e7ff`:**
+
+- Schema: `18.sqm` + `19.sqm` + `DecryptFailedEnvelope.sq` (new table + queries) + `Conversation.sq` (suspect columns + queries).
+- Kotlin: `ConversationEntity` + interface + Sql impl updated; new `DecryptFailedEnvelopeRepository` interface + Sql impl.
+- `build.gradle.kts` schema version 17 → 19.
+- Test fake `InMemoryRepositoryTest.FakeConversationRepository` updated with 3 new methods (stub impls for `setSessionSuspect` / `clearSessionSuspect` / `getSessionSuspectConversations`).
+- `:shared:core:storage:assemble` + `:shared:core:storage:jvmTest` green.
+- **Zero behaviour change.** Receive path, encrypt path, and `DefaultMessagingService` are completely untouched in this commit. Grep evidence: no files under `shared/core/messaging/` are in the diff.
+
+**Next: commit 2 — `DECRYPT_TRACE` logs + `holdMacFailures` param** (still behaviour-neutral when default=false). Scope:
+
+1. `DefaultMessagingService` constructor gains `holdMacFailures: Boolean = false` + `decryptFailedRepo: DecryptFailedEnvelopeRepository? = null` params with safe defaults.
+2. In `handleDeliver` around `ratchet.decrypt` (line ~1668), add `DECRYPT_TRACE attempt msgId=<8> sender=<8> conv=<8> sessionState=<rk:ck> x3dhInit=<bool>` before the call, and `DECRYPT_TRACE ok msgId=<8> elapsedMs=<n>` / `DECRYPT_TRACE fail_mac msgId=<8> sessionState=<rk:ck>` / `DECRYPT_TRACE fail_other errorClass=<...>` after.
+3. `sessionState` is `firstNHexChars(rootKeyBytes, 8) + ":" + firstNHexChars(receivingChainKeyBytes, 8)` from `RatchetState` (already has public fields per Explore report).
+4. `AppContainer` wires `holdMacFailures = BuildConfig.DEBUG`, passes through the new param.
+5. No conditional branching on `holdMacFailures` yet — release behaviour identical because the holding path doesn't exist in this commit.
+
+**Open architectural questions remaining for commit 3+:**
+
+- Per-conversation mutex implementation: `ConcurrentHashMap<String, Mutex>` lazy-creating per `conversationId`? Or extend existing `decryptMutex` to a keyed variant? Defer decision until commit 4.
+- Where to put `SessionRepairService` — new file under `shared/core/messaging/` or extension functions on `DefaultMessagingService`? Defer until commit 4.
+- Maximum replay attempts per held envelope before giving up early (before 24h TTL) — architect did not specify a hard limit. Suggestion: 3 attempts then mark for fast-eviction. Confirm with architect at commit 5.
+
+**Architect process notes (carry from PR #241):**
+
+- Additive commits, never force-push. PR opens after commit 3 (first behaviour-change commit) so architect review starts on a buildable, testable surface.
+- Each commit message includes grep-verifiable invariants in the body.
+- Pre-fix grep verification when architect findings come in.
+
+**Acceptance gates:**
+
+- WORKING_RULES Rule 8 — Test #87 on Tecno (Wi-Fi sufficient; transport not involved).
+- WORKING_RULES Rule 9 — architect approval on PR thread before merge.
+
+**Resume sequence next session:**
+
+1. Read this mini-lock + `MEMORY.md` + `project_next_session_crypto_session_repair_2026_05_28.md`.
+2. `git checkout feat/pr-crypto-session-repair1 && git pull` (HEAD should be `94d5e7ff`).
+3. Open `DefaultMessagingService.kt` at line ~73 (constructor) and line ~1668 (`ratchet.decrypt` call site).
+4. Start commit 2 per the scope above.
