@@ -1,0 +1,78 @@
+-- DecryptFailedEnvelope.sq — current schema + queries for the held-
+-- envelope table introduced in 18.sqm. See 18.sqm for full design
+-- rationale and replay lifecycle. Replayed payloads are stored
+-- verbatim as the wire-frame JSON so the receive path can re-decode
+-- and re-feed them into ratchet.decrypt after session repair.
+
+CREATE TABLE decrypt_failed_envelopes (
+    envelope_id          TEXT    NOT NULL PRIMARY KEY,
+    conversation_id      TEXT    NOT NULL,
+    sender_pubkey_hex    TEXT    NOT NULL,
+    error_type           TEXT    NOT NULL,
+    received_at_ms       INTEGER NOT NULL,
+    x3dh_init_present    INTEGER NOT NULL DEFAULT 0,
+    wire_frame_json      TEXT    NOT NULL,
+    replay_attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_replay_at_ms    INTEGER
+);
+
+-- Insert on the hold path. INSERT OR IGNORE because a duplicate
+-- envelope_id is possible in theory (two coroutines reach handleDeliver
+-- for the same id before either writes) and we want the second insert
+-- to no-op cleanly without raising a constraint error that would
+-- propagate up the runCatching block.
+insert:
+INSERT OR IGNORE INTO decrypt_failed_envelopes(
+    envelope_id,
+    conversation_id,
+    sender_pubkey_hex,
+    error_type,
+    received_at_ms,
+    x3dh_init_present,
+    wire_frame_json,
+    replay_attempt_count,
+    last_replay_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL);
+
+-- Hot path query after session repair completes. Replay loop iterates
+-- this in received_at_ms order so the user sees held envelopes in the
+-- order they were originally sent.
+listByConversation:
+SELECT *
+FROM decrypt_failed_envelopes
+WHERE conversation_id = ?
+ORDER BY received_at_ms ASC;
+
+-- Called when a replay attempt succeeds. Same INSERT OR IGNORE rationale
+-- as markProcessed in ProcessedEnvelope.sq.
+deleteByEnvelopeId:
+DELETE FROM decrypt_failed_envelopes WHERE envelope_id = ?;
+
+-- Called when a replay attempt fails. Bumps the count + sets the
+-- timestamp so we have an audit trail of how many times this envelope
+-- has been re-tried since being held.
+recordReplayAttempt:
+UPDATE decrypt_failed_envelopes
+SET replay_attempt_count = replay_attempt_count + 1,
+    last_replay_at_ms = ?
+WHERE envelope_id = ?;
+
+-- TTL sweep — 24h. Held envelopes whose ciphertext was encrypted
+-- under the drifted ratchet are unlikely to ever decrypt, so we
+-- evict to keep the table bounded.
+deleteOlderThan:
+DELETE FROM decrypt_failed_envelopes WHERE received_at_ms < ?;
+
+-- Diagnostic — surfaces hold-table size and the per-conversation
+-- distribution to logs.
+count:
+SELECT COUNT(*) FROM decrypt_failed_envelopes;
+
+countByConversation:
+SELECT conversation_id, COUNT(*) AS cnt
+FROM decrypt_failed_envelopes
+GROUP BY conversation_id;
+
+-- Wipe (test reset paths). Same surface as ProcessedEnvelope.deleteAll.
+deleteAll:
+DELETE FROM decrypt_failed_envelopes;

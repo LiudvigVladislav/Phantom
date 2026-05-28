@@ -1,0 +1,35 @@
+-- 19.sqm — conversation.session_suspect + session_suspect_set_at_ms
+-- columns for PR-CRYPTO-SESSION-REPAIR1.
+--
+-- Marks a 1:1 conversation whose local ratchet state is believed to
+-- have drifted from the sender's view (typical cause: force-stop
+-- cycle interrupting a ratchet chain-key write). Set on MAC error
+-- when the receiver chose to hold the envelope rather than ack it
+-- (debug/beta builds with holdMacFailures = true). The next outgoing
+-- message in such a conversation forces an X3DH bootstrap; the flag
+-- is cleared ONLY after the fresh ratchet is encrypt+save committed
+-- — if bootstrap fails partway, the flag stays so the next send
+-- retries.
+--
+-- This is deliberately a separate column from the existing
+-- `needs_rehandshake` flag (1.sqm-era, set by Alpha 1 → Alpha 2
+-- migration). The semantics overlap (both "next outgoing should
+-- bootstrap"), but the lifecycle, trigger, and audit trail are
+-- different:
+--   - needs_rehandshake is set ONCE by migration code at install/
+--     upgrade time and surfaces in the chat-list UI as a "needs re-
+--     handshake" indicator.
+--   - session_suspect is set by runtime decrypt-failure detection
+--     and produces NO UI signal (debug-build hold path is silent by
+--     design; UX surfacing belongs to a separate later track).
+--
+-- Keeping them separate avoids accidental UX leakage and lets each
+-- code path own its own state machine. If a future change unifies
+-- them, the migration is straightforward.
+--
+-- `session_suspect_set_at_ms` is logged for diagnostics (DECRYPT_TRACE)
+-- and for any future "give up after N hours of repair failures"
+-- policy. Not currently used to drive behaviour.
+
+ALTER TABLE conversation ADD COLUMN session_suspect INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE conversation ADD COLUMN session_suspect_set_at_ms INTEGER;

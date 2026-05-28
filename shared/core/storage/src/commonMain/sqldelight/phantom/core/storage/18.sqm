@@ -1,0 +1,53 @@
+-- 18.sqm — decrypt_failed_envelopes table for PR-CRYPTO-SESSION-REPAIR1.
+--
+-- Holds incoming envelopes that produced a `Permanent decrypt failure
+-- (MAC error)` during ratchet.decrypt instead of ack-delivering them
+-- back to the relay (and losing them silently). Stored as a fully
+-- replayable artefact: the deliver wire frame is preserved verbatim
+-- so the held envelope can be re-fed into ratchet.decrypt after
+-- session repair installs a fresh ratchet for the conversation.
+--
+-- Lifecycle (debug/beta builds only):
+--   1. ratchet.decrypt throws MAC failure → row is inserted with
+--      error_type='mac' and replay_attempt_count=0.
+--   2. The conversation is marked session_suspect (Conversation.sq).
+--   3. Next outgoing message in that conversation triggers fresh X3DH;
+--      after the new ratchet is saved, the receive layer iterates
+--      listByConversation(...) and re-attempts decrypt on each held
+--      envelope.
+--   4. On replay success the row is deleted and the envelope is
+--      processed through the normal handleDeliver path.
+--   5. On replay failure replay_attempt_count is incremented and
+--      last_replay_at_ms is updated. The row stays until the 24-hour
+--      TTL evicts it (see deleteOlderThan).
+--
+-- Release behaviour preserved: when `holdMacFailures = false` the
+-- existing ack-on-MAC + `processed_envelopes.markProcessed` path runs
+-- unchanged, this table stays empty.
+--
+-- Honest assumption (Vladislav-architect 2026-05-29): held envelopes
+-- were encrypted under the previous (drifted) ratchet chain key. A
+-- fresh X3DH installs a new chain, so the held ciphertext is likely
+-- to STILL fail decrypt on replay. The product win is twofold:
+--   - no silent destructive loss: the row exists and can be inspected
+--     forensically (replay_attempt_count grows, last_replay_at_ms
+--     shows when), instead of the relay's copy being ack-deleted.
+--   - automatic repair for FUTURE messages: once the next outgoing
+--     fires fresh X3DH, both sides reconverge and subsequent
+--     envelopes decrypt cleanly.
+--
+-- The `wire_frame_json` column is NOT optional — without the original
+-- ciphertext we cannot retry, and the PR-CRYPTO-SESSION-REPAIR1 product
+-- goal is replay, not just metadata-for-forensics.
+
+CREATE TABLE decrypt_failed_envelopes (
+    envelope_id          TEXT    NOT NULL PRIMARY KEY,
+    conversation_id      TEXT    NOT NULL,
+    sender_pubkey_hex    TEXT    NOT NULL,
+    error_type           TEXT    NOT NULL,
+    received_at_ms       INTEGER NOT NULL,
+    x3dh_init_present    INTEGER NOT NULL DEFAULT 0,
+    wire_frame_json      TEXT    NOT NULL,
+    replay_attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_replay_at_ms    INTEGER
+);

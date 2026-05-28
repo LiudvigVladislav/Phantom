@@ -48,6 +48,29 @@ interface ConversationRepository {
      * the Alpha 1 → Alpha 2 migration after wiping ratchet states.
      */
     suspend fun markAllNeedsRehandshake()
+
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 (2026-05-29) — mark a conversation as
+     * having a suspect (drifted) local ratchet state, observed via a
+     * `Permanent decrypt failure (MAC error)` on the receive path in
+     * debug/beta builds where `holdMacFailures = true`.
+     *
+     * The flag triggers a fresh X3DH 4-DH bootstrap on the NEXT outgoing
+     * message in this conversation. It is cleared via [clearSessionSuspect]
+     * ONLY after the new ratchet is encrypt+save committed; if bootstrap
+     * fails partway, the flag stays so the next send retries.
+     *
+     * @param setAtMs wall-clock ms when the suspect mark was set. Logged
+     *   for diagnostics; persisted on the row for future "give up after
+     *   N hours of repair failures" policies.
+     */
+    suspend fun setSessionSuspect(conversationId: String, setAtMs: Long)
+
+    /** Clear the suspect flag after a successful X3DH bootstrap commit. */
+    suspend fun clearSessionSuspect(conversationId: String)
+
+    /** Returns all conversations currently flagged suspect (diagnostic). */
+    suspend fun getSessionSuspectConversations(): List<ConversationEntity>
 }
 
 data class ConversationEntity(
@@ -76,4 +99,19 @@ data class ConversationEntity(
      * completed.
      */
     val needsRehandshake: Boolean = false,
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 (2026-05-29) — runtime-detected suspect
+     * ratchet state. Differs from [needsRehandshake] in trigger
+     * (decrypt-failure detection vs migration code) and UX
+     * implications (silent, no chat-list indicator). Both flags share
+     * the same recovery action (force X3DH on next outgoing); a future
+     * cleanup could unify them. Default `false`.
+     */
+    val sessionSuspect: Boolean = false,
+    /**
+     * Wall-clock epoch ms when [sessionSuspect] was set. `null` when
+     * the flag is false. Logged for diagnostics and reserved for
+     * future "give up repair after N hours" policies.
+     */
+    val sessionSuspectSetAtMs: Long? = null,
 )

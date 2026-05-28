@@ -20,7 +20,20 @@ CREATE TABLE conversation (
     -- list shows a "needs re-handshake" indicator and the next outbound
     -- message in such a conversation forces the X3DH 4-DH bootstrap
     -- path. Cleared after a successful new session is established.
-    needs_rehandshake INTEGER NOT NULL DEFAULT 0
+    needs_rehandshake INTEGER NOT NULL DEFAULT 0,
+    -- PR-CRYPTO-SESSION-REPAIR1 (2026-05-29): set when the receive
+    -- path observed a `Permanent decrypt failure (MAC error)` AND the
+    -- build is configured to hold-on-MAC (debug/beta only). Triggers
+    -- a fresh X3DH 4-DH bootstrap on the NEXT outgoing message in
+    -- this conversation, after which held envelopes (see
+    -- DecryptFailedEnvelope.sq) are best-effort replayed.
+    --
+    -- Deliberately separate from `needs_rehandshake` despite semantic
+    -- overlap: this flag is runtime-detected (not migration-set) and
+    -- produces NO chat-list UI indicator (debug-build hold path is
+    -- silent by design). See 19.sqm for the full distinction.
+    session_suspect INTEGER NOT NULL DEFAULT 0,
+    session_suspect_set_at_ms INTEGER
 );
 
 getAllConversations:
@@ -46,14 +59,34 @@ INSERT OR REPLACE INTO conversation(
     trust_tier, blocked, notes,
     is_verified, disappearing_timer_secs, archived,
     identity_key_changed_at, muted_until, pinned,
-    needs_rehandshake
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    needs_rehandshake,
+    session_suspect, session_suspect_set_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 setNeedsRehandshake:
 UPDATE conversation SET needs_rehandshake = :flag WHERE id = :id;
 
 markAllNeedsRehandshake:
 UPDATE conversation SET needs_rehandshake = 1;
+
+-- PR-CRYPTO-SESSION-REPAIR1 (2026-05-29) — suspect-flag mutators.
+-- Read site is `getConversation` (returns the full row including
+-- session_suspect + session_suspect_set_at_ms).
+
+setSessionSuspect:
+UPDATE conversation
+SET session_suspect = 1,
+    session_suspect_set_at_ms = :setAtMs
+WHERE id = :id;
+
+clearSessionSuspect:
+UPDATE conversation
+SET session_suspect = 0,
+    session_suspect_set_at_ms = NULL
+WHERE id = :id;
+
+getSessionSuspectConversations:
+SELECT * FROM conversation WHERE session_suspect = 1;
 
 updateNotes:
 UPDATE conversation SET notes = ? WHERE id = ?;
