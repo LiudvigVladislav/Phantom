@@ -1538,6 +1538,385 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 3c (2026-05-30) — remaining 4
+    // tests of the architect-locked 5-matrix. Pattern from
+    // `decrypt_mac_error_holds_in_debug` (commit 3b 22af5d7b)
+    // architect-ACKed; these tests are direct rig variations + the
+    // dedicated byte-level wireFrameJson regression guard.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun decrypt_mac_error_acks_on_release() = runTest {
+        // Architect-locked invariant 4: when holdMacFailures=false, the
+        // release path is unchanged from pre-PR. Verify the destructive
+        // ack + FAILED_MAC ledger entry still fires AND the new hold
+        // table stays empty + suspect flag stays false.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            scope = backgroundScope,
+            ratchet = MacFailingDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            // Release / production gate — even with the repo non-null,
+            // holdMacFailures=false MUST keep the existing ack path.
+            holdMacFailures = false,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x10, 0x11, 0x12),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-release-mac",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // Release path: ack fires, FAILED_MAC ledger row written.
+        assertTrue(
+            "env-release-mac" in transport.ackedDelivers,
+            "release path MUST call sendDeliveryAck; transport.ackedDelivers=${transport.ackedDelivers}",
+        )
+        assertEquals(
+            true,
+            processedRepo.exists("env-release-mac"),
+            "release path MUST call markProcessed FAILED_MAC",
+        )
+        // Hold table untouched + suspect stays false.
+        assertEquals(
+            0,
+            decryptFailedRepo.listByConversation("aabb_ccdd").size,
+            "release path MUST NOT write to decrypt_failed_envelopes",
+        )
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: false,
+            "release path MUST NOT set session_suspect",
+        )
+    }
+
+    @Test
+    fun normal_path_unaffected_in_debug() = runTest {
+        // Architect-locked invariant 5: non-MAC envelope under
+        // holdMacFailures=true takes the unchanged normal flow — ack,
+        // markProcessed PROCESSED, message inserted, no hold table
+        // touch, no suspect mark.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+        val msgRepo = FakeMessageRepository()
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            msgRepo = msgRepo,
+            scope = backgroundScope,
+            // PassthroughDoubleRatchet returns ciphertext verbatim so
+            // the receive path JSON-decodes it as MessagePayload below.
+            ratchet = PassthroughDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = true,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // For PassthroughDoubleRatchet the ciphertext IS the plaintext.
+        // Build a valid MessagePayload so the post-decrypt JSON parse
+        // succeeds and the downstream insert / ack path runs normally.
+        val payload = MessagePayload(
+            type = "message",
+            text = "hi from normal path debug",
+        )
+        val plaintextJsonBytes = json
+            .encodeToString(MessagePayload.serializer(), payload)
+            .encodeToByteArray()
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = plaintextJsonBytes,
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-debug-normal",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // Normal path: ack fires + PROCESSED ledger row + message persisted.
+        assertTrue(
+            "env-debug-normal" in transport.ackedDelivers,
+            "normal path MUST call sendDeliveryAck",
+        )
+        assertEquals(
+            true,
+            processedRepo.exists("env-debug-normal"),
+            "normal path MUST call markProcessed",
+        )
+        assertTrue(
+            msgRepo.messages.any { it.plaintextCache == "hi from normal path debug" },
+            "normal path MUST insert the decoded message; got ${msgRepo.messages.map { it.plaintextCache }}",
+        )
+        // Hold table untouched + suspect stays false (architect invariant 5).
+        assertEquals(
+            0,
+            decryptFailedRepo.listByConversation("aabb_ccdd").size,
+            "normal path under holdMacFailures=true MUST NOT touch decrypt_failed_envelopes",
+        )
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: false,
+            "normal path MUST NOT set session_suspect",
+        )
+    }
+
+    @Test
+    fun normal_path_unaffected_in_release() = runTest {
+        // Mirror of the debug normal-path test under holdMacFailures=false.
+        // Both should look identical from the receive-path perspective
+        // because the hold branch is only taken on MAC error, never on
+        // a successful decrypt.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+        val msgRepo = FakeMessageRepository()
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            msgRepo = msgRepo,
+            scope = backgroundScope,
+            ratchet = PassthroughDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = false,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        val payload = MessagePayload(
+            type = "message",
+            text = "hi from normal path release",
+        )
+        val plaintextJsonBytes = json
+            .encodeToString(MessagePayload.serializer(), payload)
+            .encodeToByteArray()
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = plaintextJsonBytes,
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-release-normal",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertTrue("env-release-normal" in transport.ackedDelivers)
+        assertEquals(true, processedRepo.exists("env-release-normal"))
+        assertTrue(
+            msgRepo.messages.any { it.plaintextCache == "hi from normal path release" },
+        )
+        assertEquals(0, decryptFailedRepo.listByConversation("aabb_ccdd").size)
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(false, updatedConv?.sessionSuspect ?: false)
+    }
+
+    @Test
+    fun hold_path_wireFrameJson_decodes_back_to_inner_WireFrame_preserving_encryptedMessage() = runTest {
+        // Architect-strengthened wireFrameJson regression guard (P2
+        // 2026-05-30): the first test (decrypt_mac_error_holds_in_debug)
+        // only checked `messageIndex` round-trip. This dedicated test
+        // verifies byte-level equality on the ENTIRE inner
+        // `EncryptedMessage` so the replay-payload contract is locked.
+        // If a future change accidentally re-encodes the wire frame as
+        // outer `RelayMessage.Deliver` JSON (the wrong layer per
+        // architect 2026-05-29 on PR #243 95c7aae0), this test fails.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            scope = backgroundScope,
+            ratchet = MacFailingDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = true,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Distinct non-zero byte patterns per field so a swap between
+        // fields would be detectable.
+        val knownRatchetPub = ByteArray(32) { (0xA0 + (it % 16)).toByte() }
+        val knownNonce = ByteArray(24) { (0xB0 + (it % 16)).toByte() }
+        val knownCiphertext = byteArrayOf(
+            0xC0.toByte(), 0xC1.toByte(), 0xC2.toByte(), 0xC3.toByte(),
+            0xC4.toByte(), 0xC5.toByte(), 0xC6.toByte(), 0xC7.toByte(),
+        )
+        val knownMessageIndex = 42
+        val knownEncryptedMessage = phantom.core.crypto.EncryptedMessage(
+            ratchetPublicKey = knownRatchetPub,
+            messageIndex = knownMessageIndex,
+            ciphertext = knownCiphertext,
+            nonce = knownNonce,
+        )
+        val knownWireFrame = WireFrame(
+            encryptedMessage = knownEncryptedMessage,
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+
+        val wireFrameBytes = json
+            .encodeToString(WireFrame.serializer(), knownWireFrame)
+            .encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-wfj-roundtrip",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        val held = decryptFailedRepo.listByConversation("aabb_ccdd")
+        assertEquals(1, held.size, "exactly one held envelope expected")
+        val storedJson = held[0].wireFrameJson
+
+        // Decode via WireFrame.serializer() — NOT RelayMessage.Deliver.
+        val decoded = json.decodeFromString(WireFrame.serializer(), storedJson)
+
+        // ── Byte-level EncryptedMessage equality ───────────────────────
+        assertEquals(
+            knownMessageIndex,
+            decoded.encryptedMessage.messageIndex,
+            "messageIndex must round-trip",
+        )
+        assertTrue(
+            knownRatchetPub.contentEquals(decoded.encryptedMessage.ratchetPublicKey),
+            "ratchetPublicKey bytes must round-trip unchanged",
+        )
+        assertTrue(
+            knownNonce.contentEquals(decoded.encryptedMessage.nonce),
+            "nonce bytes must round-trip unchanged",
+        )
+        assertTrue(
+            knownCiphertext.contentEquals(decoded.encryptedMessage.ciphertext),
+            "ciphertext bytes must round-trip unchanged",
+        )
+        // x3dhInit absence must also survive the trip (relevant for the
+        // commit 5 replay path: if x3dh init was present at receive
+        // time, the replay must replay through the bootstrap branch,
+        // not the existing-session branch).
+        kotlin.test.assertNull(
+            decoded.x3dhInit,
+            "x3dhInit absence must round-trip as null",
+        )
+    }
+
     @Test
     fun handleDeliver_unknownEnvelopeId_passesGuard_andReachesDecryptPath() = runTest {
         // Symmetry check: an envelope id NOT in the ledger must pass the
