@@ -1766,13 +1766,111 @@ class DefaultMessagingService(
                                     "relay store. id=${deliver.messageId.take(12)}… " +
                                     "conv=${conversationId.take(16)}… err=${e.message}",
                             )
+                            // ═════════════════════════════════════════════════════════
+                            // PR-CRYPTO-SESSION-REPAIR1 commit 3 (2026-05-29) —
+                            // ADDITIVE hold-on-MAC branch (architect re-ACKed
+                            // PR #243 commit 95c7aae0 → e0b61403 sequence).
+                            //
+                            // Architect-locked invariants verified by grep
+                            // on this diff:
+                            //   (1) NO call to transport.sendDeliveryAck here.
+                            //   (2) NO call to processedEnvelopeRepository
+                            //       .markProcessed here.
+                            //   (3) `return@withLock null` short-circuits
+                            //       BEFORE the release-path log + ack +
+                            //       markProcessed code below, so the existing
+                            //       release behaviour is reached only when
+                            //       this branch is NOT taken.
+                            //   (4) The else-branch below (the original ack
+                            //       + FAILED_MAC ledger path) is COMPLETELY
+                            //       UNCHANGED. Additive only — zero deletions.
+                            //
+                            // Gate: (holdMacFailures && repo != null). Both
+                            // conditions are required because Android wires
+                            // BuildConfig.DEBUG into holdMacFailures and the
+                            // repo into decryptFailedEnvelopeRepository; if
+                            // either is missing (test scaffolding, legacy
+                            // DMS construction), we fall through to the
+                            // existing ack path — same as before this PR.
+                            //
+                            // Storage-failure safety: if insert OR
+                            // setSessionSuspect throws, we still return null
+                            // WITHOUT acking. The envelope sits on the relay
+                            // and gets re-delivered next session; worst case
+                            // is 7-day relay TTL eviction. We do NOT fall
+                            // through to the ack path because that would
+                            // re-introduce the silent destructive loss this
+                            // PR exists to prevent.
+                            // ═════════════════════════════════════════════════════════
+                            if (holdMacFailures && decryptFailedEnvelopeRepository != null) {
+                                // Local-capture the non-null repository so
+                                // the smart-cast holds inside the runCatching
+                                // lambda (Kotlin smart-cast doesn't propagate
+                                // a class-property nullability check across
+                                // a lambda boundary).
+                                val heldRepo: DecryptFailedEnvelopeRepository =
+                                    decryptFailedEnvelopeRepository
+                                val nowMs = Clock.System.now().toEpochMilliseconds()
+                                val holdResult = runCatching {
+                                    // Architect-locked inner-WireFrame JSON
+                                    // semantic (PR #243 95c7aae0): encode the
+                                    // SAME `wireFrame` object the receive path
+                                    // just decoded, so the replay loop in
+                                    // commit 5 can decode → re-feed
+                                    // `wireFrame.encryptedMessage` into
+                                    // `ratchet.decrypt` under the fresh
+                                    // ratchet.
+                                    val wireFrameJson = json.encodeToString(wireFrame)
+                                    heldRepo.insert(
+                                        envelopeId = deliver.messageId,
+                                        conversationId = conversationId,
+                                        senderPubKeyHex = senderPubKeyHex,
+                                        errorType = "mac",
+                                        receivedAtMs = nowMs,
+                                        x3dhInitPresent = wireFrame.x3dhInit != null,
+                                        wireFrameJson = wireFrameJson,
+                                    )
+                                    conversationRepository.setSessionSuspect(
+                                        conversationId = conversationId,
+                                        setAtMs = nowMs,
+                                    )
+                                }
+                                if (holdResult.isSuccess) {
+                                    messagingLog(
+                                        MessagingLogLevel.WARN,
+                                        "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
+                                            "sender=${senderPubKeyHex.take(8)} " +
+                                            "conv=${conversationId.take(8)} " +
+                                            "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
+                                            "action=hold",
+                                    )
+                                } else {
+                                    // Storage failure inside hold path: we
+                                    // STILL skip ack so the envelope is not
+                                    // silently destroyed. The relay redelivers
+                                    // next session; if hold path keeps failing
+                                    // we get repeated redeliveries until the
+                                    // relay's 7-day TTL evicts. action=hold_
+                                    // storage_error makes this state grep-able.
+                                    val err = holdResult.exceptionOrNull()
+                                    messagingLog(
+                                        MessagingLogLevel.WARN,
+                                        "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
+                                            "sender=${senderPubKeyHex.take(8)} " +
+                                            "conv=${conversationId.take(8)} " +
+                                            "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
+                                            "action=hold_storage_error " +
+                                            "errorClass=${err?.let { it::class.simpleName } ?: "Unknown"}",
+                                    )
+                                }
+                                return@withLock null
+                            }
+                            // ═════════════════════════════════════════════════════════
+                            // RELEASE PATH — COMPLETELY UNCHANGED FROM PRE-PR.
                             // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
                             // DECRYPT_TRACE fail_mac marker. `action=ack`
-                            // reflects the CURRENT behaviour (preserved in
-                            // this commit). Commit 3 introduces conditional
-                            // `action=hold` when holdMacFailures = true; in
-                            // commit 2 the action is always ack so release
-                            // behaviour is unchanged. No raw key material.
+                            // reflects the release-build behaviour.
+                            // ═════════════════════════════════════════════════════════
                             messagingLog(
                                 MessagingLogLevel.WARN,
                                 "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
