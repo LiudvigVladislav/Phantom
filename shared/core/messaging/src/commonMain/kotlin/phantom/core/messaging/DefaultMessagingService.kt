@@ -266,6 +266,17 @@ class DefaultMessagingService(
     }
 
     companion object {
+        /**
+         * PR-CRYPTO-SESSION-REPAIR1 commit 5 (2026-05-30) — diagnostic
+         * cap on per-envelope replay attempts (architect-locked at 3).
+         * Held envelopes whose ciphertext was encrypted under the
+         * drifted chain will fail decrypt on every replay; capping
+         * stops the loop from re-trying them on EVERY subsequent
+         * successful repair until the 24h TTL sweep clears them
+         * (commit 6).
+         */
+        const val MAX_REPLAY_ATTEMPTS_PER_HELD = 3L
+
         const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
         // PR-D2b.1 (2026-05-17): shrunk from 8 KB → 3 KB so envelopes pass
         // the REST short-poll body cap. Background: D1c+D1d turned REST
@@ -550,11 +561,231 @@ class DefaultMessagingService(
                         MessagingLogLevel.INFO,
                         "DECRYPT_TRACE repair_done conv=$convTag",
                     )
+
+                    // PR-CRYPTO-SESSION-REPAIR1 commit 5 (2026-05-30) —
+                    // best-effort replay of held envelopes for this
+                    // conversation now that the fresh ratchet is committed.
+                    // Architect-locked guardrails honoured inside
+                    // [replayHeldEnvelopesAfterRepair]:
+                    //   * fires ONLY after successful repair / saveSession
+                    //     (this block);
+                    //   * decodes wire_frame_json as inner WireFrame;
+                    //   * on success: marks PROCESSED + best-effort
+                    //     inserts text messages + acks + deletes row;
+                    //   * on failure: bumps replay_attempt_count, leaves
+                    //     row held, NEVER re-sets session_suspect;
+                    //   * caps replay attempts at
+                    //     MAX_REPLAY_ATTEMPTS_PER_HELD = 3;
+                    //   * per-conversation (only the conv we just
+                    //     repaired);
+                    //   * runs inside the existing per-conversation
+                    //     mutex so concurrent sends + the replay decrypt
+                    //     cannot race on the ratchet state.
+                    if (decryptFailedEnvelopeRepository != null) {
+                        replayHeldEnvelopesAfterRepair(conversationId, convTag)
+                    }
                 }
                 wireFrame
             }
         }
     }
+
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 commit 5 (2026-05-30) — replay loop.
+     *
+     * Best-effort decrypt of every held envelope for [conversationId]
+     * under the fresh ratchet that was just committed by
+     * [encryptUnderLock]. ALL invocation paths reach this method
+     * INSIDE the per-conversation mutex acquired by encryptUnderLock,
+     * so concurrent sends in the same conversation cannot race on
+     * the ratchet state.
+     *
+     * Architect-locked semantics:
+     *   - On replay decrypt SUCCESS:
+     *       * sessionManager.saveSession with the advanced state;
+     *       * processedEnvelopeRepository.markProcessed PROCESSED;
+     *       * for `MessagePayload.TYPE_MESSAGE` payloads only, insert
+     *         a DELIVERED message row (`MessageStatus.DELIVERED`);
+     *       * for other payload types (group, voice chunks, voice
+     *         manifests, reactions, pins, ...): log
+     *         `DECRYPT_TRACE replay_skipped_complex_payload` and
+     *         move on — the envelope is still ack'd + row deleted +
+     *         ratchet advanced, so the relay copy is recovered and
+     *         the live session reconverges; only the UI surface for
+     *         those types is deferred to a follow-up commit;
+     *       * transport.sendDeliveryAck(envelopeId);
+     *       * decryptFailedEnvelopeRepository.deleteByEnvelopeId.
+     *   - On replay decrypt FAILURE:
+     *       * recordReplayAttempt(envelopeId, nowMs);
+     *       * row remains held until 24h TTL (commit 6) or 3 attempts
+     *         exhausted (this method, [MAX_REPLAY_ATTEMPTS_PER_HELD]);
+     *       * **MUST NOT** call setSessionSuspect — the anti-loop
+     *         guarantee from architect pre-decision #3 invariant 4.
+     *   - Rows whose `replay_attempt_count >= MAX_REPLAY_ATTEMPTS_PER_HELD`
+     *     are skipped without further decrypt attempts.
+     */
+    private suspend fun replayHeldEnvelopesAfterRepair(
+        conversationId: String,
+        convTag: String,
+    ) {
+        val repo = decryptFailedEnvelopeRepository ?: return
+        val held = repo.listByConversation(conversationId)
+        if (held.isEmpty()) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "DECRYPT_TRACE replay_loop_empty conv=$convTag",
+            )
+            return
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE replay_loop_start conv=$convTag count=${held.size}",
+        )
+
+        for (entry in held) {
+            val msgTag = entry.envelopeId.take(8)
+
+            if (entry.replayAttemptCount >= MAX_REPLAY_ATTEMPTS_PER_HELD) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "DECRYPT_TRACE replay_skip_max_attempts conv=$convTag " +
+                        "msgId=$msgTag attemptCount=${entry.replayAttemptCount}",
+                )
+                continue
+            }
+
+            val nowMs = Clock.System.now().toEpochMilliseconds()
+            val attemptNo = entry.replayAttemptCount + 1
+
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "DECRYPT_TRACE replay_attempt conv=$convTag msgId=$msgTag attemptNo=$attemptNo",
+            )
+
+            // Decode inner WireFrame from the stored JSON — architect-
+            // locked semantic (PR #243 95c7aae0): the column holds the
+            // inner WireFrame, NOT the outer RelayMessage.Deliver.
+            val wireFrame = runCatching {
+                json.decodeFromString(WireFrame.serializer(), entry.wireFrameJson)
+            }.getOrElse { e ->
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "DECRYPT_TRACE replay_decode_fail conv=$convTag msgId=$msgTag " +
+                        "errorClass=${e::class.simpleName}",
+                )
+                repo.recordReplayAttempt(entry.envelopeId, nowMs)
+                continue
+            }
+
+            val currentState = sessionManager.tryLoadSession(conversationId)
+            if (currentState == null) {
+                // Defensive: the fresh ratchet was just saved by the
+                // caller, so this should be unreachable. Logged for
+                // forensics; do not fall into setSessionSuspect.
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "DECRYPT_TRACE replay_no_session conv=$convTag msgId=$msgTag " +
+                        "— session vanished between repair save and replay",
+                )
+                repo.recordReplayAttempt(entry.envelopeId, nowMs)
+                continue
+            }
+
+            val decryptResult = runCatching {
+                ratchet.decrypt(currentState, wireFrame.encryptedMessage)
+            }
+
+            if (decryptResult.isFailure) {
+                val err = decryptResult.exceptionOrNull()
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "DECRYPT_TRACE replay_fail conv=$convTag msgId=$msgTag " +
+                        "attemptCount=$attemptNo " +
+                        "errorClass=${err?.let { it::class.simpleName } ?: "Unknown"}",
+                )
+                repo.recordReplayAttempt(entry.envelopeId, nowMs)
+                continue
+            }
+
+            val (newState, plainBytes) = decryptResult.getOrThrow()
+
+            // Replay decrypt SUCCESS — advance + persist session, mark
+            // processed, surface as a text message when applicable,
+            // ack the relay, delete held row.
+            sessionManager.saveSession(conversationId, newState)
+
+            processedEnvelopeRepository?.markProcessed(
+                envelopeId = entry.envelopeId,
+                conversationId = conversationId,
+                senderPubKeyHex = entry.senderPubKeyHex,
+                payloadType = "unknown",
+                status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                nowMs = nowMs,
+            )
+
+            runCatching {
+                val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
+                if (payload.type == MessagePayload.TYPE_MESSAGE) {
+                    messageRepository.insertMessage(
+                        MessageEntity(
+                            id = entry.envelopeId,
+                            conversationId = conversationId,
+                            ciphertext = wireFrame.encryptedMessage.ciphertext,
+                            plaintextCache = payload.text,
+                            sent = false,
+                            status = MessageStatus.DELIVERED,
+                            createdAt = nowMs,
+                            expiresAtMs = null,
+                        )
+                    )
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "DECRYPT_TRACE replay_inserted_text conv=$convTag msgId=$msgTag " +
+                            "plaintextBytes=${plainBytes.size}",
+                    )
+                } else {
+                    // Architectural scope note: group routing + voice
+                    // chunk assembly + reaction/pin handlers all require
+                    // state outside the receive ratchet (memory buffers,
+                    // GroupMessagingService, voiceChunkRepository, etc).
+                    // Replicating their handlers inside the send-path
+                    // replay loop risks duplicate state mutations.
+                    // Commit 5 deliberately leaves their UI surface
+                    // deferred — the envelope is still recovered from
+                    // the crypto perspective (decrypt OK, ratchet
+                    // advanced, ledger PROCESSED, row deleted, relay
+                    // ack'd) so no silent loss; only the UI bubble for
+                    // these complex types is missing.
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "DECRYPT_TRACE replay_skipped_complex_payload conv=$convTag " +
+                            "msgId=$msgTag type=${payload.type}",
+                    )
+                }
+            }.onFailure { e ->
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "DECRYPT_TRACE replay_payload_decode_fail conv=$convTag msgId=$msgTag " +
+                        "errorClass=${e::class.simpleName}",
+                )
+            }
+
+            transport.sendDeliveryAck(entry.envelopeId)
+            repo.deleteByEnvelopeId(entry.envelopeId)
+
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "DECRYPT_TRACE replay_ok conv=$convTag msgId=$msgTag " +
+                    "plaintextBytes=${plainBytes.size}",
+            )
+        }
+
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE replay_loop_done conv=$convTag",
+        )
+    }
+
 
     /**
      * Platform hook for local push notifications.
