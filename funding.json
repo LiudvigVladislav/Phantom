@@ -46,13 +46,13 @@
       {
         "guid": "liberapay",
         "type": "payment-provider",
-        "address": "https://liberapay.com/phantom-messenger",
+        "address": "https://liberapay.com/Phantom-messenger",
         "description": "Liberapay is a French non-profit platform for recurring weekly/monthly/yearly micro-donations. Zero platform fee. Donor anonymity by default. Best for FOSS-aligned recurring contributions."
       },
       {
         "guid": "buy-me-a-coffee",
         "type": "payment-provider",
-        "address": "https://www.buymeacoffee.com/phantommessenger",
+        "address": "https://www.buymeacoffee.com/phantompro",
         "description": "Low-friction one-time and membership donation platform. Accepts credit/debit cards and PayPal. For one-time contributions from blog readers and social audiences."
       },
       {
