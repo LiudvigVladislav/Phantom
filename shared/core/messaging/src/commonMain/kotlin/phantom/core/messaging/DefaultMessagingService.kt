@@ -37,6 +37,7 @@ import phantom.core.identity.IdentityRecord
 import phantom.core.identity.IdentitySigningKeyPair
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.ConversationRepository
+import phantom.core.storage.DecryptFailedEnvelopeRepository
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
@@ -166,6 +167,35 @@ class DefaultMessagingService(
      * both to the same tag. Default is no-op for tests / non-Android.
      */
     private val mediaLog: (String) -> Unit = {},
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 (2026-05-29, commit 2/N) — durable
+     * hold table for envelopes that produce `Permanent decrypt failure
+     * (MAC error)`. NULLABLE + DEFAULT NULL for call-site compatibility
+     * with existing tests and the legacy code paths that construct DMS
+     * without storage. Production wires the SQLDelight repository
+     * through AppContainer.
+     *
+     * **Not read in commit 2** — wired through the constructor so the
+     * dependency is available when commit 3 introduces the hold path.
+     * The receive MAC branch still ack-delivers + writes
+     * `processed_envelopes.markProcessed(status=FAILED_MAC)` unchanged
+     * in this commit.
+     */
+    private val decryptFailedEnvelopeRepository: DecryptFailedEnvelopeRepository? = null,
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 (2026-05-29, commit 2/N) — semantic
+     * flag that gates the upcoming hold-on-MAC behaviour. Platform-
+     * agnostic: Android wires `BuildConfig.DEBUG`, JVM tests set per-
+     * scenario, default `false` keeps existing tests + release builds
+     * on the unchanged ack-on-MAC path.
+     *
+     * **Not branched on in commit 2** — the flag is plumbed through
+     * the constructor so commit 3 can read it without touching the
+     * constructor again. Grep evidence for invariant 2 (release
+     * preserved): no `if (holdMacFailures)` branch exists in this
+     * file in commit 2.
+     */
+    private val holdMacFailures: Boolean = false,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -236,6 +266,32 @@ class DefaultMessagingService(
     }
 
     companion object {
+        /**
+         * PR-CRYPTO-SESSION-REPAIR1 commit 5 (2026-05-30) — diagnostic
+         * cap on per-envelope replay attempts (architect-locked at 3).
+         * Held envelopes whose ciphertext was encrypted under the
+         * drifted chain will fail decrypt on every replay; capping
+         * stops the loop from re-trying them on EVERY subsequent
+         * successful repair until the 24h TTL sweep clears them
+         * (commit 6).
+         */
+        const val MAX_REPLAY_ATTEMPTS_PER_HELD = 3L
+
+        /**
+         * PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31) — local 24h
+         * TTL on held decrypt-failed envelopes. Held rows whose
+         * `received_at_ms` is older than `nowMs - HELD_ENVELOPE_TTL_MS`
+         * are deleted from the local hold table opportunistically at
+         * the entry of each replay cycle. This is LOCAL cleanup only:
+         * the relay's own envelope TTL is separate and remains
+         * authoritative on the server side. TTL eviction does NOT
+         * send a delivery ack — the relay's copy is dealt with by
+         * the relay's own TTL.
+         *
+         * Architect-locked at 24h (PR #243 thread, commit 6 mini-lock).
+         */
+        const val HELD_ENVELOPE_TTL_MS = 24L * 60L * 60L * 1_000L
+
         const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
         // PR-D2b.1 (2026-05-17): shrunk from 8 KB → 3 KB so envelopes pass
         // the REST short-poll body cap. Background: D1c+D1d turned REST
@@ -336,9 +392,45 @@ class DefaultMessagingService(
         messagingLog(MessagingLogLevel.INFO, "SEND_TRACE encrypt_lock_wait conv=$convTag")
         return mutexFor(conversationId).withLock {
             messagingLog(MessagingLogLevel.INFO, "SEND_TRACE encrypt_lock_acquired conv=$convTag")
-            messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_lookup conv=$convTag")
+
+            // ═════════════════════════════════════════════════════════
+            // PR-CRYPTO-SESSION-REPAIR1 commit 4 (2026-05-30) — per-
+            // conversation suspect check inside the existing per-
+            // conversation mutex (architect pre-decision #1: reuse
+            // mutexFor, do not introduce a parallel map).
+            //
+            // When the receive path's hold-on-MAC branch flagged this
+            // conversation as `session_suspect=true`, the next outgoing
+            // message bypasses tryLoadSession and forces the fresh X3DH
+            // bootstrap branch. The flag is cleared only after the
+            // local saveSession commits — bootstrap, encrypt, or save
+            // failure leaves the flag set so the NEXT outgoing retries
+            // the repair (architect-correction 2026-05-29: clear on
+            // local crypto commit, NOT on transport.send which runs
+            // outside the mutex).
+            //
+            // Receive ack / markProcessed ownership stays in DMS receive
+            // path (architect pre-decision #2). Replay of held envelopes
+            // is OUT OF SCOPE for commit 4 — that lands in commit 5.
+            // ═════════════════════════════════════════════════════════
+            val sessionSuspect =
+                conversationRepository.getConversation(conversationId)?.sessionSuspect == true
+            if (sessionSuspect) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "DECRYPT_TRACE repair_armed trigger=outbound_send conv=$convTag",
+                )
+            }
+
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "SEND_TRACE session_lookup conv=$convTag suspect=$sessionSuspect",
+            )
             val existingState = sessionManager.tryLoadSession(conversationId)
-            if (existingState != null) {
+            // Existing-session branch runs ONLY when a session exists
+            // AND the conversation is NOT flagged suspect. Suspect flows
+            // into the bootstrap branch below regardless of existingState.
+            if (existingState != null && !sessionSuspect) {
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_existing conv=$convTag")
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE ratchet_encrypt_start conv=$convTag plaintextBytes=${plaintext.size}")
                 val (newState, encrypted) = ratchet.encrypt(existingState, plaintext)
@@ -463,10 +555,573 @@ class DefaultMessagingService(
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_start conv=$convTag")
                 sessionManager.saveSession(conversationId, newState)
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
+
+                // PR-CRYPTO-SESSION-REPAIR1 commit 4 (2026-05-30): clear
+                // session_suspect ONLY after the local crypto commit
+                // (saveSession) has succeeded — still inside mutexFor
+                // (conversationId) so the next outgoing send sees the
+                // cleared state atomically. If anything above this line
+                // throws (prekey fetch, bootstrap, encrypt, afterEncrypt
+                // callback, saveSession), the exception propagates out
+                // of the mutex and this clear DOES NOT run, leaving the
+                // flag at true so the NEXT outgoing retries the repair.
+                //
+                // Only fires when the bootstrap branch ran BECAUSE of
+                // the suspect flag — for a regular first-send
+                // (sessionSuspect=false, just a fresh peer), this is a
+                // no-op.
+                if (sessionSuspect) {
+                    conversationRepository.clearSessionSuspect(conversationId)
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "DECRYPT_TRACE repair_done conv=$convTag",
+                    )
+
+                    // PR-CRYPTO-SESSION-REPAIR1 commit 5 (2026-05-30) —
+                    // best-effort replay of held envelopes for this
+                    // conversation now that the fresh ratchet is committed.
+                    // Architect-locked guardrails honoured inside
+                    // [replayHeldEnvelopesAfterRepair]:
+                    //   * fires ONLY after successful repair / saveSession
+                    //     (this block);
+                    //   * decodes wire_frame_json as inner WireFrame;
+                    //   * on success: marks PROCESSED + best-effort
+                    //     inserts text messages + acks + deletes row;
+                    //   * on failure: bumps replay_attempt_count, leaves
+                    //     row held, NEVER re-sets session_suspect;
+                    //   * caps replay attempts at
+                    //     MAX_REPLAY_ATTEMPTS_PER_HELD = 3;
+                    //   * per-conversation (only the conv we just
+                    //     repaired);
+                    //   * runs inside the existing per-conversation
+                    //     mutex so concurrent sends + the replay decrypt
+                    //     cannot race on the ratchet state.
+                    if (decryptFailedEnvelopeRepository != null) {
+                        replayHeldEnvelopesAfterRepair(conversationId, convTag)
+                    }
+                }
                 wireFrame
             }
         }
     }
+
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 commit 5 / 5a / 5b
+     * (2026-05-30 / 2026-05-31) — replay loop.
+     *
+     * Best-effort decrypt of every held envelope for [conversationId]
+     * under the fresh ratchet that was just committed by
+     * [encryptUnderLock]. ALL invocation paths reach this method
+     * INSIDE the per-conversation mutex acquired by encryptUnderLock,
+     * so concurrent sends in the same conversation cannot race on
+     * the ratchet state.
+     *
+     * Architect-locked semantics (commit 5a Safety Patch + commit
+     * 5b Ratchet Commit Ordering):
+     *
+     *   - No replay exception MAY escape this method. The outer
+     *     per-envelope guard catches any throwable (decode, decrypt,
+     *     saveSession, db, transport, callback), best-effort bumps
+     *     `replay_attempt_count`, logs `replay_unexpected_exception`,
+     *     and CONTINUES to the next entry. The trigger-send that
+     *     invoked us MUST NEVER be aborted by replay (commit 5a).
+     *
+     *   - Replay SUCCESS = decrypt OK + payload is TYPE_MESSAGE +
+     *     text durably inserted + ratchet advanced + conv / emit /
+     *     notify + ledger + ack + delete-held all OK. Order is
+     *     strict per [attemptReplayOne] (commit 5b):
+     *       1. decode inner WireFrame from `wire_frame_json`;
+     *       2. load fresh session (the one just saveSession'd by
+     *          encryptUnderLock);
+     *       3. ratchet.decrypt IN MEMORY (do NOT save yet);
+     *       4. decode `MessagePayload` JSON;
+     *       5. gate on `payload.type == TYPE_MESSAGE` (complex types
+     *          return false BEFORE saveSession — commit 5b);
+     *       6. insert text row with disappearing-timer expiry
+     *          (return false BEFORE saveSession on insert failure —
+     *          commit 5b);
+     *       7. saveSession with the advanced state (ONLY NOW —
+     *          commit 5b architect rule);
+     *       8. upsert conversation + `_incomingMessages.emit` +
+     *          `invokeIncomingNotificationCallback("text", …)`;
+     *       9. `processedEnvelopeRepository.markProcessed PROCESSED`;
+     *      10. `transport.sendDeliveryAck`;
+     *      11. `decryptFailedEnvelopeRepository.deleteByEnvelopeId`.
+     *     Failure at ANY step → recordReplayAttempt + leave row
+     *     held + no ack + no delete + no setSessionSuspect. Failures
+     *     in steps 1–6 leave the ratchet UN-ADVANCED so the same
+     *     row remains decryptable on the next replay cycle.
+     *
+     *   - Complex (non-`TYPE_MESSAGE`) payloads: row stays held +
+     *     attempt recorded + ratchet UN-ADVANCED + NO ack + NO
+     *     delete. When the complex-payload replay handler ships in
+     *     a follow-up commit, the same wireFrame is still
+     *     decryptable under the un-advanced chain.
+     *
+     *   - **MUST NOT** call setSessionSuspect on ANY failure path —
+     *     the anti-loop guarantee from architect pre-decision #3
+     *     invariant 4. Replay is best-effort; the user's repaired
+     *     send already succeeded, so re-suspecting on a replay
+     *     decrypt failure would cause an infinite repair loop.
+     *
+     *   - Rows whose `replay_attempt_count >= MAX_REPLAY_ATTEMPTS_PER_HELD`
+     *     are skipped without further decrypt attempts (and without
+     *     bumping the counter further).
+     */
+    private suspend fun replayHeldEnvelopesAfterRepair(
+        conversationId: String,
+        convTag: String,
+    ) {
+        val repo = decryptFailedEnvelopeRepository ?: return
+
+        // PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31): opportunistic
+        // 24h TTL sweep BEFORE listByConversation so expired held rows
+        // are dropped before any replay/decrypt happens against them.
+        // LOCAL cleanup only — no ack, no markProcessed; the relay's
+        // own envelope TTL is the authoritative server-side cleanup.
+        // The sweep is global (deletes across all conversations) which
+        // is acceptable because the call is already serialized by
+        // encryptUnderLock's per-conversation mutex; a stale row on
+        // another conv that gets evicted here is identical to what
+        // that conv's own next replay cycle would have done.
+        val ttlCutoffMs = Clock.System.now().toEpochMilliseconds() - HELD_ENVELOPE_TTL_MS
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE held_ttl_sweep_start conv=$convTag cutoffMs=$ttlCutoffMs",
+        )
+        try {
+            repo.deleteOlderThan(ttlCutoffMs)
+        } catch (e: Throwable) {
+            // TTL sweep is best-effort. A failure here does NOT abort
+            // the rest of the replay loop — surviving rows still get
+            // their decrypt attempts.
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE held_ttl_sweep_fail conv=$convTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE held_ttl_sweep_done conv=$convTag",
+        )
+
+        val held = repo.listByConversation(conversationId)
+        if (held.isEmpty()) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "DECRYPT_TRACE replay_loop_empty conv=$convTag",
+            )
+            return
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE replay_loop_start conv=$convTag count=${held.size}",
+        )
+
+        for (entry in held) {
+            val msgTag = entry.envelopeId.take(8)
+
+            if (entry.replayAttemptCount >= MAX_REPLAY_ATTEMPTS_PER_HELD) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "DECRYPT_TRACE replay_skip_max_attempts conv=$convTag " +
+                        "msgId=$msgTag attemptCount=${entry.replayAttemptCount}",
+                )
+                continue
+            }
+
+            val nowMs = Clock.System.now().toEpochMilliseconds()
+            val attemptNo = entry.replayAttemptCount + 1
+
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "DECRYPT_TRACE replay_attempt conv=$convTag msgId=$msgTag attemptNo=$attemptNo",
+            )
+
+            // OUTER SAFETY NET (commit 5a). Any throwable that the
+            // inner steps do not catch + handle MUST stop here. The
+            // trigger-send in encryptUnderLock is one stack-frame
+            // above us; an escaping replay exception would abort it
+            // and produce silent send failures.
+            val replayedOk = try {
+                attemptReplayOne(
+                    entry = entry,
+                    msgTag = msgTag,
+                    convTag = convTag,
+                    conversationId = conversationId,
+                    attemptNo = attemptNo,
+                    nowMs = nowMs,
+                )
+            } catch (e: Throwable) {
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "DECRYPT_TRACE replay_unexpected_exception conv=$convTag msgId=$msgTag " +
+                        "attemptNo=$attemptNo errorClass=${e::class.simpleName}",
+                )
+                false
+            }
+
+            if (!replayedOk) {
+                // Inner path may have already recorded; this catch
+                // path also records, idempotent because we only call
+                // it when the inner returned false (no recording yet)
+                // OR when an unexpected throwable escaped. The
+                // ledger's `recordReplayAttempt` is itself wrapped to
+                // never re-throw from this safety net.
+                //
+                // CRITICAL: must NOT setSessionSuspect — anti-loop.
+                runCatching { repo.recordReplayAttempt(entry.envelopeId, nowMs) }
+                    .onFailure { e ->
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "DECRYPT_TRACE replay_record_attempt_fail conv=$convTag " +
+                                "msgId=$msgTag errorClass=${e::class.simpleName}",
+                        )
+                    }
+            }
+        }
+
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE replay_loop_done conv=$convTag",
+        )
+    }
+
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31) — replay
+     * worker for a single held envelope.
+     *
+     * Architect-locked step order — the receive ratchet MUST NOT be
+     * advanced (`saveSession`) until the replayed plaintext is known
+     * to be a supported text payload AND durably inserted into the
+     * messages table. Otherwise a held row whose decrypt-then-insert
+     * sequence fails would leave the ratchet committed to a state
+     * past the held envelope's message index, making the same row
+     * un-retryable on the next replay cycle even though the relay
+     * still has the (un-acked) ciphertext.
+     *
+     * Steps:
+     *   1. decode `WireFrame`;
+     *   2. load fresh session;
+     *   3. `ratchet.decrypt` IN MEMORY — do NOT save yet;
+     *   4. decode `MessagePayload`;
+     *   5. require `TYPE_MESSAGE` — return false BEFORE save on
+     *      complex payloads (architect tightened in 5b);
+     *   6. insert text row with disappearing-timer expiry — return
+     *      false BEFORE save on insert failure;
+     *   7. `saveSession(newState)` — commit ratchet (only NOW);
+     *   8. upsert conversation + emit `_incomingMessages` + notify;
+     *   9. `processedEnvelopeRepository.markProcessed`;
+     *  10. `transport.sendDeliveryAck`;
+     *  11. `decryptFailedEnvelopeRepository.deleteByEnvelopeId`.
+     *
+     * Returns `true` iff every step (1–11) completed. Returns
+     * `false` on any KNOWN failure (logged with a specific tag);
+     * throws only on UNKNOWN failures, which the outer guard in
+     * [replayHeldEnvelopesAfterRepair] catches.
+     *
+     * On `false`, the caller MUST call `recordReplayAttempt` exactly
+     * once and MUST NOT touch `sessionSuspect`. On `true`, the
+     * caller does nothing — bookkeeping is complete inside.
+     */
+    private suspend fun attemptReplayOne(
+        entry: DecryptFailedEnvelopeRepository.Entry,
+        msgTag: String,
+        convTag: String,
+        conversationId: String,
+        attemptNo: Long,
+        nowMs: Long,
+    ): Boolean {
+        val repo = decryptFailedEnvelopeRepository ?: return false
+
+        // Step 1: decode inner WireFrame from the stored JSON —
+        // architect-locked semantic (PR #243 95c7aae0).
+        val wireFrame = try {
+            json.decodeFromString(WireFrame.serializer(), entry.wireFrameJson)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_decode_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        // Step 2: load fresh session.
+        val currentState = sessionManager.tryLoadSession(conversationId)
+        if (currentState == null) {
+            // Defensive: the fresh ratchet was just saved by the
+            // caller. Logged for forensics; never setSessionSuspect.
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_no_session conv=$convTag msgId=$msgTag " +
+                    "— session vanished between repair save and replay",
+            )
+            return false
+        }
+
+        // Step 3: ratchet.decrypt IN MEMORY. The advanced state
+        // [newState] is held in a local until step 7 — commit-5b
+        // architect rule. Failure here leaves the held row + ratchet
+        // both untouched, so the row remains decryptable on the
+        // next replay cycle.
+        val decryptResult = try {
+            ratchet.decrypt(currentState, wireFrame.encryptedMessage)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_fail conv=$convTag msgId=$msgTag " +
+                    "attemptCount=$attemptNo errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+        val (newState, plainBytes) = decryptResult
+
+        // Step 4: decode MessagePayload JSON. Failure here returns
+        // BEFORE saveSession — the un-advanced ratchet means the
+        // next replay (after the held row's wireFrame is fixed, or
+        // after manual intervention) can still decrypt the original
+        // ciphertext under the same chain key.
+        val payload = try {
+            json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_payload_decode_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        // Step 5: gate on TYPE_MESSAGE. Architectural scope note:
+        // group routing + voice chunk assembly + reaction/pin
+        // handlers all require state outside the receive ratchet
+        // (memory buffers, GroupMessagingService,
+        // voiceChunkRepository, etc). Replicating their handlers
+        // inside the send-path replay loop risks duplicate state
+        // mutations.
+        //
+        // Commit 5b architect rule: NO saveSession on the
+        // complex-payload path. The row stays held + ratchet stays
+        // un-advanced + no ack + no delete. When the complex-
+        // payload replay handler ships in a follow-up commit, the
+        // ratchet will advance via that handler — the same wireFrame
+        // is still decryptable under the un-advanced chain.
+        if (payload.type != MessagePayload.TYPE_MESSAGE) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "DECRYPT_TRACE replay_skipped_complex_payload conv=$convTag " +
+                    "msgId=$msgTag type=${payload.type}",
+            )
+            return false
+        }
+
+        // Step 6: insert text row with disappearing-timer expiry —
+        // architect-locked durability gate before ratchet commit.
+        // Failure here returns BEFORE saveSession; the un-advanced
+        // ratchet keeps the row retryable on the next cycle.
+        val timerSecs = try {
+            conversationRepository.getDisappearingTimer(conversationId)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_disappearing_read_fail conv=$convTag " +
+                    "msgId=$msgTag errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+        val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
+        try {
+            messageRepository.insertMessage(
+                MessageEntity(
+                    id = entry.envelopeId,
+                    conversationId = conversationId,
+                    ciphertext = wireFrame.encryptedMessage.ciphertext,
+                    plaintextCache = payload.text,
+                    sent = false,
+                    status = MessageStatus.DELIVERED,
+                    createdAt = nowMs,
+                    expiresAtMs = expiresAtMs,
+                )
+            )
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_insert_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE replay_inserted_text conv=$convTag msgId=$msgTag " +
+                "expiresAtMs=$expiresAtMs",
+        )
+
+        // Step 7: commit ratchet. Only after a successful durable
+        // insert do we advance the receive chain. Failure here
+        // (rare — usually DB connectivity) leaves the message in
+        // the DB but the ratchet un-advanced; future replay re-
+        // executes the same chain (INSERT OR IGNORE is idempotent
+        // so the duplicate insert no-ops).
+        try {
+            sessionManager.saveSession(conversationId, newState)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_save_session_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        // Step 8: conversation upsert + UI emit + notification —
+        // the user-visible mirror of normal text receive. Failure
+        // here is partial state (message durable, ratchet advanced,
+        // conv preview / unread / notification missed). Row stays
+        // held; next replay finds the message already inserted and
+        // re-runs upsert/emit/notify idempotently.
+        try {
+            applyReplayConvUpsertEmitNotify(
+                entry = entry,
+                payload = payload,
+                conversationId = conversationId,
+                nowMs = nowMs,
+            )
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_side_effect_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        // Step 9: ledger PROCESSED.
+        try {
+            processedEnvelopeRepository?.markProcessed(
+                envelopeId = entry.envelopeId,
+                conversationId = conversationId,
+                senderPubKeyHex = entry.senderPubKeyHex,
+                payloadType = payload.type,
+                status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                nowMs = nowMs,
+            )
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_mark_processed_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        // Step 10: ack the relay.
+        try {
+            transport.sendDeliveryAck(entry.envelopeId)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_ack_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        // Step 11: delete the held row. Failure here is the most
+        // benign — message is durably in UI + ledger + relay-ack'd;
+        // only the row remains. Still keep held + recordAttempt
+        // so cleanup converges via attempt cap or commit-6 TTL.
+        try {
+            repo.deleteByEnvelopeId(entry.envelopeId)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_delete_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE replay_ok conv=$convTag msgId=$msgTag " +
+                "plaintextBytes=${plainBytes.size}",
+        )
+        return true
+    }
+
+    /**
+     * PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31). Conversation
+     * upsert + `_incomingMessages.emit` + notification — the post-
+     * `saveSession` half of the text-receive mirror. Splits commit
+     * 5a's `applyTextReplaySideEffects` so the insert can run BEFORE
+     * the ratchet commit and the upsert/emit/notify after, per the
+     * architect-locked step ordering.
+     *
+     * Throws if any sub-step fails — the caller wraps this in
+     * try/catch and records a replay attempt on failure.
+     */
+    private suspend fun applyReplayConvUpsertEmitNotify(
+        entry: DecryptFailedEnvelopeRepository.Entry,
+        payload: MessagePayload,
+        conversationId: String,
+        nowMs: Long,
+    ) {
+        // Upsert conversation: mirror the live receive's
+        // preview/lastMessageAt/unreadCount++ on existing convs and
+        // REQUEST-creation on unknown senders. In the repair-replay
+        // path the conv almost always exists (the user just sent
+        // through it), but the create-REQUEST branch stays for
+        // defensive symmetry with the live receive path.
+        val senderName = payload.senderUsername.ifBlank { entry.senderPubKeyHex.take(8) }
+        val existing = conversationRepository.getConversation(conversationId)
+        if (existing == null) {
+            conversationRepository.upsertConversation(
+                ConversationEntity(
+                    id = conversationId,
+                    theirUsername = senderName,
+                    theirPublicKeyHex = entry.senderPubKeyHex,
+                    lastMessagePreview = previewText(payload.text),
+                    lastMessageAt = nowMs,
+                    unreadCount = 1,
+                    trustTier = TrustTier.REQUEST,
+                    blocked = false,
+                )
+            )
+        } else {
+            conversationRepository.upsertConversation(
+                existing.copy(
+                    lastMessagePreview = previewText(payload.text),
+                    lastMessageAt = nowMs,
+                    unreadCount = existing.unreadCount + 1,
+                )
+            )
+        }
+
+        // Emit to UI flow.
+        _incomingMessages.emit(
+            IncomingMessage(
+                id = entry.envelopeId,
+                conversationId = conversationId,
+                senderPublicKeyHex = entry.senderPubKeyHex,
+                text = payload.text,
+                receivedAt = nowMs,
+            )
+        )
+
+        // Local push notification (best-effort; the callback itself
+        // is `runCatching`-wrapped inside).
+        invokeIncomingNotificationCallback(
+            source = "text",
+            conversationId = conversationId,
+            senderName = senderName,
+            preview = previewText(payload.text),
+            senderPubKeyHex = entry.senderPubKeyHex,
+        )
+    }
+
 
     /**
      * Platform hook for local push notifications.
@@ -1655,6 +2310,21 @@ class DefaultMessagingService(
             val mutex = mutexFor(conversationId)
             val plainBytes: ByteArray? = mutex.withLock {
                 val state = sessionManager.tryLoadSession(conversationId)
+                // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — DECRYPT_TRACE
+                // attempt marker. Emitted before EVERY ratchet.decrypt call so
+                // the next-session DECRYPT_TRACE pipeline can correlate
+                // attempt → outcome lines without ambiguity. Architect-locked
+                // log content (no raw key material): short ids only, plus
+                // boolean session/x3dhInit flags.
+                val decryptStartMs = Clock.System.now().toEpochMilliseconds()
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "DECRYPT_TRACE attempt msgId=${deliver.messageId.take(8)} " +
+                        "sender=${senderPubKeyHex.take(8)} " +
+                        "conv=${conversationId.take(8)} " +
+                        "sessionExists=${state != null} " +
+                        "x3dhInitPresent=${wireFrame.x3dhInit != null}",
+                )
                 if (state != null) {
                     // Existing session — decrypt directly. Any x3dhInit /
                     // signing pubkey that came with this frame are
@@ -1670,6 +2340,16 @@ class DefaultMessagingService(
                         messagingLog(
                             MessagingLogLevel.INFO,
                             "Decrypt OK: plaintextBytes=${decrypted.size}",
+                        )
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                        // observability-only DECRYPT_TRACE ok marker.
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
+                                "conv=${conversationId.take(8)} " +
+                                "plaintextBytes=${decrypted.size} " +
+                                "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
+                                "bootstrap=false",
                         )
                         // PR-H2b: record the envelope id BEFORE we leave
                         // the per-conversation mutex so a concurrent
@@ -1690,26 +2370,159 @@ class DefaultMessagingService(
                         )
                         decrypted
                     } catch (e: IllegalArgumentException) {
-                        // ADR-012 / 2026-05-01 audit finding: a MAC
-                        // verification error is a HARD cryptographic
-                        // verdict — the chain key positions on sender
-                        // and receiver have permanently diverged
-                        // (typically: pre-migration envelope still in
-                        // relay store after PR C wiped sessions; or
-                        // double-send under the same id with chain
-                        // advanced between sends). The receiver can
-                        // never recover this envelope, no matter how
-                        // many redeliveries happen. Ack so the relay
-                        // drops it. Log the id so QA can audit which
-                        // envelopes died this way.
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 3c (architect P2
+                        // 2026-05-30 on PR #243): the pre-commit-3 destructive-
+                        // ack warning ("…ack-deliver'ing to clear relay store…")
+                        // and the ADR-012 rationale that justified it both
+                        // moved INSIDE the release/ack branch below. Pre-PR
+                        // they were the only path; in commit 3a they sat in
+                        // front of BOTH the new hold branch and the existing
+                        // release branch, which made the warning lie in debug
+                        // hold mode ("ack-deliver'ing" while no ack actually
+                        // fires). The DECRYPT_TRACE `action=hold|ack` lines
+                        // remain the canonical action source for both modes.
                         if (e.message?.contains("MAC", ignoreCase = true) == true ||
                             e.message?.contains("verification", ignoreCase = true) == true
                         ) {
+                            // ═════════════════════════════════════════════════════════
+                            // PR-CRYPTO-SESSION-REPAIR1 commit 3 (2026-05-29) —
+                            // ADDITIVE hold-on-MAC branch (architect re-ACKed
+                            // PR #243 commit 95c7aae0 → e0b61403 sequence).
+                            //
+                            // Architect-locked invariants verified by grep
+                            // on this diff:
+                            //   (1) NO call to transport.sendDeliveryAck here.
+                            //   (2) NO call to processedEnvelopeRepository
+                            //       .markProcessed here.
+                            //   (3) `return@withLock null` short-circuits
+                            //       BEFORE the release-path log + ack +
+                            //       markProcessed code below, so the existing
+                            //       release behaviour is reached only when
+                            //       this branch is NOT taken.
+                            //   (4) The else-branch below (the original ack
+                            //       + FAILED_MAC ledger path) is COMPLETELY
+                            //       UNCHANGED. Additive only — zero deletions.
+                            //
+                            // Gate: (holdMacFailures && repo != null). Both
+                            // conditions are required because Android wires
+                            // BuildConfig.DEBUG into holdMacFailures and the
+                            // repo into decryptFailedEnvelopeRepository; if
+                            // either is missing (test scaffolding, legacy
+                            // DMS construction), we fall through to the
+                            // existing ack path — same as before this PR.
+                            //
+                            // Storage-failure safety: if insert OR
+                            // setSessionSuspect throws, we still return null
+                            // WITHOUT acking. The envelope sits on the relay
+                            // and gets re-delivered next session; worst case
+                            // is 7-day relay TTL eviction. We do NOT fall
+                            // through to the ack path because that would
+                            // re-introduce the silent destructive loss this
+                            // PR exists to prevent.
+                            // ═════════════════════════════════════════════════════════
+                            if (holdMacFailures && decryptFailedEnvelopeRepository != null) {
+                                // Local-capture the non-null repository so
+                                // the smart-cast holds inside the runCatching
+                                // lambda (Kotlin smart-cast doesn't propagate
+                                // a class-property nullability check across
+                                // a lambda boundary).
+                                val heldRepo: DecryptFailedEnvelopeRepository =
+                                    decryptFailedEnvelopeRepository
+                                val nowMs = Clock.System.now().toEpochMilliseconds()
+                                val holdResult = runCatching {
+                                    // Architect-locked inner-WireFrame JSON
+                                    // semantic (PR #243 95c7aae0): encode the
+                                    // SAME `wireFrame` object the receive path
+                                    // just decoded, so the replay loop in
+                                    // commit 5 can decode → re-feed
+                                    // `wireFrame.encryptedMessage` into
+                                    // `ratchet.decrypt` under the fresh
+                                    // ratchet.
+                                    val wireFrameJson = json.encodeToString(wireFrame)
+                                    heldRepo.insert(
+                                        envelopeId = deliver.messageId,
+                                        conversationId = conversationId,
+                                        senderPubKeyHex = senderPubKeyHex,
+                                        errorType = "mac",
+                                        receivedAtMs = nowMs,
+                                        x3dhInitPresent = wireFrame.x3dhInit != null,
+                                        wireFrameJson = wireFrameJson,
+                                    )
+                                    conversationRepository.setSessionSuspect(
+                                        conversationId = conversationId,
+                                        setAtMs = nowMs,
+                                    )
+                                }
+                                if (holdResult.isSuccess) {
+                                    messagingLog(
+                                        MessagingLogLevel.WARN,
+                                        "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
+                                            "sender=${senderPubKeyHex.take(8)} " +
+                                            "conv=${conversationId.take(8)} " +
+                                            "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
+                                            "action=hold",
+                                    )
+                                } else {
+                                    // Storage failure inside hold path: we
+                                    // STILL skip ack so the envelope is not
+                                    // silently destroyed. The relay redelivers
+                                    // next session; if hold path keeps failing
+                                    // we get repeated redeliveries until the
+                                    // relay's 7-day TTL evicts. action=hold_
+                                    // storage_error makes this state grep-able.
+                                    val err = holdResult.exceptionOrNull()
+                                    messagingLog(
+                                        MessagingLogLevel.WARN,
+                                        "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
+                                            "sender=${senderPubKeyHex.take(8)} " +
+                                            "conv=${conversationId.take(8)} " +
+                                            "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
+                                            "action=hold_storage_error " +
+                                            "errorClass=${err?.let { it::class.simpleName } ?: "Unknown"}",
+                                    )
+                                }
+                                return@withLock null
+                            }
+                            // ═════════════════════════════════════════════════════════
+                            // RELEASE / ack-on-MAC PATH.
+                            //
+                            // ADR-012 / 2026-05-01 audit finding (relocated
+                            // here in commit 3c per architect P2 2026-05-30):
+                            // a MAC verification error is a HARD cryptographic
+                            // verdict — the chain key positions on sender and
+                            // receiver have permanently diverged (typically:
+                            // pre-migration envelope still in relay store
+                            // after PR C wiped sessions; or double-send under
+                            // the same id with chain advanced between sends).
+                            // The receiver can never recover THIS envelope on
+                            // the unchanged ratchet, no matter how many
+                            // redeliveries happen. Ack so the relay drops it.
+                            // Log the id so QA can audit which envelopes died
+                            // this way.
+                            //
+                            // The hold path above (debug/beta only) replaces
+                            // this destructive ack with a persistent held row
+                            // + suspect mark; under that path the relay copy
+                            // is preserved (not acked) and a future fresh
+                            // X3DH gives the held envelope a second chance.
+                            //
+                            // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29):
+                            // DECRYPT_TRACE fail_mac marker. `action=ack`
+                            // reflects the release-build behaviour.
+                            // ═════════════════════════════════════════════════════════
                             messagingLog(
                                 MessagingLogLevel.WARN,
                                 "Permanent decrypt failure (MAC error) — ack-deliver'ing to clear " +
                                     "relay store. id=${deliver.messageId.take(12)}… " +
                                     "conv=${conversationId.take(16)}… err=${e.message}",
+                            )
+                            messagingLog(
+                                MessagingLogLevel.WARN,
+                                "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
+                                    "sender=${senderPubKeyHex.take(8)} " +
+                                    "conv=${conversationId.take(8)} " +
+                                    "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
+                                    "action=ack",
                             )
                             // PR-H2b: pin this envelope id with FAILED_MAC
                             // so a future redelivery sees the ledger hit
@@ -1729,6 +2542,18 @@ class DefaultMessagingService(
                             return@withLock null
                         }
                         // Other IAE — rethrow, outer onFailure handles it.
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                        // DECRYPT_TRACE fail_other for non-MAC IllegalArgument
+                        // exceptions. These don't get held under
+                        // holdMacFailures (the gate is MAC-specific by
+                        // design); their action remains `rethrow`.
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "DECRYPT_TRACE fail_other msgId=${deliver.messageId.take(8)} " +
+                                "conv=${conversationId.take(8)} " +
+                                "errorClass=${e::class.simpleName} " +
+                                "action=rethrow",
+                        )
                         throw e
                     }
                 } else {
@@ -1749,6 +2574,21 @@ class DefaultMessagingService(
                             "Legacy envelope: no session for conv=${conversationId.take(16)}… " +
                                 "and no x3dhInit header — ack-deliver'ing to clear relay store: " +
                                 "id=${deliver.messageId.take(12)}…",
+                        )
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                        // DECRYPT_TRACE fail_legacy_no_x3dh marker. This is
+                        // structurally similar to fail_mac (destructive ack)
+                        // but the root cause is different: no x3dhInit on
+                        // a no-session envelope makes recovery architecturally
+                        // impossible, whereas fail_mac is chain divergence
+                        // that fresh X3DH can repair. action=ack in this
+                        // commit and beyond — holdMacFailures only gates the
+                        // MAC class, not this one.
+                        messagingLog(
+                            MessagingLogLevel.WARN,
+                            "DECRYPT_TRACE fail_legacy_no_x3dh msgId=${deliver.messageId.take(8)} " +
+                                "sender=${senderPubKeyHex.take(8)} " +
+                                "conv=${conversationId.take(8)} action=ack",
                         )
                         // PR-H2b: same as the MAC-fail path above —
                         // record so a future redelivery skips immediately.
@@ -1787,6 +2627,20 @@ class DefaultMessagingService(
                     messagingLog(
                         MessagingLogLevel.INFO,
                         "Decrypt OK after bootstrap: plaintextBytes=${decrypted.size}",
+                    )
+                    // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                    // DECRYPT_TRACE ok for the bootstrap path. `bootstrap=true`
+                    // distinguishes this from the existing-session ok line so
+                    // the next-session DECRYPT_TRACE pipeline can compute
+                    // "fresh sessions per hour" diagnostics without parsing
+                    // session state.
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
+                            "conv=${conversationId.take(8)} " +
+                            "plaintextBytes=${decrypted.size} " +
+                            "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
+                            "bootstrap=true",
                     )
                     // PR-H2b: same ledger insert as the existing-session
                     // branch above. Bootstrap path lands here once per

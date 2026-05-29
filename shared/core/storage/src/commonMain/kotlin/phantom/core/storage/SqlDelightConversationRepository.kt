@@ -50,6 +50,8 @@ class SqlDelightConversationRepository(
                 muted_until = entity.mutedUntil,
                 pinned = if (entity.pinned) 1L else 0L,
                 needs_rehandshake = if (entity.needsRehandshake) 1L else 0L,
+                session_suspect = if (entity.sessionSuspect) 1L else 0L,
+                session_suspect_set_at_ms = entity.sessionSuspectSetAtMs,
             )
         }
 
@@ -164,6 +166,26 @@ class SqlDelightConversationRepository(
             db.conversationQueries.markAllNeedsRehandshake()
         }
 
+    override suspend fun setSessionSuspect(conversationId: String, setAtMs: Long): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.setSessionSuspect(
+                setAtMs = setAtMs,
+                id = conversationId,
+            )
+        }
+
+    override suspend fun clearSessionSuspect(conversationId: String): Unit =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.clearSessionSuspect(id = conversationId)
+        }
+
+    override suspend fun getSessionSuspectConversations(): List<ConversationEntity> =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.getSessionSuspectConversations()
+                .executeAsList()
+                .map { it.toEntity() }
+        }
+
     // ---------------------------------------------------------------------------
     // Mapping
     // ---------------------------------------------------------------------------
@@ -185,5 +207,7 @@ class SqlDelightConversationRepository(
         mutedUntil = muted_until,
         pinned = pinned != 0L,
         needsRehandshake = needs_rehandshake != 0L,
+        sessionSuspect = session_suspect != 0L,
+        sessionSuspectSetAtMs = session_suspect_set_at_ms,
     )
 }

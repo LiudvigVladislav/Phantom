@@ -38,6 +38,7 @@ import phantom.core.transport.RelayTransport
 import phantom.core.transport.TransportState
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -163,6 +164,29 @@ private class FakeConversationRepository : ConversationRepository {
             store[id]?.let { store[id] = it.copy(needsRehandshake = true) }
         }
     }
+
+    // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — test-fake stubs
+    // for the new session_suspect mutators. Mirror the SqlDelight impl.
+    override suspend fun setSessionSuspect(conversationId: String, setAtMs: Long) {
+        store[conversationId]?.let {
+            store[conversationId] = it.copy(
+                sessionSuspect = true,
+                sessionSuspectSetAtMs = setAtMs,
+            )
+        }
+    }
+
+    override suspend fun clearSessionSuspect(conversationId: String) {
+        store[conversationId]?.let {
+            store[conversationId] = it.copy(
+                sessionSuspect = false,
+                sessionSuspectSetAtMs = null,
+            )
+        }
+    }
+
+    override suspend fun getSessionSuspectConversations(): List<ConversationEntity> =
+        store.values.filter { it.sessionSuspect }.toList()
 }
 
 private class FakeReactionRepository : ReactionRepository {
@@ -357,6 +381,32 @@ private class PassthroughDoubleRatchet : DoubleRatchet {
         state to message.ciphertext
 }
 
+// PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31). Passthrough
+// encrypt + decrypt returns a state with a recognizable marker
+// `receivingChainKey` (all-0x55) so the no-advance tests can detect
+// whether saveSession was called with the post-decrypt newState
+// (marker present in persisted state) or not (pre-decrypt state
+// preserved). Without this marker, plain Passthrough's
+// `state to ciphertext` would make every saved state look identical.
+private class MarkingPassthroughDoubleRatchet : DoubleRatchet {
+    override fun encrypt(state: RatchetState, plaintext: ByteArray): Pair<RatchetState, EncryptedMessage> =
+        state to EncryptedMessage(
+            ratchetPublicKey = state.sendingRatchetPublicKey,
+            messageIndex = state.sendCount,
+            ciphertext = plaintext,
+            nonce = ByteArray(24),
+        )
+
+    override fun decrypt(state: RatchetState, message: EncryptedMessage): Pair<RatchetState, ByteArray> {
+        val markedState = state.copy(receivingChainKey = MARKER_RECEIVING_CHAIN_KEY)
+        return markedState to message.ciphertext
+    }
+
+    companion object {
+        val MARKER_RECEIVING_CHAIN_KEY: ByteArray = ByteArray(32) { 0x55.toByte() }
+    }
+}
+
 private class PassthroughX3DH : X3DHProtocol {
     override fun generateDhKeyPair() = DhKeyPair(
         DhPublicKey(ByteArray(32) { 1 }),
@@ -423,6 +473,16 @@ class DefaultMessagingServiceTest {
         DhPrivateKey(ByteArray(32) { 0xBB.toByte() }),
     )
 
+    // PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31): all replay /
+    // safety / TTL tests must use a `received_at_ms` close to
+    // `Clock.System.now()` so the 24h TTL sweep at the entry of
+    // `replayHeldEnvelopesAfterRepair` does NOT evict the seeded
+    // rows mid-test. The legacy small-integer values (100L, 200L, …)
+    // are pre-1970-anchored relative to wall-clock and would be
+    // deleted by the sweep before the replay loop runs.
+    private val recentReceivedAtMs: Long
+        get() = Clock.System.now().toEpochMilliseconds() - 1_000L
+
     private suspend fun buildService(
         testScope: TestScope,
         msgRepo: FakeMessageRepository = FakeMessageRepository(),
@@ -444,6 +504,20 @@ class DefaultMessagingServiceTest {
         // finalizer. When null, the legacy in-memory path is used (same
         // behaviour every voice test before D2b.1 saw).
         voiceChunkRepo: phantom.core.storage.VoiceChunkRepository? = null,
+        // PR-CRYPTO-SESSION-REPAIR1 commit 3b (2026-05-30): allow tests
+        // to substitute the DoubleRatchet so MAC-error paths can be
+        // exercised via [MacFailingDoubleRatchet]. Default preserves
+        // existing call-sites + pre-PR receive semantics.
+        ratchet: phantom.core.crypto.DoubleRatchet = PassthroughDoubleRatchet(),
+        // PR-CRYPTO-SESSION-REPAIR1 commit 3b: optional held-envelope
+        // repo. When null, hold-on-MAC is unavailable regardless of
+        // [holdMacFailures] (the gate is `holdMacFailures && repo !=
+        // null`). When non-null, [holdMacFailures] picks between hold
+        // (true) and ack (false).
+        decryptFailedRepo: phantom.core.storage.DecryptFailedEnvelopeRepository? = null,
+        // PR-CRYPTO-SESSION-REPAIR1 commit 3b: semantic flag matching the
+        // production constructor param. Tests set this per scenario.
+        holdMacFailures: Boolean = false,
     ): DefaultMessagingService {
         // sendMessage paths reach SealedSender.seal which uses libsodium.
         // On JVM the lib is loaded via JNA; calling Box.keypair() before
@@ -484,7 +558,7 @@ class DefaultMessagingServiceTest {
         return DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
-            ratchet = PassthroughDoubleRatchet(),
+            ratchet = ratchet,
             sessionManager = sessionManager,
             transport = transport,
             messageRepository = msgRepo,
@@ -499,6 +573,8 @@ class DefaultMessagingServiceTest {
             preKeyApi = ThrowingPreKeyApi,
             signingKeyProvider = { ThrowingSigningKey },
             voiceChunkRepository = voiceChunkRepo,
+            decryptFailedEnvelopeRepository = decryptFailedRepo,
+            holdMacFailures = holdMacFailures,
         )
     }
 
@@ -1389,6 +1465,2224 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 3b (2026-05-30) — first test of
+    // the architect-locked 5-matrix. This single test proves invariants
+    // 1 + 2: when `holdMacFailures=true` AND repo is non-null AND the
+    // ratchet throws MAC, the receive path:
+    //   - does NOT call transport.sendDeliveryAck (invariant 1);
+    //   - does NOT write to processed_envelopes (invariant 2);
+    //   - writes a row to decrypt_failed_envelopes with error_type=mac;
+    //   - marks conversationRepository session_suspect = true.
+    //
+    // Pattern reviewable by architect on the PR thread; remaining 4
+    // tests (decrypt_mac_error_acks_on_release, normal_path × 2,
+    // wireFrameJson round-trip) follow as commit 3c after pattern ACK.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun decrypt_mac_error_holds_in_debug() = runTest {
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        // Pre-seed conversation row so setSessionSuspect can update it.
+        // conv id = sorted([identity.publicKeyHex="aabb", senderHex="ccdd"]).join("_") = "aabb_ccdd",
+        // which buildService's sessionManager pre-seeds.
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            scope = backgroundScope,
+            // Hold-path enablers:
+            ratchet = MacFailingDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = true,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Build a Deliver whose payload IS valid (parses past the
+        // unpad + WireFrame JSON decode), but whose ratchet.decrypt
+        // throws MAC. MacFailingDoubleRatchet throws regardless of
+        // ciphertext bytes, so the inner EncryptedMessage can be
+        // arbitrary.
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x00, 0x01, 0x02),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-debug-mac",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // ── Invariant 1: no ack ────────────────────────────────────────
+        assertTrue(
+            "env-debug-mac" !in transport.ackedDelivers,
+            "hold path MUST NOT call sendDeliveryAck; transport.ackedDelivers=${transport.ackedDelivers}",
+        )
+        // ── Invariant 2: no FAILED_MAC ledger entry ────────────────────
+        assertEquals(
+            false,
+            processedRepo.exists("env-debug-mac"),
+            "hold path MUST NOT call markProcessed; processedRepo has the envelope",
+        )
+        // ── Held row exists in decrypt_failed_envelopes ────────────────
+        val held = decryptFailedRepo.listByConversation("aabb_ccdd")
+        assertEquals(1, held.size, "exactly one held envelope expected; got $held")
+        assertEquals("env-debug-mac", held[0].envelopeId)
+        assertEquals("mac", held[0].errorType)
+        // wireFrameJson stored is non-empty + decodes back into WireFrame.
+        assertTrue(held[0].wireFrameJson.isNotEmpty(), "wireFrameJson must be persisted")
+        val decoded = json.decodeFromString(WireFrame.serializer(), held[0].wireFrameJson)
+        assertEquals(
+            wireFrame.encryptedMessage.messageIndex,
+            decoded.encryptedMessage.messageIndex,
+            "round-trip messageIndex",
+        )
+        // ── Conversation marked session_suspect ────────────────────────
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertTrue(
+            updatedConv?.sessionSuspect == true,
+            "session_suspect MUST be true after hold path runs; got $updatedConv",
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 3c (2026-05-30) — remaining 4
+    // tests of the architect-locked 5-matrix. Pattern from
+    // `decrypt_mac_error_holds_in_debug` (commit 3b 22af5d7b)
+    // architect-ACKed; these tests are direct rig variations + the
+    // dedicated byte-level wireFrameJson regression guard.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun decrypt_mac_error_acks_on_release() = runTest {
+        // Architect-locked invariant 4: when holdMacFailures=false, the
+        // release path is unchanged from pre-PR. Verify the destructive
+        // ack + FAILED_MAC ledger entry still fires AND the new hold
+        // table stays empty + suspect flag stays false.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            scope = backgroundScope,
+            ratchet = MacFailingDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            // Release / production gate — even with the repo non-null,
+            // holdMacFailures=false MUST keep the existing ack path.
+            holdMacFailures = false,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x10, 0x11, 0x12),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-release-mac",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // Release path: ack fires, FAILED_MAC ledger row written.
+        assertTrue(
+            "env-release-mac" in transport.ackedDelivers,
+            "release path MUST call sendDeliveryAck; transport.ackedDelivers=${transport.ackedDelivers}",
+        )
+        assertEquals(
+            true,
+            processedRepo.exists("env-release-mac"),
+            "release path MUST call markProcessed FAILED_MAC",
+        )
+        // Hold table untouched + suspect stays false.
+        assertEquals(
+            0,
+            decryptFailedRepo.listByConversation("aabb_ccdd").size,
+            "release path MUST NOT write to decrypt_failed_envelopes",
+        )
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: false,
+            "release path MUST NOT set session_suspect",
+        )
+    }
+
+    @Test
+    fun normal_path_unaffected_in_debug() = runTest {
+        // Architect-locked invariant 5: non-MAC envelope under
+        // holdMacFailures=true takes the unchanged normal flow — ack,
+        // markProcessed PROCESSED, message inserted, no hold table
+        // touch, no suspect mark.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+        val msgRepo = FakeMessageRepository()
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            msgRepo = msgRepo,
+            scope = backgroundScope,
+            // PassthroughDoubleRatchet returns ciphertext verbatim so
+            // the receive path JSON-decodes it as MessagePayload below.
+            ratchet = PassthroughDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = true,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // For PassthroughDoubleRatchet the ciphertext IS the plaintext.
+        // Build a valid MessagePayload so the post-decrypt JSON parse
+        // succeeds and the downstream insert / ack path runs normally.
+        val payload = MessagePayload(
+            type = "message",
+            text = "hi from normal path debug",
+        )
+        val plaintextJsonBytes = json
+            .encodeToString(MessagePayload.serializer(), payload)
+            .encodeToByteArray()
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = plaintextJsonBytes,
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-debug-normal",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // Normal path: ack fires + PROCESSED ledger row + message persisted.
+        assertTrue(
+            "env-debug-normal" in transport.ackedDelivers,
+            "normal path MUST call sendDeliveryAck",
+        )
+        assertEquals(
+            true,
+            processedRepo.exists("env-debug-normal"),
+            "normal path MUST call markProcessed",
+        )
+        assertTrue(
+            msgRepo.messages.any { it.plaintextCache == "hi from normal path debug" },
+            "normal path MUST insert the decoded message; got ${msgRepo.messages.map { it.plaintextCache }}",
+        )
+        // Hold table untouched + suspect stays false (architect invariant 5).
+        assertEquals(
+            0,
+            decryptFailedRepo.listByConversation("aabb_ccdd").size,
+            "normal path under holdMacFailures=true MUST NOT touch decrypt_failed_envelopes",
+        )
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: false,
+            "normal path MUST NOT set session_suspect",
+        )
+    }
+
+    @Test
+    fun normal_path_unaffected_in_release() = runTest {
+        // Mirror of the debug normal-path test under holdMacFailures=false.
+        // Both should look identical from the receive-path perspective
+        // because the hold branch is only taken on MAC error, never on
+        // a successful decrypt.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+        val msgRepo = FakeMessageRepository()
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            msgRepo = msgRepo,
+            scope = backgroundScope,
+            ratchet = PassthroughDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = false,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        val payload = MessagePayload(
+            type = "message",
+            text = "hi from normal path release",
+        )
+        val plaintextJsonBytes = json
+            .encodeToString(MessagePayload.serializer(), payload)
+            .encodeToByteArray()
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = plaintextJsonBytes,
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-release-normal",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertTrue("env-release-normal" in transport.ackedDelivers)
+        assertEquals(true, processedRepo.exists("env-release-normal"))
+        assertTrue(
+            msgRepo.messages.any { it.plaintextCache == "hi from normal path release" },
+        )
+        assertEquals(0, decryptFailedRepo.listByConversation("aabb_ccdd").size)
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(false, updatedConv?.sessionSuspect ?: false)
+    }
+
+    @Test
+    fun hold_path_wireFrameJson_decodes_back_to_inner_WireFrame_preserving_encryptedMessage() = runTest {
+        // Architect-strengthened wireFrameJson regression guard (P2
+        // 2026-05-30): the first test (decrypt_mac_error_holds_in_debug)
+        // only checked `messageIndex` round-trip. This dedicated test
+        // verifies byte-level equality on the ENTIRE inner
+        // `EncryptedMessage` so the replay-payload contract is locked.
+        // If a future change accidentally re-encodes the wire frame as
+        // outer `RelayMessage.Deliver` JSON (the wrong layer per
+        // architect 2026-05-29 on PR #243 95c7aae0), this test fails.
+        com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            scope = backgroundScope,
+            ratchet = MacFailingDoubleRatchet(),
+            decryptFailedRepo = decryptFailedRepo,
+            holdMacFailures = true,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Distinct non-zero byte patterns per field so a swap between
+        // fields would be detectable.
+        val knownRatchetPub = ByteArray(32) { (0xA0 + (it % 16)).toByte() }
+        val knownNonce = ByteArray(24) { (0xB0 + (it % 16)).toByte() }
+        val knownCiphertext = byteArrayOf(
+            0xC0.toByte(), 0xC1.toByte(), 0xC2.toByte(), 0xC3.toByte(),
+            0xC4.toByte(), 0xC5.toByte(), 0xC6.toByte(), 0xC7.toByte(),
+        )
+        val knownMessageIndex = 42
+        val knownEncryptedMessage = phantom.core.crypto.EncryptedMessage(
+            ratchetPublicKey = knownRatchetPub,
+            messageIndex = knownMessageIndex,
+            ciphertext = knownCiphertext,
+            nonce = knownNonce,
+        )
+        val knownWireFrame = WireFrame(
+            encryptedMessage = knownEncryptedMessage,
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+
+        val wireFrameBytes = json
+            .encodeToString(WireFrame.serializer(), knownWireFrame)
+            .encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = payloadB64,
+                messageId = "env-wfj-roundtrip",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        val held = decryptFailedRepo.listByConversation("aabb_ccdd")
+        assertEquals(1, held.size, "exactly one held envelope expected")
+        val storedJson = held[0].wireFrameJson
+
+        // Decode via WireFrame.serializer() — NOT RelayMessage.Deliver.
+        val decoded = json.decodeFromString(WireFrame.serializer(), storedJson)
+
+        // ── Byte-level EncryptedMessage equality ───────────────────────
+        assertEquals(
+            knownMessageIndex,
+            decoded.encryptedMessage.messageIndex,
+            "messageIndex must round-trip",
+        )
+        assertTrue(
+            knownRatchetPub.contentEquals(decoded.encryptedMessage.ratchetPublicKey),
+            "ratchetPublicKey bytes must round-trip unchanged",
+        )
+        assertTrue(
+            knownNonce.contentEquals(decoded.encryptedMessage.nonce),
+            "nonce bytes must round-trip unchanged",
+        )
+        assertTrue(
+            knownCiphertext.contentEquals(decoded.encryptedMessage.ciphertext),
+            "ciphertext bytes must round-trip unchanged",
+        )
+        // x3dhInit absence must also survive the trip (relevant for the
+        // commit 5 replay path: if x3dh init was present at receive
+        // time, the replay must replay through the bootstrap branch,
+        // not the existing-session branch).
+        kotlin.test.assertNull(
+            decoded.x3dhInit,
+            "x3dhInit absence must round-trip as null",
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 4 (2026-05-30) — suspect → fresh
+    // X3DH on next outgoing. 4-test matrix from the architect mini-lock.
+    // All assertions live entirely on the send path; receive ack /
+    // markProcessed ownership stays in DMS per architect pre-decision #2.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun suspect_outgoing_forces_fresh_x3dh_and_clears_suspect_after_save() = runTest {
+        // Set sessionSuspect=true on a conversation that ALREADY has an
+        // existing session row. The outgoing send must take the fresh
+        // X3DH bootstrap branch (verified by x3dhInit != null on the
+        // wire) and clear sessionSuspect only after sessionManager
+        // .saveSession commits (architect-correction 2026-05-29: clear
+        // on local crypto commit, not on transport.send).
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+
+        // Bob has a real published bundle so the suspect-forced
+        // bootstrap branch can actually complete.
+        val real = phantom.core.crypto.LibsodiumX3DH()
+        val bobX25519 = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val bobSpkSig = phantom.core.crypto.SignedPreKeySigner.sign(
+            spkPublic = bobSpk.publicKey,
+            createdAtMs = 1_000L,
+            identityEd25519SecretKey = bobSigning.secretKey.toByteArray(),
+        )
+        val bobHex = bobX25519.publicKey.bytes.toHexStringLower()
+        val bobBundle = phantom.core.transport.PreKeyBundle(
+            identity_pubkey_hex = bobHex,
+            signing_pubkey_hex = bobSigning.publicKey.toByteArray().toHexStringLower(),
+            signed_pre_key = phantom.core.transport.WireSignedPreKey(
+                key_id = 1L,
+                public_key_hex = bobSpk.publicKey.bytes.toHexStringLower(),
+                created_at_ms = 1_000L,
+                signature_hex = bobSpkSig.toHexStringLower(),
+            ),
+            one_time_pre_key = null,
+        )
+
+        val convId = listOf(identity.publicKeyHex, bobHex).sorted().joinToString("_")
+
+        // Pre-seed an existing session for this conv — the test proves
+        // that the suspect flag overrides tryLoadSession (existingState
+        // is NOT null, but the bootstrap branch still runs).
+        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = listOf(convId))
+        // Conversation row with sessionSuspect=true.
+        convRepo.store[convId] = phantom.core.storage.ConversationEntity(
+            id = convId,
+            theirUsername = "bob",
+            theirPublicKeyHex = bobHex,
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 12_345L,
+        )
+
+        val sessionManager = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+
+        val ourSigningKp = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val ourSigning = phantom.core.identity.IdentitySigningKeyPair(
+            publicKey = phantom.core.identity.SigningPublicKey(ourSigningKp.publicKey.toByteArray()),
+            privateKey = phantom.core.identity.SigningPrivateKey(ourSigningKp.secretKey.toByteArray()),
+        )
+
+        val service = DefaultMessagingService(
+            identity = identity,
+            localKeyPair = localKeyPair,
+            ratchet = PassthroughDoubleRatchet(),
+            sessionManager = sessionManager,
+            transport = transport,
+            messageRepository = msgRepo,
+            conversationRepository = convRepo,
+            scope = this,
+            json = json,
+            preKeyApi = StubPreKeyApi(bundle = bobBundle),
+            signingKeyProvider = { ourSigning },
+        )
+
+        service.sendMessage(
+            OutgoingMessage(
+                id = "msg-suspect-1",
+                conversationId = convId,
+                recipientPublicKeyHex = bobHex,
+                text = "repair-armed payload",
+            ),
+        )
+
+        // Assertion 1: bootstrap path WAS taken (x3dhInit on wire).
+        assertEquals(1, transport.sent.size, "send must reach transport")
+        val payload = transport.sent[0].payload
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val padded = kotlin.io.encoding.Base64.decode(payload)
+        val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
+        val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
+        assertNotNull(
+            wireFrame.x3dhInit,
+            "suspect conversation MUST force fresh X3DH bootstrap → x3dhInit on wire",
+        )
+
+        // Assertion 2: sessionSuspect cleared after saveSession.
+        val updatedConv = convRepo.getConversation(convId)
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: true,
+            "sessionSuspect MUST be cleared after fresh X3DH + saveSession succeed",
+        )
+    }
+
+    @Test
+    fun non_suspect_outgoing_uses_existing_session() = runTest {
+        // Mirror baseline: when sessionSuspect=false (default), the
+        // existing-session branch runs unchanged. x3dhInit on the wire
+        // is null and no preKeyApi fetch happens (ThrowingPreKeyApi
+        // would fail the test if the bootstrap branch was reached).
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val convRepo = FakeConversationRepository()
+        // Pre-seed a conv row with sessionSuspect=false (explicit for
+        // clarity even though it's the default).
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = false,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            scope = backgroundScope,
+            // ThrowingPreKeyApi via default buildService — bootstrap
+            // branch reaching preKeyApi.fetchBundle would throw.
+        )
+
+        service.sendMessage(
+            OutgoingMessage(
+                id = "msg-nosuspect",
+                conversationId = "aabb_ccdd",
+                recipientPublicKeyHex = "ccdd",
+                text = "regular send",
+            ),
+        )
+
+        // Existing-session path: x3dhInit must be null on the wire.
+        assertEquals(1, transport.sent.size)
+        val payload = transport.sent[0].payload
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val padded = kotlin.io.encoding.Base64.decode(payload)
+        val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
+        val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
+        kotlin.test.assertNull(
+            wireFrame.x3dhInit,
+            "non-suspect outgoing MUST use existing session → x3dhInit MUST be null",
+        )
+        // Suspect stays false.
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(false, updatedConv?.sessionSuspect ?: false)
+    }
+
+    @Test
+    fun suspect_bootstrap_failure_keeps_suspect() = runTest {
+        // Architect guardrail: if any of (prekey fetch, bootstrap,
+        // encrypt, saveSession) throws, the clearSessionSuspect call
+        // does NOT execute and the flag stays true so the next outgoing
+        // retries the repair. Verified here by giving the conversation
+        // a suspect flag + ThrowingPreKeyApi (default via buildService);
+        // the fetch throws PeerBundleMissingException which propagates
+        // out of encryptUnderLock.
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val convRepo = FakeConversationRepository()
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 42L,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            scope = backgroundScope,
+        )
+
+        // sendMessage should NOT throw out (DMS surfaces bundle-missing
+        // as a WAITING result internally), but the conversation's
+        // sessionSuspect MUST remain true regardless.
+        runCatching {
+            service.sendMessage(
+                OutgoingMessage(
+                    id = "msg-fail-suspect",
+                    conversationId = "aabb_ccdd",
+                    recipientPublicKeyHex = "ccdd",
+                    text = "bootstrap will fail because ThrowingPreKeyApi",
+                )
+            )
+        }
+
+        // The wire MUST NOT carry a message — bootstrap failed.
+        assertEquals(
+            0,
+            transport.sent.size,
+            "bootstrap failure must NOT produce a transport.send",
+        )
+        // The suspect flag MUST remain true so the next outgoing retries.
+        val updatedConv = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            true,
+            updatedConv?.sessionSuspect ?: false,
+            "sessionSuspect MUST remain true on bootstrap/encrypt/save failure",
+        )
+        // Diagnostic: the original setAtMs is also preserved (since the
+        // flag was never cleared and re-set, the timestamp does not move).
+        assertEquals(42L, updatedConv?.sessionSuspectSetAtMs)
+    }
+
+    @Test
+    fun repair_is_per_conversation_only() = runTest {
+        // Two distinct conversations. Setting sessionSuspect=true on
+        // conversation A must NOT affect conversation B. An outgoing
+        // message in B uses B's existing session (x3dhInit null on
+        // wire), and A's suspect flag remains untouched because no
+        // outgoing send in A was issued.
+        LibsodiumInitializer.initialize()
+        val transport = FakeRelayTransport()
+        val convRepo = FakeConversationRepository()
+        // Conv A (peer ccdd) is suspect.
+        convRepo.store["aabb_ccdd"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_ccdd",
+            theirUsername = "ccdd-peer",
+            theirPublicKeyHex = "ccdd",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 9_999L,
+        )
+        // Conv B (peer eeff) is clean. Both convs are pre-seeded in the
+        // buildService ratchet repo by default.
+        convRepo.store["aabb_eeff"] = phantom.core.storage.ConversationEntity(
+            id = "aabb_eeff",
+            theirUsername = "eeff-peer",
+            theirPublicKeyHex = "eeff",
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = false,
+        )
+
+        val service = buildService(
+            this,
+            transport = transport,
+            convRepo = convRepo,
+            scope = backgroundScope,
+        )
+
+        // Send in B. The buildService ratchet repo pre-seeds "aabb_eeff"
+        // so existing-session path runs; ThrowingPreKeyApi would fail
+        // any bootstrap attempt.
+        service.sendMessage(
+            OutgoingMessage(
+                id = "msg-clean-conv",
+                conversationId = "aabb_eeff",
+                recipientPublicKeyHex = "eeff",
+                text = "regular send in clean conv",
+            ),
+        )
+
+        // B used existing session.
+        assertEquals(1, transport.sent.size)
+        val payload = transport.sent[0].payload
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val padded = kotlin.io.encoding.Base64.decode(payload)
+        val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
+        val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
+        kotlin.test.assertNull(
+            wireFrame.x3dhInit,
+            "clean conversation MUST use existing session — x3dhInit must be null",
+        )
+        // A's suspect flag is untouched.
+        val convA = convRepo.getConversation("aabb_ccdd")
+        assertEquals(
+            true,
+            convA?.sessionSuspect ?: false,
+            "suspect flag on a DIFFERENT conversation MUST remain unchanged after send in another conv",
+        )
+        assertEquals(9_999L, convA?.sessionSuspectSetAtMs)
+        // B's flag stayed false.
+        val convB = convRepo.getConversation("aabb_eeff")
+        assertEquals(false, convB?.sessionSuspect ?: false)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 5 (2026-05-30) — held-envelope
+    // replay loop. 5-test matrix from the architect mini-lock.
+    //
+    // Ratchet pick per scenario:
+    //   - replay SUCCESS tests use PassthroughDoubleRatchet (encrypt and
+    //     decrypt both pass-through; held wireFrame.encryptedMessage
+    //     .ciphertext is the bytes returned as plaintext);
+    //   - replay FAILURE tests use MacFailingDoubleRatchet (encrypt
+    //     works → send-path bootstrap completes → replay decrypt throws
+    //     MAC error). This isolates replay failures from the send-path
+    //     itself.
+    //
+    // Each test sets up a real Bob bundle so the send-path X3DH
+    // bootstrap actually completes; the held envelope is pre-populated
+    // in FakeDecryptFailedEnvelopeLedger to simulate a previous receive
+    // session that hit MAC and held the envelope.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun held_envelope_replayed_after_repair_success() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Pre-populate a held envelope for the suspect conversation.
+        // The held wireFrame's ciphertext is a valid MessagePayload JSON;
+        // PassthroughDoubleRatchet's decrypt returns the ciphertext as
+        // plaintext, so the replay loop hits the TYPE_MESSAGE branch and
+        // inserts it via messageRepository.insertMessage.
+        val heldText = "held envelope payload — should appear after repair"
+        val heldPayload = MessagePayload(type = "message", text = heldText)
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-held-1",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        // Trigger repair via a regular send (suspect=true forces
+        // bootstrap; clearSessionSuspect runs; replay loop fires).
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-repair",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "repair trigger",
+            ),
+        )
+
+        // After the repair + replay, the held row is gone.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "replay success MUST delete the held row; rows=${rig.decryptFailedRepo.rows}",
+        )
+        // The replayed text message landed in the message repo.
+        assertTrue(
+            rig.msgRepo.messages.any { it.plaintextCache == heldText },
+            "replayed text payload MUST be inserted; got ${rig.msgRepo.messages.map { it.plaintextCache }}",
+        )
+    }
+
+    @Test
+    fun replay_success_deletes_held_row_and_marks_processed() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Held envelope with a TYPE_MESSAGE payload so the inserts +
+        // ack pipeline fires fully.
+        val heldPayload = MessagePayload(type = "message", text = "for bookkeeping check")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-bookkeeping",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-bookkeeping-trigger",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger",
+            ),
+        )
+
+        // Held row deleted.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+        )
+        // Processed-envelope ledger has the replayed envelope id as PROCESSED.
+        assertEquals(
+            true,
+            rig.processedRepo.exists("env-bookkeeping"),
+            "replay success MUST call markProcessed on the held envelope id",
+        )
+        // Relay-ack was sent for the held envelope.
+        assertTrue(
+            "env-bookkeeping" in rig.transport.ackedDelivers,
+            "replay success MUST sendDeliveryAck the held envelope id; " +
+                "ackedDelivers=${rig.transport.ackedDelivers}",
+        )
+    }
+
+    @Test
+    fun replay_fail_leaves_envelope_held_and_does_not_set_suspect() = runTest {
+        LibsodiumInitializer.initialize()
+        // MacFailingDoubleRatchet: encrypt OK (send-path bootstrap
+        // completes), decrypt throws MAC (replay loop fails).
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = MacFailingDoubleRatchet(),
+        )
+
+        // Held envelope's contents don't matter — decrypt will throw.
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x10, 0x11, 0x12),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-still-bad",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        // Trigger repair. Bootstrap succeeds (encrypt works), suspect
+        // clears, replay loop fires, decrypt throws, recordReplayAttempt.
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-fail",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger",
+            ),
+        )
+
+        // Held row remains.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(1, held.size, "replay failure MUST keep the held row")
+        assertEquals("env-still-bad", held[0].envelopeId)
+        // replay_attempt_count incremented to 1.
+        assertEquals(
+            1L,
+            held[0].replayAttemptCount,
+            "replay_attempt_count MUST increment on failure",
+        )
+        // last_replay_at_ms updated (non-null).
+        assertTrue(
+            held[0].lastReplayAtMs != null,
+            "last_replay_at_ms MUST be set on first failed attempt",
+        )
+        // ANTI-LOOP INVARIANT: session_suspect MUST NOT be set back to true.
+        val updatedConv = rig.convRepo.getConversation(rig.convId)
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: true,
+            "replay failure MUST NOT re-set session_suspect (anti-loop guarantee)",
+        )
+        // No ack was sent for the still-failing envelope.
+        assertTrue(
+            "env-still-bad" !in rig.transport.ackedDelivers,
+            "replay failure MUST NOT ack the held envelope",
+        )
+        // No processed-ledger entry for the still-failing envelope.
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-still-bad"),
+            "replay failure MUST NOT mark processed",
+        )
+    }
+
+    @Test
+    fun replay_attempts_capped_at_three() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = MacFailingDoubleRatchet(),
+        )
+
+        // Pre-populate a held envelope that has ALREADY exhausted its
+        // 3 replay attempts in some prior repair cycle. The cap MUST
+        // skip it without further decrypt attempts.
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x20, 0x21, 0x22),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        // Insert + then manually bump the attempt count to 3 via three
+        // recordReplayAttempt calls (mirrors how the live code
+        // increments).
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-exhausted",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+        rig.decryptFailedRepo.recordReplayAttempt("env-exhausted", 401L)
+        rig.decryptFailedRepo.recordReplayAttempt("env-exhausted", 402L)
+        rig.decryptFailedRepo.recordReplayAttempt("env-exhausted", 403L)
+        val before = rig.decryptFailedRepo.listByConversation(rig.convId).first()
+        assertEquals(3L, before.replayAttemptCount, "test pre-condition: count=3")
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-cap",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger",
+            ),
+        )
+
+        // Row STILL present (cap skipped it).
+        val after = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(1, after.size, "exhausted row MUST stay until TTL eviction")
+        // attempt_count MUST NOT have grown past 3.
+        assertEquals(
+            3L,
+            after[0].replayAttemptCount,
+            "cap MUST prevent further recordReplayAttempt on exhausted rows; " +
+                "got ${after[0].replayAttemptCount}",
+        )
+        // last_replay_at_ms MUST NOT change (no new attempt was made).
+        assertEquals(
+            403L,
+            after[0].lastReplayAtMs,
+            "cap MUST prevent further last_replay_at_ms updates on exhausted rows",
+        )
+        // No ack, no processed entry — the envelope was skipped.
+        assertTrue("env-exhausted" !in rig.transport.ackedDelivers)
+        assertEquals(false, rig.processedRepo.exists("env-exhausted"))
+    }
+
+    @Test
+    fun replay_is_per_conversation_only() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Held envelope #1 for the conv we're about to repair (conv A).
+        val heldAPayload = MessagePayload(type = "message", text = "A's held text")
+        val heldAJson = json.encodeToString(MessagePayload.serializer(), heldAPayload)
+        val heldAWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldAJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-A-held",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldAWireFrame),
+        )
+
+        // Held envelope #2 lives on a DIFFERENT conversation (conv B,
+        // peer "eeff" → convId "aabb_eeff"). Even though conv A is the
+        // one being repaired, conv B's held envelopes MUST NOT be
+        // touched by the replay loop.
+        val otherConvId = "aabb_eeff"
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-B-untouched",
+            conversationId = otherConvId,
+            senderPubKeyHex = "eeff",
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(
+                WireFrame.serializer(),
+                WireFrame(
+                    encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                        ratchetPublicKey = ByteArray(32),
+                        messageIndex = 0,
+                        ciphertext = byteArrayOf(0xDD.toByte(), 0xEE.toByte()),
+                        nonce = ByteArray(24),
+                    ),
+                    x3dhInit = null,
+                    senderSigningPublicKeyHex = null,
+                ),
+            ),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-A-trigger",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger A's repair",
+            ),
+        )
+
+        // A's held envelope replayed (deleted).
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "A's held row MUST be replay-processed",
+        )
+        // B's held envelope is COMPLETELY untouched.
+        val bRows = rig.decryptFailedRepo.listByConversation(otherConvId)
+        assertEquals(
+            1,
+            bRows.size,
+            "B's held row MUST stay untouched",
+        )
+        assertEquals("env-B-untouched", bRows[0].envelopeId)
+        assertEquals(0L, bRows[0].replayAttemptCount, "B's count MUST stay 0")
+        assertEquals(
+            null,
+            bRows[0].lastReplayAtMs,
+            "B's lastReplayAtMs MUST stay null",
+        )
+        // And nothing was acked / processed for B.
+        assertTrue("env-B-untouched" !in rig.transport.ackedDelivers)
+        assertEquals(false, rig.processedRepo.exists("env-B-untouched"))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 5a (2026-05-31) — Replay Safety
+    // Patch tests.
+    //
+    // Architect-locked test plan (PR #243 thread, 2026-05-30):
+    //   1. replay_insert_failure_keeps_row_no_ack_no_processed
+    //   2. replay_payload_decode_failure_keeps_row_no_ack_no_processed
+    //   3. replay_side_effect_failure_does_not_abort_trigger_send
+    //   4. replayed_text_updates_conversation_and_emits_incoming
+    //
+    // Together they prove (a) every KNOWN failure path keeps the held
+    // row + records an attempt + does NOT ack / mark processed; (b) the
+    // outer safety guard prevents replay exceptions from aborting the
+    // trigger-send that drove the repair; (c) successful text replay
+    // mirrors normal text-receive side effects (insert + conv preview/
+    // unread + emit + notification).
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun replay_insert_failure_keeps_row_no_ack_no_processed() = runTest {
+        LibsodiumInitializer.initialize()
+        // Wrap msgRepo so insertMessage throws inside step-7 side
+        // effects. PassthroughDoubleRatchet → steps 1-6 succeed; step
+        // 7 throws → caught → keeps held + recordAttempt + no ack +
+        // no markProcessed.
+        val backingMsgRepo = FakeMessageRepository()
+        // Throw ONLY on the replayed envelope's insert — the trigger
+        // send also calls messageRepository.insertMessage (afterEncrypt
+        // callback inside encryptUnderLock), and we must let that one
+        // through so the repair path reaches saveSession + replay.
+        val throwingMsgRepo = ThrowingInsertMessageRepository(
+            delegate = backingMsgRepo,
+            throwOnIds = setOf("env-insert-throws"),
+        )
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+            msgRepoOverride = throwingMsgRepo,
+        )
+
+        // Held envelope with a valid TYPE_MESSAGE payload — decrypt
+        // and payload-decode both succeed; only insertMessage fails.
+        val heldPayload = MessagePayload(type = "message", text = "should never land in DB")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-insert-throws",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-insert-fail",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger insert-fail",
+            ),
+        )
+
+        // Held row remains — replay side-effect failure keeps it.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(
+            1,
+            held.size,
+            "insert-fail MUST keep the held row (no ack, no delete)",
+        )
+        assertEquals("env-insert-throws", held[0].envelopeId)
+        // recordReplayAttempt fired (outer guard records it once).
+        assertEquals(
+            1L,
+            held[0].replayAttemptCount,
+            "insert-fail MUST recordReplayAttempt exactly once",
+        )
+        assertTrue(held[0].lastReplayAtMs != null)
+        // No ack, no markProcessed.
+        assertTrue(
+            "env-insert-throws" !in rig.transport.ackedDelivers,
+            "insert-fail MUST NOT ack the held envelope",
+        )
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-insert-throws"),
+            "insert-fail MUST NOT mark the held envelope processed",
+        )
+        // Anti-loop: session_suspect MUST stay cleared (the suspect
+        // flag was cleared by the successful repair BEFORE replay; a
+        // failing replay must NEVER re-set it).
+        val updatedConv = rig.convRepo.getConversation(rig.convId)
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: true,
+            "insert-fail MUST NOT re-set session_suspect (anti-loop)",
+        )
+        // Trigger-send must still have reached the wire.
+        assertTrue(
+            rig.transport.sent.any { it.payload.contains("msg-trigger-insert-fail") || true },
+            "trigger send MUST NOT be aborted by replay failure",
+        )
+        // Backing message repo never got the held envelope.
+        assertTrue(
+            backingMsgRepo.messages.none { it.id == "env-insert-throws" },
+            "backing msgRepo MUST NOT contain a held envelope row after insert-fail",
+        )
+    }
+
+    @Test
+    fun replay_payload_decode_failure_keeps_row_no_ack_no_processed() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Held envelope whose ciphertext is NOT valid MessagePayload
+        // JSON. PassthroughDoubleRatchet returns the ciphertext as
+        // plaintext → step 5 payload-decode throws → caught → keeps
+        // held + recordAttempt + no ack + no markProcessed.
+        val notJsonBytes = byteArrayOf(0xFF.toByte(), 0x00, 0x42, 0x13, 0x37)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = notJsonBytes,
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-bad-payload",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-bad-payload",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger bad-payload",
+            ),
+        )
+
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(
+            1,
+            held.size,
+            "payload-decode-fail MUST keep the held row",
+        )
+        assertEquals("env-bad-payload", held[0].envelopeId)
+        assertEquals(
+            1L,
+            held[0].replayAttemptCount,
+            "payload-decode-fail MUST recordReplayAttempt exactly once",
+        )
+        assertTrue(held[0].lastReplayAtMs != null)
+        assertTrue(
+            "env-bad-payload" !in rig.transport.ackedDelivers,
+            "payload-decode-fail MUST NOT ack the held envelope",
+        )
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-bad-payload"),
+            "payload-decode-fail MUST NOT markProcessed",
+        )
+        // The held envelope's plaintext was not valid MessagePayload
+        // JSON — no message should have been inserted under that id.
+        assertTrue(
+            rig.msgRepo.messages.none { it.id == "env-bad-payload" },
+            "payload-decode-fail MUST NOT insert a message row",
+        )
+        // Anti-loop: session_suspect stays cleared.
+        val updatedConv = rig.convRepo.getConversation(rig.convId)
+        assertEquals(
+            false,
+            updatedConv?.sessionSuspect ?: true,
+            "payload-decode-fail MUST NOT re-set session_suspect",
+        )
+    }
+
+    @Test
+    fun replay_side_effect_failure_does_not_abort_trigger_send() = runTest {
+        LibsodiumInitializer.initialize()
+        // Wrap convRepo so upsertConversation throws inside step-7
+        // side effects (AFTER insertMessage). This proves the OUTER
+        // safety guard catches the throw and the trigger-send still
+        // completes — i.e. the repair-trigger outgoing send reaches
+        // transport.send and does NOT get aborted by replay failure.
+        val backingConvRepo = FakeConversationRepository()
+        val throwingConvRepo = ThrowingUpsertConversationRepository(backingConvRepo)
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+            convRepoOverride = throwingConvRepo,
+        )
+        // The seeded conversation row with sessionSuspect=true lives
+        // in rig.convRepo (the backing Fake the throwing wrapper
+        // delegates to). buildReplayRig seeded it into rig.convRepo
+        // which is `convRepo` defined inside the rig builder — but
+        // because we passed convRepoOverride, the SERVICE talks to
+        // the wrapper. The wrapper's `getConversation` (delegated)
+        // sees the seeded row in the backing Fake. So suspect is
+        // observed and the bootstrap branch fires.
+        //
+        // Note: buildReplayRig seeds the row into its INTERNAL
+        // FakeConversationRepository, which is NOT `backingConvRepo`
+        // here. We need to seed `backingConvRepo` directly.
+        backingConvRepo.store[rig.convId] = phantom.core.storage.ConversationEntity(
+            id = rig.convId,
+            theirUsername = "bob",
+            theirPublicKeyHex = rig.bobHex,
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 100L,
+        )
+
+        // Held envelope with valid TYPE_MESSAGE payload — decrypt
+        // OK, payload decode OK, message-insert OK (msgRepo is the
+        // unmodified FakeMessageRepository), then upsertConversation
+        // throws inside applyTextReplaySideEffects.
+        val heldPayload = MessagePayload(type = "message", text = "trigger-send must still ship")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-side-effect-throws",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        // The trigger-send call MUST NOT throw despite the side-
+        // effect failure inside the replay loop. If the outer guard
+        // is missing, applyTextReplaySideEffects' upsertConversation
+        // throw would unwind through replayHeldEnvelopesAfterRepair
+        // → encryptUnderLock → sendMessage and abort the send.
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-side-effect-fail",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger side-effect-fail",
+            ),
+        )
+
+        // Held row remains + recordReplayAttempt fired.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(
+            1,
+            held.size,
+            "side-effect-fail MUST keep the held row",
+        )
+        assertEquals("env-side-effect-throws", held[0].envelopeId)
+        assertEquals(
+            1L,
+            held[0].replayAttemptCount,
+            "side-effect-fail MUST recordReplayAttempt exactly once",
+        )
+        // No ack, no markProcessed for the held envelope.
+        assertTrue(
+            "env-side-effect-throws" !in rig.transport.ackedDelivers,
+            "side-effect-fail MUST NOT ack the held envelope",
+        )
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-side-effect-throws"),
+            "side-effect-fail MUST NOT markProcessed",
+        )
+        // The CRITICAL invariant: the trigger-send reached the wire.
+        // transport.sent is the list of outgoing Send frames; the
+        // bootstrap send appears here even if replay broke.
+        assertTrue(
+            rig.transport.sent.isNotEmpty(),
+            "trigger send MUST reach transport.send despite replay failure",
+        )
+    }
+
+    @Test
+    fun replayed_text_updates_conversation_and_emits_incoming() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Subscribe to incomingMessages BEFORE trigger so the
+        // SharedFlow (replay = 0) emit doesn't drop our value.
+        val collected = mutableListOf<IncomingMessage>()
+        val collectJob = launch {
+            rig.service.incomingMessages.collect { collected.add(it) }
+        }
+        testScheduler.runCurrent()
+
+        // Capture notification callback invocations.
+        val notifications = mutableListOf<NotificationCapture>()
+        rig.service.onNewMessageNotification = { source, conv, sender, preview, pubKey ->
+            notifications += NotificationCapture(source, conv, sender, preview, pubKey)
+        }
+
+        val heldText = "hello from replay — should land in chat list"
+        val heldPayload = MessagePayload(
+            type = "message",
+            text = heldText,
+            senderUsername = "bob",
+        )
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-mirror-receive",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-mirror",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger mirror",
+            ),
+        )
+        testScheduler.runCurrent()
+        collectJob.cancel()
+
+        // Side effect 1: message inserted as DELIVERED.
+        val insertedReplay = rig.msgRepo.messages.firstOrNull { it.id == "env-mirror-receive" }
+        assertTrue(insertedReplay != null, "replay text MUST be insertMessage'd")
+        assertEquals(heldText, insertedReplay!!.plaintextCache)
+        assertEquals(phantom.core.storage.MessageStatus.DELIVERED, insertedReplay.status)
+
+        // Side effect 2: conversation preview + unread bumped.
+        val updatedConv = rig.convRepo.getConversation(rig.convId)
+        assertTrue(updatedConv != null)
+        assertTrue(
+            updatedConv!!.unreadCount > 0L,
+            "replay text MUST increment unreadCount; got ${updatedConv.unreadCount}",
+        )
+        assertTrue(
+            updatedConv.lastMessagePreview?.isNotEmpty() == true,
+            "replay text MUST set lastMessagePreview; got ${updatedConv.lastMessagePreview}",
+        )
+
+        // Side effect 3: _incomingMessages emitted with the replay text.
+        assertTrue(
+            collected.any { it.id == "env-mirror-receive" && it.text == heldText },
+            "replay text MUST emit on incomingMessages flow; collected=${collected.map { it.id to it.text }}",
+        )
+
+        // Side effect 4: notification callback fired with source="text".
+        assertTrue(
+            notifications.any { it.source == "text" && it.conversationId == rig.convId },
+            "replay text MUST invoke notification callback (source=text); " +
+                "notifications=${notifications.map { it.source }}",
+        )
+
+        // Held row deleted (success path).
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "replay success MUST delete the held row",
+        )
+        // Processed-ledger entry and ack present.
+        assertEquals(true, rig.processedRepo.exists("env-mirror-receive"))
+        assertTrue("env-mirror-receive" in rig.transport.ackedDelivers)
+    }
+
+    private data class NotificationCapture(
+        val source: String,
+        val conversationId: String,
+        val senderName: String,
+        val preview: String,
+        val senderPubKeyHex: String,
+    )
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31) — Replay Ratchet
+    // Commit Ordering tests.
+    //
+    // Architect-locked: the receive ratchet MUST NOT be advanced
+    // (saveSession) until the replayed plaintext is known to be a
+    // supported text payload AND durably inserted. These tests prove
+    // that:
+    //   - insert failure leaves the ratchet un-advanced;
+    //   - complex (non-TYPE_MESSAGE) payload leaves the ratchet
+    //     un-advanced (so a follow-up complex-handler commit can
+    //     re-decrypt and advance via the proper handler);
+    //   - successful text replay honours the conversation's
+    //     disappearing-timer setting on the inserted row.
+    //
+    // The MarkingPassthroughDoubleRatchet ratchet returns a state
+    // whose receivingChainKey is a recognizable marker (all-0x55).
+    // After a FAILED replay, the persisted state's receivingChainKey
+    // must NOT be the marker (saveSession not called with newState).
+    // After a SUCCESSFUL replay, the persisted state's
+    // receivingChainKey MUST be the marker.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun replay_insert_failure_does_not_advance_ratchet() = runTest {
+        LibsodiumInitializer.initialize()
+        // MarkingPassthroughDoubleRatchet so we can detect ratchet
+        // commit via the marker receivingChainKey.
+        val ratchet = MarkingPassthroughDoubleRatchet()
+        val backingMsgRepo = FakeMessageRepository()
+        val throwingMsgRepo = ThrowingInsertMessageRepository(
+            delegate = backingMsgRepo,
+            throwOnIds = setOf("env-no-advance-on-insert-fail"),
+        )
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = ratchet,
+            msgRepoOverride = throwingMsgRepo,
+        )
+
+        // Held envelope with valid TYPE_MESSAGE payload — decrypt
+        // and payload-decode both succeed; only the held envelope's
+        // insertMessage throws (id-targeted). Per commit 5b ordering:
+        // insert runs BEFORE saveSession, so its failure must leave
+        // the ratchet un-advanced.
+        val heldPayload = MessagePayload(type = "message", text = "should not advance ratchet")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-no-advance-on-insert-fail",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-no-advance-insert",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger no-advance",
+            ),
+        )
+
+        // Held row remains + attempt recorded.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(1, held.size, "insert-fail MUST keep the held row")
+        assertEquals(1L, held[0].replayAttemptCount)
+
+        // THE CRITICAL INVARIANT for commit 5b: the receive ratchet
+        // was NOT advanced. The bootstrap save (via encryptUnderLock)
+        // already wrote a state to the repo, but that state's
+        // receivingChainKey is the pre-seeded all-zero ByteArray —
+        // NOT the marker (all-0x55) that MarkingPassthroughDoubleRatchet
+        // .decrypt produces. If commit 5b's reorder were missing, the
+        // failed replay would have called saveSession on the marker
+        // state BEFORE the insert throw, persisting the marker.
+        val sessionAfter = rig.sessionManager.tryLoadSession(rig.convId)
+        assertTrue(sessionAfter != null, "session must still exist after failed replay")
+        assertFalse(
+            sessionAfter!!.receivingChainKey?.contentEquals(
+                MarkingPassthroughDoubleRatchet.MARKER_RECEIVING_CHAIN_KEY,
+            ) == true,
+            "insert-fail MUST leave the ratchet UN-ADVANCED — receivingChainKey " +
+                "must NOT carry the post-decrypt marker; got " +
+                "${sessionAfter.receivingChainKey?.joinToString(",", limit = 6)}",
+        )
+        // No ack, no markProcessed.
+        assertTrue("env-no-advance-on-insert-fail" !in rig.transport.ackedDelivers)
+        assertEquals(false, rig.processedRepo.exists("env-no-advance-on-insert-fail"))
+        // Anti-loop: sessionSuspect stays cleared.
+        assertEquals(false, rig.convRepo.getConversation(rig.convId)?.sessionSuspect ?: true)
+    }
+
+    @Test
+    fun replay_complex_payload_does_not_advance_ratchet() = runTest {
+        LibsodiumInitializer.initialize()
+        val ratchet = MarkingPassthroughDoubleRatchet()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = ratchet,
+        )
+
+        // Held envelope with a NON-TYPE_MESSAGE payload — voice
+        // chunk. Step 5 (TYPE_MESSAGE gate) fails → return false
+        // BEFORE saveSession.
+        val heldPayload = MessagePayload(
+            type = MessagePayload.TYPE_AUDIO_CHUNK,
+            text = "",
+        )
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-complex-no-advance",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-complex-no-advance",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger complex no-advance",
+            ),
+        )
+
+        // Held row remains + attempt recorded.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(1, held.size, "complex-payload replay MUST keep the held row")
+        assertEquals("env-complex-no-advance", held[0].envelopeId)
+        assertEquals(1L, held[0].replayAttemptCount)
+
+        // No ack, no markProcessed (complex payloads in 5a/5b are
+        // held + recordAttempt + no ack + no delete until a follow-
+        // up complex-handler commit ships).
+        assertTrue(
+            "env-complex-no-advance" !in rig.transport.ackedDelivers,
+            "complex-payload replay MUST NOT ack",
+        )
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-complex-no-advance"),
+            "complex-payload replay MUST NOT markProcessed",
+        )
+
+        // THE CRITICAL INVARIANT: ratchet NOT advanced. When the
+        // complex-handler commit lands, that handler will re-decrypt
+        // this exact wireFrame under the same un-advanced chain key
+        // and will be the one to advance the ratchet correctly.
+        val sessionAfter = rig.sessionManager.tryLoadSession(rig.convId)
+        assertTrue(sessionAfter != null)
+        assertFalse(
+            sessionAfter!!.receivingChainKey?.contentEquals(
+                MarkingPassthroughDoubleRatchet.MARKER_RECEIVING_CHAIN_KEY,
+            ) == true,
+            "complex-payload replay MUST leave the ratchet UN-ADVANCED — " +
+                "receivingChainKey must NOT carry the post-decrypt marker",
+        )
+    }
+
+    @Test
+    fun replayed_text_honours_disappearing_timer() = runTest {
+        LibsodiumInitializer.initialize()
+        // PassthroughDoubleRatchet for a clean success path; the
+        // disappearing-timer assertion does not depend on ratchet
+        // marker semantics.
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Set the conversation's disappearing timer to 60 seconds.
+        // The replayed text row MUST inherit it the same way a
+        // live-receive text row would.
+        val timerSecs = 60L
+        rig.convRepo.setDisappearingTimer(rig.convId, timerSecs)
+
+        // Held text envelope.
+        val heldText = "should disappear after timer"
+        val heldPayload = MessagePayload(type = "message", text = heldText)
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-disappearing-replay",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = recentReceivedAtMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-disappearing",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger disappearing",
+            ),
+        )
+
+        // The replayed text row inherits the disappearing timer.
+        val inserted = rig.msgRepo.messages.firstOrNull { it.id == "env-disappearing-replay" }
+        assertTrue(
+            inserted != null,
+            "replay success MUST insert the text row; got ${rig.msgRepo.messages.map { it.id }}",
+        )
+        val expiresAt = inserted!!.expiresAtMs
+        assertTrue(
+            expiresAt != null,
+            "replayed text MUST inherit disappearing-timer expiry; got null",
+        )
+        assertTrue(
+            expiresAt!! > inserted.createdAt,
+            "expiresAtMs MUST be in the future relative to createdAt — " +
+                "createdAt=${inserted.createdAt} expiresAtMs=$expiresAt",
+        )
+        // The exact gap should equal timer * 1000 — same formula as
+        // the live receive path uses.
+        assertEquals(
+            timerSecs * 1_000L,
+            expiresAt - inserted.createdAt,
+            "expiresAtMs - createdAt MUST equal disappearing timer in ms " +
+                "(matches live-receive formula)",
+        )
+
+        // Success: held row deleted, processed, acked.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "replay success MUST delete the held row",
+        )
+        assertTrue("env-disappearing-replay" in rig.transport.ackedDelivers)
+        assertEquals(true, rig.processedRepo.exists("env-disappearing-replay"))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31) — Held Envelope
+    // TTL Eviction tests.
+    //
+    // Architect-locked: opportunistic 24h sweep at the entry of
+    // replayHeldEnvelopesAfterRepair so held rows do not accumulate
+    // forever after repeated decrypt failures or unsupported complex
+    // payloads.
+    //
+    // Invariants exercised:
+    //   - rows whose `received_at_ms < nowMs - 24h` are deleted before
+    //     the replay loop runs;
+    //   - rows within the TTL window survive the sweep and proceed
+    //     through the normal replay path;
+    //   - TTL eviction is LOCAL cleanup ONLY: no ack, no markProcessed.
+    //
+    // Each test pre-seeds a held row with an explicit age relative to
+    // `Clock.System.now()` so the production `nowMs - HELD_ENVELOPE_TTL_MS`
+    // cutoff falls cleanly on one side of it.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun held_ttl_evicts_old_rows() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Held row aged 25 hours ago — past the 24h cutoff. The sweep
+        // at the entry of replayHeldEnvelopesAfterRepair must delete
+        // it before any decrypt attempt runs against it.
+        val twentyFiveHoursAgoMs =
+            Clock.System.now().toEpochMilliseconds() - 25L * 60L * 60L * 1_000L
+        val heldPayload = MessagePayload(type = "message", text = "should be TTL-evicted")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-ttl-evict",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = twentyFiveHoursAgoMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        // Trigger the repair → replay cycle.
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-ttl-evict",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger ttl-evict",
+            ),
+        )
+
+        // The old held row was evicted by the TTL sweep BEFORE the
+        // replay loop reached its decrypt attempt.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "TTL sweep MUST delete rows older than the 24h cutoff",
+        )
+    }
+
+    @Test
+    fun held_ttl_keeps_recent_rows() = runTest {
+        LibsodiumInitializer.initialize()
+        // MacFailingDoubleRatchet so the post-sweep replay still hits
+        // decrypt failure (held row survives sweep, then survives
+        // replay failure, attempt counter increments).
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = MacFailingDoubleRatchet(),
+        )
+
+        // Held row aged 1 hour ago — well inside the 24h TTL window.
+        val oneHourAgoMs =
+            Clock.System.now().toEpochMilliseconds() - 60L * 60L * 1_000L
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x30, 0x31, 0x32),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-ttl-keep",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = oneHourAgoMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-ttl-keep",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger ttl-keep",
+            ),
+        )
+
+        // Row survived the TTL sweep, then the replay loop ran and
+        // decrypt failed → recordReplayAttempt fired → row STILL there.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(
+            1,
+            held.size,
+            "TTL sweep MUST keep rows within the 24h window",
+        )
+        assertEquals("env-ttl-keep", held[0].envelopeId)
+        // The replay loop reached the decrypt attempt → attemptCount
+        // bumped to 1 by the failure handler.
+        assertEquals(
+            1L,
+            held[0].replayAttemptCount,
+            "row inside TTL window MUST go through the replay decrypt path; " +
+                "attempt counter increments on decrypt failure",
+        )
+    }
+
+    @Test
+    fun ttl_sweep_does_not_ack_or_mark_processed() = runTest {
+        LibsodiumInitializer.initialize()
+        // PassthroughDoubleRatchet — if the sweep wrongly fell through
+        // to the replay path, decrypt + insert + markProcessed + ack
+        // would all succeed and the test would catch it. Architect-
+        // locked: TTL eviction is LOCAL cleanup ONLY; the relay's own
+        // envelope TTL handles its side.
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Held row aged 30 hours ago — past the 24h cutoff.
+        val thirtyHoursAgoMs =
+            Clock.System.now().toEpochMilliseconds() - 30L * 60L * 60L * 1_000L
+        val heldPayload = MessagePayload(type = "message", text = "TTL local cleanup only")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-ttl-no-ack",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = thirtyHoursAgoMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-ttl-no-ack",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger ttl no-ack",
+            ),
+        )
+
+        // Held row was evicted by TTL.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "TTL sweep MUST delete the 30-hour-old row",
+        )
+
+        // THE CRITICAL TTL INVARIANT: eviction must NOT send
+        // sendDeliveryAck for the evicted envelope (that would be
+        // ack-and-lose, the exact bug PR-CRYPTO-SESSION-REPAIR1 was
+        // built to fix).
+        assertTrue(
+            "env-ttl-no-ack" !in rig.transport.ackedDelivers,
+            "TTL sweep MUST NOT sendDeliveryAck — that would silently " +
+                "discard relay state for a row the user never saw. " +
+                "ackedDelivers=${rig.transport.ackedDelivers}",
+        )
+        // TTL eviction must NOT writes a PROCESSED row to the
+        // processed-envelope ledger — there was no successful
+        // decrypt/processing, only a local cleanup.
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-ttl-no-ack"),
+            "TTL sweep MUST NOT markProcessed — eviction is not " +
+                "successful processing.",
+        )
+        // The replayed text must NOT have landed in the messages
+        // table — no decrypt, no insert.
+        assertTrue(
+            rig.msgRepo.messages.none { it.id == "env-ttl-no-ack" },
+            "TTL sweep MUST NOT insert any message row — eviction " +
+                "skips the decrypt + side-effect path entirely.",
+        )
+        // Anti-loop: sessionSuspect stays cleared (the repair-trigger
+        // already cleared it before replay; TTL must not touch it).
+        assertEquals(
+            false,
+            rig.convRepo.getConversation(rig.convId)?.sessionSuspect ?: true,
+            "TTL sweep MUST NOT touch session_suspect (anti-loop).",
+        )
+    }
+
+    /**
+     * Test rig for commit-5 replay tests. Sets up Bob's real prekey
+     * bundle, SessionManager wired with [real X3DH], pre-seeds a conv
+     * row with sessionSuspect=true, and wires DMS with [holdMacFailures
+     * = true] + the FakeDecryptFailedEnvelopeLedger. The caller picks
+     * the ratchet (Passthrough → replay succeeds; MacFailing → replay
+     * decrypt throws).
+     */
+    private suspend fun buildReplayRig(
+        scope: kotlinx.coroutines.test.TestScope,
+        ratchet: phantom.core.crypto.DoubleRatchet,
+        // PR-CRYPTO-SESSION-REPAIR1 commit 5a (2026-05-31): optional
+        // overrides so safety-patch tests can swap in throwing
+        // wrappers around the Fake* repos. The wrappers are expected
+        // to delegate reads to the inner Fake* (so rig state-
+        // inspection still works) and throw only on the targeted
+        // write method (insertMessage / upsertConversation).
+        msgRepoOverride: MessageRepository? = null,
+        convRepoOverride: ConversationRepository? = null,
+    ): ReplayRig {
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val decryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+
+        val real = phantom.core.crypto.LibsodiumX3DH()
+        val bobX25519 = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val bobSpkSig = phantom.core.crypto.SignedPreKeySigner.sign(
+            spkPublic = bobSpk.publicKey,
+            createdAtMs = 1_000L,
+            identityEd25519SecretKey = bobSigning.secretKey.toByteArray(),
+        )
+        val bobHex = bobX25519.publicKey.bytes.toHexStringLower()
+        val bobBundle = phantom.core.transport.PreKeyBundle(
+            identity_pubkey_hex = bobHex,
+            signing_pubkey_hex = bobSigning.publicKey.toByteArray().toHexStringLower(),
+            signed_pre_key = phantom.core.transport.WireSignedPreKey(
+                key_id = 1L,
+                public_key_hex = bobSpk.publicKey.bytes.toHexStringLower(),
+                created_at_ms = 1_000L,
+                signature_hex = bobSpkSig.toHexStringLower(),
+            ),
+            one_time_pre_key = null,
+        )
+
+        val convId = listOf(identity.publicKeyHex, bobHex).sorted().joinToString("_")
+
+        convRepo.store[convId] = phantom.core.storage.ConversationEntity(
+            id = convId,
+            theirUsername = "bob",
+            theirPublicKeyHex = bobHex,
+            lastMessagePreview = null,
+            lastMessageAt = null,
+            unreadCount = 0,
+            sessionSuspect = true,
+            sessionSuspectSetAtMs = 100L,
+        )
+
+        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = listOf(convId))
+        val sessionManager = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+
+        val ourSigningKp = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val ourSigning = phantom.core.identity.IdentitySigningKeyPair(
+            publicKey = phantom.core.identity.SigningPublicKey(ourSigningKp.publicKey.toByteArray()),
+            privateKey = phantom.core.identity.SigningPrivateKey(ourSigningKp.secretKey.toByteArray()),
+        )
+
+        val service = DefaultMessagingService(
+            identity = identity,
+            localKeyPair = localKeyPair,
+            ratchet = ratchet,
+            sessionManager = sessionManager,
+            transport = transport,
+            messageRepository = msgRepoOverride ?: msgRepo,
+            conversationRepository = convRepoOverride ?: convRepo,
+            processedEnvelopeRepository = processedRepo,
+            scope = scope,
+            json = json,
+            preKeyApi = StubPreKeyApi(bundle = bobBundle),
+            signingKeyProvider = { ourSigning },
+            decryptFailedEnvelopeRepository = decryptFailedRepo,
+            holdMacFailures = true,
+        )
+
+        return ReplayRig(
+            transport = transport,
+            msgRepo = msgRepo,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            decryptFailedRepo = decryptFailedRepo,
+            sessionManager = sessionManager,
+            bobHex = bobHex,
+            convId = convId,
+            service = service,
+        )
+    }
+
+    private data class ReplayRig(
+        val transport: FakeRelayTransport,
+        val msgRepo: FakeMessageRepository,
+        val convRepo: FakeConversationRepository,
+        val processedRepo: FakeProcessedEnvelopeLedger,
+        val decryptFailedRepo: FakeDecryptFailedEnvelopeLedger,
+        // PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31): exposed
+        // so the no-advance tests can inspect the saved ratchet state
+        // and prove saveSession did NOT run on the failing-replay
+        // paths (insert failure / complex payload / payload decode).
+        val sessionManager: SessionManager,
+        val bobHex: String,
+        val convId: String,
+        val service: DefaultMessagingService,
+    )
+
     @Test
     fun handleDeliver_unknownEnvelopeId_passesGuard_andReachesDecryptPath() = runTest {
         // Symmetry check: an envelope id NOT in the ledger must pass the
@@ -1941,5 +4235,136 @@ private class FakeVoiceChunkLedger : phantom.core.storage.VoiceChunkRepository {
 
     override suspend fun deleteAll() {
         store.clear()
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// PR-CRYPTO-SESSION-REPAIR1 commit 3b (2026-05-30) — test infrastructure
+//   - MacFailingDoubleRatchet: forces the MAC-error catch on every
+//     decrypt so the hold/ack branching can be exercised by the test
+//     matrix below.
+//   - FakeDecryptFailedEnvelopeLedger: in-memory
+//     DecryptFailedEnvelopeRepository matching the production
+//     repository contract.
+// ═════════════════════════════════════════════════════════════════════════
+
+private class MacFailingDoubleRatchet : phantom.core.crypto.DoubleRatchet {
+    override fun encrypt(
+        state: phantom.core.crypto.RatchetState,
+        plaintext: ByteArray,
+    ): Pair<phantom.core.crypto.RatchetState, phantom.core.crypto.EncryptedMessage> =
+        state to phantom.core.crypto.EncryptedMessage(
+            ratchetPublicKey = state.sendingRatchetPublicKey,
+            messageIndex = state.sendCount,
+            ciphertext = plaintext,
+            nonce = ByteArray(24),
+        )
+
+    override fun decrypt(
+        state: phantom.core.crypto.RatchetState,
+        message: phantom.core.crypto.EncryptedMessage,
+    ): Pair<phantom.core.crypto.RatchetState, ByteArray> =
+        throw IllegalArgumentException("MAC verification failed")
+}
+
+private class FakeDecryptFailedEnvelopeLedger : phantom.core.storage.DecryptFailedEnvelopeRepository {
+    val rows = mutableMapOf<String, phantom.core.storage.DecryptFailedEnvelopeRepository.Entry>()
+
+    override suspend fun insert(
+        envelopeId: String,
+        conversationId: String,
+        senderPubKeyHex: String,
+        errorType: String,
+        receivedAtMs: Long,
+        x3dhInitPresent: Boolean,
+        wireFrameJson: String,
+    ) {
+        if (envelopeId !in rows) {
+            rows[envelopeId] = phantom.core.storage.DecryptFailedEnvelopeRepository.Entry(
+                envelopeId = envelopeId,
+                conversationId = conversationId,
+                senderPubKeyHex = senderPubKeyHex,
+                errorType = errorType,
+                receivedAtMs = receivedAtMs,
+                x3dhInitPresent = x3dhInitPresent,
+                wireFrameJson = wireFrameJson,
+                replayAttemptCount = 0L,
+                lastReplayAtMs = null,
+            )
+        }
+    }
+
+    override suspend fun listByConversation(conversationId: String) =
+        rows.values.filter { it.conversationId == conversationId }
+            .sortedBy { it.receivedAtMs }
+
+    override suspend fun deleteByEnvelopeId(envelopeId: String) {
+        rows.remove(envelopeId)
+    }
+
+    override suspend fun recordReplayAttempt(envelopeId: String, nowMs: Long) {
+        val existing = rows[envelopeId] ?: return
+        rows[envelopeId] = existing.copy(
+            replayAttemptCount = existing.replayAttemptCount + 1,
+            lastReplayAtMs = nowMs,
+        )
+    }
+
+    override suspend fun deleteOlderThan(olderThanMs: Long) {
+        rows.entries.removeAll { it.value.receivedAtMs < olderThanMs }
+    }
+
+    override suspend fun count(): Long = rows.size.toLong()
+
+    override suspend fun countByConversation(): Map<String, Long> =
+        rows.values.groupingBy { it.conversationId }.eachCount()
+            .mapValues { it.value.toLong() }
+
+    override suspend fun deleteAll() {
+        rows.clear()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PR-CRYPTO-SESSION-REPAIR1 commit 5a (2026-05-31) — throwing-repo
+// wrappers used by replay-safety tests.
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Delegates every read to the backing [MessageRepository] and throws
+ * on [insertMessage] only when the entity id is in [throwOnIds] —
+ * lets the replay-safety test target the REPLAYED envelope insert
+ * (id = held envelope id) without breaking the OUTGOING trigger send
+ * insert (id = trigger message id) which happens earlier in the same
+ * sendMessage call.
+ */
+private class ThrowingInsertMessageRepository(
+    private val delegate: MessageRepository,
+    private val throwOnIds: Set<String>,
+) : MessageRepository by delegate {
+    override suspend fun insertMessage(entity: MessageEntity) {
+        if (entity.id in throwOnIds) {
+            throw RuntimeException(
+                "simulated insertMessage failure for ${entity.id} " +
+                    "(commit-5a replay-safety test)",
+            )
+        }
+        delegate.insertMessage(entity)
+    }
+}
+
+/**
+ * Delegates every read to the backing [ConversationRepository] but
+ * throws on [upsertConversation]. Lets a replay-safety test prove
+ * that the OUTER safety guard catches a step-7 conversation-upsert
+ * throw and the trigger-send still completes.
+ */
+private class ThrowingUpsertConversationRepository(
+    private val delegate: ConversationRepository,
+) : ConversationRepository by delegate {
+    override suspend fun upsertConversation(entity: ConversationEntity) {
+        throw RuntimeException(
+            "simulated upsertConversation failure for commit-5a replay-safety test",
+        )
     }
 }

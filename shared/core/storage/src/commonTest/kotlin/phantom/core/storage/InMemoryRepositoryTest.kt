@@ -117,6 +117,30 @@ private class FakeConversationRepository : ConversationRepository {
             store[id]?.let { store[id] = it.copy(needsRehandshake = true) }
         }
     }
+
+    // PR-CRYPTO-SESSION-REPAIR1 (2026-05-29) — test-fake suspect-flag mutators.
+    // Mirror the SqlDelight impl's per-conversation suspect/clear semantics.
+
+    override suspend fun setSessionSuspect(conversationId: String, setAtMs: Long) {
+        store[conversationId]?.let {
+            store[conversationId] = it.copy(
+                sessionSuspect = true,
+                sessionSuspectSetAtMs = setAtMs,
+            )
+        }
+    }
+
+    override suspend fun clearSessionSuspect(conversationId: String) {
+        store[conversationId]?.let {
+            store[conversationId] = it.copy(
+                sessionSuspect = false,
+                sessionSuspectSetAtMs = null,
+            )
+        }
+    }
+
+    override suspend fun getSessionSuspectConversations(): List<ConversationEntity> =
+        store.values.filter { it.sessionSuspect }.toList()
 }
 
 private class FakeMessageRepository : MessageRepository {
