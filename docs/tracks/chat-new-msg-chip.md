@@ -261,3 +261,117 @@ All under PhantomUI tag (consistent with `CHAT_CACHE` from CACHE1).
   `DECRYPT_TRACE attempt sessionExists=true x3dhInitPresent=true` →
   `DECRYPT_TRACE inbound_repair_ok bootstrap=true`, then
   `CHAT_CHIP incoming conv=<8> count=1` while scrolled up.
+
+## Test #83 Forensic Appendix
+
+Field record from the two Test #83 runs on 2026-05-29 (Tecno via Windows
+adb + emulator-5554). Captured here as forensic evidence so that the
+next CHIP1 rerun has line-level anchors to compare against. Raw logs:
+`C:\temp\test83-tecno.log` + `C:\temp\test83-emu.log` (v1),
+`C:\temp\test83-v2-tecno.log` + `C:\temp\test83-v2-emu.log` (v2).
+
+### 1. CHIP partial verification in v1
+
+Before the v1 transport collapse, the CHIP behaviour was already
+log-verified for four of the ten acceptance scenarios. Line refs are
+from `test83-tecno.log`:
+
+- `CHAT_CHIP visible    reason=scroll_up` — line `:521`
+- `CHAT_CHIP incoming   count=1`          — line `:545`
+- `CHAT_CHIP incoming   count=2`          — line `:592`
+- `CHAT_CHIP tap        target=first_unread` + `CHAT_CHIP hidden reason=tap` — line `:611`
+- `CHAT_CHIP tap        target=latest`    — line `:638`
+
+This is the existing partial PASS evidence the next rerun should
+preserve / extend, not re-discover.
+
+### 2. Transport blocker in v1 (`ws_alive_60s` race)
+
+The v1 collapse was a transport-layer event mid-scenario 4, not a CHIP
+failure:
+
+- `test83-tecno.log:620` — `OkHttp WS Ping → "sent ping but didn't
+  receive pong within 15000ms"` (WS effectively dead).
+- `test83-tecno.log:632` — `RestStateMachine mode_switched
+  from=WsCandidate to=WS_ACTIVE reason=ws_alive_60s` + `poll_stopped
+  reason=ws_active` issued **after** the WS had already failed. REST
+  poll was stopped against a dead WS.
+- After this, REST send / poll / auth all timed out (60 s each) and
+  messages stopped arriving.
+
+Tracked separately as `PR-WS-HEALTH-STATE1`; not in CHIP1 scope.
+
+### 3. Wi-Fi / TLS observation in v2 (alt network only)
+
+After Phase 3c force-stop + restart the Direct + Reality probes to
+`relay.phntm.pro:443` stalled at TLS `secureConnectStart` for 10 s
+(Direct, × 2 attempts) and 20 s (Reality), then failed with
+`SocketException Socket closed`. Lower layers were fine: TCP `connect`
+~ 100 ms, DNS 1 ms. The chain correctly fell through to Tor and
+bootstrapped.
+
+This is **network-level on a temporarily-different Wi-Fi** Vladislav
+was on during 2026-05-29 (Mac-side period), not a code bug. Does not
+reproduce on the usual Hetzner-tested Wi-Fi per the Test #88 baseline
+(`C:\temp\test88-*.log` on Vladislav's main Windows PC). If the same
+TLS stall recurs on a future run, a transport-Wi-Fi diagnostic track
+should compare the signature against Test #88 directly. Out of CHIP1
+scope.
+
+### 4. Crypto blocker in v2 (inbound `x3dhInit` ignored — now closed)
+
+In v2, transport was healthy on the Tecno side (`Online via Direct ·
+Standard`). Emulator-side manual sends `4eb6d2d7`, `1ae7218e`,
+`d4ed789b` reached the Tecno as envelopes, but every envelope received
+`DECRYPT_TRACE fail_mac action=hold`. Because nothing was decrypted on
+the receive side, `CHAT_CHIP incoming count=…` never fired even though
+the user was correctly scrolled up.
+
+Root cause is captured in PR #248 mini-lock and resolved in PR #249
+(`1408cd75`). The next rerun should see `DECRYPT_TRACE inbound_repair_ok
+bootstrap=true` instead of `fail_mac action=hold` for the first
+emulator-side fresh-X3DH envelope.
+
+### 5. Read-receipts clarification
+
+During v2, two Tecno **outbound** envelopes appeared right at
+`ChatScreen` open: `cd246cbe` and `dbdd8a05`. Neither had a
+`SEND_TRACE send_start` log line because they were not user messages —
+they were sealed read receipts emitted by `markConversationRead(...)`
+under Standard privacy mode (which sends read receipts as
+sealed-sender envelopes through the normal send pipeline).
+
+The emulator received both and **also** logged `DECRYPT_TRACE fail_mac
+action=hold`. This cross-direction MAC failure (Tecno → emulator and
+emulator → Tecno both failing) is the evidence that **both sides had
+diverged session state**, not a one-sided drift. This rules out a
+local-only Tecno ratchet corruption hypothesis and justified the
+"both-sides need to handle inbound `x3dhInit` repair hints" framing
+that became PR #249.
+
+### 6. Parking rationale — Rule 4 did not fire
+
+Both v1 and v2 BLOCKED states were **upstream of the CHIP layer**:
+
+- v1 blocked by transport (`ws_alive_60s` race).
+- v2 blocked by inbound crypto (`x3dhInit` ignored).
+
+CHIP1 itself never failed an acceptance scenario — every CHIP-side log
+line the design called for fired correctly during v1 before transport
+fell over. Therefore:
+
+- WORKING_RULES rule 4 (TWO architectural attempts → park) did **not**
+  fire — CHIP1 has ONE design with TWO non-CHIP runtime blockers.
+- CHIP1 was parked, not failed. Design held; the way forward was to
+  clear the blockers in the layers below.
+
+### Minor implementation deviation (recorded for the rebase)
+
+`ScrollToBottomState.kt` (commit `a1092023`) dropped the `onUserSend`
+factory parameter referenced in the mini-lock `§ State management`
+line 141. The param was semantically dead — `ChatScreen` invokes
+`state.onOwnSend(...)` directly at the send sites
+(`8db77f24`), so the factory wiring was never used. Deviation approved
+by Vladislav 2026-05-29 in the same review window that authorised
+parking. No behaviour impact; flag here only so a future reviewer
+does not chase the missing parameter against the mini-lock text.
