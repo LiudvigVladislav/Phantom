@@ -473,6 +473,16 @@ class DefaultMessagingServiceTest {
         DhPrivateKey(ByteArray(32) { 0xBB.toByte() }),
     )
 
+    // PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31): all replay /
+    // safety / TTL tests must use a `received_at_ms` close to
+    // `Clock.System.now()` so the 24h TTL sweep at the entry of
+    // `replayHeldEnvelopesAfterRepair` does NOT evict the seeded
+    // rows mid-test. The legacy small-integer values (100L, 200L, …)
+    // are pre-1970-anchored relative to wall-clock and would be
+    // deleted by the sweep before the replay loop runs.
+    private val recentReceivedAtMs: Long
+        get() = Clock.System.now().toEpochMilliseconds() - 1_000L
+
     private suspend fun buildService(
         testScope: TestScope,
         msgRepo: FakeMessageRepository = FakeMessageRepository(),
@@ -2308,7 +2318,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 100L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -2364,7 +2374,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 200L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -2423,7 +2433,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 300L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -2503,7 +2513,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 400L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -2569,7 +2579,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 500L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldAWireFrame),
         )
@@ -2584,7 +2594,7 @@ class DefaultMessagingServiceTest {
             conversationId = otherConvId,
             senderPubKeyHex = "eeff",
             errorType = "mac",
-            receivedAtMs = 600L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(
                 WireFrame.serializer(),
@@ -2694,7 +2704,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 700L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -2782,7 +2792,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 800L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -2892,7 +2902,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 900L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -2987,7 +2997,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 1000L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -3115,7 +3125,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 1_200L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -3191,7 +3201,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 1_300L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -3275,7 +3285,7 @@ class DefaultMessagingServiceTest {
             conversationId = rig.convId,
             senderPubKeyHex = rig.bobHex,
             errorType = "mac",
-            receivedAtMs = 1_400L,
+            receivedAtMs = recentReceivedAtMs,
             x3dhInitPresent = false,
             wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
         )
@@ -3322,6 +3332,232 @@ class DefaultMessagingServiceTest {
         )
         assertTrue("env-disappearing-replay" in rig.transport.ackedDelivers)
         assertEquals(true, rig.processedRepo.exists("env-disappearing-replay"))
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31) — Held Envelope
+    // TTL Eviction tests.
+    //
+    // Architect-locked: opportunistic 24h sweep at the entry of
+    // replayHeldEnvelopesAfterRepair so held rows do not accumulate
+    // forever after repeated decrypt failures or unsupported complex
+    // payloads.
+    //
+    // Invariants exercised:
+    //   - rows whose `received_at_ms < nowMs - 24h` are deleted before
+    //     the replay loop runs;
+    //   - rows within the TTL window survive the sweep and proceed
+    //     through the normal replay path;
+    //   - TTL eviction is LOCAL cleanup ONLY: no ack, no markProcessed.
+    //
+    // Each test pre-seeds a held row with an explicit age relative to
+    // `Clock.System.now()` so the production `nowMs - HELD_ENVELOPE_TTL_MS`
+    // cutoff falls cleanly on one side of it.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun held_ttl_evicts_old_rows() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Held row aged 25 hours ago — past the 24h cutoff. The sweep
+        // at the entry of replayHeldEnvelopesAfterRepair must delete
+        // it before any decrypt attempt runs against it.
+        val twentyFiveHoursAgoMs =
+            Clock.System.now().toEpochMilliseconds() - 25L * 60L * 60L * 1_000L
+        val heldPayload = MessagePayload(type = "message", text = "should be TTL-evicted")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-ttl-evict",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = twentyFiveHoursAgoMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        // Trigger the repair → replay cycle.
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-ttl-evict",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger ttl-evict",
+            ),
+        )
+
+        // The old held row was evicted by the TTL sweep BEFORE the
+        // replay loop reached its decrypt attempt.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "TTL sweep MUST delete rows older than the 24h cutoff",
+        )
+    }
+
+    @Test
+    fun held_ttl_keeps_recent_rows() = runTest {
+        LibsodiumInitializer.initialize()
+        // MacFailingDoubleRatchet so the post-sweep replay still hits
+        // decrypt failure (held row survives sweep, then survives
+        // replay failure, attempt counter increments).
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = MacFailingDoubleRatchet(),
+        )
+
+        // Held row aged 1 hour ago — well inside the 24h TTL window.
+        val oneHourAgoMs =
+            Clock.System.now().toEpochMilliseconds() - 60L * 60L * 1_000L
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x30, 0x31, 0x32),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-ttl-keep",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = oneHourAgoMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-ttl-keep",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger ttl-keep",
+            ),
+        )
+
+        // Row survived the TTL sweep, then the replay loop ran and
+        // decrypt failed → recordReplayAttempt fired → row STILL there.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(
+            1,
+            held.size,
+            "TTL sweep MUST keep rows within the 24h window",
+        )
+        assertEquals("env-ttl-keep", held[0].envelopeId)
+        // The replay loop reached the decrypt attempt → attemptCount
+        // bumped to 1 by the failure handler.
+        assertEquals(
+            1L,
+            held[0].replayAttemptCount,
+            "row inside TTL window MUST go through the replay decrypt path; " +
+                "attempt counter increments on decrypt failure",
+        )
+    }
+
+    @Test
+    fun ttl_sweep_does_not_ack_or_mark_processed() = runTest {
+        LibsodiumInitializer.initialize()
+        // PassthroughDoubleRatchet — if the sweep wrongly fell through
+        // to the replay path, decrypt + insert + markProcessed + ack
+        // would all succeed and the test would catch it. Architect-
+        // locked: TTL eviction is LOCAL cleanup ONLY; the relay's own
+        // envelope TTL handles its side.
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Held row aged 30 hours ago — past the 24h cutoff.
+        val thirtyHoursAgoMs =
+            Clock.System.now().toEpochMilliseconds() - 30L * 60L * 60L * 1_000L
+        val heldPayload = MessagePayload(type = "message", text = "TTL local cleanup only")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-ttl-no-ack",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = thirtyHoursAgoMs,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-ttl-no-ack",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger ttl no-ack",
+            ),
+        )
+
+        // Held row was evicted by TTL.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "TTL sweep MUST delete the 30-hour-old row",
+        )
+
+        // THE CRITICAL TTL INVARIANT: eviction must NOT send
+        // sendDeliveryAck for the evicted envelope (that would be
+        // ack-and-lose, the exact bug PR-CRYPTO-SESSION-REPAIR1 was
+        // built to fix).
+        assertTrue(
+            "env-ttl-no-ack" !in rig.transport.ackedDelivers,
+            "TTL sweep MUST NOT sendDeliveryAck — that would silently " +
+                "discard relay state for a row the user never saw. " +
+                "ackedDelivers=${rig.transport.ackedDelivers}",
+        )
+        // TTL eviction must NOT writes a PROCESSED row to the
+        // processed-envelope ledger — there was no successful
+        // decrypt/processing, only a local cleanup.
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-ttl-no-ack"),
+            "TTL sweep MUST NOT markProcessed — eviction is not " +
+                "successful processing.",
+        )
+        // The replayed text must NOT have landed in the messages
+        // table — no decrypt, no insert.
+        assertTrue(
+            rig.msgRepo.messages.none { it.id == "env-ttl-no-ack" },
+            "TTL sweep MUST NOT insert any message row — eviction " +
+                "skips the decrypt + side-effect path entirely.",
+        )
+        // Anti-loop: sessionSuspect stays cleared (the repair-trigger
+        // already cleared it before replay; TTL must not touch it).
+        assertEquals(
+            false,
+            rig.convRepo.getConversation(rig.convId)?.sessionSuspect ?: true,
+            "TTL sweep MUST NOT touch session_suspect (anti-loop).",
+        )
     }
 
     /**

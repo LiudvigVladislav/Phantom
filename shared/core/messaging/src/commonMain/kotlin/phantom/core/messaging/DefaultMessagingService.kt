@@ -277,6 +277,21 @@ class DefaultMessagingService(
          */
         const val MAX_REPLAY_ATTEMPTS_PER_HELD = 3L
 
+        /**
+         * PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31) — local 24h
+         * TTL on held decrypt-failed envelopes. Held rows whose
+         * `received_at_ms` is older than `nowMs - HELD_ENVELOPE_TTL_MS`
+         * are deleted from the local hold table opportunistically at
+         * the entry of each replay cycle. This is LOCAL cleanup only:
+         * the relay's own envelope TTL is separate and remains
+         * authoritative on the server side. TTL eviction does NOT
+         * send a delivery ack — the relay's copy is dealt with by
+         * the relay's own TTL.
+         *
+         * Architect-locked at 24h (PR #243 thread, commit 6 mini-lock).
+         */
+        const val HELD_ENVELOPE_TTL_MS = 24L * 60L * 60L * 1_000L
+
         const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
         // PR-D2b.1 (2026-05-17): shrunk from 8 KB → 3 KB so envelopes pass
         // the REST short-poll body cap. Background: D1c+D1d turned REST
@@ -658,6 +673,39 @@ class DefaultMessagingService(
         convTag: String,
     ) {
         val repo = decryptFailedEnvelopeRepository ?: return
+
+        // PR-CRYPTO-SESSION-REPAIR1 commit 6 (2026-05-31): opportunistic
+        // 24h TTL sweep BEFORE listByConversation so expired held rows
+        // are dropped before any replay/decrypt happens against them.
+        // LOCAL cleanup only — no ack, no markProcessed; the relay's
+        // own envelope TTL is the authoritative server-side cleanup.
+        // The sweep is global (deletes across all conversations) which
+        // is acceptable because the call is already serialized by
+        // encryptUnderLock's per-conversation mutex; a stale row on
+        // another conv that gets evicted here is identical to what
+        // that conv's own next replay cycle would have done.
+        val ttlCutoffMs = Clock.System.now().toEpochMilliseconds() - HELD_ENVELOPE_TTL_MS
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE held_ttl_sweep_start conv=$convTag cutoffMs=$ttlCutoffMs",
+        )
+        try {
+            repo.deleteOlderThan(ttlCutoffMs)
+        } catch (e: Throwable) {
+            // TTL sweep is best-effort. A failure here does NOT abort
+            // the rest of the replay loop — surviving rows still get
+            // their decrypt attempts.
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE held_ttl_sweep_fail conv=$convTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE held_ttl_sweep_done conv=$convTag",
+        )
+
         val held = repo.listByConversation(conversationId)
         if (held.isEmpty()) {
             messagingLog(
