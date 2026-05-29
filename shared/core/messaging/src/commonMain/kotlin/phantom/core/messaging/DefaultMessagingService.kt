@@ -2409,12 +2409,16 @@ class DefaultMessagingService(
                             //       commit 3a contract preserved.
                             //   (2) Old ratchet session row is NEVER touched on failure.
                             //       sessionManager.saveSession() runs ONLY after the
-                            //       candidate-decrypt succeeds. On any failure path
-                            //       (candidate bootstrap throws SessionBootstrapException
-                            //       OR candidate decrypt throws MAC again OR any other
+                            //       candidate-decrypt succeeds. On any non-cancellation
+                            //       failure (candidate bootstrap throws
+                            //       SessionBootstrapException OR candidate decrypt
+                            //       throws MAC again OR any other non-cancellation
                             //       Throwable), control falls through to the existing
                             //       hold branch with the on-disk session row byte-
                             //       identical to its pre-receive content.
+                            //       CancellationException is re-thrown (commit 2a),
+                            //       not converted to a failure — see comments at the
+                            //       try/catch site below.
                             //   (3) Does NOT call setSessionSuspect. The new branch
                             //       itself never re-suspects; if it fails, the existing
                             //       hold branch below may set suspect exactly as it
@@ -2553,8 +2557,12 @@ class DefaultMessagingService(
                                     // INTENTIONAL fall-through to the existing
                                     // hold branch below. The candidate state
                                     // is discarded (local val inside the
-                                    // runCatching lambda — nothing was
-                                    // persisted). The on-disk session row
+                                    // try block — nothing was persisted; the
+                                    // explicit try/catch shape from commit
+                                    // 2a re-throws CancellationException and
+                                    // converts only non-cancellation
+                                    // Throwables to Result.failure). The
+                                    // on-disk session row
                                     // remains byte-identical to its pre-
                                     // receive content (mini-lock §Scope item
                                     // 5 invariant). No setSessionSuspect from
