@@ -8,6 +8,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.onEach
 import org.json.JSONException
 import org.json.JSONObject
@@ -157,6 +158,28 @@ fun ChatScreen(
             firstVisibleItemScrollOffset = 0,
         )
     }
+
+    // PR-UI-CHAT-NEW-MSG-CHIP1 (2026-05-29) — floating scroll-to-bottom
+    // chip with new-msg badge. Pure UI overlay on top of CACHE1's hot
+    // StateFlow snapshot path — NO change to message sourcing, NO
+    // change to the existing incomingMessages collector below (line
+    // ~516). The holder internally filters
+    // container.messagingService?.incomingMessages by conversationId
+    // and counts incoming envelopes only while the user is scrolled
+    // away from the visual bottom. The button is rendered at the end
+    // of the back-swipe Box (around the close at ~line 1390) and
+    // anchored to BottomEnd, 14 dp above the 56 dp composer slot.
+    // See `docs/tracks/chat-new-msg-chip.md` for the locked design
+    // tokens + count semantics.
+    val chipState = rememberScrollToBottomState(
+        listState = listState,
+        incomingFlow = container.messagingService?.incomingMessages ?: emptyFlow(),
+        conversationId = conversationId,
+        profileMsgPrefix = PROFILE_MSG_PREFIX,
+        scope = scope,
+    )
+    val convTagForChip = remember(conversationId) { conversationId.take(8) }
+
     var showEmojiPanel by remember { mutableStateOf(false) }
 
     // PR-UI-REC1 (2026-05-20) — Voice recording state machine.
@@ -1030,6 +1053,13 @@ fun ChatScreen(
                         // / busy guards live inside finalizeAndSendVoice.
                         Log.i("PhantomMedia", "VOICE_REC send_voice_tap state=${recordingState?.name ?: "idle"}")
                         finalizeAndSendVoice()
+                        // PR-UI-CHAT-NEW-MSG-CHIP1 (2026-05-29) — user's
+                        // own voice-send is an explicit "bring me to
+                        // the latest" signal (mini-lock § "Count
+                        // semantics" line 126). Clears the chip count +
+                        // animates scroll to visual bottom (source
+                        // index 0 in reverseLayout = true).
+                        chipState.onOwnSend(scope, listState, convTagForChip)
                     },
                     onSend = {
                         val text = inputText.trim()
@@ -1071,6 +1101,16 @@ fun ChatScreen(
                                 )
                                 reloadMessages()
                                 if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                // PR-UI-CHAT-NEW-MSG-CHIP1 (2026-05-29)
+                                // — user's own text-send is an explicit
+                                // "bring me to the latest" signal
+                                // (mini-lock § "Count semantics" line
+                                // 126, Vladislav-locked Telegram/Signal
+                                // parity). Clears the chip count +
+                                // animates scroll to visual bottom
+                                // (source index 0 in reverseLayout).
+                                // Idempotent if already at bottom.
+                                chipState.onOwnSend(scope, listState, convTagForChip)
                             }
                         }
                     }
@@ -1387,6 +1427,46 @@ fun ChatScreen(
                 item(key = "__e2ee__") { E2EENoteRow(theirUsername = theirUsername) }
             } // end LazyColumn (PR-UI-CHAT-THREAD-CACHE1 v1.1)
         } // end Column wrap (pinned banner OUTSIDE LazyColumn)
+
+        // PR-UI-CHAT-NEW-MSG-CHIP1 (2026-05-29) — floating scroll-to-
+        // bottom chip. Anchored 14 dp from the trailing edge and 14 dp
+        // above the 56 dp composer (= bottom 70 dp), per mini-lock §
+        // "Button geometry" / "Anchor". Recording-panel coexistence
+        // (mini-lock § "Recording-panel coexistence", Vladislav-locked):
+        // visibility is decoupled from `recordingState` so the button
+        // stays available mid-recording — a user may need to scroll
+        // back to the most recent incoming while answering. The button
+        // is the LAST child of the back-swipe Box so it draws on top
+        // of the message bubble layer.
+        ScrollToBottomButton(
+            visible = chipState.visible,
+            count = chipState.count,
+            badgeBumpKey = chipState.badgeBumpKey,
+            onClick = {
+                scope.launch {
+                    chipState.scrollToFirstUnreadOrLatest(
+                        listState = listState,
+                        // displayItems is the SOURCE order for the
+                        // reverseLayout LazyColumn (newest-first), so
+                        // the source index for a `ChatItem.Msg` is its
+                        // position in displayItems. Falls back to 0
+                        // (visual bottom) if the envelope id is no
+                        // longer in the in-memory window — see the
+                        // holder's safeguard at
+                        // `?.takeIf { it >= 0 } ?: 0`.
+                        resolveSourceIndex = { id ->
+                            displayItems.indexOfFirst {
+                                it is ChatItem.Msg && it.entity.id == id
+                            }
+                        },
+                        convTag = convTagForChip,
+                    )
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 14.dp, bottom = 70.dp),
+        )
         } // end back-swipe Box
     }
 }
