@@ -70,7 +70,15 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./well-known:/srv/well-known:ro
-      - ./landing:/srv/landing:ro
+      # phntm.pro static site (index/about/roadmap/donate, bilingual EN/RU,
+      # animations). Source of truth: repo-root `site/`, mounted read-only
+      # into the container path that Caddyfile's phntm.pro vhost serves
+      # (`/srv/landing` — kept stable so the Caddyfile root doesn't need
+      # to change). The previous stub at `deploy/landing/` is preserved
+      # in git history but is no longer bind-mounted; revert this line to
+      # `./landing:/srv/landing:ro` to roll back to the stub.
+      # See `site/README.md` for the deploy + verify procedure.
+      - ../site:/srv/landing:ro
       # Static placeholder landing for the WebTunnel bridge subdomain.
       # Anyone scanning bridge.phntm.pro sees a small static site rather
       # than an empty 404 — defence in depth against TSPU enumeration.
