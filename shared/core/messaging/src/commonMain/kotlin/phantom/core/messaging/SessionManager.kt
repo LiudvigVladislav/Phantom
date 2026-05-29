@@ -205,6 +205,112 @@ class SessionManager(
         senderIdentityPublicKeyHex: String,
         x3dhInit: X3dhInitHeader,
     ): RatchetState {
+        // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 1 (2026-05-29) — refactored
+        // into a thin wrapper over [recipientBootstrapInMemory] + [saveSession]
+        // so the crypto-only and crypto+persist paths share byte-identical
+        // derivation logic. No behaviour change at this call site; the
+        // existing no-session bootstrap path in
+        // `DefaultMessagingService.handleDeliver` continues to call
+        // [recipientBootstrap] and see the same persistence + return.
+        val state = recipientBootstrapInMemory(
+            conversationId = conversationId,
+            localIdentityKeyPair = localIdentityKeyPair,
+            senderIdentityPublicKeyHex = senderIdentityPublicKeyHex,
+            x3dhInit = x3dhInit,
+        )
+        saveSession(conversationId, state)
+        return state
+    }
+
+    /**
+     * PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 1 (2026-05-29) — in-memory
+     * recipient-bootstrap variant.
+     *
+     * Derives a candidate [RatchetState] from an inbound X3DH header
+     * WITHOUT persisting it to the ratchet state repository. The intended
+     * consumer is `DefaultMessagingService.handleDeliver`'s MAC-failure
+     * repair branch (Commit 2 of this PR) — when the existing local
+     * session has gone stale and the inbound envelope carries an
+     * `x3dhInit` payload, the receive path uses this method to derive
+     * a candidate state, attempts `ratchet.decrypt(candidate, …)`, and
+     * commits the new state via [saveSession] ONLY AFTER the decrypt
+     * succeeds.
+     *
+     * **Differences from [recipientBootstrap]:**
+     *
+     * 1. **Does NOT call [saveSession].** The returned candidate state
+     *    must be persisted by the caller AFTER candidate-decrypt
+     *    succeeds. If candidate-decrypt fails (the inbound `x3dhInit`
+     *    was forged, replayed, or the derived ratchet still mismatches
+     *    the on-wire ciphertext), the caller MUST NOT persist this
+     *    state — the on-disk session row remains byte-identical to its
+     *    pre-receive content. This is the central invariant of
+     *    PR-CRYPTO-INBOUND-X3DH-REPAIR1
+     *    (`docs/tracks/crypto-inbound-x3dh-repair.md` §Scope item 5):
+     *    *OLD RATCHET SESSION MUST BE PRESERVED on candidate
+     *    bootstrap / candidate-decrypt failure*.
+     *
+     * 2. **OPK consumption follows the same eager-consume model as the
+     *    existing [recipientBootstrap]** — the referenced OPK is
+     *    deleted from the local pool BEFORE the X3DH handshake runs,
+     *    preserving the F1 single-use invariant.
+     *
+     *    This is an **explicit implementation decision** (per mini-lock
+     *    §Scope item 5: "OPK consumption is left as an implementation
+     *    decision at commit-1 review"). The choice here — eager consume,
+     *    same as existing — is conservative because:
+     *      - it preserves the F1 invariant uniformly across both
+     *        bootstrap variants;
+     *      - it matches the semantic peers expect: a successful
+     *        x3dhInit (even one whose decrypt later fails) was a
+     *        legitimate consumption signal at the SessionManager layer,
+     *        and the relay's bundle-fetch path has already removed the
+     *        OPK from the public store anyway;
+     *      - the alternative (defer consumption until candidate-decrypt
+     *        succeeds) would need a separate OPK-reservation pathway
+     *        that complicates the F1 single-use guarantee and adds
+     *        schema-state without a clear win — the peer would still
+     *        derive a fresh OPK for any subsequent repair attempt
+     *        because the repair-on-suspect flow re-fetches the bundle
+     *        upstream.
+     *
+     *    If Commit 2's receive-path design surfaces a concrete need to
+     *    preserve OPK on candidate-decrypt failure, the policy can be
+     *    introduced as a parameter on this method at that review or as
+     *    a separate follow-up. The §Scope item 5 invariant — preservation
+     *    of the *ratchet session row* — holds regardless of OPK
+     *    lifecycle.
+     *
+     * **Failure semantics:** any error propagates as the same typed
+     * exception that [recipientBootstrap] would throw:
+     *   - [SessionBootstrapException.SpkNotFound] when the inbound
+     *     `x3dhInit.spkKeyId` doesn't match the current or previous SPK
+     *     in the local store;
+     *   - [SessionBootstrapException.OpkNotFound] when the inbound
+     *     `x3dhInit.opkKeyIdHex` references an OPK not in the local
+     *     pool (already consumed, never published, or local DB wiped);
+     *   - whatever `x3dh.recipientHandshake4DH(...)` raises (X3DH-layer
+     *     crypto exceptions — typically `IllegalArgumentException` from
+     *     libsodium for malformed inputs);
+     *   - [IllegalArgumentException] from `require(...)` if the F15
+     *     invariant ever surfaces a regression in `LibsodiumX3DH`
+     *     (sendingRatchet keypair must not equal the local identity).
+     *
+     * The caller wraps the resulting [Throwable] into a
+     * `DECRYPT_TRACE inbound_repair_fail errorClass=${e::class.simpleName}`
+     * log line; the typed exception names preserve diagnostic
+     * specificity for triage (per mini-lock §Scope item 3
+     * Vladislav-locked 2026-05-29: a nullable return would have erased
+     * the `errorClass` to `Unknown`).
+     *
+     * **Returns:** non-null [RatchetState] candidate. Never returns null.
+     */
+    suspend fun recipientBootstrapInMemory(
+        conversationId: String,
+        localIdentityKeyPair: DhKeyPair,
+        senderIdentityPublicKeyHex: String,
+        x3dhInit: X3dhInitHeader,
+    ): RatchetState {
         // Resolve the SPK keypair locally. Either the current SPK or the
         // previous (retained for SPK_PREVIOUS_RETENTION_DAYS days after
         // rotation) must match the targeted keyId. Anything else is an
@@ -235,7 +341,10 @@ class SessionManager(
                 ?: throw SessionBootstrapException.OpkNotFound(opkId)
             // Single-use lifecycle: delete first, then use the value.
             // Safe because we hold the only async reference; the pool
-            // is per-device, not concurrent.
+            // is per-device, not concurrent. See § "OPK consumption"
+            // in this method's KDoc for the explicit implementation
+            // decision recorded in commit-1 review of PR-CRYPTO-
+            // INBOUND-X3DH-REPAIR1.
             oneTimePreKeyRepository.deleteByKeyId(opkId)
             DhKeyPair(
                 publicKey = DhPublicKey(opk.publicKeyHex.hexToByteArray()),
@@ -277,7 +386,12 @@ class SessionManager(
                 "localIdentity.privateKey."
         }
 
-        saveSession(conversationId, state)
+        // CRITICAL DIFFERENCE FROM [recipientBootstrap]: no [saveSession]
+        // call. The on-disk ratchet state row for `conversationId`
+        // remains byte-identical to its pre-call content. The caller
+        // commits this state via [saveSession] ONLY AFTER successful
+        // candidate-decrypt; on candidate-decrypt failure, the caller
+        // discards `state` and the existing session row is preserved.
         return state
     }
 

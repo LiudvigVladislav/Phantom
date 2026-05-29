@@ -682,4 +682,313 @@ class SessionManagerTest {
             assertTrue(e.opkKeyIdHex.startsWith("deadbeef"))
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 1 (2026-05-29)
+    //
+    // Tests for the new `recipientBootstrapInMemory` API surface. The
+    // method is the crypto-only sibling of `recipientBootstrap` —
+    // SAME derivation path, SAME OPK consumption (eager), SAME F15
+    // invariants, but does NOT call `saveSession`. The caller (Commit
+    // 2 receive-path repair branch) commits the candidate state via
+    // `saveSession` ONLY AFTER candidate-decrypt succeeds.
+    //
+    // The 3 commit-1 acceptance gates (mini-lock §Implementation plan
+    // + Vladislav 2026-05-29):
+    //
+    //   1. API returns non-null `RatchetState`; failure throws typed
+    //      exception so `DECRYPT_TRACE inbound_repair_fail errorClass=…`
+    //      preserves diagnostic specificity.
+    //   2. Old ratchet session row preserved on derivation failure (no
+    //      `upsertRatchetState` call before the caller's saveSession).
+    //   3. OPK consumption documented as explicit decision (eager
+    //      consume; tested for byte-identity with `recipientBootstrap`).
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun recipientBootstrapInMemory_success_returnsCandidateAndDoesNotPersist() = runTest {
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val aliceIdentity = real.generateDhKeyPair()
+        val bobIdentity = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobOpk = real.generateDhKeyPair()
+        val bobOpkIdHex = "ffeeddccbbaa99887766554433221100"
+        val bobSigning = Signature.keypair()
+
+        // Alice runs initiatorBootstrap so we have a real x3dhInit
+        // header to feed Bob's in-memory recipient bootstrap.
+        val aliceMgr = makeManager(real, InMemoryRatchetRepo())
+        val bundle = buildBundleFromBob(
+            bobX25519IdentityHex = bobIdentity.publicKey.bytes.toHexString(),
+            bobEd25519SigningPub = bobSigning.publicKey.toByteArray(),
+            bobEd25519SigningSecret = bobSigning.secretKey.toByteArray(),
+            bobSpkPair = bobSpk,
+            bobSpkKeyId = 7L,
+            bobSpkCreatedAtMs = 1_000L,
+            bobOpkPair = bobOpk,
+            bobOpkIdHex = bobOpkIdHex,
+        )
+        val initiatorResult = aliceMgr.initiatorBootstrap(
+            conversationId = "alice-bob",
+            localIdentityKeyPair = aliceIdentity,
+            bundle = bundle,
+        )
+
+        val bobSpkRepo = InMemorySignedPreKeyRepo().also {
+            it.upsert(
+                LocalSignedPreKeyEntity(
+                    keyId = 7L,
+                    publicKeyHex = bobSpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobSpk.privateKey.bytes.toHexString(),
+                    createdAtMs = 1_000L,
+                    signatureHex = "00".repeat(64),
+                ),
+            )
+        }
+        val bobOpkRepo = InMemoryOneTimePreKeyRepo().also {
+            it.insert(
+                LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkIdHex,
+                    publicKeyHex = bobOpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobOpk.privateKey.bytes.toHexString(),
+                    uploadedAtMs = 500L,
+                ),
+            )
+        }
+        val bobRatchetRepo = InMemoryRatchetRepo()
+        val bobMgr = makeManager(
+            x3dh = real,
+            ratchetRepo = bobRatchetRepo,
+            spkRepo = bobSpkRepo,
+            opkRepo = bobOpkRepo,
+        )
+
+        val candidate = bobMgr.recipientBootstrapInMemory(
+            conversationId = "alice-bob",
+            localIdentityKeyPair = bobIdentity,
+            senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
+            x3dhInit = initiatorResult.x3dhInit,
+        )
+
+        // Gate 1: returned a non-null RatchetState that derives the
+        // SAME root key as Alice's initiator state (proving the
+        // crypto path is byte-identical to existing recipientBootstrap).
+        assertContentEquals(
+            initiatorResult.ratchetState.rootKey,
+            candidate.rootKey,
+            "recipientBootstrapInMemory must derive the same root key as initiatorBootstrap " +
+                "(byte-identical crypto path with recipientBootstrap)",
+        )
+
+        // Gate 2 (CENTRAL): no saveSession was called — the on-disk
+        // ratchet state row for "alice-bob" is NOT populated.
+        assertTrue(
+            !bobRatchetRepo.isPersisted("alice-bob"),
+            "recipientBootstrapInMemory MUST NOT persist the candidate state. " +
+                "The caller commits via saveSession() ONLY AFTER candidate-decrypt succeeds. " +
+                "Mini-lock §Scope item 5: OLD RATCHET SESSION MUST BE PRESERVED on failure.",
+        )
+
+        // Gate 3: OPK was eagerly consumed (matches existing
+        // recipientBootstrap behaviour; explicit implementation decision
+        // documented in mini-lock §Scope item 5).
+        assertTrue(
+            !bobOpkRepo.has(bobOpkIdHex),
+            "OPK must be deleted from Bob's pool after eager consumption (explicit " +
+                "implementation decision matching recipientBootstrap pattern)",
+        )
+    }
+
+    @Test
+    fun recipientBootstrapInMemory_throwsSpkNotFound_andDoesNotPersist() = runTest {
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val bobRatchetRepo = InMemoryRatchetRepo()
+        // Empty SPK repo by default — Bob has no SPK at all.
+        val mgr = makeManager(real, bobRatchetRepo)
+        val aliceIdentity = real.generateDhKeyPair()
+        val bobIdentity = real.generateDhKeyPair()
+        val header = X3dhInitHeader(
+            ephemeralPubKeyHex = real.generateDhKeyPair().publicKey.bytes.toHexString(),
+            spkKeyId = 777L,
+            opkKeyIdHex = null,
+        )
+
+        try {
+            mgr.recipientBootstrapInMemory(
+                conversationId = "alice-bob-spk-missing",
+                localIdentityKeyPair = bobIdentity,
+                senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
+                x3dhInit = header,
+            )
+            fail("expected SessionBootstrapException.SpkNotFound (typed exception per gate 1)")
+        } catch (e: SessionBootstrapException.SpkNotFound) {
+            // Gate 1 satisfied: typed exception (not a nullable return,
+            // not an IllegalStateException). The caller can log
+            // errorClass=SpkNotFound directly.
+            assertEquals(777L, e.spkKeyId)
+        }
+
+        // Gate 2 (CENTRAL): the on-disk ratchet state row for
+        // "alice-bob-spk-missing" was NEVER touched. This is the
+        // invariant the whole PR exists to guarantee.
+        assertTrue(
+            !bobRatchetRepo.isPersisted("alice-bob-spk-missing"),
+            "OLD RATCHET SESSION MUST BE PRESERVED on bootstrap failure (SpkNotFound). " +
+                "Mini-lock §Scope item 5.",
+        )
+    }
+
+    @Test
+    fun recipientBootstrapInMemory_throwsOpkNotFound_andDoesNotPersist() = runTest {
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val bobIdentity = real.generateDhKeyPair()
+        val aliceIdentity = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+
+        val spkRepo = InMemorySignedPreKeyRepo().also {
+            it.upsert(
+                LocalSignedPreKeyEntity(
+                    keyId = 11L,
+                    publicKeyHex = bobSpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobSpk.privateKey.bytes.toHexString(),
+                    createdAtMs = 0L,
+                    signatureHex = "00".repeat(64),
+                ),
+            )
+        }
+        // OPK repo is intentionally empty — initiator referenced an
+        // OPK Bob never had (or already consumed).
+        val bobOpkRepo = InMemoryOneTimePreKeyRepo()
+        val bobRatchetRepo = InMemoryRatchetRepo()
+        val mgr = makeManager(
+            x3dh = real,
+            ratchetRepo = bobRatchetRepo,
+            spkRepo = spkRepo,
+            opkRepo = bobOpkRepo,
+        )
+
+        val header = X3dhInitHeader(
+            ephemeralPubKeyHex = real.generateDhKeyPair().publicKey.bytes.toHexString(),
+            spkKeyId = 11L,
+            opkKeyIdHex = "deadbeefcafef00d1234567890abcdef",
+        )
+
+        try {
+            mgr.recipientBootstrapInMemory(
+                conversationId = "alice-bob-opk-missing",
+                localIdentityKeyPair = bobIdentity,
+                senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
+                x3dhInit = header,
+            )
+            fail("expected SessionBootstrapException.OpkNotFound (typed exception per gate 1)")
+        } catch (e: SessionBootstrapException.OpkNotFound) {
+            // Gate 1: typed exception preserves errorClass=OpkNotFound
+            // for `DECRYPT_TRACE inbound_repair_fail`.
+            assertTrue(e.opkKeyIdHex.startsWith("deadbeef"))
+        }
+
+        // Gate 2 (CENTRAL): the on-disk ratchet state row was NEVER
+        // touched on OPK lookup failure either.
+        assertTrue(
+            !bobRatchetRepo.isPersisted("alice-bob-opk-missing"),
+            "OLD RATCHET SESSION MUST BE PRESERVED on bootstrap failure (OpkNotFound). " +
+                "Mini-lock §Scope item 5.",
+        )
+    }
+
+    @Test
+    fun recipientBootstrap_stillPersistsAfterRefactor_regressionCheck() = runTest {
+        // After PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 1, the existing
+        // `recipientBootstrap` is a thin wrapper over
+        // `recipientBootstrapInMemory` + `saveSession`. This regression
+        // test proves the wrapper still persists the state on success —
+        // the existing no-session bootstrap path in
+        // `DefaultMessagingService.handleDeliver` continues to see the
+        // same persistence behaviour as before the refactor.
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val aliceIdentity = real.generateDhKeyPair()
+        val bobIdentity = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobOpk = real.generateDhKeyPair()
+        val bobOpkIdHex = "aaaaaaaaaaaaaaaa0000000000000000"
+        val bobSigning = Signature.keypair()
+
+        val aliceMgr = makeManager(real, InMemoryRatchetRepo())
+        val bundle = buildBundleFromBob(
+            bobX25519IdentityHex = bobIdentity.publicKey.bytes.toHexString(),
+            bobEd25519SigningPub = bobSigning.publicKey.toByteArray(),
+            bobEd25519SigningSecret = bobSigning.secretKey.toByteArray(),
+            bobSpkPair = bobSpk,
+            bobSpkKeyId = 13L,
+            bobSpkCreatedAtMs = 1_000L,
+            bobOpkPair = bobOpk,
+            bobOpkIdHex = bobOpkIdHex,
+        )
+        val initiatorResult = aliceMgr.initiatorBootstrap(
+            conversationId = "alice-bob-regression",
+            localIdentityKeyPair = aliceIdentity,
+            bundle = bundle,
+        )
+
+        val bobSpkRepo = InMemorySignedPreKeyRepo().also {
+            it.upsert(
+                LocalSignedPreKeyEntity(
+                    keyId = 13L,
+                    publicKeyHex = bobSpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobSpk.privateKey.bytes.toHexString(),
+                    createdAtMs = 1_000L,
+                    signatureHex = "00".repeat(64),
+                ),
+            )
+        }
+        val bobOpkRepo = InMemoryOneTimePreKeyRepo().also {
+            it.insert(
+                LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkIdHex,
+                    publicKeyHex = bobOpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobOpk.privateKey.bytes.toHexString(),
+                    uploadedAtMs = 500L,
+                ),
+            )
+        }
+        val bobRatchetRepo = InMemoryRatchetRepo()
+        val bobMgr = makeManager(
+            x3dh = real,
+            ratchetRepo = bobRatchetRepo,
+            spkRepo = bobSpkRepo,
+            opkRepo = bobOpkRepo,
+        )
+
+        val bobState = bobMgr.recipientBootstrap(
+            conversationId = "alice-bob-regression",
+            localIdentityKeyPair = bobIdentity,
+            senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
+            x3dhInit = initiatorResult.x3dhInit,
+        )
+
+        // Crypto behaviour unchanged: same root key as Alice's
+        // initiator state.
+        assertContentEquals(
+            initiatorResult.ratchetState.rootKey,
+            bobState.rootKey,
+            "recipientBootstrap refactor must preserve byte-identical crypto path",
+        )
+
+        // Persistence behaviour unchanged: state IS persisted (this is
+        // the difference from recipientBootstrapInMemory).
+        assertTrue(
+            bobRatchetRepo.isPersisted("alice-bob-regression"),
+            "recipientBootstrap MUST still persist after refactor (regression check)",
+        )
+
+        // OPK was consumed (same as pre-refactor).
+        assertTrue(
+            !bobOpkRepo.has(bobOpkIdHex),
+            "recipientBootstrap MUST still consume OPK after refactor (regression check)",
+        )
+    }
 }

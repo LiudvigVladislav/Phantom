@@ -32,6 +32,7 @@ import kotlinx.serialization.json.Json
 import phantom.core.crypto.DoubleRatchet
 import phantom.core.crypto.DhKeyPair
 import phantom.core.crypto.MessagePadding
+import phantom.core.crypto.RatchetState
 import phantom.core.crypto.SealedSender
 import phantom.core.identity.IdentityRecord
 import phantom.core.identity.IdentitySigningKeyPair
@@ -2326,10 +2327,22 @@ class DefaultMessagingService(
                         "x3dhInitPresent=${wireFrame.x3dhInit != null}",
                 )
                 if (state != null) {
-                    // Existing session — decrypt directly. Any x3dhInit /
-                    // signing pubkey that came with this frame are
-                    // re-bootstraps; ignored when we already hold a
-                    // session, the peer simply pays a few wasted bytes.
+                    // Existing session — decrypt directly first. The peer's
+                    // signing pubkey carried alongside the frame is ignored
+                    // here; identity-key change handling is a separate path
+                    // (PR C / Phase 5 SPK rotation cache).
+                    //
+                    // After PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 2
+                    // (2026-05-29): if the direct decrypt fails MAC and the
+                    // frame carries `x3dhInit`, the catch branch below uses
+                    // that `x3dhInit` as a recipient-side repair hint —
+                    // candidate bootstrap in memory + decrypt under the
+                    // candidate + commit only on success (mini-lock fe90c8a9
+                    // §Scope items 1+5). On the SUCCESSFUL direct-decrypt
+                    // path here the `x3dhInit` is still ignored — the peer
+                    // simply pays a few wasted bytes when their suspect
+                    // outbound (#243 commit 4) attaches a repair hint to a
+                    // frame the receiver could already decrypt.
                     messagingLog(
                         MessagingLogLevel.INFO,
                         "Session loaded: conv=${conversationId.take(24)}… decrypting…",
@@ -2384,6 +2397,180 @@ class DefaultMessagingService(
                         if (e.message?.contains("MAC", ignoreCase = true) == true ||
                             e.message?.contains("verification", ignoreCase = true) == true
                         ) {
+                            // ═════════════════════════════════════════════════════════
+                            // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 2 (2026-05-29) —
+                            // ADDITIVE inbound-repair branch (architect-ACKed
+                            // mini-lock fe90c8a9 + commit-1 ACK 61724ed7).
+                            //
+                            // Architect-locked invariants (mini-lock §Scope items 1+4+5+7):
+                            //   (1) Fires ONLY when wireFrame.x3dhInit != null. Frames
+                            //       without an inbound repair hint fall through to the
+                            //       existing hold/release branches below — PR #243
+                            //       commit 3a contract preserved.
+                            //   (2) Old ratchet session row is NEVER touched on failure.
+                            //       sessionManager.saveSession() runs ONLY after the
+                            //       candidate-decrypt succeeds. On any non-cancellation
+                            //       failure (candidate bootstrap throws
+                            //       SessionBootstrapException OR candidate decrypt
+                            //       throws MAC again OR any other non-cancellation
+                            //       Throwable), control falls through to the existing
+                            //       hold branch with the on-disk session row byte-
+                            //       identical to its pre-receive content.
+                            //       CancellationException is re-thrown (commit 2a),
+                            //       not converted to a failure — see comments at the
+                            //       try/catch site below.
+                            //   (3) Does NOT call setSessionSuspect. The new branch
+                            //       itself never re-suspects; if it fails, the existing
+                            //       hold branch below may set suspect exactly as it
+                            //       does today (PR #243 commit 3a behaviour unchanged).
+                            //   (4) Does NOT early-ack and does NOT bypass downstream
+                            //       payload processing. Successful repair returns the
+                            //       decrypted plaintext from `withLock { ... }` (same
+                            //       block-return shape as the existing state != null
+                            //       success path at line 2371), so the rest of
+                            //       handleDeliver routes it through the same payload
+                            //       handlers and the eventual ack happens via that
+                            //       normal flow.
+                            //   (5) OPK is eagerly consumed inside
+                            //       recipientBootstrapInMemory (explicit commit-1
+                            //       decision matching recipientBootstrap behaviour;
+                            //       see SessionManager KDoc).
+                            //   (6) NOT gated on holdMacFailures. This is successful
+                            //       crypto recovery — not a destructive-ack-vs-hold
+                            //       choice — so it fires in BOTH debug AND release
+                            //       builds. Worst case for release builds is the same
+                            //       as today (fall through to the existing ack path).
+                            //       Best case is the user recovers a message that
+                            //       would have been silently lost.
+                            // ═════════════════════════════════════════════════════════
+                            val inboundX3dhInit = wireFrame.x3dhInit
+                            if (inboundX3dhInit != null) {
+                                val repairStartMs = Clock.System.now().toEpochMilliseconds()
+                                messagingLog(
+                                    MessagingLogLevel.INFO,
+                                    "DECRYPT_TRACE inbound_repair_armed msgId=${deliver.messageId.take(8)} " +
+                                        "sender=${senderPubKeyHex.take(8)} " +
+                                        "conv=${conversationId.take(8)} " +
+                                        "reason=fail_mac_existing_session",
+                                )
+                                // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 2a
+                                // (2026-05-29) — Vladislav P2 finding on
+                                // Commit 2 `23394e8f`: replace runCatching
+                                // with an explicit try/catch so
+                                // CancellationException is RE-THROWN, not
+                                // swallowed as a generic failure that would
+                                // fall through to the existing hold path —
+                                // and in release builds (where
+                                // holdMacFailures=false) further fall through
+                                // to the destructive `FAILED_MAC + ack-deliver`
+                                // branch, dropping the envelope due to a
+                                // coroutine lifecycle event rather than any
+                                // actual crypto verdict. The same idiom is
+                                // already documented as the
+                                // PR-MEDIA-UPLOAD-CANCEL2 fix in
+                                // `VoiceV2Sender.kt:73-91` — Test #76.4
+                                // surfaced the exact bug in that module
+                                // (cancellation became a normal Result.failure
+                                // and the cancellation handler never ran).
+                                //
+                                // Candidate state is NOT yet persisted — that
+                                // happens only after this ratchet.decrypt
+                                // succeeds. On non-cancellation failure here,
+                                // the catch block produces Result.failure(t),
+                                // the candidate state is discarded (it was
+                                // only a local val), control falls through to
+                                // the existing hold branch below, and the
+                                // on-disk session row remains byte-identical
+                                // to its pre-receive content (mini-lock
+                                // §Scope item 5 CENTRAL invariant).
+                                val repairResult: Result<Pair<RatchetState, ByteArray>> = try {
+                                    val candidate = sessionManager.recipientBootstrapInMemory(
+                                        conversationId = conversationId,
+                                        localIdentityKeyPair = localKeyPair,
+                                        senderIdentityPublicKeyHex = senderPubKeyHex,
+                                        x3dhInit = inboundX3dhInit,
+                                    )
+                                    val (advancedState, decryptedPlaintext) =
+                                        ratchet.decrypt(candidate, encrypted)
+                                    Result.success(advancedState to decryptedPlaintext)
+                                } catch (ce: kotlinx.coroutines.CancellationException) {
+                                    // Cancellation is a coroutine lifecycle
+                                    // signal, not a crypto verdict — re-throw
+                                    // so the structured-concurrency parent can
+                                    // observe it. The runCatching variant
+                                    // (which would have caught it as Throwable)
+                                    // is the regression vector documented in
+                                    // VoiceV2Sender.kt:73-91 and re-confirmed
+                                    // by Vladislav P2 review of this PR's
+                                    // Commit 2 `23394e8f`.
+                                    throw ce
+                                } catch (t: Throwable) {
+                                    Result.failure(t)
+                                }
+                                if (repairResult.isSuccess) {
+                                    val (advancedState, decryptedPlaintext) =
+                                        repairResult.getOrThrow()
+                                    // Commit the advanced state ONLY NOW —
+                                    // candidate-decrypt succeeded, so the new
+                                    // ratchet is valid and replaces the stale
+                                    // on-disk row.
+                                    sessionManager.saveSession(conversationId, advancedState)
+                                    messagingLog(
+                                        MessagingLogLevel.INFO,
+                                        "DECRYPT_TRACE inbound_repair_ok msgId=${deliver.messageId.take(8)} " +
+                                            "conv=${conversationId.take(8)} " +
+                                            "bootstrap=true " +
+                                            "plaintextBytes=${decryptedPlaintext.size} " +
+                                            "elapsedMs=${Clock.System.now().toEpochMilliseconds() - repairStartMs}",
+                                    )
+                                    // markProcessed PROCESSED — matches the
+                                    // existing state != null success path at
+                                    // line ~2363 (same payload_type=unknown
+                                    // placeholder, same INSERT OR IGNORE
+                                    // semantic).
+                                    processedEnvelopeRepository?.markProcessed(
+                                        envelopeId = deliver.messageId,
+                                        conversationId = conversationId,
+                                        senderPubKeyHex = senderPubKeyHex,
+                                        payloadType = "unknown",
+                                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                                        nowMs = Clock.System.now().toEpochMilliseconds(),
+                                    )
+                                    // Return the decrypted plaintext to flow
+                                    // back into the normal downstream payload
+                                    // processing — same block-return shape as
+                                    // the existing success path at line 2371.
+                                    // Invariant 4: no early ack, no special
+                                    // path; the ack happens via the normal
+                                    // downstream flow after payload handling.
+                                    return@withLock decryptedPlaintext
+                                } else {
+                                    val err = repairResult.exceptionOrNull()
+                                    messagingLog(
+                                        MessagingLogLevel.WARN,
+                                        "DECRYPT_TRACE inbound_repair_fail msgId=${deliver.messageId.take(8)} " +
+                                            "sender=${senderPubKeyHex.take(8)} " +
+                                            "conv=${conversationId.take(8)} " +
+                                            "errorClass=${err?.let { it::class.simpleName } ?: "Unknown"} " +
+                                            "action=fall_through_to_hold",
+                                    )
+                                    // INTENTIONAL fall-through to the existing
+                                    // hold branch below. The candidate state
+                                    // is discarded (local val inside the
+                                    // try block — nothing was persisted; the
+                                    // explicit try/catch shape from commit
+                                    // 2a re-throws CancellationException and
+                                    // converts only non-cancellation
+                                    // Throwables to Result.failure). The
+                                    // on-disk session row
+                                    // remains byte-identical to its pre-
+                                    // receive content (mini-lock §Scope item
+                                    // 5 invariant). No setSessionSuspect from
+                                    // this branch — the existing hold branch
+                                    // sets suspect on fresh hold-row insertion
+                                    // exactly as today (invariant 3 unchanged).
+                                }
+                            }
                             // ═════════════════════════════════════════════════════════
                             // PR-CRYPTO-SESSION-REPAIR1 commit 3 (2026-05-29) —
                             // ADDITIVE hold-on-MAC branch (architect re-ACKed
