@@ -144,8 +144,8 @@ This track inserts a THIRD arm BEFORE both of those, gated on `wireFrame.x3dhIni
 
 ## Implementation plan (sketched; refine per architect pre-decisions before commit 1)
 
-- **Commit 1 — `SessionManager.tryRecipientBootstrapInMemory` API surface (no behaviour change).**
-  Add the in-memory bootstrap method. Return type: `RatchetState?` (null on bootstrap failure). Existing call sites that use `recipientHandshake4DH + saveSession` continue to compile + behave identically. Tests added for the in-memory variant against the same test bundle that PR #243 commits 4 + 5 used (`PreSeededRatchetStateRepository`, `MacFailingDoubleRatchet`, `PassthroughDoubleRatchet`, `FakeDecryptFailedEnvelopeLedger`).
+- **Commit 1 — `SessionManager` in-memory recipient-bootstrap API surface (no behaviour change).**
+  Add the in-memory bootstrap method (`deriveRecipientBootstrapCandidate(...)` or `recipientBootstrapInMemory(...)` per § Scope item 3). Return type: `RatchetState` (non-null); bootstrap failure must throw a typed exception so `DECRYPT_TRACE inbound_repair_fail` can preserve `errorClass`. Existing call sites that use `recipientHandshake4DH + saveSession` continue to compile and behave identically. Tests added for the in-memory variant against the same test bundle that PR #243 commits 4 + 5 used (`PreSeededRatchetStateRepository`, `MacFailingDoubleRatchet`, `PassthroughDoubleRatchet`, `FakeDecryptFailedEnvelopeLedger`).
 
 - **Commit 2 — Receive-path repair branch in `DefaultMessagingService.handleDeliver`.**
   Insert the new `if (x3dhInit != null) { tryInboundRepairDecrypt(...) }` block per the pseudocode skeleton above, BEFORE the existing `holdMacFailures` branch. New `DECRYPT_TRACE` log keys per § Logs below. Strict order: derive candidate → decrypt under candidate → on success, save + markProcessed + ack + return decrypted → on failure, fall through to existing hold path (no setSessionSuspect from inbound side).
