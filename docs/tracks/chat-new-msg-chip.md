@@ -248,4 +248,16 @@ All under PhantomUI tag (consistent with `CHAT_CACHE` from CACHE1).
 
 ## Last hand-off
 
-(empty — track queued, awaiting Vladislav greenlight on this mini-lock before code begins)
+2026-05-29 close-session note after PR #249:
+
+- `PR-CRYPTO-INBOUND-X3DH-REPAIR1` merged on master at `1408cd75`; the inbound
+  `x3dhInit` repair gap that blocked Test #83 v2 is closed.
+- Next CHIP1 session starts from fresh `master`, rebases
+  `feat/pr-ui-chat-new-msg-chip1`, rebuilds APK, then reruns the 10 Test #83
+  acceptance scenarios above before opening the CHIP1 PR.
+- `stash@{0}` is the CHIP1 hand-off edit and must not be popped unless
+  Vladislav explicitly chooses to use it.
+- Expected crypto sanity before CHIP assertions on Tecno:
+  `DECRYPT_TRACE attempt sessionExists=true x3dhInitPresent=true` →
+  `DECRYPT_TRACE inbound_repair_ok bootstrap=true`, then
+  `CHAT_CHIP incoming conv=<8> count=1` while scrolled up.

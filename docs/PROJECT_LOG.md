@@ -589,6 +589,57 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-29 (fri, close) · PR-CRYPTO-INBOUND-X3DH-REPAIR1 MERGED — inbound X3DH repair gap closed; CHIP1 unblocked
+
+PR #249 squash-merged at `1408cd75` on 2026-05-29 after the docs-only
+mini-lock PR #248 (`fe90c8a9`) captured the Test #83 v2 diagnosis:
+outbound repair from the emulator was working, but the Tecno receive path
+ignored a fresh `wireFrame.x3dhInit` whenever a stale local ratchet session
+already existed. The result was `x3dhInitPresent=true` followed by MAC failure
+and hold instead of accepting the repair hint.
+
+**What shipped (squashed in PR #249):**
+
+- `SessionManager.recipientBootstrapInMemory(...)` derives a recipient
+  bootstrap candidate without persisting it. The API returns a non-null
+  `RatchetState` and preserves typed `SessionBootstrapException` failures for
+  logging.
+- `DefaultMessagingService.handleDeliver` now tries the normal existing-session
+  decrypt first. If that fails with MAC / verification and the envelope carries
+  `x3dhInit`, it derives a candidate ratchet in memory, candidate-decrypts the
+  same encrypted payload, and saves the advanced ratchet state only after that
+  decrypt succeeds. The success path then flows through the normal downstream
+  message handling and ACK path.
+- Failure path preserves the old ratchet row byte-for-byte, does not set
+  `session_suspect` inside the new repair branch, and falls through to the
+  existing PR #243 hold branch. `CancellationException` is rethrown so coroutine
+  cancellation cannot be converted into repair failure / destructive ACK
+  behavior.
+- Dedicated DMS integration tests cover success, no-`x3dhInit`, no-existing
+  session, and the central stale-session failure invariant: stale session +
+  inbound `x3dhInit` + candidate decrypt failure leaves the pre-receive ratchet
+  blob byte-identical.
+
+**Verification:** local JVM verification was green for
+`:shared:core:messaging:jvmTest` + `:shared:core:storage:jvmTest`
+(`52` DMS + `14` SessionManager + `46` other messaging + `52` storage =
+`164` tests, 0 failures), and `:apps:android:assembleDebug` was green. PR
+CI was green on head `5d84da3e`. Changed files were limited to four
+`shared/core/messaging` files; no UI, transport, DB/schema, CHIP1, or relay
+code moved in this track.
+
+**Follow-up discipline:** CHIP1 is unblocked but intentionally not continued in
+this session. Next session should start cleanly from `master` at `1408cd75`,
+rebase `feat/pr-ui-chat-new-msg-chip1`, rebuild the APK, and rerun Test #83's
+10 CHIP scenarios. `stash@{0}` contains the CHIP1 hand-off edit and remains
+untouched until Vladislav explicitly decides whether to use it. Expected crypto
+sanity on the next Tecno run: `DECRYPT_TRACE attempt sessionExists=true
+x3dhInitPresent=true` → `DECRYPT_TRACE inbound_repair_ok bootstrap=true`, then
+the CHIP assertion `CHAT_CHIP incoming conv=<8> count=1` when scrolled up.
+
+Stabilization Sprint queue after this close: **PR-UI-CHAT-NEW-MSG-CHIP1** →
+**RENDER-PERF1** (conditional) → **NOTIF-POLICY1** → **D1e**.
+
 ### 2026-05-29 (fri, late) · Out-of-queue: phntm.pro site replace + funding.json donation URL fix — both LIVE in single deploy sweep
 
 Two out-of-queue PRs deployed back-to-back in one VPS sweep, ahead of resuming the Stabilization Sprint queue at PR-UI-CHAT-NEW-MSG-CHIP1.
