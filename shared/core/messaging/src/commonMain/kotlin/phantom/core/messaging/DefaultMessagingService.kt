@@ -32,6 +32,7 @@ import kotlinx.serialization.json.Json
 import phantom.core.crypto.DoubleRatchet
 import phantom.core.crypto.DhKeyPair
 import phantom.core.crypto.MessagePadding
+import phantom.core.crypto.RatchetState
 import phantom.core.crypto.SealedSender
 import phantom.core.identity.IdentityRecord
 import phantom.core.identity.IdentitySigningKeyPair
@@ -2326,10 +2327,22 @@ class DefaultMessagingService(
                         "x3dhInitPresent=${wireFrame.x3dhInit != null}",
                 )
                 if (state != null) {
-                    // Existing session — decrypt directly. Any x3dhInit /
-                    // signing pubkey that came with this frame are
-                    // re-bootstraps; ignored when we already hold a
-                    // session, the peer simply pays a few wasted bytes.
+                    // Existing session — decrypt directly first. The peer's
+                    // signing pubkey carried alongside the frame is ignored
+                    // here; identity-key change handling is a separate path
+                    // (PR C / Phase 5 SPK rotation cache).
+                    //
+                    // After PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 2
+                    // (2026-05-29): if the direct decrypt fails MAC and the
+                    // frame carries `x3dhInit`, the catch branch below uses
+                    // that `x3dhInit` as a recipient-side repair hint —
+                    // candidate bootstrap in memory + decrypt under the
+                    // candidate + commit only on success (mini-lock fe90c8a9
+                    // §Scope items 1+5). On the SUCCESSFUL direct-decrypt
+                    // path here the `x3dhInit` is still ignored — the peer
+                    // simply pays a few wasted bytes when their suspect
+                    // outbound (#243 commit 4) attaches a repair hint to a
+                    // frame the receiver could already decrypt.
                     messagingLog(
                         MessagingLogLevel.INFO,
                         "Session loaded: conv=${conversationId.take(24)}… decrypting…",
@@ -2436,25 +2449,59 @@ class DefaultMessagingService(
                                         "conv=${conversationId.take(8)} " +
                                         "reason=fail_mac_existing_session",
                                 )
-                                val repairResult = runCatching {
+                                // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 2a
+                                // (2026-05-29) — Vladislav P2 finding on
+                                // Commit 2 `23394e8f`: replace runCatching
+                                // with an explicit try/catch so
+                                // CancellationException is RE-THROWN, not
+                                // swallowed as a generic failure that would
+                                // fall through to the existing hold path —
+                                // and in release builds (where
+                                // holdMacFailures=false) further fall through
+                                // to the destructive `FAILED_MAC + ack-deliver`
+                                // branch, dropping the envelope due to a
+                                // coroutine lifecycle event rather than any
+                                // actual crypto verdict. The same idiom is
+                                // already documented as the
+                                // PR-MEDIA-UPLOAD-CANCEL2 fix in
+                                // `VoiceV2Sender.kt:73-91` — Test #76.4
+                                // surfaced the exact bug in that module
+                                // (cancellation became a normal Result.failure
+                                // and the cancellation handler never ran).
+                                //
+                                // Candidate state is NOT yet persisted — that
+                                // happens only after this ratchet.decrypt
+                                // succeeds. On non-cancellation failure here,
+                                // the catch block produces Result.failure(t),
+                                // the candidate state is discarded (it was
+                                // only a local val), control falls through to
+                                // the existing hold branch below, and the
+                                // on-disk session row remains byte-identical
+                                // to its pre-receive content (mini-lock
+                                // §Scope item 5 CENTRAL invariant).
+                                val repairResult: Result<Pair<RatchetState, ByteArray>> = try {
                                     val candidate = sessionManager.recipientBootstrapInMemory(
                                         conversationId = conversationId,
                                         localIdentityKeyPair = localKeyPair,
                                         senderIdentityPublicKeyHex = senderPubKeyHex,
                                         x3dhInit = inboundX3dhInit,
                                     )
-                                    // Candidate state is NOT yet persisted — that
-                                    // happens only after this ratchet.decrypt
-                                    // succeeds. On failure here, the runCatching
-                                    // catches the exception, the candidate state
-                                    // is discarded (it was only a local val), we
-                                    // fall through to the existing hold branch
-                                    // below, and the on-disk session row remains
-                                    // byte-identical to its pre-receive content
-                                    // (mini-lock §Scope item 5 CENTRAL invariant).
                                     val (advancedState, decryptedPlaintext) =
                                         ratchet.decrypt(candidate, encrypted)
-                                    advancedState to decryptedPlaintext
+                                    Result.success(advancedState to decryptedPlaintext)
+                                } catch (ce: kotlinx.coroutines.CancellationException) {
+                                    // Cancellation is a coroutine lifecycle
+                                    // signal, not a crypto verdict — re-throw
+                                    // so the structured-concurrency parent can
+                                    // observe it. The runCatching variant
+                                    // (which would have caught it as Throwable)
+                                    // is the regression vector documented in
+                                    // VoiceV2Sender.kt:73-91 and re-confirmed
+                                    // by Vladislav P2 review of this PR's
+                                    // Commit 2 `23394e8f`.
+                                    throw ce
+                                } catch (t: Throwable) {
+                                    Result.failure(t)
                                 }
                                 if (repairResult.isSuccess) {
                                     val (advancedState, decryptedPlaintext) =
