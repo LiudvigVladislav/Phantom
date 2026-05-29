@@ -591,8 +591,8 @@ class DefaultMessagingService(
     }
 
     /**
-     * PR-CRYPTO-SESSION-REPAIR1 commit 5 + 5a (2026-05-30 / 2026-05-31)
-     * — replay loop.
+     * PR-CRYPTO-SESSION-REPAIR1 commit 5 / 5a / 5b
+     * (2026-05-30 / 2026-05-31) — replay loop.
      *
      * Best-effort decrypt of every held envelope for [conversationId]
      * under the fresh ratchet that was just committed by
@@ -601,47 +601,47 @@ class DefaultMessagingService(
      * so concurrent sends in the same conversation cannot race on
      * the ratchet state.
      *
-     * Architect-locked semantics (commit 5a Replay Safety Patch):
+     * Architect-locked semantics (commit 5a Safety Patch + commit
+     * 5b Ratchet Commit Ordering):
      *
      *   - No replay exception MAY escape this method. The outer
      *     per-envelope guard catches any throwable (decode, decrypt,
      *     saveSession, db, transport, callback), best-effort bumps
      *     `replay_attempt_count`, logs `replay_unexpected_exception`,
      *     and CONTINUES to the next entry. The trigger-send that
-     *     invoked us MUST NEVER be aborted by replay.
+     *     invoked us MUST NEVER be aborted by replay (commit 5a).
      *
-     *   - Replay SUCCESS = decrypt OK + payload durably handled +
-     *     ledger + ack + delete-held all OK. Order is strict:
+     *   - Replay SUCCESS = decrypt OK + payload is TYPE_MESSAGE +
+     *     text durably inserted + ratchet advanced + conv / emit /
+     *     notify + ledger + ack + delete-held all OK. Order is
+     *     strict per [attemptReplayOne] (commit 5b):
      *       1. decode inner WireFrame from `wire_frame_json`;
      *       2. load fresh session (the one just saveSession'd by
      *          encryptUnderLock);
-     *       3. ratchet.decrypt;
-     *       4. saveSession with the advanced state;
-     *       5. decode `MessagePayload` JSON;
-     *       6. gate on `payload.type == TYPE_MESSAGE` (complex types
-     *          are NOT replayed in 5a — they keep the row held and
-     *          record an attempt; see note below);
-     *       7. mirror normal text-receive side effects: insert message
-     *          (DELIVERED, INSERT OR IGNORE idempotent), upsert
-     *          conversation (preview / lastMessageAt / unreadCount++
-     *          or create REQUEST if unknown), `_incomingMessages.emit`,
+     *       3. ratchet.decrypt IN MEMORY (do NOT save yet);
+     *       4. decode `MessagePayload` JSON;
+     *       5. gate on `payload.type == TYPE_MESSAGE` (complex types
+     *          return false BEFORE saveSession — commit 5b);
+     *       6. insert text row with disappearing-timer expiry
+     *          (return false BEFORE saveSession on insert failure —
+     *          commit 5b);
+     *       7. saveSession with the advanced state (ONLY NOW —
+     *          commit 5b architect rule);
+     *       8. upsert conversation + `_incomingMessages.emit` +
      *          `invokeIncomingNotificationCallback("text", …)`;
-     *       8. `processedEnvelopeRepository.markProcessed PROCESSED`;
-     *       9. `transport.sendDeliveryAck`;
-     *      10. `decryptFailedEnvelopeRepository.deleteByEnvelopeId`.
-     *     Failure at ANY of steps 1–9 → recordReplayAttempt + leave
-     *     row held + no ack + no delete. (Failure at step 10
-     *     specifically also records an attempt; the message is in
-     *     the UI + relay-ack'd, so the held row is a memory leak only,
-     *     cleaned up by the attempt cap or commit 6's TTL eviction.)
+     *       9. `processedEnvelopeRepository.markProcessed PROCESSED`;
+     *      10. `transport.sendDeliveryAck`;
+     *      11. `decryptFailedEnvelopeRepository.deleteByEnvelopeId`.
+     *     Failure at ANY step → recordReplayAttempt + leave row
+     *     held + no ack + no delete + no setSessionSuspect. Failures
+     *     in steps 1–6 leave the ratchet UN-ADVANCED so the same
+     *     row remains decryptable on the next replay cycle.
      *
-     *   - Complex (non-`TYPE_MESSAGE`) payloads: commit 5a tightens
-     *     commit 5's behaviour. Per architect: until UI surface for
-     *     group / voice chunk / reaction / pin replay is wired
-     *     (deferred to a follow-up commit), the row is left held +
-     *     attempt recorded + NO ack + NO delete + NO setSessionSuspect.
-     *     The previous commit-5 path of "ack + delete on complex"
-     *     would have silently discarded payloads the user never sees.
+     *   - Complex (non-`TYPE_MESSAGE`) payloads: row stays held +
+     *     attempt recorded + ratchet UN-ADVANCED + NO ack + NO
+     *     delete. When the complex-payload replay handler ships in
+     *     a follow-up commit, the same wireFrame is still
+     *     decryptable under the un-advanced chain.
      *
      *   - **MUST NOT** call setSessionSuspect on ANY failure path —
      *     the anti-loop guarantee from architect pre-decision #3
@@ -741,14 +741,37 @@ class DefaultMessagingService(
     }
 
     /**
-     * PR-CRYPTO-SESSION-REPAIR1 commit 5a (2026-05-31) — replay
+     * PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31) — replay
      * worker for a single held envelope.
      *
-     * Returns `true` iff every step (decrypt → saveSession → payload
-     * decode → text side effects → markProcessed → ack → delete)
-     * completed. Returns `false` on any KNOWN failure (logged with
-     * a specific tag); throws only on UNKNOWN failures, which the
-     * outer guard in [replayHeldEnvelopesAfterRepair] catches.
+     * Architect-locked step order — the receive ratchet MUST NOT be
+     * advanced (`saveSession`) until the replayed plaintext is known
+     * to be a supported text payload AND durably inserted into the
+     * messages table. Otherwise a held row whose decrypt-then-insert
+     * sequence fails would leave the ratchet committed to a state
+     * past the held envelope's message index, making the same row
+     * un-retryable on the next replay cycle even though the relay
+     * still has the (un-acked) ciphertext.
+     *
+     * Steps:
+     *   1. decode `WireFrame`;
+     *   2. load fresh session;
+     *   3. `ratchet.decrypt` IN MEMORY — do NOT save yet;
+     *   4. decode `MessagePayload`;
+     *   5. require `TYPE_MESSAGE` — return false BEFORE save on
+     *      complex payloads (architect tightened in 5b);
+     *   6. insert text row with disappearing-timer expiry — return
+     *      false BEFORE save on insert failure;
+     *   7. `saveSession(newState)` — commit ratchet (only NOW);
+     *   8. upsert conversation + emit `_incomingMessages` + notify;
+     *   9. `processedEnvelopeRepository.markProcessed`;
+     *  10. `transport.sendDeliveryAck`;
+     *  11. `decryptFailedEnvelopeRepository.deleteByEnvelopeId`.
+     *
+     * Returns `true` iff every step (1–11) completed. Returns
+     * `false` on any KNOWN failure (logged with a specific tag);
+     * throws only on UNKNOWN failures, which the outer guard in
+     * [replayHeldEnvelopesAfterRepair] catches.
      *
      * On `false`, the caller MUST call `recordReplayAttempt` exactly
      * once and MUST NOT touch `sessionSuspect`. On `true`, the
@@ -790,7 +813,11 @@ class DefaultMessagingService(
             return false
         }
 
-        // Step 3: ratchet.decrypt.
+        // Step 3: ratchet.decrypt IN MEMORY. The advanced state
+        // [newState] is held in a local until step 7 — commit-5b
+        // architect rule. Failure here leaves the held row + ratchet
+        // both untouched, so the row remains decryptable on the
+        // next replay cycle.
         val decryptResult = try {
             ratchet.decrypt(currentState, wireFrame.encryptedMessage)
         } catch (e: Throwable) {
@@ -803,21 +830,11 @@ class DefaultMessagingService(
         }
         val (newState, plainBytes) = decryptResult
 
-        // Step 4: save advanced ratchet. Failure here means future
-        // replay attempts of this row may still succeed (state was
-        // not advanced) — keep the row held.
-        try {
-            sessionManager.saveSession(conversationId, newState)
-        } catch (e: Throwable) {
-            messagingLog(
-                MessagingLogLevel.WARN,
-                "DECRYPT_TRACE replay_save_session_fail conv=$convTag msgId=$msgTag " +
-                    "errorClass=${e::class.simpleName}",
-            )
-            return false
-        }
-
-        // Step 5: decode MessagePayload JSON.
+        // Step 4: decode MessagePayload JSON. Failure here returns
+        // BEFORE saveSession — the un-advanced ratchet means the
+        // next replay (after the held row's wireFrame is fixed, or
+        // after manual intervention) can still decrypt the original
+        // ciphertext under the same chain key.
         val payload = try {
             json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
         } catch (e: Throwable) {
@@ -829,18 +846,20 @@ class DefaultMessagingService(
             return false
         }
 
-        // Step 6: gate on TYPE_MESSAGE. Architectural scope note:
+        // Step 5: gate on TYPE_MESSAGE. Architectural scope note:
         // group routing + voice chunk assembly + reaction/pin
         // handlers all require state outside the receive ratchet
         // (memory buffers, GroupMessagingService,
         // voiceChunkRepository, etc). Replicating their handlers
         // inside the send-path replay loop risks duplicate state
-        // mutations, and commit 5a tightens commit 5's behaviour:
-        // until the complex-payload replay handlers are wired
-        // (deferred follow-up), the row stays held + attempt
-        // recorded + no ack + no delete. The previous commit-5 path
-        // of ack+delete on complex would have silently discarded
-        // payloads the user never sees.
+        // mutations.
+        //
+        // Commit 5b architect rule: NO saveSession on the
+        // complex-payload path. The row stays held + ratchet stays
+        // un-advanced + no ack + no delete. When the complex-
+        // payload replay handler ships in a follow-up commit, the
+        // ratchet will advance via that handler — the same wireFrame
+        // is still decryptable under the un-advanced chain.
         if (payload.type != MessagePayload.TYPE_MESSAGE) {
             messagingLog(
                 MessagingLogLevel.INFO,
@@ -850,18 +869,76 @@ class DefaultMessagingService(
             return false
         }
 
-        // Step 7: mirror normal text-receive side effects so the
-        // user actually sees the recovered message — insert,
-        // upsert conversation, emit, notify. Failure at ANY sub-
-        // step here keeps the row held + attempt recorded.
+        // Step 6: insert text row with disappearing-timer expiry —
+        // architect-locked durability gate before ratchet commit.
+        // Failure here returns BEFORE saveSession; the un-advanced
+        // ratchet keeps the row retryable on the next cycle.
+        val timerSecs = try {
+            conversationRepository.getDisappearingTimer(conversationId)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_disappearing_read_fail conv=$convTag " +
+                    "msgId=$msgTag errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+        val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
         try {
-            applyTextReplaySideEffects(
+            messageRepository.insertMessage(
+                MessageEntity(
+                    id = entry.envelopeId,
+                    conversationId = conversationId,
+                    ciphertext = wireFrame.encryptedMessage.ciphertext,
+                    plaintextCache = payload.text,
+                    sent = false,
+                    status = MessageStatus.DELIVERED,
+                    createdAt = nowMs,
+                    expiresAtMs = expiresAtMs,
+                )
+            )
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_insert_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE replay_inserted_text conv=$convTag msgId=$msgTag " +
+                "expiresAtMs=$expiresAtMs",
+        )
+
+        // Step 7: commit ratchet. Only after a successful durable
+        // insert do we advance the receive chain. Failure here
+        // (rare — usually DB connectivity) leaves the message in
+        // the DB but the ratchet un-advanced; future replay re-
+        // executes the same chain (INSERT OR IGNORE is idempotent
+        // so the duplicate insert no-ops).
+        try {
+            sessionManager.saveSession(conversationId, newState)
+        } catch (e: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE replay_save_session_fail conv=$convTag msgId=$msgTag " +
+                    "errorClass=${e::class.simpleName}",
+            )
+            return false
+        }
+
+        // Step 8: conversation upsert + UI emit + notification —
+        // the user-visible mirror of normal text receive. Failure
+        // here is partial state (message durable, ratchet advanced,
+        // conv preview / unread / notification missed). Row stays
+        // held; next replay finds the message already inserted and
+        // re-runs upsert/emit/notify idempotently.
+        try {
+            applyReplayConvUpsertEmitNotify(
                 entry = entry,
                 payload = payload,
-                wireFrame = wireFrame,
                 conversationId = conversationId,
-                convTag = convTag,
-                msgTag = msgTag,
                 nowMs = nowMs,
             )
         } catch (e: Throwable) {
@@ -873,7 +950,7 @@ class DefaultMessagingService(
             return false
         }
 
-        // Step 8: ledger PROCESSED.
+        // Step 9: ledger PROCESSED.
         try {
             processedEnvelopeRepository?.markProcessed(
                 envelopeId = entry.envelopeId,
@@ -892,7 +969,7 @@ class DefaultMessagingService(
             return false
         }
 
-        // Step 9: ack the relay.
+        // Step 10: ack the relay.
         try {
             transport.sendDeliveryAck(entry.envelopeId)
         } catch (e: Throwable) {
@@ -904,7 +981,7 @@ class DefaultMessagingService(
             return false
         }
 
-        // Step 10: delete the held row. Failure here is the most
+        // Step 11: delete the held row. Failure here is the most
         // benign — message is durably in UI + ledger + relay-ack'd;
         // only the row remains. Still keep held + recordAttempt
         // so cleanup converges via attempt cap or commit-6 TTL.
@@ -928,45 +1005,22 @@ class DefaultMessagingService(
     }
 
     /**
-     * PR-CRYPTO-SESSION-REPAIR1 commit 5a (2026-05-31). Mirrors the
-     * normal text-receive side effects (lines ~2820–2939 in
-     * `handleDeliver`) so a replayed text payload behaves as if it
-     * arrived via the live receive path: durably persisted, visible
-     * in the chat list, surfaced via `_incomingMessages`, and
-     * notified.
+     * PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31). Conversation
+     * upsert + `_incomingMessages.emit` + notification — the post-
+     * `saveSession` half of the text-receive mirror. Splits commit
+     * 5a's `applyTextReplaySideEffects` so the insert can run BEFORE
+     * the ratchet commit and the upsert/emit/notify after, per the
+     * architect-locked step ordering.
      *
-     * MUST be called only when `payload.type == TYPE_MESSAGE`.
-     * Throws if any sub-step (insertMessage, upsertConversation,
-     * emit, notification) fails — the caller wraps this in try/catch.
+     * Throws if any sub-step fails — the caller wraps this in
+     * try/catch and records a replay attempt on failure.
      */
-    private suspend fun applyTextReplaySideEffects(
+    private suspend fun applyReplayConvUpsertEmitNotify(
         entry: DecryptFailedEnvelopeRepository.Entry,
         payload: MessagePayload,
-        wireFrame: WireFrame,
         conversationId: String,
-        convTag: String,
-        msgTag: String,
         nowMs: Long,
     ) {
-        // Insert message (INSERT OR IGNORE keeps it idempotent if a
-        // future cycle re-runs after a partial failure).
-        messageRepository.insertMessage(
-            MessageEntity(
-                id = entry.envelopeId,
-                conversationId = conversationId,
-                ciphertext = wireFrame.encryptedMessage.ciphertext,
-                plaintextCache = payload.text,
-                sent = false,
-                status = MessageStatus.DELIVERED,
-                createdAt = nowMs,
-                expiresAtMs = null,
-            )
-        )
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "DECRYPT_TRACE replay_inserted_text conv=$convTag msgId=$msgTag",
-        )
-
         // Upsert conversation: mirror the live receive's
         // preview/lastMessageAt/unreadCount++ on existing convs and
         // REQUEST-creation on unknown senders. In the repair-replay

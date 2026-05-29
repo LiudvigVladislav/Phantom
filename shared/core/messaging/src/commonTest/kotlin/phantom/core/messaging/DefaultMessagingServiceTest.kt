@@ -38,6 +38,7 @@ import phantom.core.transport.RelayTransport
 import phantom.core.transport.TransportState
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -378,6 +379,32 @@ private class PassthroughDoubleRatchet : DoubleRatchet {
         )
     override fun decrypt(state: RatchetState, message: EncryptedMessage): Pair<RatchetState, ByteArray> =
         state to message.ciphertext
+}
+
+// PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31). Passthrough
+// encrypt + decrypt returns a state with a recognizable marker
+// `receivingChainKey` (all-0x55) so the no-advance tests can detect
+// whether saveSession was called with the post-decrypt newState
+// (marker present in persisted state) or not (pre-decrypt state
+// preserved). Without this marker, plain Passthrough's
+// `state to ciphertext` would make every saved state look identical.
+private class MarkingPassthroughDoubleRatchet : DoubleRatchet {
+    override fun encrypt(state: RatchetState, plaintext: ByteArray): Pair<RatchetState, EncryptedMessage> =
+        state to EncryptedMessage(
+            ratchetPublicKey = state.sendingRatchetPublicKey,
+            messageIndex = state.sendCount,
+            ciphertext = plaintext,
+            nonce = ByteArray(24),
+        )
+
+    override fun decrypt(state: RatchetState, message: EncryptedMessage): Pair<RatchetState, ByteArray> {
+        val markedState = state.copy(receivingChainKey = MARKER_RECEIVING_CHAIN_KEY)
+        return markedState to message.ciphertext
+    }
+
+    companion object {
+        val MARKER_RECEIVING_CHAIN_KEY: ByteArray = ByteArray(32) { 0x55.toByte() }
+    }
 }
 
 private class PassthroughX3DH : X3DHProtocol {
@@ -3026,6 +3053,277 @@ class DefaultMessagingServiceTest {
         val senderPubKeyHex: String,
     )
 
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31) — Replay Ratchet
+    // Commit Ordering tests.
+    //
+    // Architect-locked: the receive ratchet MUST NOT be advanced
+    // (saveSession) until the replayed plaintext is known to be a
+    // supported text payload AND durably inserted. These tests prove
+    // that:
+    //   - insert failure leaves the ratchet un-advanced;
+    //   - complex (non-TYPE_MESSAGE) payload leaves the ratchet
+    //     un-advanced (so a follow-up complex-handler commit can
+    //     re-decrypt and advance via the proper handler);
+    //   - successful text replay honours the conversation's
+    //     disappearing-timer setting on the inserted row.
+    //
+    // The MarkingPassthroughDoubleRatchet ratchet returns a state
+    // whose receivingChainKey is a recognizable marker (all-0x55).
+    // After a FAILED replay, the persisted state's receivingChainKey
+    // must NOT be the marker (saveSession not called with newState).
+    // After a SUCCESSFUL replay, the persisted state's
+    // receivingChainKey MUST be the marker.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun replay_insert_failure_does_not_advance_ratchet() = runTest {
+        LibsodiumInitializer.initialize()
+        // MarkingPassthroughDoubleRatchet so we can detect ratchet
+        // commit via the marker receivingChainKey.
+        val ratchet = MarkingPassthroughDoubleRatchet()
+        val backingMsgRepo = FakeMessageRepository()
+        val throwingMsgRepo = ThrowingInsertMessageRepository(
+            delegate = backingMsgRepo,
+            throwOnIds = setOf("env-no-advance-on-insert-fail"),
+        )
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = ratchet,
+            msgRepoOverride = throwingMsgRepo,
+        )
+
+        // Held envelope with valid TYPE_MESSAGE payload — decrypt
+        // and payload-decode both succeed; only the held envelope's
+        // insertMessage throws (id-targeted). Per commit 5b ordering:
+        // insert runs BEFORE saveSession, so its failure must leave
+        // the ratchet un-advanced.
+        val heldPayload = MessagePayload(type = "message", text = "should not advance ratchet")
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-no-advance-on-insert-fail",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = 1_200L,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-no-advance-insert",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger no-advance",
+            ),
+        )
+
+        // Held row remains + attempt recorded.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(1, held.size, "insert-fail MUST keep the held row")
+        assertEquals(1L, held[0].replayAttemptCount)
+
+        // THE CRITICAL INVARIANT for commit 5b: the receive ratchet
+        // was NOT advanced. The bootstrap save (via encryptUnderLock)
+        // already wrote a state to the repo, but that state's
+        // receivingChainKey is the pre-seeded all-zero ByteArray —
+        // NOT the marker (all-0x55) that MarkingPassthroughDoubleRatchet
+        // .decrypt produces. If commit 5b's reorder were missing, the
+        // failed replay would have called saveSession on the marker
+        // state BEFORE the insert throw, persisting the marker.
+        val sessionAfter = rig.sessionManager.tryLoadSession(rig.convId)
+        assertTrue(sessionAfter != null, "session must still exist after failed replay")
+        assertFalse(
+            sessionAfter!!.receivingChainKey?.contentEquals(
+                MarkingPassthroughDoubleRatchet.MARKER_RECEIVING_CHAIN_KEY,
+            ) == true,
+            "insert-fail MUST leave the ratchet UN-ADVANCED — receivingChainKey " +
+                "must NOT carry the post-decrypt marker; got " +
+                "${sessionAfter.receivingChainKey?.joinToString(",", limit = 6)}",
+        )
+        // No ack, no markProcessed.
+        assertTrue("env-no-advance-on-insert-fail" !in rig.transport.ackedDelivers)
+        assertEquals(false, rig.processedRepo.exists("env-no-advance-on-insert-fail"))
+        // Anti-loop: sessionSuspect stays cleared.
+        assertEquals(false, rig.convRepo.getConversation(rig.convId)?.sessionSuspect ?: true)
+    }
+
+    @Test
+    fun replay_complex_payload_does_not_advance_ratchet() = runTest {
+        LibsodiumInitializer.initialize()
+        val ratchet = MarkingPassthroughDoubleRatchet()
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = ratchet,
+        )
+
+        // Held envelope with a NON-TYPE_MESSAGE payload — voice
+        // chunk. Step 5 (TYPE_MESSAGE gate) fails → return false
+        // BEFORE saveSession.
+        val heldPayload = MessagePayload(
+            type = MessagePayload.TYPE_AUDIO_CHUNK,
+            text = "",
+        )
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-complex-no-advance",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = 1_300L,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-complex-no-advance",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger complex no-advance",
+            ),
+        )
+
+        // Held row remains + attempt recorded.
+        val held = rig.decryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(1, held.size, "complex-payload replay MUST keep the held row")
+        assertEquals("env-complex-no-advance", held[0].envelopeId)
+        assertEquals(1L, held[0].replayAttemptCount)
+
+        // No ack, no markProcessed (complex payloads in 5a/5b are
+        // held + recordAttempt + no ack + no delete until a follow-
+        // up complex-handler commit ships).
+        assertTrue(
+            "env-complex-no-advance" !in rig.transport.ackedDelivers,
+            "complex-payload replay MUST NOT ack",
+        )
+        assertEquals(
+            false,
+            rig.processedRepo.exists("env-complex-no-advance"),
+            "complex-payload replay MUST NOT markProcessed",
+        )
+
+        // THE CRITICAL INVARIANT: ratchet NOT advanced. When the
+        // complex-handler commit lands, that handler will re-decrypt
+        // this exact wireFrame under the same un-advanced chain key
+        // and will be the one to advance the ratchet correctly.
+        val sessionAfter = rig.sessionManager.tryLoadSession(rig.convId)
+        assertTrue(sessionAfter != null)
+        assertFalse(
+            sessionAfter!!.receivingChainKey?.contentEquals(
+                MarkingPassthroughDoubleRatchet.MARKER_RECEIVING_CHAIN_KEY,
+            ) == true,
+            "complex-payload replay MUST leave the ratchet UN-ADVANCED — " +
+                "receivingChainKey must NOT carry the post-decrypt marker",
+        )
+    }
+
+    @Test
+    fun replayed_text_honours_disappearing_timer() = runTest {
+        LibsodiumInitializer.initialize()
+        // PassthroughDoubleRatchet for a clean success path; the
+        // disappearing-timer assertion does not depend on ratchet
+        // marker semantics.
+        val rig = buildReplayRig(
+            scope = this,
+            ratchet = PassthroughDoubleRatchet(),
+        )
+
+        // Set the conversation's disappearing timer to 60 seconds.
+        // The replayed text row MUST inherit it the same way a
+        // live-receive text row would.
+        val timerSecs = 60L
+        rig.convRepo.setDisappearingTimer(rig.convId, timerSecs)
+
+        // Held text envelope.
+        val heldText = "should disappear after timer"
+        val heldPayload = MessagePayload(type = "message", text = heldText)
+        val heldPayloadJson = json.encodeToString(MessagePayload.serializer(), heldPayload)
+        val heldWireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = heldPayloadJson.encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        rig.decryptFailedRepo.insert(
+            envelopeId = "env-disappearing-replay",
+            conversationId = rig.convId,
+            senderPubKeyHex = rig.bobHex,
+            errorType = "mac",
+            receivedAtMs = 1_400L,
+            x3dhInitPresent = false,
+            wireFrameJson = json.encodeToString(WireFrame.serializer(), heldWireFrame),
+        )
+
+        rig.service.sendMessage(
+            OutgoingMessage(
+                id = "msg-trigger-disappearing",
+                conversationId = rig.convId,
+                recipientPublicKeyHex = rig.bobHex,
+                text = "trigger disappearing",
+            ),
+        )
+
+        // The replayed text row inherits the disappearing timer.
+        val inserted = rig.msgRepo.messages.firstOrNull { it.id == "env-disappearing-replay" }
+        assertTrue(
+            inserted != null,
+            "replay success MUST insert the text row; got ${rig.msgRepo.messages.map { it.id }}",
+        )
+        val expiresAt = inserted!!.expiresAtMs
+        assertTrue(
+            expiresAt != null,
+            "replayed text MUST inherit disappearing-timer expiry; got null",
+        )
+        assertTrue(
+            expiresAt!! > inserted.createdAt,
+            "expiresAtMs MUST be in the future relative to createdAt — " +
+                "createdAt=${inserted.createdAt} expiresAtMs=$expiresAt",
+        )
+        // The exact gap should equal timer * 1000 — same formula as
+        // the live receive path uses.
+        assertEquals(
+            timerSecs * 1_000L,
+            expiresAt - inserted.createdAt,
+            "expiresAtMs - createdAt MUST equal disappearing timer in ms " +
+                "(matches live-receive formula)",
+        )
+
+        // Success: held row deleted, processed, acked.
+        assertEquals(
+            0,
+            rig.decryptFailedRepo.listByConversation(rig.convId).size,
+            "replay success MUST delete the held row",
+        )
+        assertTrue("env-disappearing-replay" in rig.transport.ackedDelivers)
+        assertEquals(true, rig.processedRepo.exists("env-disappearing-replay"))
+    }
+
     /**
      * Test rig for commit-5 replay tests. Sets up Bob's real prekey
      * bundle, SessionManager wired with [real X3DH], pre-seeds a conv
@@ -3126,6 +3424,7 @@ class DefaultMessagingServiceTest {
             convRepo = convRepo,
             processedRepo = processedRepo,
             decryptFailedRepo = decryptFailedRepo,
+            sessionManager = sessionManager,
             bobHex = bobHex,
             convId = convId,
             service = service,
@@ -3138,6 +3437,11 @@ class DefaultMessagingServiceTest {
         val convRepo: FakeConversationRepository,
         val processedRepo: FakeProcessedEnvelopeLedger,
         val decryptFailedRepo: FakeDecryptFailedEnvelopeLedger,
+        // PR-CRYPTO-SESSION-REPAIR1 commit 5b (2026-05-31): exposed
+        // so the no-advance tests can inspect the saved ratchet state
+        // and prove saveSession did NOT run on the failing-replay
+        // paths (insert failure / complex payload / payload decode).
+        val sessionManager: SessionManager,
         val bobHex: String,
         val convId: String,
         val service: DefaultMessagingService,
