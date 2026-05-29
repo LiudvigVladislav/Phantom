@@ -589,6 +589,73 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-29 (fri) · PR-CRYPTO-SESSION-REPAIR1 MERGED — hold MAC errors instead of ack-and-lose; replay after fresh X3DH; 24h local TTL
+
+PR #243 squash-merged at `a292ac4f` on 2026-05-29T05:48:09Z after eight architect ACK rounds (commits 1+2 plumbing, 3a hold branch, 3b/3c invariant tests, 4 fresh X3DH, 5 replay loop, 5a Replay Safety Patch, 5b Replay Ratchet Commit Ordering, 6 24h TTL eviction) plus an explicit final-merge ACK and an explicit Vladislav greenlight on the merge step. Closes the silent-message-loss class first hardened in agent memory as `bug_force_stop_ratchet_corruption_2026_05_27.md`: on Tecno after force-stop / re-install cycles, the receiver's persisted Double Ratchet state drifted away from the sender's view, the next incoming envelope hit `Permanent decrypt failure (MAC error)`, the existing receive path ack-delivered it and wrote `processed_envelopes.FAILED_MAC`, and the message was silently lost — only working remediation up to this PR was `pm clear phantom.android` (identity wipe).
+
+**Production behavior unchanged.** The new path is gated on `holdMacFailures = phantom.android.BuildConfig.DEBUG` wired in `AppContainer.kt`. Release APKs keep the existing ack-on-MAC + FAILED_MAC code path completely intact. Debug / beta APKs (where `BuildConfig.DEBUG == true`) now run the hold → suspect → fresh X3DH → bounded-replay → 24h-TTL cycle.
+
+**What shipped (17 commits squashed):**
+
+- **Storage layer (commit 1, `94d5e7ff`)** — new SqlDelight table `decrypt_failed_envelopes` (forward-only migration `18.sqm`) and two new columns on `conversation` (`session_suspect`, `session_suspect_set_at_ms`, migration `19.sqm`). Repository interface + impl + in-memory test fake. Zero behaviour change. Both columns default `0 / NULL`; the new table starts empty. Existing rows survive untouched on upgrade.
+- **Observability + DI wiring (commit 2, `7825fa3b`)** — `DefaultMessagingService` constructor gains `holdMacFailures: Boolean = false` + `decryptFailedEnvelopeRepository: DecryptFailedEnvelopeRepository? = null`. `AppContainer.kt` instantiates `SqlDelightDecryptFailedEnvelopeRepository(dbHolder.database)` and passes it to DMS alongside `holdMacFailures = BuildConfig.DEBUG`. Six `DECRYPT_TRACE` log lines added at decrypt decision points — flag plumbed but unused this commit, observability only.
+- **Hold branch in `handleDeliver` (commits 3a/3b/3c, `8404e9c5` + `1599b351` + `22af5d7b` + `0362e782`)** — additive `if (holdMacFailures && repo != null)` branch BEFORE the existing ack + markProcessed code in the MAC-error site. The hold branch persists the inner `WireFrame` JSON to `decrypt_failed_envelopes`, marks `conversation.session_suspect = true`, and does NOT ack and does NOT markProcessed. The `else` branch (release: `holdMacFailures = false`) keeps the current ack-on-MAC + FAILED_MAC path completely unchanged. Architect P2 from 3a (3c) relocated the destructive-ack warning INTO the release-only branch where it actually applies. Five-test invariant matrix shipped in 3b + 3c: hold-in-debug, ack-on-release, normal-debug, normal-release, byte-level `wire_frame_json` regression — all green.
+- **Suspect-driven fresh X3DH (commit 4, `e42bb0ca`)** — when the next outgoing in a `session_suspect = true` conversation enters `encryptUnderLock`, it forces a fresh X3DH bootstrap regardless of any cached ratchet state. Per-conversation `mutexFor(conversationId)` (architect pre-decision #1, reuse-existing-mutex) serializes the repair. The suspect flag is cleared ONLY after the local `saveSession(newState)` commit succeeds — not after `transport.send`. Architect-locked: if anything between bootstrap and `saveSession` throws, the suspect flag stays `true` so the NEXT outgoing retries the repair.
+- **Replay loop after successful repair (commits 5 / 5a / 5b, `8ad94320` + `679e7347` + `b24b09a7`)** — `replayHeldEnvelopesAfterRepair` runs inside the same per-conversation mutex immediately after `clearSessionSuspect`. The final shape after 5a Safety Patch + 5b Ratchet Commit Ordering is: decode WireFrame → load fresh session → `ratchet.decrypt` IN MEMORY → decode `MessagePayload` → require `TYPE_MESSAGE` → insert text row with disappearing-timer expiry → **`saveSession(newState)`** → upsert conversation + emit `_incomingMessages` + notification callback → markProcessed → ack → delete held row. Failures at steps 1–6 return `false` BEFORE `saveSession`, leaving the receive chain un-advanced so the same row remains decryptable on the next replay cycle.
+- **24h local TTL eviction (commit 6, `4378c462`)** — new `HELD_ENVELOPE_TTL_MS = 24h` constant next to `MAX_REPLAY_ATTEMPTS_PER_HELD = 3L` on the companion. Opportunistic `deleteOlderThan(nowMs - HELD_ENVELOPE_TTL_MS)` runs BEFORE `listByConversation` at the entry of `replayHeldEnvelopesAfterRepair`. Sweep failure is non-fatal (logged; surviving rows still get their decrypt attempts). LOCAL cleanup only — no `sendDeliveryAck`, no `markProcessed`, no `setSessionSuspect`. Relay-side envelope TTL is separate and authoritative.
+
+**Architect invariants enforced and test-covered (final replay loop):**
+
+1. **Outer per-envelope guard** (5a): no replay exception escapes back into `encryptUnderLock`. The trigger-send that drove the repair is NEVER aborted by replay failure. `recordReplayAttempt` is itself `runCatching`-wrapped.
+2. **Strict step order** (5b): insert is the durability gate; `saveSession` runs ONLY after the durable text insert succeeds. Insert-fail / complex-payload / payload-decode-fail return BEFORE `saveSession`, leaving the receive chain un-advanced. Verified by `replay_insert_failure_does_not_advance_ratchet` and `replay_complex_payload_does_not_advance_ratchet` using a marker `MarkingPassthroughDoubleRatchet` whose `decrypt` returns a state with a recognizable `receivingChainKey = ByteArray(32) { 0x55 }`.
+3. **Anti-loop guarantee** (architect pre-decision #3 invariant 4): NO failure path EVER re-sets `session_suspect`. A failed replay does not retrigger another bootstrap. Verified by 4 separate tests.
+4. **Diagnostic cap + safety net**: `MAX_REPLAY_ATTEMPTS_PER_HELD = 3` (architect-locked diagnostic cap) and `HELD_ENVELOPE_TTL_MS = 24h` (primary safety net). Capped attempts protect against tight loop on a single bootstrap; TTL is the cleanup for accumulated stale rows.
+5. **Per-conversation scope + mutex serialization**: replay only touches rows for the conversation that just got repaired; all paths run inside the existing `mutexFor(conversationId)` — no concurrent ratchet races.
+6. **Disappearing-timer mirror** (5b): replayed text rows inherit `expiresAtMs = nowMs + timerSecs * 1000` using the same formula as the live-receive path at `handleDeliver` lines ~2820–2840.
+7. **Complex-payload handling** (5a tightened): non-`TYPE_MESSAGE` payloads stay held + recordAttempt + ratchet un-advanced + no ack + no delete. Commit 5's earlier "ack + delete on complex" would have silently discarded payloads the user never sees. Group / voice chunk / reaction / pin replay UI handlers deferred to a follow-up commit; the un-advanced ratchet means the same `WireFrame` remains decryptable when that handler ships.
+
+**Replay-specific test catalogue (all green, 15 tests):**
+
+1. `held_envelope_replayed_after_repair_success` *(5)*
+2. `replay_success_deletes_held_row_and_marks_processed` *(5)*
+3. `replay_fail_leaves_envelope_held_and_does_not_set_suspect` *(5)*
+4. `replay_attempts_capped_at_three` *(5)*
+5. `replay_is_per_conversation_only` *(5)*
+6. `replay_insert_failure_keeps_row_no_ack_no_processed` *(5a)*
+7. `replay_payload_decode_failure_keeps_row_no_ack_no_processed` *(5a)*
+8. `replay_side_effect_failure_does_not_abort_trigger_send` *(5a)*
+9. `replayed_text_updates_conversation_and_emits_incoming` *(5a)*
+10. `replay_insert_failure_does_not_advance_ratchet` *(5b)*
+11. `replay_complex_payload_does_not_advance_ratchet` *(5b)*
+12. `replayed_text_honours_disappearing_timer` *(5b)*
+13. `held_ttl_evicts_old_rows` *(6)*
+14. `held_ttl_keeps_recent_rows` *(6)*
+15. `ttl_sweep_does_not_ack_or_mark_processed` *(6)*
+
+**Final verification (pre-merge):**
+
+- `:shared:core:messaging:jvmTest` → `DefaultMessagingServiceTest` — **48 tests, 0 failures** (15 replay + 33 pre-existing)
+- `:shared:core:messaging:jvmTest` → 8 sibling classes (`Alpha0IntegrationTest`, `ChatThreadStateHolderTest`, `MediaChunkerTest`, `MigrationManagerTest`, `PreKeyLifecycleServiceTest`, `SessionManagerTest`, `VoiceManifestSerializationTest`, `VoiceV2SendReceiveTest`) — **56 tests, 0 failures**
+- `:shared:core:storage:jvmTest` → 8 classes (`ConversationRepositoryTest`, `MessageRepositoryTest`, `PrivateKeyStorageCodecTest`, `ProcessedEnvelopeRepositoryContractTest`, `RatchetStateRepositoryTest`, `RatchetStateStorageCodecTest`, `VoiceChunkRepositoryContractTest`, `VoiceV2DownloadRepositoryContractTest`) — **52 tests, 0 failures**
+- `:apps:android:assembleDebug` — **BUILD SUCCESSFUL**. APK SHA256 `f09b0e04a8f1e112f09dd43ec79e10904dab05e143d57d33a264e38383fb68df`.
+- GitHub CI checks pre-merge: 3/3 green (build-and-test, build-test, lint).
+
+**Test #87 manual MAC repro — honest status:** The triggering bug (`Permanent decrypt failure (MAC error)` after multiple force-stop + re-install cycles on the Tecno receiver) is **not deterministically reproducible on demand**. The original repro was naturally occurring after a multi-day force-stop pattern accumulating ratchet drift; standard manual force-stop + reinstall during the final-hardening window did not reproduce the MAC mismatch. The PR's correctness rests on the 48-test invariant matrix. Post-merge observation point: a row appearing in `decrypt_failed_envelopes` on any debug / beta install is the diagnostic signal that the bug actually fired on a real device — the hold table itself is the empirical reproducer that was missing during final hardening.
+
+**Locked process gates that fired:**
+
+- **WORKING_RULES Rule 8** (transport regression gate): carve-out applies — this PR is crypto-only and does not touch chain selection / reconnect lifecycle / network-change / probes / WS-REST fallback. Documented in the PR body under "Architectural rationale".
+- **WORKING_RULES Rule 9** (no merge without verification): eight architect ACK rounds on the PR thread, one per commit (1+2 plumbing, 3a, 3b/3c invariant tests, 4, 5, 5a, 5b, 6) + an explicit final-merge ACK. Each round produced grep-verified fix mappings on the PR comment thread. PR body rewritten at final hardening to reflect actual landed state (stale "commit 3 not landed" wording removed).
+
+**Architectural rationale preserved in PR body and mini-lock** (`docs/tracks/crypto-session-repair.md`):
+
+- Per-conversation mutex reuse (pre-decision #1): repair piggybacks on existing `mutexFor(conversationId)`, not a parallel `ConcurrentHashMap`.
+- Receive ack ownership stays in DMS (pre-decision #2): `SessionRepairService` as a separate file was preserved as an option but not split in this PR. Repair logic stays inline in `DefaultMessagingService`, scoped to `encryptUnderLock` + `replayHeldEnvelopesAfterRepair`.
+- 24h TTL as the primary limiter, 3-attempt cap as the diagnostic guard (pre-decision #3 cont.).
+- Forward-only migrations (commit 1): rollback safe without schema rollback since new columns default `0 / NULL` and the new table stays empty if the new code is never executed.
+
+**Stabilization Sprint queue advances.** PR-CRYPTO-SESSION-REPAIR1 (position #2) is now ✅ DONE. **Next: PR-UI-CHAT-NEW-MSG-CHIP1** (position #3, branch `feat/pr-ui-chat-new-msg-chip1` exists in repo with the early scaffold; mini-lock at `docs/tracks/chat-new-msg-chip.md`; designer handoff at `phantom-messengers/project/Scroll-to-bottom.html` with all tokens locked — 44×44dp circle, 14dp anchors, cyan #00D4FF badge, MONO 10sp tabular figures, enter 180 ms / exit 140 ms / badge bump 220 ms). After CHIP1 the remaining Stabilization Sprint items continue: RENDER-PERF1 (conditional — fire only if Vladislav still feels manual scroll jerks after CHIP1) → NOTIF-POLICY1 → D1e. Master HEAD after merge: `a292ac4f`.
+
 ### 2026-05-28 (thu, late) · PR-LTE-NETCHANGE1 MERGED — Event.NetworkChanged wired + TransportRewalkCoordinator + LTE attribution diagnostics
 
 PR #241 `899d45bd` merged after three architect review rounds (functional Test #88 PASS on Tecno Tele2 LTE) and three additive commits preserving the verification trail (`61b4da0b` initial impl → `ea9b74a4` 3 P1 fixes → `b340eba5` P2 fix + KDoc nit). Closes the dead-handler gap empirically reproduced in PR #240's baseline Scenario B (zero `NETWORK_TRACE` lines, no fresh `chain_start` after Wi-Fi → LTE).
