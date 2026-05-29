@@ -589,6 +589,67 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-05-29 (fri, late) · Out-of-queue: phntm.pro site replace + funding.json donation URL fix — both LIVE in single deploy sweep
+
+Two out-of-queue PRs deployed back-to-back in one VPS sweep, ahead of resuming the Stabilization Sprint queue at PR-UI-CHAT-NEW-MSG-CHIP1.
+
+**PR #245 `3109126f` — funding.json donation URL typo fix.** Two URLs were silently 404ing since the file shipped in PR #215 / #221:
+- Liberapay was `liberapay.com/phantom-messenger` (lowercase p) → fixed to `liberapay.com/Phantom-messenger` (capital P; Liberapay handles are case-sensitive in the URL).
+- Buy Me a Coffee was `buymeacoffee.com/phantommessenger` (old handle) → fixed to `buymeacoffee.com/phantompro` (Vladislav changed the BMAC handle).
+
+2-line diff in `funding.json`, JSON validity re-checked, schema unchanged at v1.1.0. CI 3/3 green; merged on Rule 9 typo carve-out (architect ACK + Vladislav-explicit "обновить в репо") without an architect-thread re-review round.
+
+**PR #246 `dd0b3dce` — phntm.pro static site replacing the stub landing.** Replaces the prior placeholder (`<meta name="robots" content="noindex,nofollow">` + "Alpha invites coming soon" + `hello@phntm.pro` email) with the full project site authored by Vladislav at `D:\VL Stories Studio\phantom-site-final\`:
+
+- **Four pages**, bilingual EN / RU: `index.html` (hero / features / privacy modes / transports / status), `about.html` (mission / how-built / who-builds), `roadmap.html` (Shipped / In progress / Planned), `donate.html` (channels + crypto copy-buttons for BTC / XMR / ETH).
+- **Each HTML self-contained** — CSS + JS inlined, logo embedded as base64 data URI. CDN dependencies only for fonts (Inter + JetBrains Mono via Google Fonts, Geist via jsdelivr) with fallback fonts in the family stack.
+- **Browser-language autodetect** + manual EN / RU switcher with `localStorage` persistence. Scroll-reveal + hover-lift animations (`prefers-reduced-motion` respected). Clipboard-copy for crypto addresses.
+- **`<meta name="robots" content="index,follow">` baked into every `<head>`** as defense-in-depth against any reverse-proxy / CDN inheritance of the old stub's `noindex,nofollow` directive. The new robots meta lands in both the four committed HTML files AND the four `.build/build_*.py` regen scripts so future rebuilds preserve it.
+- **`site/static/` (NOT `assets/`)** — Caddy on phntm.pro has a dedicated `handle_path /assets/*` route that proxies to `/srv/legal/assets/` for the legal pages (`/terms`, `/privacy`). Using `assets/` for site files would silently 404 any future `<img src="assets/...">` reference. Currently invisible at runtime because every HTML embeds the logo as base64 inline, but the build scripts already write `static/phantom-logo.jpg` so any future build that decides to use external images instead of base64 will work without surprise.
+- **`site/.build/` (NOT `_build_scripts/`)** — Caddy `file_server` hides dot-prefix files by default; underscore-prefix is NOT auto-hidden. Dot-prefix keeps the build artefacts versioned in git but invisible at `https://phntm.pro/.build/*` (404 instead of 200 with directory listing).
+
+**Roadmap security wording precision fix** during final review. Drafts had "Eight P1 security findings closed (keystore-wrap, signed auth, key rotation)" — the "Eight" count was not verifiable against ADR-023 / ADR-024 / ADR-027 evidence (which cover 4 findings across 3 ADRs: F22 prekey wrap, F8 ratchet state wrap, F11 + F26 signed-challenge auth). Reworded to verifiable form per Vladislav 2026-05-29:
+- EN: "Multiple P1 cryptographic findings resolved: prekey wrap, ratchet state wrap, signed-challenge authentication."
+- RU: "Усиление безопасности — закрыты P1-находки по криптографии: оборачивание prekey, оборачивание состояния ratchet, подписанная аутентификация."
+
+Both `roadmap.html` and `.build/build_roadmap.py` updated together so future regenerations preserve the precision.
+
+**Single-sweep deploy** on Hetzner VPS at 2026-05-29 closed BOTH PRs in one `git pull` + `docker compose up -d --force-recreate caddy` + one Cloudflare Dashboard purge:
+
+```
+cd /home/phantom/Phantom && git pull
+cd deploy && docker compose up -d --force-recreate caddy
+# Cloudflare Dashboard → phntm.pro → Caching → Configuration → Purge Everything
+```
+
+`--force-recreate` required because `funding.json` is a single-file bind-mount (inode trap from PR #218 / #219 / #221 — container holds original inode after `git pull` overwrites the file on disk). The site uses a directory bind-mount which is less fragile but the same `--force-recreate` covers both.
+
+**Four `curl` verify checks all PASS on the live host** (output captured from `phantom@phantom-relay-01`):
+
+1. `curl -sL https://phntm.pro/ | grep '<meta name="robots"'` → `<meta name="robots" content="index,follow">` ✅
+2. `curl -sL https://phntm.pro/ | grep -i 'noindex'` → empty ✅
+3. `curl -s https://phntm.pro/funding.json | grep -E 'liberapay|buymeacoffee'` → `Phantom-messenger` (capital P) + `phantompro` ✅
+4. `curl -sI https://phntm.pro/{about,roadmap,donate}.html | head -1` → HTTP/2 200 on all three ✅
+
+**docker-compose change** (one line in `services.caddy.volumes`):
+- Was: `./landing:/srv/landing:ro`
+- Is now: `../site:/srv/landing:ro`
+
+Container path `/srv/landing` unchanged → Caddyfile root path stays correct, **no Caddyfile edit required**. The previous `deploy/landing/` directory stays in git history as historical artefact but is no longer bind-mounted; revert that single line to roll back.
+
+**What is NOT changed** (preserved across deploy):
+- `funding.json` at repo root — already separately bind-mounted as `../funding.json:/srv/funding/funding.json:ro` and served at `https://phntm.pro/funding.json` by a dedicated Caddyfile `handle`.
+- `.well-known/funding-manifest-urls` at repo root — for the FLOSS/fund GitHub wellKnown proof only. NOT served via phntm.pro.
+- `deploy/well-known/assetlinks.json` — Android App Links manifest, separately bind-mounted to `/srv/well-known`.
+- Caddy auto-managed `.well-known/acme-challenge/` and the `caddy_data` named volume (Let's Encrypt certs + keys).
+
+**Process gates that fired:**
+
+- **WORKING_RULES Rule 8** (transport regression gate): carve-out applies on both PRs — docs / site / funding.json changes don't touch transport chain selection or reconnect lifecycle.
+- **WORKING_RULES Rule 9** (no merge without verification): PR #245 merged on typo carve-out (Vladislav-explicit "обновить в репо" + 2-line diff). PR #246 merged after a 7-section grep-verified checklist (structure / paths, HTML content, donate URLs, build-script sync, docker-compose surgical edit, Caddyfile-not-touched, README) + CI 3/3 green + explicit Vladislav "го" greenlight. Drafts source authoring attribution preserved in PR body and commit message.
+
+**Stabilization Sprint queue** — unchanged. Next: **PR-UI-CHAT-NEW-MSG-CHIP1** (position #3, mini-lock at `docs/tracks/chat-new-msg-chip.md`; branch `feat/pr-ui-chat-new-msg-chip1` carries early scaffold from pre-Stabilization-Sprint period — diff against current master before reusing). Master HEAD after this docs PR: pending merge.
+
 ### 2026-05-29 (fri) · PR-CRYPTO-SESSION-REPAIR1 MERGED — hold MAC errors instead of ack-and-lose; replay after fresh X3DH; 24h local TTL
 
 PR #243 squash-merged at `a292ac4f` on 2026-05-29T05:48:09Z after eight architect ACK rounds (commits 1+2 plumbing, 3a hold branch, 3b/3c invariant tests, 4 fresh X3DH, 5 replay loop, 5a Replay Safety Patch, 5b Replay Ratchet Commit Ordering, 6 24h TTL eviction) plus an explicit final-merge ACK and an explicit Vladislav greenlight on the merge step. Closes the silent-message-loss class first hardened in agent memory as `bug_force_stop_ratchet_corruption_2026_05_27.md`: on Tecno after force-stop / re-install cycles, the receiver's persisted Double Ratchet state drifted away from the sender's view, the next incoming envelope hit `Permanent decrypt failure (MAC error)`, the existing receive path ack-delivered it and wrote `processed_envelopes.FAILED_MAC`, and the message was silently lost — only working remediation up to this PR was `pm clear phantom.android` (identity wipe).
