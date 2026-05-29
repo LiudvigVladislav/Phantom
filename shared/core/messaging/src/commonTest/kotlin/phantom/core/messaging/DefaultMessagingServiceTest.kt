@@ -39,6 +39,7 @@ import phantom.core.transport.TransportState
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -3995,6 +3996,532 @@ class DefaultMessagingServiceTest {
         assertEquals(0, voiceRepo.countChunks("v-stale"))
         assertEquals(0, msgRepo.messages.count { it.plaintextCache?.startsWith("[AUDIO:") == true })
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 3 (2026-05-29) — receive-path
+    // integration tests for the inbound-repair branch shipped in Commit 2
+    // (23394e8f) + Commit 2a (daf7c5f9).
+    //
+    // Per mini-lock §Test plan + Vladislav-locked Commit 2 guardrails
+    // 2026-05-29: 4 dedicated tests covering the new branch's behaviour.
+    // The most important test (Vladislav's specific emphasis) is #2:
+    // pre-seeded stale ratchet row + inbound x3dhInit + candidate decrypt
+    // FAILS → persisted ratchet row byte-identical after receive, no
+    // ACK in hold mode, existing PR #243 commit 3a hold path still owns
+    // suspect behaviour.
+    //
+    // Each test follows the existing wire-flow pattern from
+    // `recipientBootstrap_consumes_singleUseOPK_andDerivesSameRootKeyAs_initiator`
+    // (line ~855) but with two key differences:
+    //   - Bob's ratchet repo is pre-seeded with a STALE session row
+    //     (all-zero state) so `if (state != null)` fires at line 2328;
+    //   - Bob's DoubleRatchet either fails MAC on stale-only (Test 1,
+    //     candidate succeeds via real LibsodiumDoubleRatchet) or always
+    //     fails MAC (Test 2, candidate also fails via MacFailing variant).
+    //
+    // Note on test ratchet choice: real `LibsodiumDoubleRatchet` decrypt
+    // under the all-zero seeded state naturally fails MAC because Alice
+    // encrypted under a real X3DH-derived chain. So Test 1 uses real
+    // LibsodiumDoubleRatchet — the stale-vs-candidate behaviour emerges
+    // from real crypto, no mock needed. Test 2 uses MacFailingDoubleRatchet
+    // (the existing fixture from line ~4251) so candidate decrypt fails
+    // deterministically.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun inbound_repair_success_savesAdvancedState_processesEnvelope_andFlowsToDownstream() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = buildInboundRepairRig(
+            testScope = this,
+            bobRatchet = phantom.core.crypto.LibsodiumDoubleRatchet(),
+        )
+
+        // Deliver Alice's wire frame to Bob.
+        rig.deliverAliceWireFrameToBob("msg-inbound-repair-ok")
+        testScheduler.runCurrent()
+
+        // GATE: the candidate-decrypt path succeeded — payload landed
+        // in the message repo, processed ledger has PROCESSED, ack
+        // flowed via the normal downstream path, no held row was
+        // created, sessionSuspect stays false.
+        assertTrue(
+            rig.bobMsgRepo.messages.any { it.plaintextCache == "hello from alice — inbound repair test" },
+            "inbound repair SUCCESS MUST insert the decrypted message; " +
+                "got plaintexts=${rig.bobMsgRepo.messages.map { it.plaintextCache }}",
+        )
+        assertTrue(
+            rig.bobProcessedRepo.exists("msg-inbound-repair-ok"),
+            "inbound repair SUCCESS MUST markProcessed PROCESSED",
+        )
+        assertTrue(
+            "msg-inbound-repair-ok" in rig.bobTransport.ackedDelivers,
+            "inbound repair SUCCESS MUST ack via the normal downstream flow " +
+                "(invariant 4: no early ack, normal handleDeliver path runs the ack)",
+        )
+        assertEquals(
+            0,
+            rig.bobDecryptFailedRepo.listByConversation(rig.convId).size,
+            "inbound repair SUCCESS MUST NOT create any held row",
+        )
+        val convAfter = rig.bobConvRepo.getConversation(rig.convId)
+        assertEquals(
+            false,
+            convAfter?.sessionSuspect ?: false,
+            "inbound repair SUCCESS MUST NOT set sessionSuspect " +
+                "(invariant 3: new branch never re-suspects)",
+        )
+
+        // Verify the new ratchet state WAS persisted with the advanced
+        // (post-candidate-decrypt) state — NOT the stale all-zero row.
+        val newBlob = rig.bobRatchetRepo.getRatchetState(rig.convId)
+        assertNotNull(newBlob, "advanced state MUST be persisted on success")
+        assertNotEquals(
+            rig.staleSerializedState,
+            newBlob,
+            "advanced state MUST differ from the pre-receive stale state",
+        )
+    }
+
+    @Test
+    fun inbound_repair_decryptFailure_preservesOldSessionRowByteIdentical_fallsThroughToHold() = runTest {
+        // ── Vladislav-emphasised central invariant test for Commit 3 ──
+        // "pre-seeded stale ratchet row + inbound x3dhInit + candidate
+        //  decrypt fail → persisted ratchet row byte/field-identical
+        //  after receive, no ACK in hold mode, existing hold path still
+        //  owns suspect behavior."
+        LibsodiumInitializer.initialize()
+        val rig = buildInboundRepairRig(
+            testScope = this,
+            // MacFailing ALWAYS fails decrypt → both stale-state attempt
+            // AND candidate attempt fail MAC → fall through to existing
+            // hold branch unchanged.
+            bobRatchet = MacFailingDoubleRatchet(),
+        )
+
+        // Capture the on-disk session row BEFORE delivery for the
+        // byte-identity invariant check.
+        val sessionRowBeforeReceive = rig.bobRatchetRepo.getRatchetState(rig.convId)
+        assertNotNull(
+            sessionRowBeforeReceive,
+            "pre-condition: stale session row exists for the conversation",
+        )
+
+        rig.deliverAliceWireFrameToBob("msg-inbound-repair-fail")
+        testScheduler.runCurrent()
+
+        // ─── CENTRAL INVARIANT (mini-lock §Scope item 5) ───
+        // The on-disk session row MUST be byte-identical to its
+        // pre-receive content. No saveSession from the repair branch,
+        // no saveSession from the existing hold branch, no other
+        // mutation.
+        val sessionRowAfterReceive = rig.bobRatchetRepo.getRatchetState(rig.convId)
+        assertEquals(
+            sessionRowBeforeReceive,
+            sessionRowAfterReceive,
+            "CENTRAL INVARIANT (mini-lock §Scope item 5): the on-disk session " +
+                "row MUST be byte-identical to its pre-receive content after " +
+                "candidate-decrypt failure. Any difference means the inbound " +
+                "repair branch leaked a partial state commit.",
+        )
+
+        // No ACK: in hold mode (holdMacFailures=true + repo non-null),
+        // the existing PR #243 commit 3a branch does NOT ack on MAC
+        // failure. The new inbound-repair branch also does NOT ack on
+        // candidate failure (invariant 4: no early ack).
+        assertTrue(
+            "msg-inbound-repair-fail" !in rig.bobTransport.ackedDelivers,
+            "inbound repair failure + holdMacFailures=true MUST NOT ack the envelope",
+        )
+
+        // Existing hold path fires: held row created with
+        // x3dhInitPresent=true (this is the diagnostic signal post-merge
+        // that the inbound x3dhInit was received but the repair could
+        // not succeed).
+        val held = rig.bobDecryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(
+            1,
+            held.size,
+            "inbound repair failure MUST fall through to the existing hold " +
+                "branch (PR #243 commit 3a) which creates the held row",
+        )
+        assertEquals("msg-inbound-repair-fail", held[0].envelopeId)
+        assertEquals(
+            true,
+            held[0].x3dhInitPresent,
+            "held row MUST record x3dhInitPresent=true (the row's " +
+                "diagnostic field that distinguishes repair-attempted-but-failed " +
+                "from never-tried-repair holds)",
+        )
+
+        // Suspect set by existing hold path (NOT by the new repair
+        // branch — invariant 3).
+        val convAfter = rig.bobConvRepo.getConversation(rig.convId)
+        assertEquals(
+            true,
+            convAfter?.sessionSuspect ?: false,
+            "existing PR #243 commit 3a hold path MUST set sessionSuspect=true " +
+                "exactly as it does today (invariant 3: inbound-repair branch " +
+                "does NOT touch sessionSuspect itself, the existing hold branch " +
+                "does)",
+        )
+
+        // No PROCESSED entry — envelope was not successfully processed.
+        assertEquals(
+            false,
+            rig.bobProcessedRepo.exists("msg-inbound-repair-fail"),
+            "inbound repair failure MUST NOT markProcessed",
+        )
+    }
+
+    @Test
+    fun inbound_repair_notTriggered_when_x3dhInit_absent_fallsThroughToHold() = runTest {
+        // Regression for mini-lock §Test plan item 3:
+        //   "existing session + no x3dhInit + MAC still follows current hold path"
+        // The new branch fires ONLY when wireFrame.x3dhInit != null
+        // (invariant 1). Frames without an x3dhInit hint must reach the
+        // existing PR #243 commit 3a hold path with unchanged behaviour.
+        LibsodiumInitializer.initialize()
+        val rig = buildInboundRepairRig(
+            testScope = this,
+            bobRatchet = MacFailingDoubleRatchet(),
+            stripAliceX3dhInitFromWireFrame = true,  // Test-specific: remove x3dhInit
+        )
+
+        rig.deliverAliceWireFrameToBob("msg-no-x3dhInit")
+        testScheduler.runCurrent()
+
+        // Existing hold path fires unchanged — held row created with
+        // x3dhInitPresent=false.
+        val held = rig.bobDecryptFailedRepo.listByConversation(rig.convId)
+        assertEquals(1, held.size, "no x3dhInit + MAC fail MUST fall through to existing hold")
+        assertEquals(false, held[0].x3dhInitPresent, "held row records x3dhInitPresent=false")
+
+        // Suspect set by existing hold path.
+        assertEquals(
+            true,
+            rig.bobConvRepo.getConversation(rig.convId)?.sessionSuspect ?: false,
+        )
+
+        // No inbound_repair_armed log expected — no easy way to assert
+        // logs in unit tests, so the absence is implied by the existing
+        // hold-row contents (x3dhInitPresent=false) matching the
+        // pre-Commit-2 contract.
+
+        // No ack, no PROCESSED — same as Test 2.
+        assertTrue("msg-no-x3dhInit" !in rig.bobTransport.ackedDelivers)
+        assertEquals(false, rig.bobProcessedRepo.exists("msg-no-x3dhInit"))
+    }
+
+    @Test
+    fun inbound_repair_notTriggered_when_noExistingSession_usesNoSessionBootstrap() = runTest {
+        // Regression for mini-lock §Test plan item 4:
+        //   "no-session bootstrap path still works"
+        // The new branch lives inside `if (state != null)` (line 2328).
+        // When state == null, control goes to the `else` branch at line
+        // ~2559 — the existing no-session bootstrap path that calls
+        // sessionManager.recipientBootstrap(...) (= the thin wrapper
+        // shipped in Commit 1 that calls recipientBootstrapInMemory +
+        // saveSession). That path is unchanged from pre-PR behaviour.
+        LibsodiumInitializer.initialize()
+        val rig = buildInboundRepairRig(
+            testScope = this,
+            bobRatchet = phantom.core.crypto.LibsodiumDoubleRatchet(),
+            skipBobStaleSessionSeed = true,  // Test-specific: state == null
+        )
+
+        rig.deliverAliceWireFrameToBob("msg-no-session-bootstrap")
+        testScheduler.runCurrent()
+
+        // Existing no-session bootstrap path: message inserted, ack
+        // flowed, session was saved by recipientBootstrap's wrapper.
+        assertTrue(
+            rig.bobMsgRepo.messages.any { it.plaintextCache == "hello from alice — inbound repair test" },
+            "no-session bootstrap path MUST still produce a decrypted message " +
+                "(regression: recipientBootstrap refactor to thin wrapper preserves " +
+                "byte-identical behaviour)",
+        )
+        assertTrue(
+            "msg-no-session-bootstrap" in rig.bobTransport.ackedDelivers,
+            "no-session bootstrap path MUST still ack",
+        )
+        assertNotNull(
+            rig.bobRatchetRepo.getRatchetState(rig.convId),
+            "no-session bootstrap path MUST still persist the session row " +
+                "(refactored recipientBootstrap = recipientBootstrapInMemory + saveSession)",
+        )
+    }
+
+    /**
+     * Test rig for PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 3 integration
+     * tests. Builds Alice's side (real X3DH initiator producing a
+     * WireFrame with x3dhInit + ciphertext) and Bob's side (DMS with
+     * pre-seeded stale session row + working SPK/OPK repos for the
+     * candidate bootstrap to resolve). The caller picks Bob's
+     * DoubleRatchet to control whether the candidate decrypt succeeds
+     * (real LibsodiumDoubleRatchet) or fails (MacFailingDoubleRatchet).
+     *
+     * Mirrors the pattern from the existing bootstrap-on-first-send test
+     * (around line 855) but adds:
+     *   - pre-seeded stale session row for Bob;
+     *   - byte-identity readback on Bob's ratchet repo;
+     *   - hooks for delivering the captured Alice wire frame to Bob's
+     *     transport.
+     */
+    private suspend fun buildInboundRepairRig(
+        testScope: kotlinx.coroutines.test.TestScope,
+        bobRatchet: phantom.core.crypto.DoubleRatchet,
+        stripAliceX3dhInitFromWireFrame: Boolean = false,
+        skipBobStaleSessionSeed: Boolean = false,
+    ): InboundRepairRig {
+        val real = phantom.core.crypto.LibsodiumX3DH()
+
+        // ── Alice (sender) identity ─────────────────────────────────────
+        val aliceX25519 = real.generateDhKeyPair()
+        val aliceSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+
+        // ── Bob (receiver) identity + SPK + OPK ─────────────────────────
+        val bobX25519 = real.generateDhKeyPair()
+        val bobSpkPair = real.generateDhKeyPair()
+        val bobSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val bobOpkPair = real.generateDhKeyPair()
+        val bobOpkIdHex = "11223344556677889900aabbccddeeff"
+
+        val bobSpkRepo = object : phantom.core.storage.LocalSignedPreKeyRepository {
+            private var stored: phantom.core.storage.LocalSignedPreKeyEntity? =
+                phantom.core.storage.LocalSignedPreKeyEntity(
+                    keyId = 1L,
+                    publicKeyHex = bobSpkPair.publicKey.bytes.toHexStringLower(),
+                    privateKeyHex = bobSpkPair.privateKey.bytes.toHexStringLower(),
+                    createdAtMs = 1_000L,
+                    signatureHex = "00".repeat(64),
+                )
+            override suspend fun get() = stored
+            override suspend fun upsert(entity: phantom.core.storage.LocalSignedPreKeyEntity) {
+                stored = entity
+            }
+            override suspend fun clear() { stored = null }
+        }
+        val bobOpkRepo = object : phantom.core.storage.LocalOneTimePreKeyRepository {
+            private val store = mutableMapOf(
+                bobOpkIdHex to phantom.core.storage.LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkIdHex,
+                    publicKeyHex = bobOpkPair.publicKey.bytes.toHexStringLower(),
+                    privateKeyHex = bobOpkPair.privateKey.bytes.toHexStringLower(),
+                    uploadedAtMs = 0L,
+                ),
+            )
+            override suspend fun get(keyIdHex: String) = store[keyIdHex]
+            override suspend fun getAll() = store.values.toList()
+            override suspend fun count() = store.size
+            override suspend fun insert(entity: phantom.core.storage.LocalOneTimePreKeyEntity) {
+                store[entity.keyIdHex] = entity
+            }
+            override suspend fun insertAll(entities: List<phantom.core.storage.LocalOneTimePreKeyEntity>) {
+                entities.forEach { insert(it) }
+            }
+            override suspend fun deleteByKeyId(keyIdHex: String) { store.remove(keyIdHex) }
+            override suspend fun clear() { store.clear() }
+        }
+
+        // ── Alice runs initiatorBootstrap against Bob's published bundle
+        //    to produce an x3dhInit + initial ratchet state. ───────────
+        val bobBundleForAlice = PreKeyBundle(
+            identityPubkeyHex = bobX25519.publicKey.bytes.toHexStringLower(),
+            signingPubkeyHex = bobSigning.publicKey.toByteArray().toHexStringLower(),
+            signedPreKeyId = 1L,
+            signedPreKeyPublicHex = bobSpkPair.publicKey.bytes.toHexStringLower(),
+            signedPreKeyCreatedAtMs = 1_000L,
+            signedPreKeySignatureHex = phantom.core.crypto.SignedPreKeySigner.sign(
+                spkPublic = bobSpkPair.publicKey,
+                createdAtMs = 1_000L,
+                identityEd25519SecretKey = bobSigning.secretKey.toByteArray(),
+            ).toHexStringLower(),
+            oneTimePreKeyIdHex = bobOpkIdHex,
+            oneTimePreKeyPublicHex = bobOpkPair.publicKey.bytes.toHexStringLower(),
+        )
+        val aliceSessionMgr = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = FakeRatchetStateRepository(),
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+        val aliceBootstrap = aliceSessionMgr.initiatorBootstrap(
+            conversationId = "alice-side",
+            localIdentityKeyPair = aliceX25519,
+            bundle = bobBundleForAlice,
+        )
+
+        // Alice encrypts her plaintext under the initial ratchet state
+        // using REAL LibsodiumDoubleRatchet (so Bob's later real-X3DH
+        // candidate state will decrypt the result successfully in Test 1).
+        val aliceRealRatchet = phantom.core.crypto.LibsodiumDoubleRatchet()
+        val plaintextPayload = json.encodeToString(
+            MessagePayload.serializer(),
+            MessagePayload(
+                text = "hello from alice — inbound repair test",
+                sentAt = 1_700_000_000_000L,
+                senderUsername = "alice",
+            ),
+        ).encodeToByteArray()
+        val (_, encrypted) = aliceRealRatchet.encrypt(aliceBootstrap.ratchetState, plaintextPayload)
+        val wireFrame = WireFrame(
+            encryptedMessage = encrypted,
+            x3dhInit = if (stripAliceX3dhInitFromWireFrame) null else aliceBootstrap.x3dhInit,
+            senderSigningPublicKeyHex = aliceSigning.publicKey.toByteArray().toHexStringLower(),
+        )
+        val wireFrameBytes = json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val sealedSenderHex = phantom.core.crypto.SealedSender.seal(
+            fromPubKeyHex = aliceX25519.publicKey.bytes.toHexStringLower(),
+            toPublicKeyBytes = bobX25519.publicKey.bytes,
+        )
+
+        // ── Bob's DMS rig ──────────────────────────────────────────────
+        val bobIdentity = phantom.core.identity.IdentityRecord(
+            id = "bob-id",
+            username = "bob",
+            publicKeyHex = bobX25519.publicKey.bytes.toHexStringLower(),
+            dhPrivateKeyHex = bobX25519.privateKey.bytes.toHexStringLower(),
+            createdAt = 0L,
+        )
+        // Conversation id derivation matches DefaultMessagingService's
+        // receive path (sorted hex join with `_`).
+        val convId = listOf(
+            bobIdentity.publicKeyHex,
+            aliceX25519.publicKey.bytes.toHexStringLower(),
+        ).sorted().joinToString("_")
+
+        val bobRatchetRepo = FakeRatchetStateRepository()
+        val staleSerializedState: String? = if (skipBobStaleSessionSeed) {
+            null
+        } else {
+            // Pre-seed a stale all-zero state for Bob. This makes
+            // `state != null` fire at line 2328, taking control into
+            // the existing-session decrypt path. Real LibsodiumDoubleRatchet
+            // (or MacFailingDoubleRatchet) will then MAC-fail under this
+            // stale state, triggering the catch + new inbound-repair branch.
+            val staleState = phantom.core.crypto.RatchetState(
+                rootKey = ByteArray(32),
+                sendingChainKey = ByteArray(32),
+                receivingChainKey = ByteArray(32),
+                sendingRatchetPublicKey = ByteArray(32),
+                sendingRatchetPrivateKey = ByteArray(32),
+                receivingRatchetPublicKey = ByteArray(32),
+            )
+            val blob = json.encodeToString(
+                phantom.core.crypto.RatchetState.serializer(),
+                staleState,
+            )
+            bobRatchetRepo.upsertRatchetState(convId, blob)
+            blob
+        }
+
+        val bobSessionMgr = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = bobRatchetRepo,
+            signedPreKeyRepository = bobSpkRepo,
+            oneTimePreKeyRepository = bobOpkRepo,
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+        // FakeRelayTransport (NOT ManualIncomingTransport) — we need the
+        // `ackedDelivers` tracking list to assert on invariant 4 (no
+        // early ack on success path + no ack on failure paths).
+        val bobIncomingTransport = FakeRelayTransport()
+        val bobMsgRepo = FakeMessageRepository()
+        val bobConvRepo = FakeConversationRepository()
+        val bobProcessedRepo = FakeProcessedEnvelopeLedger()
+        val bobDecryptFailedRepo = FakeDecryptFailedEnvelopeLedger()
+
+        // Pre-seed the conversation row for `convId` (NOT sessionSuspect
+        // yet — that's set by the existing PR #243 commit 3a hold branch
+        // when it fires). FakeConversationRepository.setSessionSuspect
+        // no-ops when the row doesn't exist (see line ~171 — it does
+        // `store[conversationId]?.let { ... }` and silently skips if
+        // null). The mirror behaviour of the SQLDelight implementation
+        // also requires an existing row before suspect updates take
+        // effect. Tests 2 + 3 assert on suspect transitions, so the
+        // row needs to exist beforehand.
+        bobConvRepo.upsertConversation(
+            ConversationEntity(
+                id = convId,
+                theirUsername = "alice",
+                theirPublicKeyHex = aliceX25519.publicKey.bytes.toHexStringLower(),
+                lastMessagePreview = "",
+                lastMessageAt = 0L,
+                unreadCount = 0,
+                sessionSuspect = false,
+                sessionSuspectSetAtMs = null,
+            ),
+        )
+
+        val bobService = DefaultMessagingService(
+            identity = bobIdentity,
+            localKeyPair = bobX25519,
+            ratchet = bobRatchet,
+            sessionManager = bobSessionMgr,
+            transport = bobIncomingTransport,
+            messageRepository = bobMsgRepo,
+            conversationRepository = bobConvRepo,
+            processedEnvelopeRepository = bobProcessedRepo,
+            scope = testScope.backgroundScope,
+            json = json,
+            preKeyApi = ThrowingPreKeyApi,
+            signingKeyProvider = { ThrowingSigningKey },
+            decryptFailedEnvelopeRepository = bobDecryptFailedRepo,
+            holdMacFailures = true,
+        )
+        bobService.startReceiving()
+        // Let startReceiving's internal `transport.incoming.collect`
+        // coroutine actually subscribe BEFORE we return the rig.
+        // Without this pump, the test body's `deliver(...)` may emit
+        // to the transport's SharedFlow (replay=0) BEFORE the service's
+        // collector is subscribed, and the value is silently dropped.
+        // Mirrors the `testScheduler.runCurrent()` between
+        // startReceiving + deliver in the existing bootstrap-on-first-
+        // send test at line ~969-1011.
+        testScope.testScheduler.runCurrent()
+
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val deliverFn: suspend (String) -> Unit = { messageId ->
+            bobIncomingTransport.deliver(
+                phantom.core.transport.RelayMessage.Deliver(
+                    from = "",
+                    sealedSender = kotlin.io.encoding.Base64.encode(sealedSenderHex),
+                    payload = kotlin.io.encoding.Base64.encode(padded),
+                    messageId = messageId,
+                ),
+            )
+        }
+
+        return InboundRepairRig(
+            convId = convId,
+            bobMsgRepo = bobMsgRepo,
+            bobConvRepo = bobConvRepo,
+            bobProcessedRepo = bobProcessedRepo,
+            bobDecryptFailedRepo = bobDecryptFailedRepo,
+            bobTransport = bobIncomingTransport,
+            bobRatchetRepo = bobRatchetRepo,
+            staleSerializedState = staleSerializedState,
+            deliverAliceWireFrameToBob = deliverFn,
+        )
+    }
+
+    private class InboundRepairRig(
+        val convId: String,
+        val bobMsgRepo: FakeMessageRepository,
+        val bobConvRepo: FakeConversationRepository,
+        val bobProcessedRepo: FakeProcessedEnvelopeLedger,
+        val bobDecryptFailedRepo: FakeDecryptFailedEnvelopeLedger,
+        val bobTransport: FakeRelayTransport,
+        val bobRatchetRepo: FakeRatchetStateRepository,
+        val staleSerializedState: String?,
+        val deliverAliceWireFrameToBob: suspend (messageId: String) -> Unit,
+    )
 }
 
 /**
