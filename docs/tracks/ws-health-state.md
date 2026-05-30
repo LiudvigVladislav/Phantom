@@ -1,6 +1,6 @@
 # PR-WS-HEALTH-STATE1 — mini-lock
 
-**Status:** Draft, **revision 2** after architect P2/P3 review on PR #252 2026-05-30. Five facts/hypotheses rewritten or replaced (F4, F7, F8, F9, H4) and two invariants tightened (Inv3 wording, Inv6 target set). Still awaiting Vladislav explicit ACK on §1, §2, §3 before code work begins. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
+**Status:** Draft, **revision 3** after architect P3 follow-up on rev2 (PR #252 2026-05-30). Rev2 fixed F4/F7/F8/F9/H4/Inv3/Inv6. Rev3 propagates those corrections into the still-stale H3 (sub-corroboration framing), H5 (timeout numbers), H6 (downgrade + reword off "REST `/auth/challenge` race"), and H7 (relay-side evidence dependency made explicit). Rev3 also folds in the four-commit Implementation plan ladder Vladislav approved on PR #252 thread. Still awaiting Vladislav explicit ACK on §1, §2, §3 + Implementation plan before code work begins. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
 
 **Motivating event:** Test #83 v3 (2026-05-30) PASSED Phase 1 crypto gate + Phase 2 scenarios 1-4, but BLOCKED on scenario 5 (burst incoming, ~20 messages). Tecno received 7 of ~20 and then transport collapsed for >2 minutes.
 
@@ -148,7 +148,7 @@ Each hypothesis is labeled with the test that would falsify it. Lock no root cau
 
 > Falsification test: pull Caddy and relay container logs from the VPS for the window `01:18:30-01:20:40 UTC` (Vladislav-delegated via `feedback_ssh_delegation`). If relay's view shows it sent envelopes successfully to Tecno's WS socket and got socket-write OK during the window where Tecno reports `InterruptedIOException`, the loss is at network level (Tecno's local network, ISP, or Hetzner uplink dropped packets).
 > 
-> Confirming signal would also include: `outbound_ack_deadline_expired` on relay side for the same window (relay sent, never got ack back). F4 already shows this pattern for s=1.
+> **Sub-corroboration from Tecno-side log (F4):** Tecno-side `outbound_ack_deadline_expired` on s=1 (lines :222/:232/:239/:241) proves Tecno's outbound was not getting acked by relay either — bidirectional sickness on the same WS session. This narrows the H3 hypothesis to "WS path between Tecno and relay was dropping in both directions". But this corroboration is **client-side only**; relay-side confirmation (relay sent successfully, never got ack back) still requires the VPS log pull above.
 > 
 > If confirmed: the fix is NOT in our code — it is in chain selection. Burst should fall through to Tor / next chain link sooner.
 
@@ -162,23 +162,29 @@ Each hypothesis is labeled with the test that would falsify it. Lock no root cau
 > 
 > If confirmed: the fix is to (a) lower per-call ceilings so a single stuck handshake fails fast and triggers fall-through, (b) add jittered backoff to avoid all retries landing simultaneously, and (c) potentially detect repeated phase-failures and force a longer cooldown before next attempt.
 
-### H5 — REST timeouts (60 s read / 60 s write / 120 s call) are too generous for burst delivery
+### H5 — REST fallback timeouts (call=60 s / connect=30 s / read=60 s / write=60 s) are too generous for burst short-message delivery
 
+> Numeric source: F9 (revised), `AndroidNativeOkHttpRestFallbackTransport.kt:188-191`. The original wording of this hypothesis used the prekey/Ktor `callTimeout=120s` from `RelayTransportFactory.kt`, which is a different code path; corrected here to match F9 rev2.
+> 
+> Note: the WS reconnect `auth/challenge` HTTPS GET uses a separate client (Ktor-based in `KtorRelayTransport`), but it observably hits the **same `SocketTimeoutException` 60 s wall** (F8 :905/:913). So the hypothesis "60 s per-call ceilings are over-provisioned for burst short messages" applies to BOTH the REST fallback path AND the WS reconnect auth path — the fix likely needs to touch both, not just `AndroidNativeOkHttpRestFallbackTransport`.
+> 
 > Falsification test: temporarily set REST short-message send/poll/auth timeouts to 10 s and rerun Test #83 v3 scenario 5. If reliability drops, the 60 s budgets were load-bearing. If user-visible recovery is faster but reliability holds, the budgets were over-provisioned for this path.
-> 
-> Note: F9 comment confirms the 60 s budget is tuned for chunked media upload. PR-M2 (media) and PR-WS-HEALTH-STATE1 (short messages) have different latency budgets; mixing them in one client is suspicious.
 
-### H6 — REST `/auth/challenge` race with WS-to-REST mode switch (token state)
+### H6 — Auth-state race between WS reconnect challenge and REST session refresh (low priority)
 
-> Falsification test: log auth-token state at every state transition (`token_state_pre_transition` + `token_state_post_transition` with `expires_in_ms`, `acquired_at_ms`, `reuse_counter`). If `/auth/challenge` was called while a refresh was in flight from the WS-side path, the race is the cause.
+> Reframed after F8 correction: the failed `auth/challenge` calls in F8 are the **WS reconnect** path, not the REST `/auth/session` path. A race between the WS reconnect's identity-challenge GET and any in-flight REST fallback session refresh is therefore the actual shape of this hypothesis, not "REST `/auth/challenge` race".
 > 
-> Less likely than H3/H4/H5 because F8 shows two consecutive auth challenges both hitting `SocketTimeoutException`, not a 401/403. The socket-level failure is more consistent with network/pool issues than auth race.
+> Falsification test: log auth-token state at every transport state transition (`token_state_pre_transition` + `token_state_post_transition` with `expires_in_ms`, `acquired_at_ms`, `reuse_counter`, `path={ws|rest}`). If either path's auth call is firing while the other is mid-refresh, the race is the cause.
+> 
+> **Demoted to low priority:** F8 shows the two consecutive auth challenges both hit `SocketTimeoutException` at the socket layer — not a 401/403 / token-rejection signal. A socket-level failure across two distinct generations of WS session (`s=4`, `s=5`) is more consistent with the network/socket/radio/OS stall framing (H4) than with an auth-state race. Investigate H6 only if H3/H4/H5 are all falsified.
 
 ### H7 — Relay-side inbound-flow back-pressure during burst
 
-> Falsification test: relay logs for the s=3 window. Did relay attempt to deliver all ~20 burst envelopes to Tecno's WS during s=3, or did it queue them and try to drain in batches? If relay queue depth was rising while Tecno's WS was alive but silent (no acks coming back per F4), the relay's outbound flow control could be at fault — too many envelopes inflight on a stalled socket trigger back-pressure that kills throughput.
+> Falsification test: relay-side log for the s=3 window. Did relay attempt to deliver all ~20 burst envelopes to Tecno's WS during s=3, or did it queue them and try to drain in batches? If relay queue depth was rising while Tecno's WS was alive but silent on the inbound side, the relay's outbound flow control could be at fault — too many envelopes inflight on a stalled socket trigger back-pressure that kills throughput.
 > 
-> This would also explain why the s=3 session ran 136 seconds (much longer than s=1's 76 s or s=2's 91 s) — relay was still trying to push envelopes when the OkHttp ping timeout finally fired.
+> **Required evidence (not yet available):** this hypothesis depends on **relay-side telemetry** — outbound queue depth per recipient, ack-timeout counters from the relay's view, and `inbound_frames`/`acks_received` numbers from the relay's session_summary. None of that is in `test83-v3-tecno.log`. F4 shows only Tecno-client-side outbound expirations, which corroborate bidirectional sickness but do NOT confirm relay→Tecno ack drops. The relay log pull queued by H3 is the prerequisite for evaluating H7.
+> 
+> Tecno's session_summary `since_last_inbound_ms` numbers (F2) hint at long inbound silences (29-52 s before each WS death), which is consistent with H7 but also with H3/H4 — so the inbound-silence signal alone cannot discriminate.
 
 ### H8 — Tecno-specific network condition (cellular policy, NAT, DPI)
 
@@ -249,6 +255,50 @@ Verification: contract test on the connection-state flow exposed by the relay tr
 ### Inv8 — No reintroduction of `lastWorkingTransport` lock-in from REST fallback
 
 Per `feedback_sticky_fallback_hint_2026_05_27.md`, REST fallback successes during burst MUST NOT save `lastWorkingTransport`. Only `kind == strategy.chain.first()` may. This is a pre-existing locked invariant; this track confirms it stays.
+
+---
+
+## Implementation plan (locked after Vladislav ACK on §1 §2 §3)
+
+Four ordered commits, each independently mergeable but designed to land together as the WS-HEALTH-STATE1 squash. Each commit has its own architect ACK gate per PR #243's per-commit-review model.
+
+### Commit 1 — Diagnostic `EventListener` on REST fallback (no behaviour change)
+
+Instrument `AndroidNativeOkHttpRestFallbackTransport` with an OkHttp `EventListener` exposing per-call phase timings, analogous to the existing `ProbeEventListener` used by `KtorTransportProbe`. Emit structured `REST_TRACE phase_*` log lines: `dnsStart`/`dnsEnd`/`connectStart`/`connectEnd`/`secureConnectStart`/`secureConnectEnd`/`responseHeadersStart`/`callFailed` per call, each tagged with `op={send|poll|ack|session}` and `id=<idem>`.
+
+This commit is the **falsification instrument for H3/H4/H5**. After it ships and a Test #83 v3 scenario 5 is rerun, the logs will tell us WHICH phase consumes the 60 s — DNS / TCP SYN-ACK / TLS handshake / response headers. Until we have that data, the timeout-tightening commit (Commit 2) is guessing.
+
+Scope guard: NO timeout changes, NO state-machine changes, NO UI changes. Diagnostic-only.
+
+### Commit 2 — Short-message fail-fast ceilings
+
+Lower per-call ceilings for `/relay/send`, `/relay/poll`, `/relay/ack-deliver`, and `auth/challenge` (both REST fallback and WS reconnect paths per H5 revision) so a single stuck handshake fails within 10-15 s instead of 60 s. Specific numbers Vladislav-set during the Commit-2 review window.
+
+Add jittered backoff (per the H4 finding that "all retries landing simultaneously" makes the burst symptom worse).
+
+Inv2 (REST send during WS death succeeds in 5 s or fails in 10 s) and Inv6 (20 → ≥ 19 in 60 s) are the merge gates.
+
+Scope guard: NO change to the underlying client architecture (still fresh `OkHttpClient` + `ConnectionPool(0, 1ms)` per call — F9 design intentional per `:40-:42`). NO change to chain selection.
+
+### Commit 3 — Connection-state surface to UI + fall-through after repeated failures
+
+When `RestStateMachine` is in `RestActive` and either (a) N consecutive `/poll` fail, (b) N consecutive `/send` fail, OR (c) any auth-path call fails N consecutive times (per Inv3 revision covering both WS reconnect and REST), emit a connection-state event the UI can surface as "Reconnecting" (no longer "Online via Direct · Standard" while delivery is dead).
+
+Also: after the same N, trigger chain rewalk / fall-through to next chain link (Tor on Tecno). Currently the orchestrator silently retries forever.
+
+Inv3 and Inv7 are the merge gates.
+
+Scope guard: NO change to the chain-link list itself; NO change to the WS heartbeat (Inv5 protects); NO change to `lastWorkingTransport` (Inv8 protects).
+
+### Commit 4 — Explicit guard tests for the locked invariants
+
+Tests that codify the no-regression invariants directly:
+
+- A test that asserts `idle_watchdog` never calls `forceReconnect` regardless of `sinceLastPong` (Inv5).
+- A test that asserts REST fallback success never updates `lastWorkingTransport` (Inv8).
+- A test that asserts the `R0.4b` log line `no reconnect action (R0.4b)` still fires under the same conditions as Test #83 v3 (idle WS, watchdog passive).
+
+These tests are merge-blocking gates so a future regression cannot silently re-enable behaviour PR-R0.4b removed.
 
 ---
 
