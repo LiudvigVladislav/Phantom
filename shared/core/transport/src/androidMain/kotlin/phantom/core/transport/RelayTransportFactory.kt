@@ -94,6 +94,28 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // gets harder. HTTP/1.1 keeps "one TCP per WS" so close() acts
         // intuitively. See ADR-010 "Updated 2026-05-01".
         .protocols(listOf(Protocol.HTTP_1_1))
+        // PR-WS-HEALTH-STATE1 Commit 1 (2026-05-30): diagnostic-only
+        // phase logging for the WS reconnect HTTPS auth/challenge GET
+        // and the subsequent WebSocket upgrade. The same OkHttp engine
+        // services both calls (Ktor wraps this client), so we use an
+        // eventListenerFactory so a fresh per-call listener picks the
+        // right `op` tag from the Call's URL:
+        //   - `/auth/challenge` → op=ws_auth
+        //   - everything else   → op=ws_upgrade
+        // Generation/session correlation is by timestamp against the
+        // existing `[gen=N s=M]` lines in KtorRelayTransport; not
+        // injected here to avoid cross-module shared mutable plumbing
+        // that the Commit 1 scope guard rules out. NO behaviour change.
+        .eventListenerFactory { call ->
+            val path = call.request().url.encodedPath
+            val op = if (path.contains("/auth/challenge")) "ws_auth" else "ws_upgrade"
+            HttpPhaseEventListener(
+                tag = "PhantomRelay",
+                keyword = "RELAY_TRACE",
+                op = op,
+                correlationKey = System.identityHashCode(call).toString(16),
+            )
+        }
 
     // ADR-016 Stage 2C: route this generation's TCP connection through
     // the embedded tor's SOCKS5 listener. tor binds an ephemeral port

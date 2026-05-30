@@ -61,7 +61,13 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         body: AuthSessionRequest,
     ): RestFallbackResponse<AuthSessionResponse> = withContext(Dispatchers.IO) {
         val jsonBody = jsonCodec.encodeToString(AuthSessionRequest.serializer(), body)
-        val response = post(url, token = null, idempotencyKey = null, bodyJson = jsonBody)
+        val response = post(
+            url = url,
+            token = null,
+            idempotencyKey = null,
+            bodyJson = jsonBody,
+            op = "session",
+        )
         decode(response, AuthSessionResponse.serializer())
     }
 
@@ -72,7 +78,13 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         body: SendRequest,
     ): RestFallbackResponse<SendResponse> = withContext(Dispatchers.IO) {
         val jsonBody = jsonCodec.encodeToString(SendRequest.serializer(), body)
-        val response = post(url, token = token, idempotencyKey = idempotencyKey, bodyJson = jsonBody)
+        val response = post(
+            url = url,
+            token = token,
+            idempotencyKey = idempotencyKey,
+            bodyJson = jsonBody,
+            op = "send",
+        )
         decode(response, SendResponse.serializer())
     }
 
@@ -82,7 +94,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         sinceSeq: Long?,
     ): RestFallbackResponse<PollResponse> = withContext(Dispatchers.IO) {
         val fullUrl = if (sinceSeq != null) "$url?since_seq=$sinceSeq" else url
-        val response = get(fullUrl, token)
+        val response = get(fullUrl, token, op = "poll")
         decode(response, PollResponse.serializer())
     }
 
@@ -92,7 +104,13 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         body: AckDeliverRequest,
     ): RestFallbackResponse<AckDeliverResponse> = withContext(Dispatchers.IO) {
         val jsonBody = jsonCodec.encodeToString(AckDeliverRequest.serializer(), body)
-        val response = post(url, token = token, idempotencyKey = null, bodyJson = jsonBody)
+        val response = post(
+            url = url,
+            token = token,
+            idempotencyKey = null,
+            bodyJson = jsonBody,
+            op = "ack",
+        )
         decode(response, AckDeliverResponse.serializer())
     }
 
@@ -110,8 +128,9 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         token: String?,
         idempotencyKey: String?,
         bodyJson: String,
+        op: String,
     ): RawResponse {
-        val client = buildClient()
+        val client = buildClient(op = op, correlationKey = idempotencyKey ?: url)
         val builder = Request.Builder()
             .url(url)
             .header("Connection", "close")
@@ -121,8 +140,8 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         return execute(client, builder.build())
     }
 
-    private fun get(url: String, token: String): RawResponse {
-        val client = buildClient()
+    private fun get(url: String, token: String, op: String): RawResponse {
+        val client = buildClient(op = op, correlationKey = url)
         val request = Request.Builder()
             .url(url)
             .header("Connection", "close")
@@ -169,15 +188,31 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         )
     }
 
-    private fun buildClient(): OkHttpClient = OkHttpClient.Builder()
-        .protocols(listOf(Protocol.HTTP_1_1))
-        .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
-        .retryOnConnectionFailure(false)
-        .callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
-        .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
-        .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
-        .writeTimeout(writeTimeoutMs, TimeUnit.MILLISECONDS)
-        .build()
+    private fun buildClient(op: String, correlationKey: String): OkHttpClient =
+        OkHttpClient.Builder()
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
+            .retryOnConnectionFailure(false)
+            .callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+            .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+            .writeTimeout(writeTimeoutMs, TimeUnit.MILLISECONDS)
+            // PR-WS-HEALTH-STATE1 Commit 1 (2026-05-30): diagnostic-only
+            // phase logging. Emits `REST_TRACE phase_event op=<op> key=<idem
+            // or url> event=<dns|connect|secureConnect|responseHeaders|...>
+            // elapsedMs=<n>` per OkHttp lifecycle event, under the existing
+            // `PhantomHybrid` tag so the new lines sort with the existing
+            // REST_TRACE send/poll/auth bodies. NO behaviour change; the
+            // listener does string concatenation and Log.i only.
+            .eventListener(
+                HttpPhaseEventListener(
+                    tag = "PhantomHybrid",
+                    keyword = "REST_TRACE",
+                    op = op,
+                    correlationKey = correlationKey,
+                ),
+            )
+            .build()
 
     companion object {
         /**
