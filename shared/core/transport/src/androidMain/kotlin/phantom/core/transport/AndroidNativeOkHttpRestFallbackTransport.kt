@@ -216,14 +216,28 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
 
     companion object {
         /**
-         * Total per-call ceiling. The orchestrator's retry layer decides earlier
-         * (5 attempts × backoffs) so this is mostly a safety net for the very
-         * last attempt.
+         * Per-call ceilings for the short relay paths (`/relay/send`,
+         * `/relay/poll`, `/relay/ack-deliver`, `/auth/session`).
+         *
+         * PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): tightened from
+         * `call=60s / connect=30s / read=60s / write=60s` to the values
+         * below per the design note locked in
+         * `docs/tracks/ws-health-state.md` § Implementation plan § Commit 2
+         * design note (Vladislav-locked rev2). Empirical base
+         * `C:\temp\test83-v4-tecno.log:679-:721` proved the 60 s wall was
+         * OkHttp's `callTimeout(60s)` force-closing the socket on a
+         * TLS handshake that never completes — entirely client-side, so
+         * the budget can be tightened without server cooperation.
+         *
+         * The 10 s ceiling matches `AndroidNativeOkHttpMediaUploadTransport.kt`
+         * `:673` (`CALL_TIMEOUT_MS = 10_000L`), which has run in production
+         * since PR-M2 without trouble — i.e. it is the proven class of
+         * budget for PHANTOM's networks, not a guess.
          */
-        const val CALL_TIMEOUT_MS: Long = 60_000L
-        const val CONNECT_TIMEOUT_MS: Long = 30_000L
-        const val READ_TIMEOUT_MS: Long = 60_000L
-        const val WRITE_TIMEOUT_MS: Long = 60_000L
+        const val CALL_TIMEOUT_MS: Long = 10_000L
+        const val CONNECT_TIMEOUT_MS: Long = 5_000L
+        const val READ_TIMEOUT_MS: Long = 10_000L
+        const val WRITE_TIMEOUT_MS: Long = 10_000L
 
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
     }

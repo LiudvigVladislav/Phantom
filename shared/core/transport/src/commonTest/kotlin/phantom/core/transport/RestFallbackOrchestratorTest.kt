@@ -359,10 +359,17 @@ class RestFallbackOrchestratorTest {
 
     @Test
     fun retry_delays_table_matches_locked_spec() {
-        // Locked 2026-05-16: 1s / 3s / 8s / 20s / 60s
+        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): rebalanced from
+        // {1, 3, 8, 20, 60} to {1, 3, 8, 15, 15} per the design note
+        // locked in docs/tracks/ws-health-state.md § Implementation
+        // plan § Commit 2 § Commit 2 design note rev2. Index [4] is
+        // dead per delayForRetry's contract (attempt 5 fail breaks
+        // before delaying); kept at 15_000L for cosmetic consistency
+        // with the active tail. Index [3] (attempt 4 fail wait)
+        // carries the actual effect: 20 s → 15 s.
         assertTrue(
             RestFallbackOrchestrator.SEND_RETRY_DELAYS_MS.toList() ==
-                listOf(1_000L, 3_000L, 8_000L, 20_000L, 60_000L),
+                listOf(1_000L, 3_000L, 8_000L, 15_000L, 15_000L),
             "retry-delay table drifted from the locked spec; got " +
                 RestFallbackOrchestrator.SEND_RETRY_DELAYS_MS.toList(),
         )

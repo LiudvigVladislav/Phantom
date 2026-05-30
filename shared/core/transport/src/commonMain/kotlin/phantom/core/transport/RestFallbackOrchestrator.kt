@@ -20,6 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.CoroutineContext
+import kotlin.random.Random
 
 /**
  * High-level lifecycle owner for the REST short-poll fallback transport — PR-D1.
@@ -272,13 +273,30 @@ class RestFallbackOrchestrator(
                 val ex = outcome.exceptionOrNull()!!
                 lastStatus = null
                 lastReason = ex::class.simpleName ?: "Exception"
-                log(
-                    "REST_TRACE send_retry id=${envelopeId.take(8)} reason=$lastReason " +
-                        "attempt=$attempt next_delay_ms=${delayForRetry(attempt)} " +
-                        "elapsedMs=$attemptElapsed",
-                )
                 if (attempt < SEND_MAX_ATTEMPTS) {
-                    delay(delayForRetry(attempt))
+                    // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                    // backoff. `next_delay_ms` is the actual wait we will
+                    // perform; `nominal_delay_ms` is the un-jittered source
+                    // for post-hoc verification of the ±20 % band.
+                    //
+                    // Rev2 fix (Vladislav P2 on PR #255): jitter computation +
+                    // `send_retry` log moved INSIDE the `attempt < SEND_MAX_ATTEMPTS`
+                    // check. On `attempt = SEND_MAX_ATTEMPTS` (final failure) the
+                    // code now goes straight to `break` and the downstream
+                    // `send_fail_giving_up` log records the terminal state. This
+                    // keeps `next_delay_ms` semantics honest (= actual wait, never
+                    // a phantom value on the giving-up branch) and restores the
+                    // `SEND_RETRY_DELAYS_MS` doc claim that `delayForRetry(5)`
+                    // is never called.
+                    val nominalDelay = delayForRetry(attempt)
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE send_retry id=${envelopeId.take(8)} reason=$lastReason " +
+                            "attempt=$attempt next_delay_ms=$jitteredDelay " +
+                            "nominal_delay_ms=$nominalDelay elapsedMs=$attemptElapsed",
+                    )
+                    delay(jitteredDelay)
                     continue
                 }
                 break
@@ -321,7 +339,18 @@ class RestFallbackOrchestrator(
                 in 500..599, 408, 429 -> {
                     lastReason = "retryable_status_${response.statusCode}"
                     if (attempt < SEND_MAX_ATTEMPTS) {
-                        delay(delayForRetry(attempt))
+                        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30):
+                        // jittered backoff per the design note shape.
+                        val nominalDelay = delayForRetry(attempt)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        log(
+                            "REST_TRACE send_retry id=${envelopeId.take(8)} " +
+                                "reason=$lastReason attempt=$attempt " +
+                                "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay " +
+                                "status=${response.statusCode}",
+                        )
+                        delay(jitteredDelay)
                         continue
                     }
                     break
@@ -329,7 +358,18 @@ class RestFallbackOrchestrator(
                 else -> {
                     lastReason = "unexpected_status_${response.statusCode}"
                     if (attempt < SEND_MAX_ATTEMPTS) {
-                        delay(delayForRetry(attempt))
+                        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30):
+                        // jittered backoff per the design note shape.
+                        val nominalDelay = delayForRetry(attempt)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        log(
+                            "REST_TRACE send_retry id=${envelopeId.take(8)} " +
+                                "reason=$lastReason attempt=$attempt " +
+                                "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay " +
+                                "status=${response.statusCode}",
+                        )
+                        delay(jitteredDelay)
                         continue
                     }
                     break
@@ -421,8 +461,17 @@ class RestFallbackOrchestrator(
                 staleToken = staleToken,
             )
             if (token == null) {
-                log("REST_TRACE poll_call_skipped reason=no_token")
-                delay(POLL_BACKOFF_NO_TOKEN_MS)
+                // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                // backoff. This site can herd in recovery when multiple
+                // poll iterations all skip-no-token simultaneously.
+                val nominalDelay = POLL_BACKOFF_NO_TOKEN_MS
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE poll_call_skipped reason=no_token " +
+                        "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                )
+                delay(jitteredDelay)
                 continue
             }
             staleToken = null
@@ -438,11 +487,17 @@ class RestFallbackOrchestrator(
 
             if (outcome.isFailure) {
                 val ex = outcome.exceptionOrNull()!!
+                // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                // backoff. `next_delay_ms` is the actual wait;
+                // `nominal_delay_ms` is the un-jittered source.
+                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                 log(
                     "REST_TRACE poll_fail reason=${ex::class.simpleName} elapsedMs=$elapsed " +
-                        "next_delay_ms=${intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)}",
+                        "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
                 )
-                delay(intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS))
+                delay(jitteredDelay)
                 continue
             }
 
@@ -450,8 +505,17 @@ class RestFallbackOrchestrator(
             when (response.statusCode) {
                 401 -> {
                     staleToken = token
-                    log("REST_TRACE poll_401_token_stale elapsedMs=$elapsed")
-                    delay(POLL_FAIL_BACKOFF_MS)
+                    // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                    // backoff. Token-stale on a burst can herd if multiple
+                    // poll iterations all 401 at the same moment.
+                    val nominalDelay = POLL_FAIL_BACKOFF_MS
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE poll_401_token_stale elapsedMs=$elapsed " +
+                            "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                    )
+                    delay(jitteredDelay)
                     continue
                 }
                 in 200..299 -> {
@@ -478,11 +542,18 @@ class RestFallbackOrchestrator(
                     delay(intervalMs)
                 }
                 else -> {
+                    // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                    // backoff. Server-unexpected-status retries can herd
+                    // when a transient relay condition rejects many polls.
+                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                     log(
                         "REST_TRACE poll_unexpected_status status=${response.statusCode} " +
-                            "elapsedMs=$elapsed",
+                            "elapsedMs=$elapsed " +
+                            "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
                     )
-                    delay(intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS))
+                    delay(jitteredDelay)
                 }
             }
         }
@@ -672,7 +743,16 @@ class RestFallbackOrchestrator(
          * elapsed across all 5 attempts ≈ 92 s.
          */
         val SEND_RETRY_DELAYS_MS: LongArray = longArrayOf(
-            1_000L, 3_000L, 8_000L, 20_000L, 60_000L,
+            // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): rebalanced from
+            // {1, 3, 8, 20, 60} to {1, 3, 8, 15, 15} to match the new
+            // 10 s per-call fail-fast ceilings. `delayForRetry(5)` is
+            // never called by the retry-loop contract at :280-:282
+            // (`delay(...)` only enters when `attempt < SEND_MAX_ATTEMPTS`),
+            // so index [4] is dead — kept at 15_000L for cosmetic
+            // consistency with the active tail. Index [3] carries the
+            // actual effect (`attempt = 4` fail now waits 15 s instead
+            // of 20 s before attempt = 5).
+            1_000L, 3_000L, 8_000L, 15_000L, 15_000L,
         )
 
         /**
