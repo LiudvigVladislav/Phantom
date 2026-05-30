@@ -1,6 +1,6 @@
 # PR-WS-HEALTH-STATE1 — mini-lock
 
-**Status:** Draft, **revision 4** after architect final polish on rev3 (PR #252 2026-05-30). Rev2 fixed F4/F7/F8/F9/H4/Inv3/Inv6. Rev3 propagated those into H3/H5/H6/H7 and added the four-commit Implementation plan. Rev4 cleans the H4 path wording (`/auth/challenge`, not `/relay/auth/challenge`) and extends Commit 1's diagnostic `EventListener` to cover the WS reconnect auth path in addition to the REST fallback. Awaiting Vladislav explicit final ACK on §1, §2, §3, Implementation plan before merge + code work begins. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
+**Status:** Draft, **revision 5** — pre-merge polish per architect green-after-cleanup on rev4 (PR #252 2026-05-30). Rev2 fixed F4/F7/F8/F9/H4/Inv3/Inv6. Rev3 propagated those into H3/H5/H6/H7 and added the four-commit Implementation plan. Rev4 cleaned H4 path wording + extended Commit 1 to cover WS reconnect auth diagnostics. **Rev5** weakens F9's "exact ceilings" claim — the REST fallback OkHttp client numbers (`AndroidNativeOkHttpRestFallbackTransport.kt:188-191`) explain F6/F7 only; the WS reconnect `auth/challenge` 60 s wall in F8 goes through a separate `KtorRelayTransport` client whose effective ceiling Commit 1 must measure before timeout tightening. PR body refreshed to match rev5 via `gh pr edit`. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
 
 **Motivating event:** Test #83 v3 (2026-05-30) PASSED Phase 1 crypto gate + Phase 2 scenarios 1-4, but BLOCKED on scenario 5 (burst incoming, ~20 messages). Tecno received 7 of ~20 and then transport collapsed for >2 minutes.
 
@@ -106,9 +106,11 @@ Implication: during the burst-collapse window, **both REST fallback AND WS recon
 - `:188-:191` — `CALL_TIMEOUT_MS = 60_000L`, `CONNECT_TIMEOUT_MS = 30_000L`, `READ_TIMEOUT_MS = 60_000L`, `WRITE_TIMEOUT_MS = 60_000L`.
 - Comment at `:40-:42` explicitly explains the no-pool stance: *"re-use a pool entry the server side has discarded, resulting in 30 s+ stalls. One fresh TCP+TLS handshake per call costs ~50–200 ms on a healthy uplink and is the price we pay for reliable delivery on hostile networks."*
 
-These timeouts are the **exact ceilings** producing the `elapsedMs=60016/60017/60020` values in F6/F7 and the WS-reconnect `auth/challenge` 60 s wait in F8 (since the WS reconnect path uses a similar HTTPS GET that hits the same network condition).
+These timeouts are the **exact ceilings** producing the `elapsedMs=60016/60017/60020` values in F6/F7 (REST `/send` and `/poll` go through this client).
 
-These ceilings were chosen to give chunked media upload (PR-M2) enough budget. They are NOT tuned for burst short-message delivery. A 60 s ceiling on `/relay/send` for a 1.6 KB body is several orders of magnitude over the legitimate need.
+The WS reconnect `auth/challenge` HTTPS GET in F8 is a **separate code path** — it goes through `KtorRelayTransport` and a different HTTP client, **not** `AndroidNativeOkHttpRestFallbackTransport`. Its observable ~60 s `SocketTimeoutException` wall in F8 (`:905`, `:913`) is empirical and aligns numerically with the REST 60 s budget, but the two are NOT the same client. Whatever the WS auth client's effective ceiling is, it should be confirmed by Commit 1's `EventListener` instrumentation on that path before any timeout tightening.
+
+These ceilings (REST fallback's 60 s read/write/call, 30 s connect) were chosen to give chunked media upload (PR-M2) enough budget. They are NOT tuned for burst short-message delivery. A 60 s ceiling on `/relay/send` for a 1.6 KB body is several orders of magnitude over the legitimate need.
 
 ### F10. Sender (emu) side was healthy throughout the burst
 
