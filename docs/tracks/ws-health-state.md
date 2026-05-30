@@ -276,13 +276,122 @@ Scope guard: NO timeout changes, NO state-machine changes, NO UI changes. Diagno
 
 ### Commit 2 — Short-message fail-fast ceilings
 
-Lower per-call ceilings for `/relay/send`, `/relay/poll`, `/relay/ack-deliver`, and `auth/challenge` (both REST fallback and WS reconnect paths per H5 revision) so a single stuck handshake fails within 10-15 s instead of 60 s. Specific numbers Vladislav-set during the Commit-2 review window.
+Lower per-call ceilings for `/relay/send`, `/relay/poll`, `/relay/ack-deliver`, and `auth/challenge` (both REST fallback and WS reconnect paths per H5 revision) so a single stuck handshake fails within 10-15 s instead of 60 s. Specific numbers Vladislav-set during the Commit-2 review window — **now locked in the design note appendix below**.
 
 Add jittered backoff (per the H4 finding that "all retries landing simultaneously" makes the burst symptom worse).
 
 Inv2 (REST send during WS death succeeds in 5 s or fails in 10 s) and Inv6 (20 → ≥ 19 in 60 s) are the merge gates.
 
 Scope guard: NO change to the underlying client architecture (still fresh `OkHttpClient` + `ConnectionPool(0, 1ms)` per call — F9 design intentional per `:40-:42`). NO change to chain selection.
+
+#### Commit 2 design note (Vladislav-locked 2026-05-30 post Commit 1 field run, **revision 2** post architect P3 on PR #254)
+
+Empirical justification — the Commit 1 EventListener captured the exact mechanism on `C:\temp\test83-v4-tecno.log`:
+
+- `:679 REST_TRACE phase_event op=send key=300a861b event=secureConnectStart` at `05:06:03.744`.
+- `:721 REST_TRACE phase_event op=send key=300a861b event=connectFailed exception=SocketException message=Socket closed elapsedMs=59999` at `05:07:03.602`.
+
+Exactly 60 000 ms of TLS handshake silence terminated by `Socket closed`. That is **OkHttp's `callTimeout(60 s)` force-closing the socket**, not a network-layer timeout. The 60 s wall is therefore entirely client-side configurable. Tightening it is safe and is exactly the right knob — there is no upstream server budget that requires 60 s.
+
+The same pattern reproduced for `op=poll` (`:724`), `op=ack` (`:727`), and `op=ws_auth` (`:737-:738 callFailed exception=SocketTimeoutException totalMs=60198`). Cross-path symmetry confirms H5: REST short-message paths AND the WS reconnect auth path share the same over-provisioned ceiling and the same field failure mode.
+
+##### Numeric targets (Vladislav-locked, line refs corrected in rev2)
+
+| Constant | File | Line | Current | Commit 2 |
+|---|---|---|---|---|
+| `CALL_TIMEOUT_MS` | `AndroidNativeOkHttpRestFallbackTransport.kt` | `:223` | `60_000L` | **`10_000L`** |
+| `CONNECT_TIMEOUT_MS` | `AndroidNativeOkHttpRestFallbackTransport.kt` | `:224` | `30_000L` | **`5_000L`** |
+| `READ_TIMEOUT_MS` | `AndroidNativeOkHttpRestFallbackTransport.kt` | `:225` | `60_000L` | **`10_000L`** |
+| `WRITE_TIMEOUT_MS` | `AndroidNativeOkHttpRestFallbackTransport.kt` | `:226` | `60_000L` | **`10_000L`** |
+| WS-path `connectTimeout` (Direct only) | `RelayTransportFactory.kt` (Android) | `:90` | `if (socksProxyPort != null) 90 else 10` (seconds) | **`if (socksProxyPort != null) 90 else 5`** (seconds) |
+| WS-path `callTimeout` (Direct only — NEW) | `RelayTransportFactory.kt` (Android) | new line after `:90` | not set | **`callTimeout(10, SECONDS)` when `socksProxyPort == null`** |
+| `SEND_RETRY_DELAYS_MS` (whole array) | `RestFallbackOrchestrator.kt` | `:674-:676` | `1_000L, 3_000L, 8_000L, 20_000L, 60_000L` | **`1_000L, 3_000L, 8_000L, 15_000L, 15_000L`** |
+
+> **Rev2 correction (architect P3 on rev1):** the original rev1 said *"`SEND_RETRY_DELAYS_MS[4] 60_000 → 15_000`"*, which is **insufficient**. `delayForRetry(attemptIndex)` at `RestFallbackOrchestrator.kt:520-525` uses `idx = (attemptIndex - 1).coerceIn(...)` and the retry loop at `:280-:282` only enters `delay(...)` when `attempt < SEND_MAX_ATTEMPTS`, so the 5th call (`attempt = 5` failure) reaches `break` **without ever calling `delayForRetry(5)`**. Index `[4]` is therefore dead code. The actually-used indices are `[0..3]` = current `1s/3s/8s/20s`. To achieve the target cadence `1/3/8/15/15` we must change `[3] 20_000 → 15_000` for the real effect; setting `[4] 60_000 → 15_000` is harmless cosmetic alignment. The whole-array spec above captures both.
+>
+> **Rev2 correction (architect P3 on rev1):** constants in `AndroidNativeOkHttpRestFallbackTransport.kt` were at `:188-191` BEFORE PR-WS-HEALTH-STATE1 Commit 1 landed. Commit 1 (`d79eaedd`) inserted the `.eventListener(...)` block in `buildClient()` and shifted the companion-object constants to `:223-226`. The rev2 table above cites current-master line numbers.
+
+##### Jitter (±20 %, applied at orchestrator level — rev2: 7 sites + computed-then-logged shape)
+
+Seven `delay(...)` sites in `RestFallbackOrchestrator.kt` are retry/backoff and MUST be jittered:
+
+| Line | Site | Nominal source |
+|---|---|---|
+| `:281` | send retry on exception | `delayForRetry(attempt)` |
+| `:324` | send retry on retryable 5xx/408/429 status | `delayForRetry(attempt)` |
+| `:332` | send retry on unexpected status | `delayForRetry(attempt)` |
+| `:425` | poll backoff when no token (added in rev2) | `POLL_BACKOFF_NO_TOKEN_MS` |
+| `:445` | poll fail backoff | `intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)` |
+| `:454` | poll 401 token stale | `POLL_FAIL_BACKOFF_MS` |
+| `:485` | poll unexpected status | `intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)` |
+
+**NOT jittered** (normal cadence, not retry backoff): `delay(intervalMs)` at `:461/:478` (regular poll spacing), `delay(POLL_DRAIN_IMMEDIATE_MS)` at `:475` (server-says-more drain). These are already rate-limited spacing for non-failure paths.
+
+**Required code shape (rev2 — Vladislav P3): compute jitter, log the jittered value, then delay.** Mutating `delay(d * factor)` inline would leave the existing `next_delay_ms=` log fields showing the nominal value (`delayForRetry(attempt)`), making the rev2 acceptance gate ("`next_delay_ms` lands in ±20 % band") unprovable from logs. Concrete shape:
+
+```kotlin
+val nominalDelay = delayForRetry(attempt)
+val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4   // 0.8..1.2
+val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+log(
+    "REST_TRACE send_retry id=${envelopeId.take(8)} reason=$lastReason " +
+        "attempt=$attempt next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay " +
+        "elapsedMs=$attemptElapsed",
+)
+delay(jitteredDelay)
+```
+
+- `next_delay_ms` is the **actual** wait time (preserves the historical field semantics — operators reading it see the real wait).
+- `nominal_delay_ms` is a NEW field recording the un-jittered value so the ±20 % band can be verified post-hoc.
+- Same shape (with the appropriate constant name in `nominalDelay`) applied to all 7 sites.
+
+The `Random.Default` import (`import kotlin.random.Random`) is added at the top of the file. No deterministic-mean behaviour change; the jitter spreads simultaneous retries by ±20 % so the H4 stampede pattern (`send + poll + ack + ws_auth` all hit `secureConnectStart` simultaneously, observed at `test83-v4-tecno.log:679/:710/:711/:719`) is broken without serialising the calls.
+
+##### Hard guards (preserved invariants)
+
+| Invariant | Guarded by |
+|---|---|
+| Inv5 — R0.4b idle_watchdog stays passive | NO changes to `idle_watchdog` / `forceReconnect` / `lastInboundFrameMark`. Verified by grep absence in the Commit 2 diff. |
+| Inv8 — REST fallback success MUST NOT update `lastWorkingTransport` | NO changes to `TransportManager` / `lastWorkingTransport` policy. Verified by grep absence. |
+| SOCKS / Tor path budgets | `connectTimeout(90, SECONDS)` for SOCKS unchanged. NEW `callTimeout(10, SECONDS)` applies ONLY when `socksProxyPort == null`. Tor circuit cost remains accommodated. |
+| Media upload OkHttp client | `AndroidNativeOkHttpMediaUploadTransport.kt:657-:665` (`buildClient()`). Already at 10 s `callTimeout` per `:673`. Separate code path; NOT touched. |
+| Prekey publish / fetch clients | `RelayTransportFactory.kt:152-:215` (`createRestHttpClient()`) and `:218-:254` (`createPreKeyPublishHttpClient()`, deprecated) and the inline client in `AndroidNativeOkHttpPreKeyPublishTransport.publish()` at `:270-:285`. All prekey paths — NOT touched. **Rev2 correction**: rev1 mislabeled these as "media upload"; they are actually prekey-related. The actual media upload client is in `AndroidNativeOkHttpMediaUploadTransport`. |
+| WS frame-level liveness gate | `readTimeout(60, TimeUnit.SECONDS)` at `RelayTransportFactory.kt:78` unchanged — it is the OS-level backstop for the WS-frame readLoop per ADR-010, not a per-call ceiling for the auth/challenge GET. |
+| WS heartbeat | `pingInterval(15_000L)` at `RelayTransportFactory.kt:71` unchanged per `feedback_ws_heartbeat_diagnostic_2026_05_27.md`. |
+
+##### NO parallel-handshake limiter in Commit 2 (Vladislav-decided 2026-05-30)
+
+The Commit 1 field log shows simultaneous `send + poll + ack + ws_auth` `secureConnectStart` events (`test83-v4-tecno.log:679, :710, :711, :719`). Adding a per-host concurrency limiter is tempting, but Vladislav-rejected for THIS commit because:
+
+- Head-of-line blocking risk: one stuck `send` would block `poll` and `ws_auth`, recreating the "ничего не происходит" symptom in a different shape.
+- Diagnostic data after fail-fast lands may show stampede is no longer destructive once the 60 s wait collapses to 10 s.
+
+If Commit 2 field test (Test #83 v5) still shows stampede-correlated failures, scope expansion goes to a deferred **optional Commit 2b**: mild per-host limiter (e.g. max 2 concurrent short-message HTTPS calls, low priority on `ack`). NOT in scope of THIS commit.
+
+##### Scope diff (files touched in Commit 2 code — rev2 corrected)
+
+| File | Change |
+|---|---|
+| `shared/core/transport/src/androidMain/.../AndroidNativeOkHttpRestFallbackTransport.kt` | 4 companion constants at `:223-:226` (rev2 line refs). |
+| `shared/core/transport/src/androidMain/.../RelayTransportFactory.kt` | Direct-path `connectTimeout(10)` → `connectTimeout(5)` at `:90`. NEW `callTimeout(10, SECONDS)` (Direct only) inserted after `:90`. |
+| `shared/core/transport/src/commonMain/.../RestFallbackOrchestrator.kt` | `SEND_RETRY_DELAYS_MS` whole-array `:674-:676` `{1_000, 3_000, 8_000, 20_000, 60_000} → {1_000, 3_000, 8_000, 15_000, 15_000}` (rev2: change `[3]` for actual effect, `[4]` kept for cosmetic consistency). Jitter applied at the **7** `delay(...)` sites `:281/:324/:332/:425/:445/:454/:485` using the computed-then-logged shape. New `import kotlin.random.Random`. |
+
+Expected diff size: ~35 lines net across 3 files (rev2: 7 sites × ~3 lines + log-shape change is ~25 lines, plus the constant edits). No new files.
+
+##### Test plan for Commit 2 code (Vladislav-locked 2026-05-30)
+
+NOT a full CHIP1 acceptance ladder — transport-focused:
+
+1. Cold-start install (force-stop + install APK).
+2. Open PHANTOM, dispatch chat with emu → generate read receipts (Standard mode).
+3. Burst 20 messages from emu in PowerShell loop (per Test #83 v3 playbook).
+4. **PASS gate**: zero occurrences of `secureConnectStart → 60 s silence → connectFailed Socket closed elapsedMs=59999` anywhere in `C:\temp\test83-v5-tecno.log`. Any stall MUST fail within 10-15 s (the new ceiling).
+5. **PASS gate**: any retry MUST land at jittered intervals (rev2: visible in the NEW `nominal_delay_ms=` and existing `next_delay_ms=` field pair on `send_retry` / `poll_fail` lines: `next_delay_ms` is the actual jittered wait, `nominal_delay_ms` is the un-jittered source; verifier asserts `0.8 ≤ next_delay_ms / nominal_delay_ms ≤ 1.2`).
+6. **Observation gate (NOT blocking Commit 2 merge)**: if stampede pattern persists (multiple ops `secureConnectStart` within the same 100 ms window during the failure burst), record as evidence for optional Commit 2b. If stampede is gone, Commit 2b is not needed.
+
+##### Why no Commit 2 code in this docs PR
+
+`feedback_session_close_discipline.md` — design note first, then code. Same process model as PR-CRYPTO-INBOUND-X3DH-REPAIR1 (#248 mini-lock → #249 code). The numbers above are Vladislav-locked, but the code lands in a separate PR after explicit ACK on the design note. The design-note merge is the architect's last chance to push back on numbers before code branches.
 
 ### Commit 3 — Connection-state surface to UI + fall-through after repeated failures
 
