@@ -273,19 +273,29 @@ class RestFallbackOrchestrator(
                 val ex = outcome.exceptionOrNull()!!
                 lastStatus = null
                 lastReason = ex::class.simpleName ?: "Exception"
-                // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
-                // backoff. `next_delay_ms` is the actual wait we will
-                // perform; `nominal_delay_ms` is the un-jittered source
-                // for post-hoc verification of the ±20 % band.
-                val nominalDelay = delayForRetry(attempt)
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
-                log(
-                    "REST_TRACE send_retry id=${envelopeId.take(8)} reason=$lastReason " +
-                        "attempt=$attempt next_delay_ms=$jitteredDelay " +
-                        "nominal_delay_ms=$nominalDelay elapsedMs=$attemptElapsed",
-                )
                 if (attempt < SEND_MAX_ATTEMPTS) {
+                    // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                    // backoff. `next_delay_ms` is the actual wait we will
+                    // perform; `nominal_delay_ms` is the un-jittered source
+                    // for post-hoc verification of the ±20 % band.
+                    //
+                    // Rev2 fix (Vladislav P2 on PR #255): jitter computation +
+                    // `send_retry` log moved INSIDE the `attempt < SEND_MAX_ATTEMPTS`
+                    // check. On `attempt = SEND_MAX_ATTEMPTS` (final failure) the
+                    // code now goes straight to `break` and the downstream
+                    // `send_fail_giving_up` log records the terminal state. This
+                    // keeps `next_delay_ms` semantics honest (= actual wait, never
+                    // a phantom value on the giving-up branch) and restores the
+                    // `SEND_RETRY_DELAYS_MS` doc claim that `delayForRetry(5)`
+                    // is never called.
+                    val nominalDelay = delayForRetry(attempt)
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE send_retry id=${envelopeId.take(8)} reason=$lastReason " +
+                            "attempt=$attempt next_delay_ms=$jitteredDelay " +
+                            "nominal_delay_ms=$nominalDelay elapsedMs=$attemptElapsed",
+                    )
                     delay(jitteredDelay)
                     continue
                 }
