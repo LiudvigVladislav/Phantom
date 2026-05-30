@@ -87,7 +87,19 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // (cross-device test 2026-05-10), making the WS attempt cycle
         // for ~3 minutes before succeeding even though the underlying
         // transport had reached Connected.
-        .connectTimeout(if (socksProxyPort != null) 90 else 10, TimeUnit.SECONDS)
+        //
+        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): tightened the
+        // Direct value from 10 s → 5 s. TCP SYN+ACK on a healthy
+        // mobile Direct uplink to `relay.phntm.pro` consistently
+        // completes in well under 1 s (Commit 1 phase logs show
+        // 180-330 ms `secureConnectEnd` elapsedMs on healthy calls
+        // at `test83-v4-tecno.log:482/:524/:570/:613/:655/:658`),
+        // so a 5 s ceiling fails-fast on a stuck handshake without
+        // false-tripping a slow-but-legitimate connection. The
+        // SOCKS/Tor budget (90 s) is preserved unchanged because
+        // Tor circuit + onion HS-descriptor fetch legitimately
+        // takes 30-60 s.
+        .connectTimeout(if (socksProxyPort != null) 90 else 5, TimeUnit.SECONDS)
         // Force HTTP/1.1 only for the WebSocket upgrade. With HTTP/2 one
         // TCP connection multiplexes many streams and the pool entry is
         // a long-lived h2 connection — connection lifecycle reasoning
@@ -126,6 +138,20 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
     // interface so we never leak the proxy address off-device.
     if (socksProxyPort != null) {
         builder.proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksProxyPort)))
+    }
+
+    // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): per-call ceiling for
+    // the WS reconnect `/auth/challenge` HTTPS GET on the Direct path
+    // only. Test #83 v4 (`test83-v4-tecno.log:737-:738`) showed the
+    // auth/challenge call hitting `SocketTimeoutException Read timed out
+    // elapsedMs=60186 totalMs=60198` — the same 60 s wall as the REST
+    // fallback (now tightened by AndroidNativeOkHttpRestFallbackTransport
+    // companion constants). The new 10 s callTimeout fails-fast on a
+    // stuck handshake. NOT applied to SOCKS/Tor paths because the Tor
+    // circuit + HS-descriptor fetch can legitimately eat 30-60 s for the
+    // first call through a fresh tunnel.
+    if (socksProxyPort == null) {
+        builder.callTimeout(10, TimeUnit.SECONDS)
     }
 
     val okHttp = builder.build()
