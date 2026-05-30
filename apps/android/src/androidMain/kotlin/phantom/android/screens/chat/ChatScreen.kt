@@ -327,8 +327,16 @@ fun ChatScreen(
         isVerified = conv?.isVerified == true
     }
 
-    val transportState by container.transport.state.collectAsState()
-    val isConnected = transportState is TransportState.Connected
+    // PR-WS-HEALTH-STATE1 Commit 3.1 (2026-05-30): switched from raw
+    // `container.transport.state` (TransportState) to the composite
+    // presentation flow (ConnectionUiState). `isConnected` now reflects
+    // delivery health, not raw WS health — so the "online" status row at
+    // ~:4480 stays correctly true while REST fallback is delivering or
+    // while WS is recovering from a transient drop.
+    val transportState by container.connectionUiState.collectAsState()
+    val isConnected = transportState is phantom.android.transport.ConnectionUiState.Online ||
+        transportState is phantom.android.transport.ConnectionUiState.LimitedRealtime ||
+        transportState is phantom.android.transport.ConnectionUiState.Recovering
 
     // PR-UI-CHAT-THREAD-CACHE1 — no-op stub. Kept for source-compat with
     // the 7 existing call-sites (lines ~399, 417, 516, 1013, 1031, 1234,
