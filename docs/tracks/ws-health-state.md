@@ -436,12 +436,16 @@ These tests are merge-blocking gates so a future regression cannot silently re-e
 
 ---
 
-## Commit 3.1 design note — UI composite transport state ONLY (Vladislav-locked 2026-05-30, **rev2 after architect P2 on PR #256**)
+## Commit 3.1 design note — UI composite transport state ONLY (Vladislav-locked 2026-05-30, **rev3 after architect P2 on rev2 code shape**)
 
-**Rev2 changes** (architect surfaced 2 P2s on rev1):
+**Rev3 change (architect P2 on rev2 implementation shape):**
 
-1. Derivation table precedence: `RestMode` priority OVER raw `wsState` (rev1 had ambiguous overlap between `Connected | *` and `* | RestActive`). The notification shade overlay at `PhantomMessagingService.kt:254-:260` already encodes the same precedence (`RestActive`/`WsCandidate` intercepted before `WsActive` falls through), so the rev2 table aligns ChatList + shade onto a single derivation.
-2. Owner shifted from `HybridRelayTransport` to `AppContainer`. `container.transport.get() = hybridTransport ?: wsTransport` at `AppContainer.kt:325-:326` falls back to bare `wsTransport` during the pre-init startup race — exposing `effectiveState` on `HybridRelayTransport` would force every UI consumer to handle a null source. Hoisting to `AppContainer` lets the property be an always-present `StateFlow` with a clean null-hybrid fallback derivation. Plus rev2: type renamed `TransportEffectiveState` → `ConnectionUiState` (architect-preferred, less confusable with `TransportState`).
+Rev2 drafted the derivation as `combine(wsTransport.state, hybridTransport?.stateMachine?.state ?: MutableStateFlow(RestMode.WsActive))`. The elvis is evaluated **once at `combine(...)` construction time** — if `hybridTransport == null` then, `combine` permanently subscribes to a dummy `MutableStateFlow` that no later code updates. UI would stay stuck on `WsActive` forever even after `hybridTransport` lands. Rev3 replaces that shape with a class-level `connectionRestMode: MutableStateFlow(RestMode.WsActive)` source that `combine` always reads from, and a separate coroutine forwards `hybrid.stateMachine.state` into it once `hybridTransport` exists. Standard "swap upstream lazily" pattern. Gate 8 genuinely satisfiable.
+
+**Rev2 changes** (architect P2s on rev1):
+
+1. Derivation table precedence: `RestMode` priority OVER raw `wsState` (rev1 had ambiguous overlap between `Connected | *` and `* | RestActive`). Aligns with the notification shade overlay precedence at `PhantomMessagingService.kt:254-:260`.
+2. Owner shifted from `HybridRelayTransport` to `AppContainer` (`container.transport.get() = hybridTransport ?: wsTransport` at `AppContainer.kt:325-:326` falls back to bare `wsTransport` during the startup race). Type renamed `TransportEffectiveState` → `ConnectionUiState` (architect-preferred).
 
 Added gates 7 (precedence test) and 8 (startup / null-hybrid fallback).
 
@@ -511,24 +515,44 @@ sealed class ConnectionUiState {
 }
 ```
 
-NEW property + derivation function on `AppContainer`:
+NEW property + derivation function on `AppContainer` (rev3 — architect-corrected combine shape):
 
 ```kotlin
 // In AppContainer:
-private val _connectionUiState = MutableStateFlow<ConnectionUiState>(ConnectionUiState.Connecting)
-val connectionUiState: StateFlow<ConnectionUiState> = _connectionUiState.asStateFlow()
 
-// Wired inside initMessaging (after hybridTransport is set):
+// Always-present RestMode source. Initial value is RestMode.WsActive
+// so the pre-init window flows the bare-wsTransport semantics through
+// the derivation correctly. After initMessaging wires hybridTransport
+// (rev3 — see the separate forwarder coroutine below), this flow
+// becomes the live mirror of hybrid.stateMachine.state.
+private val connectionRestMode = MutableStateFlow(RestMode.WsActive)
+
+// Composed presentation flow — always present from AppContainer
+// construction, so consumers never see null.
+val connectionUiState: StateFlow<ConnectionUiState> = combine(
+    wsTransport.state,
+    connectionRestMode,
+) { wsState, restMode ->
+    deriveConnectionUiState(wsState, restMode)
+}.stateIn(
+    scope = appScope,
+    started = SharingStarted.Eagerly,
+    initialValue = ConnectionUiState.Connecting,
+)
+
+// Inside initMessaging, AFTER hybridTransport becomes non-null
+// (around the same site as the existing transport.state listeners
+// at AppContainer.kt:987 and :1022):
 appScope.launch {
-    combine(
-        wsTransport.state,                               // always present
-        hybridTransport?.stateMachine?.state             // null until hybrid wired
-            ?: MutableStateFlow(RestMode.WsActive),
-    ) { wsState, restMode -> deriveConnectionUiState(wsState, restMode) }
-        .collect { _connectionUiState.value = it }
+    val hybrid = hybridTransport ?: return@launch
+    hybrid.stateMachine.state.collect { mode ->
+        connectionRestMode.value = mode
+    }
 }
 
-// Pure derivation function, table-driven, unit-testable:
+// Pure derivation function, table-driven, unit-testable.
+// Sealed-class API kept internal so tests can target it without
+// going through combine / StateFlow plumbing.
 internal fun deriveConnectionUiState(
     wsState: TransportState,
     restMode: RestMode,
@@ -545,7 +569,9 @@ internal fun deriveConnectionUiState(
 }
 ```
 
-The pre-init window (before `initMessaging` finishes constructing `hybridTransport`) flows through the null-fallback branch with implied `RestMode.WsActive`, so the UI sees normal `Connecting` / `Disconnected` / `Connected` / `Reconnecting` semantics against the bare WS transport. As soon as `hybridTransport` is constructed and `_connectionUiState` collector is wired, the derivation switches to the real `combine(wsTransport.state, stateMachine.state)`. No null-handling required at consumer sites.
+**Architectural note (rev3 — addresses architect P2 on rev2 code shape):** the rev2 draft used `combine(wsTransport.state, hybridTransport?.stateMachine?.state ?: MutableStateFlow(RestMode.WsActive))`. The elvis operator is evaluated **once at `combine(...)` construction time**. If `hybridTransport == null` at that moment (startup race), `combine` permanently subscribes to a fresh dummy `MutableStateFlow` that no later code path ever updates — so even after `initMessaging` constructs `hybridTransport`, the UI flow stays stuck on the initial `WsActive` and never tracks the real `stateMachine.state`. The rev3 shape above instead uses a class-level `connectionRestMode` source that `combine` always reads from, and a separate coroutine forwards updates into it once `hybridTransport` lands. This is the standard pattern for "swap the upstream of a flow lazily after construction" and makes gate 8 genuinely satisfiable.
+
+The pre-init window: `connectionRestMode` starts at `RestMode.WsActive`, so the derivation flows the bare-wsTransport semantics correctly (`Connecting` / `Disconnected` / `Connected` / `Reconnecting`). Once the forwarder coroutine starts collecting `hybrid.stateMachine.state`, every emission propagates through `connectionRestMode` → `combine` → `connectionUiState` → all UI consumers, without any extra plumbing at the consumer sites.
 
 Derivation table (rev2 — architect-corrected for explicit precedence on `RestMode`):
 
