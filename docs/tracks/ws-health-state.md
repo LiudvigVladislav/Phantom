@@ -1,6 +1,6 @@
 # PR-WS-HEALTH-STATE1 — mini-lock
 
-**Status:** Draft, **revision 3** after architect P3 follow-up on rev2 (PR #252 2026-05-30). Rev2 fixed F4/F7/F8/F9/H4/Inv3/Inv6. Rev3 propagates those corrections into the still-stale H3 (sub-corroboration framing), H5 (timeout numbers), H6 (downgrade + reword off "REST `/auth/challenge` race"), and H7 (relay-side evidence dependency made explicit). Rev3 also folds in the four-commit Implementation plan ladder Vladislav approved on PR #252 thread. Still awaiting Vladislav explicit ACK on §1, §2, §3 + Implementation plan before code work begins. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
+**Status:** Draft, **revision 4** after architect final polish on rev3 (PR #252 2026-05-30). Rev2 fixed F4/F7/F8/F9/H4/Inv3/Inv6. Rev3 propagated those into H3/H5/H6/H7 and added the four-commit Implementation plan. Rev4 cleans the H4 path wording (`/auth/challenge`, not `/relay/auth/challenge`) and extends Commit 1's diagnostic `EventListener` to cover the WS reconnect auth path in addition to the REST fallback. Awaiting Vladislav explicit final ACK on §1, §2, §3, Implementation plan before merge + code work begins. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
 
 **Motivating event:** Test #83 v3 (2026-05-30) PASSED Phase 1 crypto gate + Phase 2 scenarios 1-4, but BLOCKED on scenario 5 (burst incoming, ~20 messages). Tecno received 7 of ~20 and then transport collapsed for >2 minutes.
 
@@ -156,7 +156,7 @@ Each hypothesis is labeled with the test that would falsify it. Lock no root cau
 
 > **Replaces the original "OkHttp Dispatcher/ConnectionPool saturation" framing**, which is **architecturally impossible** per F9: the REST fallback uses `ConnectionPool(0, 1ms)` on a fresh `OkHttpClient` per call, so there is no shared pool to saturate. The architect surfaced this on 2026-05-30 PR #252 review.
 > 
-> Reframed hypothesis: during the burst window, Tecno's local network stack (cellular radio state, NAT entry table on the home router, or Android's per-app socket/file-descriptor limit) was overwhelmed by the volume of *fresh* TCP+TLS handshakes the REST fallback issues per call. Each `/relay/send`, `/relay/poll`, `/relay/auth/challenge`, and WS reconnect = one fresh socket. Multiple in flight + retry storms = many simultaneous handshakes.
+> Reframed hypothesis: during the burst window, Tecno's local network stack (cellular radio state, NAT entry table on the home router, or Android's per-app socket/file-descriptor limit) was overwhelmed by the volume of *fresh* TCP+TLS handshakes the REST fallback issues per call. Each `/relay/send`, `/relay/poll`, `/auth/challenge`, and WS reconnect = one fresh socket. Multiple in flight + retry storms = many simultaneous handshakes.
 > 
 > Falsification test: instrument `AndroidNativeOkHttpRestFallbackTransport` with an OkHttp `EventListener` exposing `dnsStart` / `connectStart` / `secureConnectStart` / `responseHeadersStart` / `callFailed` per call (analogous to `ProbeEventListener`). Rerun Test #83 v3 scenario 5. If the 60 s elapsed time is dominated by a single phase — e.g. `dnsStart` → `connectStart` → no `secureConnectStart` for 30 s — that pinpoints the network-stack stall layer (DNS / TCP SYN-ACK / TLS handshake) and tells us whether the issue is per-socket cost or radio/router state.
 > 
@@ -262,11 +262,13 @@ Per `feedback_sticky_fallback_hint_2026_05_27.md`, REST fallback successes durin
 
 Four ordered commits, each independently mergeable but designed to land together as the WS-HEALTH-STATE1 squash. Each commit has its own architect ACK gate per PR #243's per-commit-review model.
 
-### Commit 1 — Diagnostic `EventListener` on REST fallback (no behaviour change)
+### Commit 1 — Diagnostic `EventListener` on REST fallback **and on WS reconnect auth path** (no behaviour change)
 
 Instrument `AndroidNativeOkHttpRestFallbackTransport` with an OkHttp `EventListener` exposing per-call phase timings, analogous to the existing `ProbeEventListener` used by `KtorTransportProbe`. Emit structured `REST_TRACE phase_*` log lines: `dnsStart`/`dnsEnd`/`connectStart`/`connectEnd`/`secureConnectStart`/`secureConnectEnd`/`responseHeadersStart`/`callFailed` per call, each tagged with `op={send|poll|ack|session}` and `id=<idem>`.
 
-This commit is the **falsification instrument for H3/H4/H5**. After it ships and a Test #83 v3 scenario 5 is rerun, the logs will tell us WHICH phase consumes the 60 s — DNS / TCP SYN-ACK / TLS handshake / response headers. Until we have that data, the timeout-tightening commit (Commit 2) is guessing.
+**Add the same phase instrumentation to the WS reconnect `auth/challenge` HTTPS GET** in `KtorRelayTransport` (or wherever the auth-challenge Ktor call lives), tagged `op=ws_auth gen=<n> s=<n>`. Per F8 + the H5 revision, both paths hit the same 60 s socket-level wall under the burst condition; covering only the REST fallback would leave the WS reconnect side of the failure invisible.
+
+This commit is the **falsification instrument for H3/H4/H5**. After it ships and a Test #83 v3 scenario 5 is rerun, the logs will tell us WHICH phase consumes the 60 s — DNS / TCP SYN-ACK / TLS handshake / response headers — on BOTH the REST fallback and the WS reconnect auth paths. Until we have that data, the timeout-tightening commit (Commit 2) is guessing.
 
 Scope guard: NO timeout changes, NO state-machine changes, NO UI changes. Diagnostic-only.
 
