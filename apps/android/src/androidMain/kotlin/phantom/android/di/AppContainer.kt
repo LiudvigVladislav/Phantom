@@ -274,7 +274,21 @@ class AppContainer(private val context: Context) {
         }.stateIn(
             scope = appScope,
             started = SharingStarted.Eagerly,
-            initialValue = phantom.android.transport.ConnectionUiState.Connecting,
+            // PR-WS-HEALTH-STATE1 Commit 3.1 rev2 (architect P2 on PR #257):
+            // initial value MUST be derived from the current snapshot, not a
+            // hardcoded constant. Otherwise a synchronous `.value` read in the
+            // narrow window before combine's first emission would return
+            // ConnectionUiState.Connecting even when wsTransport.state.value
+            // is already Disconnected (cold-start) — and ConnectionBanner's
+            // LaunchedEffect would set `hasEverConnected = true` on that
+            // spurious Connecting and surface a false-positive grace-period
+            // banner later. Gate 8 says the pre-init window must observe the
+            // (wsTransport.state, RestMode.WsActive) derivation; using the
+            // derivation function literally here makes the semantics match.
+            initialValue = phantom.android.transport.deriveConnectionUiState(
+                wsTransport.state.value,
+                connectionRestMode.value,
+            ),
         )
 
     /**
