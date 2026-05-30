@@ -461,7 +461,6 @@ fun ChatScreen(
                         ).show()
                     } else {
                         reloadMessages()
-                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
                     }
                 } finally {
                     voiceSendInProgress = false
@@ -587,7 +586,11 @@ fun ChatScreen(
                         conversationId, conv.theirPublicKeyHex, sendReceipts,
                     )
                 }
-                listState.animateScrollToItem(messages.lastIndex.coerceAtLeast(0))
+                // PR-UI-CHAT-NEW-MSG-CHIP1 mini-lock § Test acceptance row 3:
+                // do NOT auto-scroll on incoming. Compose recomposition + the
+                // reverseLayout=true + firstVisibleItemIndex=0 invariant keep
+                // an at-bottom user pinned; a scrolled-up user gets the chip
+                // badge via ScrollToBottomState.onIncoming(...).
             }
         }
     }
@@ -1100,7 +1103,6 @@ fun ChatScreen(
                                     )
                                 )
                                 reloadMessages()
-                                if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
                                 // PR-UI-CHAT-NEW-MSG-CHIP1 (2026-05-29)
                                 // — user's own text-send is an explicit
                                 // "bring me to the latest" signal
@@ -1110,6 +1112,11 @@ fun ChatScreen(
                                 // animates scroll to visual bottom
                                 // (source index 0 in reverseLayout).
                                 // Idempotent if already at bottom.
+                                // Single source of truth — the prior
+                                // legacy animateScrollToItem(messages.lastIndex)
+                                // here scrolled to the visual TOP and fought
+                                // this onOwnSend (Test #83 v3 "скролл туда-сюда"
+                                // forensic, 2026-05-30).
                                 chipState.onOwnSend(scope, listState, convTagForChip)
                             }
                         }
