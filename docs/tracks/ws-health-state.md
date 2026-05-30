@@ -436,7 +436,15 @@ These tests are merge-blocking gates so a future regression cannot silently re-e
 
 ---
 
-## Commit 3.1 design note — UI composite transport state ONLY (Vladislav-locked 2026-05-30)
+## Commit 3.1 design note — UI composite transport state ONLY (Vladislav-locked 2026-05-30, **rev2 after architect P2 on PR #256**)
+
+**Rev2 changes** (architect surfaced 2 P2s on rev1):
+
+1. Derivation table precedence: `RestMode` priority OVER raw `wsState` (rev1 had ambiguous overlap between `Connected | *` and `* | RestActive`). The notification shade overlay at `PhantomMessagingService.kt:254-:260` already encodes the same precedence (`RestActive`/`WsCandidate` intercepted before `WsActive` falls through), so the rev2 table aligns ChatList + shade onto a single derivation.
+2. Owner shifted from `HybridRelayTransport` to `AppContainer`. `container.transport.get() = hybridTransport ?: wsTransport` at `AppContainer.kt:325-:326` falls back to bare `wsTransport` during the pre-init startup race — exposing `effectiveState` on `HybridRelayTransport` would force every UI consumer to handle a null source. Hoisting to `AppContainer` lets the property be an always-present `StateFlow` with a clean null-hybrid fallback derivation. Plus rev2: type renamed `TransportEffectiveState` → `ConnectionUiState` (architect-preferred, less confusable with `TransportState`).
+
+Added gates 7 (precedence test) and 8 (startup / null-hybrid fallback).
+
 
 **Goal.** When `RestMode = RestActive` and raw WS state is `Connecting` / `Reconnecting` / `Error` / `Disconnected`, the ChatList main screen and the `ConnectionBanner` MUST NOT show misleading `Connecting...` / `Offline — messages queued`. Delivery is already happening through REST fallback; UI must reflect that reality.
 
@@ -489,69 +497,113 @@ So Commit 3.1 is partly "extract the existing-and-correct shade logic into a sha
 
 **Path A — Android-side derived `TransportEffectiveState` (PREFERRED):**
 
-NEW file `apps/android/src/androidMain/kotlin/phantom/android/transport/TransportEffectiveState.kt`:
+NEW file `apps/android/src/androidMain/kotlin/phantom/android/transport/ConnectionUiState.kt`:
 
 ```kotlin
-sealed class TransportEffectiveState {
-    object Online : TransportEffectiveState()                       // WS Connected
-    object LimitedRealtime : TransportEffectiveState()              // RestMode.RestActive (fallback delivering)
-    object Recovering : TransportEffectiveState()                   // RestMode.WsCandidate (transitioning back)
-    object Connecting : TransportEffectiveState()                   // WS Connecting + RestMode.WsActive (no fallback yet)
-    object Reconnecting : TransportEffectiveState()                 // WS Reconnecting + RestMode.WsActive
-    object Offline : TransportEffectiveState()                      // WS Disconnected/Error + RestMode.WsActive
-    data class Error(val cause: Throwable) : TransportEffectiveState()  // terminal WS error + no fallback
+sealed class ConnectionUiState {
+    object Online : ConnectionUiState()                       // RestMode.WsActive + WS Connected
+    object LimitedRealtime : ConnectionUiState()              // RestMode.RestActive (fallback delivering)
+    object Recovering : ConnectionUiState()                   // RestMode.WsCandidate (transitioning back)
+    object Connecting : ConnectionUiState()                   // RestMode.WsActive + WS Connecting
+    object Reconnecting : ConnectionUiState()                 // RestMode.WsActive + WS Reconnecting
+    object Offline : ConnectionUiState()                      // RestMode.WsActive + WS Disconnected
+    data class Error(val cause: Throwable) : ConnectionUiState()  // RestMode.WsActive + WS Error(t)
 }
 ```
 
-NEW property on `HybridRelayTransport`:
+NEW property + derivation function on `AppContainer`:
 
 ```kotlin
-val effectiveState: StateFlow<TransportEffectiveState> = combine(
-    wsTransport.state,
-    stateMachine.state,
-) { wsState, restMode -> derive(wsState, restMode) }
-    .stateIn(scope, SharingStarted.Eagerly, TransportEffectiveState.Connecting)
+// In AppContainer:
+private val _connectionUiState = MutableStateFlow<ConnectionUiState>(ConnectionUiState.Connecting)
+val connectionUiState: StateFlow<ConnectionUiState> = _connectionUiState.asStateFlow()
+
+// Wired inside initMessaging (after hybridTransport is set):
+appScope.launch {
+    combine(
+        wsTransport.state,                               // always present
+        hybridTransport?.stateMachine?.state             // null until hybrid wired
+            ?: MutableStateFlow(RestMode.WsActive),
+    ) { wsState, restMode -> deriveConnectionUiState(wsState, restMode) }
+        .collect { _connectionUiState.value = it }
+}
+
+// Pure derivation function, table-driven, unit-testable:
+internal fun deriveConnectionUiState(
+    wsState: TransportState,
+    restMode: RestMode,
+): ConnectionUiState = when (restMode) {
+    RestMode.RestActive  -> ConnectionUiState.LimitedRealtime  // priority 1
+    RestMode.WsCandidate -> ConnectionUiState.Recovering       // priority 2
+    RestMode.WsActive    -> when (wsState) {                   // priority 3+
+        TransportState.Connected    -> ConnectionUiState.Online
+        TransportState.Connecting   -> ConnectionUiState.Connecting
+        TransportState.Reconnecting -> ConnectionUiState.Reconnecting
+        TransportState.Disconnected -> ConnectionUiState.Offline
+        is TransportState.Error     -> ConnectionUiState.Error(wsState.cause)
+    }
+}
 ```
 
-Derivation table (Vladislav-set in design note review):
+The pre-init window (before `initMessaging` finishes constructing `hybridTransport`) flows through the null-fallback branch with implied `RestMode.WsActive`, so the UI sees normal `Connecting` / `Disconnected` / `Connected` / `Reconnecting` semantics against the bare WS transport. As soon as `hybridTransport` is constructed and `_connectionUiState` collector is wired, the derivation switches to the real `combine(wsTransport.state, stateMachine.state)`. No null-handling required at consumer sites.
 
-| `wsState` | `restMode` | `effectiveState` |
-|---|---|---|
-| Connected | * | `Online` |
-| * | `RestActive` | `LimitedRealtime` |
-| * | `WsCandidate` | `Recovering` |
-| Reconnecting | `WsActive` | `Reconnecting` |
-| Connecting | `WsActive` | `Connecting` |
-| Disconnected | `WsActive` | `Offline` |
-| Error(t) | `WsActive` | `Error(t)` |
+Derivation table (rev2 — architect-corrected for explicit precedence on `RestMode`):
+
+Pattern-match order matters in Kotlin `when` — first match wins. The table is intentionally written so that `RestMode` is evaluated BEFORE raw `wsState`, because `RestActive`/`WsCandidate` carry presentation semantics that supersede raw WS health. Concretely: `RestStateMachine.kt:34-:45` documents that `WsCandidate` keeps REST polling continuing until either 60 s of WS uptime OR an outbound ACK round-trip lands — so raw WS `Connected` may transiently co-exist with `RestMode.WsCandidate`/`RestActive`, and the UI must reflect the LimitedRealtime/Recovering state in that window, not "Online".
+
+| Priority | `restMode` | `wsState` | `connectionUiState` |
+|---|---|---|---|
+| 1 | `RestActive` | * | `LimitedRealtime` |
+| 2 | `WsCandidate` | * | `Recovering` |
+| 3 | `WsActive` | `Connected` | `Online` |
+| 4 | `WsActive` | `Reconnecting` | `Reconnecting` |
+| 5 | `WsActive` | `Connecting` | `Connecting` |
+| 6 | `WsActive` | `Disconnected` | `Offline` |
+| 7 | `WsActive` | `Error(t)` | `Error(t)` |
+
+This matches the precedence already used by the notification shade overlay at `PhantomMessagingService.kt:254-:260`, where `RestActive` and `WsCandidate` are explicitly intercepted BEFORE falling through to `WsActive` (`null` return → defers to the raw-state-driven `TransportManager` collector).
+
+Side note (architect 2026-05-30): **do NOT reuse `TransportCapabilities`** as the UI presentation source. `TransportCapabilities` lives at `shared/core/transport/.../TransportCapabilities.kt:28` and answers "can the user send text / voice / start a call right now?" — capability domain. UI presentation answers "what label and color does the banner show?" — presentation domain. Keep them separated even though both consume `RestMode`.
+
+Owner of the derivation — **`AppContainer` (rev2)**, NOT `HybridRelayTransport`.
+
+Architect 2026-05-30 surfaced that `container.transport` at `AppContainer.kt:325-:326` is implemented as `get() = hybridTransport ?: wsTransport` — i.e. it falls back to bare `wsTransport` BEFORE `initMessaging` constructs the hybrid wrapper. If the derivation lived on `HybridRelayTransport`, every UI consumer would need to handle a null source during the startup race. Hoisting the derivation to `AppContainer` lets it expose an always-present `StateFlow<ConnectionUiState>` that internally:
+
+1. If `hybridTransport != null` → derive from `(hybridTransport.wsTransport.state, hybridTransport.stateMachine.state)`.
+2. If `hybridTransport == null` → derive from `(wsTransport.state, RestMode.WsActive)` (implied — no fallback layer yet).
+
+This matches the existing `transport` accessor's null-safety pattern, keeps the consumer API trivially `val ui = container.connectionUiState.collectAsState(initial = …)`, and avoids touching `HybridRelayTransport`'s public surface area at all.
 
 Consumer switches:
 
-- `ChatListScreen.kt:147` — switch source: `container.hybridTransport?.effectiveState.collectAsState(initial = Connecting)`.
-- `ChatScreen.kt:330-:331` — switch source + `isConnected = (effectiveState is Online || effectiveState is LimitedRealtime || effectiveState is Recovering)` (now correctly true when delivering via fallback).
-- `ConnectionBanner.kt:71-:117` — accept `TransportEffectiveState`, pattern-match new variants:
+- `ChatListScreen.kt:147` — switch source: `container.connectionUiState.collectAsState(initial = ConnectionUiState.Connecting)`.
+- `ChatScreen.kt:330-:331` — switch source + `isConnected = (state is Online || state is LimitedRealtime || state is Recovering)` (now correctly true when delivering via fallback).
+- `ConnectionBanner.kt:71-:117` — accept `ConnectionUiState`, pattern-match new variants:
   - `Online` → no banner.
-  - `LimitedRealtime` → `"Online via fallback"` / cyan dot.
-  - `Recovering` → `"Recovering"` / amber.
+  - `LimitedRealtime` → `"Online · Limited realtime"` / cyan dot.
+  - `Recovering` → `"Online · Recovering"` / amber.
   - `Connecting` → keep current `"Connecting…"` / amber (correct on cold-start).
   - `Reconnecting` → keep current `"Reconnecting…"` / amber.
   - `Offline` → `"Offline — messages queued"` / danger.
   - `Error(t)` → keep current `"Offline — reconnecting"` / danger.
-- Optional: `PhantomMessagingService.kt:246-:267` shade overlay — switch to `effectiveState.collect` for DRY (one source of truth). If kept on `stateMachine.state`, the two paths must stay in semantic sync — feasible but brittle.
+- Optional: `PhantomMessagingService.kt:246-:267` shade overlay — switch to `container.connectionUiState.collect` for DRY (one source of truth). If kept on `stateMachine.state`, the two paths must stay in semantic sync — feasible but brittle. Recommended DRY-fy.
+
+Type naming rev2: `TransportEffectiveState` → **`ConnectionUiState`** (architect-preferred). The new name makes it obvious the type is presentation-only and not a candidate substitute for the existing `TransportState` source of truth.
 
 Logic consumers (`AppContainer.kt:987-:999` retryWaitingMessages, `:1022-` prekey lifecycle) **unchanged** — still use raw `transport.state.is Connected` because the semantics they want is "fresh WS came up, retry the things that need a WS round-trip" and that's WS-specific.
 
 `PhantomWakeupReceiver.kt:164` **unchanged** — same WS-specific semantics for alarm-driven connectivity poke.
 
-**Blast radius Path A:**
-- NEW files: 1 (`TransportEffectiveState.kt`, ~30 lines).
-- EDIT files: 3-4 (`HybridRelayTransport.kt` +20 lines derivation; `ChatListScreen.kt` 1 line; `ChatScreen.kt` 2 lines; `ConnectionBanner.kt` ~30 lines pattern rewrite).
-- OPTIONAL: 1 more (`PhantomMessagingService.kt` ~10 lines DRY-fy).
+**Blast radius Path A (rev2):**
+- NEW files: 1 (`ConnectionUiState.kt`, ~30 lines).
+- EDIT files: 3-4 (`AppContainer.kt` +25 lines for the property + collector + derivation; `ChatListScreen.kt:147` ~1 line; `ChatScreen.kt:330-:331` ~2 lines; `ConnectionBanner.kt:71-:117` ~30 lines pattern rewrite).
+- OPTIONAL: 1 more (`PhantomMessagingService.kt:246-:267` ~10 lines DRY-fy).
+- `HybridRelayTransport.kt`: **UNTOUCHED** (architect-corrected from rev1).
 - Common `TransportState` API: **UNTOUCHED**.
 - All existing test fakes: **UNTOUCHED**.
 - iOS / JVM stubs: **UNTOUCHED**.
 
-Expected net diff: ~80 lines across 4-5 files.
+Expected net diff: ~85 lines across 4-5 files.
 
 **Path B — new common-side `TransportState.LimitedRealtime` variant (REJECTED):**
 
@@ -575,22 +627,29 @@ Files touched: ~10-15 across Android + common + iOS-stub + 3-5 test files. Expec
 
 **Decision:** **Path A** — strict per Vladislav's 2026-05-30 guidance ("for малого 3.1 лучше сначала проверить, можно ли сделать derived UI model рядом с Android layer, не меняя common transport API"). Audit confirms common `TransportState` is too widely consumed (6+ Android sites, all test fakes, common `isConnected()`) for a low-blast-radius variant addition. Path B reserved as escape hatch only if Path A surfaces an actual blocker during code.
 
-### §4 — Acceptance gates for the Commit 3.1 code PR
+### §4 — Acceptance gates for the Commit 3.1 code PR (rev2: 8 gates)
 
-1. **UI consistency:** when `RestMode = RestActive` (REST fallback delivering), `ConnectionBanner` does NOT show `"Connecting…"` / `"Offline — messages queued"` / `"Reconnecting…"`. It shows `"Online via fallback"` or equivalent positive-state label.
+1. **UI consistency:** when `RestMode = RestActive` (REST fallback delivering), `ConnectionBanner` does NOT show `"Connecting…"` / `"Offline — messages queued"` / `"Reconnecting…"`. It shows `"Online · Limited realtime"`.
 2. **No raw-state regression:** when `RestMode = WsActive` (no fallback) and WS is `Connecting`/`Reconnecting`/`Disconnected`, the banner still shows the same labels it does today.
-3. **Logic consumers unchanged:** `AppContainer.kt:987-:999` prekey retry and `:1022-` lifecycle hooks fire ONLY on raw `TransportState.Connected` transitions (same as today). Verified by grep on the Commit 3.1 diff.
+3. **Logic consumers unchanged:** `AppContainer.kt:987-:999` prekey retry and `:1022-` lifecycle hooks fire ONLY on raw `TransportState.Connected` transitions (same as today). Verified by grep on the Commit 3.1 diff. `PhantomWakeupReceiver.kt:164` `is TransportState.Connecting` check also unchanged.
 4. **Hard guards:** Inv5 (R0.4b passive watchdog) and Inv8 (no `lastWorkingTransport` lock-in) untouched. Grep-absence verifiable.
 5. **Common `TransportState` API unchanged.** Grep `phantom.core.transport.TransportState` for added variants — must show zero.
 6. **No iOS/JVM stub edits.** Grep `shared/core/transport/src/(iosMain|jvmMain)` for changes — must show zero.
+7. **RestMode-over-wsState precedence verified (rev2 — architect P2 on rev1):** a unit test on `deriveConnectionUiState(wsState, restMode)` exhaustively asserts the 7 rows of the priority table, including the architect-flagged ambiguous cases:
+    - `(Connected, RestActive)` → `LimitedRealtime` (NOT `Online`).
+    - `(Connected, WsCandidate)` → `Recovering` (NOT `Online`).
+    - `(Reconnecting, RestActive)` → `LimitedRealtime` (NOT `Reconnecting`).
+    - `(Error(t), RestActive)` → `LimitedRealtime` (NOT `Error(t)`).
+   The function lives at internal visibility so the test can target it without going through `combine`/`StateFlow` plumbing.
+8. **Startup / null-hybrid path (rev2 — architect P2 on rev1):** `container.connectionUiState` is an always-present `StateFlow` (initialised before `initMessaging` completes) and consumers reading it before `hybridTransport` is wired observe a non-null state derived from `(wsTransport.state, RestMode.WsActive)` — i.e. the same `Connecting`/`Disconnected`/`Connected`/`Reconnecting` semantics they got today on `container.transport.state`. Verified by a startup-race test in `AppContainer`-style harness, or by reasoning from the implementation if no harness exists.
 
-### §5 — Implementation order for the code PR (after this design note merges)
+### §5 — Implementation order for the code PR (rev2 — owner shifted to AppContainer)
 
-1. NEW `TransportEffectiveState.kt` + unit-test the derivation function table.
-2. ADD `effectiveState` property on `HybridRelayTransport`.
-3. SWITCH `ChatListScreen.kt`, `ChatScreen.kt`, `ConnectionBanner.kt` to consume `effectiveState`.
-4. (Optional) DRY-fy `PhantomMessagingService.kt:246-:267` shade overlay onto the same derivation.
-5. Field rerun: cold-start → chat-open → observe REST migration in real time → confirm ChatList shows `"Online via fallback"`, NOT `"Connecting…"`.
+1. NEW `ConnectionUiState.kt` + extract the pure `deriveConnectionUiState(wsState, restMode)` function next to it. Unit-test the 7 priority rows of the table (gate 7).
+2. ADD `connectionUiState: StateFlow<ConnectionUiState>` to `AppContainer` with the null-hybrid fallback derivation (gate 8). Wire the collector inside `initMessaging` after `hybridTransport` becomes non-null.
+3. SWITCH `ChatListScreen.kt`, `ChatScreen.kt`, `ConnectionBanner.kt` to consume `container.connectionUiState`.
+4. (Optional) DRY-fy `PhantomMessagingService.kt:246-:267` shade overlay onto the same flow.
+5. Field rerun: cold-start → chat-open → observe REST migration in real time → confirm ChatList shows `"Online · Limited realtime"`, NOT `"Connecting…"`.
 
 ### §6 — Out of scope for Commit 3.1 (hard)
 
