@@ -1,6 +1,6 @@
 # PR-WS-HEALTH-STATE1 — mini-lock
 
-**Status:** Draft. Awaiting Vladislav explicit ACK on §1, §2, §3 before code work begins. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
+**Status:** Draft, **revision 2** after architect P2/P3 review on PR #252 2026-05-30. Five facts/hypotheses rewritten or replaced (F4, F7, F8, F9, H4) and two invariants tightened (Inv3 wording, Inv6 target set). Still awaiting Vladislav explicit ACK on §1, §2, §3 before code work begins. Three-section opening procedure per `feedback_session_close_discipline.md` + 2026-05-30 lock.
 
 **Motivating event:** Test #83 v3 (2026-05-30) PASSED Phase 1 crypto gate + Phase 2 scenarios 1-4, but BLOCKED on scenario 5 (burst incoming, ~20 messages). Tecno received 7 of ~20 and then transport collapsed for >2 minutes.
 
@@ -50,9 +50,15 @@ Source for the log line:
 - `shared/core/transport/.../KtorRelayTransport.kt:1008-1011` — emits the exact `no reconnect action (R0.4b)` string.
 - `shared/core/transport/.../RelayTransportConfig.kt:160` — comment confirming "PR-R0.4b — no forceReconnect from the idle watchdog".
 
-### F4. Relay-side outbound acks expired during s=1 burst window
+### F4. Tecno client-side outbound envelopes expired waiting for relay ACK during s=1
 
-Relay sent 4 envelopes to Tecno via WS during s=1 (lines :180, :193, :206, :219), all four `outbound_ack_deadline_armed timeoutMs=10000`. All four expired 10 s later with `outbound_ack_deadline_expired ageMs=10003-10004` (lines :222, :232, :239, :241). Tecno's WS was NOT delivering acks back to relay, even though the WS connection was technically open.
+**Corrected after architect review 2026-05-30 (P2 on PR #252):** the original wording attributed these envelopes to "relay sent 4 envelopes to Tecno"; that is wrong. The `PhantomRelay` tag in these lines is the **Tecno-side `KtorRelayTransport` client**, not the relay server. The `to=7fbdfbf11d35b462…` address is the recipient (emulator) pubkey, and the `outbound_ack_deadline_*` logs are the **Tecno client** waiting for the relay's ack on outbound envelopes that Tecno emitted. Confirmed by adjacent `SEND_TRACE encrypt_lock_wait` / `session_lookup` on the same conv at `test83-v3-tecno.log:182-:187` — the SEND_TRACE pipeline is what produced these envelopes.
+
+So the corrected fact:
+
+Tecno emitted 4 outbound envelopes during s=1 (lines :180, :193, :206, :219), each `outbound_ack_deadline_armed timeoutMs=10000`. All four expired 10 s later with `outbound_ack_deadline_expired ageMs=10003-10004` (lines :222, :232, :239, :241). The relay never acked them within the deadline. Their identity (likely sealed read receipts from `markConversationRead(...)` in Standard mode per the Test #83 v2 forensic appendix pattern; could also be other outbound sends) is unknown without correlating to relay-side log.
+
+The signal value is preserved: bidirectional traffic was failing — Tecno's outbound was not getting acked AND inbound was sparse — so the WS path between Tecno and relay was sick in both directions, not just receive-stalled.
 
 ### F5. State-machine transition `candidate_session_regression` is correct per code
 
@@ -70,32 +76,39 @@ After the s=3 → RestActive switch, the queued send `id=3c496e93` retried 3 tim
 - `test83-v3-tecno.log:907` — `send_retry ... attempt=2 elapsedMs=60020`.
 - `test83-v3-tecno.log:909` — `send_start attempt=3/5`.
 
-### F7. REST `/poll` failed twice with `InterruptedIOException elapsedMs≈60017`
+### F7. REST `/poll` failed twice with `InterruptedIOException elapsedMs≈60017` on a short-poll endpoint
 
-Same window. Long-poll requests hung the full read-timeout budget.
+**Corrected after architect review 2026-05-30 (P2 on PR #252):** original wording called these "long-poll requests"; that is wrong. The contract on both sides is **short-poll**: client `RestFallbackTransport.kt:81-82` says *"Short-poll only — server returns immediately, empty array if nothing"*, and the relay server at `services/relay/src/rest_fallback.rs:1163-1165` confirms *"Short-poll: returns immediately with an empty array if nothing is queued"*.
+
+So a 60 s `poll_fail` on a short-poll endpoint is **definitively a stuck HTTP call**, not a long-poll waiting for server-side timeout. There is no legitimate interpretation under which the client sits at the server for 60 s.
 
 - `test83-v3-tecno.log:900` — `REST_TRACE poll_fail reason=InterruptedIOException elapsedMs=60017 next_delay_ms=5000`.
 - `test83-v3-tecno.log:910` — analogous, elapsedMs=60017.
 
-### F8. REST `/auth/challenge` failed twice with `SocketTimeoutException`
+### F8. WS reconnect auth challenge failed twice with `SocketTimeoutException`
 
-REST also tried to re-establish auth and hit the same wall.
+**Corrected after architect review 2026-05-30 (P2 on PR #252):** original wording called this "REST `/auth/challenge`"; that is wrong. The two failed `Auth handshake failed` entries carry the **`PhantomRelay` tag with `[gen=1 s=4]` and `[gen=1 s=5]`** — those are WS session generation/seq numbers belonging to **`KtorRelayTransport`**, not the REST fallback layer. The actual REST auth path emits `REST_TRACE session_challenge_fail` (search the log — that string never appears).
 
-- `test83-v3-tecno.log:905` — `Auth handshake failed (attempt=1): SocketTimeoutException Socket timeout has expired [url=https://relay.phntm.pro/auth/challenge?...]`.
-- `test83-v3-tecno.log:913` — `Auth handshake failed (attempt=2): SocketTimeoutException`.
+So the corrected fact: **after s=3 collapsed, the WS-reconnect loop tried to re-establish a fresh WS session (s=4, then s=5), and each of those new WS sessions' `auth/challenge` HTTP call timed out with `SocketTimeoutException`**.
 
-### F9. OkHttp client REST timeouts are intentionally generous (60 s read/write, 120 s call)
+- `test83-v3-tecno.log:905` — `[gen=1 s=4] Auth handshake failed (attempt=1): SocketTimeoutException ... [url=https://relay.phntm.pro/auth/challenge?identity=…]`.
+- `test83-v3-tecno.log:913` — `[gen=1 s=5] Auth handshake failed (attempt=2): SocketTimeoutException`.
 
-`RelayTransportFactory.kt:221-224` for the direct REST path:
+Implication: during the burst-collapse window, **both REST fallback AND WS reconnect were failing simultaneously** with similar 60 s socket timeouts. The failure is broader than "REST path is broken"; it's "any new HTTPS call to `relay.phntm.pro` is broken during this window".
 
-```
-.connectTimeout(15, TimeUnit.SECONDS)
-.writeTimeout(60, TimeUnit.SECONDS)
-.readTimeout(60, TimeUnit.SECONDS)
-.callTimeout(120, TimeUnit.SECONDS)
-```
+### F9. REST fallback OkHttp client uses a fresh client per call with `call=60 s / connect=30 s / read=60 s / write=60 s`
 
-Comment context at `:208-:210` explicitly notes these are "generous budgets" for chunked media upload. They are NOT tuned for burst short-message delivery.
+**Corrected after architect review 2026-05-30 (P2 on PR #252):** original wording cited `RelayTransportFactory.kt:221-224` (`callTimeout=120s`) — that is a different code path (prekey/Ktor client), not the REST fallback transport actually used for `/relay/send`, `/relay/poll`, `/relay/ack-deliver`. The real path is:
+
+`shared/core/transport/src/androidMain/.../AndroidNativeOkHttpRestFallbackTransport.kt`:
+
+- `:172-:180` — `private fun buildClient(): OkHttpClient` is invoked **per call**, returning a fresh OkHttpClient with `ConnectionPool(0, 1ms)` (line `:174`) — zero idle keepalive, no pooling between calls.
+- `:188-:191` — `CALL_TIMEOUT_MS = 60_000L`, `CONNECT_TIMEOUT_MS = 30_000L`, `READ_TIMEOUT_MS = 60_000L`, `WRITE_TIMEOUT_MS = 60_000L`.
+- Comment at `:40-:42` explicitly explains the no-pool stance: *"re-use a pool entry the server side has discarded, resulting in 30 s+ stalls. One fresh TCP+TLS handshake per call costs ~50–200 ms on a healthy uplink and is the price we pay for reliable delivery on hostile networks."*
+
+These timeouts are the **exact ceilings** producing the `elapsedMs=60016/60017/60020` values in F6/F7 and the WS-reconnect `auth/challenge` 60 s wait in F8 (since the WS reconnect path uses a similar HTTPS GET that hits the same network condition).
+
+These ceilings were chosen to give chunked media upload (PR-M2) enough budget. They are NOT tuned for burst short-message delivery. A 60 s ceiling on `/relay/send` for a 1.6 KB body is several orders of magnitude over the legitimate need.
 
 ### F10. Sender (emu) side was healthy throughout the burst
 
@@ -139,13 +152,15 @@ Each hypothesis is labeled with the test that would falsify it. Lock no root cau
 > 
 > If confirmed: the fix is NOT in our code — it is in chain selection. Burst should fall through to Tor / next chain link sooner.
 
-### H4 — OkHttp `Dispatcher` / `ConnectionPool` saturation on Tecno after WS death
+### H4 — Tecno-side socket / radio / OS resource stall under bursts of fresh HTTPS calls
 
-> Falsification test: enable OkHttp `Dispatcher.executorService` queue-depth metrics + `ConnectionPool.connectionCount()` snapshots during a controlled burst. If queue depth > 0 during the 60 s timeouts in F6/F7/F8, the pool is full.
+> **Replaces the original "OkHttp Dispatcher/ConnectionPool saturation" framing**, which is **architecturally impossible** per F9: the REST fallback uses `ConnectionPool(0, 1ms)` on a fresh `OkHttpClient` per call, so there is no shared pool to saturate. The architect surfaced this on 2026-05-30 PR #252 review.
 > 
-> If confirmed: the WS death released N concurrent requests back into a saturated pool; new REST calls were queued behind them; each queued call inherited an aged callTimeout and effectively had less time to succeed.
+> Reframed hypothesis: during the burst window, Tecno's local network stack (cellular radio state, NAT entry table on the home router, or Android's per-app socket/file-descriptor limit) was overwhelmed by the volume of *fresh* TCP+TLS handshakes the REST fallback issues per call. Each `/relay/send`, `/relay/poll`, `/relay/auth/challenge`, and WS reconnect = one fresh socket. Multiple in flight + retry storms = many simultaneous handshakes.
 > 
-> The fix would be a separate OkHttpClient instance for REST fallback (small dedicated pool, no shared state with the dying WS path).
+> Falsification test: instrument `AndroidNativeOkHttpRestFallbackTransport` with an OkHttp `EventListener` exposing `dnsStart` / `connectStart` / `secureConnectStart` / `responseHeadersStart` / `callFailed` per call (analogous to `ProbeEventListener`). Rerun Test #83 v3 scenario 5. If the 60 s elapsed time is dominated by a single phase — e.g. `dnsStart` → `connectStart` → no `secureConnectStart` for 30 s — that pinpoints the network-stack stall layer (DNS / TCP SYN-ACK / TLS handshake) and tells us whether the issue is per-socket cost or radio/router state.
+> 
+> If confirmed: the fix is to (a) lower per-call ceilings so a single stuck handshake fails fast and triggers fall-through, (b) add jittered backoff to avoid all retries landing simultaneously, and (c) potentially detect repeated phase-failures and force a longer cooldown before next attempt.
 
 ### H5 — REST timeouts (60 s read / 60 s write / 120 s call) are too generous for burst delivery
 
@@ -193,13 +208,15 @@ The current 60 s read timeout violates this — it gives the user a full minute 
 
 Verification: integration test that simulates WS death during a 20-message burst and asserts that within 30 s of the WS close, either ≥ 80% of the burst is delivered via REST OR the chain falls through.
 
-### Inv3 — REST `/auth/challenge` N consecutive failures within 30 s MUST surface to the user OR fall through
+### Inv3 — Auth path N consecutive failures within 30 s MUST surface to the user OR fall through
 
-If REST `/auth/challenge` returns `SocketTimeoutException` or any transport error N times consecutively (N = 2 per F8's observed pattern) within a 30 s window, the orchestration layer MUST either (a) trigger a connectivity-pulse event that the UI can surface as "reconnecting" OR (b) fall through to the next chain link.
+**Reworded after architect review 2026-05-30 (P2 on PR #252):** the original Inv3 spoke specifically of "REST `/auth/challenge`"; the actual failure in F8 is the **WS reconnect auth challenge** from `KtorRelayTransport`. The invariant must cover **both auth paths** — the WS reconnect HTTPS auth GET AND any REST fallback session-challenge call — because in practice the same network condition kills both, and the user-visible black-hole symptom is identical.
+
+If any auth path (WS reconnect `auth/challenge`, REST fallback session challenge, or any other recovery-time auth call) returns `SocketTimeoutException` or any transport error N times consecutively (N = 2 per F8's observed pattern) within a 30 s window, the orchestration layer MUST either (a) trigger a connection-state event that the UI can surface as "Reconnecting" OR (b) fall through to the next chain link.
 
 Silent retry forever (current behaviour beyond the test window) is unacceptable — the user sits in a transport black hole with no signal.
 
-Verification: contract test on `RestFallbackOrchestrator` (or equivalent) that drives N consecutive auth failures and asserts the appropriate event is emitted to consumers.
+Verification: contract test on the connection-state flow exposed by the relay transport AND the REST fallback orchestrator, driven by N consecutive auth-layer transport errors from either path.
 
 ### Inv4 — WS reconnect fast path stays intact
 
@@ -213,11 +230,11 @@ The `idle_watchdog` MUST remain passive-log-only per PR-R0.4b (#151) Vladislav-l
 
 Verification: `feedback_ws_heartbeat_diagnostic_2026_05_27.md` already records the v1.3/v1.4 own-goal. The PR diff must show the watchdog log line at `KtorRelayTransport.kt:1008-1011` unchanged AND no new `forceReconnect()` call from any new code path.
 
-### Inv6 — Burst delivery floor on stable network
+### Inv6 — Burst delivery floor on stable Wi-Fi: 20 → ≥19 in 60 s
 
-Define N = TBD (Vladislav-set). A burst of N consecutive incoming messages on a stable home Wi-Fi MUST result in at least M of them being delivered to the receiver UI within 60 s.
+**Vladislav-set target 2026-05-30 (P3 on PR #252):** a burst of **20 consecutive incoming messages** on a stable home Wi-Fi MUST result in **at least 19** of them being delivered to the receiver UI within **60 seconds**. No 60 s silent timeout during the burst is acceptable.
 
-Test #83 v3 saw 7 / ~20 = 35%. That is the floor; the fix should raise it substantially. Vladislav to set the post-fix target (e.g. M/N = 95% within 60 s) before code work begins.
+Test #83 v3 baseline: 7 / ~20 = 35 %. Post-fix target: 19 / 20 = 95 %.
 
 Verification: a controlled-burst scenario in the Test #83 acceptance ladder (already drafted in `docs/tracks/chat-new-msg-chip.md`). The PR cannot merge without a PASS reading on this scenario.
 
