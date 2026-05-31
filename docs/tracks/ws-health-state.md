@@ -685,3 +685,236 @@ Files touched: ~10-15 across Android + common + iOS-stub + 3-5 test files. Expec
 - ❌ `TransportState` common-side new variant (Path B, rejected).
 - ❌ Refactoring `AppContainer` prekey hooks to use `effectiveState` (their semantics ARE WS-specific).
 - ❌ CHIP1 (stays parked at `78bd979e`).
+
+---
+
+## Commit 3.3 design note — ping/pong diagnostics ONLY (no behaviour, no rewalk) (Vladislav-locked 2026-05-31)
+
+**Goal.** Discriminate WHERE the OkHttp WS protocol Ping/Pong path drops on Tecno's home Wi-Fi. Test #83 v6 reproduced the failure mode **33 times** in one run: each WS session lives ~31 seconds, dies with `SocketTimeoutException: sent ping but didn't receive pong within 15000ms (after 0 successful ping/pongs)` despite receiving `inbound_frames=10±2` Frame.Text envelopes from the relay during its lifetime. This is the load-bearing transport bug that drove every preceding track: Commit 1 phase events traced the 60 s callTimeout firing; Commit 2 tightened it to 10 s; Commit 3.1 gave the UI an honest label for the failure mode. None of those fix the ping/pong itself.
+
+**Scope guards (Vladislav-locked):**
+
+- ❌ NO behaviour changes. Diagnostic instrumentation ONLY, same pattern as Commit 1 (PR #253 OkHttp `EventListener` on REST + WS auth).
+- ❌ NO chain rewalk (Commit 3.2 territory, last per Vladislav anti-masking rationale).
+- ❌ NO change to `pingInterval(15_000L)` at `RelayTransportFactory.kt:71`.
+- ❌ NO change to `readTimeout(60s)` at `RelayTransportFactory.kt:78`.
+- ❌ NO change to app-level `RelayMessage.Ping`/`Pong` handling (sender is removed by design per the PR-H1e comment block).
+- ❌ NO change to `RestStateMachine`, `HybridRelayTransport`, `TransportManager`, REST fallback.
+- ❌ NO `forceReconnect` from idle_watchdog (Inv5).
+- ❌ NO `lastWorkingTransport` updates (Inv8).
+- ❌ NO `APP_LEVEL_PING_ENABLED` flag flip — it is documentation drift (see §3 below) and changing the value is a behaviour A/B that the architect explicitly forbade.
+- ✅ Add structured `PING_TRACE` log lines on both client (Tecno + emulator) and relay (VPS).
+- ✅ Field-test ladder must capture **three log streams** (Tecno + emulator + VPS relay) over the same wall-clock window.
+
+### §1 — Empirical base (independent grep-verified against `C:\temp\test83-v6-tecno.log`)
+
+33 sessions in v6 follow the same stable pattern (5 sample sessions cited; rest follow within ±10 ms):
+
+| Line | Session | duration_ms | thrown text | pings_sent | pongs_received | inbound_frames | acks_received | since_last_pong_ms |
+|---|---|---|---|---|---|---|---|---|
+| `:258` | `gen=1 s=1` | 31019 | `after 0 successful ping/pongs` | 0 | 0 | 10 | 0 | -1 |
+| `:352` | `gen=1 s=2` | 31023 | same | 0 | 0 | 9 | 0 | -1 |
+| `:486` | `gen=1 s=3` | 31023 | same | 0 | 0 | 11 | 0 | -1 |
+| `:587` | `gen=1 s=4` | 31022 | same | 0 | 0 | 10 | 0 | -1 |
+| `:667` | `gen=1 s=5` | 31013 | same | 0 | 0 | 7 | 0 | -1 |
+
+**Observation:** every session dies at **exactly the same elapsed time** (~31 s = 15 s ping wait + 16 s before client gives up). This is OkHttp's `pingInterval(15_000L)` firing followed by an internal 15-16 s pong-wait window. Architect was right that the thrown-text "after 0 successful ping/pongs" is the most-trustworthy signal we have today.
+
+### §2 — Independent code audit (read-only against master `3567d37a`)
+
+All 7 architect line refs verified verbatim:
+
+| Architect cite | Actual finding |
+|---|---|
+| `RelayTransportFactory.kt:71` `.pingInterval(15_000L, MS)` | ✅ EXACT — OkHttp protocol Ping at 15 s. |
+| `RelayTransportFactory.kt:168` `pingIntervalMillis = 0L` (Ktor ping disabled) | ✅ — assignment is at `:170` inside `install(WebSockets) {` block opening at `:168`. Comment at `:169`: *"Disabled — app-level Ping/Pong handles liveness in KtorRelayTransport"*. |
+| `KtorRelayTransport.kt:501` `pingsSent` / `pongsReceived` declared | ✅ EXACT in `SessionStats` data class. |
+| `routes.rs:475-:485` `Message::Ping → socket.send(Message::Pong)` | ✅ EXACT — server has WS-protocol pong reply code, counts `pings_received` at `:483`. |
+| `RelayTransportConfig.kt:181` `APP_LEVEL_PING_ENABLED = true` | ✅ EXACT. |
+| No `RelayMessage.Ping` send call anywhere | ✅ Grep-verified zero send sites; only handler for `RelayMessage.Pong` at `KtorRelayTransport.kt:1226`. |
+| `KtorRelayTransport.kt:1226` `RelayMessage.Pong` handler | ✅ EXACT. |
+
+**Five additional findings the architect did not surface (worth recording for the field-test analysis):**
+
+A. `pingsSent` (`KtorRelayTransport.kt:501`) is **DEAD CODE** — declared, but grep finds zero `pingsSent++` / `pingsSent =` write sites. Field `pings_sent=0` in `session_summary` is therefore not "client thinks no pings happened"; it's "client never had a counter wired".
+
+B. `pongsReceived` is incremented at `KtorRelayTransport.kt:1235` **only on `RelayMessage.Pong` text-frame receive**. Since no peer sends `RelayMessage.Ping` (finding A's mirror), no peer will reply with `RelayMessage.Pong` either, so `pongsReceived` will always be 0 too. Counter is structurally dead, not just zero by accident.
+
+C. `lastPongMark` (`KtorRelayTransport.kt:286`, used at `:999` to compute `sinceLastPong` for the idle_watchdog log) is updated only at session-open (`:744`) and on `RelayMessage.Pong` text receive (`:1233`). NOT updated on OkHttp protocol Pong. So `sinceLastPong` in idle_watchdog logs grows unbounded for the entire session lifetime regardless of OkHttp protocol Pong health.
+
+D. Documentation drift: the comment at `RelayTransportConfig.kt:9` declares *"Since PR-H1e the loop no longer emits app-level RelayMessage.Ping frames (APP_LEVEL_PING_ENABLED = false)"*, but the actual constant value at `:181` is `true`. The flag is **dead config** — value of `true` is not consumed by any sender code, so flipping it changes nothing. The design note records this so a future reader does not waste time A/B-testing the flag.
+
+E. Ktor's `HttpClient(OkHttp) { install(WebSockets) }` abstracts away OkHttp's `WebSocketListener` callbacks (`onPing` / `onPong`). The codebase has `EventListener` instrumentation for HTTP calls (`ProbeEventListener` + `HttpPhaseEventListener` from Commit 1) but **zero** instrumentation on OkHttp protocol WS frames. Without bypassing Ktor's WS abstraction, we cannot directly observe OkHttp protocol Ping/Pong from inside our code. This is the load-bearing instrumentation gap.
+
+### §3 — Hypothesis pool (4 from existing mini-lock + 2 new from §2 audit)
+
+Each hypothesis labeled with the test that would falsify it.
+
+**H-Ping1 — OkHttp's WS ping scheduler is conditionally gated.**
+
+> Hypothesis: OkHttp's `RealWebSocket` initialises ping scheduling only after some condition met (e.g. first write to the socket, or `okhttp.WebSocketListener.onOpen` fully returned). If we never write anything in the first 15 s — and v6 shows the client only reads inbound frames during the 31 s session window — OkHttp may not actually fire its first protocol Ping until something else nudges it.
+>
+> Falsification: relay-side log of `pings_received` for the session window. If relay log shows zero `pings_received` count during the 31 s window, OkHttp's scheduler genuinely didn't fire. If relay shows `pings_received > 0` but client still throws "after 0 successful ping/pongs", H-Ping1 is falsified (scheduler fires, problem is elsewhere).
+>
+> Currently **plausible** — but requires VPS log to discriminate.
+
+**H-Ping2 — Pings sent OK, pong reply lost between relay and Tecno.**
+
+> Hypothesis: OkHttp on Tecno sends WS-protocol Ping, relay receives and replies with Pong, but Pong is dropped between relay and Tecno (cellular middlebox, Wi-Fi router QoS, OS NAT entry expiry). OkHttp times out waiting for Pong and closes the socket.
+>
+> Falsification: relay-side `ws_protocol_pong_sent` count for the session. If relay log shows N pong sends but Tecno's OkHttp exception says "after 0 successful ping/pongs", drop happened on the return path. If relay log shows zero pong sends, H-Ping2 is falsified.
+>
+> Currently **plausible** — same VPS log dependency.
+
+**H-Ping3 — F2 counter-lie is the whole issue (no actual transport bug).**
+
+> Hypothesis: OkHttp's internal ping scheduler IS firing and reply DOES arrive, but the F2-flagged counter-mismatch (the exception text counter and our `session_summary` counter both come from app-level paths that are dead per findings A/B/C above) makes us think no ping/pong happened when it actually did. Sessions die for a SEPARATE reason (e.g. peer NAT timeout closing the underlying TCP connection from the relay side, or an iptables idle-timeout on the home router).
+>
+> Falsification: relay-side `ws_protocol_pong_sent` log. If relay shows N pongs sent AND relay's `pings_received` ≈ floor(31000/15000) ≈ 2 per session, the ping/pong path is healthy and the "after 0 successful ping/pongs" exception text is genuinely a lie. The death cause is then a TCP-layer event the WS layer surfaces as a generic ping timeout.
+>
+> **Strongest single explanation right now** — would unify findings A/B/C (all counters structurally dead) and the architect's earlier "after N successful ping/pongs" observation in v5b1 / v6. Requires VPS log.
+
+**H-Ping4 — App-side ACK lag triggers relay-side close.**
+
+> Hypothesis: Tecno receives 10±2 inbound frames in 31 s, doesn't ACK any of them (`acks_received=0` consistently in v6). Relay's outbound-ack watchdog (`outbound_ack_deadline_armed` then `outbound_ack_deadline_expired` per the v3/v5b1 observations) tears down the WS session because it concludes the recipient is stuck. The OkHttp side surfaces the relay-initiated close as a ping timeout because the WS frames stop arriving.
+>
+> Falsification: relay-side log of `outbound_ack_deadline_expired` count during the 31 s window. If we see ~10 expirations per session, relay is closing on its side. If zero, H-Ping4 is falsified.
+>
+> Currently **plausible** but doesn't match the "after 0 successful ping/pongs" wording — that text comes from OkHttp's own scheduler, not a relay-initiated close.
+
+**H-Ping5 (NEW from finding D) — Documentation drift confuses readers but doesn't cause the bug.**
+
+> Hypothesis: `APP_LEVEL_PING_ENABLED = true` is dead config (no sender). Flipping the value or removing it does NOT change the failure mode.
+>
+> Falsification: this is metadata only; the field test does not need to actively prove it. Recorded as a fix candidate for a follow-up cleanup commit AFTER 3.3 closes. NOT part of 3.3 scope.
+
+**H-Ping6 (NEW from finding E) — Ktor abstraction is preventing observability, but underlying OkHttp is fine.**
+
+> Hypothesis: OkHttp's `WebSocketListener.onPing/onPong` callbacks ARE firing correctly inside Ktor's bridge, but Ktor's API doesn't surface them to us. The bug is purely visibility, not behaviour.
+>
+> Falsification: same as H-Ping3 — relay-side `ws_protocol_pong_sent` log discriminates. If relay shows pongs, H-Ping6 holds. If not, we have a real transport bug separately from the visibility gap.
+>
+> The proposed Commit 3.3 instrumentation does NOT try to bypass Ktor; it instead parses the OkHttp exception text and adds relay-side correlation, which is enough to test H-Ping3 / H-Ping6.
+
+### §4 — Locked instrumentation shape (Vladislav-locked, no behaviour)
+
+#### Client-side (Tecno + emulator, same Android code)
+
+NEW log lines emitted at session-close inside `KtorRelayTransport.endSessionStats(...)` (`:539-:587`):
+
+```
+RELAY_TRACE ws_ping_timeout_diag
+  gen=<n> s=<n>
+  duration_ms=<n>
+  okhttp_successful_ping_pongs=<n>     # NEW — parsed from exception text
+  okhttp_throwable_class=<simpleName>  # NEW — exception class for correlation
+  app_level_ping_sent=<n>              # = stats.pingsSent (currently always 0; field documents the dead counter)
+  app_level_pong_received=<n>          # = stats.pongsReceived (currently always 0; same)
+  app_level_dead_counter=true          # NEW — explicit flag so the next reader does not chase the numbers
+  inbound_frames=<n>                   # = stats.inboundFrames
+  acks_received=<n>                    # = stats.acksReceived
+  since_last_inbound_ms=<n>            # = stats.lastInboundFrameAtMs derived
+  ping_interval_ms=15000               # NEW — config snapshot for grep correlation
+  read_timeout_ms=60000                # NEW — same
+```
+
+Parsing rule for `okhttp_successful_ping_pongs`: regex `\(after (\d+) successful ping/pongs\)` on the thrown message. If unmatched, emit `-1`.
+
+Plus the existing `session_summary` line stays UNCHANGED (do not modify the existing field set — operators correlate by timestamp). The new `ws_ping_timeout_diag` is a separate line, easy to grep.
+
+NEW file (likely): `shared/core/transport/src/commonMain/.../PingTimeoutTextParser.kt` — internal helper extracting `okhttp_successful_ping_pongs` from the exception. Unit-testable. ~20 lines.
+
+EDIT: `KtorRelayTransport.endSessionStats(...)` adds a second `relayLog(...)` call right after the existing `session_summary` emit at `:568-:586`. ~15 lines.
+
+#### Relay-side (VPS, Rust)
+
+NEW log lines emitted at `services/relay/src/routes.rs:483/:485` area (Ping handler):
+
+```
+tracing::info!(
+    conn_id = conn_id,
+    payload_len = payload.len(),
+    pings_received = pings_received,
+    "ws_protocol_ping_received"
+);
+```
+
+Plus immediately after the `socket.send(Message::Pong(payload)).await` at `:485`:
+
+```
+tracing::info!(
+    conn_id = conn_id,
+    payload_len = payload.len(),
+    "ws_protocol_pong_sent"
+);
+```
+
+If the `socket.send(...)` returns `Err`, the existing error branch at `:486-:494` already logs `"ws-protocol pong send failed — closing session"` (which becomes the discriminator for H-Ping2 success vs failure). Keep the existing error path; add ONLY the two `info!` lines above.
+
+Optionally add a parallel pair for the app-level path (where `RelayMessage::Ping` from the JSON parser is handled), tagged `event="app_ping_received"` / `event="app_pong_sent"`. We expect zero hits — recording the zero is itself the falsification of H-Ping5.
+
+Scope: ~10 lines in `routes.rs`. NO change to the actual routing / heartbeat / timer / queue / WS lifecycle code.
+
+#### Field-test capture
+
+Vladislav-locked: Test #83 v7 captures **three** log streams over the same wall-clock window:
+
+1. `C:\temp\test83-v7-tecno.log` (Android logcat with the canonical filter set).
+2. `C:\temp\test83-v7-emu.log` (same).
+3. `C:\temp\test83-v7-relay.log` — VPS relay container logs, time-synchronised via `docker compose logs --since=<start> --until=<end> relay > test83-v7-relay.log` (Vladislav-delegated via `feedback_ssh_delegation.md`).
+
+VPS deploy MUST land the relay change before the field test. Architect explicit gate: design-note ACK is conditional on the deploy being part of the rollout plan.
+
+### §5 — Acceptance gates (8 total)
+
+1. **No behaviour change.** Grep on the Commit 3.3 diff finds zero edits in: `pingInterval`, `readTimeout`, `RestStateMachine.kt`, `HybridRelayTransport.kt`, `TransportManager.kt`, `forceReconnect`, `lastWorkingTransport`, `RestFallbackOrchestrator.kt`, `APP_LEVEL_PING_ENABLED`.
+
+2. **Client emits `ws_ping_timeout_diag`** once per WS session that closes with `SocketTimeoutException`. Field-verified by `Select-String` on v7-tecno.log.
+
+3. **Relay emits `ws_protocol_ping_received` and `ws_protocol_pong_sent`** with monotonically-increasing `pings_received` counter. Field-verified on v7-relay.log.
+
+4. **Three-source correlation:** for each WS session that died with "after 0 successful ping/pongs" in `test83-v7-tecno.log`, the corresponding window in `test83-v7-relay.log` either:
+   - Shows N≥1 `ws_protocol_ping_received` events (H-Ping3 / H-Ping6 confirmed — counters lie, ping/pong was fine), OR
+   - Shows zero (H-Ping1 confirmed — scheduler genuinely didn't fire, client problem), OR
+   - Shows N≥1 `ws_protocol_pong_sent` after each ping but Tecno still saw zero (H-Ping2 confirmed — drop on the return path).
+
+   After v7 we can answer "**ping dropped on segment X**" in one sentence per the architect's gate.
+
+5. **Counter lies documented in the new diagnostic line.** The `app_level_dead_counter=true` field MUST be present in every `ws_ping_timeout_diag` emit, so any future grep of `pings_sent=0` finds an accompanying line warning that the count is structurally zero.
+
+6. **VPS deploy step is on the merge plan.** Before merging Commit 3.3, the design note must record the VPS deploy / restart commands needed to land the relay-side changes. Architect must ACK the deploy plan.
+
+7. **Pure parser is unit-tested.** `PingTimeoutTextParser` has unit tests for: matching `after 7 successful ping/pongs`, matching `after 0 successful ping/pongs`, no-match on unrelated exception text, robustness against partial/garbled text.
+
+8. **Inv5 (R0.4b passive watchdog) and Inv8 (no `lastWorkingTransport` lock-in) untouched.** Grep absence verified.
+
+### §6 — Implementation order (locked for the code PR)
+
+1. **Code PR scope** (this docs note's scope only locks the design — code lands separately):
+   - NEW `PingTimeoutTextParser.kt` (~20 lines + unit test).
+   - EDIT `KtorRelayTransport.endSessionStats(...)` adds the second `relayLog(...)` after the existing `session_summary` emit.
+   - EDIT `services/relay/src/routes.rs` adds two `tracing::info!` lines around the `Message::Ping` handler.
+
+2. **VPS deploy step** before field test: rebuild relay binary from the new `routes.rs`, `docker compose up -d --force-recreate relay`, verify via `curl https://relay.phntm.pro/health`.
+
+3. **Test #83 v7 field run** captures three log streams.
+
+4. **Analysis pass:** discriminate H-Ping1 / H-Ping2 / H-Ping3 / H-Ping6 by §5 gate 4.
+
+5. **Outcome decides next track:**
+   - H-Ping3 / H-Ping6 confirmed → Commit 3.3-followup is a counter-cleanup pass (mark dead counters as such or remove). The 31 s closes themselves are then a relay-server / network issue, not client.
+   - H-Ping1 confirmed → research how to coax OkHttp's WS ping scheduler to fire pre-write. Possibly a Commit 3.3b.
+   - H-Ping2 confirmed → research relay→client path stability. Possibly a network/QoS observation track.
+
+   Whatever the answer, **Commit 3.2 chain rewalk does not start until we have it in writing**. That is the anti-masking gate Vladislav locked.
+
+### §7 — Out of scope for Commit 3.3 (hard)
+
+- ❌ Behaviour changes of ANY kind. This is instrumentation only.
+- ❌ Commit 3.2 chain rewalk (LAST per anti-masking rationale).
+- ❌ Restructuring to raw OkHttp `newWebSocket(...)` to install our own `WebSocketListener` (finding E says Ktor abstracts the protocol Ping/Pong callbacks; bypassing it is a much larger refactor that has not been ACKd).
+- ❌ Fixing the `APP_LEVEL_PING_ENABLED` documentation drift in `RelayTransportConfig.kt` (recorded for a later cleanup commit).
+- ❌ Removing the dead `pingsSent` counter (recorded for a later cleanup commit; keeping the counter but flagging `app_level_dead_counter=true` is the 3.3 approach).
+- ❌ App-level `RelayMessage.Ping` sender reintroduction (PR-H1e explicitly removed it; not in 3.3 scope).
+- ❌ CHIP1 (stays parked at `78bd979e`).
+- ❌ Any change to the existing `session_summary` line shape. Operators correlate by it; preserve byte-for-byte.
