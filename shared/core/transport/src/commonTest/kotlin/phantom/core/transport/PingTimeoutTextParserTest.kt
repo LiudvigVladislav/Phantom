@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
+package phantom.core.transport
+
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+/**
+ * Unit tests for [PingTimeoutTextParser] introduced by PR-WS-HEALTH-STATE1
+ * Commit 3.3 (2026-05-31). Gate 7 of the design note rev2 requires this
+ * parser to be unit-tested against:
+ *
+ *   - A typical OkHttp `after N successful ping/pongs` message with
+ *     varied N values (positive, zero, multi-digit).
+ *   - Garbled / partial text.
+ *   - Null and empty inputs.
+ *   - OkHttp-version drift adding extra punctuation around the parenthesised
+ *     phrase.
+ *
+ * The full OkHttp 4.x phrasing observed in field logs (test83-v6-tecno.log
+ * `:258` for example) is:
+ *
+ *     "sent ping but didn't receive pong within 15000ms (after 0 successful ping/pongs)"
+ *
+ * Tests run on the JVM (commonTest source set). No Android runtime needed
+ * — parser is pure Kotlin regex.
+ */
+class PingTimeoutTextParserTest {
+
+    @Test
+    fun parses_zero_pingpongs_case_observed_in_v6() {
+        val text = "sent ping but didn't receive pong within 15000ms " +
+            "(after 0 successful ping/pongs)"
+        assertEquals(0, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun parses_seven_pingpongs_case_observed_in_v5b1() {
+        val text = "sent ping but didn't receive pong within 15000ms " +
+            "(after 7 successful ping/pongs)"
+        assertEquals(7, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun parses_three_digit_count() {
+        val text = "...some prefix... (after 123 successful ping/pongs) ...suffix"
+        assertEquals(123, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun returns_minus_one_on_null_input() {
+        assertEquals(-1, PingTimeoutTextParser.parseSuccessfulPingPongs(null))
+    }
+
+    @Test
+    fun returns_minus_one_on_empty_input() {
+        assertEquals(-1, PingTimeoutTextParser.parseSuccessfulPingPongs(""))
+    }
+
+    @Test
+    fun returns_minus_one_on_unrelated_okhttp_exception() {
+        val text = "SocketTimeoutException: connect timed out"
+        assertEquals(-1, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun returns_minus_one_on_partial_pattern_without_parens() {
+        val text = "after 5 successful ping/pongs"
+        assertEquals(-1, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun returns_minus_one_on_pattern_with_letters_instead_of_digits() {
+        val text = "(after N successful ping/pongs)"
+        assertEquals(-1, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun handles_case_insensitive_match() {
+        val text = "(AFTER 4 SUCCESSFUL PING/PONGS)"
+        assertEquals(4, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun ignores_a_later_match_if_first_match_is_valid() {
+        val text = "(after 2 successful ping/pongs) some noise (after 99 successful ping/pongs)"
+        assertEquals(2, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun returns_minus_one_on_garbled_text() {
+        // Rev2 (architect P2 on PR #259): literal control bytes in the source
+        // string would make Git classify the file as binary and break the
+        // GitHub diff view for gate-7 review. Use Unicode escapes so the source
+        // stays plain text while the runtime string still contains the
+        // garbled bytes the test cares about.
+        val text = "\u0000\u0001\u0002 some control chars (after )"
+        assertEquals(-1, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun clamps_huge_count_to_int_max_value() {
+        // Rev2 (architect P2 on PR #259): the parser previously documented
+        // that overflow clamps to Int.MAX_VALUE but actually performed a
+        // narrowing Long.toInt() wrap (e.g. 2147483648L.toInt() == -2147483648).
+        // Now the code uses explicit coerceAtMost(Int.MAX_VALUE.toLong()) and
+        // a Long-parse-failure on absurd input returns Int.MAX_VALUE so the
+        // returned value is monotonically increasing with the parsed count.
+        val text = "(after 2147483648 successful ping/pongs)"
+        assertEquals(Int.MAX_VALUE, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+
+    @Test
+    fun returns_int_max_value_on_count_beyond_long_max() {
+        // 20-digit number > Long.MAX_VALUE (~9.2e18) — toLongOrNull returns
+        // null, the parser falls back to Int.MAX_VALUE rather than -1 so
+        // numerically the value sorts above any real session.
+        val text = "(after 99999999999999999999 successful ping/pongs)"
+        assertEquals(Int.MAX_VALUE, PingTimeoutTextParser.parseSuccessfulPingPongs(text))
+    }
+}
