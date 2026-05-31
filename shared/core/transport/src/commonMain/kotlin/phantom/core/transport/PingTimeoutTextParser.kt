@@ -45,20 +45,31 @@ internal object PingTimeoutTextParser {
     /**
      * Extract the `N` from OkHttp's `after N successful ping/pongs`
      * phrasing inside [text]. Returns the parsed integer on a match,
-     * or `-1` if [text] is null or the pattern does not match.
+     * or `-1` if [text] is null, empty, or the pattern does not match.
+     *
+     * Overflow handling (rev2 fix per architect P2 on PR #259): on a
+     * digit run that exceeds [Int.MAX_VALUE] but is still parseable as
+     * [Long], the value is explicitly clamped to [Int.MAX_VALUE] via
+     * [coerceAtMost]. On a digit run that exceeds [Long.MAX_VALUE]
+     * (more than 19 digits roughly), [String.toLongOrNull] returns
+     * null and the function falls back to [Int.MAX_VALUE] so the
+     * returned value is monotonically increasing with the parsed
+     * count. The previous shape (`raw.toLongOrNull()?.toInt() ?: -1`)
+     * silently wrapped via [Long.toInt]'s narrowing semantics
+     * (`2147483648L.toInt() == -2147483648`), which would have mixed
+     * "huge ping/pong count" with "no match" in any downstream
+     * aggregation.
      *
      * Safe against `null`, empty input, partial text, OkHttp-version
      * drift that adds extra punctuation around the parenthesised
-     * phrase, and absurdly large numbers (only the first match is
-     * consumed; on overflow the result is clamped to [Int.MAX_VALUE]
-     * via `Long.toInt()` semantics — fine for diagnostics since
-     * a session that survived `Int.MAX_VALUE` ping/pongs has not
-     * been observed in any field run).
+     * phrase, and absurdly large numbers. Only the first match is
+     * consumed.
      */
     fun parseSuccessfulPingPongs(text: String?): Int {
         if (text.isNullOrEmpty()) return -1
         val match = regex.find(text) ?: return -1
         val raw = match.groupValues.getOrNull(1) ?: return -1
-        return raw.toLongOrNull()?.toInt() ?: -1
+        val parsed = raw.toLongOrNull() ?: return Int.MAX_VALUE
+        return parsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 }

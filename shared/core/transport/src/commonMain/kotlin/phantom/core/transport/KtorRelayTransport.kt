@@ -609,10 +609,20 @@ class KtorRelayTransport(
         val okhttpSuccessfulPingPongs =
             PingTimeoutTextParser.parseSuccessfulPingPongs(thrown?.message)
         val okhttpThrowableClass = thrown?.let { it::class.simpleName } ?: "none"
+        // Rev2 (architect P3 on PR #259): the emit runs on every session
+        // close, not only on OkHttp ping timeouts. For analysis purposes
+        // it is important to discriminate "real ping-timeout session"
+        // from "clean close where OkHttp didn't emit the after-N idiom".
+        // The parser returns -1 only when the regex does not match, and
+        // the regex is OkHttp-specific, so `okhttpSuccessfulPingPongs >= 0`
+        // is a reliable detector. Field-test grep can filter to
+        // `okhttp_ping_timeout_detected=true` to isolate the failure mode.
+        val okhttpPingTimeoutDetected = okhttpSuccessfulPingPongs >= 0
         relayLog(
             RelayLogLevel.INFO,
             "${genTag(stats.sessionEpoch)} ws_ping_timeout_diag " +
                 "duration_ms=$durationMs " +
+                "okhttp_ping_timeout_detected=$okhttpPingTimeoutDetected " +
                 "okhttp_successful_ping_pongs=$okhttpSuccessfulPingPongs " +
                 "okhttp_throwable_class=$okhttpThrowableClass " +
                 "app_level_ping_sent=${stats.pingsSent} " +
