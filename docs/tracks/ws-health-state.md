@@ -688,7 +688,14 @@ Files touched: ~10-15 across Android + common + iOS-stub + 3-5 test files. Expec
 
 ---
 
-## Commit 3.3 design note — ping/pong diagnostics ONLY (no behaviour, no rewalk) (Vladislav-locked 2026-05-31)
+## Commit 3.3 design note — ping/pong diagnostics ONLY (no behaviour, no rewalk) (Vladislav-locked 2026-05-31, **rev2 after architect 3-point conditional ACK**)
+
+**Rev2 changes** (architect conditional ACK on PR #258 2026-05-31 — 3 sharpenings):
+
+1. **H-Ping3 elevated to PRIMARY hypothesis** with explicit framing: "the system has built a misleading diagnostic surface around a dead app-level heartbeat. The REAL heartbeat lives inside OkHttp at the WS protocol layer, but we have zero visibility there." H-Ping3 unifies findings A/B/C and is now the central explanation we are testing; other hypotheses are orthogonal alternatives.
+2. **VPS deploy hardened from "merge plan step" to "merge-blocking precondition"** — gate 6 now explicitly says without VPS-deployed relay binary, gates 3 and 4 fail by definition and the field test must be aborted.
+3. **Scope guard against app-level Ping A/B sharpened with historical evidence** — `RelayTransportFactory.kt:46-:47` PR-H1e Run B halved WS lifetime when ping cadence tightened to 5 s, and PR-RECV-DIAG1 v1.3 at `:57-:63` worsened behaviour when ping disabled entirely. 15 s is the only known-stable value; any heartbeat-cadence A/B in this commit is forbidden behaviour-change.
+
 
 **Goal.** Discriminate WHERE the OkHttp WS protocol Ping/Pong path drops on Tecno's home Wi-Fi. Test #83 v6 reproduced the failure mode **33 times** in one run: each WS session lives ~31 seconds, dies with `SocketTimeoutException: sent ping but didn't receive pong within 15000ms (after 0 successful ping/pongs)` despite receiving `inbound_frames=10±2` Frame.Text envelopes from the relay during its lifetime. This is the load-bearing transport bug that drove every preceding track: Commit 1 phase events traced the 60 s callTimeout firing; Commit 2 tightened it to 10 s; Commit 3.1 gave the UI an honest label for the failure mode. None of those fix the ping/pong itself.
 
@@ -698,11 +705,11 @@ Files touched: ~10-15 across Android + common + iOS-stub + 3-5 test files. Expec
 - ❌ NO chain rewalk (Commit 3.2 territory, last per Vladislav anti-masking rationale).
 - ❌ NO change to `pingInterval(15_000L)` at `RelayTransportFactory.kt:71`.
 - ❌ NO change to `readTimeout(60s)` at `RelayTransportFactory.kt:78`.
-- ❌ NO change to app-level `RelayMessage.Ping`/`Pong` handling (sender is removed by design per the PR-H1e comment block).
+- ❌ NO app-level `RelayMessage.Ping` sender reintroduction AND NO A/B testing of any heartbeat cadence (rev2 — sharpened per Vladislav 2026-05-31). Historical evidence at `RelayTransportFactory.kt:46-:47` records the PR-H1e Run B result: tightening the ping cadence to 5 s **halved** the WS lifetime (Phone 21.8 s vs 46.5 s baseline) because *"the tighter pong window and the cadence itself appeared to provoke teardown"*. PR-RECV-DIAG1 v1.3 at `:57-:63` then proved the opposite extreme (`pingInterval = 0L` / disabled) made things WORSE — Test #84.4 showed WS never died → `WsSessionEnded` events never fired → REST fallback never activated. **15 s is the only known-stable value**; any heartbeat-cadence A/B in this commit is forbidden behaviour-change.
+- ❌ NO `APP_LEVEL_PING_ENABLED` flag flip. It is dead config (finding D in §2) — the value is not consumed by any sender code, so flipping it changes nothing observable BUT would imply we believe the flag matters. Future cleanup commit can mark it deprecated or delete it; this commit does not touch it.
 - ❌ NO change to `RestStateMachine`, `HybridRelayTransport`, `TransportManager`, REST fallback.
 - ❌ NO `forceReconnect` from idle_watchdog (Inv5).
 - ❌ NO `lastWorkingTransport` updates (Inv8).
-- ❌ NO `APP_LEVEL_PING_ENABLED` flag flip — it is documentation drift (see §3 below) and changing the value is a behaviour A/B that the architect explicitly forbade.
 - ✅ Add structured `PING_TRACE` log lines on both client (Tecno + emulator) and relay (VPS).
 - ✅ Field-test ladder must capture **three log streams** (Tecno + emulator + VPS relay) over the same wall-clock window.
 
@@ -746,9 +753,19 @@ D. Documentation drift: the comment at `RelayTransportConfig.kt:9` declares *"Si
 
 E. Ktor's `HttpClient(OkHttp) { install(WebSockets) }` abstracts away OkHttp's `WebSocketListener` callbacks (`onPing` / `onPong`). The codebase has `EventListener` instrumentation for HTTP calls (`ProbeEventListener` + `HttpPhaseEventListener` from Commit 1) but **zero** instrumentation on OkHttp protocol WS frames. Without bypassing Ktor's WS abstraction, we cannot directly observe OkHttp protocol Ping/Pong from inside our code. This is the load-bearing instrumentation gap.
 
-### §3 — Hypothesis pool (4 from existing mini-lock + 2 new from §2 audit)
+### §3 — Hypothesis pool (rev2: H-Ping3 elevated to primary per Vladislav 2026-05-31)
 
 Each hypothesis labeled with the test that would falsify it.
+
+> **Rev2 framing (Vladislav 2026-05-31):** the system has built a misleading diagnostic surface around a dead app-level heartbeat. The REAL heartbeat lives inside OkHttp at the WS protocol layer, but we have zero visibility there (finding E). The counters and marks we *do* have (`pingsSent`, `pongsReceived`, `lastPongMark`) all attach to an app-level RelayMessage.Ping/Pong loop that has had no sender since PR-H1e (findings A/B/C). Therefore the "after 0 successful ping/pongs" exception text is the ONLY non-lying signal currently in our hands — and even that is a single number we read from a Throwable's message field. **H-Ping3 below is the central hypothesis** because it would unify all four observations (A/B/C dead counters + exception-text accuracy) into a single explanation: nothing is broken about ping/pong, the WS sessions are dying for a separate TCP-layer reason and the ping-pong wording is just OkHttp's idiom for "I gave up waiting for the next frame". The other hypotheses are kept as orthogonal falsifiable alternatives; the field test is structured to discriminate all of them at once.
+
+**H-Ping3 — F2 counter-lie is the whole issue (no actual transport bug). PRIMARY HYPOTHESIS.**
+
+> Hypothesis: OkHttp's internal ping scheduler IS firing and reply DOES arrive, but the F2-flagged counter-mismatch (the exception text counter and our `session_summary` counter both come from app-level paths that are dead per findings A/B/C above) makes us think no ping/pong happened when it actually did. Sessions die for a SEPARATE reason (e.g. peer NAT timeout closing the underlying TCP connection from the relay side, or an iptables idle-timeout on the home router).
+>
+> Falsification: relay-side `ws_protocol_pong_sent` log. If relay shows N pongs sent AND relay's `pings_received` ≈ floor(31000/15000) ≈ 2 per session, the ping/pong path is healthy and the "after 0 successful ping/pongs" exception text is genuinely a lie. The death cause is then a TCP-layer event the WS layer surfaces as a generic ping timeout.
+>
+> Unifies findings A/B/C from §2: all three counters are structurally dead in current code, so "0 successful ping/pongs" being reported on a session that received `inbound_frames=10` is consistent with "ping/pong actually worked, the counters and the exception text are both lying together because they share the dead app-level path". Requires VPS log to confirm.
 
 **H-Ping1 — OkHttp's WS ping scheduler is conditionally gated.**
 
@@ -765,14 +782,6 @@ Each hypothesis labeled with the test that would falsify it.
 > Falsification: relay-side `ws_protocol_pong_sent` count for the session. If relay log shows N pong sends but Tecno's OkHttp exception says "after 0 successful ping/pongs", drop happened on the return path. If relay log shows zero pong sends, H-Ping2 is falsified.
 >
 > Currently **plausible** — same VPS log dependency.
-
-**H-Ping3 — F2 counter-lie is the whole issue (no actual transport bug).**
-
-> Hypothesis: OkHttp's internal ping scheduler IS firing and reply DOES arrive, but the F2-flagged counter-mismatch (the exception text counter and our `session_summary` counter both come from app-level paths that are dead per findings A/B/C above) makes us think no ping/pong happened when it actually did. Sessions die for a SEPARATE reason (e.g. peer NAT timeout closing the underlying TCP connection from the relay side, or an iptables idle-timeout on the home router).
->
-> Falsification: relay-side `ws_protocol_pong_sent` log. If relay shows N pongs sent AND relay's `pings_received` ≈ floor(31000/15000) ≈ 2 per session, the ping/pong path is healthy and the "after 0 successful ping/pongs" exception text is genuinely a lie. The death cause is then a TCP-layer event the WS layer surfaces as a generic ping timeout.
->
-> **Strongest single explanation right now** — would unify findings A/B/C (all counters structurally dead) and the architect's earlier "after N successful ping/pongs" observation in v5b1 / v6. Requires VPS log.
 
 **H-Ping4 — App-side ACK lag triggers relay-side close.**
 
@@ -882,7 +891,7 @@ VPS deploy MUST land the relay change before the field test. Architect explicit 
 
 5. **Counter lies documented in the new diagnostic line.** The `app_level_dead_counter=true` field MUST be present in every `ws_ping_timeout_diag` emit, so any future grep of `pings_sent=0` finds an accompanying line warning that the count is structurally zero.
 
-6. **VPS deploy step is on the merge plan.** Before merging Commit 3.3, the design note must record the VPS deploy / restart commands needed to land the relay-side changes. Architect must ACK the deploy plan.
+6. **VPS deploy is a merge-blocking precondition (rev2 — sharpened per Vladislav 2026-05-31).** Without the new relay binary live on `relay.phntm.pro`, gates 3 and 4 fail by definition — `v7-relay.log` would contain zero `ws_protocol_ping_received` / `ws_protocol_pong_sent` events regardless of what client and network actually did, and the 3-source correlation in gate 4 would be unable to discriminate H-Ping1 / H-Ping2 / H-Ping3 / H-Ping6. Therefore the merge order is locked: **(a) merge client + relay code → (b) VPS rebuild + `docker compose up -d --force-recreate relay` + `curl https://relay.phntm.pro/health` verification → (c) only then field Test #83 v7 → (d) only then PR-level field PASS verdict**. If VPS deploy is skipped or partial, the field test must be aborted and the Commit 3.3 merge gates are NOT considered satisfied no matter what the client log shows.
 
 7. **Pure parser is unit-tested.** `PingTimeoutTextParser` has unit tests for: matching `after 7 successful ping/pongs`, matching `after 0 successful ping/pongs`, no-match on unrelated exception text, robustness against partial/garbled text.
 
