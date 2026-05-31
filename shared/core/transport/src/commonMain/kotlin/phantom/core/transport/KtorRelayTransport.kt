@@ -584,6 +584,46 @@ class KtorRelayTransport(
                 "since_last_pong_ms=$sinceLastPongMs " +
                 "since_last_inbound_ms=$sinceLastInboundMs",
         )
+
+        // PR-WS-HEALTH-STATE1 Commit 3.3 (2026-05-31): second emit with
+        // OkHttp-counter-aware fields. The `session_summary` line above
+        // is preserved byte-for-byte for operator correlation across
+        // historical runs; this new `ws_ping_timeout_diag` line carries
+        // the diagnostic fields the design note locked.
+        //
+        // Findings A/B/C of the design note audit established that
+        // `stats.pingsSent` / `stats.pongsReceived` / `lastPongMark`
+        // are structurally dead — they would increment only via an
+        // app-level RelayMessage.Ping/Pong loop whose sender was
+        // removed in PR-H1e. The values are kept on the line for
+        // continuity, but `app_level_dead_counter=true` is the
+        // explicit warning so future readers don't chase the zeros.
+        //
+        // `okhttp_successful_ping_pongs` is the only non-lying
+        // ping/pong number currently available client-side: the
+        // integer OkHttp embeds in the SocketTimeoutException text
+        // at close time. Pairs with relay-side `ws_protocol_ping_received`
+        // / `ws_protocol_pong_sent` (PR-WS-HEALTH-STATE1 Commit 3.3
+        // routes.rs change) for three-source field-test correlation
+        // discriminating H-Ping1 / H-Ping2 / H-Ping3 / H-Ping6.
+        val okhttpSuccessfulPingPongs =
+            PingTimeoutTextParser.parseSuccessfulPingPongs(thrown?.message)
+        val okhttpThrowableClass = thrown?.let { it::class.simpleName } ?: "none"
+        relayLog(
+            RelayLogLevel.INFO,
+            "${genTag(stats.sessionEpoch)} ws_ping_timeout_diag " +
+                "duration_ms=$durationMs " +
+                "okhttp_successful_ping_pongs=$okhttpSuccessfulPingPongs " +
+                "okhttp_throwable_class=$okhttpThrowableClass " +
+                "app_level_ping_sent=${stats.pingsSent} " +
+                "app_level_pong_received=${stats.pongsReceived} " +
+                "app_level_dead_counter=true " +
+                "inbound_frames=${stats.inboundFrames} " +
+                "acks_received=${stats.acksReceived} " +
+                "since_last_inbound_ms=$sinceLastInboundMs " +
+                "ping_interval_ms=15000 " +
+                "read_timeout_ms=60000",
+        )
     }
 
     override suspend fun connect(

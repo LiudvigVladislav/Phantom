@@ -482,6 +482,20 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                         last_inbound_at_ms = now_ms();
                         pings_received += 1;
                         last_ping_at_ms = last_inbound_at_ms;
+                        // PR-WS-HEALTH-STATE1 Commit 3.3 (2026-05-31):
+                        // pairs with client-side `ws_ping_timeout_diag`
+                        // (KtorRelayTransport.kt) for 3-source field-test
+                        // correlation. Field test analyst grep's this
+                        // line to discriminate H-Ping1 (no relay-side
+                        // pings = client scheduler didn't fire) from
+                        // H-Ping3 (pings + pongs present = counters lie
+                        // and sessions die for separate TCP reason).
+                        tracing::info!(
+                            conn_id = conn_id,
+                            payload_len = payload.len(),
+                            pings_received = pings_received,
+                            "ws_protocol_ping_received"
+                        );
                         if let Err(e) = socket.send(Message::Pong(payload)).await {
                             close_origin = "error";
                             close_error_str = Some(format!("ws_pong_send: {}", e));
@@ -494,6 +508,20 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                         }
                         pongs_sent += 1;
                         last_pong_at_ms = now_ms();
+                        // PR-WS-HEALTH-STATE1 Commit 3.3 (2026-05-31):
+                        // discriminates H-Ping2 (pings received but
+                        // pongs not actually sent / dropped on return
+                        // path) from the rest. The existing failure
+                        // path at the `tracing::warn! ws-protocol pong
+                        // send failed` line above already logs the
+                        // send-error case, so the absence of this
+                        // info line for a given conn_id is the H-Ping2
+                        // signal.
+                        tracing::info!(
+                            conn_id = conn_id,
+                            pongs_sent = pongs_sent,
+                            "ws_protocol_pong_sent"
+                        );
                     }
                     Some(Ok(Message::Close(c))) => {
                         // PR-H1b: extract close code + reason from the
