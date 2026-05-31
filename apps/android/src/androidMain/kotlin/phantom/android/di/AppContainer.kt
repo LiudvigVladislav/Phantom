@@ -13,7 +13,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -231,6 +234,62 @@ class AppContainer(private val context: Context) {
      */
     var hybridTransport: phantom.android.transport.HybridRelayTransport? = null
         private set
+
+    // PR-WS-HEALTH-STATE1 Commit 3.1 (2026-05-30): always-present source
+    // for the RestMode side of the UI presentation flow. Starts at
+    // WsActive so the pre-init window (before initMessaging wires
+    // hybridTransport) flows the bare-wsTransport semantics correctly
+    // through the derivation. After initMessaging assigns hybridTransport,
+    // a forwarder coroutine inside initMessaging begins routing
+    // hybrid.stateMachine.state into this MutableStateFlow. Standard
+    // "lazy upstream swap" pattern — combine reads this flow from
+    // AppContainer construction without depending on hybridTransport
+    // being non-null.
+    private val connectionRestMode =
+        MutableStateFlow(phantom.core.transport.RestMode.WsActive)
+
+    /**
+     * Presentation-only UI state combining raw WS [phantom.core.transport.TransportState]
+     * with [phantom.core.transport.RestMode], derived per the table in
+     * [phantom.android.transport.deriveConnectionUiState]. Consumed by the
+     * three Android UI surfaces: `ChatListScreen`, `ChatScreen`, and
+     * `ConnectionBanner`.
+     *
+     * Always-present: combine reads `wsTransport.state` (always present
+     * from class construction) and [connectionRestMode] (initialised to
+     * `WsActive` at class init, updated post-`initMessaging` by the
+     * forwarder coroutine). Consumers never see null.
+     *
+     * NOT a source-of-truth substitute for [transport.state]. Transport-
+     * internal logic (prekey retry at line ~988, prekey lifecycle at
+     * line ~1023, WakeupReceiver alarm guard) keeps reading raw
+     * `transport.state` because their semantics are WS-specific.
+     */
+    val connectionUiState: StateFlow<phantom.android.transport.ConnectionUiState> =
+        combine(
+            wsTransport.state,
+            connectionRestMode,
+        ) { wsState, restMode ->
+            phantom.android.transport.deriveConnectionUiState(wsState, restMode)
+        }.stateIn(
+            scope = appScope,
+            started = SharingStarted.Eagerly,
+            // PR-WS-HEALTH-STATE1 Commit 3.1 rev2 (architect P2 on PR #257):
+            // initial value MUST be derived from the current snapshot, not a
+            // hardcoded constant. Otherwise a synchronous `.value` read in the
+            // narrow window before combine's first emission would return
+            // ConnectionUiState.Connecting even when wsTransport.state.value
+            // is already Disconnected (cold-start) — and ConnectionBanner's
+            // LaunchedEffect would set `hasEverConnected = true` on that
+            // spurious Connecting and surface a false-positive grace-period
+            // banner later. Gate 8 says the pre-init window must observe the
+            // (wsTransport.state, RestMode.WsActive) derivation; using the
+            // derivation function literally here makes the semantics match.
+            initialValue = phantom.android.transport.deriveConnectionUiState(
+                wsTransport.state.value,
+                connectionRestMode.value,
+            ),
+        )
 
     /**
      * PR-LTE-NETCHANGE1 (2026-05-28) — Android network-change observer.
@@ -713,6 +772,22 @@ class AppContainer(private val context: Context) {
             appScope.launch {
                 hybrid.stateMachine.state.collect {
                     recomputeCapabilities()
+                }
+            }
+
+            // PR-WS-HEALTH-STATE1 Commit 3.1 (2026-05-30): forwarder
+            // coroutine for connectionUiState. The class-level
+            // `connectionRestMode` source starts at WsActive so the
+            // pre-init window flows bare-wsTransport semantics through
+            // the derivation. Now that `hybridTransport = hybrid` is
+            // assigned above (~30 lines back), route real RestMode
+            // emissions into connectionRestMode so the combine output
+            // updates accordingly. Standard "lazy upstream swap" pattern
+            // — combine itself was constructed at AppContainer init and
+            // never sees a null hybrid; only this collector starts late.
+            appScope.launch {
+                hybrid.stateMachine.state.collect { mode ->
+                    connectionRestMode.value = mode
                 }
             }
         }

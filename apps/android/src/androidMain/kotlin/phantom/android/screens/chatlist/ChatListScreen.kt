@@ -144,7 +144,11 @@ fun ChatListScreen(
             )
         },
     ) { padding ->
-        val transportState = container.transport.state.collectAsState()
+        // PR-WS-HEALTH-STATE1 Commit 3.1 (2026-05-30): switched from raw
+        // `container.transport.state` to the composite presentation flow
+        // so the banner shows "Online · Limited realtime" while REST
+        // fallback is delivering, instead of misleading "Connecting…".
+        val transportState = container.connectionUiState.collectAsState()
         Box(
             modifier = Modifier
                 .fillMaxSize()
