@@ -1163,7 +1163,12 @@ Rev2's pseudocode had `ws is Connected -> Online` as a fall-through after the `R
 
 ---
 
-## Commit 3.2b design note — Adaptive Path Validation (NO automatic rewalk) (Vladislav-locked 2026-06-01, **rev2 after Vladislav 5-point review of rev1**)
+## Commit 3.2b design note — Adaptive Path Validation (NO automatic rewalk) (Vladislav-locked 2026-06-01, **rev3 after Vladislav 2-point fact-ref review of rev2**)
+
+**Rev3 changes** (Vladislav 2-point review of rev2, 2026-06-01 late evening):
+
+1. **§1 v8 source refs corrected.** Rev2 cited `test83-v7-tecno.log:164/:165` and `:426/:427` for v8 evidence — those refs are from the v7 file (carried over from 3.2a §1's empirical base). Rev3 substitutes the actual v8 file refs grep-verified against `C:\temp\test83-v8-tecno.log`: `:191/:192` (s=1 `session_summary` + paired `ws_ping_timeout_diag`), `:368/:369` (s=2 same pair), `:372` (`WS_DEGRADED detected` rising-edge verdict). The architectural conclusion is unchanged; only the source citation is fixed.
+2. **§1 v9 claim corrected.** Rev2 stated "no `WS_DEGRADED detected` gated lines" — grep against `C:\temp\test83-v9-wifi2-tecno.log` shows one rising-edge verdict at `:374` with `gated_by_ws_candidate=false`. Rev3 phrases it precisely: "one `WS_DEGRADED detected` rising edge at `:374` with `gated_by_ws_candidate=false weighted_sum=4.6`; no `gated_by_ws_candidate=true` verdicts observed". The original intent ("v9 saw the same rising-edge pattern as v8, on a different carrier") survives intact.
 
 **Rev2 changes** (Vladislav 5-point review of rev1, 2026-06-01 evening):
 
@@ -1193,8 +1198,8 @@ Three test runs against the same Tecno (`103603734A004351`) on three different n
 
 Source line references (independently grep-verified against the raw logs):
 
-- v8 ping-timeout pattern: `C:\temp\test83-v7-tecno.log:164/:165` (s=1) and `:426/:427` (s=2). v8 grep already in 3.2a §1.
-- v9: `C:\temp\test83-v9-wifi2-tecno.log` — 5 `okhttp_ping_timeout_detected=true` lines, no `WS_DEGRADED detected` gated lines.
+- v8: `C:\temp\test83-v8-tecno.log:191/:192` (s=1 `session_summary` + paired `ws_ping_timeout_diag`) and `:368/:369` (s=2 same pair). One rising-edge verdict at `:372` — `WS_DEGRADED detected current_kind=Direct would_rewalk=true would_mark_suspect=true gated_by_ws_candidate=false ping_timeout_count=2 weighted_sum=4.6 state_machine=RestActive`.
+- v9: `C:\temp\test83-v9-wifi2-tecno.log` — 5 `okhttp_ping_timeout_detected=true` lines. One `WS_DEGRADED detected` rising edge at `:374` with `gated_by_ws_candidate=false weighted_sum=4.6`; no `gated_by_ws_candidate=true` verdicts observed.
 - v10: `C:\temp\test83-v10-reality-tecno.log:70` (`probe_returned kind=Reality ok=false elapsedMs=20063`), `:72` (`chain_attempt_failed kind=Reality reason=probe_failed`), `:243` (`send_response id=7eef5720 status=201 elapsedMs=564`), `:152` (`mode_switched WsActive→RestActive reason=inbound_idle_timeout`), `:249` (`ws_frame_text_received` → WsCandidate), `:443` (`mode_switched WsCandidate→WS_ACTIVE reason=ws_alive_60s`).
 
 Key claims this evidence supports:
