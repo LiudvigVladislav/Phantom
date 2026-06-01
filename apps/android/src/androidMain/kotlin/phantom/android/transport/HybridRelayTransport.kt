@@ -209,6 +209,23 @@ class HybridRelayTransport(
      */
     private val stateMachineLock = Mutex()
 
+    /**
+     * PR-WS-HEALTH-STATE1 Commit 3.2a (architect P2-1, 2026-06-01): the
+     * three WS event collectors below ([wsSessionEnded] /
+     * [outboundAckDeadlineExpired] / [inboundStalled]) each run in their
+     * own `scope.launch` on [appScope] (`Dispatchers.Default`). The
+     * detector is documented as "not thread-safe" — it owns a mutable
+     * `ArrayDeque`, session counters, and rising-edge boolean flags. Without
+     * this lock, parallel `recordAndEmit` / `emitSessionTotal` calls from
+     * different collectors would race the deque + counters and could miss
+     * or duplicate rising-edge log lines.
+     *
+     * `emitStateTransitionSeen` is intentionally NOT wrapped in this lock —
+     * it is a pure pass-through to the log function and mutates no detector
+     * state.
+     */
+    private val wsDegradationMutex = Mutex()
+
     // ── REST capability + retry ──────────────────────────────────────────────
 
     /**
@@ -414,16 +431,13 @@ class HybridRelayTransport(
                 // — only true ping-timeout closes contribute to the
                 // sliding-window detector, per design note §5 event mapping.
                 wsDegradationDetector?.let { det ->
-                    if (event.okhttpPingTimeoutDetected) {
-                        det.recordAndEmit(
-                            WsDegradationDetector.Event.PingTimeout,
-                            degradationCurrentKindProvider(),
+                    wsDegradationMutex.withLock {
+                        feedDegradationDetectorOnWsSessionEnded(
+                            detector = det,
+                            event = event,
+                            currentKind = degradationCurrentKindProvider(),
                         )
                     }
-                    det.emitSessionTotal(
-                        sessionDurationMs = event.durationMs,
-                        closeKind = event.closeOrigin,
-                    )
                 }
             }
         }
@@ -456,10 +470,14 @@ class HybridRelayTransport(
                     )
                 )
                 // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
-                wsDegradationDetector?.recordAndEmit(
-                    WsDegradationDetector.Event.AckTimeout,
-                    degradationCurrentKindProvider(),
-                )
+                wsDegradationDetector?.let { det ->
+                    wsDegradationMutex.withLock {
+                        feedDegradationDetectorOnAckTimeout(
+                            detector = det,
+                            currentKind = degradationCurrentKindProvider(),
+                        )
+                    }
+                }
             }
         }
 
@@ -510,10 +528,14 @@ class HybridRelayTransport(
                     )
                 )
                 // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
-                wsDegradationDetector?.recordAndEmit(
-                    WsDegradationDetector.Event.IdleTimeout,
-                    degradationCurrentKindProvider(),
-                )
+                wsDegradationDetector?.let { det ->
+                    wsDegradationMutex.withLock {
+                        feedDegradationDetectorOnInboundStalled(
+                            detector = det,
+                            currentKind = degradationCurrentKindProvider(),
+                        )
+                    }
+                }
             }
         }
     }

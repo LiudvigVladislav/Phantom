@@ -608,6 +608,15 @@ class AppContainer(private val context: Context) {
                     "will populate it on a later app start.",
             )
         } else {
+            // PR-WS-HEALTH-STATE1 Commit 3.2a (architect P2-2, 2026-06-01):
+            // var-holder so the RestFallbackOrchestrator's onModeSwitched
+            // callback can reference the detector that gets constructed
+            // immediately after the orchestrator. Single-threaded
+            // initialisation: the detector is assigned BEFORE the
+            // orchestrator's stateMachine ever fires a transition (the WS
+            // collectors only start later, after bootstrapAndStart).
+            var degradationDetectorRef: phantom.core.transport.WsDegradationDetector? = null
+
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
@@ -639,6 +648,15 @@ class AppContainer(private val context: Context) {
                 },
                 transport = phantom.core.transport.createRestFallbackTransport(),
                 log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
+                onModeSwitched = { _, _, reason ->
+                    // Mirror the REST_TRACE mode_switched reason into the
+                    // WS_DEGRADED_TELEMETRY stream so calibration can
+                    // correlate detector verdicts with state-machine
+                    // transitions (design note §6). emitStateTransitionSeen
+                    // is a pure log pass-through with no detector state
+                    // mutation; safe to call from any context, no mutex.
+                    degradationDetectorRef?.emitStateTransitionSeen(reason)
+                },
             )
 
             // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.
@@ -714,11 +732,23 @@ class AppContainer(private val context: Context) {
             // pre-`connect()` returns null and the detector's Direct-only
             // suspect lock at the verdict site forces `wouldMarkSuspect=false`
             // for null too (see WsDegradationDetector.evaluate).
+            //
+            // Clock source (architect P3, 2026-06-01): SystemClock
+            // .elapsedRealtime() is monotonic and survives wall-clock
+            // adjustments (NTP sync, manual time change), so the 5-min
+            // sliding window cannot collapse or balloon on a phone whose
+            // time gets nudged mid-session. The defence-in-depth
+            // "clockGoingBackwards" detector test still applies as a
+            // belt-and-braces measure.
             val wsDegradationDetector = phantom.core.transport.WsDegradationDetector(
-                now = { System.currentTimeMillis() },
+                now = { android.os.SystemClock.elapsedRealtime() },
                 log = { msg -> android.util.Log.i("TransportRewalkCoordinator", msg) },
                 stateProvider = { restOrchestrator.stateMachine.current },
             )
+            // P2-2: complete the var-trick set up above so the
+            // RestFallbackOrchestrator.onModeSwitched callback can mirror
+            // transitions into the detector telemetry stream.
+            degradationDetectorRef = wsDegradationDetector
 
             val hybrid = phantom.android.transport.HybridRelayTransport(
                 wsTransport = wsTransport,

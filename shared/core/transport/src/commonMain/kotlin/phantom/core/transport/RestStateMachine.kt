@@ -57,6 +57,16 @@ import kotlinx.coroutines.flow.asStateFlow
 class RestStateMachine(
     private val now: () -> Long,
     private val log: (String) -> Unit = {},
+    // PR-WS-HEALTH-STATE1 Commit 3.2a (architect P2-2, 2026-06-01):
+    // observation hook for every mode-switch. Fires AFTER `_state.value`
+    // has been assigned the new mode and AFTER the `REST_TRACE
+    // mode_switched ...` log line has been emitted. Used by
+    // [phantom.core.transport.WsDegradationDetector] to emit
+    // `WS_DEGRADED_TELEMETRY state_transition_seen reason=<reason>` so
+    // calibration can correlate detector verdicts with state-machine
+    // transitions per design note §6. Optional and defaults to no-op
+    // for backward compatibility with existing tests.
+    private val onModeSwitched: ((from: RestMode, to: RestMode, reason: String) -> Unit)? = null,
 ) {
     private val _state = MutableStateFlow<RestMode>(RestMode.WsActive)
     val state: StateFlow<RestMode> = _state.asStateFlow()
@@ -238,6 +248,7 @@ class RestStateMachine(
         candidateEnteredAtMs = null
         _state.value = RestMode.RestActive
         log("REST_TRACE mode_switched from=$from to=REST_ACTIVE reason=$reason")
+        onModeSwitched?.invoke(from, RestMode.RestActive, reason)
     }
 
     private fun transitionToCandidate(reason: String) {
@@ -246,6 +257,7 @@ class RestStateMachine(
         candidateEnteredAtMs = now()
         _state.value = RestMode.WsCandidate
         log("REST_TRACE mode_switched from=$from to=WS_CANDIDATE reason=$reason")
+        onModeSwitched?.invoke(from, RestMode.WsCandidate, reason)
     }
 
     private fun transitionToWsActive(reason: String) {
@@ -256,6 +268,7 @@ class RestStateMachine(
         candidateEnteredAtMs = null
         _state.value = RestMode.WsActive
         log("REST_TRACE mode_switched from=$from to=WS_ACTIVE reason=$reason")
+        onModeSwitched?.invoke(from, RestMode.WsActive, reason)
     }
 
     /**
