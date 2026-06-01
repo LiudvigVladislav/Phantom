@@ -64,12 +64,22 @@ class RestFallbackOrchestrator(
     private val transport: RestFallbackTransport,
     private val now: () -> Long = { defaultNowMs() },
     private val log: (String) -> Unit = {},
+    // PR-WS-HEALTH-STATE1 Commit 3.2a (architect P2-2, 2026-06-01):
+    // forwarded to [RestStateMachine] so the AppContainer wire-up can
+    // mirror REST_TRACE mode_switched reasons into the
+    // [phantom.core.transport.WsDegradationDetector] telemetry stream
+    // without parsing log lines. Optional and defaults to no-op.
+    private val onModeSwitched: ((from: RestMode, to: RestMode, reason: String) -> Unit)? = null,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
 
     /** Pure state machine. Public so the wire-up layer can observe + submit events. */
-    val stateMachine: RestStateMachine = RestStateMachine(now = now, log = log)
+    val stateMachine: RestStateMachine = RestStateMachine(
+        now = now,
+        log = log,
+        onModeSwitched = onModeSwitched,
+    )
 
     /** Convenience flow proxying [stateMachine.state]. */
     val state: StateFlow<RestMode> get() = stateMachine.state

@@ -179,4 +179,59 @@ object RelayTransportConfig {
     // we'll either keep app-level Ping as the production heartbeat OR
     // switch back to WS-protocol Ping with the routing fix.
     const val APP_LEVEL_PING_ENABLED = true
+
+    // ── PR-WS-HEALTH-STATE1 Commit 3.2a — telemetry-only constants ───────────
+    //
+    // Detector lives in [WsDegradationDetector]. It records events and emits
+    // structured dry-run logs about WHEN it WOULD have triggered a chain
+    // rewalk + suspect mark. No action is taken on these values in 3.2a;
+    // 3.2b will recompute final numbers from calibration data and wire the
+    // action surface separately.
+    //
+    // Naming convention: `_CANDIDATE_` thresholds are explicit so the 3.2b
+    // PR can replace them with calibrated values without renaming the
+    // configuration surface.
+    //
+    // Design note: docs/tracks/ws-health-state.md § Commit 3.2a (rev3 §5).
+
+    /** Sliding window for cross-session weighted degradation counting. */
+    const val WS_DEGRADED_WINDOW_MS = 300_000L
+
+    /**
+     * Strong-signal threshold: this many `okhttp_ping_timeout_detected=true`
+     * sessions inside [WS_DEGRADED_WINDOW_MS] candidates a `wouldRewalk`.
+     * Calibration target — likely too aggressive given Test #83 v7 noise
+     * floor of 2 ping_timeouts in 7 minutes. 3.2b adjusts post-field.
+     */
+    const val WS_DEGRADED_CANDIDATE_PING_THRESHOLD = 2
+
+    /**
+     * Mixed-signal threshold: this weighted sum inside [WS_DEGRADED_WINDOW_MS]
+     * candidates a `wouldRewalk`. Computed from
+     * [WS_DEGRADED_PING_WEIGHT] / [WS_DEGRADED_ACK_WEIGHT] / [WS_DEGRADED_IDLE_WEIGHT].
+     */
+    const val WS_DEGRADED_CANDIDATE_WEIGHTED_THRESHOLD = 3.0
+
+    /**
+     * Strong signal (OkHttp WS Ping timeout — `WsSessionEndedEvent
+     * .okhttpPingTimeoutDetected = true`). Highest weight: this is the
+     * non-lying signal Test #83 v7 isolated and is the only one that
+     * cleanly maps onto "return-path degradation in the final ping cycle".
+     */
+    const val WS_DEGRADED_PING_WEIGHT = 2.0
+
+    /**
+     * Weak-medium signal (`OutboundAckDeadlineExpiredEvent`). Adjacent to
+     * ping-timeout but can also trigger on bursty outbound load that is
+     * not actually degradation.
+     */
+    const val WS_DEGRADED_ACK_WEIGHT = 1.0
+
+    /**
+     * Weakest signal (`InboundStalledEvent`). Equivalent to "WS handshake
+     * succeeded but no inbound traffic for [INBOUND_STALL_THRESHOLD_MS]".
+     * Useful as a counter input but, per design note rev2 Q5, never
+     * triggers a rewalk on its own — R0.4b spirit.
+     */
+    const val WS_DEGRADED_IDLE_WEIGHT = 0.6
 }

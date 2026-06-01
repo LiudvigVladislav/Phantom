@@ -66,6 +66,14 @@ data class WsSessionEndedEvent(
     val pendingAcksAtClose: Int,
     val closeOrigin: String,
     val closeError: String?,
+    // PR-WS-HEALTH-STATE1 Commit 3.2a (2026-06-01): propagated so
+    // [phantom.android.transport.HybridRelayTransport] can feed
+    // [WsDegradationDetector.Event.PingTimeout] without re-parsing the
+    // close-error message. Computed in the same finally block that
+    // emits this event via [PingTimeoutTextParser.parseSuccessfulPingPongs]
+    // — see the `tryEmit` site below. Default `false` for backward
+    // compatibility with any commonTest construction.
+    val okhttpPingTimeoutDetected: Boolean = false,
 )
 
 /**
@@ -913,6 +921,14 @@ class KtorRelayTransport(
                         pendingAcksAtClose = pendingAckCount,
                         closeOrigin = origin.name.lowercase(),
                         closeError = caughtThrowable?.message,
+                        // PR-WS-HEALTH-STATE1 Commit 3.2a: same detector
+                        // signal used by `ws_ping_timeout_diag` above
+                        // (`emitSessionSummary`). Re-parsing the message
+                        // here is a 1-µs operation against a stable
+                        // OkHttp idiom and avoids cross-function state.
+                        okhttpPingTimeoutDetected =
+                            PingTimeoutTextParser
+                                .parseSuccessfulPingPongs(caughtThrowable?.message) >= 0,
                     )
                 )
                 if (currentSessionStats === sessionStats) {

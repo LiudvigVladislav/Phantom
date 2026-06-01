@@ -26,7 +26,9 @@ import phantom.core.transport.RestInboundDeduplicator
 import phantom.core.transport.RestMode
 import phantom.core.transport.RestStateMachine
 import phantom.core.transport.SendOutcome
+import phantom.core.transport.TransportKind
 import phantom.core.transport.TransportState
+import phantom.core.transport.WsDegradationDetector
 
 /**
  * PR-D1b (2026-05-16): wraps the existing [KtorRelayTransport] (WS path)
@@ -130,6 +132,23 @@ class HybridRelayTransport(
     private val processedEnvelopeRepository: ProcessedEnvelopeRepository?,
     private val scope: CoroutineScope,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
+    // PR-WS-HEALTH-STATE1 Commit 3.2a (2026-06-01): telemetry-only WS
+    // degradation detector. Nullable so existing JVM/commonTest
+    // constructions stay backward-compatible. When non-null, the three
+    // WS event collectors below feed [WsDegradationDetector] AFTER
+    // their existing [submitStateEvent] call per design note §8 step 4.
+    //
+    // The `wsSessionEnded` collector ALWAYS emits the mandatory
+    // `WS_DEGRADED_TELEMETRY session_total` line per close, regardless
+    // of [restCapabilityActive], so the denominator for calibration
+    // ratios is honest from cold start (per design note rev2 P2-3).
+    //
+    // `degradationCurrentKindProvider` is wired by [AppContainer] to
+    // `(transportManager.state.value as? ManagerState.Connected)?.kind`,
+    // injected here as a lambda so the Hybrid does not depend on
+    // [TransportManager] or [ManagerState] types directly.
+    private val wsDegradationDetector: WsDegradationDetector? = null,
+    private val degradationCurrentKindProvider: () -> TransportKind? = { null },
 ) : RelayTransport {
 
     // ── Delegated RelayTransport surface ─────────────────────────────────────
@@ -189,6 +208,23 @@ class HybridRelayTransport(
      * the state machine's transition counters.
      */
     private val stateMachineLock = Mutex()
+
+    /**
+     * PR-WS-HEALTH-STATE1 Commit 3.2a (architect P2-1, 2026-06-01): the
+     * three WS event collectors below ([wsSessionEnded] /
+     * [outboundAckDeadlineExpired] / [inboundStalled]) each run in their
+     * own `scope.launch` on [appScope] (`Dispatchers.Default`). The
+     * detector is documented as "not thread-safe" — it owns a mutable
+     * `ArrayDeque`, session counters, and rising-edge boolean flags. Without
+     * this lock, parallel `recordAndEmit` / `emitSessionTotal` calls from
+     * different collectors would race the deque + counters and could miss
+     * or duplicate rising-edge log lines.
+     *
+     * `emitStateTransitionSeen` is intentionally NOT wrapped in this lock —
+     * it is a pure pass-through to the log function and mutates no detector
+     * state.
+     */
+    private val wsDegradationMutex = Mutex()
 
     // ── REST capability + retry ──────────────────────────────────────────────
 
@@ -388,6 +424,21 @@ class HybridRelayTransport(
                 } else {
                     maybeRetryBootstrap()
                 }
+                // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only. Always
+                // emits the mandatory `session_total` line so calibration
+                // has the denominator (sessions-without-trigger). The
+                // `record/emit` path is gated on `okhttpPingTimeoutDetected`
+                // — only true ping-timeout closes contribute to the
+                // sliding-window detector, per design note §5 event mapping.
+                wsDegradationDetector?.let { det ->
+                    wsDegradationMutex.withLock {
+                        feedDegradationDetectorOnWsSessionEnded(
+                            detector = det,
+                            event = event,
+                            currentKind = degradationCurrentKindProvider(),
+                        )
+                    }
+                }
             }
         }
         // PR-D1d: per-envelope ACK deadline. Parallel to wsSessionEnded.
@@ -418,6 +469,15 @@ class HybridRelayTransport(
                         ageMs = event.ageMs,
                     )
                 )
+                // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
+                wsDegradationDetector?.let { det ->
+                    wsDegradationMutex.withLock {
+                        feedDegradationDetectorOnAckTimeout(
+                            detector = det,
+                            currentKind = degradationCurrentKindProvider(),
+                        )
+                    }
+                }
             }
         }
 
@@ -467,6 +527,15 @@ class HybridRelayTransport(
                         sinceLastInboundMs = event.sinceLastInboundMs,
                     )
                 )
+                // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
+                wsDegradationDetector?.let { det ->
+                    wsDegradationMutex.withLock {
+                        feedDegradationDetectorOnInboundStalled(
+                            detector = det,
+                            currentKind = degradationCurrentKindProvider(),
+                        )
+                    }
+                }
             }
         }
     }
