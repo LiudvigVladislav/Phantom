@@ -697,11 +697,39 @@ class AppContainer(private val context: Context) {
                 log            = { msg -> android.util.Log.i("PhantomMedia", msg) },
             )
 
+            // PR-WS-HEALTH-STATE1 Commit 3.2a (2026-06-01): telemetry-first
+            // WS degradation detector. Pure logic from commonMain, action-
+            // less — only emits structured `WS_DEGRADED ...` log lines so
+            // 3.2b can calibrate thresholds against real Tele2 LTE noise
+            // floor (Test #83 v7 proved 2 ping_timeouts in 7 min routine).
+            //
+            // stateProvider binds to `restOrchestrator.stateMachine.current`
+            // directly per design note §5 P3-5 and §8 step 5 — NOT through
+            // `hybridTransport?.stateMachine?.current`, which would
+            // reintroduce the elvis-once class of bug Commit 3.1 rev3
+            // already paid for. `restOrchestrator` is constructed
+            // immediately above and is non-null at this site.
+            //
+            // kindProvider reads `transportManager.state.value` lazily;
+            // pre-`connect()` returns null and the detector's Direct-only
+            // suspect lock at the verdict site forces `wouldMarkSuspect=false`
+            // for null too (see WsDegradationDetector.evaluate).
+            val wsDegradationDetector = phantom.core.transport.WsDegradationDetector(
+                now = { System.currentTimeMillis() },
+                log = { msg -> android.util.Log.i("TransportRewalkCoordinator", msg) },
+                stateProvider = { restOrchestrator.stateMachine.current },
+            )
+
             val hybrid = phantom.android.transport.HybridRelayTransport(
                 wsTransport = wsTransport,
                 orchestrator = restOrchestrator,
                 processedEnvelopeRepository = processedEnvelopeRepo,
                 scope = appScope,
+                wsDegradationDetector = wsDegradationDetector,
+                degradationCurrentKindProvider = {
+                    (transportManager.state.value
+                        as? phantom.core.transport.ManagerState.Connected)?.kind
+                },
             )
             hybridTransport = hybrid
             // Async REST bootstrap — never blocks AppContainer init. On failure
