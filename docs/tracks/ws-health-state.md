@@ -927,3 +927,236 @@ VPS deploy MUST land the relay change before the field test. Architect explicit 
 - ❌ App-level `RelayMessage.Ping` sender reintroduction (PR-H1e explicitly removed it; not in 3.3 scope).
 - ❌ CHIP1 (stays parked at `78bd979e`).
 - ❌ Any change to the existing `session_summary` line shape. Operators correlate by it; preserve byte-for-byte.
+
+---
+
+## Commit 3.2a design note — WS degradation detector, telemetry-first (NO action) (Vladislav-locked 2026-06-01, **rev3 after Vladislav 3-point review of rev2**)
+
+**Rev3 changes** (Vladislav 3-point review of rev2, 2026-06-01):
+
+1. **P2 — §8 wire-up step 5 still cited the old `stateProvider`.** Rev2 fixed §5 to bind `restOrchestrator.stateMachine.current` directly, but the implementation-order step at §8.5 still wrote `hybridTransport?.stateMachine?.current ?: RestMode.WsActive` — the very anti-pattern §5 §P3-5 calls out. Rev3 propagates the correct binding into §8 so a code PR cannot read the doc and reproduce the elvis-once trap.
+2. **P2 — §9 U2 violated Commit 3.1 shipped precedence.** Rev2 §9 had `ws is Connected → Online` as a branch reached when `rest == WsCandidate`, which the Commit 3.1 rev2 locked precedence table maps to `Recovering`. Rev3 audits the precedence-correct `(RestMode, wsState)` mapping: at `WsActive` the orchestrator's poll loop is stopped (per `RestStateMachine` kdoc and `pollJob?.cancel()` at `RestFallbackOrchestrator.kt:170`), so "long Connecting WHILE REST delivers" can never occur at `rest == WsActive`. The two states where REST IS delivering during a long Connecting (`RestActive` and `WsCandidate`) are already mapped non-ambiguously by Commit 3.1 (`RestFallback` and `Recovering` respectively). U2 therefore has no honest input signal in 3.2a — its motivating Buyer-lens scenario (Tor cold-start 3-5 min) is already covered by 3.1's existing `RestActive → RestFallback` branch. Rev3 drops U2 from 3.2a and records the analysis so it cannot be re-proposed without new evidence.
+3. **P3 — Split rationale still cited `:164,426` short-form.** Rev2 fixed §1 to the `:164/:165` and `:426/:427` pair format but missed the same reference inside the rev2 "Split rationale" paragraph. Rev3 normalises both source-ref formulations.
+
+**Rev2 changes** (Vladislav review of rev1, 2026-06-01):
+
+1. **P2 — U2 reference to non-existent `orchestrator.isPolling`.** Grep on `RestFallbackOrchestrator` confirms: only `private var pollJob: Job?` exists; no public `isPolling` accessor. Rev1 §9 derivation `restPollingActive = orchestrator.isPolling` was a phantom API. Rev2 rewrites §9 to derive `restPathActive` from `RestMode.RestActive` / `RestMode.WsCandidate` on the existing `connectionRestMode` source (already wired in Commit 3.1 rev3) — no new orchestrator surface.
+2. **P2 — Collector wiring test cannot be `commonTest`.** `HybridRelayTransport.startWsPassthroughCollectors` lives in `apps/android/src/androidMain/`. Pure detector logic stays `commonTest`; collector→detector glue moves to `androidUnitTest` OR is refactored into a pure mapper function callable from `commonTest`. Gate #6 rewritten accordingly.
+3. **P2 — Session telemetry must log on every `WsSessionEnded` close, not only on rising-edge.** Without this, calibration has no denominator (cannot distinguish "noise floor = 2 ping-timeouts per 7 min and no triggers" from "noise floor = 2 ping-timeouts per 7 min and triggers fired every session"). Rev2 §6 makes `WS_DEGRADED_TELEMETRY session_total ... on_close=true` mandatory per session close.
+4. **P3 — Line refs off-by-one for `test83-v7-tecno.log`.** Re-read confirms `:164` = `session_summary`, `:165` = `ws_ping_timeout_diag`. Rev1 cited `:164,426` as the source of `ws_ping_timeout_diag` directly. Rev2 cites the pair `:164/:165` and `:426/:427` so reviewers grep the correct file lines.
+5. **P3 — `stateProvider` source.** Bind to `restOrchestrator.stateMachine.current` directly instead of `hybridTransport?.stateMachine?.current`. `restOrchestrator` is constructed earlier in `AppContainer` and is non-null at detector construction time — eliminates the "elvis-once" class of bug Commit 3.1 rev3 already paid for.
+6. **P3 — Direct-only suspect must be explicit on the dry-run booleans.** Rev2 makes `wouldMarkSuspect=false` unconditional when `currentKind != Direct`, regardless of counter state. Prevents a 3.2b reviewer from reading dry-run logs as evidence that suspect applies to Reality/Tor (would conflict with D2).
+
+**Split rationale.** Originally Commit 3.2 was a single "chain rewalk on WS degradation" track. The 2026-06-01 Council pass (Critic / Strategist-from-scratch / Optimist / Buyer / Executor) surfaced a load-bearing finding: the empirical baseline noise floor on Tecno Tele2 LTE — proven by Test #83 v7 — is **two `okhttp_ping_timeout_detected=true` sessions inside a 7-minute window** (s=1 at `test83-v7-tecno.log:164/:165` and s=2 at `:426/:427`; in each pair the first line is the `session_summary` and the second the `ws_ping_timeout_diag`). The candidate Vladislav baseline threshold "2 strong / 5 min" therefore fires on the routine carrier behaviour, not on Direct degrading relative to the other chain links. Shipping any rewalk action against that threshold would convert recovery into a new instability source.
+
+Resolution: split Commit 3.2 into two sequenced PRs.
+
+- **3.2a (this design note)** — detector + dry-run telemetry only. No suspect mark applied to any `reorderChain` decision. No `coordinator.onWsDegraded` call. Logs `WS_DEGRADED detected ... would_rewalk=<true|false> would_mark_suspect=<true|false>` so 2-3 controlled field runs (home Wi-Fi / Tele2 LTE / poor carrier) calibrate real thresholds before any action ships.
+- **3.2b (separate PR, AFTER calibration)** — turns the dry-run booleans into actual `markSuspect` + `coordinator.onWsDegraded(...)` calls. Re-uses the existing `TransportRewalkCoordinator` 5-step pipeline. Numbers locked from 3.2a field data, not from a guess.
+
+3.2a is in-scope of THIS docs PR's lock. 3.2b numbers will be locked in a separate appendix once 3.2a field data lands.
+
+### §1 — Empirical base (Test #83 v7, independently grep-verified 2026-05-31)
+
+- **Tecno LTE noise floor.** Two `ws_ping_timeout_diag` events in 7 minutes, `okhttp_successful_ping_pongs=6` both times, `duration_ms≈121049 / 121041`. Source: `C:\temp\test83-v7-tecno.log:164/:165` (s=1: `session_summary` line :164, paired `ws_ping_timeout_diag` line :165) and `:426/:427` (s=2: same pair). This is the canonical Tele2 LTE Tecno baseline — Direct WS dies roughly every 2 minutes from return-path loss in the final ping-cycle of each session, but REST keeps delivering throughout.
+- **Relay return-path.** 46 ping_received / 46 pong_sent / 0 pong_fail across the 7-minute window (`C:\temp\test83-v7-relay-recapture.log`). conn_id=4 session 1: pongs sent at 16:59:54.771 → 17:01:24.794 with exact 15-second cadence; client-side timeout fired ~15 seconds after the 7th pong was emitted by relay. H-Ping2 confirmed in its precise form: relay-sent pong, client-not-counted. Not scheduler bug, not relay bug — sub-network return-path degradation in the final cycle.
+- **State machine is already responsive.** `RestStateMachine` correctly transitions WsActive → RestActive after 2 active-fail / 3 idle-fail / 1 ack-timeout / 1 inbound-idle-timeout. REST polling subsequently delivers. The user-facing gap is NOT delivery — it's that the chain link stays Direct forever on the same network, even though Reality or Tor would deliver over a healthier session.
+
+The 3.2a problem is therefore narrow: **build a detector that distinguishes "Direct dying from network return-path degradation" from "Direct dying from a transient blip", without false-positive'ing on the Tele2 noise floor**. Calibration cannot happen against a guess; it must happen against telemetry from the detector itself.
+
+### §2 — Council 5-lens synthesis (express mode, 2026-06-01)
+
+Five parallel general-purpose subagents under the LLM Council pattern. Compressed to the load-bearing finding per lens.
+
+1. **Critic.** Eight attack vectors; the load-bearing two are (a) Tele2 LTE noise floor exceeds candidate threshold (above), and (b) WS_DEGRADED firing while `RestStateMachine.WsCandidate` is mid-recovery would re-introduce the R0.4b pathology under a new name. Other attacks (slow-burn invisibility, bulk-inbound flood mixing, all-suspect chain, persistent-suspect foot-gun, Reality TTL semantic mismatch) all landed as design-note-explicit acknowledgements below.
+2. **Strategist-from-scratch.** Baseline shape (events → counter → threshold → TTL → rate-limit → passive recovery) is the correct discrete model. Continuous health score, server-side hint, per-network priors all sit in the parking lot. The one bring-forward: ship 3 metrics on day 1 so calibration is possible.
+3. **Optimist.** Proposed radical simplification: drop weighted events and TTL, use `RestStateMachine.transitionToRest()` directly as trigger + `chainCursor: AtomicInteger`. Critic's noise-floor attack falsifies this on Tele2 (state machine transitions to RestActive multiple times per hour on routine LTE behaviour; cursor would advance Direct→Reality→Tor in an hour even on a healthy carrier). Optimist's `chainCursor` idea is parked; the network-change-resets-suspect insight is retained in U1.
+4. **Buyer / User.** Two UX bring-forwards: clear suspect on different-network `NETWORK_AVAILABLE` (airplane-mode-recovery scenario), and `Connecting...` → `Online via REST fallback` indicator fallback when Connecting persists > 30 s and REST polling is active (prevents Tor cold-start looking like "broken"). Both reuse existing Commit 3.1 composite UI state; no new UI surface introduced.
+5. **Executor.** Shortest viable diff for the full 3.2 (a+b) is ~420 production LOC + ~520 test LOC, split 7 + 5 + 2 across unit, coordinator, integration. 3.2a in isolation is a much smaller commonMain-only delta — see §4.
+
+### §3 — Locked decisions (Vladislav ACK 2026-06-01)
+
+| ID | Decision | Rationale |
+|---|---|---|
+| **D1** | **3.2a is telemetry-first; no action.** Detector logs `WS_DEGRADED detected ... would_rewalk=<bool>` without invoking `coordinator.onWsDegraded`. Calibration via 2-3 controlled field runs (home Wi-Fi, Tele2 LTE, poor carrier), not a fixed wall-clock window. 3.2b PR turns booleans into actions. | Tele2 LTE noise floor (§1) exceeds candidate threshold. Ship action against a guess = new instability. |
+| **D2** | **Direct-only suspect**, in-memory only, no persistence in `TransportPreferences`. Reality / Tor failures keep going through the existing `TransportAttemptFailure` path at `TransportManager.kt:121`. | Reality is binary (bootstraps or not); a TTL-based suspect on Reality is semantic mismatch. Persistence through process death is the Tor lock-in foot-gun pattern from Test #84.8. |
+| **U1** | **Clear suspect on `NETWORK_AVAILABLE` when current coarse-network-generation differs from the generation captured at suspect-mark time.** Network generation is an in-memory `Int` counter advanced by `NetworkChangeObserver` on every meaningful change; NOT a raw SSID/BSSID or any persistent network identifier. No PII surface. | Airplane-mode-then-landed scenario should not keep Direct suspect for the full TTL when the network is obviously new. Privacy-safe by construction (just a monotonic counter, no carrier/SSID logging). |
+| **U2** | ~~UI-only refinement — `Connecting...` indicator falls back to `Online via REST fallback` when Connecting persists > 30 s AND REST orchestrator state is delivering.~~ **Superseded by rev3 precedence audit (§9.1) — dropped from 3.2a.** Commit 3.1 rev2's locked precedence table already maps every `(RestMode, wsState)` cell where REST is delivering to a non-Connecting UI state; U2 would have duplicated `RestActive → RestFallback` and regressed `(WsCandidate, Connected) → Recovering`. | Original Buyer-lens rationale preserved in §9 for the audit trail. The Tor cold-start UX concern is structurally handled by 3.1's `RestActive → RestFallback` branch. |
+
+### §4 — Scope (Vladislav-locked)
+
+#### What 3.2a code does
+
+- NEW `WsDegradationDetector` in `commonMain` (`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/`). Pure logic, unit-testable under `kotlinx.coroutines.test.runTest`. Sliding-window weighted counter over three event kinds; emits dry-run trigger decisions via a `WsDegradationVerdict` data class.
+- NEW `WsDegradationDetectorTest` in `commonTest`. Drives detector deterministically with a virtual clock + simulated event sequences; covers the threshold candidates and the empty-window / clock-monotonic edge cases.
+- EDIT `KtorRelayTransport.WsSessionEndedEvent` to surface `okhttpPingTimeoutDetected: Boolean` (currently `okhttp_ping_timeout_detected` is computed and logged inside `emitSessionSummary` but not propagated through the event data class). Default `false` for backward compat.
+- EDIT `HybridRelayTransport.startWsPassthroughCollectors` to feed the detector from the three existing collectors (`wsSessionEnded`, `outboundAckDeadlineExpired`, `inboundStalled`) AFTER the existing `submitStateEvent` call. Detector is consulted but no action is taken on its verdict — only a structured `WS_DEGRADED detected ...` log line is emitted.
+- EDIT `RelayTransportConfig.kt` to add three constants under a `// PR-WS-HEALTH-STATE1 Commit 3.2a (telemetry only)` section: `WS_DEGRADED_WINDOW_MS`, candidate threshold constants (named `_CANDIDATE_` so the 3.2b PR can adjust without churn), and a `WS_DEGRADED_WSCANDIDATE_GATE_MS` for the recovery-gate guard.
+
+#### What 3.2a code does NOT do
+
+- ❌ Does NOT call `TransportRewalkCoordinator.onWsDegraded(...)` (the method does not even exist yet — added in 3.2b).
+- ❌ Does NOT add `NetworkChangeReason.WS_DEGRADED` enum value (added in 3.2b).
+- ❌ Does NOT add `KindSuspectStore` or `kindSuspectUntil` storage. Only emits a structured log `would_mark_suspect_until=<ms>` so the calibration analysis can simulate what the store WOULD have done.
+- ❌ Does NOT change `TransportManager.reorderChain(...)` — no suspect filter is added yet.
+- ❌ Does NOT touch `RestStateMachine` behaviour. Detector reads `stateMachine.current` for the `WsCandidate` gate (§5) but never injects events.
+- ❌ Does NOT change REST orchestrator. Delivery during any subsequent rewalk is non-negotiable.
+- ❌ Does NOT touch heartbeat cadence (Inv5).
+- ❌ Does NOT reintroduce app-level `RelayMessage.Ping` (PR-H1e removed).
+- ❌ Does NOT change `lastWorkingTransport` promotion rules (Inv8).
+- ❌ Does NOT change relay-side (`services/relay/...`) anything. Pure client work.
+- ❌ Does NOT touch CHIP1 (stays parked at `78bd979e`).
+
+### §5 — Detector contract (locked, numbers are CANDIDATE for 3.2a calibration)
+
+```
+class WsDegradationDetector(
+    val now: () -> Long,
+    val log: (String) -> Unit = {},
+    val stateProvider: () -> RestMode = { RestMode.WsActive },
+) {
+    fun record(event: Event)              // append to window
+    fun evaluate(currentKind: TransportKind): Verdict   // dry-run decision
+}
+
+sealed class Event {
+    object PingTimeout : Event()           // okhttpPingTimeoutDetected=true on WsSessionEnded
+    object IdleTimeout : Event()           // InboundIdleTimeout
+    object AckTimeout : Event()            // ActiveOutboundAckTimeout
+}
+
+data class Verdict(
+    val wouldRewalk: Boolean,
+    val wouldMarkSuspect: Boolean,
+    val gatedByWsCandidate: Boolean,       // true => verdict suppressed by §5 gate
+    val pingTimeoutCount: Int,
+    val idleTimeoutCount: Int,
+    val ackTimeoutCount: Int,
+    val weightedSum: Double,
+    val windowMs: Long,
+)
+```
+
+**Candidate weights** (3.2a logs them; 3.2b locks the final numbers):
+
+- `PingTimeout` = 2.0  (strongest signal — matches Test #83 v7 evidence)
+- `AckTimeout` = 1.0
+- `IdleTimeout` = 0.6
+
+**Candidate window:** `WS_DEGRADED_WINDOW_MS = 300_000` (5 min). 3.2b may extend to 15 min if slow-burn (parking lot, below) field data justifies.
+
+**Candidate trigger condition (for `wouldRewalk`):** `pingTimeoutCount >= 2` OR `weightedSum >= 3.0`. 3.2a does NOT act on this — it logs the boolean and the contributing counts so the 3.2b PR can re-evaluate against real data.
+
+**Direct-only suspect on dry-run booleans (rev2 P3-6, locks D2 at the log layer).** `wouldMarkSuspect` is forced to `false` whenever `currentKind != TransportKind.Direct`, **regardless of the counter state**. The `wouldRewalk` boolean can still be `true` for non-Direct kinds (so calibration sees them) but the dry-run never tells the future 3.2b reviewer "this is the moment we would have marked Reality / Tor as suspect" — that would contradict D2. The detector's `evaluate(currentKind)` enforces this at the verdict construction site so it cannot be missed by a downstream consumer.
+
+**WsCandidate gate (Vladislav-locked, addresses Critic C7 / R0.4b spirit).** Detector consults `stateProvider()` before emitting `wouldRewalk=true`. If `RestMode.WsCandidate`, the verdict is forced to `wouldRewalk=false, gatedByWsCandidate=true`. Reason: WsCandidate means Direct is *currently attempting recovery*; firing a rewalk into that recovery window is structurally identical to the `forceReconnect` pattern PR-R0.4b removed.
+
+**`stateProvider` source (rev2 P3-5).** Bound to `restOrchestrator.stateMachine.current` directly, NOT to `hybridTransport?.stateMachine?.current`. `restOrchestrator` is constructed before `hybridTransport` in `AppContainer.initMessaging`, so the binding is non-nullable at detector construction time. This pattern eliminates the "elvis-once" class of bug surfaced by architect P2 on Commit 3.1 rev2 (a `combine(...)` with `?: MutableStateFlow(default)` evaluating once and permanently subscribing to the dummy). The detector takes a `stateProvider: () -> RestMode` lambda explicitly so the binding is visible at the wire-up site.
+
+**All-suspect safety net (described forward to 3.2b, NOT implemented in 3.2a).** When the future `markSuspect` is wired, `TransportManager.reorderChain` must apply `.filterNot { suspectFilter.isSuspect(it, nowMs()) }.ifEmpty { baseChain }`. If every kind is suspect, fallback to the unfiltered baseChain rather than throwing `NoTransportReachableException`. Logged here so 3.2b reviewer cannot omit it.
+
+### §6 — Dry-run log shape (load-bearing for calibration)
+
+After every detector evaluation that would have changed the verdict (rising edge of `wouldRewalk`, rising edge of `wouldMarkSuspect`, or `gatedByWsCandidate=true`), emit ONE structured line under tag `TransportRewalkCoordinator` (consistent with existing `NETWORK_TRACE` lines):
+
+```
+WS_DEGRADED detected current_kind=<Direct|Reality|Tor>
+    would_rewalk=<true|false>
+    would_mark_suspect=<true|false>
+    gated_by_ws_candidate=<true|false>
+    ping_timeout_count=<n>
+    idle_timeout_count=<n>
+    ack_timeout_count=<n>
+    weighted_sum=<f>
+    window_ms=300000
+    state_machine=<WsActive|WsCandidate|RestActive>
+    network_generation=<n>
+```
+
+Single line, no newlines in the actual emit. Format above is for readability. The exact constant names match the §5 contract.
+
+Three telemetry lines for §3 strategist requirement. **Rev2 P2-3:** the `session_total` line is MANDATORY on every `WsSessionEnded` close — not gated on detector rising-edge. Without unconditional per-session emit, calibration cannot compute the denominator (sessions-without-trigger vs sessions-with-trigger vs sessions-gated). The other two lines remain conditional / event-driven as described.
+
+- `WS_DEGRADED_TELEMETRY counter kind=<ping|idle|ack> count_now=<n> weighted_now=<f>` — emitted on every `record(event)` call. Lets calibration see counter growth shape over time, not just terminal values.
+- `WS_DEGRADED_TELEMETRY state_transition_seen reason=<active_outbound_threshold|idle_threshold|active_outbound_ack_timeout|inbound_idle_timeout|candidate_session_regression>` — emitted whenever `RestStateMachine` transitions through `transitionToRest(...)`. Mirrors existing `REST_TRACE mode_switched` so calibration can correlate detector verdicts with state-machine transitions.
+- `WS_DEGRADED_TELEMETRY session_total session_id=<n> ping_in_session=<n> idle_in_session=<n> ack_in_session=<n> session_duration_ms=<n> close_kind=<kind> on_close=true` — **MANDATORY on every `WsSessionEnded` close**, regardless of whether any trigger fired. Provides the denominator for calibration ratios.
+
+### §7 — Acceptance gates for 3.2a (8 total)
+
+1. **Pure logic in commonMain.** `WsDegradationDetector` has zero `androidMain` imports. Grep-verified.
+2. **No action calls.** Grep proves `coordinator.onWsDegraded` does not exist; `TransportManager.reorderChain` has no suspect filter; `TransportPreferences` has no `kindSuspectUntil`. The detector is read-only on `stateProvider` and emits only logs.
+3. **WsCandidate gate.** Unit test asserts that a window with `pingTimeoutCount >= 2` AND `stateProvider() = WsCandidate` produces `Verdict(wouldRewalk=false, gatedByWsCandidate=true)`.
+4. **Window expiry.** Unit test asserts that an event older than `WS_DEGRADED_WINDOW_MS` does not contribute to `pingTimeoutCount` / `weightedSum`.
+5. **Monotonic clock safety.** Unit test feeds clock-going-backwards via `now()` and asserts no negative weights / no IndexOutOfBounds.
+6. **`okhttpPingTimeoutDetected` propagation, split into two gates** (rev2 P2-2 fix; the Hybrid collector lives in `androidMain` so cross-module test in `commonTest` is structurally wrong).
+   - **6a (commonTest):** a pure mapper function `wsSessionEndedToDetectorEvent(event: WsSessionEndedEvent): WsDegradationDetector.Event?` (or equivalent inline mapping inside the detector) is tested deterministically: `okhttpPingTimeoutDetected=true` → `Event.PingTimeout`; `okhttpPingTimeoutDetected=false` with `inboundFrames=0` → no event (not enough signal alone); default-`false` does not break existing constructions.
+   - **6b (androidUnitTest):** a focused `HybridRelayTransport` test (or `WsPassthroughCollectorsTest`) constructs a fake `wsTransport.wsSessionEnded` `SharedFlow`, emits a single event with `okhttpPingTimeoutDetected=true`, and asserts the detector's `record(...)` was called with `Event.PingTimeout` exactly once. No common code knows about `SharedFlow` plumbing.
+7. **Dry-run telemetry emit.** Test asserts the log function fires exactly once per rising-edge verdict and never on noop reads.
+8. **WORKING_RULES rule 8 (Tele2 LTE smoke).** Code PR includes a Tele2 LTE field run (Tecno) capturing `WS_DEGRADED detected ...` lines. Even though no action is taken, the field run validates that the detector observes the noise floor §1 measured and provides the calibration baseline for 3.2b.
+
+### §8 — Implementation order for the 3.2a code PR
+
+1. NEW `WsDegradationDetector.kt` + `WsDegradationDetectorTest.kt` (commonMain / commonTest). Pure logic, ~80-120 LOC production + ~200 LOC test.
+2. EDIT `KtorRelayTransport.WsSessionEndedEvent` to add `okhttpPingTimeoutDetected: Boolean = false`. ~2 lines + propagation at the `tryEmit` site (already computes the value locally for the `ws_ping_timeout_diag` log — just plumb it through the existing event).
+3. EDIT `RelayTransportConfig.kt` to append the 3 constants under a clearly-named `// PR-WS-HEALTH-STATE1 Commit 3.2a — telemetry only` block.
+4. EDIT `HybridRelayTransport.startWsPassthroughCollectors` — three collectors gain a single line each that records into the detector AFTER the existing `submitStateEvent(...)`. Detector instance is constructed once on `bootstrapAndStart`.
+5. Wire-up in `AppContainer.initMessaging` — single `WsDegradationDetector` ctor passing `now`, `log` (tagged `TransportRewalkCoordinator`), and `stateProvider = { restOrchestrator.stateMachine.current }`. Bound directly to the `restOrchestrator` instance (constructed earlier in `initMessaging`, non-nullable at detector construction) per §5 P3-5 rationale — explicitly NOT through `hybridTransport?.stateMachine?.current` which would reintroduce the elvis-once / dummy-flow trap Commit 3.1 rev3 already paid for. Detector instance is then passed to `HybridRelayTransport` constructor.
+6. Tele2 LTE Tecno field smoke (rule 8) — verify dry-run lines fire during the noise-floor pattern from Test #83 v7. ~5-min run is sufficient (we proved 2 ping timeouts inside 7 min).
+7. Architect rule-9 review against the diff before merge.
+
+### §9 — UI work (U2 — **dropped from 3.2a** after rev3 precedence audit; analysis preserved for the record)
+
+**Rev3 outcome: U2 has no honest input signal in 3.2a and is therefore not part of this design note's scope.** The motivating Buyer-lens scenario — long `Connecting...` while REST is delivering during Tor cold-start — is already covered by Commit 3.1 rev2's locked `(RestMode, wsState)` precedence table. Adding U2 on top would either duplicate an existing branch or violate the rev2 locked precedence.
+
+#### §9.1 — Precedence audit (the analysis that drove the drop)
+
+Commit 3.1 rev2 locked `RestMode` precedence OVER raw `wsState`. The full `(RestMode × wsState)` mapping is:
+
+| `RestMode` | Raw `wsState` | Locked Commit 3.1 mapping | REST polling active? |
+|---|---|---|---|
+| `RestActive` | any | `RestFallback` | YES |
+| `WsCandidate` | any | `Recovering` | YES (safety net until commit) |
+| `WsActive` | `Connected` | `Online` | NO (`pollJob` cancelled at `RestFallbackOrchestrator.kt:170`) |
+| `WsActive` | `Connecting` | `Connecting` | NO |
+| `WsActive` | `Disconnected` / `Error` | `Offline` | NO |
+
+The U2 scenario "long Connecting WHILE REST is delivering" requires both `wsState is Connecting` AND `RestMode ∈ {RestActive, WsCandidate}` simultaneously. By the precedence table both rows map to non-Connecting UI states already (`RestFallback` and `Recovering`). The Buyer concern is therefore **structurally impossible to mis-display under the shipped 3.1 derivation**: the moment REST starts delivering, `RestMode` advances to `RestActive` or `WsCandidate`, and the UI flips out of `Connecting` without any clock-driven guard.
+
+The only `(RestMode = WsActive, wsState = Connecting)` cell — which the rev2 U2 wanted to flip to `RestFallback` after 30 s — is the cell where `pollJob` is by definition cancelled (state-machine kdoc: "WS healthy. Outbound and inbound flow over WS. REST polling stopped."). There is no parallel REST delivery in this cell, so flipping its long-Connecting variant to `RestFallback` would be a lie, not a refinement.
+
+#### §9.2 — Why rev2's U2 broke precedence
+
+Rev2's pseudocode had `ws is Connected -> Online` as a fall-through after the `RestActive` branch, meaning a `(WsCandidate, Connected)` tuple reached it and resolved to `Online`. The shipped 3.1 mapping for that tuple is `Recovering`. The rev2 shape would have **regressed** 3.1's locked behaviour for one tuple while attempting to refine a different tuple — a P2-grade scope violation against an already-shipped derivation.
+
+#### §9.3 — Outcome
+
+- **U2 is dropped from 3.2a.** No `ConnectionUiState` changes ship in this design note's scope.
+- **If field evidence later proves the precedence audit wrong** (e.g. a `(WsActive, Connecting)` cell where REST is actually delivering through some race in `RestStateMachine` we don't currently model), the appropriate response is to fix the state machine OR the precedence table — NOT to layer a clock-driven guard on top of UI derivation. That fix would be its own track.
+- **Buyer-lens UX coverage is unchanged from today:** during Tor cold-start with REST polling active, the state machine is in `RestActive` (the trigger that caused the chain rewalk in the first place was a sustained REST-delivery period), so the UI shows `RestFallback`, not `Connecting`. Long Tor cold-start without REST delivery (e.g. cold app start, no prior session) legitimately shows `Connecting` — and the right fix for that, if any, is a startup splash, not a 3.2a-scope UI refinement.
+
+### §10 — Out of scope for 3.2a (hard)
+
+- ❌ Any `markSuspect` action. Detector emits booleans, never invokes anything actionable.
+- ❌ `TransportRewalkCoordinator.onWsDegraded(...)` method — deferred to 3.2b.
+- ❌ `NetworkChangeReason.WS_DEGRADED` enum value — deferred to 3.2b.
+- ❌ `reorderChain` suspect filter — deferred to 3.2b.
+- ❌ `KindSuspectStore` / `kindSuspectUntil` storage — deferred to 3.2b.
+- ❌ Persistent suspect across process restart. Decision locked: never. Even in 3.2b.
+- ❌ Reality / Tor suspect logic. D2 locks Direct-only.
+- ❌ Heartbeat cadence (Inv5).
+- ❌ App-level `RelayMessage.Ping` (PR-H1e removed).
+- ❌ REST orchestrator behaviour.
+- ❌ Raw OkHttp `WebSocketListener` rewrite.
+- ❌ Relay-side anything.
+- ❌ `lastWorkingTransport` promotion rules (Inv8).
+- ❌ CHIP1 (parked at `78bd979e`).
+- ❌ Per-network priors / continuous health score / server-side hint — parking lot below.
+- ❌ Any `ConnectionUiState` derivation changes (U2 dropped from 3.2a per rev3 §9 precedence audit). Commit 3.1 rev2 mapping table is the single source of truth for `(RestMode, wsState) → ConnectionUiState`.
+
+### §11 — Parking lot (not 3.2a, not 3.2b)
+
+- **Slow-burn degradation invisibility.** Sliding 5-min window misses sustained degradation > ~6 min (Critic C3). Track as `PR-TRANSPORT-SLOW-BURN-DETECTOR1`. Possible shapes: extend window to 15 min with proportional threshold, OR add a separate `time_on_rest_in_last_30min > 70%` gate.
+- **Continuous health score** (Strategist Line 1). Continuous `[0..1]` per-(kind × network) exponentially-decayed score. Calibrated from 3.2a telemetry. Track as `PR-TRANSPORT-HEALTH-SCORE1` candidate.
+- **Per-network priors** (Strategist Line 4). Reorder chain by historical success rate per network fingerprint instead of static `[Direct, Reality, Tor]`. Track as `PR-TRANSPORT-NETWORK-PRIORS1`. Significant scope (network fingerprinting + 24h persistence) — out of WS-HEALTH-STATE1 scope entirely.
+- **Server-side degradation hint** (Strategist Line 2). Relay annotates REST-poll response with a `degradation_hint`. Out of scope (requires relay protocol change).
+- **Active probing budget for suspect recovery** (Strategist Line 5). Background probe of suspect link once per N minutes to enable early TTL revoke. Wait for 3.2b passive recovery field evidence before considering.
