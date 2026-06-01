@@ -1160,3 +1160,250 @@ Rev2's pseudocode had `ws is Connected -> Online` as a fall-through after the `R
 - **Per-network priors** (Strategist Line 4). Reorder chain by historical success rate per network fingerprint instead of static `[Direct, Reality, Tor]`. Track as `PR-TRANSPORT-NETWORK-PRIORS1`. Significant scope (network fingerprinting + 24h persistence) — out of WS-HEALTH-STATE1 scope entirely.
 - **Server-side degradation hint** (Strategist Line 2). Relay annotates REST-poll response with a `degradation_hint`. Out of scope (requires relay protocol change).
 - **Active probing budget for suspect recovery** (Strategist Line 5). Background probe of suspect link once per N minutes to enable early TTL revoke. Wait for 3.2b passive recovery field evidence before considering.
+
+---
+
+## Commit 3.2b design note — Adaptive Path Validation (NO automatic rewalk) (Vladislav-locked 2026-06-01, **rev2 after Vladislav 5-point review of rev1**)
+
+**Rev2 changes** (Vladislav 5-point review of rev1, 2026-06-01 evening):
+
+1. **Gate 8 (acceptance gate § §8) rephrased** — was "Tele2 LTE smoke" (carrier-specific). v9 evidence proves the Direct-WS-death pattern is carrier-independent (identical rhythm on Ростелеком Wi-Fi). Rev2 phrases the gate as "bad-network steady-state baseline including BOTH Tele2 LTE AND Ростелеком Wi-Fi (or any RU-ISP network exhibiting the v8/v9 140 s death rhythm)". The pre-merge field test set is plural, not singular.
+2. **§5 trigger semantics explicit** — rev1 §5 listed conditions for "scheduling a probe" but the wording could be misread as "scheduling an action". Rev2 §5 begins with an explicit guard line: *this triggers `markProbeStarted(Reality)` ONLY. It does NOT call `coordinator.onAdaptiveSwitch(...)`. The chain switch lives in §7 and requires `restHealth.isFailing() == true` independently.* Detector `would_rewalk=true` plus `RestActive ≥ 8 min` are inputs to a probe schedule, never to a chain switch.
+3. **D7 forbids `/health` as realtime proof** — rev2 strengthens §4: until a relay `/probe/ws` endpoint exists (parked in §12), the validator's initial shape is *transport-liveness only* (auth + WS handshake + stability window + ≥1 inbound frame), and the verdict carries explicit `roundtripProven=false` so downstream consumers cannot read it as full product-grade success. The validator MUST NOT fall back to an HTTP `/health` probe under any condition — `/health` is rejected as a realtime proof by definition.
+4. **Capability boundary preserved** — NEW §3.1 sub-section makes explicit that `TransportCapabilitiesResolver` (PR-C1, 2026-05-17) continues to gate calls capability via `(RestMode, torActive)`. 3.2b does NOT promote calls capability. A "validated Reality" status from `BackgroundPathValidator` is a DELIVERY-path fact, not a calls-feature unlock. Otherwise we ship "everything green, but calls silently broken" — exactly the trap product-level capability gating exists to prevent.
+5. **Tor never unlocks calls even if validator marks it `Validated`** — strategic pivot 2026-05-15 (Tor = text-only emergency) is preserved. The §3.1 capability table explicitly states: `torActive == true → callsAllowed == false`, independent of validator state. Validator can mark Tor as a viable DELIVERY fallback for text; calls remain `disabled` until `currentKind ∈ {Direct, Reality}` AND existing PR-C1 conditions hold.
+
+**This supersedes the original "3.2b = chain rewalk action layer" intent recorded in the 3.2a body and the §3 D-table.** The original direction was: "3.2b turns the dry-run booleans into actual `markSuspect` + `coordinator.onWsDegraded(...)` calls." After two field-test rounds (v9 control on Ростелеком Wi-Fi, v10 Reality control under `REALITY_FIRST` chain) and a 5-lens LLM Council, the action layer's underlying premise — "switching off Direct improves UX" — is **falsified** under current conditions. Rev1 below specifies the replacement direction.
+
+**Reframe history (Vladislav-locked 2026-06-01):**
+
+1. **Round 0 — original intent (from #261 3.2a body / `project_next_session_ws_health_state_3_2b_2026_06_01.md` early draft):** `KindSuspectStore` + `markSuspect(Direct)` + `coordinator.onWsDegraded(...)` + `reorderChain` suspect-filter. Hard switch.
+2. **Round 1 reframe (after Council, before v10):** soft-demote (chain reorder `[Reality, Direct, Tor]`, Direct stays in pass) gated by Reality validation control run.
+3. **Round 2 reframe (after v10, this rev1):** **NO automatic rewalk.** Background validator of alternative realtime paths. Switch only if Direct REST itself fails AND validated alternative is ready. Direct REST works = stay. Three parallel tracks for root cause + UI cleanup.
+
+### §1 — Why original 3.2b is superseded (empirical base unified)
+
+Three test runs against the same Tecno (`103603734A004351`) on three different networks confirm a single pattern:
+
+| Test | Network | Run | WS sessions died | Avg WS lifetime | Direct REST | Reality WS | Tor WS |
+|---|---|---|---|---|---|---|---|
+| **#83 v8** | Tele2 LTE cellular | ~8 min | 4 | 140 s, after 8 ping/pongs | not exercised (Direct WS path) | not tried (Standard mode) | not tried |
+| **#83 v9** | Ростелеком Wi-Fi | ~11 min | 5 | 145 s, after 8 ping/pongs | not exercised | not tried (Standard mode) | not tried |
+| **#83 v10** | Ростелеком Wi-Fi (Private mode `REALITY_FIRST`) | ~10 min | n/a (chain went to Tor) | n/a | proven 564 ms `/send` 201 | **`/health` probe failed at 20063 ms timeout** | bootstrap 128 s + 2× 90 s auth timeout + 11.6 s success = ~5 min to first realtime; once up, **first observed `ws_alive_60s` commit** across the whole test series |
+
+Source line references (independently grep-verified against the raw logs):
+
+- v8 ping-timeout pattern: `C:\temp\test83-v7-tecno.log:164/:165` (s=1) and `:426/:427` (s=2). v8 grep already in 3.2a §1.
+- v9: `C:\temp\test83-v9-wifi2-tecno.log` — 5 `okhttp_ping_timeout_detected=true` lines, no `WS_DEGRADED detected` gated lines.
+- v10: `C:\temp\test83-v10-reality-tecno.log:70` (`probe_returned kind=Reality ok=false elapsedMs=20063`), `:72` (`chain_attempt_failed kind=Reality reason=probe_failed`), `:243` (`send_response id=7eef5720 status=201 elapsedMs=564`), `:152` (`mode_switched WsActive→RestActive reason=inbound_idle_timeout`), `:249` (`ws_frame_text_received` → WsCandidate), `:443` (`mode_switched WsCandidate→WS_ACTIVE reason=ws_alive_60s`).
+
+Key claims this evidence supports:
+
+- **Direct WS death is carrier-independent.** Identical 140 s rhythm on Tele2 LTE and Ростелеком Wi-Fi. Root cause sits BELOW the carrier layer — somewhere in OkHttp/Ktor WS engine + Caddy WS reverse_proxy (NOT Cloudflare — `deploy/Caddyfile:5` confirms `relay.phntm.pro` is Cloudflare DNS-only, Caddy terminates TLS directly) + relay (Rust) WS handler + Hetzner network layer + Tecno-specific Android stack.
+- **Direct REST is proven product-grade.** 564 ms `/send` round-trip in v10. PR-D1 / PR-D0r REST fallback path is the actual messenger stability foundation; WS is a latency optimisation on top.
+- **Reality is currently unvalidated.** v10 Reality `/health` probe failed at full 20 s timeout. This could be (a) Xray SOCKS path broken on this ISP, (b) Reality endpoint blocked by Ростелеком DPI, (c) VLESS handshake failing, (d) Xray-internal stall. Until validated, "switching to Reality" means `chain_attempt_failed → fallthrough to Tor`.
+- **Tor is expensive to reach.** v10 measured ~5 min wall clock from `prepare_start kind=Tor` to first WS auth success (128 s Tor bootstrap + 2× 90 s auth timeout + 11.6 s third-attempt success). Once up, Tor demonstrated the first `ws_alive_60s` commit of the whole series — but the cost to get there is prohibitive for a casual messenger user.
+
+**Net consequence:** *any* hard switch design (original 3.2b) takes a user from "Direct WS dead but Direct REST fast (564 ms send)" to "Reality fails → 5 min Tor wait → maybe stable WS". This is a deterministic UX regression for Russian users on tested networks.
+
+### §2 — Locked decisions (Vladislav ACK 2026-06-01 after v10 + Council)
+
+| ID | Decision | Source |
+|---|---|---|
+| **D7 (OQ7)** | **Realistic realtime probe shape.** Transient validator using the same auth/WS path as the real transport (option **b**), but a *separate ephemeral connection* that does NOT touch the live session. Success criteria: auth OK → WS connected → held ≥ 3-5 min → no ping_timeout → ≥ 1 inbound frame OR an explicit echo/roundtrip. `/health` HTTP probe is NEVER realtime proof. If no safe test-frame endpoint exists yet, ship "transport-liveness only, message-roundtrip not proven" with that explicit tag in the verdict — add relay `/probe/ws` later. | Vladislav 2026-06-01 |
+| **D8 (OQ8)** | **Probe frequency = on-degradation + cooldown.** Reality probe fires when 3.2a detector emitted `would_rewalk=true` AND `RestActive` has been sustained. After one probe attempt the kind enters a cooldown window of **10-15 min**, no re-probe. Tor probe is rarer: only if Direct REST itself starts degrading AND Reality is in cooldown/failed. NOT periodic; NOT pre-emptive. | Vladislav 2026-06-01 |
+| **D9 (OQ9)** | **"Direct REST failing" threshold (for emergency switch).** Real delivery failures only — never latency alone. Triggers: (a) 3 consecutive `/send` failures (non-2xx or transport exception), OR (b) 3 consecutive `/poll` timeouts/failures within a bounded window, OR (c) outbound message queue backlog grows monotonically past a threshold. Latency alone is at most a `warning` log, never a switch trigger. While `/send` and `/poll` round-trip in the ~500-700 ms range, Direct REST is considered healthy even if Direct WS is dead. | Vladislav 2026-06-01 |
+| **D10 (OQ10)** | **Probe budget.** Reality probe: bounded — 1 attempt per 10-15 min while degradation conditions hold. Xray subsystem may stay started during this window to amortise its ~30 s cold-start cost, but no continuous background ping. Tor probe: NOT a background routine. Only on emergency (Direct REST failing) or explicit user-driven mode change. Battery and UX cost of keeping a Tor circuit warm is too high to amortise speculatively. | Vladislav 2026-06-01 |
+| **D11 (OQ11)** | **`BackgroundPathValidator` is a NEW standalone class**, NOT folded into `TransportRewalkCoordinator`. Coordinator's responsibility is action (5-step rewalk pipeline). Validator's responsibility is a single read-only fact: "alternative X is validated / unvalidated / cooldown / probing right now". Cleaner separation, no mixing of diagnostics + decision policy + service re-entry. The eventual chain-switch decision (when D8 cooldown + D9 REST-failing both met) lives in a third small component or extends `BackgroundPathValidator` with an `evaluateEmergencyAction()` method — to be specified in code PR after a `BackgroundPathValidator` skeleton exists. | Vladislav 2026-06-01 |
+| **D12 (OQ12)** | **UI label hiding = separate track `PR-UI-CONNECTION-LABELS1`.** Covers BOTH (a) main-screen / banner composite UI surface (already 3.1 derivation) AND (b) foreground notification text rendered by `PhantomMessagingService.updateNotificationFor*`. In release builds: NEVER show "Tor", "Reality", "Direct", "REST fallback". Map: WsActive any kind → "Online" (no qualifier); RestActive → "Online · Backup connection"; WsCandidate → "Recovering secure route". Debug builds keep current technical labels for diagnostic work. 3.2b itself adds NO new UI surface and NO new notification text — it preserves Commit 3.1 rev2 mapping. | Vladislav 2026-06-01 |
+
+### §3 — Scope (3.2b code PR)
+
+#### What 3.2b DOES
+
+- NEW `BackgroundPathValidator` in `commonMain` (skeleton + pure decision logic).
+  - State machine per chain kind: `Unknown` → `Probing` → `Validated(ts) | Failed(ts) | Cooldown(until)`.
+  - Methods: `markProbeStarted(kind)`, `markProbeOutcome(kind, success, reason)`, `isValidatedRecently(kind, freshnessMs): Boolean`, `inCooldown(kind, nowMs): Boolean`, `snapshot(): Map<TransportKind, ValidationState>`.
+  - No I/O. Caller drives via callbacks from the actual probe runner (Android-side).
+- NEW `RestHealthMonitor` in `commonMain` (skeleton + pure counter logic).
+  - Observes `/send` outcomes and `/poll` outcomes (event feed from `RestFallbackOrchestrator`).
+  - Methods: `recordSendOutcome(success: Boolean)`, `recordPollOutcome(success: Boolean)`, `isRestFailing(): Boolean`.
+  - Implements D9 contract: trips on 3 consecutive failures of either path inside a sliding window (e.g. 60 s), clears on any success.
+- NEW `ProbeRunner` (Android-side) — the actual ephemeral WS dial driver. Runs in its own coroutine on `appScope`, target `TransportKind`, uses `TransportManager.prepareTransport(kind)` style hook to get a SOCKS port without taking the live `TransportManager` state, opens a transient `KtorRelayTransport`-equivalent against the relay, performs the D7 success-criteria check, reports outcome back to `BackgroundPathValidator`, disconnects.
+- EDIT `WsDegradationDetector` exposes a verdict-listener interface so the action surface (yet to be designed) can subscribe without mutating detector. (Already planned in Executor lens output; minimal change.)
+- EDIT existing `TransportRewalkCoordinator` adds a NEW method `onAdaptiveSwitch(targetKind, reason)` — invoked ONLY when (D8 probe success + D9 REST failing) both hold. Reuses the existing 5-step rewalk pipeline with a new `NetworkChangeReason.ADAPTIVE_SWITCH` enum value. Existing rate-limit (`NETWORK_REWALK_MIN_INTERVAL_MS=5_000ms`) honoured; no separate WS_DEGRADED rate-limit needed (we are NOT firing on WS degradation alone — we are firing on the much rarer combined emergency).
+- Structured telemetry log family `WS_VALIDATION_*`:
+  - `WS_VALIDATION_PROBE_STARTED kind=<k> reason=<degradation_window|emergency> network_gen=<n>`
+  - `WS_VALIDATION_PROBE_OUTCOME kind=<k> ok=<bool> stable_for_ms=<n> reason=<auth_fail|ping_timeout|no_inbound|success_basic|success_roundtrip>`
+  - `WS_VALIDATION_COOLDOWN kind=<k> until_ms=<n>`
+  - `REST_HEALTH state=<healthy|degrading|failing> consecutive_send_fail=<n> consecutive_poll_fail=<n>`
+  - `WS_ADAPTIVE_SWITCH triggered target_kind=<k> reason=<rest_failing+validated_alt>` — only when action actually fires.
+
+#### What 3.2b does NOT do
+
+- ❌ NO automatic action on Direct WS degradation alone. Detector's `would_rewalk=true` is a *necessary but not sufficient* signal — at most it triggers a probe, never a switch.
+- ❌ NO `markSuspect(Direct)`. Direct is NEVER removed from the chain. `reorderChain` filter is NOT added in 3.2b.
+- ❌ NO `KindSuspectStore` (the original 3.2b primary deliverable). Validator state is *positive* ("X is validated for the next N min"), not negative ("X is suspect"). No persistence, in-memory only.
+- ❌ NO U1 network-generation suspect-clear logic (U1 was for the suspect store — there is no suspect store).
+- ❌ NO `WS_DEGRADED_MASKING_RISK` log (was masking-of-suspect — no suspect). Masking visibility is preserved structurally: Direct stays in the chain at all times, so degradation telemetry continues on Direct uninterrupted.
+- ❌ NO `ConnectionUiState` changes (Commit 3.1 rev2 mapping stays single source of truth; label hiding is `PR-UI-CONNECTION-LABELS1`).
+- ❌ NO notification text changes (`PR-UI-CONNECTION-LABELS1`).
+- ❌ NO heartbeat / app-level Ping changes (Inv5).
+- ❌ NO `lastWorkingTransport` promotion rule changes (Inv8).
+- ❌ NO `RestFallbackOrchestrator` behavioural change beyond emitting the outcome events `RestHealthMonitor` consumes.
+- ❌ NO raw OkHttp `newWebSocket(...)` rewrite (Direct WS root cause investigation = `RC-DIRECT-WS-DEATH1`, separate track).
+- ❌ NO relay-side changes (Reality `/health` probe failure investigation = `RC-REALITY-PROBE1`, separate track).
+- ❌ NO CHIP1 (parked at `78bd979e`).
+- ❌ NO Tor probe as background routine. Tor only on D8 emergency path.
+
+### §3.1 — Capability boundary (rev2 P4 + P5)
+
+The PR-C1 (2026-05-17) `TransportCapabilitiesResolver` is the **single source of truth** for product-level features (1:1 messages, voice notes, attachments, calls). It maps `(currentRestMode: RestMode?, torActive: Boolean) → TransportCapabilities`. 3.2b's `BackgroundPathValidator` and `RestHealthMonitor` are DELIVERY-path facts and **do not feed into the capability resolver**. Two invariants follow:
+
+| Invariant | What it forbids in 3.2b code |
+|---|---|
+| **Inv-CalleeReal:** Calls require WS realtime ON `Direct` OR `Reality`. They are NEVER allowed when the active outer transport is Tor, even if `BackgroundPathValidator.stateOf(Tor) == Validated(...)`. | Wiring `validator.isValidatedRecently(Tor)` into any calls-enabling code path. The validator's Tor verdict pertains exclusively to text/media delivery fallback, not calls. |
+| **Inv-NoCapabilityShortcut:** Validator status does NOT promote any `TransportCapabilities` field. The resolver's existing input domain `(RestMode, torActive)` is unchanged. | Adding `BackgroundPathValidator` (or any 3.2b component) as a parameter to `TransportCapabilitiesResolver.resolve(...)`. Adding new "validated path"-driven capability fields to `TransportCapabilities`. Any code that would let a "validated alternative" upgrade the calls / voice / attachments capability surface. |
+
+The product framing: "everything green, but calls silently broken" is the trap PR-C1 was built to prevent. 3.2b respects that contract — chain-switch decisions affect WHICH path delivers messages, never WHAT features are exposed to the user.
+
+### §4 — `BackgroundPathValidator` contract (commonMain, pure)
+
+```
+class BackgroundPathValidator(
+    private val now: () -> Long,
+    private val log: (String) -> Unit = {},
+    private val freshnessMs: Long = RelayTransportConfig.WS_VALIDATION_FRESHNESS_MS,
+    private val cooldownMs: Long = RelayTransportConfig.WS_VALIDATION_COOLDOWN_MS,
+) {
+    sealed class State {
+        object Unknown : State()
+        data class Probing(val startedAtMs: Long) : State()
+        data class Validated(val outcomeAtMs: Long, val stableForMs: Long, val roundtripProven: Boolean) : State()
+        data class Failed(val outcomeAtMs: Long, val reason: String) : State()
+        data class Cooldown(val untilMs: Long, val previousReason: String) : State()
+    }
+
+    fun snapshot(): Map<TransportKind, State>
+    fun stateOf(kind: TransportKind): State
+    fun markProbeStarted(kind: TransportKind)
+    fun markProbeOutcome(kind: TransportKind, success: Boolean, stableForMs: Long, reason: String, roundtripProven: Boolean = false)
+    fun isValidatedRecently(kind: TransportKind, nowMs: Long): Boolean       // success within freshnessMs
+    fun inCooldown(kind: TransportKind, nowMs: Long): Boolean                  // failed within cooldownMs
+    fun shouldProbe(kind: TransportKind, nowMs: Long): Boolean                 // !inCooldown && state != Probing && !isValidatedRecently
+}
+```
+
+Pure logic, no coroutines, no I/O. Thread-safety: caller serialises (the `ProbeRunner` Android-side is single-coroutine; if more than one consumer ever reads `snapshot()`, the consumer takes a lock).
+
+**Rev2 P3 — D7 lower-bound and forbidden fallback.** Until a relay `/probe/ws` endpoint exists (parked §12), the validator's verdict is *transport-liveness only*: auth handshake + WS upgrade + stability window + ≥1 inbound frame. Every `Validated(...)` state in this initial shape carries `roundtripProven=false`. The validator MUST NOT fall back to a `/health` HTTP probe under any circumstance — `/health` is rejected as realtime proof by definition, because v10 demonstrated `/health` can succeed (or, in v10's case, time out) without ANY signal about WS-layer behaviour. Code review gate: grep proves `BackgroundPathValidator` and `ProbeRunner` have zero references to `/health` or any `relay/health` URL fragment.
+
+### §5 — Triggering criteria + cooldown (D8 in concrete form)
+
+**Rev2 P2 — this section schedules a PROBE, not an action.** The chain switch is in §7 and requires `restHealth.isFailing() == true` independently. Nothing in §5 below can cause `coordinator.onAdaptiveSwitch(...)` to fire on its own. The mental model: §5 is "we observed degradation, please double-check whether alternative X is currently a viable delivery path"; §7 is "we now know alternative X is viable AND our primary delivery is breaking, switch."
+
+A **probe** is scheduled when ALL of:
+
+1. 3.2a `WsDegradationDetector.evaluate(currentKind=Direct)` returned `wouldRewalk=true` (any of the rev3 §5 candidate-or-superseded thresholds — exact numbers irrelevant since action is NOT taken on this signal in isolation).
+2. `RestStateMachine.current == RestMode.RestActive` for at least `WS_DEGRADED_ACTION_REST_ACTIVE_MIN_MS` (Vladislav-locked floor 8 min; widened from rev3 §5 to match the "sustained" framing).
+3. `BackgroundPathValidator.shouldProbe(TransportKind.Reality, nowMs)` returns true.
+
+On scheduling, the runner sets `Validator.markProbeStarted(Reality)`, dials a transient WS via Reality SOCKS, runs the D7 check, and reports outcome. If success → `Validated(stableForMs=<dialled>, roundtripProven=<bool>)`. If fail → `Cooldown(until = nowMs + cooldownMs)` and a structured `WS_VALIDATION_PROBE_OUTCOME ok=false reason=...` log.
+
+Probe cooldown lower bound 600_000 ms (10 min), upper 900_000 ms (15 min) — Vladislav-locked range; exact value picked in code PR. Tor probe is NOT scheduled on this path — only `Reality` is auto-probed.
+
+### §6 — `RestHealthMonitor` contract (commonMain, pure, D9)
+
+```
+class RestHealthMonitor(
+    private val now: () -> Long,
+    private val windowMs: Long = RelayTransportConfig.REST_HEALTH_WINDOW_MS,        // 60_000
+    private val failThreshold: Int = RelayTransportConfig.REST_HEALTH_FAIL_THRESHOLD, // 3
+) {
+    fun recordSendOutcome(success: Boolean)
+    fun recordPollOutcome(success: Boolean)
+    fun isFailing(): Boolean
+    fun consecutiveSendFailures(): Int
+    fun consecutivePollFailures(): Int
+}
+```
+
+Wires into `RestFallbackOrchestrator` via two new optional `onSendOutcome` / `onPollOutcome` callback ctor params (mirrors the 3.2a `onModeSwitched` pattern). Default no-op so existing tests stay green.
+
+`isFailing()` returns true if (a) 3 consecutive `/send` failures with timestamps inside `windowMs`, OR (b) 3 consecutive `/poll` failures with timestamps inside `windowMs`. Latency-driven warning is a separate `RestHealthMonitor.latencyWarning(latestSendLatencyMs)` method that only logs — never trips `isFailing()` (per D9).
+
+### §7 — Emergency adaptive switch decision (the only place rewalk fires)
+
+A single `WsAdaptiveActionPolicy.evaluate(currentKind, validatorSnapshot, restHealth, nowMs)` decision returns one of:
+
+- `Action.None` — stay on current chain link. Direct REST works = the right answer 99 % of the time.
+- `Action.SwitchTo(kind, reason)` — fire `coordinator.onAdaptiveSwitch(kind, reason)`. Required preconditions:
+  - `currentKind == Direct` AND `restHealth.isFailing() == true` AND `validator.isValidatedRecently(kind, nowMs) == true`.
+  - Pick first kind in `[Reality, Tor]` for which `validator.isValidatedRecently` holds. If none → `Action.None` plus a `WS_ADAPTIVE_SWITCH suppressed reason=no_validated_alternative` log (operator visibility into "we wanted to act but had nothing safe to switch to").
+
+This is the ONLY code path that calls into `TransportRewalkCoordinator.onAdaptiveSwitch(...)`. Detector's `would_rewalk=true` boolean is reduced to: "probably worth scheduling a Reality probe if no probe is in flight" — not action.
+
+### §8 — Acceptance gates (10 total)
+
+1. **No silent action.** Grep proves `coordinator.onMeaningfulChange(...)` and the new `coordinator.onAdaptiveSwitch(...)` are the ONLY pathways into the existing 5-step rewalk. `BackgroundPathValidator` and `RestHealthMonitor` never invoke either directly.
+2. **Direct stays in chain at all times.** Grep proves `TransportManager.reorderChain` is unchanged in 3.2b (NO suspect filter added).
+3. **REST orchestrator unchanged structurally.** The only additions are two optional outcome callbacks defaulting to no-op. Grep proves no behaviour difference in REST send/poll loops.
+4. **Pure logic tests in commonTest cover `BackgroundPathValidator`** state transitions, freshness/cooldown semantics, `shouldProbe` honesty.
+5. **Pure logic tests in commonTest cover `RestHealthMonitor`** consecutive-failure counting, window expiry, latency-only never trips `isFailing`.
+6. **Pure logic tests cover `WsAdaptiveActionPolicy`** — `Action.None` when REST healthy regardless of WS state; `Action.SwitchTo(Reality)` only when REST failing AND Reality validated; `Action.None` + suppressed-log when REST failing but no validated alternative.
+7. **`ProbeRunner` androidUnitTest** confirms a fake validator records `markProbeStarted` then `markProbeOutcome` with right success/failure for synthetic transient WS scenarios; failure cases include auth fail, ping_timeout, and probe-thread-cancelled.
+8. **WORKING_RULES rule 8 (bad-network steady-state smoke):** Field runs on TWO bad-network baselines — Tele2 LTE AND Ростелеком Wi-Fi (or any RU-ISP network exhibiting the v8/v9 140 s Direct-WS death rhythm). Capture `WS_VALIDATION_*` and `REST_HEALTH` log lines, verify that in steady-state `Direct-WS-dead + Direct-REST-healthy` (the v8/v9 normal pattern), NO `WS_ADAPTIVE_SWITCH triggered` line ever fires. The PR is rejected at this gate if EITHER bad-network run produces a switch. v9 proved the death pattern is carrier-independent, so a single-carrier smoke is insufficient; both networks must show zero spurious switches under healthy-REST conditions.
+9. **Tor probe never auto-scheduled.** Grep + a focused androidUnitTest assert the `ProbeRunner` is only ever started with `TransportKind.Reality` from the automatic path; the only Tor probe path runs from the emergency `Action.SwitchTo(Tor)` evaluation post REST failure.
+10. **Architect / Vladislav review** of the diff before merge per WORKING_RULES rule 9. Specifically engagement with three mandatory checks recorded in `project_next_session_ws_health_state_3_2b_2026_06_01.md`:
+    - Aggression vs Direct → satisfied trivially: NO action unless REST itself fails.
+    - R0.4b / Inv5 / Inv8 → satisfied trivially: validator + monitor are observation-only; the only new rewalk hook is the existing 5-step pipeline under a new reason name.
+    - Future ping/pong masking on Reality/Tor → Direct stays in chain, so 3.2a detector telemetry continues uninterrupted on whichever link is active; `WS_VALIDATION_*` adds visibility on alternative-path attempts.
+
+### §9 — Implementation order (code PR split, mirrors 3.2a pattern)
+
+**3.2b.1 — commonMain pure types + tests (no Android wiring, no behaviour change).**
+
+1. NEW `BackgroundPathValidator.kt` (commonMain) + `BackgroundPathValidatorTest.kt` (commonTest, ~12 cases).
+2. NEW `RestHealthMonitor.kt` (commonMain) + `RestHealthMonitorTest.kt` (commonTest, ~10 cases).
+3. NEW `WsAdaptiveActionPolicy.kt` (commonMain) + `WsAdaptiveActionPolicyTest.kt` (commonTest, ~12 cases).
+4. EDIT `RelayTransportConfig.kt` — append `WS_VALIDATION_FRESHNESS_MS`, `WS_VALIDATION_COOLDOWN_MS`, `WS_DEGRADED_ACTION_REST_ACTIVE_MIN_MS`, `REST_HEALTH_WINDOW_MS`, `REST_HEALTH_FAIL_THRESHOLD` constants. Naming convention `_CANDIDATE_` retained where calibration is open.
+5. EDIT `RestFallbackOrchestrator.kt` — add optional `onSendOutcome: ((Boolean) -> Unit)? = null` and `onPollOutcome: ((Boolean) -> Unit)? = null` ctor params (mirrors 3.2a `onModeSwitched`).
+
+Zero Android changes. Zero behaviour change. Merges behind architect rule-9 review only (WORKING_RULES rule-8 carve-out — no chain selection / reconnect lifecycle change yet).
+
+**3.2b.2 — Android wiring (behavioural change, Tele2 gate applies).**
+
+1. NEW `ProbeRunner.kt` (androidMain) — transient WS dial coroutine driver, owns its own `KtorRelayTransport` instance per probe attempt, disposes after outcome.
+2. NEW `NetworkChangeReason.ADAPTIVE_SWITCH` enum value.
+3. EDIT `TransportRewalkCoordinator.kt` — add `fun onAdaptiveSwitch(targetKind: TransportKind, reason: String)` reusing `performRewalk`.
+4. EDIT `AppContainer.kt` — construct `BackgroundPathValidator`, `RestHealthMonitor`, `WsAdaptiveActionPolicy`, `ProbeRunner`; wire `RestFallbackOrchestrator.onSendOutcome` / `onPollOutcome` into monitor; wire detector verdict-listener (added 3.2b.1) into a thin coroutine that schedules Reality probe per §5 conditions; wire policy decision tick into emergency-switch evaluator.
+5. New androidUnitTest `ProbeRunnerTest`, `AdaptiveSwitchWireUpTest`.
+6. Tele2 LTE Tecno field smoke (acceptance gate #8).
+
+### §10 — Out of scope for 3.2b (hard)
+
+- ❌ `KindSuspectStore` / `markSuspect` / `reorderChain` filter — superseded by §1.
+- ❌ `WS_DEGRADED_MASKING_RISK` / `SUSPECT_CLEARED` log family — no suspect.
+- ❌ U1 (suspect clear on new network) — no suspect store.
+- ❌ U2 (`ConnectionUiState` refinement) — dropped in 3.2a §9 audit, label hiding lives in `PR-UI-CONNECTION-LABELS1`.
+- ❌ Heartbeat cadence / app-level Ping changes (Inv5).
+- ❌ `lastWorkingTransport` promotion rule changes (Inv8).
+- ❌ REST fallback path internal changes beyond the two new outcome callbacks.
+- ❌ Raw OkHttp WS rewrite (`RC-DIRECT-WS-DEATH1` separate track).
+- ❌ Relay-side any change (`RC-REALITY-PROBE1`, `RC-DIRECT-WS-DEATH1` separate tracks).
+- ❌ CHIP1 (parked at `78bd979e`).
+- ❌ Tor as auto-probed background path (D10).
+- ❌ Periodic-always probing (D8).
+- ❌ Latency-driven REST `isFailing()` trip (D9).
+
+### §11 — Parallel tracks unlocked by v10 (separate scope, separate PRs)
+
+- **`RC-REALITY-PROBE1` — Reality `/health` probe failure investigation.** v10 showed Xray SOCKS ready in ~0.5 s but probe full timeout at 20 s. Hypothesis space: (a) Reality endpoint blocked by Ростелеком DPI; (b) VLESS handshake failing under MTU constraints; (c) Xray-internal stall reading from SOCKS; (d) probe HTTP path doesn't go through Reality at all due to wiring bug. Needs: server-side Caddy access log correlation with client-side Xray DEBUG log, ideally on more than one ISP. Without this, 3.2b's Reality probe will mostly return `Failed` on RU ISPs and the design will look correct on paper but never actually validate Reality in the field.
+- **`RC-DIRECT-WS-DEATH1` — Direct WS 140 s death rhythm investigation.** Hypothesis space: (a) Ktor `install(WebSockets)` adapter masks the protocol Ping/Pong callbacks, so OkHttp's idle detector misfires; (b) Caddy `reverse_proxy` default idle timeout closing WS frames silently; (c) Hetzner MTU / TCP segmentation issue; (d) relay (Rust) ping handler emits Pong but proxy drops the frame upstream; (e) Tecno-specific Android network stack quirk. Recommended first step: raw OkHttp `newWebSocket(...)` A/B against current Ktor path with `WebSocketListener.onMessage / onPing / onPong` callbacks logged. If raw OkHttp holds significantly longer than Ktor wrapper, Ktor adapter at fault.
+- **`PR-UI-CONNECTION-LABELS1` — release-mode UI hiding.** Both composite UI (`ConnectionBanner` etc.) AND notification text. Spec: WsActive→"Online", RestActive→"Online · Backup connection", WsCandidate→"Recovering secure route". Debug build retains technical labels. Includes a fix for the v10-observed race "outer route connected, realtime socket not yet" where notification shows "Online via Tor · Private" while main screen shows "Connecting..." — needs an explicit "Connecting realtime over backup route" or similar release-safe label.
+
+### §12 — Parking lot (post-3.2b)
+
+- **`/probe/ws` relay endpoint** for true message-roundtrip probe (D7 "roundtrip proven" criterion). Today the validator can only confirm "WS held N min, no ping_timeout, at least one inbound frame seen" — not actual message round-trip. Future relay PR could expose a self-test echo endpoint authenticated by the same `auth/session` token. Until then, validator state stays `roundtripProven=false`.
+- **Per-network priors.** If a particular network (Wi-Fi at user's home) historically validates Reality successfully and another (Tele2 LTE) historically fails, store priors keyed by U1-style network generation. Heuristic boost to `shouldProbe` and `isValidatedRecently` ages. Deferred per Council Strategist Line 4.
+- **Adaptive REST as primary path.** Council Buyer lens floated this: "stability builds on REST working, not on Direct WS being eternal." If `RC-DIRECT-WS-DEATH1` shows the WS path fundamentally unstable across the OkHttp/Caddy/relay stack, the deeper fix may be to invest in REST as the primary delivery channel and treat WS as best-effort latency win. Out of WS-HEALTH-STATE1 scope.
