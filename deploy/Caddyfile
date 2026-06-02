@@ -209,6 +209,18 @@ phntm.pro, www.phntm.pro {
         -Server
     }
 
+    # FLOSS/fund machine-readable proof of funding-manifest ownership.
+    # Plain text, one URL per line — NOT JSON. Must be served with
+    # text/plain so strict spec consumers do not reject it. Matched
+    # before the generic /.well-known/* handler below, because Caddy
+    # evaluates handle blocks in source order.
+    handle /.well-known/funding-manifest-urls {
+        rewrite * /funding-manifest-urls
+        root * /srv/well-known
+        header Content-Type "text/plain; charset=utf-8"
+        file_server
+    }
+
     # Android App Links + Apple Universal Links live under /.well-known/.
     # Android requires Content-Type: application/json on assetlinks.json.
     handle_path /.well-known/* {
