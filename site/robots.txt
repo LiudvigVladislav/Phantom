@@ -1,0 +1,39 @@
+# PHANTOM — https://phntm.pro
+# Open-source encrypted messenger by Willen LLC
+
+# Default: allow all conventional search engines
+User-agent: *
+Allow: /
+
+# AI assistant crawlers: allow grounding (search/citation), disallow training.
+# Content-Signal communicates intent at the file level; per-bot rules below
+# make it explicit and defensible for crawlers that don't yet honor the header.
+
+# Google Gemini (Google-Extended is for AI training signal; Googlebot itself is "*")
+User-agent: Google-Extended
+Allow: /
+
+# OpenAI ChatGPT browsing/search
+User-agent: GPTBot
+Allow: /
+
+# Perplexity AI
+User-agent: PerplexityBot
+Allow: /
+
+# Anthropic Claude
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-Web
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
+
+# Sitemap
+Sitemap: https://phntm.pro/sitemap.xml
+
+# Content-Signal: opt-out of training corpora, allow search/grounding.
+# See https://contentsignal.org for spec.
+Content-Signal: ai-train=no, search=yes, ai-input=yes
