@@ -456,3 +456,229 @@ Phase 2 mini-lock section is intentionally NOT drafted in this PR — modelled a
 4. **Whether 3.2b.1 adaptive validation code should resume.** Per `Inv-NoChangeUntilEvidence`, 3.2b.1 has been paused awaiting this evidence. The Phase 1 outcome — "client-stack-OR-path-dependent, two modes, both reproducible with raw OkHttp" — favours 3.2b.1 becoming a necessary UX shield (the client cannot single-handedly fix Mode 2 severity on a degraded carrier). But Phase 2 packet capture may still localise a small client-side fix that closes Mode 1 at the root; if so, 3.2b.1 may be deprioritised again. **Decision deferred until Phase 2 evidence summary lands.**
 
 Phase 1 closes here. CHIP1 remains parked at `78bd979e` throughout. 3.2b.1 code remains paused per `Inv-NoChangeUntilEvidence`.
+
+---
+
+## Phase 2 mini-lock — packet-capture wire-correlation (Vladislav-locked 2026-06-03 (wed))
+
+Master at lock: `16ee99b9` (PR #269 merge commit). Phase 2 is a docs-only mini-lock; the field-test execution will happen in a separate session and produce a Phase 2 evidence summary PR analogous to §13-§18.
+
+### §19 — Phase 2 goal & scope (two-tier evidence model)
+
+Phase 1 ruled out the Ktor adapter as primary cause and located the failure below it, somewhere in the intersection of (Tecno device / Android-HiOS network stack / OkHttp internal handling / network return-path). Phase 2's job is to discriminate **network return-path loss** from **device-side mis-handling of traffic that did arrive**, for both Mode 1 and Mode 2 (§14).
+
+**Two-tier evidence model — this is the critical structure choice:**
+
+| Tier | What it proves | How it is captured | Mandatory in Phase 2? |
+|---|---|---|---|
+| **Tier 1 — raw wire correlation** | Inbound TCP / TLS records present-or-absent on the device's PCAPdroid pcap at the UTC moment a relay-side `ws_protocol_pong_sent` line was emitted. Plus TCP-level evidence: retransmits, RST/FIN, zero-windows, MTU-related fragmentation. Does NOT prove "the WS Pong frame itself reached the device" — TLS payload is encrypted at this tier — but does prove whether **any** inbound TLS Application Data record arrived in the relevant window. | PCAPdroid raw mode (root-free VPN-based capture). Capture as `.pcapng`, analysed with `tshark` post-hoc. | **YES — primary gate.** |
+| **Tier 2 — decrypted Pong frame proof** | The actual WS protocol-Pong frame (opcode 0xA, ≤ 125 bytes payload) present-or-absent on the device. This is the literal H-A / H-B discriminator from mini-lock §2. | EITHER PCAPdroid-mitm (TLS interception via local CA, alters trust chain), OR debug build emitting `SSL_KEYLOGFILE` for Wireshark TLS decryption (alters debug-only build, not production), OR server-side BPF on the relay host. | **NO — optional, deferred to Phase 2b.** |
+
+**Rationale for two-tier split:** PCAPdroid in raw mode on non-rooted Android is observably the lowest-risk capture path (no MITM CA install, no TLS interception, no production-build edit). But TLS encrypts the WS payload, so the literal Pong frame is not visible without decryption. The wire-correlation evidence at Tier 1 is *sufficient* to discriminate H-A (no inbound TLS records at the expected moment → return-path loss) from H-B/C/D (inbound TLS records present at the expected moment but client doesn't count Pong → device-side or OkHttp internal mis-handling), without the additional Tier 2 ceremony. Tier 2 is reserved for the cases Tier 1 cannot close.
+
+**Out-of-band from Phase 1:** Phase 2 does not re-run Arm A / Arm B as standalone arms. It overlays PCAPdroid on top of an Arm A or Arm B session (the active diagnostic-flag layer from Phase 1 still applies — the relay-side identity contract is unchanged).
+
+### §20 — Refined hypothesis space (after Phase 1)
+
+| H | Statement | What needs to be observed (Tier 1 raw wire) to confirm | What needs to be observed to refute |
+|---|---|---|---|
+| **H-A — return-path loss** | The 9th Pong (Mode 1) or 1st-2nd Pong (Mode 2) never reaches the device. The relay sent it, but it was lost en route (carrier / NAT / radio / Hetzner egress / device link layer). | PCAPdroid pcap shows **zero** inbound TLS Application Data records from `relay.phntm.pro` in the ≥ 2 s window after relay's `ws_protocol_pong_sent` UTC timestamp for the failing cycle. RST/FIN may or may not be present. | PCAPdroid pcap shows inbound TLS records in the expected window. |
+| **H-B/C/D — device-side / OkHttp internal** | Inbound traffic arrived on the device, but OkHttp did not count the Pong (reader thread blocked, Android scheduling, `awaitingPong` race, kernel→userspace gap). | PCAPdroid pcap shows **inbound** TLS Application Data records in the expected window despite the OkHttp `writePingFrame` failure firing on the next cycle. | PCAPdroid pcap shows no inbound TLS records in the expected window. |
+| **H-Pcap — PCAPdroid VPN-induced mode shift** | PCAPdroid's local VPN interface alters kernel routing / latency / NAT enough to mask one or both modes (Mode 2 → Mode 1, or Mode 2 → disappears entirely). | Arm P3 control run (PCAPdroid-on, no analysis target) reproduces the same mode counts and lifetimes as the matching Phase 1 PCAPdroid-off baseline within tolerance. **Confirms PCAPdroid does NOT mask the mode.** | Arm P3 shows materially different mode counts / lifetimes vs Phase 1 baseline. **Refutes Phase 2 evidence — escalate to Phase 2b TLS-keylog approach or server-side BPF.** |
+
+**Mode classification bins (Vladislav-locked, post-hoc, no discard):**
+
+| Mode | pp_count threshold | Lifetime threshold | Both conditions required |
+|---|---|---|---|
+| **Mode 1** | `pp_count >= 6` | `120 s <= lifetime <= 170 s` | yes |
+| **Mode 2** | `pp_count <= 2` | `lifetime <= 60 s` | yes |
+| **Unbinned** | anything else | anything else | recorded as "Mode-ambiguous", reported but not used to close a discrimination gate |
+
+Sessions are classified post-hoc against actual pp_count and lifetime, not against the pre-declared target. A Tele2 run that lands on Mode 1 numbers is recorded as "Mode 1 on Tele2", not discarded. A Wi-Fi run that lands on Mode 2 numbers is recorded as "Mode 2 on Wi-Fi", not discarded.
+
+### §21 — Invariants enforced by this Phase 2 mini-lock (hard guards)
+
+Phase 1 invariants (mini-lock §3) remain in force. The Phase 2 mini-lock adds:
+
+| ID | Invariant | What it forbids |
+|---|---|---|
+| **Inv-PcapDoesNotMaskMode** | Every Phase 2 capture session is paired with an Arm P3 control reading (PCAPdroid-on, same network, same flag, no analysis target) within the same field-test day. If the control reading does NOT reproduce the matching Phase 1 baseline mode within tolerance (lifetime ± 25 %, pp_count ± 2), the capture session's Tier 1 evidence is marked "PCAPdroid-influenced" and does not close any §23 discrimination row. | Treating PCAPdroid-on lifetime/pp_count numbers as Phase 1-equivalent without the matched control reading on the same day. |
+| **Inv-NoTrafficBeyondTelemetry** | Phase 2 introduces no new outbound or inbound payload. The only new emission is a single `PHASE2_CAPTURE_MARKER mode=... utc=...` line in logcat (no WS frame). The relay-side telemetry from PR #259 is read-only consumed; no new server-side change. | Any debug code that sends a WS frame to "mark" the capture, or any relay-side change for Phase 2 instrumentation purposes. |
+| **Inv-ProductionUnchanged** | Phase 2 ships ZERO production code change. Flag `BuildConfig.DEBUG_RC_DIRECT_ARM` already exists from Phase 1; Phase 2 uses it unchanged. The PCAPdroid setup is a user-space app on Tecno, not a code change. The `PHASE2_CAPTURE_MARKER` logcat emit is gated by `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM != "0"` — never fires in release. | Any production-path edit. Any release-mode emission of `PHASE2_CAPTURE_MARKER`. Any change to `pingInterval` / `readTimeout` / `callTimeout` on the basis of Phase 2 evidence (cadence sensitivity remains observation-only per Inv-NoHeartbeatCadenceFix). |
+| **Inv-PcapReadOnlyAnalysis** | PCAPdroid pcap files are analysed read-only by `tshark` / PowerShell scripts. No mutation of capture artefacts. Capture export to `.pcapng` is preserved verbatim alongside the logcat trace. Source-of-truth pointer in §30. | Any "cleaned-up" capture or re-emitted pcap. Any analysis output that is not reproducible from the verbatim pcap. |
+| **Inv-WallClockAlignment** | Every Phase 2 field session is preceded by an NTP-fix step (Tecno + Windows host + relay container). The `PHASE2_CAPTURE_MARKER mode=... utc=...` logcat line is the canonical alignment anchor on the client side; the relay-side `ws_protocol_pong_sent` UTC timestamp is the canonical anchor on the server side. PCAPdroid's pcap timestamp is the third source and must agree with the other two within ≤ 1 s for the run to be analysable. | Running a Phase 2 capture without NTP-fix on at least the three components. Reporting Tier 1 evidence from a run whose three time sources disagree by > 1 s. |
+| **Inv-NoCarrierOrUiClaim** | Phase 2 evidence statements are scoped to Tier 1 raw wire correlation. Phase 2 must NOT claim carrier-independent severity, Tele2-only behaviour, Tecno-only behaviour, or any UI-layer outcome (the `PR-UI-CONNECTION-LABELS1` track is separate). | Any Phase 2 evidence summary line that extrapolates beyond the captured device + network + UTC window. |
+
+### §22 — Experimental arms (Phase 2)
+
+Phase 2 arms overlay PCAPdroid on top of a Phase 1 Arm A or Arm B session. Each capture run records: client logcat (existing tags + `PHASE2_CAPTURE_MARKER`), PCAPdroid `.pcapng` export, relay docker logs covering the same UTC window. No new code arms.
+
+#### Arm P1 — Mode 1 capture (Wi-Fi 8-pong rhythm)
+
+Capture target: the **9th Pong** in a Mode 1-classified session. The 8-pong rhythm was reproduced on Tecno Wi-Fi by both v9 (Ktor production) and v11 Arm B (raw OkHttp) — so the run can use either flag. Vladislav-default: **Arm B flag `"B"`** (raw OkHttp, smaller stack to interpret).
+
+**Capture window opening:** PCAPdroid recording started **before** the WS connection opens (logcat marker `PHASE2_CAPTURE_MARKER mode=P1 utc=<start_utc>`). Capture continues across the full session (~150 s expected). The 9th Pong is the cycle whose **absence** would cause OkHttp's next `writePingFrame` to fail; relay-side `ws_protocol_pong_sent` for cycle 9 is the UTC anchor to align with PCAPdroid pcap.
+
+**Capture filter:** app-scoped to Phantom (PCAPdroid's per-app filter). Post-capture `tshark` filter for analysis on the export: `tcp port 443 and host relay.phntm.pro` plus a slightly wider `ip host <relay_ipv4>` to catch RST / ICMP unreachable. DNS / TCP-handshake / TLS-handshake records are kept in the export (narrow analysis, not narrow capture).
+
+**Per-run telemetry contract (Tier 1 evidence rows):**
+
+- Logcat: `RC_DIRECT_ARM_B_ws_open` × 1, `RC_DIRECT_ARM_B_ws_failure` × 1, `okhttp_successful_ping_pongs` = 8, `PHASE2_CAPTURE_MARKER mode=P1 utc=...` × 1.
+- Relay docker log: `ws_protocol_pong_sent` × 9 for the same identity within the matching UTC window.
+- PCAPdroid pcap: TLS handshake records, ≥ 8 inbound TLS Application Data records correlated in time with relay's first 8 `ws_protocol_pong_sent` timestamps, plus **explicit presence-or-absence determination** for the 9th expected inbound TLS Application Data record at relay's 9th `ws_protocol_pong_sent` timestamp + RTT (RTT estimated from handshake or from earlier Pong pairs).
+
+**Acceptance gate per Arm P1:** at least 2 independent Mode 1-classified sessions on Tecno Wi-Fi pass the per-run telemetry contract within the same field-test day, with the matched Arm P3 control reading also taken on the same day.
+
+#### Arm P2 — Mode 2 capture (Tele2 severe 0-1-pong rhythm)
+
+Capture target: the **1st or 2nd Pong** in a Mode 2-classified session. The 0-1-pong rhythm was reproduced on Tecno Tele2 LTE by both v11 Arm A (production Ktor) and v11 Arm B (raw OkHttp). Vladislav-default: **Arm B flag `"B"`** (consistency with Arm P1).
+
+**Capture window opening:** PCAPdroid recording started **before** the WS connection opens (logcat marker `PHASE2_CAPTURE_MARKER mode=P2 utc=<start_utc>`). Capture continues for ~120 s to cover several Mode 2 session lifetimes. Each session's 1st-2nd Pong cycle and its `ws_protocol_pong_sent` UTC timestamp on relay is an anchor for Tier 1 analysis.
+
+**Capture filter:** identical to Arm P1, app-scoped to Phantom.
+
+**Per-run telemetry contract (Tier 1 evidence rows):**
+
+- Logcat per session: `RC_DIRECT_ARM_B_ws_open` × 1, `RC_DIRECT_ARM_B_ws_failure` × 1, `okhttp_successful_ping_pongs` = 0 (Mode 2 worst case) or 1, `PHASE2_CAPTURE_MARKER mode=P2 utc=...` × 1 per session.
+- Relay docker log: `ws_protocol_pong_sent` × 1 (matches OkHttp pp=0) or × 2 (matches OkHttp pp=1) for the same identity within the matching UTC window.
+- PCAPdroid pcap: TLS handshake records, **explicit presence-or-absence determination** for the 1st (and 2nd if relay sent two) inbound TLS Application Data record at relay's corresponding `ws_protocol_pong_sent` timestamp + RTT.
+
+**Acceptance gate per Arm P2:** at least 2 independent Mode 2-classified sessions on Tecno Tele2 LTE pass the per-run telemetry contract within the same field-test day, with the matched Arm P3 control reading also taken on the same day.
+
+#### Arm P3 — control run (PCAPdroid-on, no analysis target)
+
+Same network conditions as the matched Arm P1 or Arm P2 capture, same flag, same APK, PCAPdroid-on with capture started before WS opens. The control run **discards** the pcap (or keeps it sealed for an integrity check only) and reads only the logcat-derived mode count / median lifetime / median pp_count. The control run is matched against the corresponding PCAPdroid-off Phase 1 baseline (Phase 1 §13 table for the same network condition).
+
+**Inv-PcapDoesNotMaskMode acceptance rule:** if the Arm P3 control reading agrees with the matched Phase 1 baseline within `lifetime ± 25 %` and `pp_count ± 2`, the matched Arm P1 or P2 capture's Tier 1 evidence closes §23 rows normally. If outside tolerance, the matched capture is marked "PCAPdroid-influenced" in the Phase 2 evidence summary and does not close §23 rows; escalation per §27 parking lot.
+
+### §23 — Decision tree (Tier 1 raw wire outcome → root cause attribution)
+
+Phase 2 closes each mode independently. Either mode can finish ahead of the other; the Phase 2 evidence summary reports them as separate gates.
+
+| Arm P1 / P2 outcome | Arm P3 control | Verdict | Action |
+|---|---|---|---|
+| Inbound TLS records **absent** at the expected anchor (no record arrived around relay's send time + RTT) | Within tolerance vs Phase 1 baseline | **H-A confirmed for this mode (return-path loss).** Pong never reached the device socket; OkHttp had nothing to count. | 3.2b.1 unfreezes as **UX-protection** per §24 row 1; open server-side network track (`RC-RETURN-PATH-LOSS1`). Mode-specific (Mode 1 conclusion does not imply Mode 2 conclusion). |
+| Inbound TLS records **present** at the expected anchor (a record arrived around relay's send time + RTT, but OkHttp did not count Pong) | Within tolerance vs Phase 1 baseline | **H-B/C/D confirmed for this mode (device-side / OkHttp internal).** Traffic arrived but client mis-handled. | RC-DIRECT client-stack fix path takes priority per §24 row 2; 3.2b.1 may still be useful but not as the primary fix surface. Phase 2b (TLS keylog or server-side BPF) optional to discriminate H-B from H-C from H-D. |
+| Tier 1 ambiguous (records straddle the anchor; relay-side timestamps drift > 1 s vs pcap; NTP skew untraceable) | Within tolerance | **Inconclusive for this mode.** | Re-run with stricter NTP discipline; if still ambiguous after 2 retries, escalate to Phase 2b. |
+| Arm P1 / P2 outcome (any) | **Outside tolerance** vs Phase 1 baseline | **PCAPdroid masked the mode.** Tier 1 evidence does not close. | Per §24 row 3: Phase 2 inconclusive for the affected mode; escalate to Phase 2b TLS keylog (debug-only build) OR server-side BPF on Hetzner. 3.2b.1 stays paused per Inv-NoChangeUntilEvidence until a non-PCAPdroid evidence path produces a verdict. |
+| Mixed outcomes across the two modes (e.g. Mode 1 = H-A confirmed, Mode 2 = H-B/C/D confirmed) | Both within tolerance | **Both verdicts stand, independently.** | Action per row above for each mode; Phase 2 evidence summary records both. |
+
+### §24 — Acceptance gates (what counts as "we know enough to act")
+
+The Phase 2 evidence summary PR ships when ALL of:
+
+1. **Mode 1 gate (Arm P1):** at least 2 independent Mode 1-classified sessions captured with Tier 1 per-run telemetry contract satisfied; matched Arm P3 control reading taken same field-test day and within tolerance per Inv-PcapDoesNotMaskMode (or, if outside tolerance, the affected captures are explicitly marked "PCAPdroid-influenced" in the evidence summary).
+2. **Mode 2 gate (Arm P2):** at least 2 independent Mode 2-classified sessions captured with Tier 1 per-run telemetry contract satisfied; matched Arm P3 control reading taken same field-test day and within tolerance per Inv-PcapDoesNotMaskMode (or marked as above).
+3. **Relay-side cross-correlation:** for every captured session, the relay docker log for the same UTC window is preserved alongside the logcat + pcap and the `ws_protocol_pong_sent` line counts are tabulated against the OkHttp-counted pp values.
+4. **Wall-clock alignment evidence:** for every captured session, the three time sources (Tecno logcat marker, relay docker `ws_protocol_pong_sent` timestamp, PCAPdroid pcap frame timestamp) are shown to agree within ≤ 1 s in the evidence summary.
+5. **§23 decision-tree outcome** explicitly named per mode in the evidence summary (one row per mode from §23 table) with a one-paragraph "what this rules in and rules out" justification per mode.
+
+**3.2b.1 unpause criteria — explicit, Vladislav-locked:**
+
+| Phase 2 verdict | 3.2b.1 decision |
+|---|---|
+| Tier 1 shows path loss / unstable return path for either mode (Arm P3 control within tolerance) | **3.2b.1 unfreezes as UX-protection.** Adaptive validation cannot fix the network, but it is the correct response to "session is dying for reasons the client cannot control". |
+| Tier 1 shows traffic reaches device, OkHttp not counting Pong, for either mode (Arm P3 control within tolerance) | **RC-DIRECT client-stack fix path takes priority.** 3.2b.1 may still be useful as a slow fallback, but the cheaper / cleaner fix is in the OkHttp internal handling or its Android-side scheduling. 3.2b.1 stays paused until the client-stack fix decision is made. |
+| PCAPdroid changes the mode (Arm P3 control outside tolerance) for either mode | **Phase 2 inconclusive for that mode; 3.2b.1 decision deferred** until Phase 2b or a non-PCAPdroid evidence path produces a verdict. Per Inv-NoChangeUntilEvidence, 3.2b.1 remains paused. |
+| Mixed verdicts across the two modes | **Decision per mode; Mode 1 and Mode 2 are decoupled.** Example: Mode 1 = H-B/C/D → client-stack fix scope for Mode 1 specifically; Mode 2 = H-A → 3.2b.1 unfreezes as Mode 2 UX-protection. |
+
+### §25 — Implementation order (locked for the Phase 2 work)
+
+Phase 2 has no production code PR. It has:
+
+1. **Pre-field-test prep PR (this PR):** Phase 2 mini-lock §19-§30 appended to `docs/tracks/rc-direct-ws-death1.md`. Zero code change. Optional sibling commit adds `PHASE2_CAPTURE_MARKER` logcat emit gated by `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM != "0"` — **deferred to its own follow-up PR**, not bundled in this mini-lock PR.
+2. **Field-test setup (Vladislav-owned):** install PCAPdroid (https://github.com/emanuele-f/PCAPdroid) on Tecno; grant per-app capture permission for Phantom only; verify NTP-fix on Tecno, Windows host, and relay container (`docker exec relay ntpdate -q`).
+3. **Field-test execution (Vladislav-owned, assistant generates commands):**
+   - Arm P3 Wi-Fi control × 1 (15 min, flag `"B"`, PCAPdroid-on, no analysis target).
+   - Arm P1 Wi-Fi capture × 2 (15 min each, flag `"B"`, PCAPdroid-on with analysis target).
+   - Arm P3 Tele2 LTE control × 1 (15 min, flag `"B"`, PCAPdroid-on, no analysis target).
+   - Arm P2 Tele2 LTE capture × 2 (15 min each, flag `"B"`, PCAPdroid-on with analysis target).
+   - Sequential per Inv-ParallelArmIsolation; relay-side state clears between sessions.
+4. **Analysis (assistant-owned):** `tshark` / PowerShell extraction of TLS Application Data record counts, anchoring against relay-side `ws_protocol_pong_sent` UTC timestamps; mode classification per §20 bins; §23 decision-tree row attribution per mode.
+5. **Phase 2 evidence summary PR:** appended as new sections (§31 onward) to `docs/tracks/rc-direct-ws-death1.md`, modelled after §13-§18. Includes `Last updated` bump in `MASTER_TIMELINE_2026.md` + Session journal entry in `docs/PROJECT_LOG.md` (same bundle pattern as PR #269).
+6. **Architect / Vladislav review of Phase 2 evidence summary before any §23 / §24 decision branch is acted upon.**
+
+Optional analysis commands recorded for the assistant's later use (not committed to the repo as code — kept in this mini-lock as the source-of-truth contract; if Phase 2 becomes a repeatable track, a `scripts/phase2-analysis.ps1` may be added in a follow-up PR):
+
+```text
+# TLS Application Data records inbound from relay, per session window
+tshark -r capture.pcapng -Y "ip.src == <relay_ipv4> and tls.record.content_type == 23" \
+  -T fields -e frame.time_epoch -e frame.len -e tcp.seq -e tcp.ack
+
+# RST/FIN events from the relay's IP
+tshark -r capture.pcapng -Y "ip.src == <relay_ipv4> and (tcp.flags.reset == 1 or tcp.flags.fin == 1)" \
+  -T fields -e frame.time_epoch -e tcp.flags
+
+# Cross-reference: relay-side ws_protocol_pong_sent UTC timestamps
+# (collected from docker logs phantom-relay in the matching field-test session)
+grep 'ws_protocol_pong_sent' relay-docker.log | jq '.utc'
+
+# Expected CSV per session: [session_id, ws_open_utc, ws_failure_utc, okhttp_pp_count,
+#  relay_pongs_sent_count, inbound_tls_app_records_count, anchor_record_present_bool]
+```
+
+### §26 — Out of scope (hard)
+
+- ❌ Any production code change. Phase 2 ships zero production diff.
+- ❌ Any change to `pingInterval(15s)` / `readTimeout(60s)` / `callTimeout(10s)` as a "fix" (Inv-NoHeartbeatCadenceFix; observation-only).
+- ❌ Any change to `RestFallbackOrchestrator`, `RestStateMachine`, `RestHealthMonitor`, `TransportManager`, `TransportStrategy`, `KtorRelayTransport.kt`, `RelayTransportFactory.kt`, `TransportCapabilitiesResolver`, `ConnectionUiState`.
+- ❌ Any new WS frame ever sent or echoed for capture-marking purposes (Inv-NoTrafficBeyondTelemetry — the only emission is a logcat line).
+- ❌ Any relay-side change to enable Phase 2. PR #259's `ws_protocol_pong_sent` instrumentation is read-only consumed.
+- ❌ App-level Ping reintroduction (Inv-NoAppLevelPingResurrection from Phase 1 still applies).
+- ❌ PCAPdroid-mitm / TLS interception in Phase 2 proper. That is Phase 2b parking-lot (§27).
+- ❌ Rooting the Tecno handset for `tcpdump` access. PCAPdroid root-free is the chosen path.
+- ❌ Server-side BPF on the Hetzner relay host in Phase 2 proper. Parking-lot.
+- ❌ 3.2b.1 code resumption before Phase 2 evidence summary lands (Inv-NoChangeUntilEvidence carries through).
+- ❌ CHIP1 work (parked at `78bd979e`).
+- ❌ `RC-REALITY-PROBE1` work (separate track).
+- ❌ `PR-UI-CONNECTION-LABELS1` work (separate track).
+- ❌ Carrier-level / UI-level / vendor-level claims (Inv-NoCarrierOrUiClaim).
+- ❌ Second Android handset (Arm I from Phase 1 §4) — optional, not gating Phase 2; parking-lot.
+
+### §27 — Parking lot (deferred until Phase 2 evidence)
+
+- **Phase 2b — TLS keylog / decrypted Pong proof.** Required only if Phase 2 Tier 1 cannot discriminate one or both modes, OR if Inv-PcapDoesNotMaskMode fails (PCAPdroid altered the mode). Two candidate paths: (a) debug-only build that emits `SSL_KEYLOGFILE` to the device's app-private storage, used with Wireshark TLS decryption for the analysis pcap; (b) PCAPdroid-mitm with the local CA installed for Phantom only — alters the trust chain and may itself shift the mode, recorded as the more invasive option. Designed in its own mini-lock section if triggered.
+- **Server-side BPF on Hetzner relay host.** Required if both PCAPdroid raw and Phase 2b alter the mode. Captures the wire at the relay's egress, not the device's ingress; discriminates Hetzner-egress / Caddy-proxy issues from radio-path issues. Production VPS impact ~5 min during BPF attach/detach.
+- **Second Android handset on Wi-Fi + Tele2 (Arm I from Phase 1 §4).** Discriminates Tecno-specific HiOS quirks from general Android-handset behaviour. Optional, not gating; recorded as a high-value follow-up if Tier 1 confirms H-B/C/D for either mode.
+- **Mode-3 (or higher) classification.** If a Phase 2 session lands in the "Unbinned" row of §20 (pp_count ≥ 3 but ≤ 5, OR lifetime > 60 s but < 120 s), and this happens repeatedly across the field-test day, a new mode bin may be locked. Not a Phase 2 deliverable.
+- **Scripted parser `scripts/phase2-analysis.ps1` in repo.** Only if Phase 2 becomes a repeatable track. Single-use Phase 2 analysis lives in the assistant's working notes, not the repo.
+- **3.2b.1 mini-lock section update.** Once Phase 2's verdicts arrive, the WS-HEALTH-STATE1 track's 3.2b.1 plan needs a rev-bump that incorporates Phase 2's mode-specific verdicts. Not Phase 2's job; sits on the WS-HEALTH-STATE1 track.
+
+### §28 — Process gates
+
+- **WORKING_RULES rule 8** (transport regression gate): carve-out applies; Phase 2 ships zero production behaviour and zero code change.
+- **WORKING_RULES rule 9** (no merge without verification): applies fully. Phase 2 evidence summary PR's every concrete claim must be grep-verifiable against the captured logcat + pcap + relay docker log artefacts, OR architect-explicit-ACK after diff read.
+- **`feedback_apk_build_is_mine.md`** — APK builds are assistant-owned (no new APK needed for Phase 2; the Phase 1 v11 APK SHAs `2ac2afda...` / `48ffbefe...` are reused). PCAPdroid setup on Tecno is Vladislav-owned (user-app install + permission grant).
+- **`feedback_logcat_format.md`** — Phase 2 logcat capture commands generated by the assistant use the canonical PowerShell `Tee-Object` format with the existing tag set (no new tag added for Phase 2; `PHASE2_CAPTURE_MARKER` is emitted under the existing `PhantomMessaging` tag if and when the follow-up emit PR ships, OR captured as an `adb shell log -t PhantomMessaging` manual marker prior to that follow-up PR).
+- **`feedback_durable_log.md`** — Phase 2 evidence summary PR will append a Session journal entry to `docs/PROJECT_LOG.md` and bump `Last updated` in `docs/project/MASTER_TIMELINE_2026.md`, same bundle pattern as PR #269.
+- **`feedback_session_close_discipline.md`** — Phase 2 mini-lock is rev1; this PR ships rev1. Field-test execution and analysis happen in separate sessions. Phase 2 evidence summary PR is a separate session and a separate PR.
+- **`feedback_ws_heartbeat_diagnostic_2026_05_27.md`** — informs Inv-NoHeartbeatCadenceFix carried over from Phase 1.
+
+### §29 — Open questions (locked by Vladislav 2026-06-03)
+
+| OQ | Question | Vladislav-locked answer (2026-06-03) |
+|---|---|---|
+| **OQ-P1** | PCAPdroid mode: raw vs mitm? | Raw first. MITM not as primary because it may shift the mode being measured. Decrypted Pong frame proof = optional Phase 2b only if Tier 1 cannot discriminate (parking lot §27). |
+| **OQ-P2** | Filter scope: app-only vs full-device? | App-scoped capture for Phantom (PCAPdroid per-app filter). Analysis filter on `relay.phntm.pro:443` for the WS path, plus wider `ip host <relay_ipv4>` to catch RST / ICMP unreachable. DNS / TCP-handshake / TLS-handshake records kept in the export (narrow analysis, not narrow capture). |
+| **OQ-P3** | Wall-clock alignment strategy? | Both NTP-fix on all three components (Tecno, Windows host, relay container) AND explicit logcat marker `PHASE2_CAPTURE_MARKER mode=... utc=...`. No WS marker frame — would alter the stream being measured (Inv-NoTrafficBeyondTelemetry). |
+| **OQ-P4** | Synchronous relay-side recapture using PR #259 instrumentation? | **Hard requirement.** Every Phase 2 PCAPdroid session has matched relay docker log preservation for the same UTC window. Phase 1's relay-side wording was softened in §16 because v11 had no synchronous recapture; Phase 2 closes this gap by construction. |
+| **OQ-P5** | Mode-swing handling within a session? | Classify post-hoc, do NOT discard. Pre-declared target (Wi-Fi for Mode 1 / Tele2 LTE for Mode 2) is the planning intent; the actual mode is determined by §20 bins applied to the session's pp_count and lifetime. A Tele2 session that lands on Mode 1 is recorded as "Mode 1 on Tele2", not retried. Unbinned sessions are recorded but do not close discrimination gates. |
+| **OQ-P6** | Evidence format: manual Wireshark vs scripted? | Scripted `tshark` / PowerShell extraction is the gate, not manual Wireshark inspection. Analysis commands + expected CSV schema are in §25 as the source-of-truth contract. Parser-in-repo (`scripts/phase2-analysis.ps1`) only if Phase 2 becomes repeatable (parking lot §27). |
+| **OQ-P7** | 3.2b.1 unpause criteria — where defined? | In §24 acceptance-gates table, explicit Vladislav-locked criteria per Phase 2 verdict. Decoupled across the two modes (a Mode 1 verdict does not force a Mode 2 decision and vice versa). |
+| **OQ-P8** | Branch hygiene if master moves before Phase 2 PR publish? | Branch from `16ee99b9`. Docs-only mini-lock — conflict probability low. If unrelated PRs land before publish, quick rebase before push; PR body honestly reports actual base commit. |
+
+### §30 — Source-of-truth pointers
+
+- Phase 1 mini-lock and evidence summary (this file §1-§18) — every Phase 2 design decision references back to a Phase 1 outcome.
+- `docs/tracks/ws-health-state.md` § Commit 3.2b.1 — the adaptive-validation code Phase 2's verdict gates.
+- `MASTER_TIMELINE_2026.md` "Last updated 2026-06-02 (tue, late)" — track sequencing. Will be bumped again when Phase 2 evidence summary PR lands.
+- `docs/PROJECT_LOG.md` Session journal 2026-06-02 (tue, late) entry — `RC-DIRECT-WS-DEATH1 Phase 1 CLOSED` recorded; Phase 2 mini-lock will be a follow-up Session journal entry on its own PR.
+- PR #259 (`8727031f`, Commit 3.3 — relay-side `ws_protocol_pong_sent` telemetry) — the synchronous recapture data source required by Inv-WallClockAlignment and OQ-P4.
+- Phase 1 v11 APK SHAs `2ac2afda...` (Arm A, flag `"0"`) and `48ffbefe...` (Arm B, flag `"B"`), built on master `a9f66ad0` — reused for Phase 2 field tests without rebuild.
+- PCAPdroid project page: https://github.com/emanuele-f/PCAPdroid — root-free Android packet capture via local VPN.
+- PCAPdroid-mitm project page: https://github.com/emanuele-f/PCAPdroid-mitm — TLS interception variant for Phase 2b only.
+- Wireshark TLS decryption reference: https://wiki.wireshark.org/TLS — TLS keylog reference for Phase 2b path (a) only.
+- OkHttp issue #3227 (open by maintainer Swankjesse 2017-03-18) — "pong timeout not independent of ping interval" — informs H-B/C/D hypothesis attribution.
+- Codex external architect memo (received 2026-06-02 via Vladislav) — informs Phase 1 hypothesis space carried into Phase 2.
+
+Phase 2 mini-lock rev1 closes here. CHIP1 remains parked at `78bd979e` throughout. 3.2b.1 code remains paused per `Inv-NoChangeUntilEvidence`. Phase 2 evidence summary will be a separate PR after field-test execution and analysis complete.
