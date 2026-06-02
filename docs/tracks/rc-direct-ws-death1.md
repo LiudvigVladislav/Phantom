@@ -347,3 +347,112 @@ Phase 2 arms (E, F, G, H, I) live in a separate code PR after Phase 1 evidence s
 - Ktor YouTrack KTOR-4752 — "The pingInterval and pingIntervalMillis properties are not applicable for the OkHttp engine".
 - Codex external architect memo (received 2026-06-02 via Vladislav).
 - "Глобальный аудит транспортов мессенджеров и архитектурный разбор" PDF (received 2026-06-02 via Vladislav).
+
+---
+
+## Phase 1 outcome — evidence summary (Vladislav-locked 2026-06-02 (tue) after sequential v11 capture set)
+
+Master at lock: this PR's merge commit, on top of `a9f66ad0`. Phase 1 closed; Phase 2 PCAPdroid plan is pointed at §17 below and will be designed in a separate mini-lock section (next session, not this PR).
+
+### §13 — Empirical base — Phase 1 v11 capture set
+
+Four logcat captures executed sequentially on the same APK build day. Identity unchanged throughout (the only identity the relay's 64-hex `is_pubkey_hex` validator accepts). Sequential isolation discipline observed per Inv-ParallelArmIsolation: each capture starts after `am force-stop` + ≥ 30 s wait so the relay-side `state.clients[identity]` mapping clears between sessions.
+
+**Three baselines must be kept separate. Earlier write-ups collapsed v8 / v9 / v11 into one "same ~140 s rhythm" claim, which is wrong — v11 introduces a second severity mode the earlier captures did not exhibit. Phase 2 analysis must address each mode on its own terms.**
+
+| Test | Device · network | APK · flag | Sessions in 15 min | Median lifetime | Pre-fail successful ping/pongs | Notes |
+|---|---|---|---|---|---|---|
+| **v8** (2026-05-31) | Tecno · Tele2 LTE | 3.2a baseline · flag n/a (production Ktor path) | 4 | ~140 s | **8** | First-baseline cellular run |
+| **v9** (2026-06-01) | Tecno · Ростелеком Wi-Fi | 3.2a baseline · flag n/a | 5 | ~145 s | **8** | Wi-Fi parity of v8; established the "8-pong rhythm" as a cross-network pattern |
+| **v11 Arm A Tecno** (2026-06-02) | Tecno · Tele2 LTE | `phantom-arm-a-v11.apk` SHA `2ac2afda...` · flag `"0"` (production Ktor path) | **29** | **~31 s** (range 31 017–31 028 ms) | **0** | New severity mode; same OkHttp pinger kill mechanism but pong drops immediately. UI hit `Limited realtime` within ~2 min |
+| **v11 Arm A emu** (2026-06-02) | Emulator (`emulator-5554`) · Wi-Fi via host PC | same APK as above · flag `"0"` | **0** OkHttp ping-timeout closes | n/a (WS stayed alive the whole 15 min) | n/a | 4 `REST_TRACE mode_switched` lines but all from the 60 s `inbound_idle_timeout` state-machine threshold, **not** from OkHttp `pingInterval` death. Emulator did **not** reproduce v11 Tele2 severity |
+| **v11 Arm B Tecno (Tele2 LTE)** (2026-06-02) | Tecno · Tele2 LTE | `phantom-arm-b-v11.apk` SHA `48ffbefe...` · flag `"B"` (raw OkHttp diagnostic) | 13 closed (14 opened; s=14 was still running at Ctrl+C) | s=1 30 s · s=2-13 ~45 s | s=1 **0** · s=2-13 **1** | Sequential to Arm A Tele2 with relay-side state cleared. Matches Arm A Tele2 severity within margin |
+| **v11 Arm B Tecno (Wi-Fi)** (2026-06-02) | Tecno · Wi-Fi (mobile data off) | same `phantom-arm-b-v11.apk` · flag `"B"` | 5 closed (6 opened; s=6 was still running at Ctrl+C) | **~150 s** (range 150 031–150 037 ms, all five within 6 ms of each other) | **8** in every fail | **Numerically reproduces the v9 Wi-Fi baseline** within ~5 s and identical pp count |
+
+Source log paths (UTF-16 LE BOM as produced by PowerShell `Tee-Object`):
+
+- `C:\temp\test83-v11-arm-a-tecno.log` (Arm A Tecno Tele2 LTE)
+- `C:\temp\test83-v11-arm-a-emu.log` (Arm A emulator Wi-Fi)
+- `C:\temp\test83-v11-arm-b-tecno.log` (Arm B Tecno Tele2 LTE)
+- `C:\temp\test83-v11-arm-b-wifi-tecno.log` (Arm B Tecno Wi-Fi)
+
+**APK build provenance.** The two v11 APK SHAs in the table above (`2ac2afda...` for Arm A flag `"0"` and `48ffbefe...` for Arm B flag `"B"`) were built locally on the field-run day on top of master `a9f66ad0` — i.e. **after the orthogonal SEO PRs #267 (`73395111`) and #268 (`a9f66ad0`) had landed**, not on top of `08514aee` (PR #266's merge commit). The Phase 1 Arm B code itself is unchanged between those build bases; the SHAs differ from the PR #266 commit-body baseline (`444639626e14...`) because the BuildConfig bake-in includes the build's manifest-version and resource fingerprints that touch each release. None of the orthogonal SEO/funding changes affect the WS path or the diagnostic class — they touch `site/` and `deploy/` only.
+
+Sanity wire-confirm gates from Arm B Wi-Fi log (representative of all four Arm B field-test contract checks):
+
+- `RC_DIRECT_ARM_B_armed` = 1 — diagnostic class constructed and started exactly once
+- `RC_DIRECT_ARM_B_service_short_circuit` = 1 — `PhantomMessagingService.onStartCommand` bypassed the production Hybrid Ktor path
+- Production `session_summary` = 0 — production WS never opened during the Arm B window (Inv-ParallelArmIsolation held; no contention with `state.clients[identity]`)
+- Production `ws_ping_timeout_diag` = 0 — same; 3.2a detector telemetry quiet during Arm B
+- `RC_DIRECT_ARM_B_ws_open` = 6 / `RC_DIRECT_ARM_B_ws_failure` = 5 / `RC_DIRECT_ARM_B_ws_closed` = 0 — every closed session ended via `WebSocketListener.onFailure(SocketTimeoutException)`, none via clean close handshake
+
+### §14 — Two failure modes on the same Tecno device
+
+The same Tecno running the same APK (modulo build flag) and signing-in with the same identity exhibits **two qualitatively distinct OkHttp ping-timeout failure modes depending on the active network path**. The mechanism is identical in both — `okhttp3.internal.ws.RealWebSocket.writePingFrame()` fails the socket on the next scheduled ping after `awaitingPong` was left set by an unanswered ping. What differs is **how early in the ping sequence the unanswered ping happens**.
+
+**The failure mechanism is the same OkHttp pinger timeout class, but v11 shows at least two severity modes: Wi-Fi 8-pong rhythm and Tele2 severe 0-1-pong rhythm. These modes must not be collapsed in any forward analysis.**
+
+| Mode | Networks where observed | Median lifetime | Pre-fail successful pp | Implication |
+|---|---|---|---|---|
+| **Mode 1 — "Wi-Fi 8-pong rhythm"** | v9 Tecno Ростелеком Wi-Fi (production Ktor); v11 Arm B Tecno Wi-Fi (raw OkHttp) | ~145–150 s | **8** | Eight Pongs round-trip cleanly; the ninth is the loss. This is the originally hypothesised pattern. |
+| **Mode 2 — "Tele2 severe 0-1-pong rhythm"** | v11 Arm A Tecno Tele2 LTE (production Ktor); v11 Arm B Tecno Tele2 LTE (raw OkHttp) | ~31 s (Arm A) / 30 s for s=1 then 45 s for s=2-13 (Arm B) | **0–1** | The first or second Pong is dropped almost immediately. Severity is several times worse than Mode 1. v8 (also Tele2 LTE, prior month) was closer to Mode 1, so this is **not** "Tele2 always behaves like this"; the network condition itself swings between modes. |
+
+Both modes share the same proximal kill mechanism (OkHttp pinger; matches the exception text verbatim) and the same line-by-line code path in `RealWebSocket`. The split is in the **network return-path / device interaction**, not in the client code.
+
+### §15 — Decision tree resolution (mini-lock §5)
+
+Mini-lock §5 listed five outcome rows. Phase 1 captures match two of them simultaneously, in a way the table did not anticipate as a single outcome but combines cleanly:
+
+| Mini-lock §5 row | Phase 1 evidence | Verdict |
+|---|---|---|
+| "B survives ≥ 2 × A median lifetime → Ktor-adapter fix scope" | Arm B does NOT survive materially longer than Arm A in either network. Tele2: Arm A 31 s vs Arm B 30-45 s. Wi-Fi: Arm B ~150 s matches v9 Ktor ~145 s. | **Ktor adapter is NOT primary cause.** This is the load-bearing falsification of the rev1 hypothesis space's first line. |
+| "A & B both die at ~8 cycles + Emu pcap Pong present → H-B/C/D client stack" | Wi-Fi mode matches "die at ~8 cycles". Emulator pcap on default emulator image is blocked (`tcpdump: inaccessible or not found`); this row's pcap precondition is unmet in Phase 1. | Conditional outcome — promoted to Phase 2 with PCAPdroid on Tecno as the primary pcap path (per emu-non-reproduces row below). |
+| "A & B both die at ~8 cycles + Emu pcap Pong absent → H-A network/path" | Same conditional as above — pcap missing. | Conditional — Phase 2. |
+| "Emu does NOT reproduce → Tecno-specific OR path-specific" | Arm A emu on Wi-Fi via host PC stayed alive the full 15 min with zero OkHttp ping timeouts. **This row fires.** | **Tecno-and-network combination is in the picture.** The failure does not reproduce on the same Wi-Fi class when routed through a different device + network stack (emulator via host PC vs Tecno via Wi-Fi NIC). |
+| "Mixed / ambiguous → Phase 2 longer run / Arm E / Arm F" | Not the current state. | Not triggered. |
+
+**Phase 1 decision-tree outcome (combined):** raw OkHttp reproduces the failure on Tecno in both networks; raw OkHttp does NOT survive longer than Ktor wrapping; the same network class via a different device + stack (emulator via host PC) does NOT reproduce. The root cause sits **below the Ktor wrapper, somewhere in the intersection of (Tecno device / Android-HiOS network stack / OkHttp internal handling / network return-path)** and is **path/condition-sensitive** (two severity modes observed on the same device).
+
+### §16 — Rules in / rules out / still open (Vladislav-locked language)
+
+**Rules out (Phase 1):**
+
+- **Ktor adapter as primary cause.** Raw OkHttp reproduces both the Mode 1 (Wi-Fi 8-pong rhythm) and Mode 2 (Tele2 severe 0-1-pong rhythm) failures with similar lifetimes and identical pp counts to the production Ktor path. Removing Ktor from the WS path does not buy a materially longer session.
+
+**Rules in (Phase 1):**
+
+- **The raw OkHttp / WS protocol-ping path is affected on Tecno.** The failure is reproducible with no Ktor in the data path; the issue is below Ktor and above the relay's send-Pong contract (proven sent in PR #259 / Test #83 v7).
+
+**Still open (handed to Phase 2):**
+
+- Network return-path loss between relay and device, vs Tecno / Android-HiOS / device network stack quirk, vs OkHttp internal handling (`awaitingPong` race / scheduler / reader-thread blocking). Phase 1 cannot discriminate these without packet capture on the device.
+
+**Do NOT claim from Phase 1 evidence (architect-locked):**
+
+- "Carrier-independent severity" — v11 captures show Tele2 severity (Mode 2) ≫ Wi-Fi severity (Mode 1) on the same device. Modes share a mechanism but not a severity profile.
+- "Tele2-only" — Wi-Fi Mode 1 reproduced on Tecno in both v9 (Ktor) and v11 (raw OkHttp). Wi-Fi is not exempt.
+- "Server-side bug" — the relay-side Pong-send bug was **falsified in Test #83 v7** specifically (PR #259 / Commit 3.3): for that one captured session-window the relay logged `ws_protocol_pong_sent` for the Pong preceding the client-side timeout. **The v11 captures do NOT include a synchronous relay-side recapture** for either Mode 1 or Mode 2 sessions, so this Phase 1 cannot extend v7's falsification to the v11 windows by itself. Phase 2 packet capture + relay-log cross-correlation is required to discriminate "Pong sent by relay but lost on return-path" from "Pong sent and arrived but mis-handled on device". Until that happens, Phase 1 only carries the v7-window falsification forward as a prior, not as a current proof.
+- "Device-only bug" — emulator on Wi-Fi via host PC ran the same APK and did not exhibit either mode. The Tecno device contributes; the network conditions contribute; isolating each requires Phase 2 evidence.
+
+### §17 — Phase 2 pointer (separate mini-lock section, NOT this PR)
+
+Phase 2 design will plan packet-capture on Tecno using **PCAPdroid** (root-free VPN-based capture) with **two explicit targets**, one per mode identified in §14:
+
+1. **Mode 1 capture (Wi-Fi 8-pong rhythm):** capture window starting ~120 s into a healthy Arm A (or Arm B) Wi-Fi run, watching for the 9th Pong on the wire. If the 9th Pong is present on the device socket but not counted by OkHttp, the root cause is in OkHttp internal handling or the Android socket → userspace read path. If absent, return-path loss between relay and device.
+2. **Mode 2 capture (Tele2 severe 0-1-pong rhythm):** capture window starting at session open, watching for the 1st-2nd Pong on the wire. Same present/absent dichotomy, applied to the much earlier failure.
+
+PCAPdroid caveat (mini-lock §4 Arm D): VPN-based capture may alter network path / timing. Any Mode 2 number obtained under PCAPdroid is "PCAPdroid-influenced" and not raw production; for Mode 1 the larger absolute timescale gives more tolerance.
+
+Phase 2 mini-lock section is intentionally NOT drafted in this PR — modelled after the mini-lock vs evidence-summary separation already established here (§1-§12 mini-lock, §13-§18 evidence). The Phase 2 mini-lock continues the same file as `## Phase 2 ...` sections, locked separately.
+
+### §18 — Open questions handed to Phase 2
+
+1. **Two-mode convergence under PCAPdroid VPN routing.** If PCAPdroid's VPN interface changes the kernel routing, Mode 2 (~30 s lifetime) may shift toward Mode 1 (or disappear entirely). The Phase 2 mini-lock must define how to validate that PCAPdroid did not mask the mode being investigated.
+
+2. **Second Android handset on Wi-Fi.** Mode 1 reproduced on Tecno Wi-Fi (v9 + v11 Arm B). It did NOT reproduce on emulator Wi-Fi via host PC. A non-Tecno physical handset on the same Wi-Fi class would discriminate "Tecno-specific HiOS quirk" vs "any non-emulator Android handset". Mini-lock §4 Arm I covers this; optional per OQ-Q2.
+
+3. **Server-side cross-correlation with PR #259 telemetry.** During Mode 1 and Mode 2 sessions, relay-side `ws_protocol_pong_sent` log entries can be matched to client-side `RC_DIRECT_ARM_B_ws_failure` lifetimes (UTC clock difference is known). If relay sends N+1 Pongs but the client only counts N (Mode 1: relay sends 9, client counts 8; Mode 2: relay sends 2, client counts 1), the missing Pong's send-time on the relay is a known point in time to anchor a packet-capture analysis around.
+
+4. **Whether 3.2b.1 adaptive validation code should resume.** Per `Inv-NoChangeUntilEvidence`, 3.2b.1 has been paused awaiting this evidence. The Phase 1 outcome — "client-stack-OR-path-dependent, two modes, both reproducible with raw OkHttp" — favours 3.2b.1 becoming a necessary UX shield (the client cannot single-handedly fix Mode 2 severity on a degraded carrier). But Phase 2 packet capture may still localise a small client-side fix that closes Mode 1 at the root; if so, 3.2b.1 may be deprioritised again. **Decision deferred until Phase 2 evidence summary lands.**
+
+Phase 1 closes here. CHIP1 remains parked at `78bd979e` throughout. 3.2b.1 code remains paused per `Inv-NoChangeUntilEvidence`.

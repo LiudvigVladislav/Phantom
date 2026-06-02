@@ -2,7 +2,38 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-06-02 (tue) — **✅ PR-WS-HEALTH-STATE1 transport diagnostics + adaptive-validation design track shipped through design phase (5 PRs in 4 days).** Master = `f692cdcf`.
+**Last updated:** 2026-06-02 (tue, late) — **✅ RC-DIRECT-WS-DEATH1 Phase 1 CLOSED.** Master = this PR's squash commit on top of `a9f66ad0` (orthogonal SEO PRs #267 / #268 landed in parallel after #266 and are tracked separately).
+
+Shipped:
+- **#265 `99cb1d6f`** — RC-DIRECT-WS-DEATH1 mini-lock rev4 (Phase 1 plan): 6-arm matrix, 8 hard invariants, 4 stacked revisions absorbing two external architect audits.
+- **#266 `08514aee`** — Phase 1 Arm B diagnostic code: `RcDirectArmB.kt` raw OkHttp sequential WebSocket diagnostic, own `OkHttpClient` with identical builder params to production, debug-gated by `BuildConfig.DEBUG_RC_DIRECT_ARM == "B"` with release-pinned to `"0"`, read-only (`webSocket.send(...)` never called), service-level short-circuit ensures production Hybrid Ktor is off for the run window (Inv-ParallelArmIsolation). Lifecycle teardown closes the `WebSocket.cancel()` requirement (OkHttp reader runs on its own dispatcher pool thread).
+- **This PR** — Phase 1 evidence summary (§13-§18 appended to `docs/tracks/rc-direct-ws-death1.md`) + durable log bundle (this entry + matching PROJECT_LOG entry). Sequential v11 captures: Arm A Tecno Tele2 LTE (29 sessions × ~31 s × after 0 pp); Arm A emulator Wi-Fi via host (0 OkHttp ping timeouts in 15 min); Arm B Tecno Tele2 LTE (13 sessions × 30-45 s × after 0-1 pp); Arm B Tecno Wi-Fi (5 sessions × ~150 s × after 8 pp).
+
+**Phase 1 outcome (Vladislav-locked):**
+
+- **Two failure modes** identified on the same Tecno device, same OkHttp pinger kill mechanism but different severity:
+  - **Mode 1 "Wi-Fi 8-pong rhythm"** ~145-150 s lifetime (v9 production Ktor + v11 Arm B raw OkHttp both reproduce)
+  - **Mode 2 "Tele2 severe 0-1-pong rhythm"** ~31-45 s lifetime (v11 Arm A production Ktor + v11 Arm B raw OkHttp both reproduce)
+- **Rules out:** Ktor adapter as primary cause (raw OkHttp reproduces both modes, no longer survival than Ktor)
+- **Rules in:** raw OkHttp / WS protocol-ping path is affected on Tecno
+- **Still open:** network return-path loss vs Tecno / HiOS / device stack vs OkHttp internal handling
+- **Do NOT claim:** carrier-independent severity / Tele2-only / server-side bug / device-only bug
+
+**Track state:**
+
+- Phase 1 closed. Phase 2 PCAPdroid mini-lock section will be appended to the same track file in the next session (single-source-of-truth pattern, parallel to WS-HEALTH-STATE1 stacking Commit 2/3.1/3.3/3.2a/3.2b sections in one file).
+- 3.2b.1 commonMain code remains **paused** per `Inv-NoChangeUntilEvidence`. Phase 1 favours 3.2b.1 as a UX shield (client cannot single-handedly fix Mode 2 severity on a degraded carrier) but Phase 2 packet capture may still localise a smaller fix at the client-stack root.
+- `CHIP1` parked at `78bd979e`.
+
+**Three parallel tracks unlocked by audits + v10 evidence (unchanged):**
+
+- `RC-DIRECT-WS-DEATH1` — Phase 1 closed this entry; Phase 2 PCAPdroid next session
+- `RC-REALITY-PROBE1` — why Reality `/health` probe times out at 20 s on Xray SOCKS on RU ISPs (unchanged, not started)
+- `PR-UI-CONNECTION-LABELS1` — release-mode hide of "Tor" / "Reality" / "Direct" / "REST fallback" labels in both main UI/banner and notification text (unchanged, not started)
+
+**Next session = Phase 2 mini-lock section** appending to `docs/tracks/rc-direct-ws-death1.md` planning PCAPdroid capture with two mode-specific targets (Mode 1 watching 9th Pong ~120 s in; Mode 2 watching 1st-2nd Pong at session open).
+
+**Previous (2026-06-02 tue):** **✅ PR-WS-HEALTH-STATE1 transport diagnostics + adaptive-validation design track shipped through design phase (5 PRs in 4 days).** Master was `f692cdcf`.
 
 Shipped:
 - **#259 `8727031f` (2026-05-31, sun)** — Commit 3.3 ping/pong diagnostics (client + relay, NO behaviour). Field-verified Test #83 v7: relay sent 9th Pong, client OkHttp `okhttp_successful_ping_pongs=8`. What v7 proves: NOT a relay-side pong-send bug. What v7 does NOT prove: whether the 9th Pong physically reached the device's socket buffer and was mis-counted by the client stack, OR was lost on the return-path between relay and device — both possibilities feed `RC-DIRECT-WS-DEATH1` and require packet capture to discriminate. Proximal kill mechanism is OkHttp `RealWebSocket.writePingFrame()` firing on the next ping after a missed pong.
