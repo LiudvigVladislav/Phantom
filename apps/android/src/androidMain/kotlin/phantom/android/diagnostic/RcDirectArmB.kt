@@ -188,9 +188,10 @@ internal class RcDirectArmB(
         // Inv-NoTrafficBeyondTelemetry (mini-lock §21): the marker is the
         // ONLY new emission for Phase 2 — no WS frame is ever sent for
         // capture-marking. Class itself is gated by
-        // `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM != "0"`
-        // at the AppContainer wire-up site, so reaching this line implies
-        // the arm-level gate already held; defence-in-depth lives there.
+        // `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM == "B"`
+        // at the AppContainer wire-up site (only that flag value
+        // constructs RcDirectArmB), so reaching this line implies the
+        // arm-level gate already held; defence-in-depth lives there.
         Log.i(
             TAG,
             "PHASE2_CAPTURE_MARKER mode=${BuildConfig.DEBUG_PHASE2_MODE} " +

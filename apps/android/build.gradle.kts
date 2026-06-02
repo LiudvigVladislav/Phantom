@@ -164,9 +164,10 @@ android {
             // in `RcDirectArmB.runOneSession()` as the wall-clock anchor
             // required by Inv-WallClockAlignment (Phase 2 mini-lock §21).
             // Marker emit is gated by the active Arm B run window —
-            // `BuildConfig.DEBUG && DEBUG_RC_DIRECT_ARM != "0"` is enforced
-            // by the AppContainer wire-up site, so this field controls
-            // only the `mode=...` value, never the emit-or-not decision.
+            // `BuildConfig.DEBUG && DEBUG_RC_DIRECT_ARM == "B"` is enforced
+            // by the AppContainer wire-up site (only that flag value
+            // constructs `RcDirectArmB`), so this field controls only the
+            // `mode=...` value, never the emit-or-not decision.
             // Values:
             //   "0" — no Phase 2 capture intent declared (default; marker
             //         still emits with mode=0 so wall-clock anchor data is
