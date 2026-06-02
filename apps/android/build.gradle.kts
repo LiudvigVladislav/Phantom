@@ -144,6 +144,20 @@ android {
                 "ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws"
             )
             buildConfigField("String", "RELAY_ONION_URL", "\"$relayOnionUrl\"")
+            // PR-RC-DIRECT-WS-DEATH1 Phase 1: build flag for the diagnostic
+            // arm selector. Locked in `docs/tracks/rc-direct-ws-death1.md`
+            // § Commit 3.2b (rev4) §7 step 2. Values:
+            //   "0" — disabled (default; also covers Arm A field runs, which
+            //         add no new code — Arm A IS the existing production path)
+            //   "B" — Arm B: raw OkHttp sequential diagnostic; production
+            //         Hybrid Ktor `transport.connect(...)` is short-circuited
+            //         in PhantomMessagingService to keep Inv-ParallelArmIsolation
+            //   "E" — Phase 2 only (data-frame heartbeat diagnostic)
+            // Override via `local.properties` `rcDirectArm=B` or env
+            // RC_DIRECT_ARM=B. Release builds ignore the value entirely
+            // (see release block + runtime gate `BuildConfig.DEBUG && ...`).
+            val rcDirectArm = localOrEnv("rcDirectArm", "RC_DIRECT_ARM", "0")
+            buildConfigField("String", "DEBUG_RC_DIRECT_ARM", "\"$rcDirectArm\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -167,6 +181,12 @@ android {
                 "RELAY_ONION_URL",
                 "\"ws://zmdrxlrkd7iv7ozvdl5nlhctsxgx6eyuqionp6xzriolymy3m6ioloyd.onion:80/ws\""
             )
+            // PR-RC-DIRECT-WS-DEATH1 Phase 1: release builds ALWAYS pin the
+            // diagnostic flag to "0". The runtime gate at the wire-up site
+            // also checks `BuildConfig.DEBUG`, so even a corrupted release
+            // build that somehow saw a non-"0" value would still skip the
+            // diagnostic. Defence-in-depth per design note §7 step 3.
+            buildConfigField("String", "DEBUG_RC_DIRECT_ARM", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.
