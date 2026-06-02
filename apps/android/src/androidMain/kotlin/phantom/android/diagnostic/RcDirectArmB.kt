@@ -20,6 +20,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import phantom.android.BuildConfig
 import phantom.core.identity.IdentityManager
 
 /**
@@ -179,6 +180,23 @@ internal class RcDirectArmB(
     ): String {
         val sessionStartMs = System.currentTimeMillis()
         Log.i(TAG, "RC_DIRECT_ARM_B_session_start s=$sessionEpoch wall_clock_ms=$sessionStartMs")
+        // PR-RC-DIRECT-WS-DEATH1 Phase 2: wall-clock anchor for
+        // Inv-WallClockAlignment (mini-lock §21). The line is emitted
+        // before any session I/O so PCAPdroid pcap timestamps and
+        // relay-side `ws_protocol_pong_sent` UTC stamps can be aligned
+        // against this `utc=$sessionStartMs` for the same session epoch.
+        // Inv-NoTrafficBeyondTelemetry (mini-lock §21): the marker is the
+        // ONLY new emission for Phase 2 — no WS frame is ever sent for
+        // capture-marking. Class itself is gated by
+        // `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM == "B"`
+        // at the AppContainer wire-up site (only that flag value
+        // constructs RcDirectArmB), so reaching this line implies the
+        // arm-level gate already held; defence-in-depth lives there.
+        Log.i(
+            TAG,
+            "PHASE2_CAPTURE_MARKER mode=${BuildConfig.DEBUG_PHASE2_MODE} " +
+                "utc=$sessionStartMs s=$sessionEpoch",
+        )
         val authedUrl = buildAuthedWsUrl(identityHex, signingPubKeyHex, sessionEpoch)
             ?: return OUTCOME_AUTH_ABORTED
         val authDoneMs = System.currentTimeMillis()

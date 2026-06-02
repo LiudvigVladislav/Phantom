@@ -158,6 +158,28 @@ android {
             // (see release block + runtime gate `BuildConfig.DEBUG && ...`).
             val rcDirectArm = localOrEnv("rcDirectArm", "RC_DIRECT_ARM", "0")
             buildConfigField("String", "DEBUG_RC_DIRECT_ARM", "\"$rcDirectArm\"")
+            // PR-RC-DIRECT-WS-DEATH1 Phase 2: build flag for the PCAPdroid
+            // capture session mode tag. Emitted as
+            // `PHASE2_CAPTURE_MARKER mode=${DEBUG_PHASE2_MODE} utc=... s=...`
+            // in `RcDirectArmB.runOneSession()` as the wall-clock anchor
+            // required by Inv-WallClockAlignment (Phase 2 mini-lock §21).
+            // Marker emit is gated by the active Arm B run window —
+            // `BuildConfig.DEBUG && DEBUG_RC_DIRECT_ARM == "B"` is enforced
+            // by the AppContainer wire-up site (only that flag value
+            // constructs `RcDirectArmB`), so this field controls only the
+            // `mode=...` value, never the emit-or-not decision.
+            // Values:
+            //   "0" — no Phase 2 capture intent declared (default; marker
+            //         still emits with mode=0 so wall-clock anchor data is
+            //         always available when Arm B is armed)
+            //   "P1" — Mode 1 capture (Wi-Fi 8-pong rhythm; target 9th Pong)
+            //   "P2" — Mode 2 capture (Tele2 LTE severe; target 1st-2nd Pong)
+            //   "P3" — control reading (PCAPdroid-on, no analysis target)
+            // Override via `local.properties` `phase2Mode=P1` or env
+            // PHASE2_MODE. Release builds ignore the value entirely
+            // (pinned to "0" in the release block + runtime gate `BuildConfig.DEBUG`).
+            val phase2Mode = localOrEnv("phase2Mode", "PHASE2_MODE", "0")
+            buildConfigField("String", "DEBUG_PHASE2_MODE", "\"$phase2Mode\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -187,6 +209,13 @@ android {
             // build that somehow saw a non-"0" value would still skip the
             // diagnostic. Defence-in-depth per design note §7 step 3.
             buildConfigField("String", "DEBUG_RC_DIRECT_ARM", "\"0\"")
+            // PR-RC-DIRECT-WS-DEATH1 Phase 2: release builds ALWAYS pin the
+            // Phase 2 capture mode tag to "0" as well. Marker emit cannot
+            // happen in release anyway (Arm B class is never wired in
+            // release per the AppContainer `BuildConfig.DEBUG && ...` gate),
+            // but the field is pinned for defence-in-depth and to keep the
+            // release BuildConfig surface deterministic.
+            buildConfigField("String", "DEBUG_PHASE2_MODE", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.
