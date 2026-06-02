@@ -3,9 +3,82 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title data-en="PHANTOM — Encrypted messenger that survives state-level surveillance" data-ru="PHANTOM — Зашифрованный мессенджер против государственной слежки">PHANTOM</title>
+<title data-en="PHANTOM — Encrypted messenger that survives state-level surveillance" data-ru="PHANTOM — Зашифрованный мессенджер, устойчивый к слежке и сетевой цензуре">PHANTOM — Encrypted messenger that survives state-level surveillance</title>
 <meta name="description" content="Open-source, end-to-end encrypted Android messenger built to work on hostile mobile networks. Production-validated through Russia's TSPU.">
 <meta name="robots" content="index,follow">
+<link rel="canonical" href="https://phntm.pro/">
+
+<!-- Favicon -->
+<link rel="icon" type="image/jpeg" href="/static/phantom-logo.jpg">
+<link rel="apple-touch-icon" href="/static/phantom-logo.jpg">
+<meta name="theme-color" content="#08090C">
+
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://phntm.pro/">
+<meta property="og:title" content="PHANTOM — Encrypted messenger that survives state-level surveillance">
+<meta property="og:description" content="Open-source, end-to-end encrypted Android messenger built to work on hostile mobile networks. No phone number, no email, no metadata harvesting.">
+<meta property="og:image" content="https://phntm.pro/static/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:site_name" content="PHANTOM">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="ru_RU">
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="PHANTOM — Encrypted messenger that survives state-level surveillance">
+<meta name="twitter:description" content="Open-source, end-to-end encrypted Android messenger built to work on hostile mobile networks.">
+<meta name="twitter:image" content="https://phntm.pro/static/og-image.png">
+
+<!-- Structured data -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "PHANTOM",
+  "alternateName": "PHANTOM Messenger",
+  "applicationCategory": "CommunicationApplication",
+  "applicationSubCategory": "Encrypted Messaging",
+  "operatingSystem": "Android",
+  "softwareVersion": "Alpha 2",
+  "softwareRequirements": "Android 8.0+",
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+  "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+  "url": "https://phntm.pro",
+  "downloadUrl": "https://github.com/LiudvigVladislav/Phantom/releases",
+  "image": "https://phntm.pro/static/og-image.png",
+  "description": "Open-source, end-to-end encrypted Android messenger built to work on hostile mobile networks. No phone number, no email, no metadata harvesting. Multiple transports including REALITY/Xray validated against state-level DPI.",
+  "featureList": [
+    "End-to-end encryption (Double Ratchet over libsodium)",
+    "ED25519 identity keys generated on device",
+    "Sealed sender (server cannot link sender to recipient)",
+    "Censorship-resistant transports (Direct WSS, REALITY/Xray, Tor v3, REST fallback)",
+    "No phone number, no email required",
+    "Open source under AGPL-3.0"
+  ],
+  "author": {"@type": "Organization", "name": "Willen LLC", "url": "https://phntm.pro"},
+  "publisher": {"@type": "Organization", "name": "Willen LLC", "url": "https://phntm.pro"}
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "Willen LLC",
+  "url": "https://phntm.pro",
+  "logo": "https://phntm.pro/static/phantom-logo.jpg",
+  "description": "Independent developer of PHANTOM, an open-source encrypted messenger built to resist state-level surveillance and network censorship.",
+  "foundingLocation": {
+    "@type": "Place",
+    "address": {"@type": "PostalAddress", "addressRegion": "Wyoming", "addressCountry": "US"}
+  },
+  "sameAs": [
+    "https://github.com/LiudvigVladislav/Phantom",
+    "https://codeberg.org/LiudvigVladislav/Phantom"
+  ]
+}
+</script>
 
 <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 @import url('https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-sans/style.css');

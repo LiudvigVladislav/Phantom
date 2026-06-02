@@ -282,10 +282,32 @@ phntm.pro, www.phntm.pro {
         file_server
     }
 
-    # Placeholder landing. Replace with the actual Next.js build in Этап 4.3.
+    # SEO: sitemap.xml served from the site bind-mount with correct Content-Type.
+    handle /sitemap.xml {
+        root * /srv/landing
+        header Content-Type "application/xml; charset=utf-8"
+        header Cache-Control "public, max-age=3600"
+        file_server
+    }
+
+    # SEO: robots.txt served from the site bind-mount with correct Content-Type.
+    # Note: Cloudflare may inject its own robots.txt at edge — verify with
+    # `curl https://phntm.pro/robots.txt` after deploy; may need to disable
+    # Cloudflare-managed robots.txt in Dashboard if it overrides.
+    handle /robots.txt {
+        root * /srv/landing
+        header Content-Type "text/plain; charset=utf-8"
+        header Cache-Control "public, max-age=3600"
+        file_server
+    }
+
+    # Static site for phntm.pro served from `site/` bind-mount.
+    # `try_files {path} {path}/index.html =404` serves real 404 for unknown URLs
+    # instead of soft-404 falling back to index.html (which was causing every
+    # non-existent path to return homepage HTML — bad for SEO crawl budget).
     handle {
         root * /srv/landing
-        try_files {path} /index.html
+        try_files {path} {path}/index.html =404
         file_server
     }
 
