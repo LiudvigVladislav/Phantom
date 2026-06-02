@@ -186,6 +186,34 @@ class AppContainer(private val context: Context) {
         repository = identityRepo,
     )
 
+    // ── PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B diagnostic ──────────────────────
+    //
+    // Constructed lazily and ONLY when the build flag selects Arm B
+    // (`BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM == "B"`).
+    // The wire-up site (`PhantomMessagingService.onStartCommand`) checks
+    // the same gate before calling `.start(...)` and short-circuits the
+    // production Hybrid Ktor `transport.connect(...)` path so production
+    // and diagnostic sockets cannot collide on `state.clients[identity]`
+    // at the relay (Inv-ParallelArmIsolation). Release builds never
+    // construct this object — the flag is pinned to "0" in the release
+    // BuildConfig block.
+    //
+    // Locked in `docs/tracks/rc-direct-ws-death1.md` § Commit 3.2b (rev4)
+    // §7 step 3.
+    internal val rcDirectArmB: phantom.android.diagnostic.RcDirectArmB? by lazy {
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM == "B"
+        ) {
+            phantom.android.diagnostic.RcDirectArmB(
+                identityManager = identityManager,
+                relayUrl = phantom.android.BuildConfig.RELAY_URL,
+                scope = appScope,
+            )
+        } else {
+            null
+        }
+    }
+
     // In-memory cache of the current identity. Populated eagerly at startup and
     // by initMessaging*; readers (ProfileScreen, top-bar avatar, etc.) collect
     // this StateFlow instead of calling identityRepo.loadIdentity() per screen,

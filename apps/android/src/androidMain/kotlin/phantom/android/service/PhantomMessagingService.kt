@@ -456,6 +456,37 @@ class PhantomMessagingService : Service() {
             val signingPubKeyHex = signingPair.publicKey.bytes
                 .joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
 
+            // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B short-circuit. When the
+            // diagnostic flag selects Arm B, the production Hybrid Ktor path
+            // is bypassed entirely so the diagnostic raw-OkHttp socket and a
+            // production socket cannot collide on the relay's
+            // state.clients[identity] map (Inv-ParallelArmIsolation).
+            //
+            // Inv-NoProductionBehaviour: the gate is
+            // `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM == "B"`.
+            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+            // even if the flag string was somehow non-"0" — the release
+            // BuildConfig block pins it to "0" as defence-in-depth.
+            //
+            // Locked in `docs/tracks/rc-direct-ws-death1.md` § Commit 3.2b
+            // (rev4) §7 step 3.
+            if (phantom.android.BuildConfig.DEBUG &&
+                phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM == "B"
+            ) {
+                Log.i(
+                    "RC_DIRECT_ARM_B",
+                    "RC_DIRECT_ARM_B_service_short_circuit " +
+                        "identity_prefix=${myPubKey.take(16)} " +
+                        "signing_prefix=${signingPubKeyHex.take(16)} " +
+                        "gen=$myGen",
+                )
+                container.rcDirectArmB?.start(myPubKey, signingPubKeyHex)
+                // Service stays alive (foreground service is the diagnostic
+                // host); the arm runs its own reconnect loop until cancelled
+                // via container.rcDirectArmB?.stop() or the app dies.
+                return@launch
+            }
+
             val connected: ConnectedTransport = try {
                 container.transportManager.connect()
             } catch (e: NoTransportReachableException) {
@@ -532,6 +563,21 @@ class PhantomMessagingService : Service() {
     override fun onDestroy() {
         Log.d(TAG, "onDestroy — disconnecting transport")
         super.onDestroy()
+        // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B teardown. Stop the
+        // diagnostic raw OkHttp socket before the rest of cleanup so a
+        // service restart cannot race two diagnostic sockets sharing
+        // `state.clients[identity]` at the relay. Same debug + flag gate
+        // as the start site in onStartCommand. Release builds never reach
+        // this branch — the release BuildConfig pins the flag to "0".
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM == "B"
+        ) {
+            runCatching {
+                (application as PhantomApplication).container.rcDirectArmB?.stop()
+            }.onFailure {
+                Log.w(TAG, "RC_DIRECT_ARM_B_stop_failed: ${it.message}")
+            }
+        }
         // ADR-011: cancel the AlarmManager wakeup so we don't keep waking
         // the device after the user has explicitly stopped the service.
         runCatching { PhantomWakeupReceiver.cancel(applicationContext) }
