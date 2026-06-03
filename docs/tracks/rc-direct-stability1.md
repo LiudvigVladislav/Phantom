@@ -21,6 +21,7 @@ These do not need re-proving inside this track. Every Arm in §4 and every verdi
 | **F-RelayInternal** | The relay container exposes port 8080 only on the internal Docker bridge (`expose: ["8080"]`, no `ports:` block — `deploy/docker-compose.yml:39-42`). Caddy is the sole TLS terminator + edge auth + rate limiter in front of the relay. The relay has no embedded TLS listener. | `deploy/docker-compose.yml:39-42`; security review 2026-06-03 |
 | **F-AuthIntegrity** | Signed-challenge auth (ADR-027, relay `routes.rs:230-232` `is_pubkey_hex` 64-hex constraint) is integrity-based via Ed25519 over a one-shot nonce. Its security does not depend on TLS confidentiality — a plain-TCP/WS diagnostic path that preserves the auth protocol remains safe against replay or signature forgery during a short-window test. | ADR-027; security review 2026-06-03 §1 |
 | **F-CIGuard** | `Inv-BypassIsLoopbackOnly` is enforced by a pre-merge CI gate (`.github/workflows/deploy-lint.yml`) that fails the build if any relay-service `ports:` entry binds to a non-loopback address. Shipped in PR #273 on master `6c923c39`. | PR #273; security review 2026-06-03 §3 + §5 |
+| **F-Mode2-cadence-invariant** | On Tecno Tele2 LTE through production Caddy, Direct WS lifetime scales linearly with OkHttp `pingInterval` (lifetime ≈ 3 × ping_interval for subsequent sessions, ≈ 2 × ping_interval for the first session, observed at 10/15/20/30 s tested values), and the Mode 2 "first session 0 pong, then 1 pong" signature persists across all cadence values. **Cadence sensitivity exists, but only as detection timing — `pingInterval` changes WHEN OkHttp notices the already-broken path, not WHETHER the path breaks.** As a production fix lever, cadence is refuted. Production `RelayTransportFactory.kt:71 pingInterval(15_000L, MILLISECONDS)` is the right value and stays. | Arm C field matrix 2026-06-03 (`docs/tracks/rc-direct-stability1.md` §4 Arm C Outcome); memory `project_arm_c_lifetime_linear_in_interval_2026_06_04.md` |
 
 ---
 
@@ -152,15 +153,48 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
 
 **Discriminator.** If one ping-interval value produces median lifetime ≥ 3× v11 Arm B Tele2 baseline on Tele2 LTE, **H-C confirmed** (cadence-sensitive kill mechanism). The result is recorded as evidence in the §5 decision tree and the §6 ship criterion is evaluated per-value. Any production promotion of a varied pingInterval is gated to a separate named PR with its own mini-lock per Inv-OnlyDiagnosticCadenceChange. If all four values produce statistically identical lifetimes, **H-C refuted** — the kill mechanism does not depend on pingInterval cadence on the production path.
 
+**Outcome (Tecno Tele2 LTE field matrix 2026-06-03):** **H-C refuted — cadence is detection timing, not a fix lever.** Recorded findings:
+
+- **Linear scaling lifetime ≈ 3 × ping_interval across the entire matrix.** Single field-test day, Tecno + Tele2 LTE through production Caddy, no SSH tunnel, no adb reverse. Four 15-min captures from sequential APK installs:
+
+  | Run | Ping interval | Failures in 15 min | Median lifetime | P95 |
+  |---|---:|---:|---:|---:|
+  | Arm B baseline (raw OkHttp at 15 s) | 15 s | 18 | 45 s | 45 s |
+  | Arm C 10 s | 10 s | 23 | 30 s | 30 s |
+  | Arm C 20 s | 20 s | 15 | 60 s | 60 s |
+  | Arm C 30 s | 30 s | 9 | 90 s | 90 s |
+
+- **Mechanism: `RealWebSocket.writePingFrame()` fails on the next ping after `awaitingPong` was set unanswered.** For subsequent sessions, lifetime ≈ 3 × ping_interval decomposes as: one successful ping/pong was counted, then the next Pong was missed, and OkHttp failed on the following scheduled ping because `awaitingPong` was still true. For the first session, lifetime ≈ 2 × ping_interval: zero successful pongs, the first Pong was missed, and OkHttp failed on the next ping tick. Varying the interval only changes WHEN detection fires, not WHETHER the packet loss happens.
+- **Mode 2 "first session 0 pong, then 1 pong" signature persists across all four cadence values.** First reconnect always loses first Pong; subsequent reconnects lose second Pong. The Phase 2 carrier signature is identical regardless of ping interval. Rules out "ping interval interacts with carrier idle-keepalive teardown" as the kill mechanism.
+- **Matrix validity clean.** Arm B baseline only fired `RC_DIRECT_ARM_B_*`. Arm C 10/20/30 only fired `RC_DIRECT_ARM_C_*`. Production Ktor path silent across all four (`session_summary = 0`, `ws_ping_timeout_diag = 0`). Inv-ParallelArmIsolation held.
+- **Deceptive metric warning.** "Fewer failures per 15 min" at 30 s (9 vs 23 at 10 s) is not a real UX improvement — it is the same broken connection diagnosed later. The connection still dies; it just takes longer to notice.
+- **Verdict per §5 + §6:** **§6 ship criterion (zero `SocketTimeoutException: sent ping but didn't receive pong` in 15-min capture) FAILS across all 4 values.** **H-C as a production fix lever is refuted.** Cadence sensitivity is observed, but only as detection timing: changing `pingInterval` changes WHEN OkHttp notices the already-broken path, not WHETHER the path breaks. §5 decision-tree row "Arm C all-FAIL → H-C refuted, continue to Arm D" fires. Production `RelayTransportFactory.kt:71 pingInterval(15_000L, MILLISECONDS)` line **stays at 15 s** per `Inv-OnlyDiagnosticCadenceChange`. No production promotion candidate.
+- **Carry-forward to Arm D.** The Mode 2 carrier signature is independent of WS-control-frame cadence. The next discrimination question becomes: is the kill specific to WS control frames (Ping/Pong) at all, or do application data frames also die at the same Phase 2 anchor (first inbound after WS upgrade)? That is the Arm D data-frame-heartbeat question, scoped below.
+- **Memory:** detailed Arm C result + structural findings preserved in `feedback`-style memory entry `project_arm_c_lifetime_linear_in_interval_2026_06_04.md` for future-track reference.
+
 ### Arm D — Data-frame heartbeat diagnostic (client + relay coordinated)
 
-**Goal.** Probe H-D by maintaining a periodic application-data-frame heartbeat (WS Text or Binary, not Ping) on the diagnostic path. Verify whether data-plane traffic survives the conditions where control-plane Pong dies.
+**Goal.** Probe H-D by maintaining a periodic application-data-frame heartbeat (WS Text payload, not Ping) on the diagnostic path. Verify whether data-plane traffic survives the conditions where control-plane Pong dies. Specifically: does the Mode 2 "first inbound after WS upgrade" anchor that kills the first Pong also kill the first inbound heartbeat echo? Per the Arm C structural finding, the carrier signature is cadence-invariant — if it is also data-vs-control-invariant, the kill is at packet layer (broader than WS control frames). If echoes survive while Ping/Pong dies, the kill is WS-control-specific.
+
+**Refined scope (locked 2026-06-03 + 2026-06-04 PR-5 review):**
+
+- **Payload format (Vladislav-locked):** ASCII Text frames matching the prefix `phantom:diagnostic:heartbeat-echo:v1:<seq>:<client_ms>`. Reasons: grep-friendly in relay + device logs, no JSON envelope ambiguity, easy prefix check (relay can match on exact prefix), namespaced so future protocol additions do not collide. Binary opcode pattern parked.
+- **Default-off env flag (Vladislav-locked):** relay echo handler is gated by `RELAY_ENABLE_HEARTBEAT_ECHO=1`. Default off. Flag flipped only by operator during Arm D field test window, with explicit revert step after the test. PR-6 commit body must include the revert checklist.
+- **Echo direction is WS Text only** (Inv-DataFrameNotControlFrame from §3). Relay sends back `Message::Text(...)` matching the inbound payload verbatim. Never `Message::Pong(...)` or `Message::Ping(...)` from application code on either side.
+- **Payload validation rigour on the relay side (locked per architect pre-review 2026-06-04 for PR-6):**
+  - **Length cap:** total payload ≤ 256 bytes. Reject (log + ignore, do not echo) above this. Prevents the relay from becoming a free echo amplifier under flag-on.
+  - **Prefix exact match** on the full `phantom:diagnostic:heartbeat-echo:v1:` string (not just `phantom:`). Future `:v2:` payloads will not silently enter the v1 handler.
+  - **Parse `<seq>` and `<client_ms>` as `u64`** for the relay log line; reject on parse failure.
+  - **Echo via `Message::Text(...)` only** per `Inv-DataFrameNotControlFrame` (§3). Never `Message::Pong` (would re-introduce PR-H1e regression class). Inline comment at the send site naming the invariant; unit test asserting returned opcode type.
+  - **Per-session counters** `echo_frames_received` / `echo_frames_sent` added to existing `session_summary` log line; per-frame echo logs at `debug!` level only.
+- **Feature flag read pattern (locked per architect pre-review):** `std::env::var("RELAY_ENABLE_HEARTBEAT_ECHO")` is read **once at process start** in `RelayConfig::from_env()` (existing codebase idiom), parsed strictly as `v == "1"` (any other value including `"true"` / `"yes"` fails closed), stored as `pub heartbeat_echo_enabled: bool`, threaded through `Arc<AppState>`. A startup `info!` log line announces the flag state.
 
 **Setup.**
 
-1. **Prerequisite (relay PR, ships first).** Small relay-side PR adds an echo-opcode handler in `services/relay/src/routes.rs` for a specific WS Text payload (e.g. `"\x00HEARTBEAT-ECHO"`), returning the same payload as a Text frame. Behind a feature flag gated by env var `RELAY_ENABLE_HEARTBEAT_ECHO=1`, default off. Architect review explicit ACK; passes `Relay CI / build-test`.
-2. New diagnostic class `RcDirectArmD` (after relay PR lands on master). Sends one Text-frame heartbeat every 15 s on the diagnostic WS; counts inbound echo replies; emits `RC_DIRECT_ARM_D_echo_received seq=N rtt_ms=...` per round-trip. No production WS path touched.
-3. Field run identical to Arm C cadence (Tele2 LTE 15-min capture).
+1. **PR-6 (relay code, ships first).** Adds the echo handler in `services/relay/src/routes.rs` matching the payload contract above. Behind `RELAY_ENABLE_HEARTBEAT_ECHO=1`, default off. Architect explicit pre-draft review locks the relay-side design (handler insertion point, env-flag read pattern, validation rigour, logging shape, operator runbook). Passes `Relay CI / build-test` + `Deploy lint` if any. Inv-RelayChangeNeedsItsOwnPR carries through.
+2. **VPS deploy (Vladislav-owned).** After PR-6 merges, operator adds `RELAY_ENABLE_HEARTBEAT_ECHO=1` to `.env` on the VPS and runs `docker compose up -d --force-recreate relay`. Reachability verification: connect a quick local WS client against the loopback bypass binding (PR-3a) or via a short-lived diagnostic APK, send the canonical payload, verify echo returns. Revert checklist: remove the line from `.env`, recreate.
+3. **PR-7 (Android diagnostic class).** New `RcDirectArmD` (after PR-6 lands on master AND `RELAY_ENABLE_HEARTBEAT_ECHO=1` deployed on the VPS). Near-clone of `RcDirectArmC`. Sends one Text-frame heartbeat every 15 s on the diagnostic WS with the canonical payload; counts inbound echo replies; emits `RC_DIRECT_ARM_D_echo_sent seq=N` per outbound and `RC_DIRECT_ARM_D_echo_received seq=N rtt_ms=...` per round-trip. No production WS path touched. Read-only outbound is allowed for this arm specifically because the WS Text echo is the diagnostic primitive — this is an explicit narrow carve-out from Inv-RawArmReadOnly noted inline.
+4. **Field run** identical to Arm C cadence (Tele2 LTE 15-min capture on Tecno, through production Caddy, no SSH tunnel needed).
 
 **Cost.** ~30 LOC relay code (echo handler), ~40 LOC Android code (RcDirectArmD), 1 hour field test. Relay PR is small but is the first relay production touch in this track — requires WORKING_RULES rule 9 verification.
 

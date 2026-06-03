@@ -2,7 +2,7 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-06-03 (wed, late) — **🟢 STRATEGIC PIVOT after RC-DIRECT-WS-DEATH1 Phase 2 closure:** primary fix track is now `RC-DIRECT-STABILITY1` (fix Direct WS at its source via 6 fix-candidate arms); 3.2b.1 stays `unfrozen but parked` behind this track per `Inv-NoSpinningUntilEvidence`. Master = this PR's squash commit on top of `6c923c39` (PR #273 CI gate).
+**Last updated:** 2026-06-04 (thu) — **🟡 Arm C field matrix closed → H-C refuted (cadence is detection timing, not fix lever). Next: Arm D data-frame heartbeat** to discriminate WS-control-frame-only kill vs broader packet-layer kill. Production `pingInterval(15 s)` stays. Master = this PR's squash commit on top of `bbc575a8` (PR #277 Arm C merge).
 
 Shipped:
 - **#265 `99cb1d6f`** — RC-DIRECT-WS-DEATH1 mini-lock rev4 (Phase 1 plan).
@@ -12,6 +12,11 @@ Shipped:
 - **#271 `358e063e`** — Phase 2 marker emit (`PHASE2_CAPTURE_MARKER` logcat line + `DEBUG_PHASE2_MODE` BuildConfig field, debug-gated, zero transport touch).
 - **#272 `a4d3b45b`** — Phase 2 outcome — evidence summary §31-§39 + durable log bundle. PCAPdroid v12 capture set (6 sessions × 3 artifacts), tshark spot-checks confirmed (#1 + #2) and refined (#3 TCP-layer ambiguous). 3.2b.1 unfreezes; Mode 1 closed as return-path loss; Mode 2 closed as unstable TCP/TLS path with mixed sub-cases.
 - **#273 `6c923c39`** — PR-1 of three locked PRs for opening RC-DIRECT-STABILITY1: CI loopback-only-ports gate (`.github/workflows/deploy-lint.yml`). Pre-merge enforcement of `Inv-BypassIsLoopbackOnly` before any Arm A experiment can add a temporary port binding on the production VPS. Python + PyYAML structural parse, short-circuits on irrelevant PRs, fail-closed on missing `127.0.0.1:` prefix or long-form dict syntax with missing `host_ip`.
+- **#274 `3458c136`** — RC-DIRECT-STABILITY1 mini-lock §1-§12 + ADR-028 Direct Stability Architecture Intent + durable log bundle.
+- **#275 `179327bf`** — Arm A PR-3a: loopback-only compose delta (`127.0.0.1:8081:8080`) + field playbook two-command bridge (`ssh -N -L` + `adb reverse`). VPS-deployed + 3 reachability checks passed.
+- **#276 `a6d8bea9`** — Arm A PR-3b: `RcDirectArmA` Caddy-bypass diagnostic class + `DEBUG_BYPASS_URL` double-gate + AppContainer wire-up + Service short-circuit + lifecycle shield fixup.
+- **#277 `bbc575a8`** — Arm C PR-4: OkHttp ping interval matrix diagnostic + Arm A outcome record (PARTIAL/PASS for loopback path) + Arm A.2 parking-lot fallback + baseline-semantics clarification.
+- **This PR** — PR-5 docs bundle: Arm C outcome record (H-C refuted, lifetime ≈ 3 × ping_interval, Mode 2 carrier signature persists) + Arm D scope refine (payload `phantom:diagnostic:heartbeat-echo:v1:<seq>:<client_ms>`, default-off env flag, architect pre-review design locks for PR-6 absorbed) + new F-Mode2-cadence-invariant fact in §1.
 - **This PR** — PR-2 of three locked PRs: RC-DIRECT-STABILITY1 mini-lock §1-§12 + ADR-028 (Direct Stability Architecture Intent) + durable log bundle. Strategic pivot documented; 4-layer architecture locked (REST messages always / WS+SSE realtime signaling / REST voice media / WebRTC+TURN calls / Tor+Reality privacy overlays). Six fix-candidate arms scoped (A Caddy bypass / B Caddy tuning verification / C OkHttp ping interval matrix / D data-frame heartbeat / E short-lived rotation / F SSE-long-poll deferred to its own future mini-lock). Architect + security pre-draft reviews absorbed. Ship criterion locked with asymmetric PASS / PARTIAL / FAIL semantics — PASS = zero ping-timeout in 15-min capture on target network, PARTIAL = p95 ≥ 3× baseline AND no delivery regression but ping-timeouts persist, FAIL = neither.
 
 **Phase 2 outcome (Vladislav-locked):**
