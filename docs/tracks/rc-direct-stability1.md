@@ -69,9 +69,23 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
 
 **Setup.**
 
-1. Operator edits `deploy/docker-compose.yml` to add `ports: ["127.0.0.1:8081:8080"]` to the relay service block. The CI gate from PR #273 enforces the loopback prefix at merge time. A short comment alongside the new line documents the revert TODO.
-2. Operator runs `docker compose up -d relay` on the VPS. ~5 s container restart; existing WS users drop and reconnect via REST fallback per `RestStateMachine`.
-3. Operator opens an SSH local-forward from a dev machine to the VPS loopback: `ssh -L 8081:127.0.0.1:8081 root@phntm.pro`. The dev machine now reaches the relay's bypass listener at `127.0.0.1:8081`.
+1. Operator edits `deploy/docker-compose.yml` to add `ports: ["127.0.0.1:8081:8080"]` to the relay service block (landed by PR-3a). The CI gate from PR #273 enforces the loopback prefix at merge time. The comment alongside the new line documents the revert TODO.
+2. Operator runs `docker compose up -d --force-recreate relay` on the VPS. ~5 s container restart; existing WS users drop and reconnect via REST fallback per `RestStateMachine`.
+3. Operator establishes the **two-command bridge** between the test device and the VPS loopback. Both commands are required — if only `adb reverse` is set up, Tecno's `ws://127.0.0.1:8081/ws` falls into Windows localhost (where nothing listens), not the VPS loopback:
+
+   ```powershell
+   # 1. Hold an SSH local-forward (background, no remote shell) from the dev
+   #    machine to the VPS loopback. The `-N` flag tells SSH to forward only.
+   ssh -N -L 8081:127.0.0.1:8081 phantom@relay.phntm.pro
+
+   # 2. (Physical Tecno only — skip for emulator.) Forward the on-device
+   #    127.0.0.1:8081 over USB to the dev machine's 127.0.0.1:8081, which
+   #    in turn is the SSH-tunnel endpoint from step 1.
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 reverse tcp:8081 tcp:8081
+   ```
+
+   After both commands the data path is:
+   `Tecno ws://127.0.0.1:8081/ws → adb reverse over USB → dev-machine 127.0.0.1:8081 → ssh tunnel → VPS 127.0.0.1:8081 → relay container 8080`.
 4. I build a diagnostic Android APK `phantom-bypass-arm-a.apk` with `BuildConfig.DEBUG_BYPASS_URL` set per the device-target rules below. The new diagnostic class `RcDirectArmA` is a sibling of `RcDirectArmB` (Phase 1) — same raw OkHttp `newWebSocket(...)` pattern, same WebSocketListener telemetry shape, but pointed at the bypass URL.
 
    **Device-target rules (locked 2026-06-03 to close `Inv-NoLanInNsc` conflict per PR #274 review):**
