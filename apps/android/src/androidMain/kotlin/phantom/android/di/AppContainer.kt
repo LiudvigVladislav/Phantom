@@ -214,6 +214,43 @@ class AppContainer(private val context: Context) {
         }
     }
 
+    // ── RC-DIRECT-STABILITY1 Arm A — Caddy-bypass diagnostic ────────────────
+    //
+    // Constructed lazily and ONLY when the bypass URL is non-empty in a
+    // debug build (`BuildConfig.DEBUG && BuildConfig.DEBUG_BYPASS_URL.isNotEmpty()`).
+    // The wire-up site (`PhantomMessagingService.onStartCommand`) checks
+    // the same gate before calling `.start(...)` and short-circuits the
+    // production Hybrid Ktor `transport.connect(...)` path so production
+    // and diagnostic WS never share `state.clients[identity]` at the
+    // relay (Inv-ParallelArmIsolation carried forward from Phase 1).
+    //
+    // Release builds (`!BuildConfig.DEBUG`) are excluded by the gate, AND
+    // the release BuildConfig block pins `DEBUG_BYPASS_URL` to `""` for
+    // defence-in-depth (see `apps/android/build.gradle.kts` release block).
+    //
+    // The bypass URL points at the relay's loopback host port binding
+    // landed in PR-3a (`deploy/docker-compose.yml`
+    // `ports: ["127.0.0.1:8081:8080"]`) via the two-command bridge
+    // documented in `docs/tracks/rc-direct-stability1.md` §4 Arm A:
+    // `ssh -N -L 8081:127.0.0.1:8081 phantom@relay.phntm.pro` from the
+    // dev machine, plus `adb reverse tcp:8081 tcp:8081` for physical
+    // Tecno.
+    //
+    // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A + §7 step 2.
+    internal val rcDirectArmA: phantom.android.diagnostic.RcDirectArmA? by lazy {
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_BYPASS_URL.isNotEmpty()
+        ) {
+            phantom.android.diagnostic.RcDirectArmA(
+                identityManager = identityManager,
+                relayUrl = phantom.android.BuildConfig.DEBUG_BYPASS_URL,
+                scope = appScope,
+            )
+        } else {
+            null
+        }
+    }
+
     // In-memory cache of the current identity. Populated eagerly at startup and
     // by initMessaging*; readers (ProfileScreen, top-bar avatar, etc.) collect
     // this StateFlow instead of calling identityRepo.loadIdentity() per screen,

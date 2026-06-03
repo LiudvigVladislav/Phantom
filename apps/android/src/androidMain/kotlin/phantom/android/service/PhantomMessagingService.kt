@@ -456,6 +456,43 @@ class PhantomMessagingService : Service() {
             val signingPubKeyHex = signingPair.publicKey.bytes
                 .joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
 
+            // RC-DIRECT-STABILITY1 Arm A short-circuit. When DEBUG_BYPASS_URL
+            // is non-empty in a debug build, route the service to the
+            // Caddy-bypass diagnostic raw-OkHttp socket instead of the
+            // production Hybrid Ktor `transport.connect(...)` path. Same
+            // Inv-ParallelArmIsolation rationale as Arm B below — production
+            // and diagnostic WS must never share `state.clients[identity]`.
+            //
+            // This branch is checked BEFORE the Arm B branch so that if
+            // both flags were somehow set simultaneously, Arm A takes
+            // precedence (the bypass URL is the more specific override).
+            // Both arms should never be active at once in practice — they
+            // measure different things and would compete for the same
+            // identity slot on the relay.
+            //
+            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+            // even if `DEBUG_BYPASS_URL` was somehow non-empty — the release
+            // BuildConfig block pins it to "" as defence-in-depth.
+            //
+            // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A + §7 step 2.
+            if (phantom.android.BuildConfig.DEBUG &&
+                phantom.android.BuildConfig.DEBUG_BYPASS_URL.isNotEmpty()
+            ) {
+                Log.i(
+                    "RC_DIRECT_ARM_A",
+                    "RC_DIRECT_ARM_A_service_short_circuit " +
+                        "identity_prefix=${myPubKey.take(16)} " +
+                        "signing_prefix=${signingPubKeyHex.take(16)} " +
+                        "bypass_url=${phantom.android.BuildConfig.DEBUG_BYPASS_URL} " +
+                        "gen=$myGen",
+                )
+                container.rcDirectArmA?.start(myPubKey, signingPubKeyHex)
+                // Service stays alive (foreground service is the diagnostic
+                // host); the arm runs its own reconnect loop until cancelled
+                // via container.rcDirectArmA?.stop() or the app dies.
+                return@launch
+            }
+
             // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B short-circuit. When the
             // diagnostic flag selects Arm B, the production Hybrid Ktor path
             // is bypassed entirely so the diagnostic raw-OkHttp socket and a
@@ -563,6 +600,22 @@ class PhantomMessagingService : Service() {
     override fun onDestroy() {
         Log.d(TAG, "onDestroy — disconnecting transport")
         super.onDestroy()
+        // RC-DIRECT-STABILITY1 Arm A teardown. Stop the Caddy-bypass
+        // diagnostic socket before the rest of cleanup so a service
+        // restart cannot race two diagnostic sockets sharing
+        // `state.clients[identity]` at the relay (Inv-ParallelArmIsolation
+        // carried forward from Phase 1). Same debug + flag gate as the
+        // start site in onStartCommand. Release builds never reach this
+        // branch — the release BuildConfig pins DEBUG_BYPASS_URL to "".
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_BYPASS_URL.isNotEmpty()
+        ) {
+            runCatching {
+                (application as PhantomApplication).container.rcDirectArmA?.stop()
+            }.onFailure {
+                Log.w(TAG, "RC_DIRECT_ARM_A_stop_failed: ${it.message}")
+            }
+        }
         // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B teardown. Stop the
         // diagnostic raw OkHttp socket before the rest of cleanup so a
         // service restart cannot race two diagnostic sockets sharing
