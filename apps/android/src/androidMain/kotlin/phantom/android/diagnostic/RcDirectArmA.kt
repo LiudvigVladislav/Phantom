@@ -368,6 +368,14 @@ internal class RcDirectArmA(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            // Lifecycle shield #1 per PR #276 review: null `currentWebSocket`
+            // here, before logging or completion.complete, so a concurrent
+            // stop() call from onDestroy cannot read a stale reference to an
+            // already-dead socket and log a spurious `ws_cancelled=true`.
+            // The finally block in runOneSession remains as shield #2.
+            if (currentWebSocket === webSocket) {
+                currentWebSocket = null
+            }
             val nowMs = System.currentTimeMillis()
             val lifetimeMs = if (openAtMs > 0L) nowMs - openAtMs else -1L
             Log.i(
@@ -383,6 +391,10 @@ internal class RcDirectArmA(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            // Lifecycle shield #1 per PR #276 review (same rationale as onClosed).
+            if (currentWebSocket === webSocket) {
+                currentWebSocket = null
+            }
             val nowMs = System.currentTimeMillis()
             val lifetimeMs = if (openAtMs > 0L) nowMs - openAtMs else -1L
             Log.w(
