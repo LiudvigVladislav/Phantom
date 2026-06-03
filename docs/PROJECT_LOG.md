@@ -589,7 +589,7 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
-### 2026-06-03 (wed) · RC-DIRECT-WS-DEATH1 Phase 2 CLOSED + 3.2b.1 UNFROZEN — mini-lock + marker emit + PCAPdroid v12 capture set + tshark spot-checks; Direct WebSocket unreliable on both Wi-Fi and Tele2, root cause is network-layer not client-stack, 3.2b.1 unfreezes as UX-protection for both modes
+### 2026-06-03 (wed) · RC-DIRECT-WS-DEATH1 Phase 2 CLOSED + 3.2b.1 UNFROZEN — mini-lock + marker emit + PCAPdroid v12 capture set + tshark spot-checks; Direct WebSocket unreliable on both Wi-Fi and Tele2, root cause is below app/Ktor and manifests as unreliable TCP/TLS path (not proven to be an OkHttp/Ktor counting bug), 3.2b.1 unfreezes as UX-protection for both modes
 
 Single track-closing journal entry covering three sequential PRs in one day:
 
@@ -604,7 +604,7 @@ Single track-closing journal entry covering three sequential PRs in one day:
 **Phase 2 verdict (Vladislav-locked):**
 - **Mode 1 (Wi-Fi 8-pong rhythm) — H-A confirmed (return-path loss).** 11 Mode 1 deaths across cap1+cap2, 10 with relay-side `ws_protocol_pong_sent` anchor, 0 inbound TLS records on device pcap. `Inv-PcapDoesNotMaskMode` satisfied (Arm P3 Wi-Fi control 5 deaths × 8 pp × ~150 s matches v9 baseline within tolerance).
 - **Mode 2 (Tele2 LTE severe 0-1-pong rhythm) — H-A confirmed for pp=0 sub-case (3 deaths, return-path loss); TCP-layer ambiguous for pp=1 sub-case (36 deaths).** Both sub-cases share the same operational implication: link is unreliable. `Inv-PcapDoesNotMaskMode` satisfied (Arm P3 Tele2 control 23 deaths × 0-1 pp × 30-45 s matches v11 Arm A baseline).
-- **H-B/C/D refuted** as a primary or contributing mechanism for any death captured in Phase 2 (Phase 1's hypothesis that OkHttp internal mis-handling might explain the deaths is **not supported** by Phase 2 raw wire evidence — no Mode 1 or Mode 2 death has inbound TLS records present at the expected anchor).
+- **H-B/C/D "inbound TLS reached device but OkHttp failed to count Pong" branch is refuted** for every death where Tier 1 evidence is conclusive (all Mode 1 + Mode 2 pp=0 — no inbound TLS records present at the expected anchor). **Mode 2 pp=1 remains TCP-layer ambiguous** per §32(c) — outbound TLS payload present and relay TCP-acks it, but the relay-side TLS/WS delivery stall candidate cannot be excluded without TCP seq-number or BPF analysis. **Does not block 3.2b.1 unfreeze** per §35.
 - **3.2b.1 unpause decision per §24 acceptance gates:** **3.2b.1 unfreezes as UX-protection for both modes.** `Inv-NoChangeUntilEvidence` (Phase 1 mini-lock §3) is satisfied. Combined verdict: Mode 1 closed as return-path loss; Mode 2 closed as unstable TCP/TLS path with mixed sub-cases.
 
 **Architect interpretation reconciliation (§37):** spot-checks #1 and #2 confirm architect parser output. Spot-check #3 refines architect's "похоже на uplink loss" hypothesis — operational verdict ("link unreliable") stands, but the specific mechanism is left open per §32(c) and parked in §38. The refinement does NOT change the §35 unfreeze verdict.
