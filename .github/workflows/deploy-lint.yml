@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Deploy hardening lint — pre-merge enforcement of deploy/ invariants that
+# cannot be enforced at code level.
+#
+# Currently enforces one invariant: relay service in deploy/docker-compose.yml
+# must not bind ports to non-loopback addresses. Background:
+#   - The relay container runs on the internal Docker bridge and is reached
+#     by Caddy for TLS termination + edge auth + rate limits.
+#   - Production has NO host port binding on the relay service (the existing
+#     comment at deploy/docker-compose.yml:39-40 documents this).
+#   - Diagnostic experiments (e.g. RC-DIRECT-STABILITY1 Arm A bypass) need a
+#     temporary host port binding to talk to the relay without Caddy in front.
+#   - Such bindings MUST use 127.0.0.1:PORT:8080 (or ::1:PORT:8080). A missing
+#     loopback prefix — i.e. PORT:8080 alone or 0.0.0.0:PORT:8080 — exposes
+#     the relay's plain-WS endpoint to the public internet, bypassing TLS,
+#     auth-rate-limiting, and Caddy edge protections. This gate fails closed
+#     on such a typo BEFORE the change can be merged and deployed.
+#
+# Implementation: Python + PyYAML (both preinstalled on ubuntu-latest) parses
+# the compose file structurally rather than relying on regex over raw YAML,
+# which avoids quoting / multiline-list / comment edge cases.
+
+name: Deploy lint
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'deploy/docker-compose.yml'
+      - '.github/workflows/deploy-lint.yml'
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  relay-loopback-only-ports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # On pull_request, short-circuit to green if the diff does not touch
+      # the files this gate cares about. Mirrors the relay.yml pattern so
+      # branch protection rulesets marking this check as required do not
+      # deadlock on unrelated PRs.
+      - name: Detect deploy-lint-relevant changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$base" "$head" -- \
+                'deploy/docker-compose.yml' \
+                '.github/workflows/deploy-lint.yml' \
+                | grep -q .; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No deploy/docker-compose.yml or workflow changes — skipping loopback check."
+            fi
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install PyYAML
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          python3 -m pip install --quiet --user PyYAML
+          python3 -c "import yaml; print(f'PyYAML {yaml.__version__}')"
+
+      - name: Verify relay service ports are loopback-only
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import sys
+          import yaml
+
+          COMPOSE = "deploy/docker-compose.yml"
+
+          # Loopback prefixes that are safe — both IPv4 and IPv6 forms.
+          # Docker accepts either; the kernel restricts the bind to the
+          # loopback interface in both cases.
+          LOOPBACK_PREFIXES = ("127.0.0.1:", "::1:", "[::1]:")
+
+          try:
+              with open(COMPOSE, "r", encoding="utf-8") as f:
+                  doc = yaml.safe_load(f)
+          except FileNotFoundError:
+              print(f"::notice::{COMPOSE} not present; nothing to check.")
+              sys.exit(0)
+          except yaml.YAMLError as e:
+              print(f"::error file={COMPOSE}::Failed to parse compose YAML: {e}")
+              sys.exit(2)
+
+          services = (doc or {}).get("services", {}) or {}
+          relay = services.get("relay", {}) or {}
+          ports = relay.get("ports", []) or []
+
+          if not ports:
+              print(f"::notice::relay service in {COMPOSE} has no host port bindings — production-safe state. PASS.")
+              sys.exit(0)
+
+          print(f"Found {len(ports)} relay port binding(s):")
+          for p in ports:
+              print(f"  - {p!r}")
+          print()
+
+          invalid = []
+          for entry in ports:
+              # Each entry can be a string ("127.0.0.1:8081:8080") or a dict
+              # (long-form syntax). Normalise to a string for the prefix test;
+              # for long-form dicts, the relevant field is `host_ip` (defaults
+              # to 0.0.0.0 if absent).
+              if isinstance(entry, str):
+                  s = entry.strip()
+                  if not s.startswith(LOOPBACK_PREFIXES):
+                      invalid.append(entry)
+              elif isinstance(entry, dict):
+                  host_ip = entry.get("host_ip", "")
+                  # An empty host_ip in long-form syntax means Docker defaults
+                  # to 0.0.0.0 — explicitly disallow that as well.
+                  if host_ip not in ("127.0.0.1", "::1"):
+                      invalid.append(entry)
+              else:
+                  # Unknown shape — fail closed.
+                  invalid.append(entry)
+
+          if invalid:
+              print(f"::error file={COMPOSE}::Inv-BypassIsLoopbackOnly violated — relay service has non-loopback port binding(s):")
+              for entry in invalid:
+                  print(f"::error file={COMPOSE}::  {entry!r}")
+              print()
+              print("Bypass diagnostic experiments (e.g. RC-DIRECT-STABILITY1 Arm A) MUST")
+              print("bind to 127.0.0.1:PORT:8080 or ::1:PORT:8080 only. A missing loopback")
+              print("prefix defaults to 0.0.0.0 in Docker — exposing a TLS-free WS endpoint")
+              print("to the public internet, bypassing Caddy edge protections.")
+              print()
+              print("See docs/tracks/rc-direct-stability1.md §3 Inv-BypassIsLoopbackOnly.")
+              sys.exit(1)
+
+          print("All relay port bindings are loopback-only. PASS.")
+          PYEOF
