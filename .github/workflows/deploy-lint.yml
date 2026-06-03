@@ -16,9 +16,10 @@
 #     auth-rate-limiting, and Caddy edge protections. This gate fails closed
 #     on such a typo BEFORE the change can be merged and deployed.
 #
-# Implementation: Python + PyYAML (both preinstalled on ubuntu-latest) parses
-# the compose file structurally rather than relying on regex over raw YAML,
-# which avoids quoting / multiline-list / comment edge cases.
+# Implementation: Python (preinstalled on ubuntu-latest) + PyYAML (installed
+# in a dedicated workflow step) parses the compose file structurally rather
+# than relying on regex over raw YAML, which avoids quoting / multiline-list /
+# comment edge cases.
 
 name: Deploy lint
 
