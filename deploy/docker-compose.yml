@@ -36,8 +36,32 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    # No host port binding — Caddy reaches the relay on the internal network only.
-    # Exposing the port publicly would bypass TLS termination and rate limits.
+    # Production: no PUBLIC host port binding. Caddy reaches the relay on the
+    # internal Docker network only. Exposing the port publicly would bypass TLS
+    # termination, edge auth-challenge rate limits, and abuse-report logging.
+    #
+    # Diagnostic (RC-DIRECT-STABILITY1 Arm A): a loopback-only host binding
+    # exposes the relay on 127.0.0.1:8081 of the VPS host. This is unreachable
+    # from any non-loopback interface by Linux kernel routing — it is NOT a
+    # public exposure. A dev machine reaches it via an SSH tunnel
+    # (`ssh -N -L 8081:127.0.0.1:8081 phantom@relay.phntm.pro`); a physical
+    # Android device additionally needs `adb reverse tcp:8081 tcp:8081` so
+    # the on-device URL stays `ws://127.0.0.1:8081/ws` and Inv-NoLanInNsc
+    # holds. See docs/tracks/rc-direct-stability1.md §4 Arm A for the full
+    # field playbook.
+    #
+    # The 127.0.0.1: prefix is mandatory and machine-enforced: the CI gate at
+    # .github/workflows/deploy-lint.yml (Inv-BypassIsLoopbackOnly, shipped in
+    # PR #273) fails the merge if this entry loses the loopback prefix or
+    # binds to 0.0.0.0 / unqualified PORT:8080. Removing the prefix would
+    # silently default to public exposure in Docker.
+    #
+    # TODO REVERT after RC-DIRECT-STABILITY1 Arm A field run completes:
+    # remove the `ports:` block entirely, then on the VPS
+    # `docker compose up -d --force-recreate relay` (brief ~5 s container
+    # restart; existing WS users drop and reconnect via REST fallback).
+    ports:
+      - "127.0.0.1:8081:8080"
     expose:
       - "8080"
     networks:
