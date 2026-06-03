@@ -180,6 +180,26 @@ android {
             // (pinned to "0" in the release block + runtime gate `BuildConfig.DEBUG`).
             val phase2Mode = localOrEnv("phase2Mode", "PHASE2_MODE", "0")
             buildConfigField("String", "DEBUG_PHASE2_MODE", "\"$phase2Mode\"")
+            // RC-DIRECT-STABILITY1 Arm A: Caddy-bypass diagnostic URL.
+            // When non-empty in a debug build, the wire-up site at
+            // `AppContainer.rcDirectArmA` constructs `RcDirectArmA` pointed
+            // at this URL, and `PhantomMessagingService.onStartCommand`
+            // short-circuits the production Hybrid Ktor `transport.connect(...)`
+            // path (Inv-ParallelArmIsolation). Expected values:
+            //   ""                          — disabled (default; production-equivalent run)
+            //   "ws://10.0.2.2:8081/ws"     — emulator + adb localhost forward
+            //                                 (10.0.2.2 is already in NSC cleartext whitelist)
+            //   "ws://127.0.0.1:8081/ws"    — physical Tecno via the two-command
+            //                                 bridge: `ssh -N -L 8081:127.0.0.1:8081 ...`
+            //                                 + `adb reverse tcp:8081 tcp:8081`
+            //                                 (127.0.0.1 is already in NSC cleartext whitelist;
+            //                                 LAN IPs are forbidden per Inv-NoLanInNsc)
+            // Override via `local.properties` `debugBypassUrl=ws://...` or
+            // env DEBUG_BYPASS_URL. Release builds ignore the value entirely
+            // (pinned to "" in the release block + runtime gate `BuildConfig.DEBUG`).
+            // Design locked in `docs/tracks/rc-direct-stability1.md` §3 + §4 Arm A.
+            val debugBypassUrl = localOrEnv("debugBypassUrl", "DEBUG_BYPASS_URL", "")
+            buildConfigField("String", "DEBUG_BYPASS_URL", "\"$debugBypassUrl\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -216,6 +236,16 @@ android {
             // but the field is pinned for defence-in-depth and to keep the
             // release BuildConfig surface deterministic.
             buildConfigField("String", "DEBUG_PHASE2_MODE", "\"0\"")
+            // RC-DIRECT-STABILITY1 Arm A: release builds ALWAYS pin the
+            // Caddy-bypass URL to "". The runtime gate at the wire-up
+            // site also checks `BuildConfig.DEBUG && DEBUG_BYPASS_URL.isNotEmpty()`,
+            // so a release build can never construct `RcDirectArmA` even
+            // if the field were corrupted. A plain-WS path that points at
+            // any address from a release APK would violate Inv-NoLanInNsc
+            // and the ADR-028 security baseline; this pin is the
+            // defence-in-depth backstop locked in
+            // `docs/tracks/rc-direct-stability1.md` §3 Inv-BypassIsLoopbackOnly.
+            buildConfigField("String", "DEBUG_BYPASS_URL", "\"\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.
