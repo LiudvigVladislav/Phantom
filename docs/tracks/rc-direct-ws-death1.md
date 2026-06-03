@@ -682,3 +682,211 @@ grep 'ws_protocol_pong_sent' relay-docker.log | jq '.utc'
 - Codex external architect memo (received 2026-06-02 via Vladislav) — informs Phase 1 hypothesis space carried into Phase 2.
 
 Phase 2 mini-lock rev1 closes here. CHIP1 remains parked at `78bd979e` throughout. 3.2b.1 code remains paused per `Inv-NoChangeUntilEvidence`. Phase 2 evidence summary will be a separate PR after field-test execution and analysis complete.
+
+---
+
+## Phase 2 outcome — evidence summary (Vladislav-locked 2026-06-03 (wed) after PCAPdroid v12 capture set)
+
+Master at lock: this PR's merge commit, on top of `358e063e`. Phase 2 closed; 3.2b.1 code path unfreezes per §35; Council on revised 3.2b.1 scope follows in a separate session per Vladislav direction.
+
+### §31 — Empirical base — Phase 2 v12 capture set
+
+Six logcat + pcap + relay-log triples executed sequentially on the same field-test day across two network types. Identity unchanged throughout. APKs all built from master `358e063e` with `rcDirectArm=B` (Phase 1 Arm B raw OkHttp diagnostic) and one of three `phase2Mode` values (P3 control / P1 Wi-Fi target / P2 Tele2 LTE target) per Phase 2 mini-lock §22. PCAPdroid in raw mode, app-scoped to `phantom.android`, full pcap export.
+
+| # | Session | Network | APK SHA256 | UTC start | UTC end | Duration |
+|---|---|---|---|---|---|---|
+| 1 | Arm P3 Wi-Fi control | Wi-Fi | `09b3ec5c12028a8a87f6cbb01c45f4cb0511c830eeb939a8f59265addc1986d8` (APK_P3) | `2026-06-03T04:51:15.140Z` | `2026-06-03T05:06:11.531Z` | 14m 56s |
+| 2 | Arm P1 Wi-Fi capture #1 | Wi-Fi | `2ca6908c627f57172edee0f0ec47ceb78e55f47058c3657f6bc992087a056bfb` (APK_P1) | `2026-06-03T05:10:37.209Z` | `2026-06-03T05:25:05.804Z` | 14m 28s |
+| 3 | Arm P1 Wi-Fi capture #2 | Wi-Fi | same APK_P1 | `2026-06-03T06:05:42.381Z` | `2026-06-03T06:22:00.628Z` | 16m 18s |
+| 4 | Arm P3 Tele2 LTE control | Tele2 LTE | APK_P3 (reinstall) | `2026-06-03T06:28:41.468Z` | `2026-06-03T06:46:45.331Z` | 18m 03s |
+| 5 | Arm P2 Tele2 LTE capture #1 | Tele2 LTE | `ce8c52de38c621f1334c61fa65b3c345632ea9a19405f665ca312af8f25994a9` (APK_P2) | `2026-06-03T06:50:51.637Z` | `2026-06-03T07:06:03.922Z` | 15m 12s |
+| 6 | Arm P2 Tele2 LTE capture #2 | Tele2 LTE | same APK_P2 | `2026-06-03T07:08:53.165Z` | `2026-06-03T07:25:22.341Z` | 16m 29s |
+
+Total: 6 sessions × 3 artifacts = **18 files** archived in `C:\temp\phase2-day-2026-06-03\`. Artifact triples per session: `arm-<arm-id>-<network>-<phase>-tecno.log` (PowerShell `Tee-Object`, UTF-16 LE BOM), `arm-<arm-id>-<network>-<phase>-tecno.pcap` (PCAPdroid full pcap export), `arm-<arm-id>-<network>-<phase>-relay.log` (`docker logs phantom-relay --since/--until`, UTF-16 LE BOM).
+
+Initial Sessions 2 (`arm-p1-wifi-cap1-relay.log`) was empty (0 bytes) on first pull due to UTC argument truncation; re-pull on the same field-test day succeeded with `132 940 bytes` and the session was promoted from PARTIAL to PASS for Mode 1 evidence.
+
+Wall-clock alignment per Inv-WallClockAlignment §21: three time sources verified within ≤ 1 s at field-test day start (Tecno `adb shell date -u` 04:45:50, Windows host `[DateTime]::UtcNow` 04:45:51.26, relay container `docker exec phantom-relay date -u` 04:45:53 — three-second spread of which most is `adb shell` + `ssh round-trip` latency, real clock skew ≤ 1 s).
+
+### §32 — Tier 1 raw wire correlation findings
+
+Independently verified with `tshark` 4.6.6 spot-checks on three architect-anchored cases. Reproducible commands in §36.
+
+**(a) Mode 1 — Wi-Fi 8-pong rhythm — return-path loss confirmed.**
+
+| Capture | Mode 1 deaths | With relay `ws_protocol_pong_sent` log anchor | Inbound TLS records ±2s around anchor (tshark) |
+|---|---|---|---|
+| Arm P1 Wi-Fi cap1 (Session 2) | 5 | 5 | **0** |
+| Arm P1 Wi-Fi cap2 (Session 3) | 6 | 5 of 6 (one outside relay log window) | **0** |
+
+For each Mode 1 death: relay docker log records `ws_protocol_pong_sent conn_id=<id> pongs_sent=N+1` at the expected UTC, but the device pcap shows **zero inbound TLS Application Data records** from `65.108.154.152:443` in a ±2 s window around relay's send-time + RTT, and **zero packets of any kind** from relay in a wider ±10 s window. This is the canonical signature of return-path loss: relay sent the Pong, it never reached the device's TCP stack.
+
+Tshark spot-check #1 (P1 Wi-Fi cap2 Session 3, 9th Pong anchor `2026-06-03T06:11:00.196Z`): independently verified `0` inbound TLS records ±2 s, `0` packets ±10 s. Architect parser output matches.
+
+**(b) Mode 2 — Tele2 LTE severe 0-1-pong rhythm — pp=0 sub-case: return-path loss confirmed.**
+
+| Capture | pp=0 deaths | With relay `ws_protocol_pong_sent` log anchor | Inbound TLS records ±2s around anchor (tshark) |
+|---|---|---|---|
+| Arm P2 Tele2 LTE cap1 (Session 5) + cap2 (Session 6) combined | 3 | 3 | **0** |
+
+Same signature as Mode 1: relay sent 1st Pong, device pcap shows no inbound TLS records around the anchor.
+
+Tshark spot-check #2 (P2 Tele2 cap1 first session, 1st Pong anchor `2026-06-03T06:51:28.529Z`): independently verified `0` inbound TLS records ±2 s, `0` packets ±10 s. Architect parser output matches.
+
+**(c) Mode 2 — Tele2 LTE severe 0-1-pong rhythm — pp=1 sub-case: TCP-layer ambiguous.**
+
+| Capture | pp=1 deaths | Outbound 2nd ping TLS payload visible in pcap | Relay-side `ws_protocol_ping_received` for the 2nd ping |
+|---|---|---|---|
+| Arm P2 Tele2 LTE cap1 + cap2 combined | 36 | yes (28-byte outbound TLS Application Data records around expected 2nd-ping UTC) | **no** (relay session_summary consistently shows `pings_received=1`) |
+
+For each pp=1 death: the device pcap contains an outbound 28-byte TLS Application Data record at the expected 2nd-ping UTC (≈ 1st-ping UTC + 15 s pingInterval), but the relay logs only `pings_received=1` for that `conn_id` and closes the session with `Connection reset without closing handshake` and a `since_last_ping_ms` value ≈ session lifetime − 15 s.
+
+Tshark spot-check #3 (P2 Tele2 cap1, conn_id=197, 2nd-ping anchor near `2026-06-03T06:52:13.452Z`): outbound 28-byte TLS Application Data record observed at `06:52:14.649Z` (1.2 s after architect's expected anchor). At `06:52:14.650Z` — 1 ms after the outbound packet — a TCP ACK arrives from relay (0-byte TLS payload). Relay's WS layer logged no `ws_protocol_ping_received` for the 2nd ping; session ended at `06:54:34.569Z` with `pings_received=1 pongs_sent=1 since_last_ping_ms=153650`.
+
+**Architect refinement (Vladislav-locked language):** Mode 2 pp=1 sub-case is **TCP-layer ambiguous**. The pcap shows an outbound TLS payload and a near-immediate relay TCP ACK, but the relay's WS layer logs no second ping/pong. Discriminating "Tecno-side TCP retransmit satisfied by duplicate ACK → uplink loss at IP layer" from "TCP packet arrived at relay's TCP buffer but the inner WS frame was not delivered to relay's WS application layer → relay-side TLS/WS delivery stall" requires TCP sequence/ack-number analysis or server-side BPF. Both candidates point to the same operational conclusion: **the link Tecno ↔ relay is unreliable in this sub-case**.
+
+The exact mechanism is parked (see §38 parking lot) — discrimination is not load-bearing for the §35 unfreeze decision.
+
+### §33 — Inv-PcapDoesNotMaskMode verification (P3 control comparisons)
+
+Per Phase 2 mini-lock §21 Inv-PcapDoesNotMaskMode: each Arm P1 / P2 capture is paired with an Arm P3 control reading taken on the same field-test day. Acceptance: control reading within `lifetime ± 25 %` and `pp_count ± 2` of the matching Phase 1 baseline.
+
+| Control | Phase 1 baseline | Control reading (under PCAPdroid VPN) | Within tolerance? |
+|---|---|---|---|
+| Arm P3 Wi-Fi (Session 1) vs v9 Tecno Wi-Fi (production Ktor) | 5 sessions, ~145 s median lifetime, 8 pp | 5 sessions × pp=8 × lifetime 150 045 .. 150 053 ms (mean ~150 s) | **YES** — lifetime within +3 % of baseline; pp identical |
+| Arm P3 Tele2 LTE (Session 4) vs v11 Arm A Tecno Tele2 LTE | 29 sessions, ~31 s median lifetime, pp=0 | 23 sessions × pp=0 or 1 × lifetime 30 004 .. 45 010 ms | **YES** — lifetime band overlaps Phase 1; pp within ±2 |
+
+Inv-PcapDoesNotMaskMode **satisfied for both modes**. PCAPdroid raw mode did not materially shift either rhythm relative to Phase 1 baselines. Tier 1 evidence in §32 closes §23 rows for both modes.
+
+### §34 — Decision tree resolution (Phase 2 mini-lock §23)
+
+Phase 2 mini-lock §23 listed five outcome rows. Phase 2 captures match two of them cleanly plus identify one row not anticipated by the original §23 table.
+
+| §23 row | Phase 2 evidence | Verdict per row |
+|---|---|---|
+| "Tier 1 records **absent** at expected anchor + Arm P3 control within tolerance → **H-A confirmed for this mode (return-path loss)**" | **Mode 1 fires this row** (§32(a): 11 Mode 1 deaths across cap1+cap2, 10 with relay Pong anchor, 0 inbound TLS records). Inv-PcapDoesNotMaskMode satisfied per §33. | **H-A confirmed for Mode 1.** Return-path loss is the mechanism. Direct WS on Wi-Fi cannot be made reliable by client-side changes alone. |
+| Same row applied to Mode 2 pp=0 sub-case | **Mode 2 pp=0 sub-case fires this row** (§32(b): 3 deaths, 3 with relay Pong anchor, 0 inbound TLS records). Inv-PcapDoesNotMaskMode satisfied per §33. | **H-A confirmed for Mode 2 pp=0 sub-case.** Return-path loss for 1st Pong. |
+| "Tier 1 records **present** at expected anchor + Arm P3 control within tolerance → **H-B/C/D confirmed (device-side / OkHttp internal)**" | Not observed in any Mode 1 or Mode 2 pp=0 death. Mode 2 pp=1 sub-case is TCP-layer ambiguous (§32(c)) — outbound TLS payload present and relay TCP-acks it, but the relay-side TLS/WS delivery stall candidate cannot be excluded without TCP seq-number or BPF analysis. | **H-B/C/D "inbound TLS reached device but OkHttp failed to count Pong" branch is refuted** for every death where Tier 1 evidence is conclusive (all Mode 1 + Mode 2 pp=0). **Mode 2 pp=1 remains TCP-layer ambiguous**, but does not block 3.2b.1 unfreeze per §35. Phase 1's hypothesis that OkHttp internal mis-handling might explain the deaths is **not supported** by Phase 2 raw wire evidence for the conclusively-classified cases. |
+| "Tier 1 ambiguous" | Mode 2 pp=1 sub-case (§32(c)) is **Tier 1 evidence ambiguous at the TCP layer**, but for a refined reason: outbound TLS payload visible, relay TCP-acks it, but relay WS layer doesn't process it. Original §23 "ambiguous" row anticipated NTP drift or anchor-aliasing as causes; this is a different ambiguity. | **§23 table did not anticipate this row.** §38 adds it to the parking lot. **Operational implication identical to H-A:** link is unreliable for this sub-case, regardless of which TCP-layer mechanism is responsible. |
+| "PCAPdroid masked the mode → §27 escalation" | Not fired. Inv-PcapDoesNotMaskMode satisfied per §33. | n/a |
+| "Mixed verdicts across modes" | Fires (Mode 1 = H-A; Mode 2 = H-A for pp=0 + TCP-ambiguous for pp=1) | **Per-mode verdicts stand, independent.** §35 applies §24 verdict rows per mode. |
+
+### §35 — 3.2b.1 unpause decision per §24 acceptance gates
+
+Phase 2 mini-lock §24 Vladislav-locked: per-mode 3.2b.1 unpause criteria, decoupled across modes.
+
+**Mode 1 (Wi-Fi 8-pong rhythm): Tier 1 shows path loss, Arm P3 control within tolerance → §24 row 1 fires → 3.2b.1 unfreezes as UX-protection.**
+
+**Mode 2 (Tele2 LTE severe 0-1-pong rhythm): Tier 1 shows path loss for pp=0 sub-case (3 of ≥ 39 deaths); TCP-ambiguous for pp=1 sub-case (36 of ≥ 39 deaths). Both sub-cases share the same operational implication: the link is unreliable. Arm P3 control within tolerance → §24 row 1 fires (modulo the pp=1 TCP-ambiguity which does not affect the unfreeze decision per Vladislav direction) → 3.2b.1 unfreezes as UX-protection.**
+
+**Combined verdict (Vladislav-locked language):** `3.2b.1 unfreezes as UX-protection for both modes`, formulated as: "Mode 1 closed as return-path loss; Mode 2 closed as unstable TCP/TLS path with mixed sub-cases".
+
+`Inv-NoChangeUntilEvidence` (Phase 1 mini-lock §3) is now formally satisfied for the 3.2b.1 commonMain code path. Implementation work can resume.
+
+The 3.2b.1 scope itself — adaptive validation threshold revision in light of Phase 2 evidence (Mode 2 severity, mixed sub-cases, bidirectional fragility) — is a separate Council session per Vladislav direction (parking lot §38).
+
+### §36 — Tshark reproducible commands (independent verification of architect parser output)
+
+`tshark` 4.6.6 installed via `winget install --id WiresharkFoundation.Wireshark`. All three spot-checks executed against the raw pcap artifacts in `C:\temp\phase2-day-2026-06-03\` with the following commands.
+
+**Spot-check #1 — Mode 1 P1 Wi-Fi cap2, 9th Pong anchor:**
+
+```text
+tshark -r arm-p1-wifi-cap2-tecno.pcap \
+  -Y 'ip.src == 65.108.154.152 and tls and frame.time >= "2026-06-03 06:10:58.196" and frame.time <= "2026-06-03 06:11:02.196"' \
+  -T fields -e frame.time_utc -e tcp.srcport -e tcp.len
+# Result: empty (0 lines) — 0 inbound TLS records ±2s
+
+tshark -r arm-p1-wifi-cap2-tecno.pcap \
+  -Y 'ip.src == 65.108.154.152 and frame.time >= "2026-06-03 06:10:50" and frame.time <= "2026-06-03 06:11:10"' \
+  -T fields -e frame.time_utc -e tcp.flags
+# Result: empty — 0 ALL packets ±10s
+```
+
+**Spot-check #2 — Mode 2 pp=0 P2 Tele2 cap1 first session, 1st Pong anchor:**
+
+```text
+tshark -r arm-p2-tele2-cap1-tecno.pcap \
+  -Y 'ip.src == 65.108.154.152 and tls and frame.time >= "2026-06-03 06:51:26.529" and frame.time <= "2026-06-03 06:51:30.529"' \
+  -T fields -e frame.time_utc -e tcp.srcport -e tcp.len
+# Result: empty — 0 inbound TLS records ±2s
+
+tshark -r arm-p2-tele2-cap1-tecno.pcap \
+  -Y 'ip.src == 65.108.154.152 and frame.time >= "2026-06-03 06:51:20" and frame.time <= "2026-06-03 06:51:40"' \
+  -T fields -e frame.time_utc
+# Result: empty — 0 ALL packets ±10s
+```
+
+**Spot-check #3 — Mode 2 pp=1 P2 Tele2 cap1, conn_id=197 full session timeline:**
+
+```text
+tshark -r arm-p2-tele2-cap1-tecno.pcap \
+  -Y 'tcp.port == 55954 and (ip.src == 65.108.154.152 or ip.dst == 65.108.154.152)' \
+  -T fields -e frame.time_utc -e ip.src -e ip.dst -e tcp.len -e tcp.flags
+# Key rows from output (see §32(c) for full interpretation):
+#   06:51:43.830  10.215.173.1 → 65.108.154.152   0 bytes  SYN (0x0002)
+#   06:51:44.636  65.108.154.152 → 10.215.173.1   370 bytes  TLS handshake done
+#   06:51:59.645  10.215.173.1 → 65.108.154.152   28 bytes  1st ping outbound
+#   06:51:59.836  65.108.154.152 → 10.215.173.1   24 bytes  1st pong inbound  (pp=1 confirmed)
+#   06:52:14.649  10.215.173.1 → 65.108.154.152   28 bytes  2nd ping outbound
+#   06:52:14.650  65.108.154.152 → 10.215.173.1    0 bytes  TCP ACK (no TLS payload)
+#   06:52:29.658  10.215.173.1 → 65.108.154.152   24 bytes  outbound (3rd ping or close-prelude)
+#   06:52:29.661  10.215.173.1 → 65.108.154.152    0 bytes  FIN-ACK (0x0011)  Tecno closes
+#   06:53:32.141  65.108.154.152 → 10.215.173.1    0 bytes  RST-ACK (0x0014)  relay closes
+```
+
+Note: `10.215.173.1` is PCAPdroid's local VPN gateway address on the device side (since PCAPdroid in raw mode tunnels traffic through a local VPN). The actual relay IP `65.108.154.152` is preserved as the remote peer; PCAPdroid's VPN does not NAT the remote peer address.
+
+Relay-side cross-correlation for spot-check #3 (UTF-8-converted relay log):
+
+```text
+grep "conn_id=197 " arm-p2-tele2-cap1-relay-clean.log
+# Output:
+#   06:51:45.746  metadata event="connect" key=89c3b665e9e446b1 conn_id=197
+#   06:52:00.919617  ws_protocol_ping_received conn_id=197 pings_received=1
+#   06:52:00.919712  ws_protocol_pong_sent conn_id=197 pongs_sent=1
+#   06:54:34.569331  WARN ws read error — closing session conn_id=197 error=WebSocket protocol error: Connection reset without closing handshake
+#   06:54:34.569376  ws session ended event="session_summary" conn_id=197 duration_ms=168823 pings_received=1 pongs_sent=1 inbound_frames=1 outbound_frames=0 since_last_ping_ms=153650
+```
+
+Relay-side observed exactly 1 ping/pong for conn_id=197, despite Tecno's pcap showing 2 outbound ping-like 28-byte TLS payloads. This is the TCP-ambiguous Mode 2 pp=1 sub-case per §32(c).
+
+`PCAPdroid` v1.6.x raw mode; `Wireshark`/`tshark` 4.6.6; `PowerShell` ANSI-strip helper applied to UTF-16 BOM relay log for `grep` consumption.
+
+### §37 — Architect interpretation reconciliation
+
+Architect provided first-pass analysis (received 2026-06-03 via Vladislav) using a custom read-only parser. Independent tshark spot-checks confirm or refine the architect's findings as follows:
+
+| Architect claim | Tshark verification | Status |
+|---|---|---|
+| "Mode 1 (Wi-Fi): 0 inbound TLS records ±2s around relay-side 9th Pong UTC" | Spot-check #1: confirmed `0` ±2 s plus `0` ±10 s | **Confirmed** |
+| "Mode 2 pp=0 sub-case (Tele2): 0 inbound TLS records ±2s around relay-side 1st Pong UTC" | Spot-check #2: confirmed `0` ±2 s plus `0` ±10 s | **Confirmed** |
+| "Mode 2 pp=1 sub-case (Tele2): outbound TLS visible around expected 2nd ping, relay не видит следующий ping/pong, **похоже на uplink loss**" | Spot-check #3: outbound TLS confirmed (at 06:52:14.649 — 1.2 s after architect's expected 06:52:13.452); relay-side `pings_received=1` for conn_id=197 confirmed. **TCP ACK from relay at 06:52:14.650 introduces TCP-layer ambiguity** that distinguishes "pure uplink loss" from "TCP arrived but WS-layer stalled". Architect's "похоже на uplink loss" was a hypothesis, not a closed conclusion. | **Refined**: architect's operational verdict ("link unreliable") stands; the specific mechanism ("uplink loss" vs "relay-side TLS/WS delivery stall") is left open per §32(c) and parked in §38. |
+
+The refinement does **not** change the §35 unfreeze verdict. It does motivate keeping the discrimination as a parking-lot item for a future deeper-dive track if the 3.2b.1 work itself surfaces actionable questions about Mode 2 sub-case classification at runtime.
+
+### §38 — Parking lot (deferred until Phase 2 outcomes are absorbed)
+
+- **Mode 2 pp=1 TCP-layer mechanism discrimination.** Distinguishing "Tecno-side TCP retransmit satisfied by duplicate ACK → IP-layer uplink loss" from "TCP packet arrived at relay's TCP buffer but the inner WS frame was not delivered to relay's WS application layer → relay-side TLS/WS delivery stall" requires either TCP sequence/ack-number deep-dive analysis on the existing pcap artifacts, or a future server-side BPF capture on the Hetzner relay host paired with a Phase 2-equivalent Tecno field run. Not load-bearing for §35 unfreeze decision. Open only if the 3.2b.1 implementation work surfaces operational questions that need this discrimination.
+- **Phase 2b — TLS keylog / decrypted Pong proof.** Mini-lock §27 parking-lot item carries over: not triggered by Phase 2 outcomes because Tier 1 raw wire correlation closed the discrimination gates for both modes. Re-evaluate only if a future track explicitly needs WS-frame-level evidence beyond TCP/TLS record-level evidence.
+- **Server-side BPF on Hetzner relay host.** Same status as Phase 2b: not triggered.
+- **Second Android handset on Wi-Fi + Tele2 (Arm I from Phase 1 §4).** Not triggered. Phase 2 closed both modes on Tecno alone.
+- **3.2b.1 scope-revision Council session (Vladislav-locked sequencing).** This evidence summary PR lands first; Council on the revised 3.2b.1 design in light of Phase 2 findings (Mode 2 severity, mixed sub-cases, bidirectional fragility, threshold implications for adaptive validation) follows as a separate session per Vladislav direction. The Council outcome lands as a new design-note PR on the WS-HEALTH-STATE1 track, not as a new Phase 3 section here.
+
+### §39 — Source-of-truth pointers
+
+Phase 2 evidence summary references:
+
+- Phase 1 mini-lock and evidence summary (this file §1-§18) — Phase 1 hypothesis space and Phase 1 v11 baselines for Inv-PcapDoesNotMaskMode comparison.
+- Phase 2 mini-lock (this file §19-§30) — Phase 2 design that this evidence summary fulfils.
+- `docs/tracks/ws-health-state.md` § Commit 3.2b.1 — the adaptive-validation code that unfreezes per §35.
+- `MASTER_TIMELINE_2026.md` "Last updated 2026-06-03 (wed)" — track sequencing; Phase 2 closure bumped this PR.
+- `docs/PROJECT_LOG.md` Session journal 2026-06-03 (wed) entry — `RC-DIRECT-WS-DEATH1 Phase 2 CLOSED + 3.2b.1 UNFROZEN` durable-log entry from this PR.
+- PR #259 (`8727031f`, Commit 3.3 — relay-side `ws_protocol_pong_sent` telemetry) — the relay-side data source used for the Inv-WallClockAlignment cross-correlation.
+- PR #271 (`358e063e`, Phase 2 marker emit) — the `PHASE2_CAPTURE_MARKER` logcat anchor used to align Tecno logcat / relay docker logs / PCAPdroid pcap timestamps per session.
+- Phase 2 v12 APK SHAs: `09b3ec5c...` (APK_P3, `phase2Mode=P3`), `2ca6908c...` (APK_P1, `phase2Mode=P1`), `ce8c52de...` (APK_P2, `phase2Mode=P2`) — all built on master `358e063e` with `rcDirectArm=B`.
+- Phase 2 v12 artifact set: 18 files in `C:\temp\phase2-day-2026-06-03\` (6 sessions × 3 artifacts each). UTF-16 BOM relay logs; UTF-8-converted variants for grep consumption under `*-clean.log`.
+- Tshark version: `Wireshark` / `tshark` 4.6.6 (installed via winget `WiresharkFoundation.Wireshark`). PCAPdroid version: 1.6.x (raw mode, app-scoped to `phantom.android`, full pcap export).
+- Architect first-pass analysis (received 2026-06-03 via Vladislav) — base interpretation that §32 + §37 either confirmed or refined.
+
+Phase 2 closes here. CHIP1 remains parked at `78bd979e`. `Inv-NoChangeUntilEvidence` is now satisfied for 3.2b.1; that code path unfreezes for design + implementation work, which proceeds on the WS-HEALTH-STATE1 track in a separate session after Council on revised scope.

@@ -2,27 +2,30 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-06-02 (tue, late) — **✅ RC-DIRECT-WS-DEATH1 Phase 1 CLOSED.** Master = this PR's squash commit on top of `a9f66ad0` (orthogonal SEO PRs #267 / #268 landed in parallel after #266 and are tracked separately).
+**Last updated:** 2026-06-03 (wed) — **✅ RC-DIRECT-WS-DEATH1 Phase 2 CLOSED + 3.2b.1 UNFROZEN.** Master = this PR's squash commit on top of `358e063e` (PR #271 marker emit).
 
 Shipped:
-- **#265 `99cb1d6f`** — RC-DIRECT-WS-DEATH1 mini-lock rev4 (Phase 1 plan): 6-arm matrix, 8 hard invariants, 4 stacked revisions absorbing two external architect audits.
-- **#266 `08514aee`** — Phase 1 Arm B diagnostic code: `RcDirectArmB.kt` raw OkHttp sequential WebSocket diagnostic, own `OkHttpClient` with identical builder params to production, debug-gated by `BuildConfig.DEBUG_RC_DIRECT_ARM == "B"` with release-pinned to `"0"`, read-only (`webSocket.send(...)` never called), service-level short-circuit ensures production Hybrid Ktor is off for the run window (Inv-ParallelArmIsolation). Lifecycle teardown closes the `WebSocket.cancel()` requirement (OkHttp reader runs on its own dispatcher pool thread).
-- **This PR** — Phase 1 evidence summary (§13-§18 appended to `docs/tracks/rc-direct-ws-death1.md`) + durable log bundle (this entry + matching PROJECT_LOG entry). Sequential v11 captures: Arm A Tecno Tele2 LTE (29 sessions × ~31 s × after 0 pp); Arm A emulator Wi-Fi via host (0 OkHttp ping timeouts in 15 min); Arm B Tecno Tele2 LTE (13 sessions × 30-45 s × after 0-1 pp); Arm B Tecno Wi-Fi (5 sessions × ~150 s × after 8 pp).
+- **#265 `99cb1d6f`** — RC-DIRECT-WS-DEATH1 mini-lock rev4 (Phase 1 plan).
+- **#266 `08514aee`** — Phase 1 Arm B diagnostic code.
+- **#269 `16ee99b9`** — Phase 1 outcome — evidence summary §13-§18 + durable log bundle.
+- **#270 `ca620fe6`** — Phase 2 mini-lock rev1 (PCAPdroid wire-correlation plan §19-§30, two-tier evidence model).
+- **#271 `358e063e`** — Phase 2 marker emit (`PHASE2_CAPTURE_MARKER` logcat line + `DEBUG_PHASE2_MODE` BuildConfig field, debug-gated, zero transport touch).
+- **This PR** — Phase 2 outcome — evidence summary §31-§39 + durable log bundle (this entry + matching PROJECT_LOG entry). PCAPdroid v12 capture set: 6 sessions × 3 artifacts = 18 files, on Tecno Wi-Fi + Tele2 LTE, APKs `09b3ec5c...` (P3 control), `2ca6908c...` (P1 Wi-Fi target), `ce8c52de...` (P2 Tele2 target), all built on master `358e063e` with `rcDirectArm=B`. Independent `tshark` 4.6.6 verification of three architect-anchored spot-checks: spot-check #1 (Mode 1 P1 cap2) and #2 (Mode 2 pp=0 P2 cap1) confirmed; spot-check #3 (Mode 2 pp=1 P2 cap1 conn_id=197) refined architect's interpretation — TCP-layer ambiguous, not pure uplink loss.
 
-**Phase 1 outcome (Vladislav-locked):**
+**Phase 2 outcome (Vladislav-locked):**
 
-- **Two failure modes** identified on the same Tecno device, same OkHttp pinger kill mechanism but different severity:
-  - **Mode 1 "Wi-Fi 8-pong rhythm"** ~145-150 s lifetime (v9 production Ktor + v11 Arm B raw OkHttp both reproduce)
-  - **Mode 2 "Tele2 severe 0-1-pong rhythm"** ~31-45 s lifetime (v11 Arm A production Ktor + v11 Arm B raw OkHttp both reproduce)
-- **Rules out:** Ktor adapter as primary cause (raw OkHttp reproduces both modes, no longer survival than Ktor)
-- **Rules in:** raw OkHttp / WS protocol-ping path is affected on Tecno
-- **Still open:** network return-path loss vs Tecno / HiOS / device stack vs OkHttp internal handling
-- **Do NOT claim:** carrier-independent severity / Tele2-only / server-side bug / device-only bug
+- **Mode 1 (Wi-Fi 8-pong rhythm) — H-A confirmed (return-path loss).** Across both Wi-Fi captures: 11 Mode 1 deaths, 10 with relay-side `ws_protocol_pong_sent` anchor, **0 inbound TLS records** on device pcap within ±2 s around relay's send-time + RTT. Inv-PcapDoesNotMaskMode verified (Arm P3 Wi-Fi control 5 deaths × 8 pp × ~150 s, matches Phase 1 v9 baseline within tolerance).
+- **Mode 2 (Tele2 LTE severe 0-1-pong rhythm) — H-A confirmed for pp=0 sub-case (3 deaths); TCP-layer ambiguous for pp=1 sub-case (36 deaths).** Both sub-cases share the same operational implication: link Tecno ↔ relay is unreliable. Inv-PcapDoesNotMaskMode verified (Arm P3 Tele2 control 23 deaths × 0-1 pp × 30-45 s, matches Phase 1 v11 Arm A baseline).
+- **Rules out (Phase 1 + Phase 2 combined):** Ktor adapter as primary cause; OkHttp internal mis-handling as a primary or contributing mechanism (H-B/C/D refuted by Tier 1 raw wire — no Mode 1 or Mode 2 death has inbound TLS records present at the expected anchor).
+- **Rules in:** Direct WebSocket on Tecno → relay path is unreliable on both Wi-Fi and Tele2, with different severity profiles per network. The root cause is **below app/Ktor and manifests as an unreliable TCP/TLS path; not proven to be an OkHttp/Ktor counting bug**. Mode 2 pp=1 sub-case leaves a relay-side TLS/WS delivery-stall candidate that Tier 1 evidence does not exclude.
+- **3.2b.1 unpause decision per §24 acceptance gates:** **3.2b.1 unfreezes as UX-protection for both modes.** Inv-NoChangeUntilEvidence (Phase 1 mini-lock §3) is satisfied. Mode 1 closed as return-path loss; Mode 2 closed as unstable TCP/TLS path with mixed sub-cases.
 
 **Track state:**
 
-- Phase 1 closed. Phase 2 PCAPdroid mini-lock section will be appended to the same track file in the next session (single-source-of-truth pattern, parallel to WS-HEALTH-STATE1 stacking Commit 2/3.1/3.3/3.2a/3.2b sections in one file).
-- 3.2b.1 commonMain code remains **paused** per `Inv-NoChangeUntilEvidence`. Phase 1 favours 3.2b.1 as a UX shield (client cannot single-handedly fix Mode 2 severity on a degraded carrier) but Phase 2 packet capture may still localise a smaller fix at the client-stack root.
+- Phase 2 closed. RC-DIRECT-WS-DEATH1 track shipped its purpose (discriminate client-stack vs network-stack root cause; produce evidence to unblock 3.2b.1).
+- 3.2b.1 commonMain code path **unfreezes** for design + implementation work, which proceeds on the WS-HEALTH-STATE1 track in a separate session after Council on revised scope.
+- Council session on revised 3.2b.1 scope (Mode 2 severity, mixed sub-cases, bidirectional fragility, threshold implications) follows after this PR lands per Vladislav direction.
+- Mode 2 pp=1 TCP-layer mechanism discrimination ("uplink loss" vs "relay-side TLS/WS delivery stall") parked per §38 — not load-bearing for 3.2b.1 unfreeze decision.
 - `CHIP1` parked at `78bd979e`.
 
 **Three parallel tracks unlocked by audits + v10 evidence (unchanged):**
