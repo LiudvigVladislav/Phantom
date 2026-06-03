@@ -128,8 +128,18 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
 
 1. New `BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS` field in `apps/android/build.gradle.kts`, mirroring the existing `DEBUG_RC_DIRECT_ARM` and `DEBUG_PHASE2_MODE` patterns. Values: `"0"` (use production default of 15 000 ms) / `"10000"` / `"20000"` / `"30000"`. Release-pinned to `"0"` for defence-in-depth.
 2. New diagnostic class `RcDirectArmC` constructed only when `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"`. Class reads the value, parses to `Long`, passes to `OkHttpClient.Builder().pingInterval(value, TimeUnit.MILLISECONDS)`. Otherwise identical to `RcDirectArmB`'s read-only diagnostic pattern.
-3. Build 3 diagnostic APKs (`p-armc-10000.apk` / `p-armc-20000.apk` / `p-armc-30000.apk`). Plus baseline `p-armc-0.apk` (= raw OkHttp at production 15 s, equivalent to Arm B from Phase 1).
-4. 4 × 15-min field runs on the worst-affected network (Tele2 LTE per Phase 2 evidence). Logcat capture with `RC_DIRECT_ARM_C_*` tag + PCAPdroid optional (re-use Phase 2 capture protocol if Inv-WallClockAlignment-grade evidence is needed).
+3. Build 3 Arm C diagnostic APKs (`p-armc-10000.apk` / `p-armc-20000.apk` / `p-armc-30000.apk`) — these are the cadence-variation runs. Each constructs `RcDirectArmC` with the corresponding ping interval and emits `RC_DIRECT_ARM_C_*` logs.
+4. Baseline APKs are **not** Arm C variants — at `rcDirectPingIntervalMs=0` the gate `BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"` is false and `RcDirectArmC` is not constructed. The matrix needs an explicit baseline choice:
+
+   | Baseline | Build flags | Expected telemetry | What it measures |
+   |---|---|---|---|
+   | **Production baseline** | `rcDirectPingIntervalMs=0`, `rcDirectArm=0` (defaults) | `PhantomRelay/session_summary` + `ws_ping_timeout_diag`; **no** `RC_DIRECT_ARM_C_*`, **no** `RC_DIRECT_ARM_B_*` | Production Ktor WS path through Caddy at 15 s ping |
+   | **Raw OkHttp 15 s baseline (Arm B)** | `rcDirectPingIntervalMs=0`, `rcDirectArm=B` | `RC_DIRECT_ARM_B_*` lifecycle lines | Raw OkHttp (no Ktor wrapper) through Caddy at 15 s ping |
+   | **Arm C matrix value** | `rcDirectPingIntervalMs=10000` / `20000` / `30000`, `rcDirectArm=0` | `RC_DIRECT_ARM_C_*` lifecycle lines | Raw OkHttp through Caddy at the matrix ping value |
+
+   The discriminator compares Arm C matrix runs to whichever baseline is chosen. The Arm B baseline is the cleaner comparator because it isolates "raw OkHttp + cadence variation" from "Ktor wrapper". The production baseline is the cleaner comparator if the question is "does Arm C deliver a UX improvement over production today".
+
+5. 4 × 15-min field runs on the worst-affected network (Tele2 LTE per Phase 2 evidence). Logcat capture pulls `RC_DIRECT_ARM_C:V` plus `RC_DIRECT_ARM_B:V` plus the existing production tag set (so a baseline APK with `rcDirectArm=B` is captured by the same logcat command without reconfiguration). PCAPdroid optional (re-use Phase 2 capture protocol if Inv-WallClockAlignment-grade evidence is needed).
 
 **Cost.** ~420 LOC new client code (RcDirectArmC.kt is a near-clone of RcDirectArmA — which is itself a near-clone of RcDirectArmB — with a single Builder parameter change). 1 hour of field test execution (4 × 15 min runs).
 

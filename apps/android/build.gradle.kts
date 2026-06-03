@@ -213,12 +213,17 @@ android {
             // No value here can be auto-promoted to production; any promotion
             // requires a separate named PR with its own mini-lock.
             // Expected values:
-            //   "0"     — disabled (default; matches Arm B baseline raw OkHttp
-            //             at the production 15 s interval — equivalent to running
-            //             RcDirectArmB rather than constructing RcDirectArmC)
-            //   "10000" — 10 s ping interval
-            //   "20000" — 20 s ping interval
-            //   "30000" — 30 s ping interval
+            //   "0"     — Arm C disabled (default). The gate at the wire-up
+            //             site is `BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"`,
+            //             so "0" means `RcDirectArmC` is NOT constructed and
+            //             the service falls through to the next branch: Arm B
+            //             if `rcDirectArm=B`, otherwise production Hybrid Ktor.
+            //             Baseline runs use this value combined with a separate
+            //             choice for the baseline arm (see mini-lock §4 Arm C
+            //             Setup step 4 for the baseline-choice table).
+            //   "10000" — Arm C with 10 s ping interval (RC_DIRECT_ARM_C_*)
+            //   "20000" — Arm C with 20 s ping interval (RC_DIRECT_ARM_C_*)
+            //   "30000" — Arm C with 30 s ping interval (RC_DIRECT_ARM_C_*)
             // Override via `local.properties` `rcDirectPingIntervalMs=20000`
             // or env RC_DIRECT_PING_INTERVAL_MS. Release builds ignore the
             // value entirely (pinned to "0" in the release block + runtime
