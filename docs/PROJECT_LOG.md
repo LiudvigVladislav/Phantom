@@ -589,6 +589,39 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-04 (thu) · RC-DIRECT-STABILITY1 Arm C field matrix CLOSED → H-C refuted (cadence is detection timing, not fix lever); Arm D scope refined with architect pre-review design locks for PR-6 relay echo handler
+
+Single docs-only PR covering the empirical closure of Arm C and the design refinement of Arm D before the relay PR ships.
+
+**Arm A timeline recap (PR #275 + PR #276 + emulator smoke + Tecno tunnel field test 2026-06-03):** loopback bypass via `adb reverse` + SSH local-forward proved relay binary + raw OkHttp + relay WS layer can sustain a WS for 15+ minutes when the data path is loopback (Tecno → USB → Windows → SSH tunnel → VPS loopback → relay). v11 Arm A Tele2 baseline (29 sessions × ~31 s) did NOT reproduce through the tunnel. But the tunnel bypassed Tele2 LTE radio so H-A vs H-B remained architecturally undecidable — recorded as PARTIAL/PASS for loopback-path stability only. Lesson learned saved in memory `feedback_diagnostic_design_must_isolate_one_variable.md`. Arm A.2 (public non-Caddy TLS bypass) added to §9 parking lot as conditional fallback if Arms C/D/E all FAIL.
+
+**Arm C field matrix (Tecno Tele2 LTE 2026-06-03 evening, four sequential 15-min captures via PR #277 master `bbc575a8` APKs):**
+
+| Run | Ping interval | Failures | Median lifetime | Pattern |
+|---|---:|---:|---:|---|
+| Arm B baseline (raw OkHttp at 15 s) | 15 s | 18 | 45 s | first session 0 pong, then 1 pong |
+| Arm C 10 s | 10 s | 23 | 30 s | first session 0 pong, then 1 pong |
+| Arm C 20 s | 20 s | 15 | 60 s | first session 0 pong, then 1 pong |
+| Arm C 30 s | 30 s | 9 | 90 s | first session 0 pong, then 1 pong |
+
+**H-C as a production fix lever is refuted.** Cadence sensitivity is observed, but only as detection timing: changing `pingInterval` changes WHEN OkHttp notices the already-broken path, not WHETHER the path breaks. Linear scaling decomposes as: for subsequent sessions, one successful ping/pong was counted, then the next Pong was missed, then OkHttp failed on the following scheduled ping because `awaitingPong` was still true → lifetime ≈ 3 × ping_interval. For the first session, zero successful pongs → first Pong missed → failure on next ping tick → lifetime ≈ 2 × ping_interval. Mode 2 "first 0, then 1" carrier signature persists across all cadence values. Production `RelayTransportFactory.kt:71 pingInterval(15_000L, MILLISECONDS)` stays at 15 s. Matrix validity clean — production Ktor path silent across all 4 runs (`session_summary = 0`, `ws_ping_timeout_diag = 0`); Arm B baseline only fired `RC_DIRECT_ARM_B_*`; Arm C 10/20/30 only fired `RC_DIRECT_ARM_C_*`. Saved to memory `project_arm_c_lifetime_linear_in_interval_2026_06_04.md` for future-track reference.
+
+**This PR (docs) — PR-5 of the locked sequence.** Three files updated, zero code touch:
+
+- **`docs/tracks/rc-direct-stability1.md` Arm C Outcome subsection added** under §4 Arm C — matrix table, mechanism explanation (subsequent sessions: 1 successful pong, then 1 missed Pong, then failure on next ping tick → lifetime ≈ 3× interval; first session: 0 successful pongs, first Pong missed, then failure on next ping tick → lifetime ≈ 2× interval), Mode 2 signature persistence, ship-criterion FAIL verdict, deceptive-metric warning, memory pointer.
+- **§4 Arm D scope refine** — Vladislav-locked design + architect pre-review for PR-6 absorbed. Payload format locked at `phantom:diagnostic:heartbeat-echo:v1:<seq>:<client_ms>` ASCII Text. Default-off env flag `RELAY_ENABLE_HEARTBEAT_ECHO=1` (strict `v == "1"` parse, any other value fails closed). Validation rigour: length cap ≤ 256 bytes, exact prefix match, `<seq>` + `<client_ms>` parsed as u64 for log lines. Echo via `Message::Text(...)` only per Inv-DataFrameNotControlFrame (never `Message::Pong` — would re-introduce PR-H1e regression class). Per-frame logs at `debug!` level; session-level `echo_frames_received` / `echo_frames_sent` added to existing `session_summary` info line. Operator runbook for `.env` flip + `docker compose up -d --force-recreate relay` + revert step.
+- **§1 F-Mode2-cadence-invariant** fact added — "kill is independent of WS-control-frame cadence" carried forward as a primary fact for any future track scoping (Arms E/F, future stability tracks, 3.2b.1 thresholds).
+
+**Architect pre-review for PR-6 (run in parallel during this PR's draft).** Eight concerns reviewed: code site (insert between is_ping fast-path and handle_message fall-through), feature flag handling (read once at startup in `RelayConfig::from_env()`, store on `Arc<AppState>`), payload validation (length cap + exact prefix + u64 parse), logging (debug-level per-frame + info-level session counters), operator runbook, fail-closed parse rule, test plan (unit test for prefix/length validation + integration test for round-trip), Inv-DataFrameNotControlFrame (P0 — inline comment + unit test asserting returned opcode type). PR-6 will absorb the architect findings directly into the commit body; mini-lock captures only the protocol-level locks (payload format, default-off flag, length cap, fail-closed parse).
+
+**Track sequencing locked:**
+- PR-5 (this PR, docs): Arm C outcome + Arm D scope refine.
+- PR-6 (next, relay code): `services/relay/src/config.rs` adds `heartbeat_echo_enabled: bool` to `RelayConfig`; `services/relay/src/routes.rs` adds echo handler in the `Message::Text` dispatch between the JSON `{"type":"ping"}` fast-path and `handle_message` fall-through; `services/relay/src/main.rs` startup log line announces the flag state; unit + integration tests. ~80 LOC relay code total, default-off, zero behaviour change in production traffic until VPS operator flips the flag.
+- PR-7 (after PR-6 lands + VPS deploys with flag on): NEW `apps/android/src/androidMain/.../diagnostic/RcDirectArmD.kt` near-clone of `RcDirectArmC`. Sends one heartbeat every 15 s with the canonical payload; counts `RC_DIRECT_ARM_D_echo_received seq=N rtt_ms=...` round-trips. Read-only outbound carve-out from Inv-RawArmReadOnly explicitly noted inline. AppContainer + Service wire-up under precedence Arm A → B → C → D → production.
+- Field test: Tecno Tele2 LTE 15-min capture through production network. Verdict per §6 + the H-D discrimination question: if first inbound heartbeat after WS upgrade arrives reliably (echo counts ≥ 1 within first 15 s) while OkHttp Ping/Pong dies → kill is WS-control-frame-specific. If first echo also lost at the Mode 2 anchor → kill is at packet layer, broader than control frames. Either outcome shapes Arm E + Arm A.2 + RC-CADDY-FIX1 decisions.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind RC-DIRECT-STABILITY1 outcome per Inv-NoSpinningUntilEvidence.
+
 ### 2026-06-03 (wed, late) · RC-DIRECT-STABILITY1 OPENED — strategic pivot after Phase 2; primary fix track for Direct WS stability; 3.2b.1 stays unfrozen but parked; ADR-028 locks 4-layer architecture intent
 
 Single track-opening journal entry covering two sequential PRs as the locked sequence's PR-1 + PR-2 (PR-3+ are per-arm code/relay PRs that follow this mini-lock):
