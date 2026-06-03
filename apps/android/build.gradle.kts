@@ -200,6 +200,38 @@ android {
             // Design locked in `docs/tracks/rc-direct-stability1.md` §3 + §4 Arm A.
             val debugBypassUrl = localOrEnv("debugBypassUrl", "DEBUG_BYPASS_URL", "")
             buildConfigField("String", "DEBUG_BYPASS_URL", "\"$debugBypassUrl\"")
+            // RC-DIRECT-STABILITY1 Arm C: OkHttp ping interval matrix
+            // diagnostic. When non-empty (a numeric string different from
+            // "0") in a debug build, the wire-up site at
+            // `AppContainer.rcDirectArmC` constructs `RcDirectArmC` with
+            // OkHttpClient.Builder().pingInterval(value, MILLISECONDS),
+            // and `PhantomMessagingService.onStartCommand` short-circuits
+            // the production Hybrid Ktor path (Inv-ParallelArmIsolation).
+            // Strictly diagnostic — production `RelayTransportFactory.kt:71`
+            // pingInterval(15_000L, MILLISECONDS) is read-only for the
+            // entire RC-DIRECT-STABILITY1 track per Inv-OnlyDiagnosticCadenceChange.
+            // No value here can be auto-promoted to production; any promotion
+            // requires a separate named PR with its own mini-lock.
+            // Expected values:
+            //   "0"     — Arm C disabled (default). The gate at the wire-up
+            //             site is `BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"`,
+            //             so "0" means `RcDirectArmC` is NOT constructed and
+            //             the service falls through to the next branch: Arm B
+            //             if `rcDirectArm=B`, otherwise production Hybrid Ktor.
+            //             Baseline runs use this value combined with a separate
+            //             choice for the baseline arm (see mini-lock §4 Arm C
+            //             Setup step 4 for the baseline-choice table).
+            //   "10000" — Arm C with 10 s ping interval (RC_DIRECT_ARM_C_*)
+            //   "20000" — Arm C with 20 s ping interval (RC_DIRECT_ARM_C_*)
+            //   "30000" — Arm C with 30 s ping interval (RC_DIRECT_ARM_C_*)
+            // Override via `local.properties` `rcDirectPingIntervalMs=20000`
+            // or env RC_DIRECT_PING_INTERVAL_MS. Release builds ignore the
+            // value entirely (pinned to "0" in the release block + runtime
+            // gate `BuildConfig.DEBUG`).
+            // Design locked in `docs/tracks/rc-direct-stability1.md` §3 +
+            // §4 Arm C (refined scope after PR-4 review).
+            val rcDirectPingIntervalMs = localOrEnv("rcDirectPingIntervalMs", "RC_DIRECT_PING_INTERVAL_MS", "0")
+            buildConfigField("String", "DEBUG_RC_DIRECT_PING_INTERVAL_MS", "\"$rcDirectPingIntervalMs\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -246,6 +278,15 @@ android {
             // defence-in-depth backstop locked in
             // `docs/tracks/rc-direct-stability1.md` §3 Inv-BypassIsLoopbackOnly.
             buildConfigField("String", "DEBUG_BYPASS_URL", "\"\"")
+            // RC-DIRECT-STABILITY1 Arm C: release builds ALWAYS pin the
+            // ping-interval matrix value to "0". The runtime gate at the
+            // wire-up site also checks `BuildConfig.DEBUG &&
+            // DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"`, so a release build
+            // cannot construct `RcDirectArmC` even if the field were
+            // corrupted. Any production-promoted ping-interval change is a
+            // separate named PR per Inv-OnlyDiagnosticCadenceChange — this
+            // pin is the defence-in-depth backstop.
+            buildConfigField("String", "DEBUG_RC_DIRECT_PING_INTERVAL_MS", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

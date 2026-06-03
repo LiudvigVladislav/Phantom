@@ -101,6 +101,15 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
 
 **Discriminator.** If Arm A's median session lifetime on Tele2 LTE ≥ 3× the v11 Arm A Tele2 baseline (~90 s vs ~31 s baseline), **H-A confirmed** — Caddy is the proximal kill mechanism on at least one mode. If lifetime is within ±25 % of v11 Arm A baseline, **H-B confirmed** — Caddy is innocent, focus moves to lower-layer experiments.
 
+**Outcome (PR #276 emulator smoke + Tecno field test 2026-06-03):** **PARTIAL / PASS for loopback-path stability, but the discriminator is architecturally undecidable.** Recorded findings:
+
+- **Wire-up proven.** Emulator smoke + Tecno field test both produced the expected `service_short_circuit` → `armed` → `session_start` → `auth_done` → `ws_open` sequence. `Inv-ParallelArmIsolation` held on both runs (production `session_summary` = 0, `ws_ping_timeout_diag` = 0, `RC_DIRECT_ARM_B_*` = 0).
+- **New positive empirical finding.** Tecno field test (15 min 50 s capture, APK SHA `ab6c24f5...`) opened a single WS at `~16 s` after start and held it to capture end — **~15 min 33 s sustained, zero `SocketTimeoutException: sent ping but didn't receive pong` events**. This is the first empirical evidence that the relay binary + raw OkHttp + relay-side WS protocol layer **can sustain a WS for 15+ minutes when the data path is loopback** (Tecno localhost → USB / ADB → Windows → SSH tunnel → VPS loopback → relay). v11 Arm A Tele2 baseline (~31 s) **did not reproduce** through the tunnel.
+- **Architectural limitation that prevents H-A vs H-B verdict.** The `adb reverse` + `ssh -N -L` two-command bridge routes the WS payload over USB and SSH, **not over Tele2 LTE radio**. The experiment proves "loopback path is stable" but cannot prove or refute "Caddy is the kill mechanism on Tele2". Cannot assign a §23-equivalent decision-tree row for H-A vs H-B from this evidence.
+- **Decision per PR #276 + field-test review:** the §6 ship criterion ("zero ping-timeouts in 15-min capture") is met **for the loopback path** but the captured network class is loopback, not the target problematic network (Tele2 LTE). Recorded as PARTIAL for the track's purpose. RC-DIRECT-STABILITY1 continues to Arms C / D / E which exercise the production path through Tele2 + Caddy naturally because the diagnostic is on the device side (not the path side).
+- **Arm A.2 deferred to §9 parking lot.** A public non-Caddy TLS bypass (e.g. temporary nginx / haproxy / stunnel on a different VPS port) would directly discriminate H-A vs H-B over the real carrier path, but it adds a new public TLS surface that requires its own security mini-lock. Triggered only as **conditional fallback** if Arms C / D / E all close without meeting §6.
+- **Lesson learned (memory `feedback_diagnostic_design_must_isolate_one_variable.md`):** any future "remove component X from path" diagnostic must draw the full data path first and verify the experiment exercises the target network. Tunnel / loopback designs remove X AND the target network simultaneously, making the verdict architecturally undecidable.
+
 ### Arm B — Caddy tuning verification (server-side, observational)
 
 **Goal.** Confirm empirically that the production Caddyfile is at its WS-friendliest settings and no further Caddy-side tuning is available.
@@ -119,12 +128,29 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
 
 1. New `BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS` field in `apps/android/build.gradle.kts`, mirroring the existing `DEBUG_RC_DIRECT_ARM` and `DEBUG_PHASE2_MODE` patterns. Values: `"0"` (use production default of 15 000 ms) / `"10000"` / `"20000"` / `"30000"`. Release-pinned to `"0"` for defence-in-depth.
 2. New diagnostic class `RcDirectArmC` constructed only when `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"`. Class reads the value, parses to `Long`, passes to `OkHttpClient.Builder().pingInterval(value, TimeUnit.MILLISECONDS)`. Otherwise identical to `RcDirectArmB`'s read-only diagnostic pattern.
-3. Build 3 diagnostic APKs (`p-armc-10000.apk` / `p-armc-20000.apk` / `p-armc-30000.apk`). Plus baseline `p-armc-0.apk` (= raw OkHttp at production 15 s, equivalent to Arm B from Phase 1).
-4. 4 × 15-min field runs on the worst-affected network (Tele2 LTE per Phase 2 evidence). Logcat capture with `RC_DIRECT_ARM_C_*` tag + PCAPdroid optional (re-use Phase 2 capture protocol if Inv-WallClockAlignment-grade evidence is needed).
+3. Build 3 Arm C diagnostic APKs (`p-armc-10000.apk` / `p-armc-20000.apk` / `p-armc-30000.apk`) — these are the cadence-variation runs. Each constructs `RcDirectArmC` with the corresponding ping interval and emits `RC_DIRECT_ARM_C_*` logs.
+4. Baseline APKs are **not** Arm C variants — at `rcDirectPingIntervalMs=0` the gate `BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"` is false and `RcDirectArmC` is not constructed. The matrix needs an explicit baseline choice:
 
-**Cost.** ~50 LOC new client code (RcDirectArmC.kt is a near-clone of RcDirectArmB with a single Builder parameter change). 1 hour of field test execution (4 × 15 min runs).
+   | Baseline | Build flags | Expected telemetry | What it measures |
+   |---|---|---|---|
+   | **Production baseline** | `rcDirectPingIntervalMs=0`, `rcDirectArm=0` (defaults) | `PhantomRelay/session_summary` + `ws_ping_timeout_diag`; **no** `RC_DIRECT_ARM_C_*`, **no** `RC_DIRECT_ARM_B_*` | Production Ktor WS path through Caddy at 15 s ping |
+   | **Raw OkHttp 15 s baseline (Arm B)** | `rcDirectPingIntervalMs=0`, `rcDirectArm=B` | `RC_DIRECT_ARM_B_*` lifecycle lines | Raw OkHttp (no Ktor wrapper) through Caddy at 15 s ping |
+   | **Arm C matrix value** | `rcDirectPingIntervalMs=10000` / `20000` / `30000`, `rcDirectArm=0` | `RC_DIRECT_ARM_C_*` lifecycle lines | Raw OkHttp through Caddy at the matrix ping value |
 
-**Discriminator.** If one ping-interval value (e.g. 20 000 ms or 30 000 ms) produces median lifetime ≥ 3× v11 Arm B Tele2 baseline, **H-C confirmed**. That value is then a candidate for production promotion in a separate named PR. If all four values produce statistically identical lifetimes, **H-C refuted**.
+   The discriminator compares Arm C matrix runs to whichever baseline is chosen. The Arm B baseline is the cleaner comparator because it isolates "raw OkHttp + cadence variation" from "Ktor wrapper". The production baseline is the cleaner comparator if the question is "does Arm C deliver a UX improvement over production today".
+
+5. 4 × 15-min field runs on the worst-affected network (Tele2 LTE per Phase 2 evidence). Logcat capture pulls `RC_DIRECT_ARM_C:V` plus `RC_DIRECT_ARM_B:V` plus the existing production tag set (so a baseline APK with `rcDirectArm=B` is captured by the same logcat command without reconfiguration). PCAPdroid optional (re-use Phase 2 capture protocol if Inv-WallClockAlignment-grade evidence is needed).
+
+**Cost.** ~420 LOC new client code (RcDirectArmC.kt is a near-clone of RcDirectArmA — which is itself a near-clone of RcDirectArmB — with a single Builder parameter change). 1 hour of field test execution (4 × 15 min runs).
+
+**Refined scope (locked 2026-06-03 per PR-4 review):**
+
+- **Strictly diagnostic.** RcDirectArmC is a **diagnostic cadence arm**, not a production-fix candidate. Its purpose is to measure cadence-sensitivity of the OkHttp ping path on the production carrier route (Tecno → Tele2 → Caddy → relay) — that is, to answer "does varying pingInterval change WS lifetime?" with empirical numbers. The answer is a data point fed into the §5 decision tree; it does **not** authorise any production promotion of a varied pingInterval value.
+- **Production `RelayTransportFactory.kt:71` is read-only for the entire RC-DIRECT-STABILITY1 track per `Inv-OnlyDiagnosticCadenceChange`.** Any value Arm C finds materially improves WS lifetime ships only via a separate named PR with its own mini-lock — never via this track.
+- **Arm C runs against production `BuildConfig.RELAY_URL` (`wss://relay.phntm.pro/ws`)** — through Caddy, through Tele2 LTE radio, through carrier middleboxes. No bypass, no USB tunnel. This addresses the architectural limitation that Arm A's adb-reverse tunnel hit (see Arm A Outcome subsection above): the diagnostic must exercise the target network to discriminate path-layer questions.
+- **No production code mutation.** Arm C is a sibling diagnostic class gated by a new BuildConfig flag; the production transport factory, REST orchestration, capability resolver, and chain selection are all untouched.
+
+**Discriminator.** If one ping-interval value produces median lifetime ≥ 3× v11 Arm B Tele2 baseline on Tele2 LTE, **H-C confirmed** (cadence-sensitive kill mechanism). The result is recorded as evidence in the §5 decision tree and the §6 ship criterion is evaluated per-value. Any production promotion of a varied pingInterval is gated to a separate named PR with its own mini-lock per Inv-OnlyDiagnosticCadenceChange. If all four values produce statistically identical lifetimes, **H-C refuted** — the kill mechanism does not depend on pingInterval cadence on the production path.
 
 ### Arm D — Data-frame heartbeat diagnostic (client + relay coordinated)
 
@@ -260,8 +286,9 @@ Steps 2-6 do not require all to run sequentially in chat sessions — Arm A is t
 
 ## §9 — Parking lot (deferred until §6 verdict lands)
 
-- **Arm F — SSE / HTTP long-poll alternative.** Triggered only if §6 verdict is FAIL across A-E. Implementation cost is relay-track-scale (new route + new state table + auth-surface adjustment). Designs as its own mini-lock.
-- **RC-CADDY-FIX1 track.** Triggered only if Arm A returns H-A (Caddy in kill chain). Production Caddyfile or Caddy replacement work.
+- **Arm A.2 — public non-Caddy TLS bypass.** Conditional fallback added 2026-06-03 after Arm A loopback test (PR #276) closed PARTIAL: the adb-reverse tunnel proved loopback path stability but did not exercise Tele2 LTE radio, leaving H-A vs H-B undecidable. Arm A.2 would install a temporary public TLS terminator (nginx / haproxy / stunnel) on a different VPS port (e.g. `:8443`) forwarding to the relay, then route Tecno via Tele2 LTE to `wss://relay.phntm.pro:8443/ws`. Adds a new public TLS surface that requires its own security pre-flight review + time-box + auto-revert + monitoring guardrails. **Triggered only if Arms C / D / E all close without meeting §6 ship criterion** — at that point H-A discrimination becomes load-bearing for the track verdict. Until then, parked.
+- **Arm F — SSE / HTTP long-poll alternative.** Triggered only if §6 verdict is FAIL across A-E (including Arm A.2 if it ran). Implementation cost is relay-track-scale (new route + new state table + auth-surface adjustment). Designs as its own mini-lock.
+- **RC-CADDY-FIX1 track.** Triggered only if Arm A.2 returns H-A (Caddy in kill chain). Production Caddyfile or Caddy replacement work.
 - **3.2b.1 design Council session.** Triggered only if track outcome is FAIL OR PARTIAL. If PASS, 3.2b.1 is deprioritised (Direct WS works → no UX-protection shield needed).
 - **Server-side BPF on Hetzner relay host.** Triggered only if Arm A returns H-B (Caddy innocent) AND Mode 2 pp=1 discrimination remains needed for product decisions (currently parked as out-of-scope per §8).
 - **Second Android handset on Wi-Fi + Tele2.** Triggered only if any Arm result is suspiciously Tecno-specific (e.g. Arm A PASS on Tecno but indistinguishable from production on a second handset).
