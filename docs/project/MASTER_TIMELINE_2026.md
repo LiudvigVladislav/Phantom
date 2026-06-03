@@ -2,7 +2,7 @@
 
 > **Living document.** Источник истины для трекинга всех треков работы. Обновляется по мере merge каждого PR — чекбоксы превращаются в `[x]`, в "Сделано" секцию добавляется коммит.
 
-**Last updated:** 2026-06-03 (wed) — **✅ RC-DIRECT-WS-DEATH1 Phase 2 CLOSED + 3.2b.1 UNFROZEN.** Master = this PR's squash commit on top of `358e063e` (PR #271 marker emit).
+**Last updated:** 2026-06-03 (wed, late) — **🟢 STRATEGIC PIVOT after RC-DIRECT-WS-DEATH1 Phase 2 closure:** primary fix track is now `RC-DIRECT-STABILITY1` (fix Direct WS at its source via 6 fix-candidate arms); 3.2b.1 stays `unfrozen but parked` behind this track per `Inv-NoSpinningUntilEvidence`. Master = this PR's squash commit on top of `6c923c39` (PR #273 CI gate).
 
 Shipped:
 - **#265 `99cb1d6f`** — RC-DIRECT-WS-DEATH1 mini-lock rev4 (Phase 1 plan).
@@ -10,7 +10,9 @@ Shipped:
 - **#269 `16ee99b9`** — Phase 1 outcome — evidence summary §13-§18 + durable log bundle.
 - **#270 `ca620fe6`** — Phase 2 mini-lock rev1 (PCAPdroid wire-correlation plan §19-§30, two-tier evidence model).
 - **#271 `358e063e`** — Phase 2 marker emit (`PHASE2_CAPTURE_MARKER` logcat line + `DEBUG_PHASE2_MODE` BuildConfig field, debug-gated, zero transport touch).
-- **This PR** — Phase 2 outcome — evidence summary §31-§39 + durable log bundle (this entry + matching PROJECT_LOG entry). PCAPdroid v12 capture set: 6 sessions × 3 artifacts = 18 files, on Tecno Wi-Fi + Tele2 LTE, APKs `09b3ec5c...` (P3 control), `2ca6908c...` (P1 Wi-Fi target), `ce8c52de...` (P2 Tele2 target), all built on master `358e063e` with `rcDirectArm=B`. Independent `tshark` 4.6.6 verification of three architect-anchored spot-checks: spot-check #1 (Mode 1 P1 cap2) and #2 (Mode 2 pp=0 P2 cap1) confirmed; spot-check #3 (Mode 2 pp=1 P2 cap1 conn_id=197) refined architect's interpretation — TCP-layer ambiguous, not pure uplink loss.
+- **#272 `a4d3b45b`** — Phase 2 outcome — evidence summary §31-§39 + durable log bundle. PCAPdroid v12 capture set (6 sessions × 3 artifacts), tshark spot-checks confirmed (#1 + #2) and refined (#3 TCP-layer ambiguous). 3.2b.1 unfreezes; Mode 1 closed as return-path loss; Mode 2 closed as unstable TCP/TLS path with mixed sub-cases.
+- **#273 `6c923c39`** — PR-1 of three locked PRs for opening RC-DIRECT-STABILITY1: CI loopback-only-ports gate (`.github/workflows/deploy-lint.yml`). Pre-merge enforcement of `Inv-BypassIsLoopbackOnly` before any Arm A experiment can add a temporary port binding on the production VPS. Python + PyYAML structural parse, short-circuits on irrelevant PRs, fail-closed on missing `127.0.0.1:` prefix or long-form dict syntax with missing `host_ip`.
+- **This PR** — PR-2 of three locked PRs: RC-DIRECT-STABILITY1 mini-lock §1-§12 + ADR-028 (Direct Stability Architecture Intent) + durable log bundle. Strategic pivot documented; 4-layer architecture locked (REST messages always / WS+SSE realtime signaling / REST voice media / WebRTC+TURN calls / Tor+Reality privacy overlays). Six fix-candidate arms scoped (A Caddy bypass / B Caddy tuning verification / C OkHttp ping interval matrix / D data-frame heartbeat / E short-lived rotation / F SSE-long-poll deferred to its own future mini-lock). Architect + security pre-draft reviews absorbed. Ship criterion locked with asymmetric PASS / PARTIAL / FAIL semantics — PASS = zero ping-timeout in 15-min capture on target network, PARTIAL = p95 ≥ 3× baseline AND no delivery regression but ping-timeouts persist, FAIL = neither.
 
 **Phase 2 outcome (Vladislav-locked):**
 
@@ -22,10 +24,12 @@ Shipped:
 
 **Track state:**
 
-- Phase 2 closed. RC-DIRECT-WS-DEATH1 track shipped its purpose (discriminate client-stack vs network-stack root cause; produce evidence to unblock 3.2b.1).
-- 3.2b.1 commonMain code path **unfreezes** for design + implementation work, which proceeds on the WS-HEALTH-STATE1 track in a separate session after Council on revised scope.
-- Council session on revised 3.2b.1 scope (Mode 2 severity, mixed sub-cases, bidirectional fragility, threshold implications) follows after this PR lands per Vladislav direction.
-- Mode 2 pp=1 TCP-layer mechanism discrimination ("uplink loss" vs "relay-side TLS/WS delivery stall") parked per §38 — not load-bearing for 3.2b.1 unfreeze decision.
+- RC-DIRECT-WS-DEATH1 closed (Phase 1 + Phase 2). RC-DIRECT-STABILITY1 opens as the primary fix track per strategic pivot.
+- 3.2b.1 commonMain code path stays **unfrozen but parked** behind RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence`. No 3.2b.1 design Council session and no 3.2b.1 code while RC-DIRECT-STABILITY1 has Arms still open.
+- ADR-028 (Direct Stability Architecture Intent) shipped in this PR fixes the 4-layer reliability architecture as the durable contract for future stability / transport / privacy decisions.
+- Council on revised 3.2b.1 scope **deferred** until RC-DIRECT-STABILITY1 §6 verdict (PASS / PARTIAL / FAIL) lands. If PASS, 3.2b.1 is deprioritised; if PARTIAL or FAIL, 3.2b.1 Council runs as next-session work.
+- Mode 2 pp=1 TCP-layer mechanism discrimination parked per RC-DIRECT-WS-DEATH1 §38 — may partially close as Arm A bypass side-effect.
+- Next code/relay PR after this lands: **PR-3 = Arm A** (compose-file loopback delta + `RcDirectArmA.kt` diagnostic class, both gated by PR #273 CI guard + new `Inv-BypassIsLoopbackOnly` + double-gated `DEBUG_BYPASS_URL`).
 - `CHIP1` parked at `78bd979e`.
 
 **Three parallel tracks unlocked by audits + v10 evidence (unchanged):**
