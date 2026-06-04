@@ -589,6 +589,39 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-04 (thu, late) · RC-DIRECT-STABILITY1 Arm D field run CLOSED → H-D refuted (application-data Text heartbeat does not survive Mode 2); control/application delivery asymmetry at relay application layer re-prioritises Arm A.2 ahead of Arm E
+
+Single docs-only PR closing Arm D after the field run and refining the §5 next-step rule based on the empirical asymmetry observation.
+
+**Arm D field run (Tecno Tele2 LTE 2026-06-04 13:14:10 — 13:30:20 UTC, PR-7 APK `phantom-armd.apk` SHA `bbcf64278c13bc28437a0aa5196fe7b30007348203e8a41a7612cc23aac690c8`, `RELAY_ENABLE_HEARTBEAT_ECHO=1` on VPS `.env`):**
+
+- **Client log:** 21 `RC_DIRECT_ARM_D_ws_open`, 19 `RC_DIRECT_ARM_D_ws_failure`, 39 `RC_DIRECT_ARM_D_echo_sent`, **0** `RC_DIRECT_ARM_D_echo_received`, 0 heartbeat-sender exceptions. Across every `ws_failure` summary: `echo_received=0 echo_missing=N last_echo_rtt_ms=-1 inbound_text_frames=0 inbound_binary_frames=0`.
+- **Relay log:** 21 `event="connect"` (conn_id 0..20 matching client `ws_open`), 20 `ws_protocol_ping_received` (conn_id 0..19; conn_id 20 too short before capture end), 20 `ws_protocol_pong_sent` (matching). **0** `event=heartbeat_echo_received` (per-frame log at `services/relay/src/routes.rs:523`). **0** `event=heartbeat_echo_sent`. **0** `event=heartbeat_echo_rejected`.
+- **Mode 2 carrier signature persists** across all sessions (s=1: 30 002 ms lifetime, "after 0 successful ping/pongs", ≈ 2× ping_interval; s=2..s=20: ~45 008 ms lifetime, "after 1 successful ping/pongs", ≈ 3× ping_interval). F-Mode2-cadence-invariant fact (§1) widens: the signature is also data-frame-heartbeat-invariant.
+- **First-session downlink Pong loss isolated to s=1.** Relay conn_id=0 shows ping_received + pong_sent at +15 s, but the device reports "after 0 successful ping/pongs" — Pong was sent but never observed on the device. From s=2 onward, "after 1 successful ping/pongs" — first downlink Pong arrives. Read with the asymmetry below, the path tolerates exactly one control round-trip per session before subsequent uplink frames stop reaching the relay application layer.
+
+**H-D refuted.** Application-data Text heartbeat does not survive Mode 2. A production short-message heartbeat would replicate the failure mode it was intended to mitigate. No production-promotion candidate from Arm D. Operator runbook revert step fires after this PR merges: `RELAY_ENABLE_HEARTBEAT_ECHO=1` removed from VPS `.env`, `docker compose up -d --force-recreate relay`.
+
+**Control/application delivery asymmetry at relay application layer** — primary new discriminator. For sessions s=2..s=20, the device sends WS Control Ping **and** WS Text echo seq=1 at approximately the same wall-clock instant (~+15 s after `ws_open`). Relay logs `ws_protocol_ping_received` per session but **never** logs `heartbeat_echo_received`. The two frame classes diverge in delivery to the relay application layer despite traversing the same WS connection in the same direction at the same time. Exact cause of the divergence remains open across at least four hypotheses: OkHttp writer-side enqueue-vs-egress timing on the device, Caddy/TLS WS frame handling distinguishing opcode classes, carrier path stateful inspection, or interaction across these layers. `ws.send(Text)` returning success only proves the frame was queued in OkHttp on the device — not that the bytes physically left the radio.
+
+**Side-finding (not blocker):** relay `event=session_summary` and `event=disconnect` lines absent for all 21 sessions in the captured docker-log window. Two candidate explanations: (a) the docker-logs capture filter dropped them (the SSH `grep -E` invocation had bash quoting issues, so the command that actually produced the captured log is not reproducible from chat); (b) the relay WS handler does not observe client-side teardown — `.next().await` is still pending across all 21 conn_ids when capture ended, indicating a possible server-side WS-handler leak when the carrier silently half-closes TCP. (a) is parsimonious; (b) would be a separate concrete relay bug if reproducible. Does **not** affect the Arm D verdict — per-frame `event=heartbeat_echo_received` fires on every accepted Text receipt at `services/relay/src/routes.rs:523`, independent of session close, and that counter shows zero events. Tracked as a separate low-priority diagnostic outside this track.
+
+**PR #280 lifecycle fix held in field.** Zero heartbeat-sender exceptions across all 21 sessions, no `CancellationException` noise, `openedAt: CompletableDeferred<Long>` gating between `onOpen` and the heartbeat coroutine shipped cleanly. The first echo seq=1 was visible per logcat in every session that lived past +15 s. Inv-DataFrameNotControlFrame held: all 39 outbound heartbeat frames went through the `RcDirectArmD.kt` Text path / `build_heartbeat_echo_response` sole construction site on the relay side; no `Message::Pong` from app code.
+
+**This PR (docs) — Arm D outcome lock.** Three files updated, zero code touch:
+
+- `docs/tracks/rc-direct-stability1.md` Arm D Outcome subsection added under §4 — client + relay counters, Mode 2 signature continuation, control/application asymmetry finding with conservative cause formulation across the four-hypothesis open set, first-session downlink Pong loss isolation to s=1, side-finding `session_summary` absence with two candidate explanations, §6 verdict FAIL, §5 next-step deviation (Arm A.2 ahead of Arm E justified by the asymmetry).
+- `docs/project/MASTER_TIMELINE_2026.md` Last-updated bump + Shipped list extension through PR #282 plus this PR.
+- `docs/PROJECT_LOG.md` this session entry.
+
+**Track sequencing locked:**
+
+- PR #283 (this PR, docs): Arm D outcome lock.
+- PR #284 (next, docs): Arm A.2 scope mini-lock — public non-Caddy TLS bypass on a different VPS port, three-outcome decision tree (Caddy WS path is the killer / carrier-level Text-class kill / carrier-level stateful kill of everything), public TLS surface security mini-lock for the new endpoint.
+- After PR #284 merges: per-arm code/relay PRs implementing the Arm A.2 endpoint + diagnostic APK.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence`.
+
 ### 2026-06-04 (thu) · RC-DIRECT-STABILITY1 Arm C field matrix CLOSED → H-C refuted (cadence is detection timing, not fix lever); Arm D scope refined with architect pre-review design locks for PR-6 relay echo handler
 
 Single docs-only PR covering the empirical closure of Arm C and the design refinement of Arm D before the relay PR ships.
