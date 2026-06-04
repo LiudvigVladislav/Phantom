@@ -589,6 +589,52 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-04 (thu, evening) · RC-DIRECT-STABILITY1 Arm A.2 scope mini-lock — stunnel primary candidate locked after structured trade-off review; W/X/Y three-outcome discriminator + public TLS surface security mini-lock; Arm E sequenced after Arm A.2 outcome
+
+Single docs-only PR promoting Arm A.2 from §9 parking lot to §4 active arm per the Arm D outcome deviation (PR #283 squash `601d9d8d`).
+
+**Scope-locking process.** Structured trade-off review of four TLS terminator candidates (stunnel / HAProxy / Nginx / Rust-in-relay) across four lenses (diagnostic sharpness, security, operational risk, process/architect). Pre-lean: stunnel. P1 objection check found no P1 objections across all four lenses; P2 hard gates (cert sourcing, relay proxy header dependency check, time-box, no-production-promotion, security minimum) baked into the mini-lock as verification steps for the implementation PR. Nginx ruled out as redundant with HAProxy in the same category. Rust-in-relay ruled out as production code touch for a diagnostic — inconsistent with the Arm A/B/C/D minimum-change pattern.
+
+**Why before Arm E.** Arm E (WS rotation) extends session lifetime by proactive reconnect — presupposes the next WS session would be healthy. The Arm D asymmetry makes that presupposition unsafe: rotating to a fresh WS faces the same uplink-Text-fails-immediately failure mode on the new connection. Arm A.2 discriminates the layer at which the asymmetry emerges (Caddy edge vs below-Caddy) before deciding whether Arm E remains a viable next step.
+
+**Primary candidate: stunnel.** Pure TLS unwrap → raw TCP forward to relay `127.0.0.1:8080`. No HTTP awareness, no WS-aware proxying, no Upgrade-header parsing — relay receives HTTP/WS upgrade directly after stunnel decrypts. Maximises diagnostic isolation (changes ONLY TLS implementation layer), smallest new public attack surface (single-purpose terminator with low historical CVE volume), simplest config and revert.
+
+**Fallback: HAProxy.** Activated only if stunnel reveals a hard blocker during design or implementation (cert sharing impossible, relay genuine proxy header dependency, or stunnel cannot provide required TLS mode). Fallback escalation is mechanical — does not require re-running the trade-off review.
+
+**W/X/Y three-outcome discriminator with locked wording bounds.** None of W/X/Y attribute the kill to a specific lower layer with confidence higher than the evidence supports:
+
+- **W (stunnel sustains WS ≥ 3× Tele2 baseline + Text echoes succeed):** Caddy edge path is in the kill chain or contributes. Does NOT prove "TLS innocent" — TLS is still present in stunnel; only the specific Caddy TLS + HTTP + WS-proxy layer is removed. Trigger: open `RC-CADDY-FIX1` track.
+- **X (Ping survives, Text dies — Arm D asymmetry persists):** Asymmetry origin below Caddy edge OR in a layer Caddy and stunnel share. Caddy loses priority as proximal cause. Trigger: below-edge / carrier-side investigation track; 3.2b.1 escalates from "parked" to "needed". Does NOT single-attribute kill.
+- **Y (Mode 2 signature persists through `:8443`):** Caddy strongly loses priority. Structural carrier / path / lower-layer kill. Direct WS realtime on Tele2 LTE is structurally hard. Trigger: uplift realtime per ADR-028 4-layer architecture; open Arm F parking-lot mini-lock; Arm E deprecated. Does NOT prove "TLS broken" or "WebSocket broken".
+
+**P2 hard gates baked in (verified in implementation PR before deploy):**
+
+1. **Cert sourcing strategy** — stunnel reads Caddy cert + key from Caddy's volume read-only; cert/key bytes do NOT enter git; exact path determined on VPS during implementation.
+2. **Relay proxy header dependency check** — `grep -rIn 'X-Forwarded-For\|X-Real-IP\|Forwarded' services/relay/src/` BEFORE deploy; if matches found, evaluate impact and consider HAProxy fallback.
+3. **Time-box hard limit** — stunnel container up only during capture window; separate `deploy/docker-compose.armA2.yml` overlay file NOT merged into persistent deploy.
+4. **No production traffic promotion** — debug-flag-gated client only; production `BuildConfig.RELAY_URL` and `RelayTransportFactory.kt:71` unchanged; no `:8443` URL in production code paths.
+5. **Security mini-lock** — public TLS 1.2+ only, no cleartext, auth (signed-challenge per ADR-027) unchanged, connection cap + rate-limit at stunnel or relay level, explicit deploy/verify/revert runbook, AGPL compliance preserved (stunnel is GPL-2.0).
+
+**This PR (docs) — Arm A.2 scope mini-lock.** Three files updated, zero code touch:
+
+- `docs/tracks/rc-direct-stability1.md`:
+  - §4 Arm A outcome bullet updated: "Arm A.2 deferred to §9 parking lot" → "Arm A.2 promoted to active arm — see Arm A.2 subsection below".
+  - **§4 Arm A.2 active subsection added** between Arm A and Arm B: goal, why-before-Arm-E justification, refined scope (stunnel primary + HAProxy fallback + endpoint shape + time-box + no-promotion + heartbeat-echo flag re-enable for capture window), setup (PR-8a server overlay + VPS deploy step + PR-8b Android diagnostic class + field run), cost, three-outcome discriminator with W/X/Y wording bounds, P2 hard gates, memory pointer.
+  - §5 decision tree D-FAIL row updated to point to Arm A.2 first; A.2 W/X/Y rows added between D-FAIL and E-PASS rows.
+  - §7 implementation order rows 5c (this PR) + 5d (PR-8a server) + 5e (PR-8b client) added; row 6 (Arm E) annotated as conditional on Arm A.2 outcome.
+  - §9 parking lot Arm A.2 entry updated to mark promotion to §4 with refined trigger rule.
+- `docs/project/MASTER_TIMELINE_2026.md` Last-updated bump + Shipped list extension through PR #283 plus this PR.
+- `docs/PROJECT_LOG.md` this session entry.
+
+**Track sequencing locked:**
+
+- PR #284 (this PR, docs): Arm A.2 scope mini-lock.
+- PR-8a (next, server-side code): `deploy/docker-compose.armA2.yml` overlay with stunnel + operator runbook for time-boxed `:8443` open/close.
+- PR-8b (after PR-8a deploys + heartbeat-echo re-enabled): Android `RcDirectArmA2.kt` near-clone of `RcDirectArmD` with `:8443` endpoint URL.
+- Field test: Tecno Tele2 LTE 15-min capture through `wss://relay.phntm.pro:8443/ws`. Verdict per §5 W/X/Y rows.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence` — escalates to "needed" only if Arm A.2 closes X.
+
 ### 2026-06-04 (thu, late) · RC-DIRECT-STABILITY1 Arm D field run CLOSED → H-D refuted (application-data Text heartbeat does not survive Mode 2); control/application delivery asymmetry at relay application layer re-prioritises Arm A.2 ahead of Arm E
 
 Single docs-only PR closing Arm D after the field run and refining the §5 next-step rule based on the empirical asymmetry observation.
