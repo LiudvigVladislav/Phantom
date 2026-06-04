@@ -24,7 +24,7 @@ FOOTER = '''<footer>
     </div>
     <div class="foot-links">
       <a href="https://github.com/LiudvigVladislav/Phantom">GitHub</a>
-      <a href="https://codeberg.org/LiudvigVladislav/Phantom">Codeberg</a>
+      <a href="https://codeberg.org/VladislavLiudvig/Phantom">Codeberg</a>
       <a href="donate.html" data-lang-en>Donate</a><a href="donate.html" data-lang-ru>Поддержать</a>
       <a href="index.html" data-lang-en>Home</a><a href="index.html" data-lang-ru>Главная</a>
     </div>
