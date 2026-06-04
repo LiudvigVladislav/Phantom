@@ -46,23 +46,39 @@
 
 services:
   stunnel-arm-a2:
-    # Upstream image — actively maintained, Alpine-based, single-purpose
-    # TLS terminator. Pinned by digest, not tag, so the diagnostic endpoint
-    # is reproducible: today's deploy and tomorrow's deploy use the exact
-    # same stunnel + OpenSSL build. The :latest tag in dweomer's repo can
-    # advance without notice; for a public TLS surface that's not safe.
-    # Digest resolved from Docker Hub registry API 2026-06-05.
+    # Local build from minimal Alpine + stunnel apk package — see
+    # `deploy/stunnel-armA2/Dockerfile` for the build spec. Alpine base
+    # pinned by digest (`alpine:3.20@sha256:d9e853...`) for
+    # reproducibility across deploys.
     #
-    # To refresh the pin when dweomer publishes a security-relevant
-    # update, follow the procedure in `docs/tracks/rc-direct-stability1.md`
-    # §4 Arm A.2 PR-8a implementation record (cert-rotation handling +
-    # image-refresh handling notes).
+    # Replaces the previous `image: dweomer/stunnel@sha256:c46e11...`
+    # choice from PR-8a (#285) and its port fixup (#286). dweomer's
+    # entrypoint script generates stunnel.conf from STUNNEL_SERVICE /
+    # STUNNEL_ACCEPT / STUNNEL_CONNECT env vars and ignores a
+    # bind-mounted /etc/stunnel/stunnel.conf — incompatible with the
+    # §4 Arm A.2 Security mini-lock TLS hardening + cipher list +
+    # clients cap shipped in `stunnel.armA2.conf`. Discovered at PR-8a
+    # deploy attempt 2026-06-05: container exited 1 with
+    # "one or more STUNNEL_SERVICE* values missing" without applying
+    # our config. Building from Alpine ourselves removes the entrypoint-
+    # magic class of risk entirely + reduces supply-chain trust to
+    # Alpine maintainers (vs Alpine + dweomer).
+    #
+    # First `compose up -d stunnel-arm-a2` triggers a one-time ~10-20 s
+    # local build. Subsequent ups use the cached image. To force a
+    # rebuild after refreshing the Alpine pin, run `compose build --pull
+    # stunnel-arm-a2` before `up -d`. See "Alpine-pin refresh handling
+    # note" in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 PR-8a
+    # implementation record subsection.
     #
     # Time-boxed exposure + cap_drop ALL + no-new-privileges + read_only
-    # rootfs bound the blast radius if the pinned image had a sleeper.
-    # AGPL compliance preserved per §4 Arm A.2 Security mini-lock —
-    # stunnel is GPL-2.0; relay binary unchanged.
-    image: dweomer/stunnel@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef
+    # rootfs bound the blast radius. AGPL compliance preserved per
+    # §4 Arm A.2 Security mini-lock — stunnel is GPL-2.0; relay binary
+    # unchanged.
+    build:
+      context: ./stunnel-armA2
+      dockerfile: Dockerfile
+    image: phantom-stunnel-arm-a2:latest
     container_name: phantom-stunnel-arm-a2
     # Never auto-restart. Time-boxed by operator: up only during the
     # Arm A.2 capture window, removed immediately after. If something
