@@ -299,6 +299,49 @@ class AppContainer(private val context: Context) {
         }
     }
 
+    // ── RC-DIRECT-STABILITY1 Arm D — heartbeat echo diagnostic ──────────────
+    //
+    // Constructed lazily and ONLY when DEBUG_RC_DIRECT_HEARTBEAT_ECHO == "1"
+    // in a debug build. The wire-up site
+    // (`PhantomMessagingService.onStartCommand`) checks the same gate
+    // before calling `.start(...)` and short-circuits the production
+    // Hybrid Ktor `transport.connect(...)` path so production and
+    // diagnostic WS never share `state.clients[identity]` at the relay
+    // (Inv-ParallelArmIsolation carried forward from Phase 1).
+    //
+    // Release builds (`!BuildConfig.DEBUG`) are excluded by the gate AND
+    // the release BuildConfig block pins DEBUG_RC_DIRECT_HEARTBEAT_ECHO
+    // to "0" for defence-in-depth.
+    //
+    // RcDirectArmD targets production `BuildConfig.RELAY_URL`
+    // (`wss://relay.phntm.pro/ws`) — through Caddy, through Tele2 LTE,
+    // through carrier middleboxes. The diagnostic is on the device side
+    // (sends a different payload via a single narrow `webSocket.send(...)`
+    // carve-out from Inv-RawArmReadOnly), not the path side.
+    //
+    // Production path is reached only if PR #279 relay-side echo handler
+    // is active on the VPS (`RELAY_ENABLE_HEARTBEAT_ECHO=1` in deploy/.env
+    // + container recreated). Without the flag, the heartbeat payload
+    // would fall through the relay's `handle_message` parser which
+    // silently drops non-JSON inputs — Arm D would log echo_sent but
+    // never echo_received, which still produces a useful (negative)
+    // signal but is not the intended experiment.
+    //
+    // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm D + §7 step 5.
+    internal val rcDirectArmD: phantom.android.diagnostic.RcDirectArmD? by lazy {
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_HEARTBEAT_ECHO == "1"
+        ) {
+            phantom.android.diagnostic.RcDirectArmD(
+                identityManager = identityManager,
+                relayUrl = phantom.android.BuildConfig.RELAY_URL,
+                scope = appScope,
+            )
+        } else {
+            null
+        }
+    }
+
     // In-memory cache of the current identity. Populated eagerly at startup and
     // by initMessaging*; readers (ProfileScreen, top-bar avatar, etc.) collect
     // this StateFlow instead of calling identityRepo.loadIdentity() per screen,

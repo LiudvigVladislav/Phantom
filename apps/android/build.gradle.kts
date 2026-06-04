@@ -232,6 +232,32 @@ android {
             // §4 Arm C (refined scope after PR-4 review).
             val rcDirectPingIntervalMs = localOrEnv("rcDirectPingIntervalMs", "RC_DIRECT_PING_INTERVAL_MS", "0")
             buildConfigField("String", "DEBUG_RC_DIRECT_PING_INTERVAL_MS", "\"$rcDirectPingIntervalMs\"")
+            // RC-DIRECT-STABILITY1 Arm D: data-frame heartbeat echo
+            // diagnostic. When set to "1" in a debug build, the wire-up
+            // site at `AppContainer.rcDirectArmD` constructs `RcDirectArmD`
+            // and `PhantomMessagingService.onStartCommand` short-circuits
+            // the production Hybrid Ktor `transport.connect(...)` path
+            // (Inv-ParallelArmIsolation). The diagnostic sends a canonical
+            // payload `phantom:diagnostic:heartbeat-echo:v1:<seq>:<client_ms>`
+            // every 15 s on the raw OkHttp WS and counts inbound echoes
+            // returned by the relay (PR #279 echo handler, gated by
+            // RELAY_ENABLE_HEARTBEAT_ECHO=1 on the VPS).
+            //
+            // Read-only outbound carve-out from Inv-RawArmReadOnly applies
+            // narrowly to the canonical heartbeat payload prefix only; the
+            // class never calls `webSocket.send(...)` with any other text.
+            //
+            // Expected values:
+            //   "0" — Arm D disabled (default; RcDirectArmD not constructed,
+            //         service falls through to next branch or production)
+            //   "1" — Arm D enabled (sends heartbeat every 15 s, expects echo)
+            //
+            // Override via `local.properties` `rcDirectHeartbeatEcho=1` or
+            // env RC_DIRECT_HEARTBEAT_ECHO. Release builds ignore the value
+            // entirely (pinned to "0" below; runtime gate `BuildConfig.DEBUG`).
+            // Design locked in `docs/tracks/rc-direct-stability1.md` §4 Arm D.
+            val rcDirectHeartbeatEcho = localOrEnv("rcDirectHeartbeatEcho", "RC_DIRECT_HEARTBEAT_ECHO", "0")
+            buildConfigField("String", "DEBUG_RC_DIRECT_HEARTBEAT_ECHO", "\"$rcDirectHeartbeatEcho\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -287,6 +313,13 @@ android {
             // separate named PR per Inv-OnlyDiagnosticCadenceChange — this
             // pin is the defence-in-depth backstop.
             buildConfigField("String", "DEBUG_RC_DIRECT_PING_INTERVAL_MS", "\"0\"")
+            // RC-DIRECT-STABILITY1 Arm D: release builds ALWAYS pin the
+            // heartbeat echo flag to "0". The runtime gate at the wire-up
+            // site also checks `BuildConfig.DEBUG &&
+            // DEBUG_RC_DIRECT_HEARTBEAT_ECHO == "1"`, so a release build
+            // cannot construct `RcDirectArmD` even if the field were
+            // corrupted. Defence-in-depth backstop.
+            buildConfigField("String", "DEBUG_RC_DIRECT_HEARTBEAT_ECHO", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

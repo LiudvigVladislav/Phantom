@@ -558,6 +558,38 @@ class PhantomMessagingService : Service() {
                 return@launch
             }
 
+            // RC-DIRECT-STABILITY1 Arm D short-circuit. When the heartbeat
+            // echo flag is "1" in a debug build, route the service to the
+            // data-frame heartbeat diagnostic raw-OkHttp socket instead
+            // of the production Hybrid Ktor `transport.connect(...)` path.
+            // Same Inv-ParallelArmIsolation rationale as Arms A / B / C
+            // above.
+            //
+            // Precedence: Arm A (bypass URL) → Arm B (raw OkHttp baseline)
+            // → Arm C (ping interval matrix) → Arm D (heartbeat echo) →
+            // production. They are all sequential diagnostic experiments
+            // and should never be active at once in practice — they would
+            // compete for the same identity slot on the relay.
+            //
+            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+            // even if `DEBUG_RC_DIRECT_HEARTBEAT_ECHO` was somehow non-"0"
+            // — the release BuildConfig block pins it to "0".
+            //
+            // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm D + §7 step 5.
+            if (phantom.android.BuildConfig.DEBUG &&
+                phantom.android.BuildConfig.DEBUG_RC_DIRECT_HEARTBEAT_ECHO == "1"
+            ) {
+                Log.i(
+                    "RC_DIRECT_ARM_D",
+                    "RC_DIRECT_ARM_D_service_short_circuit " +
+                        "identity_prefix=${myPubKey.take(16)} " +
+                        "signing_prefix=${signingPubKeyHex.take(16)} " +
+                        "gen=$myGen",
+                )
+                container.rcDirectArmD?.start(myPubKey, signingPubKeyHex)
+                return@launch
+            }
+
             val connected: ConnectedTransport = try {
                 container.transportManager.connect()
             } catch (e: NoTransportReachableException) {
@@ -679,6 +711,23 @@ class PhantomMessagingService : Service() {
                 (application as PhantomApplication).container.rcDirectArmC?.stop()
             }.onFailure {
                 Log.w(TAG, "RC_DIRECT_ARM_C_stop_failed: ${it.message}")
+            }
+        }
+        // RC-DIRECT-STABILITY1 Arm D teardown. Stop the heartbeat echo
+        // diagnostic socket + heartbeat sender loop before the rest of
+        // cleanup so a service restart cannot race two diagnostic sockets
+        // sharing `state.clients[identity]` at the relay
+        // (Inv-ParallelArmIsolation carried forward from Phase 1). Same
+        // debug + flag gate as the start site in onStartCommand. Release
+        // builds never reach this branch — the release BuildConfig pins
+        // DEBUG_RC_DIRECT_HEARTBEAT_ECHO to "0".
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_HEARTBEAT_ECHO == "1"
+        ) {
+            runCatching {
+                (application as PhantomApplication).container.rcDirectArmD?.stop()
+            }.onFailure {
+                Log.w(TAG, "RC_DIRECT_ARM_D_stop_failed: ${it.message}")
             }
         }
         // ADR-011: cancel the AlarmManager wakeup so we don't keep waking
