@@ -589,6 +589,68 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-05 (fri, late evening) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a TLS-options cleanup — remove four `options = NO_*` lines from stunnel.armA2.conf; `sslVersionMin/Max` directives alone enforce TLS 1.2+
+
+Third small fixup PR on top of PR #287 (Alpine-build squash on master). After PR #287 landed, retried `compose up -d stunnel-arm-a2` succeeded at the build step (Alpine-built image cached as `phantom-stunnel-arm-a2:latest`), but the started container exited at config-parse time with:
+
+```
+[.] stunnel 5.72 on x86_64-alpine-linux-musl platform
+[.] Compiled with OpenSSL 3.3.0 9 Apr 2024
+[.] Running  with OpenSSL 3.3.7 7 Apr 2026
+[.] Reading configuration from file /etc/stunnel/stunnel.conf
+[.] Initializing service [relay-arm-a2]
+[!] /etc/stunnel/stunnel.conf:93: "options = NO_TLSv1.1": Illegal TLS option
+[!] Configuration failed
+```
+
+**Root cause.** stunnel option syntax for "disable TLS 1.1" is `NO_TLSv1_1` (underscore), not `NO_TLSv1.1` (dot). The original `stunnel.armA2.conf` from PR-8a (#285) shipped the dot form — a syntax bug that the dweomer-image entrypoint failure (#287) masked until the Alpine-built container actually reached the config-parse phase. Additionally, even the syntactically-correct `NO_SSLv2` / `NO_SSLv3` / `NO_TLSv1` / `NO_TLSv1_1` option flags are largely **redundant** with the modern `sslVersionMin = TLSv1.2` + `sslVersionMax = TLSv1.3` directives also present in the config, and OpenSSL 3.x has removed several legacy option constants entirely — the next NO_* line would likely have been the next minefield.
+
+**Option B (clean) chosen over Option A (surgical syntax fix).** Removed all four `options = NO_*` lines from `deploy/stunnel.armA2.conf`. Kept `sslVersionMin = TLSv1.2` + `sslVersionMax = TLSv1.3` which alone enforce the §4 Arm A.2 Security mini-lock "TLS 1.2+ minimum, prefer TLS 1.3" rule cleanly. No security regression — the publicly-negotiated minimum is still TLS 1.2.
+
+**Inline config comment expanded.** Explains why `options = NO_*` flags are intentionally NOT used (version-fragile in OpenSSL 3.x; redundant with `sslVersionMin/Max`); preserves the deploy-finding trail so a future maintainer doesn't naively re-add them.
+
+**Diagnostic-design-lesson cumulative.** Third deploy-time lesson in the PR-8a fixup chain:
+
+- #286: port availability (host port `:8443` already bound by xray production)
+- #287: image entrypoint behaviour (dweomer auto-generates config from env vars, ignores bind-mount)
+- This PR: TLS-option syntax compatibility (dot vs underscore in `NO_TLSv1.1`; legacy NO_* flags fragile across OpenSSL versions)
+
+All three are VPS-state-or-version-dependent and must be verified before a scope-lock PR declares them. The §4 Arm A.2 PR-8a implementation record now carries the cumulative lesson with all three deploy-time finding bullets.
+
+**Files updated (this PR, fixup only):**
+
+- `deploy/stunnel.armA2.conf` — removed 4 `options = NO_*` lines; updated TLS hardening comment to explain why legacy NO_* flag passthrough is intentionally not used.
+- `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 PR-8a implementation record — new "Deploy-time finding — TLS `options = NO_*` cleanup" bullet (with the stunnel.conf:93 error stanza + Option A/B analysis + cumulative-lesson note covering all three fixup PRs).
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension through PR #287 plus this PR.
+
+**What this PR does NOT change:**
+
+- W/X/Y discriminator semantics — unchanged.
+- Port mapping `8444:8443` (host:container) — unchanged from #286.
+- Inside-container `accept = 0.0.0.0:8443` — unchanged.
+- Alpine-built image (`deploy/stunnel-armA2/Dockerfile`) — unchanged from #287.
+- Cert volume mount `caddy-data:/data:ro` — unchanged.
+- Security posture (`cap_drop ALL`, `no-new-privileges`, `read_only` rootfs, `tmpfs /tmp:4m`) — unchanged.
+- Cipher list (`HIGH:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4` + TLS 1.3 cipher suites) — unchanged.
+- `clients = 50` connection cap — unchanged.
+- `pid =` empty (read_only rootfs guard from #287) — unchanged.
+- `RELAY_ENABLE_HEARTBEAT_ECHO` flag handling — unchanged.
+- xray REALITY production binding on `:8443` — completely untouched.
+- Production `BuildConfig.RELAY_URL` or `RelayTransportFactory.kt:71` — unchanged.
+
+**WORKING_RULES rule 8 carve-out (PR-8a TLS-options fixup).** Server-side only, zero Android transport code touched.
+
+**WORKING_RULES rule 9.** Deploy-time finding documented with verbatim stunnel error log + diagnostic context.
+
+**Track sequencing locked:**
+
+- PR-8a TLS-options fixup (this PR): clean stunnel config.
+- After merge: operator re-runs §4 Arm A.2 PR-8a runbook Step 3 (`git pull` + `compose up -d stunnel-arm-a2` — image already cached from #287 build, restart is instant) + Step 4 (`curl` WS upgrade probe against `wss://relay.phntm.pro:8444/ws`).
+- After Step 3 + 4 PASS: PR-8b Android `RcDirectArmA2.kt` with `wss://relay.phntm.pro:8444/ws` endpoint URL.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked per `Inv-NoSpinningUntilEvidence`.
+
 ### 2026-06-05 (fri, evening) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a image fixup — replace `dweomer/stunnel` with minimal Alpine-built stunnel; `pid =` empty to coexist with read_only rootfs
 
 Second small fixup PR on top of PR #286 (port fixup squash on master). After the port fixup landed, retried `compose up -d stunnel-arm-a2` succeeded at the bind step but the container immediately exited 1 with logs:

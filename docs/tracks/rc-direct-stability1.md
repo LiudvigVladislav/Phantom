@@ -163,6 +163,20 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
   - Caddy stores cert + key as standalone PEM files, NOT internal DB format — read-only volume sharing with stunnel is structurally possible. HAProxy fallback per §4 Arm A.2 Refined scope rule (a) NOT triggered.
 - **Pre-code bonus check — compose network name: confirmed.** SSH-verified on VPS 2026-06-04: actual Docker network name is `deploy_phantom-internal` (default compose project name `deploy` prefix added by Docker). `phantom-relay` and `phantom-caddy` both attached at IPs `172.18.0.2` and `172.18.0.6` respectively. stunnel attaches via overlay's `networks: [phantom-internal]` reference — compose merges across `-f` files and resolves the reference to the same actual network. Docker DNS resolves `relay` → relay container IP from inside the stunnel container.
 
+- **Deploy-time finding — TLS `options = NO_*` cleanup (2026-06-05).** After the Alpine-build fixup (#287) landed, the container built and started successfully — but stunnel exited at config-parse time:
+  ```
+  [.] stunnel 5.72 on x86_64-alpine-linux-musl platform
+  [.] Compiled with OpenSSL 3.3.0 9 Apr 2024
+  [.] Running  with OpenSSL 3.3.7 7 Apr 2026
+  [.] Reading configuration from file /etc/stunnel/stunnel.conf
+  [.] Initializing service [relay-arm-a2]
+  [!] /etc/stunnel/stunnel.conf:93: "options = NO_TLSv1.1": Illegal TLS option
+  [!] Configuration failed
+  ```
+  Root cause: stunnel option syntax for TLS-1.1 disable is `NO_TLSv1_1` (underscore), not `NO_TLSv1.1` (dot). The original `stunnel.armA2.conf` from PR-8a (#285) shipped the dot form — a syntax bug that the dweomer-image entrypoint failure (#287) masked until the Alpine-built container actually reached the config-parse phase. Additionally, even the corrected `NO_SSLv2` / `NO_SSLv3` / `NO_TLSv1` / `NO_TLSv1_1` option flags are largely redundant with the modern `sslVersionMin = TLSv1.2` + `sslVersionMax = TLSv1.3` directives also present in the config, and OpenSSL 3.x has removed several legacy option constants entirely (the next NO_* line would likely have been the next minefield). **Removed all four `options = NO_*` lines from `deploy/stunnel.armA2.conf`. Kept `sslVersionMin = TLSv1.2` + `sslVersionMax = TLSv1.3` which alone enforce the §4 Arm A.2 Security mini-lock "TLS 1.2+ minimum, prefer TLS 1.3" rule cleanly.** No security regression — the publicly-negotiated minimum is still TLS 1.2.
+
+  Diagnostic-design-lesson recurrence (third instance): future stunnel/OpenSSL config locks should be smoke-tested against the actual target version pair before scope-lock, not just paper-reviewed. Cumulative lesson set across PR-8a deploy fixups (#286 / #287 / this PR): port availability + image entrypoint behaviour + TLS-option syntax compatibility are all VPS-state-or-version-dependent and must be verified before a scope-lock PR declares them. The PR-8b Android client work that follows this implementation record subsection is gated on the operator confirming a green stunnel startup (`Configuration successful` + `Service [relay-arm-a2] (FD=...)` in logs) before any APK is built.
+
 - **Deploy-time finding — image switched from dweomer to Alpine-built (2026-06-05).** After the port fixup (#286) landed, retried deploy attempt of PR-8a failed at Step 3 differently: container started but immediately exited with status 1 and `STUNNEL_SERVICE=` empty / `STUNNEL_ACCEPT=` empty / `STUNNEL_CONNECT=` empty in logs. Diagnostic on VPS:
   ```
   $ docker ps -a --filter "name=phantom-stunnel-arm-a2" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
