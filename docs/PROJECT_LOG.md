@@ -589,6 +589,75 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-05 (fri, very late) · RC-DIRECT-STABILITY1 Arm A.2 PR-8b — Android `RcDirectArmA2.kt` diagnostic class + `DEBUG_RC_DIRECT_ARM_A2_URL` BuildConfig + AppContainer/Service wire-up at precedence A → A.2 → B → C → D → production
+
+Android client PR for Arm A.2 after the server-side bypass chain (#286 + #287 + #288 + #289) landed and deploy-verified on VPS 2026-06-05 (TLS 1.3 + relay `401 Unauthorized` through stunnel `:8444`).
+
+**RcDirectArmA2.kt** — near-clone of `RcDirectArmD.kt`. Same raw OkHttp pattern, same `OkHttpClient.Builder()` parameters (`pingInterval(15s)`, `readTimeout(60s)`, `connectTimeout(5s)`, `callTimeout(10s)`, `protocols(HTTP_1_1)`), same `WebSocketListener` telemetry shape, same reconnect loop. Same heartbeat sender pattern: emits one Text frame matching `phantom:diagnostic:heartbeat-echo:v1:<seq>:<client_ms>` every 15 s after `onOpen`, counts inbound Text frames matching the same prefix as echoes returned by the relay's PR #279 handler. Same `SEND_TIME_MAP_CAPACITY = 32` bounded map for RTT computation.
+
+**Lifecycle fixes carried in from PR #276 + #280:**
+
+- `currentWebSocket` nulled in `onClosed` + `onFailure` (PR #276 shield #1) and in `runOneSession.finally` (shield #2)
+- `openedAt: CompletableDeferred<Long>` completed in `onOpen` with wall-clock millis; `completeExceptionally(...)` from `onClosed`/`onFailure` if session ends before `onOpen` so the heartbeat coroutine unblocks cleanly (PR #280 P1)
+- Heartbeat coroutine: `if (t is CancellationException) throw t` BEFORE generic `Throwable` catch so cooperative cancellation does not log a spurious warning per session close (PR #280 P2)
+
+**Path difference from Arm D, NOT logic difference.** Arm D targets production `BuildConfig.RELAY_URL` (`wss://relay.phntm.pro/ws` through Caddy on host `:443`). Arm A.2 targets `BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL` (`wss://relay.phntm.pro:8444/ws` through stunnel on host `:8444`). Same hostname, different host-network-layer port, different edge stack (Caddy HTTP/WS proxy vs stunnel raw TCP forward). The carrier path (Tele2 LTE radio + middleboxes) and the device OkHttp stack stay identical. The W/X/Y discriminator reads:
+
+- **W** — stunnel sustains the WS ≥ 3× Tele2 baseline + Text echoes succeed → Caddy edge path is in the kill chain or contributes (does NOT prove TLS innocent)
+- **X** — Ping survives, Text dies (Arm D asymmetry persists through `:8444`) → asymmetry origin below Caddy edge or in a layer Caddy and stunnel share
+- **Y** — Mode 2 signature persists through `:8444` → Caddy strongly loses priority; carrier/path/lower-layer kill
+
+**BuildConfig wire-up (Vladislav-locked gates):**
+
+- `DEBUG_RC_DIRECT_ARM_A2_URL` debug field — read via `localOrEnv("debugRcDirectArmA2Url", "DEBUG_RC_DIRECT_ARM_A2_URL", "")`, defaults to `""`
+- Release block: `buildConfigField("String", "DEBUG_RC_DIRECT_ARM_A2_URL", "\"\"")` — defence-in-depth pin
+- AppContainer `rcDirectArmA2` lazy field gated by `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()` — null in release builds even if the field were corrupted
+- Service short-circuit branch in `onStartCommand` — same double gate, returns before `transport.connect(...)` so production Hybrid Ktor path never runs in parallel with Arm A.2 (Inv-ParallelArmIsolation)
+- Service teardown in `onDestroy` — same double gate, `runCatching { container.rcDirectArmA2?.stop() }` mirroring Arms A/B/C/D pattern
+
+**Precedence locked per §7 step 5e:** Arm A (Caddy-bypass loopback URL) → Arm A.2 (public non-Caddy TLS bypass URL via stunnel `:8444`) → Arm B (raw OkHttp baseline through Caddy `:443`) → Arm C (ping interval matrix) → Arm D (heartbeat echo) → production. Only ONE arm runs per build because the BuildConfig gates are sequential `if` blocks — Arms A and A.2 both use `DEBUG_*_URL.isNotEmpty()` gates and are mutually exclusive in practice (a build sets one or the other).
+
+**Vladislav-locked review gates — all PASS:**
+
+| Gate | Verification |
+|---|---|
+| Production `BuildConfig.RELAY_URL` not touched | `git diff apps/android/build.gradle.kts` shows zero `RELAY_URL` changes |
+| `RelayTransportFactory.kt:71` not touched | File not in `git status` modified list |
+| Release build cannot enable Arm A.2 | `BuildConfig.DEBUG && DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()` double gate + release block pins field to `""` for defence-in-depth |
+| No accidental production path | Service short-circuit returns before `transport.connect(...)` |
+| Outbound Text heartbeat only, no custom Ping/Pong | Single `ws.send()` call site (line 304) with payload from `HEARTBEAT_ECHO_PREFIX` constant; OkHttp internal `pingInterval(15s)` handles WS control Ping/Pong (not our code); `Inv-DataFrameNotControlFrame` held |
+| Lifecycle stop/cancel clean | PR #276 shield #1 (`currentWebSocket` null in `onClosed`/`onFailure`) + shield #2 (`runOneSession.finally`) + PR #280 P1 (`openedAt.completeExceptionally(...)` on pre-`onOpen` failure) + PR #280 P2 (`CancellationException` rethrow in heartbeat coroutine) all preserved verbatim from Arm D |
+| Build passes | `./gradlew :apps:android:assembleDebug` → `BUILD SUCCESSFUL in 51s` |
+
+**Files updated (this PR):**
+
+- `apps/android/src/androidMain/kotlin/phantom/android/diagnostic/RcDirectArmA2.kt` (NEW) — near-clone of `RcDirectArmD.kt` with TAG `RC_DIRECT_ARM_A2`, surgical doc-comment changes referencing §4 Arm A.2 W/X/Y discriminator + PR-8a server-side dependency state + cumulative fixup chain history. Class is `internal` to the diagnostic package.
+- `apps/android/build.gradle.kts` — new `DEBUG_RC_DIRECT_ARM_A2_URL` field in debug block (via `localOrEnv`) + release block defence-in-depth pin to `""`.
+- `apps/android/src/androidMain/kotlin/phantom/android/di/AppContainer.kt` — new `rcDirectArmA2` lazy field gated by `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()`.
+- `apps/android/src/androidMain/kotlin/phantom/android/service/PhantomMessagingService.kt` — Arm A.2 short-circuit branch inserted between Arm A and Arm B (precedence A → A.2 → B → C → D → production) + matching teardown in `onDestroy`.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension through PR #289 plus this PR.
+
+**What this PR does NOT do:**
+
+- NO production code change — relay binary unchanged, production transport stack unchanged.
+- NO `:8444` URL in production code paths.
+- NO modifications to `RelayTransportFactory.kt`, `KtorRelayTransport`, `TransportManager`, or any non-diagnostic Android transport code.
+- NO APK built and shipped — APK build follows after merge per `feedback_apk_build_is_mine.md` (assistant-owned APK build + adb install commands for Vladislav-owned field test).
+
+**WORKING_RULES rule 8 (transport regression gate).** PR-8b touches Android transport code (new diagnostic class + Service short-circuit). Per rule 8, this requires Tele2 LTE smoke test before merge OR a documented carve-out. **Carve-out applies** because the changes are debug-only and gated by `BuildConfig.DEBUG && DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()`; production code paths (transport.connect, KtorRelayTransport, TransportManager) are unchanged. The diagnostic itself IS the field test, run via the APK that ships from this PR. Smoke-test substitute: `./gradlew :apps:android:assembleDebug` BUILD SUCCESSFUL — confirms the production path still compiles with the diagnostic class wired in, but BuildConfig set to disabled (`debugRcDirectArmA2Url=""` default).
+
+**WORKING_RULES rule 9 (no merge without verification).** Every code-state claim grep-verified or build-verified: build passes, `git diff` confirms no production RELAY_URL touched, `git status` confirms RelayTransportFactory.kt not modified, single `ws.send()` call site located at line 304 with `HEARTBEAT_ECHO_PREFIX` payload. Architect pre-review not requested for this PR because the diagnostic class is a structural near-clone of `RcDirectArmD` (PR #280 squash `756c0d81` on master) and the path-only change is mechanical from the locked §4 Arm A.2 scope.
+
+**Track sequencing locked:**
+
+- PR-8b (this PR): Android diagnostic code.
+- After merge: assistant builds `phantom-arma2.apk` from master with `debugRcDirectArmA2Url=wss://relay.phntm.pro:8444/ws` in `local.properties`, computes SHA, hands adb install commands to Vladislav.
+- Field test: Tecno Tele2 LTE 15-min capture through `wss://relay.phntm.pro:8444/ws`. Logcat collection per `feedback_logcat_format.md` to `C:\temp\arm-a2-tecno-tele2.log`. Parallel relay-side `docker logs phantom-relay` capture for `event=heartbeat_echo_received` counter on the `:8444` path.
+- Outcome PR (PR-9, docs-only): §4 Arm A.2 Outcome subsection (analogous to Arm C/D outcome subsections) with the W/X/Y verdict. Triggers next track per §5: RC-CADDY-FIX1 (W) / below-edge investigation (X) / Arm F mini-lock (Y).
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked per `Inv-NoSpinningUntilEvidence` — escalates to "needed" only if Arm A.2 closes X.
+
 ### 2026-06-05 (fri, late late evening) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a `clients = 50` drop — directive is global not per-service, fell back to relay-side rate-limit + diagnostic-only safeguards per §4 Arm A.2 Security mini-lock fallback branch
 
 Fourth small fixup PR on top of PR #288 (TLS-options-cleanup squash on master). After PR #288 landed, retried `compose up -d stunnel-arm-a2` succeeded at the build step and TLS-option parse step but the container exited again at config-parse:

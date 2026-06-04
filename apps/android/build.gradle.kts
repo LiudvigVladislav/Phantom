@@ -258,6 +258,36 @@ android {
             // Design locked in `docs/tracks/rc-direct-stability1.md` §4 Arm D.
             val rcDirectHeartbeatEcho = localOrEnv("rcDirectHeartbeatEcho", "RC_DIRECT_HEARTBEAT_ECHO", "0")
             buildConfigField("String", "DEBUG_RC_DIRECT_HEARTBEAT_ECHO", "\"$rcDirectHeartbeatEcho\"")
+            // RC-DIRECT-STABILITY1 Arm A.2: public non-Caddy TLS bypass
+            // diagnostic. When non-empty in a debug build, the wire-up site
+            // at `AppContainer.rcDirectArmA2` constructs `RcDirectArmA2`
+            // pointing at this URL, and `PhantomMessagingService.onStartCommand`
+            // short-circuits the production Hybrid Ktor `transport.connect(...)`
+            // path (Inv-ParallelArmIsolation). Same read-only outbound
+            // carve-out as Arm D — the only `webSocket.send(...)` call site
+            // is the canonical heartbeat prefix
+            // `phantom:diagnostic:heartbeat-echo:v1:<seq>:<client_ms>`.
+            //
+            // The URL value targets the §4 Arm A.2 PR-8a server-side stunnel
+            // overlay deployed on the VPS host `:8444` (NOT `:8443` — that
+            // port is held by production phantom-xray REALITY+WSS; the
+            // cumulative PR-8a fixup history is documented in §4 Arm A.2
+            // PR-8a implementation record). Expected values:
+            //   ""                                     — Arm A.2 disabled (default)
+            //   "wss://relay.phntm.pro:8444/ws"        — Arm A.2 production
+            //                                            field test endpoint
+            //                                            (Tele2 LTE through
+            //                                            stunnel, no Caddy)
+            //
+            // Override via `local.properties` `debugRcDirectArmA2Url=...`
+            // or env DEBUG_RC_DIRECT_ARM_A2_URL. Release builds ignore the
+            // value entirely (pinned to "" in the release block + runtime
+            // gate `BuildConfig.DEBUG`).
+            //
+            // Design locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2
+            // + §7 step 5e + PR-8a implementation record subsection.
+            val debugRcDirectArmA2Url = localOrEnv("debugRcDirectArmA2Url", "DEBUG_RC_DIRECT_ARM_A2_URL", "")
+            buildConfigField("String", "DEBUG_RC_DIRECT_ARM_A2_URL", "\"$debugRcDirectArmA2Url\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -320,6 +350,16 @@ android {
             // cannot construct `RcDirectArmD` even if the field were
             // corrupted. Defence-in-depth backstop.
             buildConfigField("String", "DEBUG_RC_DIRECT_HEARTBEAT_ECHO", "\"0\"")
+            // RC-DIRECT-STABILITY1 Arm A.2: release builds ALWAYS pin the
+            // public non-Caddy TLS bypass URL to "". The runtime gate at
+            // the wire-up site also checks `BuildConfig.DEBUG &&
+            // DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()`, so a release build
+            // cannot construct `RcDirectArmA2` even if the field were
+            // corrupted. The :8444 stunnel endpoint is a diagnostic surface
+            // only; user traffic must never route through it (§4 Arm A.2
+            // Refined scope rule "No production traffic promotion"). This
+            // pin is the defence-in-depth backstop.
+            buildConfigField("String", "DEBUG_RC_DIRECT_ARM_A2_URL", "\"\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.
