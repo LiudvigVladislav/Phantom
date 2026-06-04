@@ -3,7 +3,7 @@
 # RC-DIRECT-STABILITY1 Arm A.2 — public non-Caddy TLS bypass overlay.
 #
 # Purpose. Time-boxed diagnostic overlay. Adds a stunnel TLS terminator on
-# the public :8443 port that performs ONLY TLS unwrap and forwards raw TCP
+# the public :8444 port that performs ONLY TLS unwrap and forwards raw TCP
 # to the relay container on the existing `phantom-internal` compose
 # network. Removes Caddy's TLS + HTTP/WS proxy layer from the data path
 # so the Arm A.2 W/X/Y discriminator (`docs/tracks/rc-direct-stability1.md`
@@ -41,7 +41,7 @@
 # docs/tracks/rc-direct-stability1.md for the exact runbook sequence.
 #
 # NEVER merge this file into `deploy/docker-compose.yml` — it would make
-# the :8443 public TLS surface persistent, violating §4 Arm A.2
+# the :8444 public TLS surface persistent, violating §4 Arm A.2
 # Time-boxed exposure rule + No production traffic promotion rule.
 
 services:
@@ -69,12 +69,21 @@ services:
     # kills it during the test, operator decides whether to bring it
     # back — never automatic.
     restart: "no"
-    # Public TLS endpoint on :8443. Reachable from any IP on Tele2 LTE
+    # Public TLS endpoint on :8444. Reachable from any IP on Tele2 LTE
     # radio, which is exactly what §4 Arm A.2 needs: NO loopback, NO
     # adb reverse, NO SSH tunnel. Per `feedback_diagnostic_design_must
     # _isolate_one_variable.md` lesson.
+    #
+    # Host port :8444 — NOT :8443 — because :8443 is already bound by
+    # the production `phantom-xray` container (Stage 5E REALITY+WSS
+    # endpoint, 2026-05-07). Discovered during PR-8a deploy attempt
+    # 2026-06-05. INSIDE the container stunnel still accepts on :8443
+    # (see deploy/stunnel.armA2.conf `accept = 0.0.0.0:8443`); the
+    # Docker port-mapping below republishes container 8443 onto host 8444.
+    # See `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 PR-8a
+    # implementation record subsection for the port-choice forensic note.
     ports:
-      - "8443:8443"
+      - "8444:8443"
     volumes:
       # Caddy's data volume mounted read-only AT THE SAME PATH Caddy uses
       # internally (/data). So the cert path in stunnel.armA2.conf
@@ -93,7 +102,8 @@ services:
       # attached with IPs 172.18.0.2 and 172.18.0.6).
       - phantom-internal
     depends_on:
-      # Ensures relay is up before stunnel binds :8443. Does NOT mean
+      # Ensures relay is up before stunnel binds :8443 inside the
+      # container (published on host as :8444). Does NOT mean
       # stunnel blocks on relay being "ready" (depends_on is condition:
       # service_started, not healthy). For Arm A.2 that's sufficient
       # because the capture window starts after operator verifies

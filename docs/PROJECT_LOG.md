@@ -589,6 +589,51 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-05 (fri) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a port fixup — host port forced to `:8444` because `:8443` held by production `phantom-xray` (Stage 5E REALITY+WSS)
+
+Small fixup PR on top of PR #285 (master `b4fc4cd4`). Discovered at deploy time during Path A operator runbook execution: Step 3 (`docker compose up -d stunnel-arm-a2` via overlay) failed with `Bind for 0.0.0.0:8443 failed: port is already allocated`. Diagnostic on VPS confirmed:
+
+```
+$ sudo ss -tlnp | grep ':8443'
+LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("docker-proxy",pid=910161,fd=8))
+LISTEN 0 4096    [::]:8443    [::]:* users:(("docker-proxy",pid=910167,fd=8))
+$ docker ps --format 'table {{.Names}}\t{{.Ports}}' | grep 8443
+phantom-xray   0.0.0.0:8443->8443/tcp, [::]:8443->8443/tcp
+```
+
+Port `:8443` is bound by the production `phantom-xray` container (Stage 5E REALITY+WSS endpoint, deployed 2026-05-07; load-bearing transport for RU users via TSPU 16-KB curtain bypass). The PR #284 Arm A.2 scope mini-lock declared `:8443` as the endpoint shape **without VPS-state verification** — port choice was undertested at scope-lock time. This is a diagnostic-design-lesson recurrence: future scope-lock PRs that declare a host port should grep-verify or SSH-verify the port is free on the target VPS before merge.
+
+**Fix.** Bypass host port changed from `:8443` to `:8444` (SSH-verified free on VPS 2026-06-05). INSIDE the stunnel container the listener stays on `:8443` (no change to `deploy/stunnel.armA2.conf` `accept = 0.0.0.0:8443`); only the Docker port-mapping in `deploy/docker-compose.armA2.yml` changes from `8443:8443` to `8444:8443` (host:container). xray's `:8443` binding is completely untouched — Arm A.2 stunnel and xray REALITY coexist on different host ports.
+
+**Files changed (this PR, fixup only):**
+
+- `deploy/docker-compose.armA2.yml` — `ports: "8443:8443"` → `ports: "8444:8443"` + header comments + ports-line comment updated with forensic note about xray collision + `depends_on` comment updated to clarify container vs host port semantics.
+- `deploy/stunnel.armA2.conf` — header comment updated (host port `:8444` + xray reason); inside-container `accept = 0.0.0.0:8443` unchanged.
+- `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 — Endpoint shape rule URL `wss://relay.phntm.pro:8443/ws` → `:8444/ws` + inline note about xray collision; Setup steps 1 + 3 updated; Discriminator W/X/Y wording updated; Mini-lock hard gates updated; §4 Arm A.2 PR-8a implementation record subsection: new "Deploy-time finding" bullet with full SSH evidence + diagnostic-design-lesson note + Files shipped overlay description updated with port-forced rationale; §5 decision tree A.2 X/Y rows updated; §7 implementation order row 5d updated.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension through PR #285 plus this PR.
+
+**What this PR does NOT change:**
+
+- W/X/Y discriminator semantics — the discriminator reads the same regardless of host port; only the URL the device + curl probe target changes from `:8443/ws` to `:8444/ws`.
+- stunnel internal listener (still `accept = 0.0.0.0:8443` inside container).
+- stunnel image digest pin (still `dweomer/stunnel@sha256:c46e11...`).
+- Caddy cert volume mount, security posture (cap_drop ALL, no-new-privileges, read_only rootfs, tmpfs `/tmp:4m`), TLS hardening, `clients = 50` cap.
+- `RELAY_ENABLE_HEARTBEAT_ECHO` flag handling.
+- xray REALITY production binding on `:8443` — completely untouched.
+
+**WORKING_RULES rule 8 carve-out (PR-8a port fixup).** Server-side only, zero Android transport code touched. Rule 8 carve-out applies per server-side-only clause.
+
+**WORKING_RULES rule 9.** Deploy-time finding documented with verbatim VPS diagnostic SSH output (ss -tlnp + docker ps + ss verify port :8444 free). No code-state claims beyond what's grep-verified or SSH-verified.
+
+**Track sequencing locked:**
+
+- PR-8a port fixup (this PR): host port `:8444`.
+- After merge: operator re-runs §4 Arm A.2 PR-8a runbook Step 3 + Step 4 with the new overlay (`git pull` + `compose up -d stunnel-arm-a2` should now succeed; `curl` against `wss://relay.phntm.pro:8444/ws` for reachability verify).
+- After reachability PASS: PR-8b Android `RcDirectArmA2.kt` with `wss://relay.phntm.pro:8444/ws` endpoint URL.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked per `Inv-NoSpinningUntilEvidence`.
+
 ### 2026-06-04 (thu, night) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a — stunnel server-side overlay + config + operator runbook; pre-code Gates 1 + 2 both PASS, stunnel stays primary, HAProxy fallback not triggered
 
 Server-side implementation PR for Arm A.2. Two new files in `deploy/` + implementation-record subsection appended to `docs/tracks/rc-direct-stability1.md` §4 Arm A.2. Zero application or relay code change.
