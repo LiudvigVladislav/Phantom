@@ -589,6 +589,70 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-05 (fri, evening) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a image fixup — replace `dweomer/stunnel` with minimal Alpine-built stunnel; `pid =` empty to coexist with read_only rootfs
+
+Second small fixup PR on top of PR #286 (port fixup squash on master). After the port fixup landed, retried `compose up -d stunnel-arm-a2` succeeded at the bind step but the container immediately exited 1 with logs:
+
+```
+one or more STUNNEL_SERVICE* values missing:
+  STUNNEL_SERVICE=
+  STUNNEL_ACCEPT=
+  STUNNEL_CONNECT=
+```
+
+`docker ps -a` confirmed `Exited (1)` on image digest `c46e11e6cc13` (dweomer/stunnel).
+
+**Root cause.** The `dweomer/stunnel` image has a custom entrypoint script that generates `/etc/stunnel/stunnel.conf` from `STUNNEL_SERVICE` / `STUNNEL_ACCEPT` / `STUNNEL_CONNECT` env vars at startup, ignoring (or overwriting) any bind-mounted `/etc/stunnel/stunnel.conf`. The PR-8a (#285) image choice was made for "minimum LOC" without verifying that the image's entrypoint accepts a bind-mounted config — the image-internals trap that the diagnostic-design-lesson memory was meant to prevent.
+
+**Fix.** Build stunnel from minimal Alpine ourselves. New file `deploy/stunnel-armA2/Dockerfile`:
+
+```dockerfile
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+RUN apk add --no-cache stunnel && rm -rf /var/cache/apk/*
+ENTRYPOINT ["stunnel", "/etc/stunnel/stunnel.conf"]
+```
+
+Alpine base pinned by digest for reproducibility. apk pulls stunnel from Alpine's 3.20 package index at build time — stunnel + OpenSSL versions are 3.20-branch-locked. Refresh procedure (when an Alpine / stunnel / OpenSSL security update lands) documented in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 PR-8a implementation record "Alpine-pin refresh handling note" (replaces the previous "Image-refresh handling note").
+
+**Compose change.** `deploy/docker-compose.armA2.yml`: `image: dweomer/stunnel@sha256:c46e11...` → `build: ./stunnel-armA2` + `image: phantom-stunnel-arm-a2:latest` (compose tags the locally-built image so subsequent `up -d` calls hit the cache). First `compose up -d stunnel-arm-a2` after this PR lands triggers a one-time ~10-20 s build.
+
+**Vladislav-requested defensive add: `pid =` empty in `deploy/stunnel.armA2.conf`.** The container rootfs is `read_only` per the §4 Arm A.2 Security mini-lock. stunnel's default `/var/run/stunnel.pid` write attempt at startup would fail with EROFS, producing a deploy-time surprise. With `foreground = yes` we don't need a pid file for process management — explicit empty `pid =` removes the write entirely. Catches one more "second deploy-time surprise" class of risk cheaply.
+
+**Removed.** The previous PR-8a (#285) digest pin on `dweomer/stunnel@sha256:c46e11...` no longer applies — that image is not used. The PR-8a fixup (#286) port-mapping `8444:8443` is unchanged. xray REALITY production on `:8443` remains untouched.
+
+**Files updated (this PR, fixup only):**
+
+- `deploy/stunnel-armA2/Dockerfile` (NEW) — Alpine 3.20 digest-pinned + stunnel apk + raw stunnel entrypoint. ~25 LOC including header SPDX + forensic comment about dweomer pivot.
+- `deploy/docker-compose.armA2.yml` — `image:` → `build:` + header comments updated with the dweomer-pivot rationale.
+- `deploy/stunnel.armA2.conf` — added `pid =` empty line in the foreground/debug section with read_only-rootfs reasoning.
+- `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 PR-8a implementation record — new "Deploy-time finding — image switched from dweomer to Alpine-built" bullet (with diagnostic SSH evidence + 3-option analysis + lesson note); Files shipped section updated (new Dockerfile bullet + overlay `build:` description + stunnel.conf `pid = empty` mention); "Image-refresh handling note" replaced by "Alpine-pin refresh handling note" with the Alpine-3.20-digest query procedure.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension through PR #286 plus this PR.
+
+**What this PR does NOT change:**
+
+- W/X/Y discriminator semantics — unchanged.
+- Port mapping `8444:8443` (host:container) — unchanged from #286.
+- Inside-container `accept = 0.0.0.0:8443` — unchanged.
+- Cert volume mount `caddy-data:/data:ro` — unchanged.
+- Security posture (`cap_drop ALL`, `no-new-privileges`, `read_only` rootfs, `tmpfs /tmp:4m`) — unchanged.
+- TLS hardening + cipher list + `clients = 50` cap in `stunnel.armA2.conf` — unchanged.
+- `RELAY_ENABLE_HEARTBEAT_ECHO` flag handling — unchanged.
+- xray REALITY production binding on `:8443` — completely untouched.
+- Production `BuildConfig.RELAY_URL` or `RelayTransportFactory.kt:71` — unchanged.
+
+**WORKING_RULES rule 8 carve-out (PR-8a image fixup).** Server-side only, zero Android transport code touched.
+
+**WORKING_RULES rule 9.** Deploy-time finding documented with verbatim VPS diagnostic output (`docker ps -a` showing `Exited (1)` + image digest + stunnel log "STUNNEL_SERVICE missing" stanza).
+
+**Track sequencing locked:**
+
+- PR-8a image fixup (this PR): Alpine-built stunnel + `pid =` empty.
+- After merge: operator re-runs §4 Arm A.2 PR-8a runbook Step 3 (`git pull` + `compose up -d stunnel-arm-a2` — first run will build the image locally) + Step 4 (`curl` WS upgrade probe against `wss://relay.phntm.pro:8444/ws`).
+- After Step 3 + 4 PASS: PR-8b Android `RcDirectArmA2.kt` with `wss://relay.phntm.pro:8444/ws` endpoint URL.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked per `Inv-NoSpinningUntilEvidence`.
+
 ### 2026-06-05 (fri) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a port fixup — host port forced to `:8444` because `:8443` held by production `phantom-xray` (Stage 5E REALITY+WSS)
 
 Small fixup PR on top of PR #285 (master `b4fc4cd4`). Discovered at deploy time during Path A operator runbook execution: Step 3 (`docker compose up -d stunnel-arm-a2` via overlay) failed with `Bind for 0.0.0.0:8443 failed: port is already allocated`. Diagnostic on VPS confirmed:
