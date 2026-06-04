@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Codeberg mirror — pushes master to codeberg.org/LiudvigVladislav/Phantom
+# Codeberg mirror — pushes master to codeberg.org/VladislavLiudvig/Phantom
 # on every successful push to master. Manual fallback also available via
 # workflow_dispatch.
 #
@@ -11,7 +11,7 @@
 #   3. Add the PRIVATE key as a GitHub repository secret named
 #        CODEBERG_DEPLOY_KEY
 #   4. Set CODEBERG_REPO_URL repository variable to the SSH clone URL,
-#      e.g. git@codeberg.org:LiudvigVladislav/Phantom.git
+#      e.g. git@codeberg.org:VladislavLiudvig/Phantom.git
 #
 # Until the secret + variable are in place this workflow will fail
 # fast with a clear error message — that is intentional, not a bug.
@@ -78,23 +78,28 @@ jobs:
         working-directory: phantom-mirror
         run: |
           git remote add codeberg "${{ vars.CODEBERG_REPO_URL }}"
-          # Explicit refspecs instead of --mirror.
+          # Narrow mirror scope: `master` + tags only.
           #
-          # `git clone --mirror` from a GitHub repo brings GitHub-internal
-          # `refs/pull/<n>/head` (and on some flows `refs/pull/<n>/merge`)
-          # refs along with branches and tags. Codeberg (and Forgejo
-          # generally) reserves the `refs/pull/*` namespace for its OWN
-          # pull-request refs and rejects any external push into it with
-          # "deny updating a hidden ref". The previous `git push --mirror`
-          # consequently exited 1 on every run — branches and tags were
-          # pushed successfully, but the workflow status was permanently
-          # red because of the pull-ref rejections.
+          # Earlier revisions of this workflow pushed every `refs/heads/*`
+          # ref. That worked while GitHub-side and Codeberg-side branches
+          # stayed in lockstep, but the moment any single feature branch
+          # diverged — e.g. a parked branch that received a force-push on
+          # one side only — `git push` rejected that ref as non-fast-forward
+          # and the whole workflow exited 1, even though `master` itself
+          # pushed cleanly. Field-test cadence on this repo means parked
+          # feature branches are routine, so the broad-scope mirror
+          # produced permanent red builds for non-product-relevant reasons.
           #
-          # Explicit refspecs push only `refs/heads/*` and `refs/tags/*`,
-          # which is exactly the surface Codeberg cares about. `--prune`
-          # preserves the `--mirror` semantic of deleting destination refs
-          # whose source counterpart no longer exists, so byte-for-byte
-          # consistency with GitHub is unchanged.
-          git push codeberg --prune \
-            'refs/heads/*:refs/heads/*' \
-            'refs/tags/*:refs/tags/*'
+          # Decision (Vladislav 2026-06-04 after PR #280 cycle): the mirror
+          # exists as a stable public copy of the published state, not as
+          # a synchroniser of every WIP branch. Pushing only `master` and
+          # release tags keeps Codeberg's view production-equivalent and
+          # makes the workflow status meaningful: a red mirror run from
+          # here on out is a real release-integrity signal, not noise from
+          # a diverged WIP branch.
+          #
+          # No `+` prefix, no `--force`. If a tag conflict ever fires, the
+          # workflow fails on purpose so the operator notices the conflict
+          # rather than silently overwriting a published tag.
+          git push codeberg refs/heads/master:refs/heads/master
+          git push codeberg 'refs/tags/*:refs/tags/*'
