@@ -44,6 +44,20 @@ pub struct RelayConfig {
     /// How long media chunks are retained before the sweeper removes them
     /// (seconds). Default 7 days.
     pub media_ttl_secs: u64,
+
+    // ── Arm D heartbeat echo (PR-RC-DIRECT-STABILITY1) ────────────────────────
+
+    /// When `true`, the relay echoes inbound WS Text frames whose payload
+    /// starts with `phantom:diagnostic:heartbeat-echo:v1:` back to the
+    /// sender as a Text frame. Default `false`. Set by env var
+    /// `RELAY_ENABLE_HEARTBEAT_ECHO=1` exactly; any other value (including
+    /// `"true"` or `"yes"`) fails closed.
+    ///
+    /// Locked design in `docs/tracks/rc-direct-stability1.md` §4 Arm D.
+    /// The handler is a diagnostic primitive for the Arm D field test —
+    /// it answers whether application data frames survive the conditions
+    /// that kill WS control-plane Ping/Pong on the target carrier.
+    pub heartbeat_echo_enabled: bool,
 }
 
 impl RelayConfig {
@@ -65,6 +79,10 @@ impl RelayConfig {
             max_media_chunks: crate::media::MAX_MEDIA_CHUNKS,
             max_media_bytes: crate::media::MAX_MEDIA_BYTES,
             media_ttl_secs: 7 * 24 * 3600,
+            // Arm D heartbeat echo is off in tests by default; tests that
+            // exercise the echo handler construct a config with this flipped
+            // to `true` rather than relying on the surrounding env.
+            heartbeat_echo_enabled: false,
         }
     }
 
@@ -113,6 +131,13 @@ impl RelayConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(7 * 24 * 3600), // 7 days
+            // Arm D heartbeat echo: strict `"1"` parse. Any other value
+            // (including `"true"`, `"yes"`, `"0"`, empty string, unset) fails
+            // closed. A typo like `=true` therefore silently keeps the
+            // diagnostic disabled — explicit activation is required.
+            heartbeat_echo_enabled: std::env::var("RELAY_ENABLE_HEARTBEAT_ECHO")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 }
@@ -133,6 +158,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("max_media_chunks", &self.max_media_chunks)
             .field("max_media_bytes", &self.max_media_bytes)
             .field("media_ttl_secs", &self.media_ttl_secs)
+            .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
             .finish()
     }
 }

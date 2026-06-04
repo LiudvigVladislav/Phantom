@@ -296,6 +296,14 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
     let mut pongs_sent: u64 = 0;
     let mut inbound_frames: u64 = 0;
     let mut outbound_frames: u64 = 0;
+    // PR-RC-DIRECT-STABILITY1 Arm D: per-session heartbeat-echo counters.
+    // Always tracked; the `session_summary` log line emits both regardless
+    // of whether the feature flag was on during this session so a
+    // post-mortem grep can distinguish "echo enabled + received 0" from
+    // "echo disabled (counter stayed at 0 by design)" via the flag value
+    // recorded at startup.
+    let mut echo_frames_received: u64 = 0;
+    let mut echo_frames_sent: u64 = 0;
     let mut last_ping_at_ms: u128 = 0;
     let mut last_pong_at_ms: u128 = 0;
     let mut last_inbound_at_ms: u128 = 0;
@@ -468,6 +476,77 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                             pongs_sent += 1;
                             last_pong_at_ms = now_ms();
                             tracing::trace!(identity = %identity, "ws ping → pong (inline)");
+                        } else if state.config.heartbeat_echo_enabled
+                            && raw.starts_with(HEARTBEAT_ECHO_PREFIX)
+                        {
+                            // PR-RC-DIRECT-STABILITY1 Arm D — data-frame
+                            // heartbeat echo diagnostic. Inserted BETWEEN the
+                            // `is_ping` JSON-detection fast-path above and the
+                            // `handle_message` fall-through below: a heartbeat
+                            // payload is not JSON, so `handle_message` would
+                            // silently drop it on `serde_json::from_str` error.
+                            //
+                            // Inv-DataFrameNotControlFrame (mini-lock §3):
+                            // echo is dispatched via Message::Text (WS opcode
+                            // 0x1), NEVER Message::Pong. Sending Pong here
+                            // would re-introduce the PR-H1e regression class
+                            // (app-level Ping halved WS lifetime). The unit
+                            // test `parse_heartbeat_echo_payload_*` family
+                            // plus the integration test in
+                            // `tests/heartbeat_echo.rs` lock this contract.
+                            //
+                            // Validation (length cap + prefix + u64 parse) is
+                            // a pure function so it can be unit-tested in
+                            // isolation. A malformed payload (over 256 bytes,
+                            // missing fields, non-integer seq/client_ms) is
+                            // logged + ignored, not echoed — caps the relay
+                            // against becoming a free echo amplifier under
+                            // flag-on.
+                            // build_heartbeat_echo_response is the SOLE
+                            // construction site for the echo response
+                            // Message; it locks Inv-DataFrameNotControlFrame
+                            // (Message::Text only, never Pong) via the type
+                            // system + the unit test
+                            // `echo_response_uses_text_opcode_never_pong`.
+                            // Refactoring this branch to construct the
+                            // response message inline would bypass the
+                            // chokepoint — keep the helper call here.
+                            match build_heartbeat_echo_response(raw) {
+                                Some((parsed, response_msg)) => {
+                                    echo_frames_received += 1;
+                                    tracing::debug!(
+                                        conn_id     = conn_id,
+                                        seq         = parsed.seq,
+                                        client_ms   = parsed.client_ms,
+                                        payload_len = raw.len(),
+                                        "heartbeat_echo_received"
+                                    );
+                                    if let Err(e) = socket.send(response_msg).await {
+                                        close_origin = "error";
+                                        close_error_str =
+                                            Some(format!("heartbeat_echo_send: {}", e));
+                                        tracing::warn!(
+                                            conn_id = conn_id,
+                                            error   = %e,
+                                            "ws heartbeat echo send failed — closing session"
+                                        );
+                                        break;
+                                    }
+                                    echo_frames_sent += 1;
+                                    tracing::debug!(
+                                        conn_id = conn_id,
+                                        seq     = parsed.seq,
+                                        "heartbeat_echo_sent"
+                                    );
+                                }
+                                None => {
+                                    tracing::debug!(
+                                        conn_id     = conn_id,
+                                        payload_len = raw.len(),
+                                        "heartbeat_echo_rejected (malformed or oversize)"
+                                    );
+                                }
+                            }
                         } else {
                             handle_message(raw, &identity, conn_id, &state).await;
                         }
@@ -628,6 +707,8 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             pongs_sent             = pongs_sent,
             inbound_frames         = inbound_frames,
             outbound_frames        = outbound_frames,
+            echo_frames_received   = echo_frames_received,
+            echo_frames_sent       = echo_frames_sent,
             since_last_ping_ms     = since_last_ping_ms,
             since_last_pong_ms     = since_last_pong_ms,
             since_last_inbound_ms  = since_last_inbound_ms,
@@ -1478,4 +1559,226 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ── PR-RC-DIRECT-STABILITY1 Arm D — heartbeat echo payload validation ────────
+
+/// Canonical payload prefix locked in `docs/tracks/rc-direct-stability1.md`
+/// §4 Arm D. The echo handler matches on this exact string — a future
+/// `:v2:` payload would not silently enter the v1 handler.
+pub const HEARTBEAT_ECHO_PREFIX: &str = "phantom:diagnostic:heartbeat-echo:v1:";
+
+/// Hard cap on heartbeat echo payload length. Anything longer is rejected
+/// (logged + ignored, not echoed). Caps the relay against becoming a free
+/// echo amplifier under flag-on: the legitimate payload carries the prefix
+/// plus two integers, well below this.
+pub const HEARTBEAT_ECHO_MAX_LEN: usize = 256;
+
+/// Parsed Arm D heartbeat echo payload. `seq` is the client-side sequence
+/// number; `client_ms` is the device wall-clock at send time (used by the
+/// device-side RTT log line, mirrored here for cross-source correlation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatEcho {
+    pub seq: u64,
+    pub client_ms: u64,
+}
+
+/// Pure validation helper for the heartbeat echo payload contract.
+///
+/// Returns `Some(HeartbeatEcho)` only when ALL of the following hold:
+///   * `raw.len() <= HEARTBEAT_ECHO_MAX_LEN` (length cap)
+///   * `raw.starts_with(HEARTBEAT_ECHO_PREFIX)` (exact prefix, not a substring)
+///   * The remainder splits on `:` into exactly two fields
+///   * Both fields parse as `u64`
+///
+/// Any other shape (oversize, wrong prefix, wrong field count, non-integer
+/// fields) yields `None`. Callers (the `Message::Text` branch) log + ignore
+/// on `None` rather than echo, capping amplification risk.
+///
+/// Extracted as a free function so the test module below can exercise the
+/// contract directly without spinning up a WS server.
+pub fn parse_heartbeat_echo_payload(raw: &str) -> Option<HeartbeatEcho> {
+    if raw.len() > HEARTBEAT_ECHO_MAX_LEN {
+        return None;
+    }
+    let rest = raw.strip_prefix(HEARTBEAT_ECHO_PREFIX)?;
+    let mut parts = rest.split(':');
+    let seq = parts.next()?.parse::<u64>().ok()?;
+    let client_ms = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        // More than two `:`-separated fields after the prefix → not a v1
+        // payload. Fail closed.
+        return None;
+    }
+    Some(HeartbeatEcho { seq, client_ms })
+}
+
+/// Builds the heartbeat echo response message for a valid inbound payload.
+///
+/// Returns `Some((parsed, response_msg))` only when the payload passes
+/// [`parse_heartbeat_echo_payload`]. The response message is **always**
+/// `Message::Text(...)` — never `Message::Pong` or `Message::Ping`.
+///
+/// **`Inv-DataFrameNotControlFrame` (mini-lock §3) is locked here by the
+/// type system + the unit test [`heartbeat_echo_tests::echo_response_uses_text_opcode_never_pong`].**
+/// PR-H1e proved that app-level WS control frames can halve session
+/// lifetime; constructing the response through this single chokepoint
+/// prevents a future refactor from accidentally widening the contract to
+/// a control-frame opcode without the test surface noticing.
+///
+/// The route branch calls this once and uses the returned `Message`
+/// directly; the unit test asserts the variant matches `Message::Text`
+/// without spinning up a WS server.
+pub fn build_heartbeat_echo_response(raw: &str) -> Option<(HeartbeatEcho, Message)> {
+    let parsed = parse_heartbeat_echo_payload(raw)?;
+    // Inv-DataFrameNotControlFrame: diagnostic echo is application data
+    // (WS opcode 0x1 = Text). Never Message::Pong; PR-H1e showed
+    // app-level control-frame changes regress WS behaviour. This is the
+    // sole construction site for the echo message in the relay.
+    Some((parsed, Message::Text(raw.to_string().into())))
+}
+
+#[cfg(test)]
+mod heartbeat_echo_tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_canonical_payload() {
+        let p = parse_heartbeat_echo_payload(
+            "phantom:diagnostic:heartbeat-echo:v1:42:1717495823000",
+        );
+        assert_eq!(
+            p,
+            Some(HeartbeatEcho { seq: 42, client_ms: 1717495823000 })
+        );
+    }
+
+    #[test]
+    fn parse_accepts_zero_seq_and_ms() {
+        let p = parse_heartbeat_echo_payload("phantom:diagnostic:heartbeat-echo:v1:0:0");
+        assert_eq!(p, Some(HeartbeatEcho { seq: 0, client_ms: 0 }));
+    }
+
+    #[test]
+    fn parse_rejects_missing_prefix() {
+        // The prefix must match exactly. A `phantom:` substring is not enough.
+        assert!(parse_heartbeat_echo_payload("phantom:42:1717495823000").is_none());
+        assert!(parse_heartbeat_echo_payload(
+            "diagnostic:heartbeat-echo:v1:42:1717495823000"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_rejects_wrong_version() {
+        // Future v2 payloads must not silently enter this handler.
+        assert!(parse_heartbeat_echo_payload(
+            "phantom:diagnostic:heartbeat-echo:v2:42:1717495823000"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_rejects_non_integer_fields() {
+        // Non-numeric seq.
+        assert!(parse_heartbeat_echo_payload(
+            "phantom:diagnostic:heartbeat-echo:v1:notanint:1717495823000"
+        )
+        .is_none());
+        // Non-numeric client_ms.
+        assert!(parse_heartbeat_echo_payload(
+            "phantom:diagnostic:heartbeat-echo:v1:42:notanint"
+        )
+        .is_none());
+        // Negative seq (u64 cannot represent it).
+        assert!(parse_heartbeat_echo_payload(
+            "phantom:diagnostic:heartbeat-echo:v1:-1:0"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_rejects_too_few_fields() {
+        // Only seq, missing client_ms.
+        assert!(parse_heartbeat_echo_payload("phantom:diagnostic:heartbeat-echo:v1:42").is_none());
+        // Empty trailer.
+        assert!(parse_heartbeat_echo_payload("phantom:diagnostic:heartbeat-echo:v1:").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_extra_fields() {
+        // More than two fields after the prefix → not v1.
+        assert!(parse_heartbeat_echo_payload(
+            "phantom:diagnostic:heartbeat-echo:v1:42:1717495823000:extra"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_rejects_oversize_payload() {
+        // Padding the client_ms field until total length exceeds the cap.
+        // The legitimate prefix + ":42:" is 41 bytes; pad client_ms to 220
+        // bytes so total = 261 > 256.
+        let pad = "0".repeat(220);
+        let payload = format!("phantom:diagnostic:heartbeat-echo:v1:42:{}", pad);
+        assert!(payload.len() > HEARTBEAT_ECHO_MAX_LEN);
+        assert!(parse_heartbeat_echo_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_accepts_at_length_cap() {
+        // Payload exactly at the cap must still parse — strict `>` not `>=`.
+        // Build prefix(37) + ":42:" (3) + pad client_ms so total == 256.
+        let prefix_len = HEARTBEAT_ECHO_PREFIX.len() + "42:".len();
+        let pad_len = HEARTBEAT_ECHO_MAX_LEN - prefix_len;
+        // The padded client_ms must still parse as u64 → use digits only.
+        let pad = "0".repeat(pad_len);
+        let payload = format!("phantom:diagnostic:heartbeat-echo:v1:42:{}", pad);
+        assert_eq!(payload.len(), HEARTBEAT_ECHO_MAX_LEN);
+        // Parses because pad is all-digit u64 ("0000...0" parses as 0).
+        let parsed = parse_heartbeat_echo_payload(&payload);
+        assert_eq!(parsed, Some(HeartbeatEcho { seq: 42, client_ms: 0 }));
+    }
+
+    #[test]
+    fn echo_response_uses_text_opcode_never_pong() {
+        // Inv-DataFrameNotControlFrame (mini-lock §3): the heartbeat echo
+        // response MUST be a WS application data frame (Text opcode 0x1),
+        // NEVER a control frame (Pong, Ping). PR-H1e proved that app-level
+        // control-frame changes regress WS behaviour.
+        //
+        // This test locks the invariant at the construction site
+        // (`build_heartbeat_echo_response`) so a future refactor that
+        // accidentally widens the contract — for example, switching to
+        // Message::Pong because "echo" intuitively sounds like a pong-style
+        // response — fails the test surface immediately. The inline comment
+        // in `build_heartbeat_echo_response` and the type-system narrow
+        // construction site are complemented by this runtime assertion.
+        let raw = "phantom:diagnostic:heartbeat-echo:v1:1:1780000000000";
+        let (parsed, msg) =
+            build_heartbeat_echo_response(raw).expect("canonical payload must build a response");
+        assert_eq!(parsed, HeartbeatEcho { seq: 1, client_ms: 1780000000000 });
+        match msg {
+            Message::Text(text) => assert_eq!(text.as_str(), raw),
+            Message::Pong(_) => {
+                panic!("Inv-DataFrameNotControlFrame violated: response is Message::Pong");
+            }
+            Message::Ping(_) => {
+                panic!("Inv-DataFrameNotControlFrame violated: response is Message::Ping");
+            }
+            other => panic!("Unexpected response message variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn echo_response_none_when_payload_rejected() {
+        // A malformed payload yields None — the route branch logs +
+        // ignores rather than echoing, capping amplification risk.
+        assert!(build_heartbeat_echo_response("not a heartbeat payload").is_none());
+        // Oversize payload also rejected.
+        let pad = "0".repeat(300);
+        let oversized = format!("phantom:diagnostic:heartbeat-echo:v1:42:{}", pad);
+        assert!(oversized.len() > HEARTBEAT_ECHO_MAX_LEN);
+        assert!(build_heartbeat_echo_response(&oversized).is_none());
+    }
 }

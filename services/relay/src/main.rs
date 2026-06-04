@@ -82,6 +82,17 @@ async fn main() {
         "phantom-relay starting"
     );
 
+    // Arm D heartbeat echo flag state — logged at startup so an operator
+    // running the RC-DIRECT-STABILITY1 Arm D field test can confirm at the
+    // banner whether the env var was picked up before the first Android
+    // connection arrives. When the flag is `false` (production default),
+    // this is just a one-line audit trail; when `true`, it is a load-bearing
+    // signal that the diagnostic handler is live.
+    tracing::info!(
+        heartbeat_echo_enabled = cfg.heartbeat_echo_enabled,
+        "relay feature flags"
+    );
+
     // Background task: purge expired envelopes every 5 minutes.
     // Recipients that never connect would otherwise accumulate stale envelopes
     // indefinitely; this ensures the in-memory store is bounded in practice.
