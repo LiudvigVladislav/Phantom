@@ -490,10 +490,11 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                             // echo is dispatched via Message::Text (WS opcode
                             // 0x1), NEVER Message::Pong. Sending Pong here
                             // would re-introduce the PR-H1e regression class
-                            // (app-level Ping halved WS lifetime). The unit
-                            // test `parse_heartbeat_echo_payload_*` family
-                            // plus the integration test in
-                            // `tests/heartbeat_echo.rs` lock this contract.
+                            // (app-level Ping halved WS lifetime). The
+                            // validation unit tests plus
+                            // `echo_response_uses_text_opcode_never_pong` lock
+                            // this contract. Full WS round-trip integration is
+                            // deferred as P3 follow-up.
                             //
                             // Validation (length cap + prefix + u64 parse) is
                             // a pure function so it can be unit-tested in
