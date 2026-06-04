@@ -589,6 +589,68 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-05 (fri, late late evening) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a `clients = 50` drop — directive is global not per-service, fell back to relay-side rate-limit + diagnostic-only safeguards per §4 Arm A.2 Security mini-lock fallback branch
+
+Fourth small fixup PR on top of PR #288 (TLS-options-cleanup squash on master). After PR #288 landed, retried `compose up -d stunnel-arm-a2` succeeded at the build step and TLS-option parse step but the container exited again at config-parse:
+
+```
+[.] Reading configuration from file /etc/stunnel/stunnel.conf
+[.] Initializing service [relay-arm-a2]
+[!] /etc/stunnel/stunnel.conf:115: "clients = 50": Specified option name is not valid here
+[!] Configuration failed
+```
+
+**Root cause.** `clients` is a **global** stunnel directive, not a per-service one. The original `stunnel.armA2.conf` from PR-8a (#285) placed it inside the `[relay-arm-a2]` service section — a scope bug that the three earlier deploy failures (entrypoint + TLS-options syntax + Alpine-build) masked until this point.
+
+**Option (B) — drop entirely — chosen over Option (A) — relocate to global section.** Reason (Vladislav-formulated): we have now caught four consecutive deploy-time surprises from stunnel-side config; the time-boxed exposure + TLS-only public endpoint + signed-challenge relay auth (post-stunnel-unwrap) + `restart: "no"` + explicit teardown + non-production `:8444` port are sufficient diagnostic-only safeguards for a 15-min capture window; less stunnel config = less risk of a fifth surprise; if edge-level connection limiting is needed later, implement it explicitly via HAProxy, nftables, or relay-side limits under a separate mini-lock.
+
+**§4 Arm A.2 Security mini-lock not violated.** The clause "Connection cap + per-IP rate-limit at the stunnel level if available, **else at the relay level** (relay's existing rate-limit applies post-stunnel-unwrap)" falls back to the second branch cleanly. The publicly-negotiated minimum is still TLS 1.2, the cipher list and TLS 1.3 cipher suites are unchanged, the cert mount and security posture are unchanged.
+
+**Inline config comment expanded** in `deploy/stunnel.armA2.conf` to explain why `clients` was dropped + list the substitute diagnostic-only safeguards — so a future maintainer doesn't naively re-add the directive without understanding the fallback rationale.
+
+**Cumulative diagnostic-design-lesson — fourth instance.**
+
+- #286: port availability (host port `:8443` already bound by xray production)
+- #287: image entrypoint behaviour (dweomer auto-generates config from env vars, ignores bind-mount)
+- #288: TLS-option syntax compatibility (`NO_TLSv1.1` dot invalid; NO_* flags version-fragile in OpenSSL 3.x)
+- This PR: stunnel directive scope (global vs per-service — `clients` is global, was placed in service section)
+
+All four are stunnel/OpenSSL/Docker/version-dependent and require either pre-deploy smoke-testing against the target image (e.g., `docker run --rm -v "$PWD/stunnel.armA2.conf:/etc/stunnel/stunnel.conf:ro" phantom-stunnel-arm-a2:latest -test` or equivalent) or first-deploy validation before any scope-lock PR declares them. The PR-8b Android client work that follows is **gated on the operator confirming a green stunnel startup** before any APK is built.
+
+**Files updated (this PR, fixup only):**
+
+- `deploy/stunnel.armA2.conf` — removed `clients = 50` line + replaced preceding comment with an expanded "No stunnel-level connection cap" block explaining why the directive was dropped and listing the substitute diagnostic-only safeguards (time-box, TLS-only, signed-challenge auth, `restart: "no"`, explicit teardown, non-production port).
+- `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 PR-8a implementation record — new "Deploy-time finding — `clients = 50` dropped from stunnel config" bullet (with stunnel.conf:115 error stanza + Option A/B analysis + cumulative-lesson note covering all four fixup PRs + pre-deploy smoke-test process improvement reference); Files shipped section updated to remove the `clients = 50 connection cap` mention from both Dockerfile bullet (which previously referenced it) and stunnel.armA2.conf bullet.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension through PR #288 plus this PR.
+
+**What this PR does NOT change:**
+
+- W/X/Y discriminator semantics — unchanged.
+- Port mapping `8444:8443` (host:container) — unchanged from #286.
+- Inside-container `accept = 0.0.0.0:8443` — unchanged.
+- Alpine-built image (`deploy/stunnel-armA2/Dockerfile`) — unchanged from #287.
+- `sslVersionMin = TLSv1.2` + `sslVersionMax = TLSv1.3` — unchanged from #288.
+- Cert volume mount `caddy-data:/data:ro` — unchanged.
+- Security posture (`cap_drop ALL`, `no-new-privileges`, `read_only` rootfs, `tmpfs /tmp:4m`) — unchanged.
+- Cipher list (`HIGH:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4` + TLS 1.3 cipher suites) — unchanged.
+- `pid =` empty (read_only rootfs guard from #287) — unchanged.
+- `RELAY_ENABLE_HEARTBEAT_ECHO` flag handling — unchanged.
+- xray REALITY production binding on `:8443` — completely untouched.
+- Production `BuildConfig.RELAY_URL` or `RelayTransportFactory.kt:71` — unchanged.
+
+**WORKING_RULES rule 8 carve-out (PR-8a `clients` drop).** Server-side only, zero Android transport code touched.
+
+**WORKING_RULES rule 9.** Deploy-time finding documented with verbatim stunnel error log + diagnostic context.
+
+**Track sequencing locked:**
+
+- PR-8a `clients` drop (this PR): minimal stunnel config.
+- After merge: operator re-runs §4 Arm A.2 PR-8a runbook Step 3 (`git pull` + `compose up -d stunnel-arm-a2` — image cached from #287, restart instant) + Step 4 (`curl` WS upgrade probe against `wss://relay.phntm.pro:8444/ws`).
+- After Step 3 + 4 PASS: PR-8b Android `RcDirectArmA2.kt` with `wss://relay.phntm.pro:8444/ws` endpoint URL.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked per `Inv-NoSpinningUntilEvidence`.
+
 ### 2026-06-05 (fri, late evening) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a TLS-options cleanup — remove four `options = NO_*` lines from stunnel.armA2.conf; `sslVersionMin/Max` directives alone enforce TLS 1.2+
 
 Third small fixup PR on top of PR #287 (Alpine-build squash on master). After PR #287 landed, retried `compose up -d stunnel-arm-a2` succeeded at the build step (Alpine-built image cached as `phantom-stunnel-arm-a2:latest`), but the started container exited at config-parse time with:
