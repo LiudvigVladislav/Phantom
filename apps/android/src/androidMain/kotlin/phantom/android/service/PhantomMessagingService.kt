@@ -493,6 +493,58 @@ class PhantomMessagingService : Service() {
                 return@launch
             }
 
+            // RC-DIRECT-STABILITY1 Arm A.2 short-circuit. When
+            // DEBUG_RC_DIRECT_ARM_A2_URL is non-empty in a debug build,
+            // route the service to the public non-Caddy TLS bypass
+            // diagnostic raw-OkHttp socket (stunnel on host `:8444`)
+            // instead of the production Hybrid Ktor `transport.connect(...)`
+            // path. Same Inv-ParallelArmIsolation rationale as Arm A
+            // above — production and diagnostic WS must never share
+            // `state.clients[identity]` at the relay.
+            //
+            // Precedence per §7 step 5e (locked in mini-lock): Arm A
+            // (Caddy-bypass loopback URL) → Arm A.2 (public non-Caddy
+            // TLS bypass URL via stunnel `:8444`) → Arm B (raw OkHttp
+            // baseline through Caddy `:443`) → Arm C (ping interval
+            // matrix) → Arm D (heartbeat echo) → production. Arms A
+            // and A.2 both use a `BuildConfig.DEBUG_*_URL.isNotEmpty()`
+            // gate; they are mutually exclusive in practice because a
+            // build sets one or the other. If both happened to be set,
+            // Arm A wins (above) because its block is earlier — the
+            // narrower override.
+            //
+            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this
+            // branch even if `DEBUG_RC_DIRECT_ARM_A2_URL` was somehow
+            // non-empty — the release BuildConfig block pins it to "".
+            //
+            // Server-side dependency: this branch is meaningful only if
+            // the §4 Arm A.2 PR-8a stunnel overlay is deployed and
+            // verified on the VPS (`docker compose -f docker-compose.yml
+            // -f docker-compose.armA2.yml up -d stunnel-arm-a2`). Without
+            // that, the URL `wss://relay.phntm.pro:8444/ws` returns
+            // connection refused and Arm A.2 logs ws_failure on every
+            // session.
+            //
+            // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2
+            // + §7 step 5e + PR-8a implementation record subsection.
+            if (phantom.android.BuildConfig.DEBUG &&
+                phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()
+            ) {
+                Log.i(
+                    "RC_DIRECT_ARM_A2",
+                    "RC_DIRECT_ARM_A2_service_short_circuit " +
+                        "identity_prefix=${myPubKey.take(16)} " +
+                        "signing_prefix=${signingPubKeyHex.take(16)} " +
+                        "bypass_url=${phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL} " +
+                        "gen=$myGen",
+                )
+                container.rcDirectArmA2?.start(myPubKey, signingPubKeyHex)
+                // Service stays alive (foreground service is the diagnostic
+                // host); the arm runs its own reconnect loop until cancelled
+                // via container.rcDirectArmA2?.stop() or the app dies.
+                return@launch
+            }
+
             // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B short-circuit. When the
             // diagnostic flag selects Arm B, the production Hybrid Ktor path
             // is bypassed entirely so the diagnostic raw-OkHttp socket and a
@@ -680,6 +732,23 @@ class PhantomMessagingService : Service() {
                 (application as PhantomApplication).container.rcDirectArmA?.stop()
             }.onFailure {
                 Log.w(TAG, "RC_DIRECT_ARM_A_stop_failed: ${it.message}")
+            }
+        }
+        // RC-DIRECT-STABILITY1 Arm A.2 teardown. Stop the public non-Caddy
+        // TLS bypass diagnostic socket (stunnel :8444) before the rest of
+        // cleanup so a service restart cannot race two diagnostic sockets
+        // sharing `state.clients[identity]` at the relay
+        // (Inv-ParallelArmIsolation carried forward from Phase 1). Same
+        // debug + flag gate as the start site in onStartCommand. Release
+        // builds never reach this branch — the release BuildConfig pins
+        // DEBUG_RC_DIRECT_ARM_A2_URL to "".
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()
+        ) {
+            runCatching {
+                (application as PhantomApplication).container.rcDirectArmA2?.stop()
+            }.onFailure {
+                Log.w(TAG, "RC_DIRECT_ARM_A2_stop_failed: ${it.message}")
             }
         }
         // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B teardown. Stop the

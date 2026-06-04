@@ -342,6 +342,54 @@ class AppContainer(private val context: Context) {
         }
     }
 
+    // ── RC-DIRECT-STABILITY1 Arm A.2 — public non-Caddy TLS bypass diagnostic ──
+    //
+    // Constructed lazily and ONLY when DEBUG_RC_DIRECT_ARM_A2_URL is non-empty
+    // in a debug build. The wire-up site
+    // (`PhantomMessagingService.onStartCommand`) checks the same gate
+    // before calling `.start(...)` and short-circuits the production
+    // Hybrid Ktor `transport.connect(...)` path so production and
+    // diagnostic WS never share `state.clients[identity]` at the relay
+    // (Inv-ParallelArmIsolation carried forward from Phase 1).
+    //
+    // Release builds (`!BuildConfig.DEBUG`) are excluded by the gate AND
+    // the release BuildConfig block pins DEBUG_RC_DIRECT_ARM_A2_URL
+    // to "" for defence-in-depth.
+    //
+    // RcDirectArmA2 targets the §4 Arm A.2 PR-8a stunnel bypass URL
+    // (`wss://relay.phntm.pro:8444/ws` — NOT production `:443/ws` through
+    // Caddy). The diagnostic class is structurally a near-clone of
+    // RcDirectArmD (same heartbeat payload format, same listener shape,
+    // same lifecycle fixes from PR #276 + #280); the discriminator is
+    // the data path — Caddy edge removed by the stunnel overlay, while
+    // the carrier path (Tele2 LTE radio + middleboxes) and the device
+    // OkHttp stack stay the same.
+    //
+    // Server-side dependency (verified on VPS 2026-06-05, see §4 Arm A.2
+    // PR-8a implementation record): stunnel-arm-a2 container Up on host
+    // :8444, TLS 1.3 handshake succeeds with Caddy's Let's Encrypt EC
+    // cert, relay receives WS upgrade and runs signed-challenge auth
+    // pipeline through the new entrypoint. PR #279 relay-side echo
+    // handler must also be active (`RELAY_ENABLE_HEARTBEAT_ECHO=1` in
+    // deploy/.env + relay container recreated) so the heartbeat sender's
+    // Text frame is echoed back.
+    //
+    // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 +
+    // §7 step 5e.
+    internal val rcDirectArmA2: phantom.android.diagnostic.RcDirectArmA2? by lazy {
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()
+        ) {
+            phantom.android.diagnostic.RcDirectArmA2(
+                identityManager = identityManager,
+                relayUrl = phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL,
+                scope = appScope,
+            )
+        } else {
+            null
+        }
+    }
+
     // In-memory cache of the current identity. Populated eagerly at startup and
     // by initMessaging*; readers (ProfileScreen, top-bar avatar, etc.) collect
     // this StateFlow instead of calling identityRepo.loadIdentity() per screen,
