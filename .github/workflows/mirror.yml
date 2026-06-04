@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Codeberg mirror — pushes master to codeberg.org/LiudvigVladislav/Phantom
+# Codeberg mirror — pushes master to codeberg.org/VladislavLiudvig/Phantom
 # on every successful push to master. Manual fallback also available via
 # workflow_dispatch.
 #
@@ -11,7 +11,7 @@
 #   3. Add the PRIVATE key as a GitHub repository secret named
 #        CODEBERG_DEPLOY_KEY
 #   4. Set CODEBERG_REPO_URL repository variable to the SSH clone URL,
-#      e.g. git@codeberg.org:LiudvigVladislav/Phantom.git
+#      e.g. git@codeberg.org:VladislavLiudvig/Phantom.git
 #
 # Until the secret + variable are in place this workflow will fail
 # fast with a clear error message — that is intentional, not a bug.
