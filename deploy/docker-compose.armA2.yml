@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# RC-DIRECT-STABILITY1 Arm A.2 — public non-Caddy TLS bypass overlay.
+#
+# Purpose. Time-boxed diagnostic overlay. Adds a stunnel TLS terminator on
+# the public :8443 port that performs ONLY TLS unwrap and forwards raw TCP
+# to the relay container on the existing `phantom-internal` compose
+# network. Removes Caddy's TLS + HTTP/WS proxy layer from the data path
+# so the Arm A.2 W/X/Y discriminator (`docs/tracks/rc-direct-stability1.md`
+# §4 Arm A.2 + §5 decision tree) can read the failure mode against a
+# non-Caddy edge on Tele2 LTE.
+#
+# Usage (operator). This file is an OVERLAY only — it MUST be combined
+# with the persistent `deploy/docker-compose.yml`. Do NOT run it standalone.
+# Operator works from `/home/phantom/Phantom/deploy` on the VPS, so the
+# `-f` paths below are unprefixed.
+#
+#   Open the bypass for an Arm A.2 capture window:
+#     cd /home/phantom/Phantom/deploy
+#     docker compose \
+#       -f docker-compose.yml \
+#       -f docker-compose.armA2.yml \
+#       up -d stunnel-arm-a2
+#
+#   Close the bypass immediately after the capture window (explicit
+#   stop + rm pair — `compose rm -fs` is inconsistent across compose
+#   versions, ambiguous for a public TLS surface):
+#     docker compose \
+#       -f docker-compose.yml \
+#       -f docker-compose.armA2.yml \
+#       stop stunnel-arm-a2
+#     docker compose \
+#       -f docker-compose.yml \
+#       -f docker-compose.armA2.yml \
+#       rm -f stunnel-arm-a2
+#     docker ps --filter "name=phantom-stunnel-arm-a2" --format '{{.Names}}'
+#     # expect: empty output (container gone)
+#
+# Also flip `RELAY_ENABLE_HEARTBEAT_ECHO=1` in `.env` for the same window
+# and revert after; see §4 Arm A.2 PR-8a implementation record in
+# docs/tracks/rc-direct-stability1.md for the exact runbook sequence.
+#
+# NEVER merge this file into `deploy/docker-compose.yml` — it would make
+# the :8443 public TLS surface persistent, violating §4 Arm A.2
+# Time-boxed exposure rule + No production traffic promotion rule.
+
+services:
+  stunnel-arm-a2:
+    # Upstream image — actively maintained, Alpine-based, single-purpose
+    # TLS terminator. Pinned by digest, not tag, so the diagnostic endpoint
+    # is reproducible: today's deploy and tomorrow's deploy use the exact
+    # same stunnel + OpenSSL build. The :latest tag in dweomer's repo can
+    # advance without notice; for a public TLS surface that's not safe.
+    # Digest resolved from Docker Hub registry API 2026-06-05.
+    #
+    # To refresh the pin when dweomer publishes a security-relevant
+    # update, follow the procedure in `docs/tracks/rc-direct-stability1.md`
+    # §4 Arm A.2 PR-8a implementation record (cert-rotation handling +
+    # image-refresh handling notes).
+    #
+    # Time-boxed exposure + cap_drop ALL + no-new-privileges + read_only
+    # rootfs bound the blast radius if the pinned image had a sleeper.
+    # AGPL compliance preserved per §4 Arm A.2 Security mini-lock —
+    # stunnel is GPL-2.0; relay binary unchanged.
+    image: dweomer/stunnel@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef
+    container_name: phantom-stunnel-arm-a2
+    # Never auto-restart. Time-boxed by operator: up only during the
+    # Arm A.2 capture window, removed immediately after. If something
+    # kills it during the test, operator decides whether to bring it
+    # back — never automatic.
+    restart: "no"
+    # Public TLS endpoint on :8443. Reachable from any IP on Tele2 LTE
+    # radio, which is exactly what §4 Arm A.2 needs: NO loopback, NO
+    # adb reverse, NO SSH tunnel. Per `feedback_diagnostic_design_must
+    # _isolate_one_variable.md` lesson.
+    ports:
+      - "8443:8443"
+    volumes:
+      # Caddy's data volume mounted read-only AT THE SAME PATH Caddy uses
+      # internally (/data). So the cert path in stunnel.armA2.conf
+      # (/data/caddy/certificates/...) is identical to where Caddy
+      # provisions it. Cert format verified PEM on VPS 2026-06-04.
+      # Cert/key bytes do NOT enter git per §4 Arm A.2 P2 hard gate 1
+      # (Cert sourcing strategy).
+      - caddy-data:/data:ro
+      # stunnel config bind-mount. Read-only inside the container.
+      - ./stunnel.armA2.conf:/etc/stunnel/stunnel.conf:ro
+    networks:
+      # Join the existing phantom-internal compose network so the
+      # `connect = relay:8080` directive in stunnel.armA2.conf resolves
+      # via Docker DNS. Verified on VPS 2026-06-04 (actual network name
+      # `deploy_phantom-internal`; both phantom-relay and phantom-caddy
+      # attached with IPs 172.18.0.2 and 172.18.0.6).
+      - phantom-internal
+    depends_on:
+      # Ensures relay is up before stunnel binds :8443. Does NOT mean
+      # stunnel blocks on relay being "ready" (depends_on is condition:
+      # service_started, not healthy). For Arm A.2 that's sufficient
+      # because the capture window starts after operator verifies
+      # reachability via curl.
+      - relay
+    # Same minimal-privilege posture as the relay service. The container
+    # holds zero kernel capabilities. :8443 is unprivileged (>1024) so
+    # no CAP_NET_BIND_SERVICE needed inside the container.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Read-only rootfs. stunnel needs /tmp for ephemeral runtime state
+    # (PID files etc.) — tiny tmpfs is enough.
+    read_only: true
+    tmpfs:
+      - /tmp:size=4m

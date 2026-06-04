@@ -151,7 +151,123 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
 4. **No production traffic promotion.** Debug-flag-gated client only. Production `BuildConfig.RELAY_URL` unchanged. `RelayTransportFactory.kt:71` unchanged. No `:8443` URL anywhere in production code paths. `Inv-OnlyDiagnosticCadenceChange` (§3) extends in spirit to Arm A.2 — production transport remains read-only.
 5. **Security mini-lock.** Public TLS only (TLS 1.2+ minimum, prefer TLS 1.3). No cleartext on `:8443` ever. Auth (signed-challenge per ADR-027) unchanged — auth is in-payload, not endpoint-specific. Connection cap + per-IP rate-limit at the stunnel level if available, else at the relay level (relay's existing rate-limit applies post-stunnel-unwrap). Explicit deploy / verify / revert runbook in the implementation PR commit body. AGPL compliance preserved — stunnel is OSI-approved GPL-2.0; relay binary unchanged.
 
-**Memory pointer.** Vladislav-locked hard-points trail preserved in `project_next_session_arm_a2_scope_2026_06_04.md`; superseded by this PR's mini-lock landing on master.
+**Memory pointer.** Vladislav-locked hard-points trail preserved in `project_next_session_arm_a2_scope_2026_06_04.md`; superseded by PR #284's mini-lock landing on master.
+
+**PR-8a server-side implementation record (this PR, 2026-06-04).** Server-side stunnel overlay + config + operator runbook. Two new files in `deploy/` + this implementation record subsection in track doc + PROJECT_LOG/MASTER_TIMELINE bump. Zero application or relay code change.
+
+- **Pre-code Gate 1 — relay proxy header dependency: PASS.** Ran `grep -rIn 'X-Forwarded-For\|X-Real-IP\|Forwarded' services/relay/src/` on master `f7af95d8`. Zero matches. Relay does not depend on proxy headers for auth (signed-challenge per ADR-027 is in-payload), rate-limit, or any other policy. stunnel raw TCP forward to `relay:8080` is safe — relay receives the unmodified TCP stream from the client device after stunnel decrypts. HAProxy fallback per §4 Arm A.2 Refined scope rule (b) NOT triggered.
+- **Pre-code Gate 2 — Caddy cert format and path: PASS.** SSH-verified on VPS 2026-06-04:
+  - Caddy cert volume layout standard: `/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/relay.phntm.pro/relay.phntm.pro.{crt,key,json}`
+  - Cert file is PEM: `-----BEGIN CERTIFICATE-----`
+  - Key file is PEM EC: `-----BEGIN EC PRIVATE KEY-----`
+  - Caddy stores cert + key as standalone PEM files, NOT internal DB format — read-only volume sharing with stunnel is structurally possible. HAProxy fallback per §4 Arm A.2 Refined scope rule (a) NOT triggered.
+- **Pre-code bonus check — compose network name: confirmed.** SSH-verified on VPS 2026-06-04: actual Docker network name is `deploy_phantom-internal` (default compose project name `deploy` prefix added by Docker). `phantom-relay` and `phantom-caddy` both attached at IPs `172.18.0.2` and `172.18.0.6` respectively. stunnel attaches via overlay's `networks: [phantom-internal]` reference — compose merges across `-f` files and resolves the reference to the same actual network. Docker DNS resolves `relay` → relay container IP from inside the stunnel container.
+- **Files shipped:**
+  - `deploy/docker-compose.armA2.yml` — overlay file. Service `stunnel-arm-a2`, container `phantom-stunnel-arm-a2`, image **pinned by digest, not `:latest`**, at `dweomer/stunnel@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef` (resolved from Docker Hub registry API 2026-06-05; image-refresh procedure documented below), `restart: "no"` (time-boxed), ports `8443:8443`, volumes `caddy-data:/data:ro` + `./stunnel.armA2.conf:/etc/stunnel/stunnel.conf:ro`, network `phantom-internal`, depends_on `relay`, security posture `cap_drop ALL` + `no-new-privileges` + `read_only` rootfs + tmpfs `/tmp:4m`.
+  - `deploy/stunnel.armA2.conf` — stunnel config. `[relay-arm-a2]` service block, `accept 0.0.0.0:8443`, `connect relay:8080`, cert + key paths under `/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/relay.phntm.pro/`, TLS 1.2 minimum + 1.3 preferred, strong cipher suites only (TLS 1.3 AES-256-GCM / ChaCha20-Poly1305 / AES-128-GCM; TLS 1.2 HIGH excluding aNULL/eNULL/EXPORT/DES/MD5/PSK/RC4), `clients = 50` connection cap.
+
+**Operator runbook (open / verify / capture / revert) — Vladislav-owned.**
+
+```bash
+# Pre-requisites on VPS:
+ssh phantom@relay.phntm.pro
+cd /home/phantom/Phantom/deploy
+git pull origin master
+
+# Step 1: Enable heartbeat-echo flag for the capture window only.
+# Idempotent: if the line already exists (e.g., a previous capture window
+# left it), update it in place; otherwise append. Avoids duplicate lines
+# accumulating across multiple Arm A.2 runs.
+grep -q '^RELAY_ENABLE_HEARTBEAT_ECHO=' .env \
+  && sed -i 's/^RELAY_ENABLE_HEARTBEAT_ECHO=.*/RELAY_ENABLE_HEARTBEAT_ECHO=1/' .env \
+  || printf '\nRELAY_ENABLE_HEARTBEAT_ECHO=1\n' >> .env
+grep RELAY_ENABLE_HEARTBEAT_ECHO .env  # verify exactly one line, set to 1
+
+# Step 2: Recreate relay container so it picks up the flag.
+docker compose up -d --force-recreate relay
+sleep 3
+docker logs phantom-relay 2>&1 | grep "heartbeat_echo_enabled" | tail -1
+# Expect: heartbeat_echo_enabled=true in the "relay feature flags" line
+
+# Step 3: Bring up stunnel-arm-a2 via overlay. Operator is already
+# in /home/phantom/Phantom/deploy so the file paths are unprefixed.
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.armA2.yml \
+  up -d stunnel-arm-a2
+sleep 3
+docker logs phantom-stunnel-arm-a2 2>&1 | tail -10
+# Expect: "Configuration successful" + "Service [relay-arm-a2] (FD=*)" lines
+
+# Step 4: Reachability verify (TLS handshake + WS upgrade probe).
+curl -v --connect-timeout 5 \
+  -H "Connection: Upgrade" \
+  -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  https://relay.phntm.pro:8443/ws 2>&1 | head -30
+# Expect: TLS handshake success + HTTP/1.1 101 Switching Protocols (or
+# 400 Bad Request if relay's WS handler rejects an unauthed probe — both
+# indicate stunnel successfully terminated TLS and forwarded to relay).
+
+# Step 5: Run the Arm A.2 PR-8b diagnostic APK field capture window
+# (when PR-8b ships). Same logcat collection format as Arm D, plus a
+# parallel docker logs capture for the relay heartbeat_echo lines.
+
+# Step 6: After capture window completes, tear down stunnel-arm-a2.
+# Explicit stop + rm pair — `compose rm -fs` is not consistently
+# supported across compose versions and ambiguous for a public TLS
+# surface. Stop first (signals SIGTERM, container exits cleanly),
+# then remove.
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.armA2.yml \
+  stop stunnel-arm-a2
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.armA2.yml \
+  rm -f stunnel-arm-a2
+docker ps --filter "name=phantom-stunnel-arm-a2" --format '{{.Names}}'
+# Expect: empty output (container gone)
+
+# Step 7: Revert heartbeat-echo flag.
+sed -i '/^RELAY_ENABLE_HEARTBEAT_ECHO=/d' .env
+grep RELAY_ENABLE_HEARTBEAT_ECHO .env  # expect empty
+docker compose up -d --force-recreate relay
+sleep 3
+docker logs phantom-relay 2>&1 | grep "heartbeat_echo_enabled" | tail -1
+# Expect: heartbeat_echo_enabled=false
+
+# Step 8: Confirm relay healthy on production path.
+curl -sS https://relay.phntm.pro/health
+# Expect: {"status":"ok"}
+```
+
+**Cert-rotation handling note.** Let's Encrypt cert renewal cycle is ~60 days; production cert rotation is asynchronous and Caddy-managed. If renewal happens to fire inside an open Arm A.2 capture window, Caddy writes new PEM files to `/data/caddy/certificates/.../`. stunnel will NOT pick them up automatically — stunnel reads cert + key at startup and caches them. Two mitigations: (a) operator schedules capture windows away from anticipated renewal events (visible via `docker exec phantom-caddy caddy list-certificates`), (b) if a renewal does fire mid-window, `docker restart phantom-stunnel-arm-a2` re-reads the cert without disturbing relay. The window is short enough (~15 min) that mid-window renewals are unlikely in practice.
+
+**Image-refresh handling note.** The stunnel image in `deploy/docker-compose.armA2.yml` is pinned by digest (`dweomer/stunnel@sha256:c46e...`), not by tag, so the diagnostic endpoint is reproducible across deploys. To refresh the pin when a security-relevant upstream stunnel/OpenSSL update lands:
+
+```bash
+# Query the current digest of dweomer/stunnel:latest:
+TOKEN=$(curl -s 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:dweomer/stunnel:pull' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+curl -sI -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json" \
+  "https://registry-1.docker.io/v2/dweomer/stunnel/manifests/latest" \
+  | grep -i docker-content-digest
+```
+
+Update the `image:` line in `docker-compose.armA2.yml` with the new digest, commit as a separate small PR, then redeploy via the runbook above. Never use `:latest` directly — it makes the public TLS surface unreproducible.
+
+**WORKING_RULES rule 8 carve-out (PR-8a).** Server-side overlay + config only. Zero Android transport code touched. No client `RcDirectArmA2.kt` in this PR (that lands in PR-8b after this overlay is deployed). Rule 8 transport regression gate carve-out applies per the rule's own server-side-only clause.
+
+**WORKING_RULES rule 9 (no merge without verification).** Every code-state claim in this PR is grep-verified or SSH-VPS-verified:
+
+- relay code does not reference proxy headers → `grep` evidence above (Gate 1)
+- Caddy cert/key are PEM at the declared path → SSH evidence above (Gate 2)
+- compose service `relay` exists with `expose: 8080` → verified by reading `deploy/docker-compose.yml` lines 27-66
+- compose network attachment pattern works across `-f` merge → verified by reading `deploy/docker-compose.yml` `networks.phantom-internal` top-level + `services.relay.networks`/`services.caddy.networks` membership
+- compose project-name prefix produces `deploy_phantom-internal` actual name → SSH evidence above (`docker network ls`)
+- cert + key paths absolute and correct → SSH evidence above (`find` output)
 
 ### Arm B — Caddy tuning verification (server-side, observational)
 
