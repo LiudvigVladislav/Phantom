@@ -218,6 +218,16 @@ internal class RcDirectArmD(
         // a stale or closed socket (Vladislav PR-7 hard-point #1).
         val heartbeatJob = scope.launch {
             try {
+                // Vladislav PR-7 P1 fix: gate the first heartbeat on
+                // `onOpen` actually firing, not on time elapsed since
+                // `newWebSocket(...)`. `openedAt.await()` suspends until
+                // the listener completes the deferred in onOpen. After
+                // that, OQ-1 timing (first heartbeat at openAt + 15 s)
+                // holds even if the WS handshake took longer than usual.
+                // If the socket fails before onOpen (auth reject, network
+                // failure, etc.), the listener completes openedAt
+                // exceptionally so this coroutine cancels cleanly.
+                listener.openedAt.await()
                 delay(HEARTBEAT_INTERVAL_MS)
                 while (isActive && listener.sessionAlive) {
                     // Identity guard: if a concurrent stop() or new session
@@ -271,6 +281,12 @@ internal class RcDirectArmD(
                     delay(HEARTBEAT_INTERVAL_MS)
                 }
             } catch (t: Throwable) {
+                // Vladislav PR-7 P2 fix: rethrow CancellationException so the
+                // expected `heartbeatJob.cancel()` in `runOneSession.finally`
+                // does not log a spurious warning per session close.
+                // Cooperative cancellation MUST propagate; only true
+                // throwables (network, IO, runtime) reach the warn line.
+                if (t is kotlinx.coroutines.CancellationException) throw t
                 Log.w(
                     TAG,
                     "RC_DIRECT_ARM_D_heartbeat_sender_threw s=$sessionEpoch " +
@@ -378,6 +394,18 @@ internal class RcDirectArmD(
         @Volatile var sessionAlive: Boolean = true
         @Volatile var openAtMs: Long = 0L
 
+        /**
+         * Completed in [onOpen] with the wall-clock millis at which the WS
+         * handshake actually finished. The heartbeat sender coroutine
+         * awaits this before scheduling the first heartbeat at
+         * `openAt + 15s` (Vladislav PR-7 P1 fix). If the session fails
+         * before `onOpen` (auth reject, network failure, handshake error)
+         * the listener completes this exceptionally from [onClosed] /
+         * [onFailure] so the sender coroutine unblocks cleanly via the
+         * existing `runOneSession.finally` cancellation path.
+         */
+        val openedAt: CompletableDeferred<Long> = CompletableDeferred()
+
         private val seqCounter = java.util.concurrent.atomic.AtomicLong(0L)
         val echoSent = java.util.concurrent.atomic.AtomicLong(0L)
         private val echoReceived = java.util.concurrent.atomic.AtomicLong(0L)
@@ -390,6 +418,11 @@ internal class RcDirectArmD(
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
             openAtMs = System.currentTimeMillis()
+            // Vladislav PR-7 P1: gate the heartbeat sender on this signal,
+            // not on time elapsed since `newWebSocket(...)`. If the
+            // handshake took longer than usual the sender still respects
+            // OQ-1 (first heartbeat at openAt + 15 s).
+            openedAt.complete(openAtMs)
             Log.i(
                 TAG,
                 "RC_DIRECT_ARM_D_ws_open s=$sessionEpoch " +
@@ -464,6 +497,13 @@ internal class RcDirectArmD(
                 currentWebSocket = null
             }
             sessionAlive = false
+            // Vladislav PR-7 P1 fix: if the session closed before onOpen
+            // ever fired, unblock the heartbeat coroutine's openedAt.await()
+            // so it cancels cleanly via finally rather than hanging until
+            // outer scope cancellation.
+            openedAt.completeExceptionally(
+                IllegalStateException("ws closed before onOpen (code=$code)"),
+            )
             val nowMs = System.currentTimeMillis()
             val lifetimeMs = if (openAtMs > 0L) nowMs - openAtMs else -1L
             val sentTotal = echoSent.get()
@@ -491,6 +531,13 @@ internal class RcDirectArmD(
                 currentWebSocket = null
             }
             sessionAlive = false
+            // Vladislav PR-7 P1 fix: same rationale as onClosed — unblock
+            // openedAt.await() if the session failed before onOpen.
+            openedAt.completeExceptionally(
+                IllegalStateException(
+                    "ws failed before onOpen (${t::class.simpleName})",
+                ),
+            )
             val nowMs = System.currentTimeMillis()
             val lifetimeMs = if (openAtMs > 0L) nowMs - openAtMs else -1L
             val sentTotal = echoSent.get()
