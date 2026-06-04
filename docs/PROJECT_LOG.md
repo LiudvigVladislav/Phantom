@@ -589,6 +589,45 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-04 (thu, night) · RC-DIRECT-STABILITY1 Arm A.2 PR-8a — stunnel server-side overlay + config + operator runbook; pre-code Gates 1 + 2 both PASS, stunnel stays primary, HAProxy fallback not triggered
+
+Server-side implementation PR for Arm A.2. Two new files in `deploy/` + implementation-record subsection appended to `docs/tracks/rc-direct-stability1.md` §4 Arm A.2. Zero application or relay code change.
+
+**Pre-code Gate 1 — relay proxy header dependency: PASS.** `grep -rIn 'X-Forwarded-For\|X-Real-IP\|Forwarded' services/relay/src/` on master `f7af95d8` → zero matches. Relay does not depend on proxy headers for auth (signed-challenge per ADR-027 is in-payload), rate-limit, or any other policy. stunnel raw TCP forward to `relay:8080` is safe — relay receives the unmodified TCP stream from the client device after stunnel decrypts. HAProxy fallback per §4 Arm A.2 Refined scope rule (b) NOT triggered.
+
+**Pre-code Gate 2 — Caddy cert format and path: PASS.** SSH-verified on VPS 2026-06-04:
+
+- Cert at `/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/relay.phntm.pro/relay.phntm.pro.crt`, format PEM (`-----BEGIN CERTIFICATE-----`)
+- Key at `/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/relay.phntm.pro/relay.phntm.pro.key`, format PEM EC (`-----BEGIN EC PRIVATE KEY-----`)
+- Standalone PEM files, NOT internal database format — read-only volume sharing structurally possible. HAProxy fallback per §4 Arm A.2 Refined scope rule (a) NOT triggered.
+
+**Pre-code bonus — compose network: confirmed.** SSH-verified on VPS 2026-06-04: actual Docker network name `deploy_phantom-internal` (default compose project name `deploy` prefix). `phantom-relay` at `172.18.0.2`, `phantom-caddy` at `172.18.0.6`. stunnel attaches via overlay's `networks: [phantom-internal]` reference — compose merges across `-f` files and resolves the reference to the same actual network. Docker DNS resolves `relay` → relay container IP from inside the stunnel container, so the `connect = relay:8080` directive works.
+
+**stunnel stays primary candidate per §4 Arm A.2 trade-off review.** All three HAProxy fallback escalation triggers from §4 Arm A.2 Refined scope rule are NOT activated. No mini-lock amendment needed.
+
+**Files shipped (this PR, docs + 2 new server-side config files):**
+
+- `deploy/docker-compose.armA2.yml` (NEW) — overlay file. Service `stunnel-arm-a2`, container `phantom-stunnel-arm-a2`, image `dweomer/stunnel:latest`, `restart: "no"` (time-boxed), ports `8443:8443`, volumes `caddy-data:/data:ro` + `./stunnel.armA2.conf:/etc/stunnel/stunnel.conf:ro`, network `phantom-internal`, depends_on `relay`. Security posture: `cap_drop ALL`, `no-new-privileges`, `read_only` rootfs, tmpfs `/tmp:4m`.
+- `deploy/stunnel.armA2.conf` (NEW) — stunnel config. `[relay-arm-a2]` service block, `accept 0.0.0.0:8443`, `connect relay:8080`, cert + key paths under `/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/relay.phntm.pro/` (matching Caddy's own path inside the shared volume), TLS 1.2 minimum + 1.3 preferred, strong cipher suites only, `clients = 50` connection cap.
+- `docs/tracks/rc-direct-stability1.md` (UPDATED) — §4 Arm A.2 PR-8a implementation record subsection appended with Gate evidence + file inventory + operator runbook (open / verify / capture / revert) + cert-rotation handling note + WORKING_RULES rule 8 carve-out + rule 9 grep-verified-per-claim list.
+- `docs/PROJECT_LOG.md` (UPDATED) — this session entry.
+- `docs/project/MASTER_TIMELINE_2026.md` (UPDATED) — Last-updated bump + Shipped list extension through PR #284 plus this PR.
+
+**Operator runbook (Vladislav-owned, per §4 Arm A.2 PR-8a implementation record).** Eight steps: enable `RELAY_ENABLE_HEARTBEAT_ECHO=1`, recreate relay, bring up stunnel-arm-a2 via overlay, reachability verify with curl WS upgrade probe, capture window run with PR-8b APK, tear down stunnel-arm-a2 via `compose rm -fs`, revert heartbeat-echo flag, confirm relay healthy on production path. Full bash sequence in track doc.
+
+**WORKING_RULES rule 8 carve-out (PR-8a).** Server-side overlay + config only. Zero Android transport code touched. No `RcDirectArmA2.kt` here (that lands in PR-8b). Rule 8 transport regression gate carve-out applies per the rule's server-side-only clause.
+
+**WORKING_RULES rule 9 (no merge without verification).** Every claim in this PR is grep-verified or SSH-VPS-verified — full list in §4 Arm A.2 PR-8a implementation record subsection.
+
+**Track sequencing locked:**
+
+- PR-8a (this PR): server-side overlay + config + operator runbook.
+- PR-8b (next, Android): `RcDirectArmA2.kt` near-clone of `RcDirectArmD` with `:8443` endpoint URL + new `DEBUG_RC_DIRECT_ARM_A2_URL` BuildConfig field. AppContainer + Service wire-up under precedence A → A.2 → B → C → D → production.
+- Field test: Tecno Tele2 LTE 15-min capture through `wss://relay.phntm.pro:8443/ws` after PR-8b APK builds and operator runs the open/verify steps of the §4 Arm A.2 runbook.
+- Arm A.2 outcome record will append to §4 Arm A.2 subsection (analogous to Arm C and Arm D outcome subsections) after the field run completes.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence` — escalates to "needed" only if Arm A.2 closes X.
+
 ### 2026-06-04 (thu, evening) · RC-DIRECT-STABILITY1 Arm A.2 scope mini-lock — stunnel primary candidate locked after structured trade-off review; W/X/Y three-outcome discriminator + public TLS surface security mini-lock; Arm E sequenced after Arm A.2 outcome
 
 Single docs-only PR promoting Arm A.2 from §9 parking lot to §4 active arm per the Arm D outcome deviation (PR #283 squash `601d9d8d`).
