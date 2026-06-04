@@ -175,8 +175,13 @@ cd /home/phantom/Phantom/deploy
 git pull origin master
 
 # Step 1: Enable heartbeat-echo flag for the capture window only.
-echo 'RELAY_ENABLE_HEARTBEAT_ECHO=1' >> .env
-grep RELAY_ENABLE_HEARTBEAT_ECHO .env  # verify added
+# Idempotent: if the line already exists (e.g., a previous capture window
+# left it), update it in place; otherwise append. Avoids duplicate lines
+# accumulating across multiple Arm A.2 runs.
+grep -q '^RELAY_ENABLE_HEARTBEAT_ECHO=' .env \
+  && sed -i 's/^RELAY_ENABLE_HEARTBEAT_ECHO=.*/RELAY_ENABLE_HEARTBEAT_ECHO=1/' .env \
+  || printf '\nRELAY_ENABLE_HEARTBEAT_ECHO=1\n' >> .env
+grep RELAY_ENABLE_HEARTBEAT_ECHO .env  # verify exactly one line, set to 1
 
 # Step 2: Recreate relay container so it picks up the flag.
 docker compose up -d --force-recreate relay
@@ -210,11 +215,20 @@ curl -v --connect-timeout 5 \
 # parallel docker logs capture for the relay heartbeat_echo lines.
 
 # Step 6: After capture window completes, tear down stunnel-arm-a2.
+# Explicit stop + rm pair — `compose rm -fs` is not consistently
+# supported across compose versions and ambiguous for a public TLS
+# surface. Stop first (signals SIGTERM, container exits cleanly),
+# then remove.
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.armA2.yml \
-  rm -fs stunnel-arm-a2
-docker ps | grep stunnel  # verify gone
+  stop stunnel-arm-a2
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.armA2.yml \
+  rm -f stunnel-arm-a2
+docker ps --filter "name=phantom-stunnel-arm-a2" --format '{{.Names}}'
+# Expect: empty output (container gone)
 
 # Step 7: Revert heartbeat-echo flag.
 sed -i '/^RELAY_ENABLE_HEARTBEAT_ECHO=/d' .env
@@ -230,6 +244,19 @@ curl -sS https://relay.phntm.pro/health
 ```
 
 **Cert-rotation handling note.** Let's Encrypt cert renewal cycle is ~60 days; production cert rotation is asynchronous and Caddy-managed. If renewal happens to fire inside an open Arm A.2 capture window, Caddy writes new PEM files to `/data/caddy/certificates/.../`. stunnel will NOT pick them up automatically — stunnel reads cert + key at startup and caches them. Two mitigations: (a) operator schedules capture windows away from anticipated renewal events (visible via `docker exec phantom-caddy caddy list-certificates`), (b) if a renewal does fire mid-window, `docker restart phantom-stunnel-arm-a2` re-reads the cert without disturbing relay. The window is short enough (~15 min) that mid-window renewals are unlikely in practice.
+
+**Image-refresh handling note.** The stunnel image in `deploy/docker-compose.armA2.yml` is pinned by digest (`dweomer/stunnel@sha256:c46e...`), not by tag, so the diagnostic endpoint is reproducible across deploys. To refresh the pin when a security-relevant upstream stunnel/OpenSSL update lands:
+
+```bash
+# Query the current digest of dweomer/stunnel:latest:
+TOKEN=$(curl -s 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:dweomer/stunnel:pull' | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+curl -sI -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json" \
+  "https://registry-1.docker.io/v2/dweomer/stunnel/manifests/latest" \
+  | grep -i docker-content-digest
+```
+
+Update the `image:` line in `docker-compose.armA2.yml` with the new digest, commit as a separate small PR, then redeploy via the runbook above. Never use `:latest` directly — it makes the public TLS surface unreproducible.
 
 **WORKING_RULES rule 8 carve-out (PR-8a).** Server-side overlay + config only. Zero Android transport code touched. No client `RcDirectArmA2.kt` in this PR (that lands in PR-8b after this overlay is deployed). Rule 8 transport regression gate carve-out applies per the rule's own server-side-only clause.
 

@@ -22,11 +22,19 @@
 #       -f docker-compose.armA2.yml \
 #       up -d stunnel-arm-a2
 #
-#   Close the bypass immediately after the capture window:
+#   Close the bypass immediately after the capture window (explicit
+#   stop + rm pair — `compose rm -fs` is inconsistent across compose
+#   versions, ambiguous for a public TLS surface):
 #     docker compose \
 #       -f docker-compose.yml \
 #       -f docker-compose.armA2.yml \
-#       rm -fs stunnel-arm-a2
+#       stop stunnel-arm-a2
+#     docker compose \
+#       -f docker-compose.yml \
+#       -f docker-compose.armA2.yml \
+#       rm -f stunnel-arm-a2
+#     docker ps --filter "name=phantom-stunnel-arm-a2" --format '{{.Names}}'
+#     # expect: empty output (container gone)
 #
 # Also flip `RELAY_ENABLE_HEARTBEAT_ECHO=1` in `.env` for the same window
 # and revert after; see §4 Arm A.2 PR-8a implementation record in
@@ -39,11 +47,22 @@
 services:
   stunnel-arm-a2:
     # Upstream image — actively maintained, Alpine-based, single-purpose
-    # TLS terminator. Time-boxed exposure + cap_drop ALL + no-new-privileges
-    # + read_only rootfs bound the blast radius if image were compromised.
+    # TLS terminator. Pinned by digest, not tag, so the diagnostic endpoint
+    # is reproducible: today's deploy and tomorrow's deploy use the exact
+    # same stunnel + OpenSSL build. The :latest tag in dweomer's repo can
+    # advance without notice; for a public TLS surface that's not safe.
+    # Digest resolved from Docker Hub registry API 2026-06-05.
+    #
+    # To refresh the pin when dweomer publishes a security-relevant
+    # update, follow the procedure in `docs/tracks/rc-direct-stability1.md`
+    # §4 Arm A.2 PR-8a implementation record (cert-rotation handling +
+    # image-refresh handling notes).
+    #
+    # Time-boxed exposure + cap_drop ALL + no-new-privileges + read_only
+    # rootfs bound the blast radius if the pinned image had a sleeper.
     # AGPL compliance preserved per §4 Arm A.2 Security mini-lock —
     # stunnel is GPL-2.0; relay binary unchanged.
-    image: dweomer/stunnel:latest
+    image: dweomer/stunnel@sha256:c46e11e6cc135275566de318d739f815c272c23084fc1e65704f7e228992e9ef
     container_name: phantom-stunnel-arm-a2
     # Never auto-restart. Time-boxed by operator: up only during the
     # Arm A.2 capture window, removed immediately after. If something
