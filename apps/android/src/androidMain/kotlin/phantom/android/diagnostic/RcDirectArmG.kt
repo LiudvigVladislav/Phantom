@@ -248,10 +248,14 @@ internal class RcDirectArmG(
                 // start() does not throw; it transitions state to Failed
                 // and returns. But guard the call site anyway in case
                 // a future implementation breaks that contract.
+                //
+                // §14 hard gate 3: redact libXray error strings (may
+                // embed credentials / config paths). Log only generic
+                // class marker — never `t.message`.
                 Log.w(
                     TAG,
                     "RC_DIRECT_ARM_G_xray_start_threw " +
-                        "t=${t::class.simpleName} msg=${t.message?.take(160)}",
+                        "message_class=start_call_threw t=${t::class.simpleName}",
                 )
                 return@launch
             }
@@ -444,6 +448,18 @@ internal class RcDirectArmG(
                             "RC_DIRECT_ARM_G_heartbeat_send_failed s=$sessionEpoch seq=$seq " +
                                 "reason=enqueue_returned_false",
                         )
+                        // §14 hard gate 9 fail-fast (PR-G2 v2 fixup per
+                        // Vladislav P2(b) review): completing the
+                        // `completion` deferred terminates `runOneSession`,
+                        // which cancels the heartbeat coroutine via finally
+                        // AND closes the WS via `ws.cancel()`. Without this,
+                        // heartbeat would stop but `completion.await()`
+                        // would block waiting for the listener's
+                        // onClosed/onFailure — the session would hang
+                        // without an echo path, which corrupts the PASS /
+                        // PARTIAL / FAIL signal because the relay would
+                        // see a still-open WS with no inbound Text.
+                        completion.complete("heartbeat_send_failed_enqueue")
                         break
                     }
                     listener.echoSent.set(seq)

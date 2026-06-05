@@ -961,14 +961,26 @@ class PhantomMessagingService : Service() {
             // request boundary so a post-mortem can correlate the
             // teardown timing with any late RC_DIRECT_ARM_G_ws_failure
             // entries that may still be in flight from a final reconnect
-            // attempt cancelled above.
+            // attempt cancelled above. We log the done boundary too so
+            // PR-G3 outcome capture can verify the daemon actually
+            // reached Off rather than hanging in Stopping.
+            //
+            // §14 hard gate 3: redact libXray error strings (may embed
+            // credentials / config paths). On failure log only generic
+            // class marker — never `it.message`.
             Log.i("RC_DIRECT_ARM_G", "RC_DIRECT_ARM_G_xray_stop_requested")
             runCatching {
                 kotlinx.coroutines.runBlocking {
                     (application as PhantomApplication).container.xrayService.stop()
                 }
-            }.onFailure {
-                Log.w(TAG, "RC_DIRECT_ARM_G_xray_stop_failed: ${it.message}")
+            }.onSuccess {
+                Log.i("RC_DIRECT_ARM_G", "RC_DIRECT_ARM_G_xray_stop_done")
+            }.onFailure { t ->
+                Log.w(
+                    TAG,
+                    "RC_DIRECT_ARM_G_xray_stop_failed " +
+                        "message_class=stop_call_threw t=${t::class.simpleName}",
+                )
             }
         }
         // ADR-011: cancel the AlarmManager wakeup so we don't keep waking
