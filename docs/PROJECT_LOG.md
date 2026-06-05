@@ -589,6 +589,86 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-06 (sat) · RC-DIRECT-STABILITY1 Arm A.2 outcome — Y verdict with persistent control/application asymmetry continuation; track does NOT close, T2 byte-threshold + Arm G Reality-WS micro-experiments precede final close (1-week time-box)
+
+Docs-only PR locking the Arm A.2 field test verdict in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 Outcome subsection. Does NOT close the track — Vladislav-locked refined plan after four-architect external review 2026-06-05 carries forward two cheap micro-experiments before final close.
+
+**Field run (Tecno Tele2 LTE 2026-06-05 ~01:00 — ~01:16 local, 15-min capture, PR-8b APK `phantom-arma2.apk` SHA `17fec82e783107fac09621c4ef9d47d581b883fe27dd88003eb214b5499fed2f`):**
+
+- Client log: 21 ws_open / 20 ws_failure / 40 echo_sent events / **0** echo_received / 0 heartbeat_sender exceptions
+- Relay log: 20 ws_protocol_ping_received / 20 ws_protocol_pong_sent / **0** event=heartbeat_echo_received (per-frame log at `services/relay/src/routes.rs:523`)
+- Mode 2 carrier signature byte-perfect identical to Arm D (s=1: 30 004 ms / 0 successful pongs; s=2..s=20: ~45 008 ms / 1 successful pong)
+- Control/application asymmetry persists through `:8444` (Ping arrives at relay app layer, Text never does)
+
+**Two different TLS stacks (Caddy Go TLS vs stunnel OpenSSL 3.3.7) + two different proxy paths → byte-identical death.** The proximal cause is NOT the edge stack.
+
+**Verdict per §5 + §6 + §4 Arm A.2 Discriminator W/X/Y:**
+
+- **W refuted** — WS lifetime not extended (median ~45 s vs ≥ 90 s threshold); Mode 2 signature persists; echo round-trips never succeed.
+- **X met** — asymmetry persists Ping vs Text. Caddy loses priority as proximal cause.
+- **Y met** — Mode 2 signature persists through `:8444`. Structural carrier / path / lower-layer kill.
+- **Honest synthesis:** "Y with persistent control/application asymmetry continuation."
+
+**Wording bounds locked:** does NOT claim "Caddy innocent" / "carrier discriminates" / "TLS broken" / "WebSocket broken". Five-hypothesis open set respected.
+
+**Hypothesis-set update — Arm D four-hypothesis set EXTENDED to FIVE** after Independent Audit input 2026-06-05:
+
+1. OkHttp writer-side enqueue-vs-egress timing
+2. Caddy/TLS WS frame handling (Arm A.2 refutes this as proximal)
+3. Carrier path stateful inspection
+4. Interaction across layers 1-3
+5. **NEW: Cumulative-bytes-per-TCP-connection freeze (~14-32 KB threshold).** Documented in `net4people/bbs Issue #490` (hyperion-cs, 2025-06-27) and Runnin4ik's dpi-detector CLI. Mechanism explains: linear lifetime ≈ 3× ping_interval, Ping (6B) vs Text (50B+) asymmetry, per-connection reset, Mode 2 signature shape.
+
+T2 micro-experiment directly discriminates hypothesis 5.
+
+**External architecture review consumed (four independent architects + working architect, 2026-06-05):**
+
+- **Gemini** — close immediately + Option A. Too quick, did not know Reality is production-validated.
+- **Claude Code in-chat** — Arm G (Reality-tunneled WS) before close.
+- **Claude Code Independent Audit (most substantive 38KB document)** — introduces byte-threshold hypothesis missed in my own open set + concrete T2/Arm G designs + Reality+SSE as layers not alternatives + QUIC blocked in RU per YARA-rule do-not-pursue.
+- **Working architect** — Arm G primary discriminator before close + decision tree from result.
+- **ChatGPT Executive Summary docx** — off-track (analyses old PR-RECV-DIAG1 v1.6 sticky lastWorkingTransport + MAC error + ack_deliver problem; not current Direct WS / Tele2 track; backlog).
+- **Convergence:** bare Direct WSS no longer single foundation of realtime; ADR-028 4-layer architecture intent is correct path.
+- **Vladislav-locked refinement:** T2+Arm G both before final close (T2 cheaper sharper discriminator; Arm G follows). Hard time-box 1 week.
+
+**Five-step plan (current step = step 1):**
+
+1. **Arm A.2 outcome docs-only PR (this PR)** — locks verdict in track doc; does NOT close track.
+2. **VPS tear-down** — `compose stop stunnel-arm-a2 + rm -f`; revert `RELAY_ENABLE_HEARTBEAT_ECHO=1` from `.env`. xray REALITY `:8443` untouched.
+3. **T2 slow POST diagnostic (~1 day)** — relay endpoint `/diag/slow-post` (default-off env flag); Android `T2SlowPostDiag.kt` sends 40 KB chunked (5 KB per 10 s, total 90 s). Discriminator: dies at 14-32 KB → byte-threshold confirmed → Matrix-style 25-sec long-poll mandatory.
+4. **Arm G WS-over-Reality (~2-3 days)** — Android `RcDirectArmG.kt` routes through embedded libXray SOCKS5 `localhost:10808` → `:8443` Reality endpoint → relay. 10-15 min Tele2 LTE field test. Discriminator: holds ≥ 10 min → Reality-primary realtime for RU mobile.
+5. **Final outcome PR + Council on architecture pivot** (~1-2 days).
+
+**Decision tree after T2 + Arm G:**
+
+| T2 | Arm G | Architectural pivot |
+|---|---|---|
+| any | holds ≥ 10 min | Reality-tunneled realtime primary. Cost ~3-4 weeks. |
+| 14-32 KB freeze | dies | Matrix-style 25-sec long-poll mandatory + REST. Cost ~6-8 weeks. |
+| holds 40 KB | dies | Pure REST (Option A). Cost ~6-8 weeks. |
+
+**Files updated (this PR, docs-only):**
+
+- `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 — Outcome subsection added after PR-8a implementation record subsection (analogous to Arm C / Arm D outcome subsections), 16 bullet points covering client counters / relay counters / Mode 2 persistence / asymmetry continuation through `:8444` / hypothesis-set extension to 5 / PR #280 + fixup chain lifecycle held / matrix validity clean / W refuted + X met + Y met verdict / wording bounds carried forward / §5 X+Y joint firing / T2+Arm G carry-forward / decision tree / VPS tear-down note / external review summary / memory pointer.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension through PR #290 plus this PR.
+
+**Memory:** `project_arm_a2_outcome_y_with_asymmetry_2026_06_05.md` — Arm A.2 outcome detail + five-hypothesis open set + T2/Arm G next-step plan with discriminators + four-architect review summary + state document pointer.
+
+**State document for external architects preserved at:** `C:\temp\rc-direct-stability1-state-for-external-review.md` (~30 KB).
+
+**Field run logs preserved at:** `C:\temp\arm-a2-tecno-tele2.log` (client, 329 lines) + `C:\temp\arm-a2-relay.log` (relay, 40 lines filter-restricted).
+
+**Track sequencing locked:**
+
+- PR (this PR): Arm A.2 outcome lock. Does NOT close track.
+- Next: VPS operator tear-down (Vladislav-owned SSH).
+- After tear-down: T2 design + relay endpoint PR + Android diagnostic PR.
+- After T2 result: Arm G design + Android Xray-SOCKS routing PR.
+- After Arm G result: final outcome PR closing track with verdict + Council on architecture pivot.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence` — escalates to "needed" per §5 row A.2 X firing.
+
 ### 2026-06-05 (fri, very late) · RC-DIRECT-STABILITY1 Arm A.2 PR-8b — Android `RcDirectArmA2.kt` diagnostic class + `DEBUG_RC_DIRECT_ARM_A2_URL` BuildConfig + AppContainer/Service wire-up at precedence A → A.2 → B → C → D → production
 
 Android client PR for Arm A.2 after the server-side bypass chain (#286 + #287 + #288 + #289) landed and deploy-verified on VPS 2026-06-05 (TLS 1.3 + relay `401 Unauthorized` through stunnel `:8444`).
