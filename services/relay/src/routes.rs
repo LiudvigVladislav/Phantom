@@ -29,9 +29,10 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -116,6 +117,33 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(30),
         ));
+
+    // ── T2 slow-POST diagnostic (RC-DIRECT-STABILITY1 §10) ──────────────────
+    //
+    // Conditional route registration: when `slow_post_diag_enabled = false`
+    // (production default), the route is NOT registered and any POST to
+    // `/diag/slow-post` returns 404 — per Vladislav hard gate B 2026-06-06
+    // (route off → 404, not live endpoint returning 405). The handler itself
+    // is mounted only when the operator explicitly flips
+    // `RELAY_ENABLE_SLOW_POST_DIAG=1` on the VPS `.env`.
+    //
+    // The diagnostic answers whether the carrier path "freezes" a TCP
+    // connection at a cumulative-bytes threshold (`net4people/bbs Issue #490`
+    // hypothesis: 14-32 KB on RU mobile operators including Tele2).
+    //
+    // Critically, this route is mounted AFTER the 30-second `TimeoutLayer`
+    // is applied to the standard HTTP routes — so the layer wraps only the
+    // routes added BEFORE it, leaving `/diag/slow-post` free to run for
+    // ~70-80 seconds (8 chunks × 5120 bytes, one chunk every 10 s). The
+    // global `RequestBodyLimitLayer` (~65 KB ceiling) still applies; the
+    // 64 KB in-handler cap below it is strictly less.
+    //
+    // Locked design in `docs/tracks/rc-direct-stability1.md` §10 T2 mini-lock.
+    let http_routes = if state.config.slow_post_diag_enabled {
+        http_routes.route("/diag/slow-post", post(slow_post_diag))
+    } else {
+        http_routes
+    };
 
     Router::new()
         .route("/ws", get(ws_handler))
@@ -1017,6 +1045,156 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ── T2 slow-POST diagnostic (RC-DIRECT-STABILITY1 §10) ────────────────────────
+//
+// Conditional handler — only mounted on the router when
+// `state.config.slow_post_diag_enabled = true` (env `RELAY_ENABLE_SLOW_POST_DIAG=1`).
+// The route registration in `router()` above falls back to NOT registering
+// the route when the flag is `false`, so any POST hits the 404 fallback.
+//
+// Locked behaviour:
+//   - Requires header `X-Phantom-Diag: slow-post-v1` (anti-stray-POST guard).
+//   - Requires `Content-Type: application/octet-stream`.
+//   - Caps body at `SLOW_POST_CAP_BYTES` (64 KB); request body larger than
+//     this is aborted with 413 + `event=slow_post_aborted reason=cap_exceeded`.
+//   - Streams the body chunk-by-chunk via `Body::into_data_stream()` and
+//     logs `event=slow_post_chunk_received conn_id=N total_bytes=N
+//     elapsed_ms=T chunk_bytes=N` per chunk. The per-chunk log is the
+//     primary discriminator (Vladislav hard gate 2 — relay `total_received`
+//     IS the verdict counter, NOT Android `total_sent`).
+//   - On body complete: responds `200 OK` with JSON
+//     `{"total_received": N, "duration_ms": T}` and logs
+//     `event=slow_post_completed conn_id=N total_bytes=N elapsed_ms=T`.
+//   - On mid-body abort (carrier kill / TCP RST / read error): logs
+//     `event=slow_post_aborted conn_id=N total_bytes=N elapsed_ms=T reason=...`
+//     where `total_bytes` is the cumulative byte counter at the moment the
+//     stream ended — this is the verdict number for the T2 hypothesis.
+//
+// Verdict logic (per `docs/tracks/rc-direct-stability1.md` §10 T2):
+//   - Relay receives 14-32 KB and aborts → `net4people/bbs Issue #490`
+//     cumulative-bytes-per-TCP-connection-freeze hypothesis strongly
+//     confirmed on this path; architectural implication: even long SSE
+//     responses die at the threshold; Matrix-style 25-sec long-poll
+//     becomes mandatory primary realtime pattern.
+//   - Relay receives > 32 KB but < 40 KB and aborts → same class of
+//     hypothesis (cumulative-bytes freeze) with a different threshold value.
+//   - Relay receives all 40 960 bytes and responds 200 OK → byte-threshold
+//     hypothesis refuted on HTTP POST through Caddy. Architectural
+//     implication: kill is in hypotheses 1/2/3/4 (OkHttp egress, Caddy WS
+//     framing, carrier stateful inspection, or interaction); Arm G
+//     (WS-over-Reality) is the primary next test.
+const SLOW_POST_CAP_BYTES: u64 = 64 * 1024;
+
+async fn slow_post_diag(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    let conn_id = state.conn_counter.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+
+    // Header guards — both must match exactly. Anything else aborts with
+    // 400 BEFORE the body read begins so a misdirected POST cannot run
+    // up the byte counter and skew a concurrent diagnostic.
+    let headers = request.headers();
+    let header_check = headers
+        .get("x-phantom-diag")
+        .map(|v| v.as_bytes() == b"slow-post-v1")
+        .unwrap_or(false);
+    if !header_check {
+        tracing::warn!(
+            event = "slow_post_aborted",
+            conn_id = conn_id,
+            total_bytes = 0_u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reason = "missing_or_wrong_x_phantom_diag_header",
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected header X-Phantom-Diag: slow-post-v1",
+        )
+            .into_response();
+    }
+    let content_type_check = headers
+        .get("content-type")
+        .map(|v| v.as_bytes() == b"application/octet-stream")
+        .unwrap_or(false);
+    if !content_type_check {
+        tracing::warn!(
+            event = "slow_post_aborted",
+            conn_id = conn_id,
+            total_bytes = 0_u64,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reason = "wrong_content_type",
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected Content-Type: application/octet-stream",
+        )
+            .into_response();
+    }
+
+    // Stream body chunk-by-chunk. Each yielded `Bytes` corresponds to one
+    // HTTP/1.1 chunked-transfer chunk (or one HTTP/2 DATA frame) — the
+    // unit of work the T2 hypothesis is testing. `total_bytes` is logged
+    // per chunk so a mid-body abort captures the exact byte count at
+    // which the carrier path "froze."
+    let mut total: u64 = 0;
+    let mut stream = request.into_body().into_data_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                tracing::warn!(
+                    event = "slow_post_aborted",
+                    conn_id = conn_id,
+                    total_bytes = total,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    reason = "read_error",
+                    err = %err,
+                );
+                return (StatusCode::BAD_REQUEST, "read error").into_response();
+            }
+        };
+        let chunk_len = chunk.len() as u64;
+        total = total.saturating_add(chunk_len);
+        if total > SLOW_POST_CAP_BYTES {
+            tracing::warn!(
+                event = "slow_post_aborted",
+                conn_id = conn_id,
+                total_bytes = total,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                reason = "cap_exceeded",
+                cap_bytes = SLOW_POST_CAP_BYTES,
+            );
+            return (StatusCode::PAYLOAD_TOO_LARGE, "body cap exceeded").into_response();
+        }
+        tracing::info!(
+            event = "slow_post_chunk_received",
+            conn_id = conn_id,
+            total_bytes = total,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            chunk_bytes = chunk_len,
+        );
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(
+        event = "slow_post_completed",
+        conn_id = conn_id,
+        total_bytes = total,
+        elapsed_ms = elapsed_ms,
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "total_received": total,
+            "duration_ms": elapsed_ms,
+        })),
+    )
+        .into_response()
 }
 
 async fn send_envelope(

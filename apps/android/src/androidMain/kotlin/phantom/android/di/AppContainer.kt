@@ -390,6 +390,46 @@ class AppContainer(private val context: Context) {
         }
     }
 
+    // ── RC-DIRECT-STABILITY1 §10 T2 — slow-POST byte-threshold diagnostic ────
+    //
+    // Constructed lazily and ONLY when DEBUG_T2_SLOW_POST_URL is non-empty
+    // in a debug build. T2 is a ONE-SHOT diagnostic (not a reconnect loop)
+    // — one HTTP POST that streams 40 960 bytes over ~70-80 s. The wire-up
+    // site (`PhantomMessagingService.onStartCommand`) checks the same gate
+    // before calling `.start()` and short-circuits the production Hybrid
+    // Ktor `transport.connect(...)` path so production and diagnostic
+    // traffic never collide (Inv-ParallelArmIsolation).
+    //
+    // Release builds (`!BuildConfig.DEBUG`) are excluded by the gate AND
+    // the release BuildConfig block pins DEBUG_T2_SLOW_POST_URL to ""
+    // for defence-in-depth.
+    //
+    // T2 client uses a SEPARATE OkHttp profile from the WebSocket arms
+    // (Vladislav 2026-06-06 hard gate 1) — built inside T2SlowPostDiag
+    // itself with `callTimeout=180s` and the other diag-appropriate
+    // values. The WS arms' `callTimeout(10s)` would kill the slow POST
+    // before threshold detection.
+    //
+    // Server-side dependency (Vladislav-owned VPS step before APK runs):
+    // operator must flip `RELAY_ENABLE_SLOW_POST_DIAG=1` on the VPS `.env`
+    // and recreate relay so the `/diag/slow-post` endpoint is mounted.
+    // When the flag is `false` (production default), the endpoint returns
+    // 404 — defence-in-depth per `services/relay/src/routes.rs:router()`.
+    //
+    // Locked in `docs/tracks/rc-direct-stability1.md` §10 T2 mini-lock.
+    internal val t2SlowPostDiag: phantom.android.diagnostic.T2SlowPostDiag? by lazy {
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL.isNotEmpty()
+        ) {
+            phantom.android.diagnostic.T2SlowPostDiag(
+                endpointUrl = phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL,
+                scope = appScope,
+            )
+        } else {
+            null
+        }
+    }
+
     // In-memory cache of the current identity. Populated eagerly at startup and
     // by initMessaging*; readers (ProfileScreen, top-bar avatar, etc.) collect
     // this StateFlow instead of calling identityRepo.loadIdentity() per screen,

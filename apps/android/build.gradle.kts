@@ -288,6 +288,45 @@ android {
             // + §7 step 5e + PR-8a implementation record subsection.
             val debugRcDirectArmA2Url = localOrEnv("debugRcDirectArmA2Url", "DEBUG_RC_DIRECT_ARM_A2_URL", "")
             buildConfigField("String", "DEBUG_RC_DIRECT_ARM_A2_URL", "\"$debugRcDirectArmA2Url\"")
+            // RC-DIRECT-STABILITY1 §10 T2: slow-POST byte-threshold diagnostic.
+            // When non-empty in a debug build, the wire-up site at
+            // `AppContainer.t2SlowPostDiag` constructs `T2SlowPostDiag`
+            // pointing at this URL, and `PhantomMessagingService.onStartCommand`
+            // short-circuits the production Hybrid Ktor `transport.connect(...)`
+            // path one-shot (Inv-ParallelArmIsolation).
+            //
+            // T2 is NOT a reconnect-loop arm — it is a single 90-second POST
+            // diagnostic that sends 40 960 bytes chunked (8 chunks × 5120
+            // bytes, sink.flush() after each chunk, 10 s delay between
+            // chunks). The discriminator is the relay `total_received`
+            // counter at body complete OR mid-body abort. Verdict logic:
+            //   - relay receives 14-32 KB and aborts → `net4people/bbs Issue
+            //     #490` cumulative-bytes-per-TCP-connection-freeze hypothesis
+            //     confirmed; Matrix-style 25-sec long-poll mandatory primary
+            //   - relay receives all 40 960 bytes + 200 OK → byte-threshold
+            //     refuted; Arm G (WS-over-Reality) is primary next test
+            //
+            // The T2 client uses a SEPARATE OkHttp profile from the
+            // WebSocket arms (Vladislav hard gate 1 2026-06-06): connect=5s,
+            // write=30s, read=60s, callTimeout=180s. The WebSocket arms'
+            // `callTimeout(10s)` would kill the slow POST mid-test and
+            // produce garbage data.
+            //
+            // Expected values:
+            //   ""                                         — T2 disabled (default)
+            //   "https://relay.phntm.pro/diag/slow-post"   — T2 production field
+            //                                                test endpoint (Tele2
+            //                                                LTE through Caddy)
+            //
+            // Override via `local.properties` `debugT2SlowPostUrl=...`
+            // or env DEBUG_T2_SLOW_POST_URL. Release builds ignore the
+            // value entirely (pinned to "" in the release block + runtime
+            // gate `BuildConfig.DEBUG`).
+            //
+            // Design locked in `docs/tracks/rc-direct-stability1.md` §10 T2
+            // mini-lock.
+            val debugT2SlowPostUrl = localOrEnv("debugT2SlowPostUrl", "DEBUG_T2_SLOW_POST_URL", "")
+            buildConfigField("String", "DEBUG_T2_SLOW_POST_URL", "\"$debugT2SlowPostUrl\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -360,6 +399,15 @@ android {
             // Refined scope rule "No production traffic promotion"). This
             // pin is the defence-in-depth backstop.
             buildConfigField("String", "DEBUG_RC_DIRECT_ARM_A2_URL", "\"\"")
+            // RC-DIRECT-STABILITY1 §10 T2: release builds ALWAYS pin the
+            // slow-POST diagnostic URL to "". The runtime gate at the
+            // wire-up site also checks `BuildConfig.DEBUG &&
+            // DEBUG_T2_SLOW_POST_URL.isNotEmpty()`, so a release build
+            // cannot construct `T2SlowPostDiag` even if the field were
+            // corrupted. The `/diag/slow-post` relay endpoint is itself
+            // env-flag-gated and returns 404 in production anyway, but
+            // the client-side pin is the defence-in-depth backstop.
+            buildConfigField("String", "DEBUG_T2_SLOW_POST_URL", "\"\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

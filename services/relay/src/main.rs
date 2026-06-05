@@ -90,6 +90,7 @@ async fn main() {
     // signal that the diagnostic handler is live.
     tracing::info!(
         heartbeat_echo_enabled = cfg.heartbeat_echo_enabled,
+        slow_post_diag_enabled = cfg.slow_post_diag_enabled,
         "relay feature flags"
     );
 
