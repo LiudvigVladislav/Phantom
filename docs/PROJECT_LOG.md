@@ -589,6 +589,61 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-05 · RC-DIRECT-STABILITY1 §13 T2 — Outcome (byte-threshold class directionally confirmed, observed abort at ~5 KB — earlier than documented 14-32 KB range)
+
+Docs-only PR locking the T2 field test verdict in `docs/tracks/rc-direct-stability1.md` §13 Outcome subsection. Does NOT close the track — the final remaining cheap micro-experiment from the §4 Arm A.2 Outcome carry-forward is Arm G (Reality-tunneled WS through embedded libXray SOCKS5 → `:8443` Stage 5E Reality endpoint → relay). T2 directly informs Arm G design.
+
+**Field run (Tecno Tele2 LTE Иркутская, 2026-06-05 10:35:16 — 10:37:59 UTC, 163-second relay-side window, PR #292 debug APK `phantom-t2.apk` with `debugT2SlowPostUrl=https://relay.phntm.pro/diag/slow-post` through production Caddy after preflight PASS from a wired-LAN+VPN dev machine):**
+
+- Relay log (`C:\temp\t2-relay-window.log`, 7 entries via `docker logs --since/--until`):
+  - `10:35:16.502178Z` `event="slow_post_chunk_received" conn_id=1 total_bytes=4090 chunk_bytes=4090 elapsed_ms=0`
+  - `10:35:16.502207Z` `event="slow_post_chunk_received" conn_id=1 total_bytes=5120 chunk_bytes=1030 elapsed_ms=0` (TCP/TLS segmentation of the first Android 5120-byte burst)
+  - `10:35:16.518236Z` `event="prekey_publish" identity=bab6daa26fab3528 opk_count=40` (concurrent bootstrap, SUCCEEDED)
+  - `10:35:16.541050Z` `event="rest_session_issued" identity=bab6daa2` (concurrent bootstrap, SUCCEEDED)
+  - `10:36:17.862272Z` `event="prekey_publish"` (concurrent, SUCCEEDED)
+  - `10:37:20.063788Z` `event="prekey_publish"` (concurrent, SUCCEEDED)
+  - `10:37:59.753234Z` `WARN event="slow_post_aborted" conn_id=1 total_bytes=5120 elapsed_ms=163251 reason="read_error" err=error reading a body from connection`
+- Tecno logcat (`C:\temp\t2-tecno-tele2.log`, 133 lines): zero `T2_SLOW_POST` / `RC_DIRECT` matches — the capture filter for this run did not include the diagnostic tags. Verdict unaffected because relay-side `total_received` is the primary discriminator per hard gate 2.
+
+**Verdict:**
+
+- **Relay received 5120 of 40960 bytes (12.5%).** Chunks 2-8 never arrived at the handler. The relay-side counter is dispositive per the locked design ("`write()` proves only OkHttp queue-accept; physical egress is what the test actually measures").
+- **Concurrent short-POST traffic from the same identity SUCCEEDED through the same Caddy + Tele2 LTE path during the same 163-second window.** Three `/prekeys/publish` POSTs and one `/auth/session` POST completed normally. This is the byte-threshold-class discriminator firing in its predicted direction: same carrier path, same edge, same client device, same identity carried short request/response cycles to completion while the long-held T2 POST went silent after ~5 KB cumulative payload.
+- **Byte-threshold hypothesis class directionally confirmed. Observed abort point is SIGNIFICANTLY EARLIER than the documented `net4people/bbs #490` 14-32 KB range — 5120 bytes on this carrier / device / hour.** Honest framing: the external 14-32 KB class hypothesis is directionally confirmed, the magnitude does not match; this strengthens rather than weakens the architectural implication (bare Direct mobile uplink is even less viable than the published threshold suggested).
+
+**Isolation caveat (honest).** T2 was NOT a sole-connection field test. The relay log shows the diagnostic POST was concurrent with production bootstrap traffic from the same install (prekey publish + auth/session issuance after onboarding). The discriminator still holds — the short-lived bootstrap POSTs succeeded while the long-held T2 POST stalled — but I cannot rule out that the precise abort-byte-count (5120) interacted with the simultaneous short-POST traffic stealing carrier-allocated TCP/PDP context. Verdict is therefore "byte-threshold class confirmed" not "exact threshold 5120 ± ε confirmed."
+
+**Wording bounds (carried forward from Arm A.2 Outcome and locked here).** Does NOT claim "`net4people` exact threshold confirmed on Tele2." Does NOT claim "hypotheses 1/2/3/4 refuted" — the asymmetry continuation from Arm D and Arm A.2 Outcomes (relay sees WS Control Ping but not WS Text echo from the same wall-clock instant) is orthogonal to the long-POST byte-budget failure and may still be live. Does NOT claim "Direct WS is unfixable" — Arm G discriminates whether wrapping in Reality changes the answer.
+
+**Architectural implication: bare Direct uplink is demoted as primary realtime path on RU mobile.** This is NOT a WS-specific finding — it is a long-connection-uplink finding that subsumes the WS-specific Arm A.2 and Arm D verdicts. Any long-held connection on Tele2 LTE uplink is structurally untrustworthy, regardless of whether it carries WS frames, SSE chunks, or chunked HTTP body. §5 decision-tree row "Y met → uplift realtime per ADR-028" continues to fire; T2 strengthens the architectural component (long SSE responses through Caddy would also die at the byte threshold; Matrix-style 25-second long-poll becomes the mandatory primary REST realtime pattern; inside Reality must also use short-cycle framing such as mux / XHTTP).
+
+**5-step plan progress (next step = step 4):**
+
+1. ✅ Arm A.2 outcome docs-only PR — locked Y verdict, did NOT close track. Master `d2c22cd8`.
+2. ✅ VPS tear-down of stunnel-arm-a2 + `RELAY_ENABLE_HEARTBEAT_ECHO=1` revert.
+3. ✅ T2 slow POST diagnostic — PR #292 squash `a58ec03f` (code) + this PR (outcome docs).
+4. ⚡ Pending — Arm G WS-over-Reality (next session): new `RcDirectArmG.kt` near-clone of `RcDirectArmD` routed through embedded libXray SOCKS5 listener (`localhost:10808`, already Stage 5E production-validated for Reality outer transport) → external `:8443` Reality endpoint (production endpoint + UUID from existing `OperatorXrayConfig.kt`) → relay. Same heartbeat payload, same `Inv-DataFrameNotControlFrame`, same lifecycle fixes. 10-15 min Tele2 LTE field test. Discriminator: Reality WS holds ≥ 10 min with echo round-trips succeeding → Reality-primary realtime for RU mobile; Reality WS dies same Mode 2 → kill is below all transport layers → pure REST + Matrix-style long-poll. Hard time-box remains 1 week from §4 Arm A.2 Outcome PR landing.
+5. Pending — final outcome PR + Council on architecture pivot.
+
+**Operator-owned next steps (pre-merge of this PR):**
+
+1. SSH to VPS: idempotent revert of `RELAY_ENABLE_SLOW_POST_DIAG=1` from `/home/phantom/Phantom/deploy/.env` via `sed -i 's/^RELAY_ENABLE_SLOW_POST_DIAG=1$/# RELAY_ENABLE_SLOW_POST_DIAG=0  # T2 closed 2026-06-05/' .env`.
+2. `docker compose up -d --force-recreate relay`; verify `slow_post_diag_enabled=false` in startup log; verify `POST /diag/slow-post` returns 404.
+3. xray REALITY production on `:8443` remains untouched — Stage 5E.
+
+**Files shipped (this PR):**
+
+- `docs/tracks/rc-direct-stability1.md` — §13 T2 Outcome subsection appended after the mini-lock body (mirrors the §4 Arm A.2 Outcome subsection pattern). Includes verbatim relay log evidence, isolation caveat, wording bounds, architectural implication, Arm G carry-forward.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension with this PR + Arm G next pointer.
+- New memory entry `project_t2_outcome_2026_06_05.md` + index update in `MEMORY.md`.
+
+**WORKING_RULES rule 8 carve-out.** Docs + memory only. No Android transport code touched. Production paths unchanged.
+
+**WORKING_RULES rule 9.** All concrete claims grep- or log-verified: relay log paths quoted verbatim from `C:\temp\t2-relay-window.log`; logcat empty-state verified by `grep -E "T2_SLOW_POST|RC_DIRECT" C:\temp\t2-tecno-tele2.log` returning no matches.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind final RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence`.
+
 ### 2026-06-06 (sat, afternoon) · RC-DIRECT-STABILITY1 §13 T2 — slow-POST byte-threshold diagnostic (relay handler + Android one-shot + preflight uploader + mini-lock)
 
 Single PR shipping the §13 T2 mini-lock and code together (smaller scope than the PR-6/PR-7 split because no reconnect loop and no paired state machine). Discriminates hypothesis 5 (`net4people/bbs Issue #490` cumulative-bytes-per-TCP-connection-freeze, 14-32 KB threshold on RU mobile operators) from the other four hypotheses in the Arm D / Arm A.2 outcome open set.
