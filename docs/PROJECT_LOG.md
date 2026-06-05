@@ -645,7 +645,7 @@ Docs-only PR locking the T2 field test verdict in `docs/tracks/rc-direct-stabili
 
 **WORKING_RULES rule 8 carve-out.** Docs + memory only. No Android transport code touched. Production paths unchanged.
 
-**WORKING_RULES rule 9.** All concrete claims grep- or log-verified: relay log paths quoted verbatim from `C:\temp\t2-relay-window.log`; logcat empty-state verified by `grep -E "T2_SLOW_POST|RC_DIRECT" C:\temp\t2-tecno-tele2.log` returning no matches.
+**WORKING_RULES rule 9.** All concrete claims grep- or log-verified: relay log paths quoted verbatim from `C:\temp\t2-relay-window.log`; Tecno logcat claims verified after re-encoding the UTF-16 LE capture to UTF-8 (`C:\temp\t2-tecno-tele2-utf8.log`) — the full T2_SLOW_POST timeline is present (8 `T2_SLOW_POST_chunk_sent` events from seq=1 `total_sent=5120` through seq=8 `total_sent=40960`, terminal `T2_SLOW_POST_failed t=SocketTimeoutException total_sent=40960 elapsed_ms=130377`) plus the PREKEY_TRACE response-direction failure trail (attempts 1 + 2 hit `prekey_publish_retry reason=SocketTimeoutException`). The initial PR #293 body wrongly claimed "zero matches" due to a UTF-16-vs-ASCII grep mismatch on my side; fixed in fixup commit `e671512a`.
 
 CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind final RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence`.
 
