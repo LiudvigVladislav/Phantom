@@ -430,6 +430,77 @@ class AppContainer(private val context: Context) {
         }
     }
 
+    // ── RC-DIRECT-STABILITY1 §14 Arm G — Reality-tunneled WS heartbeat diag ──
+    //
+    // Constructed lazily and ONLY when DEBUG_RC_DIRECT_ARM_G_VIA_REALITY is
+    // exactly `"1"` in a debug build. The wire-up site
+    // (`PhantomMessagingService.onStartCommand`) checks the same gate before
+    // calling `.start(...)` and short-circuits the production Hybrid Ktor
+    // `transport.connect(...)` path so production and diagnostic WS never
+    // share `state.clients[identity]` at the relay (Inv-ParallelArmIsolation
+    // carried forward from Phase 1). Precedence per §14 hard gate 7:
+    // A → A.2 → T2 → B → C → D → G → production.
+    //
+    // Release builds (`!BuildConfig.DEBUG`) are excluded by the gate AND
+    // the release BuildConfig block pins DEBUG_RC_DIRECT_ARM_G_VIA_REALITY
+    // to "" for defence-in-depth.
+    //
+    // Inner target endpoint is production `BuildConfig.RELAY_URL`
+    // (`wss://relay.phntm.pro/ws` through Caddy on `:443`) — same URL Arm D
+    // baseline uses. The single structural variable changed vs Arm D is
+    // the outer transport: Arm G's OkHttp client connects through a
+    // SOCKS5 proxy at `127.0.0.1:<Ready.socksPort>` provided by the
+    // embedded libXray daemon (the production `xrayService` singleton
+    // below at `AppContainer.xrayService`), which wraps the stream in
+    // VLESS+REALITY to the Stage 5E production endpoint
+    // (`OperatorXrayConfig.SERVER_HOST:8443`). xray REALITY production
+    // is reused exactly as deployed — zero server-side code change.
+    //
+    // **Transport isolation, NOT structural bootstrap isolation** (per §14
+    // hard gate 6 + fixup commit `06486195`). The short-circuit at the
+    // Service prevents production `transport.connect(...)`, but
+    // `container.initMessagingFromStorage()` and `service.startReceiving()`
+    // already ran by the time the Arm G branch fires
+    // (PhantomMessagingService.kt around line 344-393). MessagingService
+    // internal state may still emit short-lived `prekey_publish` /
+    // `rest_session_issued` REST traffic during the Arm G capture window.
+    // PR-G3 outcome capture must grep-verify absence (or annotate counts
+    // + timings) of `PREKEY_TRACE` / `REST_TRACE` / `prekey_publish` /
+    // `rest_session_issued` per §14 hard gate 6 protocol.
+    //
+    // Server-side dependency (operator pre-merge step for PR-G2 field
+    // test, mirrors §4 Arm A.2 / §13 T2 runbook pattern): operator flips
+    // `RELAY_ENABLE_HEARTBEAT_ECHO=1` on the VPS `.env`, recreates the
+    // relay container, verifies `heartbeat_echo_enabled=true` in the
+    // relay startup log. Same flag Arm A.2 / Arm D used; no new env
+    // flag. Operator runbook revert before PR-G3 outcome merges.
+    //
+    // Xray lifecycle ownership note: Arm G's `start()` calls
+    // `xrayService.start()` and waits for `XrayState.Ready` via
+    // `withTimeout(15_000L)` (idempotent per `XrayService` contract).
+    // Arm G's `stop()` ONLY cancels its own runJob + WS; the
+    // `xrayService.stop()` call is owned by `PhantomMessagingService.onDestroy`
+    // and fires AFTER `rcDirectArmG.stop()` per §14 hard gate 8 teardown
+    // ordering (cancel WS first so a final reconnect attempt does not
+    // hit "connection refused" mid-shutdown of libXray).
+    //
+    // Locked in `docs/tracks/rc-direct-stability1.md` §14 Arm G mini-lock
+    // (PR #294 squash `f0b436a5` master 2026-06-05).
+    internal val rcDirectArmG: phantom.android.diagnostic.RcDirectArmG? by lazy {
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"
+        ) {
+            phantom.android.diagnostic.RcDirectArmG(
+                identityManager = identityManager,
+                relayUrl = phantom.android.BuildConfig.RELAY_URL,
+                xrayService = xrayService,
+                scope = appScope,
+            )
+        } else {
+            null
+        }
+    }
+
     // In-memory cache of the current identity. Populated eagerly at startup and
     // by initMessaging*; readers (ProfileScreen, top-bar avatar, etc.) collect
     // this StateFlow instead of calling identityRepo.loadIdentity() per screen,
