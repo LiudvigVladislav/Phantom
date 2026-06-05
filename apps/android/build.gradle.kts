@@ -327,6 +327,65 @@ android {
             // mini-lock.
             val debugT2SlowPostUrl = localOrEnv("debugT2SlowPostUrl", "DEBUG_T2_SLOW_POST_URL", "")
             buildConfigField("String", "DEBUG_T2_SLOW_POST_URL", "\"$debugT2SlowPostUrl\"")
+            // RC-DIRECT-STABILITY1 §14 Arm G: Reality-tunneled WS heartbeat
+            // diagnostic. Strict boolean flag — `"1"` enables Arm G, any
+            // other value (including `"true"`, `"yes"`, empty string, unset)
+            // disables. Mirrors `RELAY_ENABLE_HEARTBEAT_ECHO` /
+            // `RELAY_ENABLE_SLOW_POST_DIAG` strict-parse pattern.
+            //
+            // When enabled in a debug build, the wire-up site at
+            // `AppContainer.rcDirectArmG` constructs `RcDirectArmG` with
+            // `relayUrl = BuildConfig.RELAY_URL` (production WSS through
+            // Caddy) AND the production `xrayService` singleton, and
+            // `PhantomMessagingService.onStartCommand` short-circuits the
+            // production Hybrid Ktor `transport.connect(...)` path between
+            // Arm D and the production fall-through (precedence per §14
+            // hard gate 7: A → A.2 → T2 → B → C → D → G → production).
+            //
+            // The single structural variable that changes vs Arm D is the
+            // outer transport — Arm D's OkHttp client connects directly to
+            // production `relay.phntm.pro:443` through Caddy on bare TLS;
+            // Arm G's OkHttp client connects through a SOCKS5 proxy at
+            // `127.0.0.1:<Ready.socksPort>` provided by the embedded
+            // libXray daemon, which wraps the outbound stream in
+            // VLESS+REALITY to the Stage 5E production endpoint and
+            // forwards the decrypted inner stream from the server side
+            // to production `relay.phntm.pro:443` (still Caddy on the
+            // inner side, but originating from the operator VPS IP).
+            //
+            // Discriminator (3 outcomes per §14):
+            //   PASS    — lifetime ≥ 10 min + echo round-trips + no Mode 2
+            //             → Reality-primary realtime + 3.2b.1 safety net,
+            //               ~3-4 weeks impl
+            //   PARTIAL — lifetime ≥ 10 min + echo round-trips fail
+            //             → REST + Matrix long-poll primary + Reality
+            //               REST-fallback safety net, ~6-8 weeks impl
+            //   FAIL    — Mode 2 persists OR byte-budget class persists
+            //             → pure REST + Matrix 25-sec long-poll Option A,
+            //               abandon Direct WS, ~6-8 weeks impl
+            //
+            // Expected values:
+            //   ""  — Arm G disabled (default)
+            //   "1" — Arm G enabled (strict; any other non-empty value also
+            //         disabled, fails closed)
+            //
+            // Override via `local.properties` `debugRcDirectArmGViaReality=1`
+            // or env DEBUG_RC_DIRECT_ARM_G_VIA_REALITY=1. Release builds
+            // ignore the value entirely (pinned to "" in the release
+            // block + runtime gate `BuildConfig.DEBUG`).
+            //
+            // Design locked in `docs/tracks/rc-direct-stability1.md` §14
+            // Arm G mini-lock (PR #294 squash `f0b436a5` master 2026-06-05).
+            val debugRcDirectArmGViaReality = localOrEnv(
+                "debugRcDirectArmGViaReality",
+                "DEBUG_RC_DIRECT_ARM_G_VIA_REALITY",
+                "",
+            )
+            buildConfigField(
+                "String",
+                "DEBUG_RC_DIRECT_ARM_G_VIA_REALITY",
+                "\"$debugRcDirectArmGViaReality\"",
+            )
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed.
             // Outer transport selection is now a runtime decision driven by
             // the user's Privacy Mode (TransportManager walks the strategy
@@ -408,6 +467,19 @@ android {
             // env-flag-gated and returns 404 in production anyway, but
             // the client-side pin is the defence-in-depth backstop.
             buildConfigField("String", "DEBUG_T2_SLOW_POST_URL", "\"\"")
+            // RC-DIRECT-STABILITY1 §14 Arm G: release builds ALWAYS pin the
+            // Reality-tunneled WS diagnostic flag to "". The runtime gate
+            // at the wire-up site also checks `BuildConfig.DEBUG &&
+            // DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"`, so a release build
+            // cannot construct `RcDirectArmG` even if the field were
+            // corrupted. Arm G reuses the production `xrayService`
+            // singleton (which IS shipped in release for private mode);
+            // pinning the diagnostic flag prevents release builds from
+            // ever entering the Arm G short-circuit branch in the Service
+            // and accidentally routing user traffic through the
+            // diagnostic class. Defence-in-depth backstop per §14 hard
+            // gate 1 + WORKING_RULES rule 8 narrow carve-out.
+            buildConfigField("String", "DEBUG_RC_DIRECT_ARM_G_VIA_REALITY", "\"\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

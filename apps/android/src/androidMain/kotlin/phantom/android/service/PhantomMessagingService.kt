@@ -689,6 +689,68 @@ class PhantomMessagingService : Service() {
                 return@launch
             }
 
+            // RC-DIRECT-STABILITY1 §14 Arm G short-circuit. When
+            // DEBUG_RC_DIRECT_ARM_G_VIA_REALITY is exactly "1" in a debug
+            // build, route the service to the Reality-tunneled WS heartbeat
+            // diagnostic. Arm G's OkHttp client connects through a SOCKS5
+            // proxy at `127.0.0.1:<Ready.socksPort>` provided by the
+            // embedded libXray daemon (production `xrayService` singleton),
+            // which wraps the outbound stream in VLESS+REALITY to the
+            // Stage 5E production endpoint at `:8443`. The inner target
+            // endpoint stays `BuildConfig.RELAY_URL` (production WSS
+            // through Caddy) — single-variable change vs Arm D baseline.
+            //
+            // **Transport isolation, NOT structural bootstrap isolation**
+            // (per §14 hard gate 6 + PR-G1 fixup commit `06486195`). This
+            // short-circuit prevents production `transport.connect(...)`
+            // — no production `KtorRelayTransport` WS to relay in parallel.
+            // **However**, `container.initMessagingFromStorage()` and
+            // `service.startReceiving()` already ran at lines ~344-393
+            // above. MessagingService internal state may therefore still
+            // generate short-lived `prekey_publish` / `rest_session_issued`
+            // REST traffic during the Arm G capture window. This is the
+            // same surface §13 T2 hit per the T2 Outcome isolation caveat.
+            // Mitigation: PR-G3 outcome capture grep-verifies absence (or
+            // annotates counts + timings) of `PREKEY_TRACE|REST_TRACE|
+            // prekey_publish|rest_session_issued` in both the UTF-8-
+            // decoded Tecno logcat (per §13 T2 Outcome UTF-16-vs-ASCII
+            // grep-mismatch lesson) and the relay log over the Arm G
+            // window.
+            //
+            // Precedence per §14 hard gate 7: Arm A → Arm A.2 → T2 →
+            // Arm B → Arm C → Arm D → **Arm G** → production. All
+            // diagnostic arms are sequential `if` blocks gated by
+            // mutually-exclusive BuildConfig flags; only one arm runs
+            // per build.
+            //
+            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+            // even if `DEBUG_RC_DIRECT_ARM_G_VIA_REALITY` was somehow
+            // non-empty — the release BuildConfig block pins it to "".
+            //
+            // Server-side dependency: this branch is meaningful only if
+            // the operator has flipped `RELAY_ENABLE_HEARTBEAT_ECHO=1` on
+            // the VPS `.env` (same flag Arm A.2 / Arm D used). Without
+            // that, Arm G logs `echo_sent` but never `echo_received`,
+            // which still produces a useful (PARTIAL or FAIL) signal but
+            // is not the intended PASS experiment.
+            //
+            // Locked in `docs/tracks/rc-direct-stability1.md` §14 Arm G
+            // mini-lock (PR #294 squash `f0b436a5` master 2026-06-05).
+            if (phantom.android.BuildConfig.DEBUG &&
+                phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"
+            ) {
+                Log.i(
+                    "RC_DIRECT_ARM_G",
+                    "RC_DIRECT_ARM_G_service_short_circuit " +
+                        "identity_prefix=${myPubKey.take(16)} " +
+                        "signing_prefix=${signingPubKeyHex.take(16)} " +
+                        "relay_url=${phantom.android.BuildConfig.RELAY_URL} " +
+                        "gen=$myGen",
+                )
+                container.rcDirectArmG?.start(myPubKey, signingPubKeyHex)
+                return@launch
+            }
+
             val connected: ConnectedTransport = try {
                 container.transportManager.connect()
             } catch (e: NoTransportReachableException) {
@@ -860,6 +922,53 @@ class PhantomMessagingService : Service() {
                 (application as PhantomApplication).container.rcDirectArmD?.stop()
             }.onFailure {
                 Log.w(TAG, "RC_DIRECT_ARM_D_stop_failed: ${it.message}")
+            }
+        }
+        // RC-DIRECT-STABILITY1 §14 Arm G teardown — TWO-STEP ordering per
+        // hard gate 8 + implementation default #5: cancel Arm G's runJob +
+        // WS FIRST, THEN stop the xrayService daemon. Reason: if libXray
+        // were stopped first, Arm G's last reconnect attempt could hit
+        // "connection refused" mid-shutdown and produce a noisy
+        // RC_DIRECT_ARM_G_ws_failure log line that confounds the outcome
+        // analysis. Stopping the diagnostic class first cleanly cancels
+        // the runJob + cancels the in-flight WebSocket, and only then
+        // does the daemon shut down.
+        //
+        // Same debug + flag gate as the start site in onStartCommand.
+        // Release builds never reach this branch — the release BuildConfig
+        // pins DEBUG_RC_DIRECT_ARM_G_VIA_REALITY to "".
+        //
+        // The xrayService.stop() call is intentionally OWNED HERE (in the
+        // Service teardown), NOT inside RcDirectArmG.stop(). Reasons:
+        // (i) defence-in-depth — even if a future RcDirectArmG.stop()
+        // implementation were to drop the xrayService.stop() call, the
+        // Service teardown still owns it; (ii) the Service is the
+        // lifecycle owner of the foreground container, so xrayService
+        // lifecycle aligns with Service lifecycle naturally; (iii) keeps
+        // RcDirectArmG.stop() symmetric with RcDirectArmA2.stop() /
+        // RcDirectArmD.stop() — the diagnostic class only cancels its
+        // own runJob + WS.
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"
+        ) {
+            runCatching {
+                (application as PhantomApplication).container.rcDirectArmG?.stop()
+            }.onFailure {
+                Log.w(TAG, "RC_DIRECT_ARM_G_stop_failed: ${it.message}")
+            }
+            // Now stop the embedded libXray daemon. Idempotent per
+            // XrayService contract — no-op if already Off. We log the
+            // request boundary so a post-mortem can correlate the
+            // teardown timing with any late RC_DIRECT_ARM_G_ws_failure
+            // entries that may still be in flight from a final reconnect
+            // attempt cancelled above.
+            Log.i("RC_DIRECT_ARM_G", "RC_DIRECT_ARM_G_xray_stop_requested")
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    (application as PhantomApplication).container.xrayService.stop()
+                }
+            }.onFailure {
+                Log.w(TAG, "RC_DIRECT_ARM_G_xray_stop_failed: ${it.message}")
             }
         }
         // ADR-011: cancel the AlarmManager wakeup so we don't keep waking
