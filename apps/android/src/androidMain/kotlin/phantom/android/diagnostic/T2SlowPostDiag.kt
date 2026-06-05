@@ -11,6 +11,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -110,6 +111,14 @@ internal class T2SlowPostDiag(
 
     @Volatile private var runJob: Job? = null
 
+    // Per Vladislav 2026-06-06 P2 review: the OkHttp `Call` is tracked here
+    // so `stop()` can call `currentCall?.cancel()` to abort the blocking
+    // `execute()` and `writeTo()` paths if the foreground Service is killed
+    // mid-POST. Cancelling only the coroutine job is not enough — the
+    // OkHttp I/O lives on a different (blocking) thread that does not
+    // observe `Job.cancel()`. Cleared in `runOneShot.finally`.
+    @Volatile private var currentCall: Call? = null
+
     fun start() {
         if (runJob?.isActive == true) {
             Log.w(TAG, "T2_SLOW_POST_start_ignored already_running")
@@ -135,9 +144,27 @@ internal class T2SlowPostDiag(
     }
 
     fun stop() {
+        val call = currentCall
         runJob?.cancel()
         runJob = null
-        Log.i(TAG, "T2_SLOW_POST_stopped")
+        currentCall = null
+        // Per Vladislav 2026-06-06 P2 review: cancel the in-flight OkHttp
+        // Call so the blocking `execute()` / `RequestBody.writeTo()` paths
+        // unwind via IOException instead of running to natural completion
+        // on a different thread. Without this, `stop()` only cancelled the
+        // coroutine `Job` and the POST stayed alive until the next
+        // write-timeout fired (potentially ~30 s later).
+        if (call != null) {
+            runCatching { call.cancel() }
+                .onFailure { t ->
+                    Log.w(
+                        TAG,
+                        "T2_SLOW_POST_call_cancel_threw " +
+                            "t=${t::class.simpleName} msg=${t.message?.take(160)}",
+                    )
+                }
+        }
+        Log.i(TAG, "T2_SLOW_POST_stopped call_cancelled=${call != null}")
     }
 
     private suspend fun runOneShot() {
@@ -157,28 +184,37 @@ internal class T2SlowPostDiag(
 
         try {
             withContext(Dispatchers.IO) {
-                client.newCall(request).execute().use { resp ->
-                    val responseBody = resp.body?.string().orEmpty()
-                    val elapsedMs = System.currentTimeMillis() - startedMs
-                    if (resp.isSuccessful) {
-                        Log.i(
-                            TAG,
-                            "T2_SLOW_POST_completed " +
-                                "response_status=${resp.code} " +
-                                "total_sent=${body.totalSent} " +
-                                "elapsed_ms=$elapsedMs " +
-                                "response_body=${responseBody.take(200)}",
-                        )
-                    } else {
-                        Log.w(
-                            TAG,
-                            "T2_SLOW_POST_non_2xx " +
-                                "response_status=${resp.code} " +
-                                "total_sent=${body.totalSent} " +
-                                "elapsed_ms=$elapsedMs " +
-                                "response_body=${responseBody.take(200)}",
-                        )
+                val call = client.newCall(request)
+                currentCall = call
+                try {
+                    call.execute().use { resp ->
+                        val responseBody = resp.body?.string().orEmpty()
+                        val elapsedMs = System.currentTimeMillis() - startedMs
+                        if (resp.isSuccessful) {
+                            Log.i(
+                                TAG,
+                                "T2_SLOW_POST_completed " +
+                                    "response_status=${resp.code} " +
+                                    "total_sent=${body.totalSent} " +
+                                    "elapsed_ms=$elapsedMs " +
+                                    "response_body=${responseBody.take(200)}",
+                            )
+                        } else {
+                            Log.w(
+                                TAG,
+                                "T2_SLOW_POST_non_2xx " +
+                                    "response_status=${resp.code} " +
+                                    "total_sent=${body.totalSent} " +
+                                    "elapsed_ms=$elapsedMs " +
+                                    "response_body=${responseBody.take(200)}",
+                            )
+                        }
                     }
+                } finally {
+                    // Clear the Call reference so a later stop() does not
+                    // try to cancel an already-finished Call. Per Vladislav
+                    // 2026-06-06 P2 review.
+                    if (currentCall === call) currentCall = null
                 }
             }
         } catch (t: Throwable) {
@@ -212,7 +248,30 @@ internal class T2SlowPostDiag(
         @Volatile var totalSent: Long = 0L
 
         override fun contentType() = CONTENT_TYPE
-        override fun contentLength(): Long = TOTAL_BYTES.toLong()
+
+        /**
+         * Returns `-1L` so OkHttp emits the body with
+         * `Transfer-Encoding: chunked` rather than `Content-Length: 40960`.
+         *
+         * Per Vladislav 2026-06-06 P1 review: the Python preflight uploader
+         * (`scripts/t2-slow-post-preflight.py`) sends the body with
+         * `Transfer-Encoding: chunked` framing (explicit per-chunk size
+         * line + bytes + CRLF). The preflight's PASS criterion is that
+         * Caddy progressively forwards each chunk to the relay handler
+         * (which logs `event=slow_post_chunk_received` per chunk).
+         *
+         * If the field-test Android client were to send the same body with
+         * `Content-Length: 40960` instead, Caddy could (correctly per HTTP
+         * spec) buffer the body up to that announced length before
+         * forwarding. The preflight PASS would then NOT guarantee that the
+         * field test exercises the same streaming path. Returning -1L
+         * matches the framing the preflight tested.
+         *
+         * The relay handler's body-read path (`Body::into_data_stream()`)
+         * works identically for both Content-Length and chunked bodies, so
+         * the relay-side discriminator is unchanged.
+         */
+        override fun contentLength(): Long = -1L
 
         override fun writeTo(sink: BufferedSink) {
             val chunk = ByteArray(CHUNK_BYTES)
@@ -233,8 +292,11 @@ internal class T2SlowPostDiag(
                     // Thread.sleep here because `writeTo` is called on
                     // OkHttp's I/O thread (not a coroutine context).
                     // Cooperative cancellation by the outer call is
-                    // handled via `Call.cancel()` from `stop()` — OkHttp
-                    // will throw an IOException on the next write/flush.
+                    // handled via `Call.cancel()` from `stop()` — see the
+                    // `currentCall` field and its lifecycle in
+                    // `runOneShot.try/finally`. After `Call.cancel()` the
+                    // next `sink.write` or `sink.flush` throws IOException
+                    // and the body emission unwinds.
                     Thread.sleep(DELAY_MS_BETWEEN_CHUNKS)
                 }
             }
