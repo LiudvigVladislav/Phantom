@@ -545,6 +545,53 @@ class PhantomMessagingService : Service() {
                 return@launch
             }
 
+            // RC-DIRECT-STABILITY1 §10 T2 short-circuit. When DEBUG_T2_SLOW_POST_URL
+            // is non-empty in a debug build, route the service to the slow-POST
+            // byte-threshold diagnostic instead of the production Hybrid Ktor
+            // `transport.connect(...)` path. Same Inv-ParallelArmIsolation
+            // rationale as Arms A / A.2 / B / C / D above.
+            //
+            // T2 is **ONE-SHOT** — NOT a reconnect loop. One POST sends 40 960
+            // bytes chunked over ~70-80 s, the POST completes (or aborts), and
+            // the diagnostic job terminates. The Service stays alive (it's the
+            // foreground host) but T2 itself is finished after one run. Re-
+            // running requires killing the app and starting it again with the
+            // BuildConfig flag still set.
+            //
+            // Precedence per §7 step 5f (T2 inserted between A.2 and B):
+            // Arm A → Arm A.2 → T2 → Arm B → Arm C → Arm D → production. T2
+            // and the WebSocket arms are mutually exclusive in practice
+            // because a build sets DEBUG_T2_SLOW_POST_URL OR DEBUG_RC_DIRECT_*
+            // — never both.
+            //
+            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+            // even if `DEBUG_T2_SLOW_POST_URL` was somehow non-empty — the
+            // release BuildConfig block pins it to "".
+            //
+            // Server-side dependency: this branch is meaningful only if the
+            // operator has flipped `RELAY_ENABLE_SLOW_POST_DIAG=1` on the
+            // VPS `.env` and recreated relay so `/diag/slow-post` is mounted.
+            // Without that, the endpoint returns 404 and T2 logs failure on
+            // first POST.
+            //
+            // Locked in `docs/tracks/rc-direct-stability1.md` §10 T2 mini-lock.
+            if (phantom.android.BuildConfig.DEBUG &&
+                phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL.isNotEmpty()
+            ) {
+                Log.i(
+                    "T2_SLOW_POST",
+                    "T2_SLOW_POST_service_short_circuit " +
+                        "identity_prefix=${myPubKey.take(16)} " +
+                        "endpoint_url=${phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL} " +
+                        "gen=$myGen",
+                )
+                container.t2SlowPostDiag?.start()
+                // Service stays alive (foreground service is the diagnostic
+                // host); T2 runs ONE shot and the job terminates. No
+                // reconnect loop. Re-run requires app restart.
+                return@launch
+            }
+
             // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B short-circuit. When the
             // diagnostic flag selects Arm B, the production Hybrid Ktor path
             // is bypassed entirely so the diagnostic raw-OkHttp socket and a
@@ -749,6 +796,22 @@ class PhantomMessagingService : Service() {
                 (application as PhantomApplication).container.rcDirectArmA2?.stop()
             }.onFailure {
                 Log.w(TAG, "RC_DIRECT_ARM_A2_stop_failed: ${it.message}")
+            }
+        }
+        // RC-DIRECT-STABILITY1 §10 T2 teardown. Cancel the in-flight slow
+        // POST job if any. T2 is a one-shot diagnostic that normally
+        // completes on its own after ~70-80 s; this teardown handles the
+        // case where the foreground Service is killed mid-POST (e.g. app
+        // force-stop or OS-driven cleanup). Same debug + flag gate as the
+        // start site. Release builds never reach this branch — the release
+        // BuildConfig pins DEBUG_T2_SLOW_POST_URL to "".
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL.isNotEmpty()
+        ) {
+            runCatching {
+                (application as PhantomApplication).container.t2SlowPostDiag?.stop()
+            }.onFailure {
+                Log.w(TAG, "T2_SLOW_POST_stop_failed: ${it.message}")
             }
         }
         // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B teardown. Stop the

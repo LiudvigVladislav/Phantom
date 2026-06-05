@@ -589,6 +589,71 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-06 (sat, afternoon) · RC-DIRECT-STABILITY1 §13 T2 — slow-POST byte-threshold diagnostic (relay handler + Android one-shot + preflight uploader + mini-lock)
+
+Single PR shipping the §13 T2 mini-lock and code together (smaller scope than the PR-6/PR-7 split because no reconnect loop and no paired state machine). Discriminates hypothesis 5 (`net4people/bbs Issue #490` cumulative-bytes-per-TCP-connection-freeze, 14-32 KB threshold on RU mobile operators) from the other four hypotheses in the Arm D / Arm A.2 outcome open set.
+
+**Vladislav-locked 5 hard gates + 4 additions (all reflected in code, mini-lock, and preflight):**
+
+1. **Separate OkHttp profile for T2**: `connectTimeout=5s`, `writeTimeout=30s`, `readTimeout=60s`, `callTimeout=180s`. The WebSocket arms' `callTimeout(10s)` would kill the slow POST before threshold detection. Hard gate baked into `T2SlowPostDiag.kt` builder — do NOT copy from `RcDirectArmA2.kt` or `RcDirectArmD.kt`.
+2. **Primary discriminator = relay `total_received`, NOT Android `total_sent`.** `write()` proves only OkHttp queue-accept; physical egress is what the test actually measures. Verdict counter is the relay-side `event=slow_post_chunk_received total_bytes=N` log + `event=slow_post_aborted total_bytes=N reason=...` at failure.
+3. **Caddy streaming preflight required BEFORE field test.** Operator runs `python scripts/t2-slow-post-preflight.py --url https://relay.phntm.pro/diag/slow-post` from Windows/WSL and watches relay docker logs in parallel. Pass: chunks appear progressively every ~10 s. Fail: chunks all clustered at end → Caddy buffering. Explicit Python uploader instead of `curl --limit-rate` because the latter smooths the throttle but doesn't guarantee discrete chunks with explicit per-chunk flush.
+4. **Body locked at `40960 = 8 × 5120` bytes**, 10 s between chunks, total ~70-80 s. Spans the documented 14-32 KB threshold range with margin. Default-off env flag `RELAY_ENABLE_SLOW_POST_DIAG=1` (strict `== "1"` parse); cap 64 KB; required headers `Content-Type: application/octet-stream` AND `X-Phantom-Diag: slow-post-v1` (anti-stray-POST guard). When flag false, route NOT registered → 404 (Vladislav addition B: route off → 404, not live-405).
+5. **Service wire-up is ONE-SHOT, NOT reconnect loop.** T2 is structurally different from the WS arms — one POST, log outcome, terminate. Service stays alive (foreground host) but the diagnostic itself is finished. Re-running requires app restart.
+
+Additions A/B/C/D (carried through):
+- A. Idempotent preflight: locked Python uploader, not `curl --limit-rate`.
+- B. Route off → 404, defence-in-depth.
+- C. Per-chunk log structure mirrors PR-6 pattern.
+- D. Single PR (smaller scope than Arm D's PR-6/PR-7 split).
+
+**Discriminator — three locked outcomes:**
+
+| Relay outcome | Hypothesis verdict | Architectural implication |
+|---|---|---|
+| `total_received` 14-32 KB + `event=slow_post_aborted` | `net4people #490` byte-threshold strongly confirmed | Matrix-style 25-sec long-poll mandatory primary; long SSE dies; inside Reality must use short-cycle (mux/XHTTP) |
+| `total_received` > 32 KB but < 40 KB + abort | Same class, different threshold value | Same as above |
+| `total_received` = 40 960 + `200 OK` | Byte-threshold refuted on HTTP POST through Caddy | Arm G (WS-over-Reality) is primary next test |
+
+**Wording bound.** "Refuted on HTTP POST through Caddy" does NOT mean "refuted globally" — WS-over-Caddy may hit a different mechanism (the Arm D / Arm A.2 asymmetry continuation is one such candidate). Arm G follows regardless of T2's outcome.
+
+**Files shipped (this PR):**
+
+- `services/relay/src/config.rs` — new `slow_post_diag_enabled: bool` field with strict `RELAY_ENABLE_SLOW_POST_DIAG="1"` parse; `from_env_for_test()` defaults to `false`; debug fmt extended.
+- `services/relay/src/main.rs` — startup log line extended to include `slow_post_diag_enabled` flag state.
+- `services/relay/src/routes.rs` — new `slow_post_diag` handler (~140 LOC including doc comment): streams body via `Body::into_data_stream()` using `futures_util::StreamExt`, logs `event=slow_post_chunk_received` per chunk + terminal `event=slow_post_completed` or `event=slow_post_aborted reason=...`, validates `X-Phantom-Diag: slow-post-v1` AND `Content-Type: application/octet-stream` BEFORE reading body, caps at 64 KB. Route registration is conditional — when flag false, route NOT mounted → 404. Route is mounted AFTER the 30-second `TimeoutLayer` so it runs without the standard timeout (T2 POST takes ~70-80 s by design).
+- `services/relay/tests/slow_post_diag.rs` — 6 integration tests (all passing): route returns 404 when flag off; missing `X-Phantom-Diag` → 400; wrong header value → 400; wrong content-type → 400; cap exceeded → 413; happy path returns 200 with correct `total_received` JSON.
+- `apps/android/src/androidMain/kotlin/phantom/android/diagnostic/T2SlowPostDiag.kt` (NEW, ~210 LOC) — one-shot diagnostic class. Custom `RequestBody` writes 8 × 5120 bytes chunks with `sink.flush()` after each chunk and `Thread.sleep(10_000)` between chunks. Logs `T2_SLOW_POST_chunk_sent seq=N total_sent=N` per chunk (secondary client counter) + terminal `T2_SLOW_POST_completed` / `_non_2xx` / `_failed`. Own OkHttpClient profile per Vladislav hard gate 1.
+- `apps/android/build.gradle.kts` — new `DEBUG_T2_SLOW_POST_URL` BuildConfig field via `localOrEnv("debugT2SlowPostUrl", ...)`; release block pins to `""` for defence-in-depth.
+- `apps/android/src/androidMain/kotlin/phantom/android/di/AppContainer.kt` — new `t2SlowPostDiag` lazy field, gated by `BuildConfig.DEBUG && DEBUG_T2_SLOW_POST_URL.isNotEmpty()`.
+- `apps/android/src/androidMain/kotlin/phantom/android/service/PhantomMessagingService.kt` — short-circuit branch between Arm A.2 and Arm B (precedence A → A.2 → **T2** → B → C → D → production); one-shot start (no reconnect loop); matching teardown in `onDestroy`.
+- `scripts/t2-slow-post-preflight.py` (NEW, ~160 LOC) — Python preflight uploader that opens raw TCP/TLS socket, writes HTTP/1.1 chunked transfer-encoding framing manually with explicit `sock.sendall()` per chunk and `time.sleep(10)` between chunks. Pass criterion: relay logs chunks progressively. Fail criterion: clustered at end (Caddy buffering).
+- `docs/tracks/rc-direct-stability1.md` — new §13 T2 mini-lock subsection appended (~120 lines): goal, why-POST-not-WS, refined scope with 5 hard gates + 4 additions explicitly listed, three-outcome discriminator with wording bound, 8-step setup including operator-owned preflight + field test + revert.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump + Shipped list extension through PR #291 plus this PR.
+
+**WORKING_RULES rule 8 carve-out (T2 PR).** New Android transport-adjacent code (`T2SlowPostDiag.kt` + Service wire-up) but debug-only, gated by `BuildConfig.DEBUG && DEBUG_T2_SLOW_POST_URL.isNotEmpty()`. Production code paths (`transport.connect`, `KtorRelayTransport`, `TransportManager`) are unchanged. Smoke-test substitute: `./gradlew :apps:android:assembleDebug` → BUILD SUCCESSFUL in 53s with `debugT2SlowPostUrl=""` default, confirms production path still compiles. Same carve-out pattern as PR #290 (PR-8b).
+
+**WORKING_RULES rule 9.** Every code-state claim grep- or test-verified. Relay handler validated by 6 integration tests covering all error paths + happy path. Android build verified. Vladislav 5 hard gates documented inline at decision sites (T2 OkHttp builder comment + AppContainer wire-up comment + Service short-circuit comment).
+
+**Vladislav-locked 5-step plan progress (current step = step 3):**
+
+1. ✅ Arm A.2 outcome docs-only PR — locked verdict, did NOT close track. Master `d2c22cd8`.
+2. ✅ VPS tear-down — `compose stop stunnel-arm-a2 + rm -f`; reverted `RELAY_ENABLE_HEARTBEAT_ECHO=1`; `/health` ok; xray REALITY `:8443` untouched.
+3. ⚡ T2 slow POST diagnostic (this PR) — relay handler + Android one-shot + preflight uploader + §13 mini-lock.
+4. Pending — Arm G WS-over-Reality (after T2 field test result).
+5. Pending — final outcome PR + Council on architecture pivot.
+
+**Operator-owned next steps after this PR merges:**
+
+1. VPS: `git pull`; idempotent `RELAY_ENABLE_SLOW_POST_DIAG=1` flip in `.env`; `compose up -d --force-recreate relay`; verify `slow_post_diag_enabled=true` in startup log.
+2. Caddy streaming preflight from Windows/WSL: `python scripts/t2-slow-post-preflight.py --url https://relay.phntm.pro/diag/slow-post`; parallel SSH tail of relay docker logs; verify chunks appear progressively (pass) vs clustered at end (fail).
+3. If preflight PASSES: assistant builds debug APK with `debugT2SlowPostUrl=https://relay.phntm.pro/diag/slow-post` in `local.properties`; Vladislav installs on Tecno; opens app; lets onboarding create identity; returns to home screen; Service automatically triggers T2; parallel relay docker logs capture for 90 sec window; logcat for `RC_DIRECT_*` and `T2_SLOW_POST` tags.
+4. If preflight FAILS (Caddy buffering): operator either tunes Caddy or aborts T2 through Caddy and decides next path.
+5. After field test: revert `RELAY_ENABLE_SLOW_POST_DIAG=1` from `.env`; recreate relay; verify `slow_post_diag_enabled=false`.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked behind final RC-DIRECT-STABILITY1 outcome per `Inv-NoSpinningUntilEvidence` — escalates to "needed" per §5 row A.2 X firing (already locked in PR #291 outcome).
+
 ### 2026-06-06 (sat) · RC-DIRECT-STABILITY1 Arm A.2 outcome — Y verdict with persistent control/application asymmetry continuation; track does NOT close, T2 byte-threshold + Arm G Reality-WS micro-experiments precede final close (1-week time-box)
 
 Docs-only PR locking the Arm A.2 field test verdict in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2 Outcome subsection. Does NOT close the track — Vladislav-locked refined plan after four-architect external review 2026-06-05 carries forward two cheap micro-experiments before final close.

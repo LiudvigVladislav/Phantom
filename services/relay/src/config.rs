@@ -58,6 +58,32 @@ pub struct RelayConfig {
     /// it answers whether application data frames survive the conditions
     /// that kill WS control-plane Ping/Pong on the target carrier.
     pub heartbeat_echo_enabled: bool,
+
+    // ── T2 slow-POST diagnostic (RC-DIRECT-STABILITY1 §10) ────────────────────
+
+    /// When `true`, the relay exposes `POST /diag/slow-post` for the T2
+    /// byte-threshold diagnostic. Default `false`. Set by env var
+    /// `RELAY_ENABLE_SLOW_POST_DIAG=1` exactly; any other value (including
+    /// `"true"` or `"yes"`) fails closed. When `false`, the route returns
+    /// 404 — the handler is not registered (defence-in-depth per Vladislav
+    /// 2026-06-06 design lock).
+    ///
+    /// The endpoint accepts a chunked POST body up to 64 KB, logs each
+    /// received chunk progressively (`event=slow_post_chunk_received`
+    /// with byte-counter), and either returns `200 OK` on body complete
+    /// with `{"total_received": N, "duration_ms": T}` or logs
+    /// `event=slow_post_aborted` if the connection drops mid-body.
+    ///
+    /// The diagnostic answers whether the carrier path "freezes" the
+    /// TCP connection at a cumulative-bytes threshold (`net4people/bbs`
+    /// Issue #490 hypothesis: 14-32 KB on RU mobile operators). Relay's
+    /// `total_received` at abort point IS the primary discriminator
+    /// (per Vladislav 2026-06-06 hard gate 2 — Android `total_sent` is
+    /// secondary because `write()` only proves OkHttp queue accept, not
+    /// physical radio egress).
+    ///
+    /// Locked design in `docs/tracks/rc-direct-stability1.md` §10 T2.
+    pub slow_post_diag_enabled: bool,
 }
 
 impl RelayConfig {
@@ -83,6 +109,10 @@ impl RelayConfig {
             // exercise the echo handler construct a config with this flipped
             // to `true` rather than relying on the surrounding env.
             heartbeat_echo_enabled: false,
+            // T2 slow-POST diagnostic is off in tests by default; tests that
+            // exercise the handler construct a config with this flipped to
+            // `true` rather than relying on the surrounding env.
+            slow_post_diag_enabled: false,
         }
     }
 
@@ -138,6 +168,14 @@ impl RelayConfig {
             heartbeat_echo_enabled: std::env::var("RELAY_ENABLE_HEARTBEAT_ECHO")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            // T2 slow-POST diagnostic: strict `"1"` parse, fails closed on
+            // any other value. Mirrors heartbeat_echo_enabled gate pattern.
+            // When `false`, the `/diag/slow-post` route is NOT registered
+            // (returns 404 to any POST) — defence-in-depth per Vladislav
+            // 2026-06-06 hard gate B (route off → 404, not live-405).
+            slow_post_diag_enabled: std::env::var("RELAY_ENABLE_SLOW_POST_DIAG")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 }
@@ -159,6 +197,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("max_media_bytes", &self.max_media_bytes)
             .field("media_ttl_secs", &self.media_ttl_secs)
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
+            .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)
             .finish()
     }
 }
