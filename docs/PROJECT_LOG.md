@@ -589,6 +589,53 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-05 · RC-DIRECT-STABILITY1 §14 Arm G mini-lock — Reality-tunneled WS heartbeat diagnostic (PR-G1 docs-only)
+
+Docs-only PR locking the Arm G design in `docs/tracks/rc-direct-stability1.md` §14, after Council on §13 T2 Outcome. Arm G is the final cheap micro-experiment from the §4 Arm A.2 Outcome carry-forward and the §13 T2 Outcome carry-forward — wraps the same WS+Text heartbeat that Arm A.2 / Arm D ran bare through Caddy / stunnel inside an outer Reality+VLESS tunnel terminated at the Stage 5E `:8443` endpoint, and asks whether the kill that took down Arm A.2 (control/application asymmetry through stunnel) and T2 (long-connection-uplink failure at ~5 KB through Caddy) survives when the underlay is Reality instead of bare TLS.
+
+**Locked design (7 Council decisions + 4 code-state notes verified against master `d0f41fbe`):**
+
+1. **Clean diagnostic isolation, NOT production-realism.** Arm G short-circuits before `transport.connect(...)` AND before production prekey/auth bootstrap. T2 Outcome isolation caveat (§13) showed bootstrap concurrency confounds carrier-side state; Arm G avoids it.
+2. **Reuse production `xrayService` singleton** from a debug-only Arm G harness. Production lazy at `AppContainer.kt:649-653` already wraps `OperatorXrayConfig.toConfig(dataDir, socksPort = pickFreeLoopbackPort())`. Singleton is safe to reuse because the only other materialiser is `xrayServiceProvider = { xrayService }` lambda passed to `TransportManager` at `AppContainer.kt:676`, and `TransportManager` is reached only via production `transport.connect(...)` — which Arm G short-circuits before. Conditions: Arm G short-circuits before production transport AND calls `xrayService.stop()` in teardown.
+3. **SOCKS port dynamic, NOT hardcoded `10808`.** Arm G must NOT contain `localhost:10808` anywhere. Port comes from `XrayState.Ready(socksPort)` at `XrayState.kt:32`. Reason at `OperatorXrayConfig.kt:43-49`: cross-device test 2026-05-10 hit `bind: address already in use` when V2RayNG / Outline / shadowsocks-android already held 10808.
+4. **`Ready(socksPort)` wait uses `withTimeout(15_000L)`.** Stage 5E observed time-to-Ready ~2-3 sec; 15 sec = 5× margin. On timeout, Arm G logs `RC_DIRECT_ARM_G_xray_ready_timeout outcome=xray_not_ready` and terminates WITHOUT attempting WS connect — prevents an indefinitely-hanging foreground session.
+5. **Echo round-trips REQUIRED for PASS, NOT lifetime alone.** WS that lives ≥ 10 min but never delivers a single `RC_DIRECT_ARM_G_echo_received` is NOT a PASS (Arm A.2 already showed lifetime ≥ Mode 2 with 0 echoes; Arm D before that showed control/application asymmetry). PASS requires BOTH (lifetime ≥ 10 min sustained) AND (relay `event=heartbeat_echo_received` AND client `RC_DIRECT_ARM_G_echo_received`).
+6. **15-minute field run on Tecno + Tele2 LTE.** 10 min = minimum discriminator (Mode 2 baseline lifetime ~45 sec × ~13 reconnects = clear Mode 2 signature within 10 min if it fires); 15 min = locked duration for stronger confidence.
+7. **Split PR structure: G1 docs-only mini-lock (this PR) / G2 Android code / G3 outcome docs.** Firmer than §13 T2 single-PR because Arm G introduces first SOCKS5-proxied diagnostic surface AND first reuse-of-production-XrayService pattern in a debug path — both surfaces want explicit pre-code review.
+
+**Hard gates for PR-G2 review (9 invariants in §14):** `BuildConfig.DEBUG && DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"` strict parse; production stack untouched (`RELAY_URL` / `RelayTransportFactory.kt` / `TransportManager` / `KtorRelayTransport`); xray logs redacted (no UUID / shortId / publicKey / signed-challenge token); server-side zero changes (reuses Stage 5E `:8443`); xray lifecycle structured logs (`start_requested` / `ready socksPort=N` / `ready_timeout` / `stop_done` / `failed message_class=N`); `Inv-ParallelArmIsolation` enforced (no parallel production transport); precedence slot between Arm D and production fall-through; teardown calls BOTH `rcDirectArmG?.stop()` AND `xrayService.stop()`; fail-fast on `xray_not_ready` / `xray_failed` / WS pre-onOpen error / echo gaps / silent reconnect storm.
+
+**Discriminator — three locked outcomes:**
+
+- **PASS** (lifetime ≥ 10 min + echo round-trips + no Mode 2) → Reality-primary realtime for RU mobile + 3.2b.1 safety net → ~3-4 weeks impl.
+- **PARTIAL** (lifetime ≥ 10 min + echo fails) → REST + Matrix-style long-poll primary + Reality as REST-fallback safety net → ~6-8 weeks impl.
+- **FAIL** (Mode 2 persists OR byte-budget class persists) → pure REST + Matrix-style 25-sec long-poll (Option A), abandon Direct WS concept → ~6-8 weeks impl.
+
+**Wording bounds locked:** does NOT claim Reality is the solution; does NOT claim Reality definitely buffers carrier inspection well enough for WS heartbeat (Stage 5E.B.5 validated for HTTP, not inner-WS pattern); does NOT claim FAIL = REST is the only path forever (future Reality protocol upgrade Vision / XHTTP / mux could re-open the question); does NOT make the 1-week time-box a hard-stop (§15 mini-lock extension allowed if PR-G2 review surfaces real blocker).
+
+**5-step plan progress (next step = step 4 PR-G2 code):**
+
+1. ✅ Arm A.2 outcome (PR #291 master `d2c22cd8`).
+2. ✅ VPS tear-down of stunnel-arm-a2 + heartbeat_echo revert.
+3. ✅ T2 diagnostic (PR #292 `a58ec03f`) + T2 outcome (PR #293 `d0f41fbe`).
+4. ⚡ Arm G — PR-G1 mini-lock (this PR) / PR-G2 Android code / PR-G3 outcome docs after field test.
+5. Pending — final outcome PR + Council on architecture pivot per the locked PASS/PARTIAL/FAIL decision tree above.
+
+**Time-box:** 1 week from §4 Arm A.2 Outcome PR landing (2026-06-05) = 2026-06-12 hard deadline for PR-G3 outcome lock.
+
+**Files shipped (this PR):**
+
+- `docs/tracks/rc-direct-stability1.md` — §14 Arm G mini-lock subsection appended (~50 lines): goal, why-Reality-discriminates, refined scope with 7 Council decisions + 4 code-state notes inline, 9 hard gates, three-outcome discriminator with architecture decision tree, wording bounds, 6-step setup including operator runbook with VPS pre-merge and revert steps.
+- `docs/PROJECT_LOG.md` — this entry.
+- `docs/project/MASTER_TIMELINE_2026.md` — Last-updated bump.
+- Memory entry `project_arm_g_minilock_2026_06_05.md` (new) + MEMORY.md index pointer rewritten from "next session = Arm G mini-lock + scope" to "Arm G mini-lock landed (PR-G1); next session = PR-G2 code".
+
+**WORKING_RULES rule 8 carve-out (PR-G1).** Docs only. No Android code touched. Production paths unchanged.
+
+**WORKING_RULES rule 9.** All cited APIs grep-verified against master `d0f41fbe`: `pickFreeLoopbackPort()` at `OperatorXrayConfig.kt:73`; `OperatorXrayConfig.toConfig(dataDir, socksPort = pickFreeLoopbackPort())` at `OperatorXrayConfig.kt:51`; `XrayState.Ready(socksPort: Int)` at `XrayState.kt:32`; `XrayServiceFactory.android.kt:58` sets `_state.value = XrayState.Ready(socksPort = config.socksPort)`; `xrayService` lazy at `AppContainer.kt:649-653`; `xrayServiceProvider = { xrayService }` at `AppContainer.kt:676`; diagnostic short-circuit precedent at `PhantomMessagingService.kt:496-593`.
+
+CHIP1 stays parked at `78bd979e`. 3.2b.1 stays unfrozen but parked until Arm G outcome locks (PASS → 3.2b.1 escalates to "needed"; PARTIAL/FAIL → 3.2b.1 implementation cost reassessed against Matrix-pattern alternative).
+
 ### 2026-06-05 · RC-DIRECT-STABILITY1 §13 T2 — Outcome (byte-threshold class directionally confirmed, observed abort at ~5 KB — earlier than documented 14-32 KB range)
 
 Docs-only PR locking the T2 field test verdict in `docs/tracks/rc-direct-stability1.md` §13 Outcome subsection. Does NOT close the track — the final remaining cheap micro-experiment from the §4 Arm A.2 Outcome carry-forward is Arm G (Reality-tunneled WS through embedded libXray SOCKS5 → `:8443` Stage 5E Reality endpoint → relay). T2 directly informs Arm G design.
