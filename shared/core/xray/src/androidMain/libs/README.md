@@ -39,6 +39,21 @@ When XTLS/libXray ships a release we want to pick up:
 
 ## Provenance
 
-Initial vendoring: libXray @ `main` (2026-05-07), built via
-`gomobile bind` with NDK r27c, Go 1.26.2 — see the workflow run linked from
-the introducing commit for full reproducibility metadata.
+- **Current vendoring (2026-06-06):** libXray @ `f6ce61228b5630f7bcf3c3c9a19d7e1db50b88d1`
+  (HEAD of `main` at workflow run time, dated 2026-05-23 — "Merge pull
+  request #122 from XTLS/tun-icmp"), built via `gomobile bind` with NDK
+  r27c, Go 1.26.x (pinned by libxray-src/go.mod via go-version-file).
+  Workflow run: <https://github.com/LiudvigVladislav/Phantom/actions/runs/27033765713>.
+  Trigger: RC-DIRECT-STABILITY1 §14 Arm G field test 2026-06-06 — Android
+  Reality handshake silently rejected by server Xray 26.3.27; A/B Docker
+  test with form-matched config from `XrayJsonBuilder.kt` PASSed, refuting
+  config-shape hypothesis and leaving artifact drift as the only remaining
+  cause. Refresh closes the gap from the previous 2026-05-07 vendoring.
+  Follow-up infrastructure track: XRAY-VERSION-LOCK1 (memory pointer
+  `project_next_track_xray_version_lock1_2026_06_06.md`) — pins both
+  `XRAY_CORE_REF` and `LIBXRAY_REF` in `deps/xray.version`, adds CI drift
+  check and scheduled-update PR so this manual refresh becomes the
+  emergency path rather than the normal path.
+
+- **Initial vendoring (2026-05-07):** libXray @ `main`, built via
+  `gomobile bind` with NDK r27c, Go 1.26.2. Stage 5E.B.1.

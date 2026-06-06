@@ -90,9 +90,19 @@ internal class XrayServiceAndroid(
      *
      * The libXray entry point we use, [LibXray.runXrayFromJSON], expects a
      * base64-encoded JSON envelope shaped like
-     * `{"datDir":..., "mphCachePath":..., "configJSON":...}` and returns a
-     * base64-encoded `{"success":bool,"data":string}` envelope. The builder
-     * helpers below match that contract exactly.
+     * `{"datDir":..., "configJSON":...}` and returns a base64-encoded
+     * `{"success":bool,"data":string}` envelope. The builder helpers below
+     * match that contract exactly.
+     *
+     * **Drift note (2026-06-06):** previously the envelope also carried
+     * `"mphCachePath"`. Upstream libXray refresh (XTLS/libXray HEAD
+     * `f6ce61228b56` of 2026-05-23, vendored into PHANTOM via workflow run
+     * 27033765713 on 2026-06-06) dropped that field — `newXrayRunFromJSONRequest`
+     * now takes 2 args (`datDir`, `configJSON`), and the `RunXrayFromJSONRequest`
+     * DTO has only `getDatDir` + `getConfigJSON`. The mph cache directory is
+     * created on disk for forward compatibility (some libXray code paths still
+     * write a mph cache there) but is no longer passed through the request
+     * envelope.
      */
     private fun startBlocking() {
         // Ensure the runtime's working directory exists; libXray will not
@@ -125,7 +135,13 @@ internal class XrayServiceAndroid(
                 xrayConfigJson.take(240).replace("\n", "\\n"),
         )
 
-        val requestB64 = LibXray.newXrayRunFromJSONRequest(datDir, mphCachePath, xrayConfigJson)
+        // Drop `mphCachePath` arg per 2026-06-06 libXray upstream API drift
+        // (see kdoc above + shared/core/xray/src/androidMain/libs/README.md
+        // provenance entry). The local `mphCachePath` is still computed +
+        // its parent directory still exists on disk so any libXray code
+        // path that writes a mph cache there has a valid working location;
+        // it's just no longer threaded through the JNI request envelope.
+        val requestB64 = LibXray.newXrayRunFromJSONRequest(datDir, xrayConfigJson)
         Log.i(LOG_TAG, "startBlocking: requestB64Len=${requestB64.length}")
 
         val responseB64 = LibXray.runXrayFromJSON(requestB64)
