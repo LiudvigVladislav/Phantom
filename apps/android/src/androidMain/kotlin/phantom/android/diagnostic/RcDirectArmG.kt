@@ -215,6 +215,49 @@ import phantom.core.xray.createXrayService
  * a defensive backstop, but in Arm G mode that production singleton
  * is never materialised — the call is idempotent no-op.
  *
+ * **v7 amendments (2026-06-06, after Wi-Fi PARTIAL evidence + two-
+ * architect review):**
+ *   - **OkHttp `.pingInterval(0L, ...)`** disables OkHttp WS-protocol
+ *     auto-Ping. v6 evidence: app Text echo seq=2 also went silent
+ *     before OkHttp Ping noticed at +45s, so OkHttp Ping is framed as
+ *     a TRIGGER/ACCELERANT discriminator, NOT a "false-killer fix."
+ *   - **Heartbeat sender continues after a missing echo.** Counts
+ *     consecutive misses; first miss per session emits
+ *     `RC_DIRECT_ARM_G_silence_onset s=N seq=M cumulative_bytes=K
+ *     wall_clock_ms=T mono_ms=T`. Recovery (later echo arrives)
+ *     resets counter and emits `RC_DIRECT_ARM_G_silence_broken`.
+ *     Session ends at [MAX_CONSECUTIVE_MISSES] (8) OR
+ *     [SESSION_WALL_CLOCK_CAP_MS] (15 min) — whichever fires first.
+ *   - **`cumulative_bytes` on every `echo_sent`.** Sum of
+ *     `payload.encodeToByteArray().size` (exact UTF-8 length), NOT
+ *     `seq * 50`. Lower-bound app-payload metric — Reality/TLS/WS
+ *     framing is on top of this. Lets §13 T2 byte-budget comparison
+ *     (~5 KB onset on Tele2 LTE) be apples-to-apples with T2's
+ *     POST-body counter.
+ *   - **`mono_ms` on every `echo_sent` / `echo_received`** — session-
+ *     start anchor, so timeline reconstruction does not need to
+ *     subtract `openAtMs` per line.
+ *   - **`RC_DIRECT_ARM_G_locks` session-start anchor.** v6 already
+ *     ran with foreground notification + WIFI_MODE_FULL_HIGH_PERF +
+ *     PARTIAL_WAKE_LOCK + MulticastLock all held by Service
+ *     `onCreate` line 147 → `acquireKeepAliveLocks()`. WifiLock
+ *     matrix was therefore DROPPED from v7 spec (would have been
+ *     no-op; gating onCreate locks was out of v7 scope). This log
+ *     line anchors the evidence per session.
+ *   - **`ws.close(1000, "...")` bounded by [WS_CLOSE_HANDSHAKE_BOUND_MS]
+ *     then `ws.cancel()`.** Both in [stop] (Service.onDestroy path)
+ *     and in `runOneSession.finally` (per-session teardown). Clean
+ *     Close lets relay emit `session_summary` promptly; cancel()
+ *     bound prevents half-open zombie from hanging teardown.
+ *
+ * **v7 primary discriminator signals (NOT WifiLock):**
+ *   (a) `pingInterval(0)` permanent-vs-transient onset — do echoes
+ *       survive >= 10 min, or stop after seq=1/2?
+ *   (b) Relay per-seq `heartbeat_echo_received` direction (live debug-
+ *       tail during run) — uplink vs downlink silence.
+ *   (c) Tele2 LTE byte-onset vs ~5 KB cumulative — does §13 T2 byte-
+ *       budget class survive Reality?
+ *
  * **Xray lifecycle wait.** [start] calls `xrayService.start()`
  * (idempotent per [XrayService] contract — no-op if already Ready),
  * then `withTimeout(XRAY_READY_TIMEOUT_MS) { xrayService.state.first
@@ -304,6 +347,30 @@ internal class RcDirectArmG(
             while (isActive) {
                 sessionEpoch++
                 val xrayWaitStartMs = System.currentTimeMillis()
+
+                // v7 amendment 2026-06-06: lock-state diagnostic anchor.
+                // Confirmed via code-read on master + PR #296 head:
+                // `PhantomMessagingService.onCreate()` line 147 calls
+                // `acquireKeepAliveLocks()`, which acquires (at lines
+                // 282 / 291 / 300) WIFI_MODE_FULL_HIGH_PERF WifiLock +
+                // PARTIAL_WAKE_LOCK + MulticastLock for the WHOLE
+                // service lifetime, BEFORE the Arm G short-circuit at
+                // `onStartCommand` fires. Released only in
+                // `onDestroy` line 997. So v6 ran with all four
+                // anti-parking measures (foreground notification +
+                // FULL_HIGH_PERF WifiLock + WakeLock + MulticastLock)
+                // already held, which the architect deep-dive said
+                // largely refutes the HiOS Wi-Fi radio-parking
+                // hypothesis. WifiLock matrix was therefore DROPPED
+                // from v7 spec; this log line anchors the evidence so
+                // the outcome doc can cite "v6/v7 both ran with all
+                // locks held" without needing to re-grep the service.
+                Log.i(
+                    TAG,
+                    "RC_DIRECT_ARM_G_locks s=$sessionEpoch " +
+                        "wifilock=held wakelock=held multicastlock=held " +
+                        "mode=FULL_HIGH_PERF source=service_onCreate_acquireKeepAliveLocks",
+                )
 
                 // Construct a fresh XrayService instance per session.
                 // `OperatorXrayConfig.toConfig(dataDir)` allocates a
@@ -410,8 +477,22 @@ internal class RcDirectArmG(
                 // reconnect." We do BOTH: fresh client per session
                 // AND explicit `evictAll()` on the old client at the
                 // bottom of the loop.
+                //
+                // v7 amendment 2026-06-06: `pingInterval(0)` DISABLES
+                // OkHttp's WS-protocol auto-Ping. v6 evidence: app
+                // Text echo seq=2 ALSO went silent before the OkHttp
+                // Ping noticed at +45s. So OkHttp auto-Ping is now
+                // framed as a TRIGGER/ACCELERANT discriminator, NOT
+                // a "false-killer fix". With ping(0), if Text echoes
+                // survive ≥ 10 min → control-frame path was the
+                // trigger. If echoes still stop after seq=1/2 →
+                // real Reality/Android inbound silence and OkHttp
+                // Ping was irrelevant. The 8-consecutive-miss
+                // counter + 15-min wall-clock cap below replace
+                // OkHttp's automatic socket termination so the
+                // diagnostic harness still bounds session length.
                 val client = OkHttpClient.Builder()
-                    .pingInterval(15_000L, TimeUnit.MILLISECONDS)
+                    .pingInterval(0L, TimeUnit.MILLISECONDS)
                     .readTimeout(60, TimeUnit.SECONDS)
                     .connectTimeout(5, TimeUnit.SECONDS)
                     .callTimeout(10, TimeUnit.SECONDS)
@@ -476,6 +557,32 @@ internal class RcDirectArmG(
         currentWebSocket = null
         currentXrayService = null
         if (ws != null) {
+            // v7 amendment per architect 2026-06-06: bounded clean
+            // Close before cancel. `ws.close(1000, "arm_g_stop")`
+            // queues a Close frame so relay sees the disconnect and
+            // emits session_summary promptly (otherwise relay holds
+            // the half-open socket until TCP reset — the 17-minute
+            // "half-open zombie" pattern seen on v6 conn_id=1/2).
+            // After WS_CLOSE_HANDSHAKE_BOUND_MS (~2.5 s) we force
+            // teardown via `ws.cancel()` so a half-open dead socket
+            // cannot hang stop() — Service.onDestroy has bounded time
+            // before SIGKILL; we must not exceed it.
+            runCatching { ws.close(1000, "arm_g_stop") }
+                .onFailure { t ->
+                    Log.d(
+                        TAG,
+                        "RC_DIRECT_ARM_G_ws_close_threw t=${t::class.simpleName}",
+                    )
+                }
+            // Blocking delay in stop() — runBlocking is safe here
+            // because stop() is sync (called from Service.onDestroy
+            // teardown block) and the bound is conservative against
+            // the Android-imposed onDestroy time budget.
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    kotlinx.coroutines.delay(WS_CLOSE_HANDSHAKE_BOUND_MS)
+                }
+            }
             runCatching { ws.cancel() }
                 .onFailure { t ->
                     Log.w(
@@ -558,8 +665,38 @@ internal class RcDirectArmG(
                 // exceptionally from onClosed / onFailure so this
                 // coroutine cancels cleanly via finally.
                 listener.openedAt.await()
+                // v7 amendment 2026-06-06: session-start anchor for
+                // mono_ms timestamps. Logs that follow carry
+                // `mono_ms=T` (= now - sessionStartMonoMs) so timeline
+                // reconstruction does not require subtracting from
+                // openAtMs / sessionEpoch wall_clock_ms.
+                val sessionStartMonoMs = System.currentTimeMillis()
+                var cumulativeBytes = 0L
+                var consecutiveMisses = 0
+                var silenceOnsetLogged = false
+
                 delay(HEARTBEAT_INTERVAL_MS)
                 while (isActive && listener.sessionAlive) {
+                    val nowMs = System.currentTimeMillis()
+                    val monoMs = nowMs - sessionStartMonoMs
+
+                    // v7 amendment: 15-min wall-clock cap per session.
+                    // OkHttp's automatic socket-kill on ping timeout is
+                    // disabled (pingInterval(0) above); this cap takes
+                    // over the bounded-session-length contract that
+                    // the operator runbook relies on.
+                    if (monoMs >= SESSION_WALL_CLOCK_CAP_MS) {
+                        Log.i(
+                            TAG,
+                            "RC_DIRECT_ARM_G_v7_walltime_cap s=$sessionEpoch " +
+                                "mono_ms=$monoMs cap_ms=$SESSION_WALL_CLOCK_CAP_MS " +
+                                "consecutive_misses=$consecutiveMisses " +
+                                "cumulative_bytes=$cumulativeBytes",
+                        )
+                        completion.complete("v7_walltime_cap_15min")
+                        break
+                    }
+
                     // Identity guard: if a concurrent stop() or new session
                     // replaced `currentWebSocket`, do not write to this stale
                     // ws. Mirrors the listener shield #1 pattern from PR #276.
@@ -572,8 +709,19 @@ internal class RcDirectArmG(
                         break
                     }
                     val seq = listener.nextSeq()
-                    val clientMs = System.currentTimeMillis()
+                    val clientMs = nowMs
                     val payload = "$HEARTBEAT_ECHO_PREFIX$seq:$clientMs"
+                    // v7 amendment per architect: cumulative_bytes =
+                    // exact summed UTF-8 length per Text payload
+                    // (payload.encodeToByteArray().size), NOT seq*50.
+                    // Labelled "app-payload lower bound" — Reality/TLS/
+                    // WS framing is on top of this, invisible from the
+                    // app layer. Lets outcome-doc compare like-for-like
+                    // with §13 T2's POST-body byte counter when reading
+                    // for "T2 byte-budget class survived Reality" on
+                    // Tele2 LTE (~5 KB cumulative onset signal).
+                    val payloadBytes = payload.encodeToByteArray().size
+                    cumulativeBytes += payloadBytes
                     synchronized(sendTimeMap) {
                         if (sendTimeMap.size >= SEND_TIME_MAP_CAPACITY) {
                             val oldest = sendTimeMap.entries.iterator().next()
@@ -596,28 +744,99 @@ internal class RcDirectArmG(
                         Log.w(
                             TAG,
                             "RC_DIRECT_ARM_G_heartbeat_send_failed s=$sessionEpoch seq=$seq " +
-                                "reason=enqueue_returned_false",
+                                "reason=enqueue_returned_false " +
+                                "cumulative_bytes=$cumulativeBytes",
                         )
                         // §14 hard gate 9 fail-fast (PR-G2 v2 fixup per
                         // Vladislav P2(b) review): completing the
                         // `completion` deferred terminates `runOneSession`,
                         // which cancels the heartbeat coroutine via finally
-                        // AND closes the WS via `ws.cancel()`. Without this,
-                        // heartbeat would stop but `completion.await()`
-                        // would block waiting for the listener's
-                        // onClosed/onFailure — the session would hang
-                        // without an echo path, which corrupts the PASS /
-                        // PARTIAL / FAIL signal because the relay would
-                        // see a still-open WS with no inbound Text.
+                        // AND closes the WS via close(1000)→bounded→cancel.
                         completion.complete("heartbeat_send_failed_enqueue")
                         break
                     }
                     listener.echoSent.set(seq)
                     Log.i(
                         TAG,
-                        "RC_DIRECT_ARM_G_echo_sent s=$sessionEpoch seq=$seq client_ms=$clientMs",
+                        "RC_DIRECT_ARM_G_echo_sent s=$sessionEpoch seq=$seq " +
+                            "client_ms=$clientMs mono_ms=$monoMs " +
+                            "payload_bytes=$payloadBytes cumulative_bytes=$cumulativeBytes",
                     )
+
                     delay(HEARTBEAT_INTERVAL_MS)
+
+                    // v7 amendment per architect: after the delay, check
+                    // whether the seq we sent ONE FULL INTERVAL AGO came
+                    // back (the listener removes from sendTimeMap on
+                    // echo receipt). At this point seq sent 30 s ago
+                    // (= 2 × HEARTBEAT_INTERVAL_MS) has had a full
+                    // ECHO_TIMEOUT_MS window to round-trip. If still
+                    // pending, count as missed. consecutiveMisses tracks
+                    // the contiguous tail of most-recent missed seqs.
+                    // First miss in a session emits `silence_onset` with
+                    // cumulative_bytes anchor; an echo that comes back
+                    // later resets the counter and emits
+                    // `silence_broken` so the analysis grep can tell
+                    // transient from permanent silence.
+                    if (seq >= 2) {
+                        val seqToCheck = seq - 1
+                        val checkNowMs = System.currentTimeMillis()
+                        val pendingState = synchronized(sendTimeMap) {
+                            val sentAt = sendTimeMap[seqToCheck]
+                            if (sentAt == null) {
+                                "received"
+                            } else if (checkNowMs - sentAt >= ECHO_TIMEOUT_MS) {
+                                "missed"
+                            } else {
+                                "in_flight"
+                            }
+                        }
+                        when (pendingState) {
+                            "received" -> {
+                                if (consecutiveMisses > 0) {
+                                    Log.i(
+                                        TAG,
+                                        "RC_DIRECT_ARM_G_silence_broken s=$sessionEpoch " +
+                                            "seq=$seqToCheck after_misses=$consecutiveMisses " +
+                                            "mono_ms=${checkNowMs - sessionStartMonoMs}",
+                                    )
+                                }
+                                consecutiveMisses = 0
+                            }
+                            "missed" -> {
+                                consecutiveMisses++
+                                if (consecutiveMisses == 1 && !silenceOnsetLogged) {
+                                    silenceOnsetLogged = true
+                                    Log.w(
+                                        TAG,
+                                        "RC_DIRECT_ARM_G_silence_onset s=$sessionEpoch " +
+                                            "seq=$seqToCheck " +
+                                            "cumulative_bytes=$cumulativeBytes " +
+                                            "wall_clock_ms=$checkNowMs " +
+                                            "mono_ms=${checkNowMs - sessionStartMonoMs}",
+                                    )
+                                }
+                                if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) {
+                                    Log.w(
+                                        TAG,
+                                        "RC_DIRECT_ARM_G_v7_eight_consecutive_misses " +
+                                            "s=$sessionEpoch last_seq_sent=$seq " +
+                                            "last_seq_missed=$seqToCheck " +
+                                            "cumulative_bytes=$cumulativeBytes " +
+                                            "mono_ms=${checkNowMs - sessionStartMonoMs}",
+                                    )
+                                    completion.complete("v7_eight_consecutive_misses")
+                                    break
+                                }
+                            }
+                            "in_flight" -> {
+                                // Within ECHO_TIMEOUT_MS — do not count
+                                // as miss yet. Will be re-checked next
+                                // iteration when (seq - 1) becomes
+                                // (newSeq - 1) one cycle later.
+                            }
+                        }
+                    }
                 }
             } catch (t: Throwable) {
                 // PR #280 P2 fix: rethrow CancellationException so the
@@ -646,6 +865,27 @@ internal class RcDirectArmG(
             if (currentWebSocket === ws) {
                 currentWebSocket = null
             }
+            // v7 amendment per architect 2026-06-06: bounded clean
+            // Close before cancel. `ws.close(1000, "...")` queues a
+            // Close frame to relay so the server-side session_summary
+            // line emits promptly. After `WS_CLOSE_HANDSHAKE_BOUND_MS`,
+            // force teardown via `ws.cancel()` so a half-open dead
+            // socket (relay never receives the Close frame) cannot
+            // hang the reconnect loop. Architect note (b): cancel() →
+            // close() moves the terminal callback from `onFailure` to
+            // `onClosing/onClosed`; the listener already completes the
+            // `completion` deferred from both paths so the await above
+            // returns either way.
+            runCatching {
+                ws.close(1000, "v7_session_end")
+            }.onFailure { t ->
+                Log.d(
+                    TAG,
+                    "RC_DIRECT_ARM_G_ws_close_in_finally_threw s=$sessionEpoch " +
+                        "t=${t::class.simpleName}",
+                )
+            }
+            kotlinx.coroutines.delay(WS_CLOSE_HANDSHAKE_BOUND_MS)
             runCatching { ws.cancel() }
                 .onFailure { t ->
                     Log.w(
@@ -768,12 +1008,21 @@ internal class RcDirectArmG(
                 if (rttMs >= 0L) {
                     lastEchoRttMs = rttMs
                 }
+                // v7 amendment: `mono_ms` = sinceOpenMs (same anchor —
+                // openAtMs is when the WS opened; the heartbeat sender's
+                // `sessionStartMonoMs` is the moment after
+                // `openedAt.await()` returns, which is the same instant
+                // up to coroutine scheduling jitter). Provided as an
+                // explicit field on this log line so the analysis grep
+                // can correlate echo_received with the echo_sent's
+                // `mono_ms` field without subtracting openAtMs.
                 Log.i(
                     TAG,
                     "RC_DIRECT_ARM_G_echo_received s=$sessionEpoch " +
                         "seq=$seq " +
                         "rtt_ms=$rttMs " +
                         "since_open_ms=$sinceOpenMs " +
+                        "mono_ms=$sinceOpenMs " +
                         "echo_received_total=${echoReceived.get()}",
                 )
             } else {
@@ -915,6 +1164,34 @@ internal class RcDirectArmG(
         // gives a 5× margin. On timeout the diagnostic terminates without
         // a WS connect attempt (§14 hard gate 9).
         const val XRAY_READY_TIMEOUT_MS: Long = 15_000L
+
+        // ── v7 amended plan 2026-06-06 (architect ACK after v6 Wi-Fi PARTIAL evidence) ──
+
+        // Wall-clock cap per session. v6 reconnect-loop had no per-session
+        // wall-clock cap. v7 spec point 4: "End session at 15 min wall-clock
+        // OR 8 consecutive missing echoes." Whichever fires first.
+        const val SESSION_WALL_CLOCK_CAP_MS: Long = 15 * 60 * 1000L
+
+        // Maximum consecutive missing echoes before terminating a session.
+        // v7 spec point 4. Eight missed × 15-sec heartbeat ≈ 2 min of one-way
+        // silence → classify as permanent one-way and end session so the
+        // reconnect-loop can move on.
+        const val MAX_CONSECUTIVE_MISSES: Int = 8
+
+        // Echo timeout per seq. After sending seq=N, if seq=N has not been
+        // observed in the listener's echoReceived path within this window,
+        // count it as missed. 2× HEARTBEAT_INTERVAL_MS covers normal RTT
+        // variance (Stage 5E worst-case observed ~5 s; Reality + Tele2 LTE
+        // may be slower); shorter would risk false misses on slow networks.
+        const val ECHO_TIMEOUT_MS: Long = HEARTBEAT_INTERVAL_MS * 2
+
+        // Bounded wait between `ws.close(1000, "...")` and `ws.cancel()`
+        // in [stop] (and in `runOneSession.finally`). v7 spec point 9 (and
+        // architect amendment): close gives relay a chance to receive the
+        // Close frame and emit `session_summary` promptly, but a half-open
+        // dead socket will never complete the close handshake — cancel()
+        // forces teardown so stop() does not hang.
+        const val WS_CLOSE_HANDSHAKE_BOUND_MS: Long = 2_500L
 
         /**
          * Parses an inbound Text frame as a heartbeat echo. Returns
