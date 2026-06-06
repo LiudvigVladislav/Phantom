@@ -122,10 +122,20 @@ internal class XrayServiceAndroid(
             dirFile.list()?.toList()?.sorted()?.joinToString(",") ?: "<null>"
         }.getOrElse { "<list-failed: ${it.message}>" }
         val preState = runCatching { LibXray.getXrayState() }.getOrElse { "<state-call threw>" }
+        // XRAY-VERSION-LOCK1 precursor — surface the libXray-bundled Xray-core
+        // version at runtime so a future field-test outcome can correlate
+        // Reality handshake failure with server/client Xray-core version skew
+        // without needing a separate diagnostic build. Wrapped in runCatching
+        // because `xrayVersion()` is a relatively new libXray API (present in
+        // 2026-06-06 vendoring per shared/core/xray/src/androidMain/libs/README.md
+        // Provenance entry — may not be present in some refs); fail-safe to a
+        // sentinel string. No secrets in this call — Xray version is a public
+        // identifier already shipped to the server during handshake.
+        val xrayVersion = runCatching { LibXray.xrayVersion() }.getOrElse { "<version-call threw>" }
         Log.i(
             LOG_TAG,
             "startBlocking: datDir=$datDir exists=${dirFile.exists()} writable=${dirFile.canWrite()} " +
-                "contents=[$dirContents] preLibXrayState=$preState",
+                "contents=[$dirContents] preLibXrayState=$preState xrayVersion=$xrayVersion",
         )
 
         val xrayConfigJson = buildXrayClientConfig(config)
