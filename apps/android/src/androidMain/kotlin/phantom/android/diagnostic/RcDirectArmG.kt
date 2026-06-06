@@ -26,8 +26,10 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import phantom.android.BuildConfig
 import phantom.core.identity.IdentityManager
+import phantom.core.xray.OperatorXrayConfig
 import phantom.core.xray.XrayService
 import phantom.core.xray.XrayState
+import phantom.core.xray.createXrayService
 
 /**
  * RC-DIRECT-STABILITY1 §14 Arm G — Reality-tunneled WS heartbeat diagnostic.
@@ -157,19 +159,61 @@ import phantom.core.xray.XrayState
  * coroutine's `openedAt.await()` unblocks cleanly if the session failed
  * before `onOpen` ever fired (PR #280 P1 fix).
  *
- * **Reuse of production `xrayService` singleton.** Per §14 code-state
- * note (a) verified against master `d0f41fbe`: the production
- * `AppContainer.xrayService` lazy field is safe to materialise from a
- * debug-only Arm G harness because the only other materialiser is the
- * `xrayServiceProvider = { xrayService }` lambda passed to
- * `TransportManager` — and `TransportManager` is reached only via
- * production `transport.connect(...)`, which Arm G short-circuits
- * before. Conditions enforced by this class + the Service teardown
- * pair: (i) Arm G's [start] short-circuits before production transport;
- * (ii) Service `onDestroy` calls BOTH `container.rcDirectArmG?.stop()`
- * AND `container.xrayService.stop()` (Arm G's [stop] cancels only the
- * Arm G runJob + WS; the Service is the explicit owner of the
- * `xrayService.stop()` call per §14 hard gate 8).
+ * **Per-session libXray restart (PR-G2 fixup v6, 2026-06-06 Wi-Fi
+ * smoke discriminator).** The original §14 design reused the
+ * production `AppContainer.xrayService` singleton across all sessions
+ * of an Arm G run. The Wi-Fi smoke on 2026-06-06 found that the first
+ * Reality WS session opens cleanly (relay reaches Caddy, echo round-
+ * trip succeeds), but subsequent reconnect handshakes from the same
+ * long-running Android libXray process fall into REALITY fallback
+ * (xray-server forwards to `dest = www.microsoft.com:443` instead of
+ * unwrapping to phantom-caddy) — the Mode 2 ping/pong timeout kills
+ * the inner WS, then every retry from the same long-running
+ * gomobile-bound libXray instance is rejected as not-a-valid-REALITY-
+ * peer. To discriminate whether this is (A) a state issue in the
+ * long-running Android libXray process AFTER the first tunnel, or
+ * (B) a deeper Reality protocol incompatibility, this class now
+ * restarts libXray AND constructs a fresh `OkHttpClient` between
+ * every Arm G session — independent of the production singleton.
+ *
+ * Implementation:
+ *   - Constructor takes [xrayDataDir] (absolute path) instead of an
+ *     [XrayService] instance.
+ *   - Each session in the reconnect loop calls `createXrayService(
+ *     OperatorXrayConfig.toConfig(xrayDataDir))` to construct a FRESH
+ *     [XrayService] with a FRESH `socksPort` (via the default
+ *     `pickFreeLoopbackPort()` allocator), then `start()`s it,
+ *     `withTimeout` waits for [XrayState.Ready], builds a fresh
+ *     [OkHttpClient] bound to that session's SOCKS port, runs one
+ *     session, then `stop()`s the libXray instance AND
+ *     `client.connectionPool.evictAll()` to clear OkHttp's per-host
+ *     connection pool before the next session.
+ *   - The production `AppContainer.xrayService` lazy field is no
+ *     longer touched by Arm G — the lazy never materialises in Arm G
+ *     mode (the Service short-circuit fires before any production
+ *     transport path that would consume it).
+ *
+ * Expected discriminator after this fixup:
+ *   - **(A) every restarted Wi-Fi session opens again** → state issue
+ *     in the long-running gomobile libXray process strongly confirmed.
+ *     Reality leg of the per-mode-chain becomes viable WITH per-session
+ *     restart as the workaround until upstream libXray fixes the state
+ *     issue.
+ *   - **(B) only first session opens, even after full Xray restart**
+ *     → deeper Android/libXray/Reality issue. Architecture pivot per
+ *     §13 T2 lesson: REST + Matrix-style long-poll primary; Reality
+ *     stays for HTTP-only fallback. PR-G3 outcome captures this as
+ *     BLOCKED-by-upstream-libXray for WS path specifically.
+ *   - **(C) Tele2 LTE still never opens** → Tele2 case remains
+ *     separate/inconclusive until the Wi-Fi reconnect bug is isolated.
+ *     PR-G3 wording for Tele2 stays as "Reality WS path: inconclusive
+ *     on RU mobile carrier within the Arm G time-box."
+ *
+ * **No production transport change.** Arm G manages its OWN ephemeral
+ * libXray instances inside the diagnostic class. The Service
+ * `onDestroy` teardown still calls `container.xrayService.stop()` as
+ * a defensive backstop, but in Arm G mode that production singleton
+ * is never materialised — the call is idempotent no-op.
  *
  * **Xray lifecycle wait.** [start] calls `xrayService.start()`
  * (idempotent per [XrayService] contract — no-op if already Ready),
@@ -211,12 +255,19 @@ import phantom.core.xray.XrayState
 internal class RcDirectArmG(
     private val identityManager: IdentityManager,
     private val relayUrl: String,
-    private val xrayService: XrayService,
+    private val xrayDataDir: String,
     private val scope: CoroutineScope,
 ) {
 
     @Volatile private var runJob: Job? = null
     @Volatile private var currentWebSocket: WebSocket? = null
+    // PR-G2 fixup v6 (2026-06-06): track the per-session ephemeral
+    // libXray instance so [stop] (called from Service onDestroy) can
+    // cancel the currently-running session's gomobile process even if
+    // the runJob is cancelled mid-session. The reconnect loop nulls
+    // this after each session's stop_done event so stop() doesn't
+    // double-call on an already-stopped instance.
+    @Volatile private var currentXrayService: XrayService? = null
 
     fun start(identityHex: String, signingPubKeyHex: String) {
         if (runJob?.isActive == true) {
@@ -240,100 +291,139 @@ internal class RcDirectArmG(
                     "xray_ready_timeout_ms=$XRAY_READY_TIMEOUT_MS",
             )
 
-            // Xray lifecycle wait (§14 hard gate 5 + 9).
-            val xrayWaitStartMs = System.currentTimeMillis()
-            Log.i(TAG, "RC_DIRECT_ARM_G_xray_start_requested")
-            runCatching { xrayService.start() }.onFailure { t ->
-                // start() failure here is rare — XrayServiceFactory's
-                // start() does not throw; it transitions state to Failed
-                // and returns. But guard the call site anyway in case
-                // a future implementation breaks that contract.
-                //
-                // §14 hard gate 3: redact libXray error strings (may
-                // embed credentials / config paths). Log only generic
-                // class marker — never `t.message`.
-                Log.w(
-                    TAG,
-                    "RC_DIRECT_ARM_G_xray_start_threw " +
-                        "message_class=start_call_threw t=${t::class.simpleName}",
-                )
-                return@launch
-            }
-
-            // withTimeout block returns Int? — null signals that the
-            // observed terminal state was XrayState.Failed (not Ready)
-            // within the timeout window. We can't `return@launch` from
-            // inside the suspending withTimeout block (non-local return
-            // through a non-inline lambda is prohibited), so we surface
-            // the failure as a nullable and act on it at the outer
-            // `socksPort == null` check below.
-            val socksPortOrNull: Int? = try {
-                withTimeout(XRAY_READY_TIMEOUT_MS) {
-                    val ready = xrayService.state.first { it is XrayState.Ready || it is XrayState.Failed }
-                    when (ready) {
-                        is XrayState.Ready -> ready.socksPort
-                        is XrayState.Failed -> null
-                        else -> error("unreachable") // first { ... } guarantees Ready or Failed
-                    }
-                }
-            } catch (t: TimeoutCancellationException) {
-                // §14 hard gate 9 fail-fast: do NOT attempt WS connect on
-                // xray_not_ready. Terminate the diagnostic; foreground
-                // Service stays alive but Arm G itself is finished.
-                Log.w(
-                    TAG,
-                    "RC_DIRECT_ARM_G_xray_ready_timeout outcome=xray_not_ready " +
-                        "elapsed_ms=$XRAY_READY_TIMEOUT_MS",
-                )
-                return@launch
-            }
-            if (socksPortOrNull == null) {
-                // §14 hard gate 3: redact libXray error message (may
-                // embed credentials). Log generic class marker only.
-                // Observed XrayState.Failed before XrayState.Ready
-                // within the 15-second wait window.
-                Log.w(
-                    TAG,
-                    "RC_DIRECT_ARM_G_xray_failed message_class=ready_wait_observed_failed " +
-                        "elapsed_ms=${System.currentTimeMillis() - xrayWaitStartMs}",
-                )
-                return@launch
-            }
-            val socksPort: Int = socksPortOrNull
-
-            val xrayReadyElapsedMs = System.currentTimeMillis() - xrayWaitStartMs
-            Log.i(
-                TAG,
-                "RC_DIRECT_ARM_G_xray_ready socksPort=$socksPort elapsed_ms=$xrayReadyElapsedMs",
-            )
-
-            // Build the OkHttp client with the SOCKS5 proxy bound to the
-            // dynamic Ready socksPort. The .proxy(...) line IS the single
-            // structural variable that distinguishes Arm G from Arm A.2 /
-            // Arm D — every other builder parameter is identical so the
-            // W/X/Y discriminator reads against the same baseline.
-            val client = OkHttpClient.Builder()
-                .pingInterval(15_000L, TimeUnit.MILLISECONDS)
-                .readTimeout(60, TimeUnit.SECONDS)
-                .connectTimeout(5, TimeUnit.SECONDS)
-                .callTimeout(10, TimeUnit.SECONDS)
-                .protocols(listOf(Protocol.HTTP_1_1))
-                .proxy(
-                    java.net.Proxy(
-                        java.net.Proxy.Type.SOCKS,
-                        InetSocketAddress("127.0.0.1", socksPort),
-                    ),
-                )
-                .build()
-
-            // Reconnect loop matching Arm A.2 / Arm D. §14 PASS criterion
-            // explicitly allows "single session OR across reconnects
-            // without dropping below threshold at any point", so a clean
-            // ≥ 10 min session immediately reads as PASS while the loop
-            // keeps capturing until the operator cuts the 15-min window.
+            // Reconnect loop with per-session libXray restart (PR-G2
+            // fixup v6 2026-06-06). Each session: construct a fresh
+            // XrayService instance with a fresh socksPort, start +
+            // wait Ready, build a fresh OkHttp client, run one
+            // session, stop libXray, evict OkHttp connection pool.
+            // §14 hard gate 8 teardown order (rcDirectArmG.stop()
+            // first, then xrayService.stop()) is preserved for the
+            // end-of-life path; per-session cycle adds an inner
+            // start/stop cadence on top of that.
             var sessionEpoch = 0L
             while (isActive) {
                 sessionEpoch++
+                val xrayWaitStartMs = System.currentTimeMillis()
+
+                // Construct a fresh XrayService instance per session.
+                // `OperatorXrayConfig.toConfig(dataDir)` allocates a
+                // fresh loopback port via `pickFreeLoopbackPort()` on
+                // every call, so each session gets a distinct
+                // `socksPort`. The previous instance (if any) has
+                // already been stopped at the bottom of the previous
+                // iteration. The gomobile-bound libXray runtime is
+                // per-process, so we sequence start→Ready→use→stop
+                // before constructing the next instance.
+                val xrayConfig = OperatorXrayConfig.toConfig(xrayDataDir)
+                val xrayService = createXrayService(xrayConfig)
+                currentXrayService = xrayService
+
+                Log.i(TAG, "RC_DIRECT_ARM_G_xray_start_requested s=$sessionEpoch")
+                val startResult = runCatching { xrayService.start() }
+                if (startResult.isFailure) {
+                    val t = startResult.exceptionOrNull()
+                    // §14 hard gate 3: redact libXray error strings;
+                    // log generic class marker only.
+                    Log.w(
+                        TAG,
+                        "RC_DIRECT_ARM_G_xray_start_threw s=$sessionEpoch " +
+                            "message_class=start_call_threw t=${t?.let { it::class.simpleName }}",
+                    )
+                    runCatching { xrayService.stop() }
+                    currentXrayService = null
+                    if (isActive) delay(5_000L)
+                    continue
+                }
+
+                // withTimeout block returns Int? — null signals that
+                // the observed terminal state was XrayState.Failed
+                // (not Ready) within the timeout window. Surface as
+                // nullable + act outside the suspending block (non-
+                // local return through non-inline withTimeout is
+                // prohibited).
+                val socksPortOrNull: Int? = try {
+                    withTimeout(XRAY_READY_TIMEOUT_MS) {
+                        val ready = xrayService.state.first {
+                            it is XrayState.Ready || it is XrayState.Failed
+                        }
+                        when (ready) {
+                            is XrayState.Ready -> ready.socksPort
+                            is XrayState.Failed -> null
+                            else -> error("unreachable")
+                        }
+                    }
+                } catch (t: TimeoutCancellationException) {
+                    // §14 hard gate 9 fail-fast: do NOT attempt WS
+                    // connect on xray_not_ready. Tear down this
+                    // session's xray instance and continue to next
+                    // session (the reconnect-loop discriminator
+                    // requires per-session restart to isolate
+                    // Problem A vs Problem B per the KDoc above).
+                    Log.w(
+                        TAG,
+                        "RC_DIRECT_ARM_G_xray_ready_timeout s=$sessionEpoch " +
+                            "outcome=xray_not_ready elapsed_ms=$XRAY_READY_TIMEOUT_MS",
+                    )
+                    null
+                }
+
+                if (socksPortOrNull == null) {
+                    // Either Failed-state observed within timeout or
+                    // timeout fired. Either way: tear down this
+                    // instance and try a fresh one next session.
+                    Log.w(
+                        TAG,
+                        "RC_DIRECT_ARM_G_xray_failed s=$sessionEpoch " +
+                            "message_class=ready_wait_observed_failed " +
+                            "elapsed_ms=${System.currentTimeMillis() - xrayWaitStartMs}",
+                    )
+                    runCatching { xrayService.stop() }
+                        .onSuccess { Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_done s=$sessionEpoch reason=ready_wait_failed") }
+                        .onFailure { t ->
+                            Log.w(
+                                TAG,
+                                "RC_DIRECT_ARM_G_xray_stop_failed s=$sessionEpoch " +
+                                    "message_class=stop_call_threw t=${t::class.simpleName}",
+                            )
+                        }
+                    currentXrayService = null
+                    if (isActive) delay(5_000L)
+                    continue
+                }
+
+                val socksPort: Int = socksPortOrNull
+                val xrayReadyElapsedMs = System.currentTimeMillis() - xrayWaitStartMs
+                Log.i(
+                    TAG,
+                    "RC_DIRECT_ARM_G_xray_ready s=$sessionEpoch " +
+                        "socksPort=$socksPort elapsed_ms=$xrayReadyElapsedMs",
+                )
+
+                // Fresh OkHttp client per session bound to THIS
+                // session's socksPort. Building per session
+                // guarantees no stale connection pool / dispatcher
+                // state carries over from a previous tunnel — per
+                // Vladislav's second guardrail 2026-06-06: "OkHttp
+                // client must not reuse connections across sessions;
+                // either build a fresh OkHttpClient per Arm G session
+                // or explicitly evictAll + dispatcher cleanup before
+                // reconnect." We do BOTH: fresh client per session
+                // AND explicit `evictAll()` on the old client at the
+                // bottom of the loop.
+                val client = OkHttpClient.Builder()
+                    .pingInterval(15_000L, TimeUnit.MILLISECONDS)
+                    .readTimeout(60, TimeUnit.SECONDS)
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .callTimeout(10, TimeUnit.SECONDS)
+                    .protocols(listOf(Protocol.HTTP_1_1))
+                    .proxy(
+                        java.net.Proxy(
+                            java.net.Proxy.Type.SOCKS,
+                            InetSocketAddress("127.0.0.1", socksPort),
+                        ),
+                    )
+                    .build()
+
                 val outcome = runOneSession(
                     client = client,
                     identityHex = identityHex,
@@ -341,6 +431,34 @@ internal class RcDirectArmG(
                     sessionEpoch = sessionEpoch,
                 )
                 Log.i(TAG, "RC_DIRECT_ARM_G_session_finished s=$sessionEpoch outcome=$outcome")
+
+                // Tear down this session's libXray instance + OkHttp
+                // pool state BEFORE moving on. The next iteration
+                // constructs fresh of both.
+                Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_requested s=$sessionEpoch")
+                runCatching { xrayService.stop() }
+                    .onSuccess { Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_done s=$sessionEpoch reason=session_finished") }
+                    .onFailure { t ->
+                        Log.w(
+                            TAG,
+                            "RC_DIRECT_ARM_G_xray_stop_failed s=$sessionEpoch " +
+                                "message_class=stop_call_threw t=${t::class.simpleName}",
+                        )
+                    }
+                if (currentXrayService === xrayService) {
+                    currentXrayService = null
+                }
+                runCatching {
+                    client.connectionPool.evictAll()
+                    client.dispatcher.executorService.shutdown()
+                }.onFailure { t ->
+                    Log.d(
+                        TAG,
+                        "RC_DIRECT_ARM_G_okhttp_evict_threw s=$sessionEpoch " +
+                            "t=${t::class.simpleName}",
+                    )
+                }
+
                 if (outcome == OUTCOME_AUTH_ABORTED) {
                     delay(5_000L)
                 } else {
@@ -352,9 +470,11 @@ internal class RcDirectArmG(
 
     fun stop() {
         val ws = currentWebSocket
+        val xray = currentXrayService
         runJob?.cancel()
         runJob = null
         currentWebSocket = null
+        currentXrayService = null
         if (ws != null) {
             runCatching { ws.cancel() }
                 .onFailure { t ->
@@ -365,8 +485,38 @@ internal class RcDirectArmG(
                     )
                 }
         }
-        // NOTE: this stop() does NOT call xrayService.stop(). Per §14 hard
-        // gate 8, the Service onDestroy block owns the xrayService.stop()
+        // PR-G2 fixup v6 (2026-06-06): stop the per-session libXray
+        // instance if one is currently live. The reconnect loop nulls
+        // `currentXrayService` after a clean session-finished
+        // teardown, so this path only fires when stop() is called
+        // mid-session (i.e. Service onDestroy interrupted a running
+        // session). We use `runBlocking` because we have no
+        // CoroutineScope here and XrayService.stop() is suspend; the
+        // Service teardown path tolerates the brief block (it already
+        // does the same for the production singleton fallback below).
+        if (xray != null) {
+            Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_requested reason=arm_g_stop_called_mid_session")
+            runCatching {
+                kotlinx.coroutines.runBlocking { xray.stop() }
+            }.onSuccess {
+                Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_done reason=arm_g_stop_called_mid_session")
+            }.onFailure { t ->
+                Log.w(
+                    TAG,
+                    "RC_DIRECT_ARM_G_xray_stop_failed reason=arm_g_stop_called_mid_session " +
+                        "message_class=stop_call_threw t=${t::class.simpleName}",
+                )
+            }
+        }
+        // NOTE: this stop() handles its OWN per-session libXray
+        // instance via the [currentXrayService] tracking above. The
+        // Service onDestroy block ALSO calls
+        // `container.xrayService.stop()` on the production singleton
+        // as a defensive backstop — but in Arm G mode the production
+        // singleton is never materialised (the lazy field is only
+        // materialised by the production TransportManager path, which
+        // Arm G short-circuits before). So that Service-level call is
+        // an idempotent no-op in practice. Original §14 hard gate 8
         // call AFTER this stop() returns. Ordering is: cancel Arm G's
         // runJob + WS first (so a final reconnect attempt does not hit
         // "connection refused" mid-shutdown of libXray), then stop the
