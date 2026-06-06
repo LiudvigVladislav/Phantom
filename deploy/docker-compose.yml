@@ -307,24 +307,7 @@ services:
   # Xray source files modified). Same posture as v2rayNG / Hiddify.
   # ──────────────────────────────────────────────────────────────────────
   xray:
-    # Pinned to tagged stable release v26.5.9 + sha256 digest (RC-DIRECT-
-    # STABILITY1 §14 Arm G discriminator landed 2026-06-06: Android
-    # libXray bundles Xray-core 26.5.9 by default at current `main` HEAD;
-    # server was on `:latest` resolving to v26.3.27 at original 2026-05-07
-    # Stage 5E.B.5 deploy; the version skew was the root cause of Arm G
-    # Reality handshake rejection — server treated Android Reality
-    # ClientHello as "not a valid REALITY peer" and fell back to the
-    # configured dest www.microsoft.com:443 instead of unwrapping to
-    # phantom-caddy). Bumping server to v26.5.9 matches Android runtime
-    # version end-to-end. v26.5.9 is a TAGGED STABLE RELEASE (not
-    # `:main` / `:dev` bleeding edge per Vladislav 2026-06-06 lock).
-    #
-    # Digest pin is the operational invariant for reproducibility — even
-    # if XTLS later re-points the `:26.5.9` tag (rare for release tags
-    # but possible), this `@sha256:...` reference always resolves to the
-    # exact image we tested. Refresh via XRAY-VERSION-LOCK1 follow-up
-    # track per memory pointer.
-    image: ghcr.io/xtls/xray-core:26.5.9@sha256:933c868cbbb1ed632198c3ffeb99454709fa13dbb8c2a6f328d6a9a19e75269c
+    image: ghcr.io/xtls/xray-core:latest
     container_name: phantom-xray
     restart: unless-stopped
     # Override the image's default CMD (which runs `xray -confdir

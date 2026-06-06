@@ -90,19 +90,27 @@ internal class XrayServiceAndroid(
      *
      * The libXray entry point we use, [LibXray.runXrayFromJSON], expects a
      * base64-encoded JSON envelope shaped like
-     * `{"datDir":..., "configJSON":...}` and returns a base64-encoded
-     * `{"success":bool,"data":string}` envelope. The builder helpers below
-     * match that contract exactly.
+     * `{"datDir":..., "mphCachePath":..., "configJSON":...}` and returns a
+     * base64-encoded `{"success":bool,"data":string}` envelope. The builder
+     * helpers below match that contract exactly.
      *
-     * **Drift note (2026-06-06):** previously the envelope also carried
-     * `"mphCachePath"`. Upstream libXray refresh (XTLS/libXray HEAD
-     * `f6ce61228b56` of 2026-05-23, vendored into PHANTOM via workflow run
-     * 27033765713 on 2026-06-06) dropped that field — `newXrayRunFromJSONRequest`
-     * now takes 2 args (`datDir`, `configJSON`), and the `RunXrayFromJSONRequest`
-     * DTO has only `getDatDir` + `getConfigJSON`. The mph cache directory is
-     * created on disk for forward compatibility (some libXray code paths still
-     * write a mph cache there) but is no longer passed through the request
-     * envelope.
+     * **API drift history (RC-DIRECT-STABILITY1 §14 Arm G repair sprint 2026-06-06):**
+     *   - Original 2026-05-07 vendoring (libXray main HEAD at that date):
+     *     3-arg `newXrayRunFromJSONRequest(datDir, mphCachePath, configJSON)`
+     *     bundling Xray-core dev commit after 26.3.27 stable.
+     *   - First refresh attempt 2026-06-06 (libXray main HEAD `f6ce61228b56`
+     *     of 2026-05-23, workflow run 27033765713): API became 2-arg
+     *     `(datDir, configJSON)`. Bundled Xray-core 26.5.9 dev. Reality
+     *     handshake silently rejected by server Xray-core 26.3.27 → server
+     *     fell back to dest=www.microsoft.com. Even server bump to v26.5.9
+     *     (Docker A/B 03:07 UTC) FAILED on matched-version client+server.
+     *     Path B (server bump) refuted.
+     *   - Repair vendoring 2026-06-06 (libXray ref `9a86646da8d8` of
+     *     2026-05-12, workflow run 27051293410 on NDK r26d via the
+     *     `ndk_version` workflow input added in the same session):
+     *     3-arg API restored, bundling Xray-core v1.260327.0 (= 26.3.27
+     *     stable) MATCHING server. This file is back to the 3-arg form
+     *     as a result. Provenance in `shared/core/xray/src/androidMain/libs/README.md`.
      */
     private fun startBlocking() {
         // Ensure the runtime's working directory exists; libXray will not
@@ -145,13 +153,14 @@ internal class XrayServiceAndroid(
                 xrayConfigJson.take(240).replace("\n", "\\n"),
         )
 
-        // Drop `mphCachePath` arg per 2026-06-06 libXray upstream API drift
-        // (see kdoc above + shared/core/xray/src/androidMain/libs/README.md
-        // provenance entry). The local `mphCachePath` is still computed +
-        // its parent directory still exists on disk so any libXray code
-        // path that writes a mph cache there has a valid working location;
-        // it's just no longer threaded through the JNI request envelope.
-        val requestB64 = LibXray.newXrayRunFromJSONRequest(datDir, xrayConfigJson)
+        // Restore `mphCachePath` arg per 2026-06-06 §14 Arm G repair (see
+        // kdoc above + shared/core/xray/src/androidMain/libs/README.md
+        // provenance entry). The repair vendoring at libXray ref
+        // `9a86646da8d8` (2026-05-12, Xray-core v1.260327.0 / 26.3.27
+        // matching server) restored the 3-arg signature that the original
+        // 2026-05-07 vendoring used; the brief 2-arg variant was only on
+        // the 2026-05-23 main HEAD which we no longer ship.
+        val requestB64 = LibXray.newXrayRunFromJSONRequest(datDir, mphCachePath, xrayConfigJson)
         Log.i(LOG_TAG, "startBlocking: requestB64Len=${requestB64.length}")
 
         val responseB64 = LibXray.runXrayFromJSON(requestB64)
