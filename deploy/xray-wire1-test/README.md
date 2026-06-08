@@ -96,17 +96,24 @@ docker compose \
   -f docker-compose.wire1-test.yml \
   up -d xray-wire1
 
-# Verify the container started cleanly and is healthy.
+# Verify the container started cleanly and is healthy. Guardrail 2:
+# confirm host port :8444 is actually listening from OUTSIDE the
+# container, not only inside. A successful container start without an
+# externally-listening :8444 indicates a Docker port-mapping problem.
 docker ps --filter "name=phantom-xray-wire1"
-docker logs --tail 30 phantom-xray-wire1
-
-# Confirm port :8444 is listening on the host:
-ss -tlnp | grep ':8444'
+sudo ss -ltnp | grep ':8444'
+docker logs --tail 50 phantom-xray-wire1
 ```
 
 Expected `docker logs`: a single `[Warning] core: Xray <version> started`
 line and `[Info] transport/internet/tcp: listening TCP on 0.0.0.0:8443`
 (from inside the container — host sees this as `:8444`).
+
+Expected `sudo ss -ltnp | grep ':8444'`: a single line showing `LISTEN`
+on `*:8444` owned by the `docker-proxy` process. Empty output means the
+port-mapping did not bind on the host; do NOT proceed to the field test
+until this is resolved (otherwise the Tecno SYN to `:8444` returns RST
+and the result is meaningless).
 
 ### Verify production untouched
 
@@ -120,12 +127,15 @@ diff /tmp/wire1-prod-xray-sha-pre.txt /tmp/wire1-prod-xray-sha-post.txt \
 
 ### Capture window (host)
 
-In a separate SSH window, start the tcpdump capture on host `:8444`:
+In a separate SSH window, start the tcpdump capture on host `:8444`.
+Guardrail 1: use `-s 0` (no snaplen truncation) so a long ClientHello
+or any continuation segments are captured in full. Snaplen 2000 would
+fit our worst-case observed first-segment + a bit more, but `-s 0`
+removes the argument entirely from the result interpretation.
 
 ```bash
 sudo rm -f /tmp/wire1-v2-tecno-8444.pcap
-sudo tcpdump -ni any "tcp port 8444" -ttt -v -s 2000 \
-  -w /tmp/wire1-v2-tecno-8444.pcap
+sudo tcpdump -ni any "tcp port 8444" -w /tmp/wire1-v2-tecno-8444.pcap -s 0
 ```
 
 (No host filter — keeps the syntax simple and the post-decode Python
@@ -188,15 +198,23 @@ curl -sv https://relay.phntm.pro/health --max-time 10 | head -5
 
 ### Send artifacts back
 
-Two files are needed for the post-run analysis:
+Three files are needed for the post-run analysis. Guardrail 3 adds the
+diagnostic Xray container logs alongside the pcap and logcat — a 0/50
+PASS or an auth-mismatch failure mode would be very hard to diagnose
+without the server-side Xray's own view of each Tecno connection.
 
 ```bash
-# pcap from the VPS:
+# 1. pcap from the VPS:
 scp phantom@relay.phntm.pro:/tmp/wire1-v2-tecno-8444.pcap C:\temp\
 
-# logcat from the device (via the dev machine):
+# 2. logcat from the device (via the dev machine):
 adb -s <TECNO_SERIAL> logcat -d -v threadtime LIBXRAY_WIRE1:V GoLog:V PhantomXray:V *:S \
   | Out-File "C:\temp\wire1-v2-tecno-logcat.log" -Encoding utf8
+
+# 3. Diagnostic container logs (capture BEFORE teardown):
+ssh phantom@relay.phntm.pro \
+  "docker logs phantom-xray-wire1 > /tmp/wire1-v2-container-logs.txt 2>&1"
+scp phantom@relay.phntm.pro:/tmp/wire1-v2-container-logs.txt C:\temp\
 ```
 
 ## Reading the result (acceptance criteria)
@@ -216,12 +234,22 @@ PSH flags on continuation segments are evidence, not a hard gate.
 
 ### Verdict matrix
 
-| Variant 2 result | Verdict |
-|---|---|
-| `/health` 50/50 PASS + multi-segment ClientHello on wire | Splice-race hypothesis materially confirmed. Production fix path: drop XTLS-Vision on the embedded Android client OR fork libXray to force `readV` (non-splice) branch on Android. |
-| `/health` 0/50 PASS + same single-segment stall as Variant 1 | Vision is NOT sufficient — the bug is deeper in libXray's gomobile-bound write path. Vision-removal does not help. Proceed to Variants 3 (`xhttp`) / 4 (`httpupgrade`) to test whether HTTP-framed transports bypass the stall. |
-| Partial PASS (e.g. 30/50) | Non-deterministic / scheduling-race signature (consistent with v9 s=1 once-PASS pattern). Vision involvement likely but not exclusive. Proceed to Variants 3-4 anyway. |
-| `/health` FAIL with a DIFFERENT failure mode | Investigate the new failure mode before pivoting. Auth-mismatch on the server side is a common false alarm — check the server logs and reconfirm the rendered config matches production REALITY keys. |
+The Variant 2 verdict has TWO degrees of PASS, per Vladislav's
+interpretation guardrail. The strongest PASS is the one that catches
+the Vision/splice race "with hands red": the ClientHello stays larger
+than one MSS and a continuation segment appears on the wire. A weaker
+PASS where the ClientHello shrinks below 1440 bytes (so the entire
+record fits in one segment and no continuation is needed) is useful as
+a workaround but does NOT prove the splice race — it could equally be
+that a single-segment record never triggers the race in the first place.
+
+| Variant 2 result | Strength | Verdict |
+|---|---|---|
+| `/health` 50/50 PASS AND **TLS record_len > 1440 AND continuation segment appears AND handshake completes** | **STRONG PASS** | Splice-race hypothesis materially confirmed. Production fix path: drop XTLS-Vision on the embedded Android client OR fork libXray to force `readV` (non-splice) branch on Android. |
+| `/health` 50/50 PASS but **ClientHello shrinks below 1440 bytes** (one-segment fit, no continuation needed) | **WEAK PASS** | Useful as a workaround (production fix: drop Vision works), but does NOT decisively prove the splice race — it could equally be that a single-segment record never triggers the race. Recommend running Variants 3 / 4 to confirm mechanism. |
+| `/health` 0/50 PASS + same single-segment stall as Variant 1 | FAIL — same shape | Vision is NOT sufficient — the bug is deeper in libXray's gomobile-bound write path. Vision-removal does not help. Proceed to Variants 3 (`xhttp`) / 4 (`httpupgrade`) to test whether HTTP-framed transports bypass the stall. |
+| Partial PASS (e.g. 30/50) | RACE | Non-deterministic / scheduling-race signature (consistent with v9 s=1 once-PASS pattern). Vision involvement likely but not exclusive. Proceed to Variants 3-4 anyway. |
+| `/health` FAIL with a DIFFERENT failure mode | ANOMALY | Investigate the new failure mode before pivoting. Auth-mismatch on the server side is a common false alarm — check the server logs (`docker logs phantom-xray-wire1`) and reconfirm the rendered config matches production REALITY keys. |
 
 ## Cross-references
 
