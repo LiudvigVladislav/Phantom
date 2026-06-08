@@ -23,17 +23,22 @@ import kotlinx.serialization.json.putJsonObject
  * stable — a dozen leaf fields wired into the well-documented VLESS+REALITY
  * client template.
  *
- * The "log: loglevel: warning" level is deliberate: Xray's `info` level
- * leaks per-connection peer addresses to logcat, which we don't want in
- * production (privacy of the user's contact graph). `warning` keeps the
- * unrecoverable failure messages we care about and drops the rest.
+ * The "log: loglevel: warning" level is the production default: Xray's
+ * `info` level leaks per-connection peer addresses to logcat, which we
+ * don't want in production (privacy of the user's contact graph).
+ * `warning` keeps the unrecoverable failure messages we care about and
+ * drops the rest. The level is now caller-controlled via
+ * [XrayServiceConfig.loglevel] so debug builds — specifically the
+ * RC-DIRECT-STABILITY1 §14 Arm G diagnostic — can pass `debug` to see
+ * Reality handshake / uTLS / splice events that warning hides. Release
+ * keeps the default via `OperatorXrayConfig.toConfig(...)`.
  *
  * Reference template: <https://xtls.github.io/en/config/transports/reality.html>
  */
 internal fun buildXrayClientConfig(config: XrayServiceConfig): String {
     val root: JsonObject = buildJsonObject {
         putJsonObject("log") {
-            put("loglevel", "warning")
+            put("loglevel", config.loglevel)
         }
         putJsonArray("inbounds") {
             addJsonObject {

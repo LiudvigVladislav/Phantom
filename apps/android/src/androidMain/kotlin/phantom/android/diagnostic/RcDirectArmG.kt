@@ -334,19 +334,109 @@ internal class RcDirectArmG(
                     "xray_ready_timeout_ms=$XRAY_READY_TIMEOUT_MS",
             )
 
-            // Reconnect loop with per-session libXray restart (PR-G2
-            // fixup v6 2026-06-06). Each session: construct a fresh
-            // XrayService instance with a fresh socksPort, start +
-            // wait Ready, build a fresh OkHttp client, run one
-            // session, stop libXray, evict OkHttp connection pool.
-            // §14 hard gate 8 teardown order (rcDirectArmG.stop()
-            // first, then xrayService.stop()) is preserved for the
-            // end-of-life path; per-session cycle adds an inner
-            // start/stop cadence on top of that.
+            // ── v10 amendment 2026-06-08 (Council apprоval, amends mini-lock decision #2) ──
+            //
+            // **Persistent-single-instance libXray lifecycle.** v9 wide-logcat
+            // evidence empirically refuted the v6 per-session-restart approach:
+            //
+            //   - s=1 (first Xray instance, clean start) reached canonical
+            //     Reality success on Android Tecno Wi-Fi: ClientHello 517 →
+            //     TLS 1.3 1163 → `CopyRawConn splice` → `/health 200 OK`
+            //     elapsed_ms=656 → `auth_done` elapsed_ms=828.
+            //   - s=2 through s=6 (after `xray.stop()` + `xray.start()`)
+            //     uniformly degraded: dial to :8443 succeeded but
+            //     `XtlsFilterTls found tls client hello` did NOT appear,
+            //     Reality handshake stalled, `/health` threw timeout after
+            //     10 s.
+            //
+            // Council resolution 2026-06-08: per-session Xray restart is a
+            // suspected CAUSE of failure rather than an isolation tool.
+            // Replaced with one persistent XrayService per Arm G run.
+            // SOCKS port (dynamic per `pickFreeLoopbackPort()`) fixed once
+            // before the reconnect loop; reused for every session. Xray
+            // stopped once in the outer finally block (and additionally
+            // safety-stopped in [stop] for mid-run interruption).
+            //
+            // What stays per-session: OkHttp client rebuild + connection
+            // pool eviction. Vladislav's 2026-06-06 guardrail ("OkHttp
+            // client must not reuse connections across sessions; either
+            // build a fresh OkHttpClient per Arm G session or explicitly
+            // evictAll + dispatcher cleanup before reconnect") still holds
+            // — only the libXray instance is now persistent.
+            val xrayWaitStartMs = System.currentTimeMillis()
+            val xrayConfig = OperatorXrayConfig.toConfig(xrayDataDir)
+                .copy(loglevel = "debug")
+            val xrayService = createXrayService(xrayConfig)
+            currentXrayService = xrayService
+
+            Log.i(TAG, "RC_DIRECT_ARM_G_xray_start_requested s=0 reason=persistent_run_setup")
+            val startResult = runCatching { xrayService.start() }
+            if (startResult.isFailure) {
+                val t = startResult.exceptionOrNull()
+                Log.w(
+                    TAG,
+                    "RC_DIRECT_ARM_G_xray_start_threw s=0 " +
+                        "message_class=start_call_threw t=${t?.let { it::class.simpleName }} " +
+                        "outcome=run_aborted_before_loop",
+                )
+                runCatching { xrayService.stop() }
+                currentXrayService = null
+                return@launch
+            }
+
+            val socksPortOrNull: Int? = try {
+                withTimeout(XRAY_READY_TIMEOUT_MS) {
+                    val ready = xrayService.state.first {
+                        it is XrayState.Ready || it is XrayState.Failed
+                    }
+                    when (ready) {
+                        is XrayState.Ready -> ready.socksPort
+                        is XrayState.Failed -> null
+                        else -> error("unreachable")
+                    }
+                }
+            } catch (t: TimeoutCancellationException) {
+                Log.w(
+                    TAG,
+                    "RC_DIRECT_ARM_G_xray_ready_timeout s=0 " +
+                        "outcome=xray_not_ready elapsed_ms=$XRAY_READY_TIMEOUT_MS",
+                )
+                null
+            }
+
+            if (socksPortOrNull == null) {
+                Log.w(
+                    TAG,
+                    "RC_DIRECT_ARM_G_xray_failed s=0 " +
+                        "message_class=ready_wait_observed_failed " +
+                        "elapsed_ms=${System.currentTimeMillis() - xrayWaitStartMs} " +
+                        "outcome=run_aborted_before_loop",
+                )
+                runCatching { xrayService.stop() }
+                currentXrayService = null
+                return@launch
+            }
+
+            val socksPort: Int = socksPortOrNull
+            val xrayReadyElapsedMs = System.currentTimeMillis() - xrayWaitStartMs
+            Log.i(
+                TAG,
+                "RC_DIRECT_ARM_G_xray_ready s=0 socksPort=$socksPort elapsed_ms=$xrayReadyElapsedMs " +
+                    "reason=persistent_run_setup",
+            )
+
             var sessionEpoch = 0L
+            // v8 amendment 2026-06-08: cap consecutive auth_aborted sessions
+            // so a chronic SOCKS/Reality path failure does not spin the
+            // reconnect loop indefinitely. v7 Wi-Fi sanity produced 20+
+            // identical `challenge_threw timeout` sessions in 6 minutes.
+            // Counter resets to 0 on any non-auth_aborted outcome (echo
+            // success, WS-level Mode 2, etc.) so the cap only fires on a
+            // chronic pre-WS failure pattern.
+            var consecutiveAuthAborted = 0
+            try {
             while (isActive) {
                 sessionEpoch++
-                val xrayWaitStartMs = System.currentTimeMillis()
 
                 // v7 amendment 2026-06-06: lock-state diagnostic anchor.
                 // Confirmed via code-read on master + PR #296 head:
@@ -356,7 +446,7 @@ internal class RcDirectArmG(
                 // PARTIAL_WAKE_LOCK + MulticastLock for the WHOLE
                 // service lifetime, BEFORE the Arm G short-circuit at
                 // `onStartCommand` fires. Released only in
-                // `onDestroy` line 997. So v6 ran with all four
+                // `onDestroy` line 997. So v6/v7 ran with all four
                 // anti-parking measures (foreground notification +
                 // FULL_HIGH_PERF WifiLock + WakeLock + MulticastLock)
                 // already held, which the architect deep-dive said
@@ -372,111 +462,26 @@ internal class RcDirectArmG(
                         "mode=FULL_HIGH_PERF source=service_onCreate_acquireKeepAliveLocks",
                 )
 
-                // Construct a fresh XrayService instance per session.
-                // `OperatorXrayConfig.toConfig(dataDir)` allocates a
-                // fresh loopback port via `pickFreeLoopbackPort()` on
-                // every call, so each session gets a distinct
-                // `socksPort`. The previous instance (if any) has
-                // already been stopped at the bottom of the previous
-                // iteration. The gomobile-bound libXray runtime is
-                // per-process, so we sequence start→Ready→use→stop
-                // before constructing the next instance.
-                val xrayConfig = OperatorXrayConfig.toConfig(xrayDataDir)
-                val xrayService = createXrayService(xrayConfig)
-                currentXrayService = xrayService
-
-                Log.i(TAG, "RC_DIRECT_ARM_G_xray_start_requested s=$sessionEpoch")
-                val startResult = runCatching { xrayService.start() }
-                if (startResult.isFailure) {
-                    val t = startResult.exceptionOrNull()
-                    // §14 hard gate 3: redact libXray error strings;
-                    // log generic class marker only.
-                    Log.w(
-                        TAG,
-                        "RC_DIRECT_ARM_G_xray_start_threw s=$sessionEpoch " +
-                            "message_class=start_call_threw t=${t?.let { it::class.simpleName }}",
-                    )
-                    runCatching { xrayService.stop() }
-                    currentXrayService = null
-                    if (isActive) delay(5_000L)
-                    continue
-                }
-
-                // withTimeout block returns Int? — null signals that
-                // the observed terminal state was XrayState.Failed
-                // (not Ready) within the timeout window. Surface as
-                // nullable + act outside the suspending block (non-
-                // local return through non-inline withTimeout is
-                // prohibited).
-                val socksPortOrNull: Int? = try {
-                    withTimeout(XRAY_READY_TIMEOUT_MS) {
-                        val ready = xrayService.state.first {
-                            it is XrayState.Ready || it is XrayState.Failed
-                        }
-                        when (ready) {
-                            is XrayState.Ready -> ready.socksPort
-                            is XrayState.Failed -> null
-                            else -> error("unreachable")
-                        }
-                    }
-                } catch (t: TimeoutCancellationException) {
-                    // §14 hard gate 9 fail-fast: do NOT attempt WS
-                    // connect on xray_not_ready. Tear down this
-                    // session's xray instance and continue to next
-                    // session (the reconnect-loop discriminator
-                    // requires per-session restart to isolate
-                    // Problem A vs Problem B per the KDoc above).
-                    Log.w(
-                        TAG,
-                        "RC_DIRECT_ARM_G_xray_ready_timeout s=$sessionEpoch " +
-                            "outcome=xray_not_ready elapsed_ms=$XRAY_READY_TIMEOUT_MS",
-                    )
-                    null
-                }
-
-                if (socksPortOrNull == null) {
-                    // Either Failed-state observed within timeout or
-                    // timeout fired. Either way: tear down this
-                    // instance and try a fresh one next session.
-                    Log.w(
-                        TAG,
-                        "RC_DIRECT_ARM_G_xray_failed s=$sessionEpoch " +
-                            "message_class=ready_wait_observed_failed " +
-                            "elapsed_ms=${System.currentTimeMillis() - xrayWaitStartMs}",
-                    )
-                    runCatching { xrayService.stop() }
-                        .onSuccess { Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_done s=$sessionEpoch reason=ready_wait_failed") }
-                        .onFailure { t ->
-                            Log.w(
-                                TAG,
-                                "RC_DIRECT_ARM_G_xray_stop_failed s=$sessionEpoch " +
-                                    "message_class=stop_call_threw t=${t::class.simpleName}",
-                            )
-                        }
-                    currentXrayService = null
-                    if (isActive) delay(5_000L)
-                    continue
-                }
-
-                val socksPort: Int = socksPortOrNull
-                val xrayReadyElapsedMs = System.currentTimeMillis() - xrayWaitStartMs
-                Log.i(
-                    TAG,
-                    "RC_DIRECT_ARM_G_xray_ready s=$sessionEpoch " +
-                        "socksPort=$socksPort elapsed_ms=$xrayReadyElapsedMs",
-                )
-
-                // Fresh OkHttp client per session bound to THIS
-                // session's socksPort. Building per session
-                // guarantees no stale connection pool / dispatcher
-                // state carries over from a previous tunnel — per
-                // Vladislav's second guardrail 2026-06-06: "OkHttp
-                // client must not reuse connections across sessions;
-                // either build a fresh OkHttpClient per Arm G session
-                // or explicitly evictAll + dispatcher cleanup before
-                // reconnect." We do BOTH: fresh client per session
-                // AND explicit `evictAll()` on the old client at the
-                // bottom of the loop.
+                // v10 amendment 2026-06-08: persistent Xray. Inner-loop
+                // Xray construction / start / Ready-wait / stop has
+                // been removed per Council resolution that amended
+                // mini-lock decision #2. The single XrayService set up
+                // BEFORE this loop holds the SOCKS listener on the same
+                // `socksPort` for every session; the gomobile libXray
+                // runtime is no longer cycled. v9 wide-logcat evidence
+                // showed per-session restart degraded Reality handshake
+                // in s=2+ after s=1 successfully reached splice +
+                // /health 200 + auth_done on Tecno Wi-Fi — so the
+                // restart was itself the suspected cause, not the
+                // isolation tool.
+                //
+                // Fresh OkHttp client per session bound to the
+                // persistent `socksPort`. Building per session still
+                // matters: WS lifecycle state (listener, completion
+                // deferred, sendTimeMap) must not bleed across
+                // sessions. Vladislav's 2026-06-06 OkHttp guardrail
+                // (fresh client + explicit `evictAll()` on the old
+                // client) is preserved.
                 //
                 // v7 amendment 2026-06-06: `pingInterval(0)` DISABLES
                 // OkHttp's WS-protocol auto-Ping. v6 evidence: app
@@ -503,6 +508,17 @@ internal class RcDirectArmG(
                             InetSocketAddress("127.0.0.1", socksPort),
                         ),
                     )
+                    // v8 amendment 2026-06-08: per-session phase listener
+                    // so the operator can see where exactly the
+                    // 10-second callTimeout window is spent on preflight
+                    // and challenge calls (SOCKS connect? TLS handshake
+                    // through Reality? response wait?). The listener
+                    // reads each call's request tag to distinguish
+                    // op=preflight vs op=challenge; the WebSocket open
+                    // request is left untagged because Arm G already
+                    // emits a dedicated `RC_DIRECT_ARM_G_ws_open` line
+                    // from the WebSocket listener.
+                    .eventListener(ArmGPhaseListener(sessionEpoch))
                     .build()
 
                 val outcome = runOneSession(
@@ -513,22 +529,11 @@ internal class RcDirectArmG(
                 )
                 Log.i(TAG, "RC_DIRECT_ARM_G_session_finished s=$sessionEpoch outcome=$outcome")
 
-                // Tear down this session's libXray instance + OkHttp
-                // pool state BEFORE moving on. The next iteration
-                // constructs fresh of both.
-                Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_requested s=$sessionEpoch")
-                runCatching { xrayService.stop() }
-                    .onSuccess { Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_done s=$sessionEpoch reason=session_finished") }
-                    .onFailure { t ->
-                        Log.w(
-                            TAG,
-                            "RC_DIRECT_ARM_G_xray_stop_failed s=$sessionEpoch " +
-                                "message_class=stop_call_threw t=${t::class.simpleName}",
-                        )
-                    }
-                if (currentXrayService === xrayService) {
-                    currentXrayService = null
-                }
+                // v10 amendment 2026-06-08: per-session Xray teardown
+                // REMOVED per Council resolution. The persistent
+                // XrayService stays Ready for the next iteration; only
+                // the per-session OkHttp pool is evicted (Vladislav's
+                // 2026-06-06 guardrail preserved).
                 runCatching {
                     client.connectionPool.evictAll()
                     client.dispatcher.executorService.shutdown()
@@ -540,10 +545,60 @@ internal class RcDirectArmG(
                     )
                 }
 
+                // v8 amendment 2026-06-08: cap consecutive auth_aborted
+                // sessions. Counter is updated AFTER OkHttp pool
+                // eviction (above) so the cap-exceeded path leaves the
+                // diagnostic in a clean state — no live pool to tear
+                // down again. Counter resets to 0 on any other outcome
+                // (echo success, Mode 2, etc.). The persistent Xray
+                // is stopped in the outer finally block, not here.
+                if (outcome == OUTCOME_AUTH_ABORTED) {
+                    consecutiveAuthAborted++
+                    if (consecutiveAuthAborted >= MAX_CONSECUTIVE_AUTH_ABORTED) {
+                        Log.w(
+                            TAG,
+                            "RC_DIRECT_ARM_G_auth_abort_cap_exceeded " +
+                                "s=$sessionEpoch " +
+                                "consecutive=$consecutiveAuthAborted " +
+                                "max=$MAX_CONSECUTIVE_AUTH_ABORTED " +
+                                "outcome=$OUTCOME_AUTH_ABORT_CAP_EXCEEDED",
+                        )
+                        break
+                    }
+                } else {
+                    consecutiveAuthAborted = 0
+                }
+
                 if (outcome == OUTCOME_AUTH_ABORTED) {
                     delay(5_000L)
                 } else {
                     delay(1_000L)
+                }
+            }
+            } finally {
+                // v10 amendment 2026-06-08: persistent Xray stops ONCE
+                // after the reconnect loop exits (cancellation, cap
+                // exceeded, or wall-clock cap). The [stop] entrypoint
+                // ALSO stops Xray (mid-run interruption path via
+                // Service.onDestroy) — both paths are idempotent
+                // because `currentXrayService` is nulled at the first
+                // successful stop AND `XrayService.stop()` is itself
+                // idempotent (short-circuits on `state == Off`).
+                Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_requested s=$sessionEpoch reason=run_complete")
+                runCatching { xrayService.stop() }
+                    .onSuccess {
+                        Log.i(TAG, "RC_DIRECT_ARM_G_xray_stop_done s=$sessionEpoch reason=run_complete")
+                    }
+                    .onFailure { t ->
+                        Log.w(
+                            TAG,
+                            "RC_DIRECT_ARM_G_xray_stop_failed s=$sessionEpoch " +
+                                "message_class=stop_call_threw t=${t::class.simpleName} " +
+                                "reason=run_complete",
+                        )
+                    }
+                if (currentXrayService === xrayService) {
+                    currentXrayService = null
                 }
             }
         }
@@ -639,6 +694,23 @@ internal class RcDirectArmG(
     ): String {
         val sessionStartMs = System.currentTimeMillis()
         Log.i(TAG, "RC_DIRECT_ARM_G_session_start s=$sessionEpoch wall_clock_ms=$sessionStartMs")
+        // v8 amendment 2026-06-08: SOCKS-proxied /health preflight BEFORE
+        // challenge. The v7 Wi-Fi sanity 20+ sessions all died with
+        // `challenge_threw timeout`; relay saw no Arm G traffic at all.
+        // The discriminator question is: does any HTTP request through
+        // the per-session SOCKS-Reality path reach the relay? /health is
+        // the cheapest probe (200 OK with `{"status":"ok"}` from a
+        // healthy relay, no body parse needed) and shares the same
+        // OkHttpClient (same SOCKS proxy + same callTimeout=10s + same
+        // event listener) as the challenge call so any wiring
+        // difference is removed as a confound. Result is logged but
+        // NOT used to short-circuit the session — we run challenge
+        // regardless so the operator gets BOTH signals per session
+        // and can read the matrix (preflight PASS + challenge FAIL =
+        // challenge-specific; both FAIL = SOCKS-Reality broken on
+        // Tecno; preflight slow + challenge timeout = callTimeout
+        // too short for Tecno-side Reality handshake latency).
+        runHealthPreflight(client, sessionEpoch)
         val authedUrl = buildAuthedWsUrl(client, identityHex, signingPubKeyHex, sessionEpoch)
             ?: return OUTCOME_AUTH_ABORTED
         val authDoneMs = System.currentTimeMillis()
@@ -647,11 +719,44 @@ internal class RcDirectArmG(
             "RC_DIRECT_ARM_G_auth_done s=$sessionEpoch auth_elapsed_ms=${authDoneMs - sessionStartMs}",
         )
 
-        val request = Request.Builder().url(authedUrl).build()
+        // v10 amendment 2026-06-08: WS upgrade goes through a SEPARATE
+        // OkHttpClient with ConnectionPool(0, ...) so the WS upgrade
+        // CANNOT reuse the keep-alive TLS connection that preflight and
+        // challenge just used over the Reality splice. This is Architect 1's
+        // Bug A discriminator — v9 evidence showed preflight (200 OK) +
+        // challenge (auth_done) prevailed through the same Reality splice
+        // but the immediately-following WS upgrade through that same
+        // (likely-reused) HTTP/1.1 keep-alive connection failed with
+        // `response_code=null` after 10 s. If a fresh-pool WS client now
+        // PASSES the upgrade, pool-reuse-over-splice was the proximal
+        // cause. If it still FAILS, the cause is downstream (relay-side
+        // `/ws` handler OR Reality-Vision-splice + WS framing
+        // interaction). Tag the request so [ArmGPhaseListener] surfaces
+        // its phases as `op=ws_upgrade phase=...` rather than `op=untagged`,
+        // and emit `RC_DIRECT_ARM_G_ws_about_to_connect` immediately before
+        // the blocking `newWebSocket(...)` call so the operator can
+        // distinguish "WS upgrade never started" from "WS upgrade started
+        // but timed out".
+        val request = Request.Builder()
+            .url(authedUrl)
+            .tag(String::class.java, "ws_upgrade")
+            .build()
+        val wsClient = client.newBuilder()
+            .connectionPool(
+                okhttp3.ConnectionPool(0, 1, TimeUnit.NANOSECONDS),
+            )
+            .build()
+        Log.i(
+            TAG,
+            "RC_DIRECT_ARM_G_ws_about_to_connect s=$sessionEpoch " +
+                "url=$authedUrl call_timeout_ms=10000 " +
+                "pool_policy=no_reuse_zero_idle " +
+                "discriminator=bug_a_pool_reuse_over_splice",
+        )
         val completion = CompletableDeferred<String>()
         val sendTimeMap = LinkedHashMap<Long, Long>(SEND_TIME_MAP_CAPACITY, 0.75f, true)
         val listener = ArmGListener(sessionEpoch, authDoneMs, completion, sendTimeMap)
-        val ws = client.newWebSocket(request, listener)
+        val ws = wsClient.newWebSocket(request, listener)
         currentWebSocket = ws
 
         val heartbeatJob = scope.launch {
@@ -897,6 +1002,81 @@ internal class RcDirectArmG(
         }
     }
 
+    /**
+     * v8 amendment 2026-06-08: SOCKS-proxied `/health` preflight. Runs
+     * BEFORE the signed-challenge call on every reconnect loop iteration
+     * using the same [client] (same SOCKS proxy on the current session's
+     * `socksPort`, same `callTimeout=10s`, same [ArmGPhaseListener]).
+     * Result is logged via `RC_DIRECT_ARM_G_preflight_result` (200 OK)
+     * or `RC_DIRECT_ARM_G_preflight_threw` (timeout / IOException) but
+     * NEVER short-circuits the caller — the session continues to the
+     * challenge phase regardless so the operator gets both signals per
+     * session and can read the matrix described in [runOneSession].
+     *
+     * Why `/health` specifically: relay returns a fixed
+     * `{"status":"ok"}` body with no auth required, so the success path
+     * is the cheapest possible probe of the SOCKS → Reality → relay
+     * pipe. Failure modes map cleanly to discriminator outcomes:
+     *   - `200 OK + elapsed_ms < 5000` → SOCKS-Reality-relay pipe
+     *     works, challenge failure (if it follows) is challenge-
+     *     specific.
+     *   - `200 OK + elapsed_ms ≥ 8000` → callTimeout=10s is too tight
+     *     for Tecno-side Reality handshake latency; preflight winning
+     *     by a hair foreshadows challenge losing by a similar margin.
+     *   - `IOException / timeout` → SOCKS-Reality path itself is
+     *     broken on Tecno (refutes the WSL2-Linux-Xray equivalence
+     *     inference; opens libXray-gomobile-specific investigation).
+     *
+     * Tag `"preflight"` is read by [ArmGPhaseListener] from
+     * `request.tag(String::class.java)` so the per-phase event lines
+     * carry `op=preflight` next to the wall-clock-elapsed
+     * `RC_DIRECT_ARM_G_preflight_*` lines.
+     */
+    private suspend fun runHealthPreflight(
+        client: OkHttpClient,
+        sessionEpoch: Long,
+    ) {
+        val httpScheme = when {
+            relayUrl.startsWith("wss://") -> "https://"
+            relayUrl.startsWith("ws://")  -> "http://"
+            else                          -> "https://"
+        }
+        val hostAndPath = relayUrl.removePrefix("wss://").removePrefix("ws://")
+        val hostOnly = hostAndPath.substringBefore("/")
+        val healthUrl = "$httpScheme$hostOnly/health"
+        val started = System.currentTimeMillis()
+        Log.i(
+            TAG,
+            "RC_DIRECT_ARM_G_preflight_started s=$sessionEpoch " +
+                "url=$healthUrl call_timeout_ms=10000",
+        )
+        val req = Request.Builder()
+            .url(healthUrl)
+            .tag(String::class.java, "preflight")
+            .build()
+        withContext(Dispatchers.IO) {
+            runCatching {
+                client.newCall(req).execute().use { resp ->
+                    val elapsed = System.currentTimeMillis() - started
+                    Log.i(
+                        TAG,
+                        "RC_DIRECT_ARM_G_preflight_result s=$sessionEpoch " +
+                            "status=${resp.code} elapsed_ms=$elapsed",
+                    )
+                }
+            }.onFailure { t ->
+                val elapsed = System.currentTimeMillis() - started
+                Log.w(
+                    TAG,
+                    "RC_DIRECT_ARM_G_preflight_threw s=$sessionEpoch " +
+                        "t=${t::class.simpleName} " +
+                        "msg=${t.message?.take(200)} " +
+                        "elapsed_ms=$elapsed",
+                )
+            }
+        }
+    }
+
     private suspend fun buildAuthedWsUrl(
         client: OkHttpClient,
         identityHex: String,
@@ -912,7 +1092,23 @@ internal class RcDirectArmG(
         val hostOnly = hostAndPath.substringBefore("/")
         val challengeUrl = "$httpScheme$hostOnly/auth/challenge?identity=$identityHex"
 
-        val challengeReq = Request.Builder().url(challengeUrl).build()
+        val challengeReq = Request.Builder()
+            .url(challengeUrl)
+            .tag(String::class.java, "challenge")
+            .build()
+        // v8 amendment 2026-06-08: log immediately before the blocking
+        // `.execute()` call so the operator can distinguish "challenge
+        // never started" (no about_to_call line) from "challenge started
+        // but timed out" (about_to_call present, threw line follows
+        // ~10s later). The previous v7 evidence was ambiguous on this
+        // axis because the only challenge line was the terminal
+        // `challenge_threw` — we did not know whether the request had
+        // actually left the device.
+        Log.i(
+            TAG,
+            "RC_DIRECT_ARM_G_challenge_about_to_call s=$sessionEpoch " +
+                "url=$challengeUrl call_timeout_ms=10000",
+        )
         val nonceHex = withContext(Dispatchers.IO) {
             runCatching {
                 client.newCall(challengeReq).execute().use { resp ->
@@ -1132,10 +1328,108 @@ internal class RcDirectArmG(
     private fun bytesToHex(bytes: ByteArray): String =
         bytes.joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
 
+    /**
+     * v8 amendment 2026-06-08: per-session OkHttp [okhttp3.EventListener]
+     * that surfaces the wall-clock latency of each HTTP-layer phase for
+     * preflight + challenge calls on the SOCKS-Reality pipe. Reads the
+     * per-call request tag (`request.tag(String::class.java)`) so the
+     * lines carry `op=preflight` / `op=challenge`; calls without the
+     * tag (e.g. the WebSocket open) are labelled `op=untagged` and can
+     * be ignored — Arm G already emits `RC_DIRECT_ARM_G_ws_open` from
+     * the WebSocket listener.
+     *
+     * Why only a few phases: the goal is to localise where in the
+     * 10-second `callTimeout` window the call dies, not to instrument
+     * every internal step. `connectStart` / `secureConnectStart` /
+     * `secureConnectEnd` / `responseHeadersStart` / `callEnd` /
+     * `callFailed` are the six phase boundaries that map cleanly to
+     * SOCKS connect, TLS-through-Reality handshake, and response wait.
+     * DNS phases are skipped because OkHttp with a SOCKS proxy still
+     * resolves the URL host locally (so DNS latency is felix-side and
+     * already covered by other diagnostics) and would just add noise.
+     *
+     * Level=INFO so the operator can `findstr / grep` for it; under
+     * the v8 Xray `loglevel=debug` flag the logcat is verbose anyway.
+     */
+    private inner class ArmGPhaseListener(
+        private val sessionEpoch: Long,
+    ) : okhttp3.EventListener() {
+        private fun op(call: okhttp3.Call): String =
+            call.request().tag(String::class.java) ?: "untagged"
+
+        override fun connectStart(
+            call: okhttp3.Call,
+            inetSocketAddress: java.net.InetSocketAddress,
+            proxy: java.net.Proxy,
+        ) {
+            Log.i(
+                TAG,
+                "RC_DIRECT_ARM_G_phase s=$sessionEpoch op=${op(call)} " +
+                    "phase=connectStart addr=$inetSocketAddress proxy=$proxy",
+            )
+        }
+
+        override fun secureConnectStart(call: okhttp3.Call) {
+            Log.i(
+                TAG,
+                "RC_DIRECT_ARM_G_phase s=$sessionEpoch op=${op(call)} " +
+                    "phase=secureConnectStart",
+            )
+        }
+
+        override fun secureConnectEnd(call: okhttp3.Call, handshake: okhttp3.Handshake?) {
+            Log.i(
+                TAG,
+                "RC_DIRECT_ARM_G_phase s=$sessionEpoch op=${op(call)} " +
+                    "phase=secureConnectEnd " +
+                    "tlsVersion=${handshake?.tlsVersion} " +
+                    "cipherSuite=${handshake?.cipherSuite}",
+            )
+        }
+
+        override fun responseHeadersStart(call: okhttp3.Call) {
+            Log.i(
+                TAG,
+                "RC_DIRECT_ARM_G_phase s=$sessionEpoch op=${op(call)} " +
+                    "phase=responseHeadersStart",
+            )
+        }
+
+        override fun callEnd(call: okhttp3.Call) {
+            Log.i(
+                TAG,
+                "RC_DIRECT_ARM_G_phase s=$sessionEpoch op=${op(call)} " +
+                    "phase=callEnd",
+            )
+        }
+
+        override fun callFailed(call: okhttp3.Call, ioe: java.io.IOException) {
+            Log.w(
+                TAG,
+                "RC_DIRECT_ARM_G_phase s=$sessionEpoch op=${op(call)} " +
+                    "phase=callFailed t=${ioe::class.simpleName} " +
+                    "msg=${ioe.message?.take(160)}",
+            )
+        }
+    }
+
     companion object {
         private const val TAG = "RC_DIRECT_ARM_G"
         private val NONCE_REGEX = Regex("\"nonce_hex\"\\s*:\\s*\"([a-fA-F0-9]+)\"")
         private const val OUTCOME_AUTH_ABORTED = "auth_aborted"
+
+        // v8 amendment 2026-06-08: cap consecutive auth-aborted sessions so
+        // a chronic SOCKS/Reality path failure does not spin the reconnect
+        // loop indefinitely (the v7 Wi-Fi sanity run produced 20+ identical
+        // `challenge_threw timeout` sessions in 6 minutes, drowning logcat
+        // and burning device battery without new information). After
+        // [MAX_CONSECUTIVE_AUTH_ABORTED] consecutive auth_aborted outcomes,
+        // the diagnostic terminates the reconnect loop with outcome
+        // [OUTCOME_AUTH_ABORT_CAP_EXCEEDED] so the operator can read the
+        // existing evidence cleanly and trigger a code change rather than
+        // wait for the user to force-stop.
+        const val MAX_CONSECUTIVE_AUTH_ABORTED: Int = 5
+        const val OUTCOME_AUTH_ABORT_CAP_EXCEEDED: String = "auth_abort_cap_exceeded"
 
         // Canonical heartbeat payload prefix locked in mini-lock §4 Arm D
         // and reused byte-for-byte across Arm D, Arm A.2, and Arm G. Must

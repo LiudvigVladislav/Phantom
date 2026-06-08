@@ -46,6 +46,14 @@ expect fun createXrayService(config: XrayServiceConfig): XrayService
  * @property socksPort TCP port the embedded SOCKS5 inbound binds on
  *   `127.0.0.1`. Default `10808` — caller must guarantee no port collision
  *   with another in-process listener (e.g. embedded Tor's SOCKS).
+ * @property loglevel Xray-core log level emitted to logcat
+ *   (`debug` / `info` / `warning` / `error` / `none`). Defaults to
+ *   `warning` because info-level leaks per-connection peer addresses to
+ *   logcat which we do not want in production (privacy of the user's
+ *   contact graph). Debug builds — specifically the RC-DIRECT-STABILITY1
+ *   §14 Arm G diagnostic — override this to `debug` so the per-session
+ *   diagnostic can see the Reality handshake / uTLS / splice events. The
+ *   release-pinned `OperatorXrayConfig.toConfig(...)` keeps the default.
  */
 data class XrayServiceConfig(
     val serverHost: String,
@@ -56,4 +64,5 @@ data class XrayServiceConfig(
     val uuid: String,
     val dataDirectoryPath: String,
     val socksPort: Int = 10808,
+    val loglevel: String = "warning",
 )
