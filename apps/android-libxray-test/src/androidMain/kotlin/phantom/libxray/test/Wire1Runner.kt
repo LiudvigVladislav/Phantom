@@ -214,19 +214,29 @@ internal object Wire1Runner {
     private fun Wire1Variant.toXrayServiceConfig(dataDir: String) =
         when (slug) {
             "baseline" -> OperatorXrayConfig.toConfig(dataDir)
-            // Variants 2-4 require per-variant overrides (flow + network +
-            // network-specific settings). Per the Trek 1 mini-lock first-
-            // test-order gate, those variants are added in subsequent
-            // commits only AFTER baseline reproduces the single-segment
-            // stall on this standalone APK. The skeleton fails fast here
-            // so a misconfigured run cannot silently produce evidence for
-            // the wrong config shape.
+            "drop-vision" -> OperatorXrayConfig.toConfig(dataDir).copy(
+                // Variant 2 discriminator: plain VLESS without
+                // XTLS-Vision (per the Trek 1 mini-lock + claude.md
+                // splice-race hypothesis). Server-side coordination
+                // required: a separate diagnostic Reality inbound on
+                // :8444 with `clients[].flow = ""` is brought up
+                // alongside (NOT replacing) the production `:8443`
+                // inbound via the `deploy/docker-compose.wire1-test.yml`
+                // overlay; otherwise the server's VLESS auth rejects
+                // the flow mismatch and the test cannot distinguish a
+                // splice-race fix from an auth-level rejection.
+                serverPort = serverPort,
+                flow = flow,
+            )
+            // Variants 3-4 (`xhttp`, `httpupgrade`) are added in
+            // subsequent commits ONLY after Variant 2 field result is in.
+            // The skeleton fails fast here so a misconfigured run cannot
+            // silently produce evidence under the wrong config shape.
             else -> error(
                 "Variant '$slug' not yet wired in this skeleton; the Trek 1 " +
-                    "mini-lock requires baseline reproduction before adding " +
-                    "variants 2-4. See " +
-                    "project_trek1_rc_libxray_reality_wire1_minilock_2026_06_09.md " +
-                    "first-test-order gate.",
+                    "mini-lock first-test-order gate requires Variant 2 result " +
+                    "before adding Variants 3-4. See " +
+                    "project_trek1_rc_libxray_reality_wire1_minilock_2026_06_09.md.",
             )
         }
 }

@@ -54,6 +54,19 @@ expect fun createXrayService(config: XrayServiceConfig): XrayService
  *   §14 Arm G diagnostic — override this to `debug` so the per-session
  *   diagnostic can see the Reality handshake / uTLS / splice events. The
  *   release-pinned `OperatorXrayConfig.toConfig(...)` keeps the default.
+ * @property flow VLESS user-flow string passed verbatim into
+ *   `outbounds[].settings.vnext[].users[].flow`. Defaults to
+ *   `xtls-rprx-vision` — the production flow that pairs with the
+ *   server's `clients[].flow = "xtls-rprx-vision"` user entry. The
+ *   release-pinned `OperatorXrayConfig.toConfig(...)` therefore keeps
+ *   production behavior byte-for-byte equivalent on this field. Override
+ *   to `""` (plain VLESS without XTLS-Vision) ONLY in diagnostic test
+ *   surfaces, e.g. the RC-LIBXRAY-REALITY-WIRE1 (Trek 1) Variant 2
+ *   `drop-vision` discriminator (`apps/android-libxray-test/`). When the
+ *   client `flow` is overridden, the server's matching `clients[].flow`
+ *   must also accept the override OR a separate diagnostic Reality
+ *   inbound must serve the test traffic — production `:8443` is NOT
+ *   modified by Trek 1.
  */
 data class XrayServiceConfig(
     val serverHost: String,
@@ -65,4 +78,5 @@ data class XrayServiceConfig(
     val dataDirectoryPath: String,
     val socksPort: Int = 10808,
     val loglevel: String = "warning",
+    val flow: String = "xtls-rprx-vision",
 )

@@ -82,7 +82,19 @@ internal fun buildXrayClientConfig(config: XrayServiceConfig): String {
                                     // TLS session. Adding another layer would
                                     // break the TLS-fingerprint mimicry.
                                     put("encryption", "none")
-                                    put("flow", "xtls-rprx-vision")
+                                    // Production default is `xtls-rprx-vision`
+                                    // (set via `XrayServiceConfig.flow` default).
+                                    // The RC-LIBXRAY-REALITY-WIRE1 Trek 1 Variant 2
+                                    // discriminator overrides this to `""` (plain
+                                    // VLESS without XTLS-Vision) to test whether
+                                    // the multi-segment outer Reality ClientHello
+                                    // stall observed in Arm G v10/v11 + Trek 1
+                                    // baseline disappears when Vision's
+                                    // splice-handoff race is removed from the
+                                    // outbound. Production callers MUST keep the
+                                    // default; diagnostic callers override via
+                                    // `XrayServiceConfig.copy(flow = "")`.
+                                    put("flow", config.flow)
                                 }
                             }
                         }

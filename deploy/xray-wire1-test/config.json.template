@@ -1,0 +1,128 @@
+{
+  "//": "RC-LIBXRAY-REALITY-WIRE1 (Trek 1) Variant 2 DIAGNOSTIC Reality inbound.",
+  "//": "Mirrors `deploy/xray/config.json.template` for Reality auth (same",
+  "//":   "privateKey / serverNames / shortIds / dest / SNI / routing) so that",
+  "//":   "the embedded Android client's existing `OperatorXrayConfig.kt`",
+  "//":   "Reality keys work unchanged. The ONLY material delta vs production:",
+  "//":   "  clients[].flow = ''   (plain VLESS without XTLS-Vision)",
+  "//": "This config is mounted into a SEPARATE `phantom-xray-wire1` container",
+  "//":   "on host port :8444 (NAT'd to container :8443). Production",
+  "//":   "phantom-xray on host :8443 is NOT touched — per the Trek 1 mini-lock",
+  "//":   "Hard Gate 3 (production :8443 untouched, sha256 verified pre/post).",
+  "//": "This file is a TEMPLATE. Render to config.json on the VPS via the",
+  "//":   "operator runbook in `deploy/xray-wire1-test/README.md`. The REPLACE_",
+  "//":   "markers below must be substituted with the SAME values as production",
+  "//":   "(re-use `/home/phantom/Phantom/deploy/xray/.env` on the VPS) so the",
+  "//":   "client's embedded `kDRy...` public key handshakes against an identical",
+  "//":   "REALITY keypair. Otherwise a Variant 2 FAIL would be ambiguous between",
+  "//":   "splice-race-not-removed and key-mismatch.",
+
+  "log": {
+    "loglevel": "warning",
+    "//": "Why warning + access:none mirror production exactly: the diagnostic",
+    "//":   "config exists to isolate ONE variable (`flow`); any other delta",
+    "//":   "(log verbosity, access logging) could plausibly affect timing in",
+    "//":   "ways that mask or amplify the splice race we are trying to test.",
+    "access": "none"
+  },
+
+  "dns": {
+    "//": "Identical to production: relay.phntm.pro resolves to the docker",
+    "//":   "service `caddy` on the shared bridge network. The diagnostic",
+    "//":   "container MUST share the production `phantom-internal` network",
+    "//":   "(asserted in the compose overlay) for this lookup to succeed.",
+    "hosts": {
+      "relay.phntm.pro": "caddy"
+    }
+  },
+
+  "inbounds": [
+    {
+      "//": "Tag differs from production (`vless-reality-in`) so routing rules",
+      "//":   "below and the access-log stream can be greped per-test without",
+      "//":   "polluting production diagnostic queries. The `clients[].flow`",
+      "//":   "field is the ONLY material delta vs production:",
+      "//":   "  production: 'xtls-rprx-vision'",
+      "//":   "  this file:  ''  (plain VLESS, no XTLS-Vision)",
+      "tag": "vless-reality-in-wire1",
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "REPLACE_UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.microsoft.com"
+          ],
+          "privateKey": "REPLACE_PRIVATE_KEY",
+          "shortIds": [
+            "",
+            "REPLACE_SHORT_ID"
+          ],
+          "minClientVer": "1.8.0"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      }
+    }
+  ],
+
+  "outbounds": [
+    {
+      "tag": "to-relay",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      }
+    },
+    { "tag": "block",  "protocol": "blackhole" }
+  ],
+
+  "routing": {
+    "//": "Identical three-rule structure as production. Rule 1 matches via",
+    "//":   "three domain-matcher syntaxes (defence in depth against version-",
+    "//":   "specific matcher quirks per the production config comments).",
+    "//":   "Rule 3 catchall blackhole prevents open-proxy abuse for the brief",
+    "//":   "diagnostic window.",
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["vless-reality-in-wire1"],
+        "domain": [
+          "relay.phntm.pro",
+          "domain:relay.phntm.pro",
+          "full:relay.phntm.pro"
+        ],
+        "outboundTag": "to-relay"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["vless-reality-in-wire1"],
+        "port": "443",
+        "outboundTag": "to-relay"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["vless-reality-in-wire1"],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}

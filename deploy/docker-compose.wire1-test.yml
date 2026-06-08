@@ -1,0 +1,63 @@
+# RC-LIBXRAY-REALITY-WIRE1 (Trek 1) Variant 2 diagnostic overlay.
+#
+# Brings up a SECOND Xray container (`phantom-xray-wire1`) bound to host
+# port :8444 alongside the production `phantom-xray` on host port :8443.
+# Production `:8443` is NOT modified by this overlay — per the Trek 1
+# mini-lock Hard Gate 3.
+#
+# What the diagnostic container provides:
+#   - Identical Reality keys (privateKey / serverNames / shortIds / dest /
+#     SNI) so the embedded Android client's `OperatorXrayConfig.kt`
+#     handshakes against an identical REALITY keypair. A Variant 2 FAIL
+#     would otherwise be ambiguous between splice-race-not-removed and
+#     key-mismatch.
+#   - Single material delta: `inbounds[0].settings.clients[0].flow = ""`
+#     (plain VLESS without XTLS-Vision). This is the Variant 2 / Trek 1
+#     splice-handoff-race discriminator per the claude.md analysis.
+#
+# Lifecycle (Arm A.2 pattern — open / verify / capture / teardown). Full
+# operator runbook in `deploy/xray-wire1-test/README.md`. Tear down with
+# `docker compose -f docker-compose.yml -f docker-compose.wire1-test.yml
+# down phantom-xray-wire1` once the field test completes.
+
+services:
+  xray-wire1:
+    # Reuse the production image. Diagnostic is short-lived so :latest is
+    # acceptable, BUT the operator should record the resolved digest in
+    # the runbook (`docker image inspect ghcr.io/xtls/xray-core:latest`)
+    # so the run is reproducible from history.
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: phantom-xray-wire1
+    # `restart: "no"` — diagnostic only, must not auto-restart and outlive
+    # the test window. The operator brings it up explicitly, captures the
+    # tcpdump, and tears it down.
+    restart: "no"
+    command: ["run", "-c", "/etc/xray/config.json"]
+    ports:
+      # Host :8444 → container :8443. Production phantom-xray keeps host
+      # :8443 untouched. The Android test APK Variant 2 client config
+      # points at `:8444` via `Wire1Variant.serverPort = 8444` in the
+      # `apps/android-libxray-test` module.
+      - "8444:8443/tcp"
+    volumes:
+      # Rendered config — produced from
+      # `deploy/xray-wire1-test/config.json.template` on the VPS by the
+      # operator runbook (re-uses the production `deploy/xray/.env` values
+      # so the diagnostic config has identical REALITY keys to production).
+      - ./xray-wire1-test/config.json:/etc/xray/config.json:ro
+    networks:
+      # Same internal bridge as production. The diagnostic Xray uses the
+      # production `caddy` DNS entry (from the bridge's embedded DNS) when
+      # routing unwrapped relay traffic — identical to production's hosts-
+      # map mechanism.
+      - phantom-internal
+    # Drop all kernel caps; diagnostic does not need any privileged ops.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Healthcheck deliberately omitted — the operator tcpdump on host
+    # :8444 IS the health signal for this short-lived diagnostic run.
+
+# `phantom-internal` is declared in the production `docker-compose.yml`;
+# overlay just references it by name (no `networks:` block here).
