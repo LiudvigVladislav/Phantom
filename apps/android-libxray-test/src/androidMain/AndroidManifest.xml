@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  Copyright (c) 2026 Willen LLC
+
+  RC-LIBXRAY-REALITY-WIRE1 (Trek 1) — STANDALONE DIAGNOSTIC MANIFEST.
+
+  Permissions:
+    INTERNET — required for OkHttp to open the SOCKS connection to the
+               embedded libXray inbound and (through that) the outer
+               Reality dial to relay.phntm.pro:8443.
+
+  No background services, no foreground notification, no boot receivers —
+  the test runs entirely inside a single Activity launched by adb. When
+  the Activity is killed (back button / system kill), the test stops and
+  the XrayService is torn down via the Activity's onDestroy hook.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="LibXray Wire1 (Trek 1)"
+        android:allowBackup="false"
+        android:supportsRtl="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>
