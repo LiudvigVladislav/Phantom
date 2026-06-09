@@ -72,13 +72,21 @@ interface Csprng {
      * `Long.MAX_VALUE` where modulo bias would otherwise be visible.
      *
      * Performance: rejection sampling re-draws when the underlying
-     * 63-bit draw falls in the trailing partial bucket. The rejection
-     * probability is bounded by `boundExclusive / Long.MAX_VALUE` —
-     * for the Stage 2B jitter ranges (hold base 0..5000 ms,
-     * next-request 200..1000 ms) it is `5 × 10⁻¹⁶`, so the expected
-     * call cost is one libsodium draw and an integer divide. The
-     * worst-case bound (`boundExclusive = Long.MAX_VALUE`) re-draws
-     * with probability ~50% — still terminates almost surely.
+     * 63-bit draw falls in the trailing partial bucket. For typical
+     * Stage 2B jitter bounds (hold base 0..5000 ms, next-request
+     * 200..1000 ms) the rejection probability is `≤ boundExclusive /
+     * Long.MAX_VALUE` ≈ `5 × 10⁻¹⁶`, so the expected call cost is
+     * one libsodium draw and an integer divide.
+     *
+     * The worst-case rejection is ~50% and occurs when `boundExclusive`
+     * sits just above half of the 63-bit positive space (around
+     * `Long.MAX_VALUE / 2 + 1`): there the floor division
+     * `Long.MAX_VALUE / boundExclusive` collapses from 2 down to 1, so
+     * `maxValid = boundExclusive` covers only the lower half of the
+     * draw space. Bounds at or very near `Long.MAX_VALUE` itself, by
+     * contrast, give `maxValid = boundExclusive` over nearly the full
+     * 63-bit space, with rejection probability close to zero. Even at
+     * the ~50% point the loop terminates almost surely.
      *
      * Throws on `boundExclusive <= 0`.
      */
@@ -124,9 +132,11 @@ object LibsodiumCsprng : Csprng {
         // For typical Stage 2 bounds (≤ 60_000 ms) the rejection
         // probability is ≤ `boundExclusive / Long.MAX_VALUE` =
         // ~6.5 × 10⁻¹⁵, indistinguishable from a single-draw path
-        // in practice. The loop is unconditionally bounded by
-        // `rejection_rate^N` which goes to zero exponentially even
-        // for the worst case `boundExclusive` near `Long.MAX_VALUE`.
+        // in practice. The worst-case rejection (~50%) sits at
+        // `boundExclusive ≈ Long.MAX_VALUE/2 + 1`, where the floor
+        // division collapses from 2 to 1; bounds at or near
+        // `Long.MAX_VALUE` itself are close to 0% rejection. See
+        // the KDoc for the full breakdown.
         val maxValid = (Long.MAX_VALUE / boundExclusive) * boundExclusive
         while (true) {
             val raw = bytes(Long.SIZE_BYTES)
