@@ -135,6 +135,33 @@ async fn main() {
                     !queue.is_empty()
                 });
             }
+            // Trek 2 Stage 1 Q6 — evict idle `notifiers` entries to bound
+            // map size. Drop ONLY entries whose `Arc::strong_count == 1`
+            // — that means the only owner is the map itself (no in-flight
+            // poll waiter holds a clone, no concurrent `notify_recipient`
+            // send call is mid-execution with a clone). This avoids the
+            // drop-while-register race where eviction would strand a
+            // waiter without a notifier the send path can reach
+            // (security-reviewer Finding 3.A).
+            //
+            // Trade-off in the race window: if cleanup drops the entry
+            // just before `/relay/send` does `notify_recipient`, the
+            // send simply finds no entry and is a no-op — the envelope
+            // is still in `rest_store` for the next poll cycle, so
+            // Guardrail A "delivery never lost" holds.
+            {
+                let mut notifiers = cleanup_state.notifiers.write().await;
+                let before = notifiers.len();
+                notifiers.retain(|_, arc| std::sync::Arc::strong_count(arc) > 1);
+                let dropped = before.saturating_sub(notifiers.len());
+                if dropped > 0 {
+                    tracing::debug!(
+                        event   = "trek2_notifiers_cleanup",
+                        dropped = dropped,
+                        kept    = notifiers.len(),
+                    );
+                }
+            }
             tracing::debug!(
                 "Cleanup: purged expired envelopes + previous SPKs + auth challenges + REST state"
             );
