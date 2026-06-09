@@ -61,11 +61,26 @@ interface Csprng {
 
     /**
      * Returns a uniformly-distributed `Long` in `[0, boundExclusive)`.
-     * Implementation uses 8 random bytes per call and applies modulo
-     * `boundExclusive` to a non-negative cast — the bias is bounded
-     * above by `2^-63 * boundExclusive` and is therefore negligible
+     *
+     * Implementation uses **rejection sampling** so the bias is
+     * mathematically zero, not just "negligible" as the original
+     * modulo-based draft was. Vladislav PR #298 round-2 review P3
+     * (2026-06-09): `uniformLong` is positioned as the single source
+     * of bounded-random draws for every Trek 2 security-purpose RNG
+     * site, and the name itself promises mathematical uniformity —
+     * the helper now keeps that promise even for bounds approaching
+     * `Long.MAX_VALUE` where modulo bias would otherwise be visible.
+     *
+     * Performance: rejection sampling re-draws when the underlying
+     * 63-bit draw falls in the trailing partial bucket. The rejection
+     * probability is bounded by `boundExclusive / Long.MAX_VALUE` —
      * for the Stage 2B jitter ranges (hold base 0..5000 ms,
-     * next-request 200..1000 ms). Throws on `boundExclusive <= 0`.
+     * next-request 200..1000 ms) it is `5 × 10⁻¹⁶`, so the expected
+     * call cost is one libsodium draw and an integer divide. The
+     * worst-case bound (`boundExclusive = Long.MAX_VALUE`) re-draws
+     * with probability ~50% — still terminates almost surely.
+     *
+     * Throws on `boundExclusive <= 0`.
      */
     fun uniformLong(boundExclusive: Long): Long
 }
@@ -95,13 +110,38 @@ object LibsodiumCsprng : Csprng {
         require(boundExclusive > 0) {
             "boundExclusive must be positive, was $boundExclusive"
         }
-        val raw = bytes(Long.SIZE_BYTES)
-        var value = 0L
-        for (b in raw) {
-            value = (value shl 8) or (b.toLong() and 0xFF)
+        // Rejection-sampling threshold per PR #298 round-2 review P3
+        // (Vladislav 2026-06-09): after the strip-sign mask below,
+        // the draw inhabits `[0, Long.MAX_VALUE]`. Define `maxValid`
+        // as the largest multiple of `boundExclusive` that fits in
+        // that range — `[0, maxValid)` is then perfectly partitioned
+        // into equal-size buckets of width `boundExclusive`, so
+        // `value % boundExclusive` is provably unbiased on accepted
+        // draws. Values in `[maxValid, Long.MAX_VALUE]` sit in the
+        // trailing partial bucket; rejecting them removes the modulo
+        // bias entirely.
+        //
+        // For typical Stage 2 bounds (≤ 60_000 ms) the rejection
+        // probability is ≤ `boundExclusive / Long.MAX_VALUE` =
+        // ~6.5 × 10⁻¹⁵, indistinguishable from a single-draw path
+        // in practice. The loop is unconditionally bounded by
+        // `rejection_rate^N` which goes to zero exponentially even
+        // for the worst case `boundExclusive` near `Long.MAX_VALUE`.
+        val maxValid = (Long.MAX_VALUE / boundExclusive) * boundExclusive
+        while (true) {
+            val raw = bytes(Long.SIZE_BYTES)
+            var value = 0L
+            for (b in raw) {
+                value = (value shl 8) or (b.toLong() and 0xFF)
+            }
+            // Strip the sign bit so the result is unambiguously
+            // non-negative on every JVM implementation.
+            value = value and Long.MAX_VALUE
+            if (value < maxValid) {
+                return value % boundExclusive
+            }
+            // else re-draw — see KDoc + inline comment for the
+            // (vanishing) probability budget.
         }
-        // Strip the sign bit before modulo so the result is
-        // unambiguously non-negative on every JVM implementation.
-        return (value and Long.MAX_VALUE) % boundExclusive
     }
 }
