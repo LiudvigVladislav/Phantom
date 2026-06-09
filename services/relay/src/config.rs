@@ -84,6 +84,23 @@ pub struct RelayConfig {
     ///
     /// Locked design in `docs/tracks/rc-direct-stability1.md` §10 T2.
     pub slow_post_diag_enabled: bool,
+
+    // ── Trek 2 Stage 1 long-poll (SHORT-CYCLE-LONGPOLL1) ──────────────────────
+
+    /// Server-side hold-time (seconds) for `/relay/poll`. When > 0, an empty
+    /// poll request blocks on a per-identity `tokio::sync::Notify` until
+    /// either an envelope arrives (with ~50 ms coalescing) or this many
+    /// seconds elapse. When 0, the endpoint returns immediately as today —
+    /// this is the production kill switch.
+    ///
+    /// Announced to clients via `SessionResponse.poll_hold_secs`. Old
+    /// clients ignore the field and keep polling on their own cadence;
+    /// upgraded clients use it as the request timeout target.
+    ///
+    /// Default: 0 (short-poll). Override via env var `RELAY_POLL_HOLD_SECS`.
+    /// Recommended Stage 2+ values per Trek 2 mini-lock: 10–25 s active /
+    /// idle / long-idle on Standard + Private; 30 s on Ghost.
+    pub poll_hold_secs: u32,
 }
 
 impl RelayConfig {
@@ -113,6 +130,11 @@ impl RelayConfig {
             // exercise the handler construct a config with this flipped to
             // `true` rather than relying on the surrounding env.
             slow_post_diag_enabled: false,
+            // Trek 2 Stage 1: long-poll hold disabled in tests by default;
+            // tests that exercise the hold loop construct a config with
+            // this set to a non-zero value (typically 1 s, with
+            // `tokio::time::pause()` to make the wait deterministic).
+            poll_hold_secs: 0,
         }
     }
 
@@ -176,6 +198,14 @@ impl RelayConfig {
             slow_post_diag_enabled: std::env::var("RELAY_ENABLE_SLOW_POST_DIAG")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            // Trek 2 Stage 1: long-poll hold-time. Default 0 = short-poll
+            // (existing behaviour). Operator opts-in by setting
+            // `RELAY_POLL_HOLD_SECS=20` (or similar) in `.env` and restarting
+            // the container; setting it back to 0 is the kill switch.
+            poll_hold_secs: std::env::var("RELAY_POLL_HOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -198,6 +228,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("media_ttl_secs", &self.media_ttl_secs)
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
             .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)
+            .field("poll_hold_secs", &self.poll_hold_secs)
             .finish()
     }
 }

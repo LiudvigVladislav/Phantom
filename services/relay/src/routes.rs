@@ -80,7 +80,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         // which is already mounted above and shared with the WS path).
         .route("/auth/session",      post(rest_session))
         .route("/relay/send",        post(rest_send))
-        .route("/relay/poll",        get(rest_poll))
+        // Trek 2 Stage 1 Q3 — `/relay/poll` is intentionally NOT mounted
+        // here. It is mounted separately below (after the 30 s TimeoutLayer
+        // wraps these routes) with its own poll-specific timeout, so the
+        // long-poll hold can sit on a per-identity `tokio::sync::Notify`
+        // for the full `RELAY_POLL_HOLD_SECS` without the surrounding
+        // 30 s layer firing 408 first. Stage 4 Ghost mode targets
+        // 30 s + jitter; the 60 s carve-out timeout leaves a clean margin.
         .route("/relay/ack-deliver", post(rest_ack_deliver))
         // ── Encrypted media upload/download (PR-M1r) ────────────────────
         // Relay stores only opaque ciphertext keyed by a capability token
@@ -145,8 +151,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         http_routes
     };
 
+    // Trek 2 Stage 1 Q3 — `/relay/poll` carved out of the 30 s
+    // `TimeoutLayer` that wraps `http_routes`. Mounted on its own
+    // sub-router with a 60 s timeout so the server-side long-poll hold
+    // (up to `RELAY_POLL_HOLD_SECS`, default 0 = short-poll, target
+    // 30 s + jitter on Stage 4 Ghost) cannot be killed mid-hold by the
+    // surrounding layer. The poll handler itself enforces the hold-time
+    // budget; this layer is a safety ceiling above it.
+    let poll_route = Router::new()
+        .route("/relay/poll", get(rest_poll))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(60),
+        ));
+
     Router::new()
         .route("/ws", get(ws_handler))
+        .merge(poll_route)
         .merge(http_routes)
         // Log only method + path — never query string, to avoid leaking ?token= secrets.
         .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
@@ -900,6 +921,14 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 expires_at,
             )
             .await;
+            // Trek 2 Stage 1 — wake any /relay/poll long-poll waiter for
+            // this recipient so a WS sender → REST recipient flow has
+            // the same sub-50 ms latency as a REST sender → REST recipient
+            // flow. `sequence_ts` quantization happens inside the mirror
+            // helper itself (Q5), so the WS path already gets the same
+            // reduced-precision timestamp in the stored RestEnvelope as
+            // the REST send path.
+            let _ = state.notify_recipient(&to).await;
 
             // Attempt live delivery — best-effort.
             let delivered = {

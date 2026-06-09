@@ -10,7 +10,8 @@ use crate::rest_fallback::{IdempotencyCache, RestEnvelope, RestTokenStore, SeqCo
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-use tokio::sync::{mpsc, RwLock};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Notify, RwLock};
 
 /// Per-sender sliding-window rate-limit entry.
 #[derive(Debug)]
@@ -105,6 +106,34 @@ pub struct AppState {
     /// Monotonic per-recipient sequence counter for REST poll resume.
     pub rest_seq: SeqCounter,
 
+    // ── Trek 2 Stage 1 long-poll (SHORT-CYCLE-LONGPOLL1) ──────────────────────
+
+    /// Per-recipient wake-up channel for `/relay/poll` long-poll hold.
+    /// `/relay/send` calls `notify_one()` on the recipient's entry after
+    /// `mirror_envelope_to_rest_store` so an in-flight poll waiter wakes
+    /// within ~50 ms (coalescing window) and returns the new envelope.
+    ///
+    /// The `Arc<Notify>` is cloned by both producers (send path) and
+    /// consumers (poll path) so background cleanup (in `main.rs` 5-min
+    /// task) can safely evict map entries only when `Arc::strong_count == 1`
+    /// (no active waiter or send-path reference) — guards the
+    /// drop-while-register race per Q6 lock.
+    ///
+    /// Bounded at `POLL_HOLD_NOTIFIERS_LRU_CAP` entries (see
+    /// `rest_fallback.rs`) to defend against map-size amplification —
+    /// when full the poll handler degrades to immediate return (no Notify
+    /// registration) per Trek 2 mini-lock cross-cutting invariant 7.
+    pub notifiers: RwLock<HashMap<String, Arc<Notify>>>,
+
+    /// Per-identity sliding-window rate limiter for `/relay/ack-deliver`.
+    /// SEPARATE from `rate_limiter` (which counts `/relay/send` per sender)
+    /// because the same identity can be both sender and recipient — sharing
+    /// the same map would block ack-deliver after 60 sends in the window,
+    /// or block sends after 120 acks. Each map has its own limit
+    /// (60 / window for send, 120 / window for ack-deliver) and its own
+    /// per-identity counter so the two flows are independent per Q2 lock.
+    pub ack_rate_limiter: RwLock<HashMap<String, RateEntry>>,
+
     // ── Media upload store (PR-M1r) ───────────────────────────────────────────
 
     /// In-memory store for encrypted media chunks uploaded via
@@ -149,6 +178,9 @@ impl AppState {
             rest_idempotency: IdempotencyCache::new(),
             rest_store: RwLock::new(HashMap::new()),
             rest_seq: SeqCounter::new(),
+            // Trek 2 Stage 1 long-poll
+            notifiers: RwLock::new(HashMap::new()),
+            ack_rate_limiter: RwLock::new(HashMap::new()),
             // Media upload (PR-M1r)
             media_store: MediaStore::new(),
         }
@@ -161,6 +193,67 @@ impl AppState {
     pub async fn rebuild_signing_keys_from_prekeys(&self) {
         let pairs = self.prekeys.iter_identity_signing_pairs().await;
         self.signing_keys.load(pairs).await;
+    }
+
+    /// Return the per-recipient `Arc<Notify>` used by the `/relay/poll`
+    /// long-poll hold loop, creating a fresh one if the recipient has no
+    /// entry yet. Bounded by `cap`: when the map is full and the recipient
+    /// has no existing entry, returns `None` so the caller can degrade to
+    /// the immediate-return short-poll path (preserves Guardrail A
+    /// "delivery never lost" because the message is still in `rest_store`
+    /// and will be picked up on the next poll cycle).
+    ///
+    /// Trek 2 Stage 1 Q6 lock — the same `Arc` is handed to producers
+    /// (`/relay/send` -> `notify_one()`) and consumers (poll waiter); the
+    /// cleanup task only drops map entries with `Arc::strong_count == 1`
+    /// to avoid the race where eviction strands a waiter without a
+    /// notifier producers can reach.
+    pub async fn notifier_for(
+        &self,
+        recipient: &str,
+        cap: usize,
+    ) -> Option<Arc<Notify>> {
+        // Read-lock fast path.
+        {
+            let map = self.notifiers.read().await;
+            if let Some(arc) = map.get(recipient) {
+                return Some(Arc::clone(arc));
+            }
+        }
+        // Miss → write-lock to insert. Re-check under write lock to handle
+        // racing inserts (two concurrent polls for the same identity).
+        let mut map = self.notifiers.write().await;
+        if let Some(arc) = map.get(recipient) {
+            return Some(Arc::clone(arc));
+        }
+        if map.len() >= cap {
+            // Map at capacity. Don't admit a new identity — the poll
+            // handler degrades to immediate-return short-poll, which
+            // is acceptable per Guardrail A (envelope still in queue
+            // for the next poll cycle).
+            return None;
+        }
+        let arc = Arc::new(Notify::new());
+        map.insert(recipient.to_string(), Arc::clone(&arc));
+        Some(arc)
+    }
+
+    /// Best-effort `notify_one()` for a recipient — used by `/relay/send`
+    /// to wake any in-flight poll hold. Returns `true` if a notifier
+    /// existed for the recipient. If no notifier exists (the recipient
+    /// has no in-flight or recent poll), this is a no-op — the envelope
+    /// is still in `rest_store` and will be returned on the next poll.
+    ///
+    /// Performance: read-lock only, no map mutation. The send path is
+    /// hot; a write-lock here would contend with every concurrent send.
+    pub async fn notify_recipient(&self, recipient: &str) -> bool {
+        let map = self.notifiers.read().await;
+        if let Some(arc) = map.get(recipient) {
+            arc.notify_one();
+            true
+        } else {
+            false
+        }
     }
 }
 

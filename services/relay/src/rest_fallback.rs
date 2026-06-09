@@ -72,7 +72,54 @@ pub const REST_MAX_BODY_BYTES: usize = 4_096;
 
 /// How many envelopes /relay/poll returns per call (conservative — raise only
 /// after empirical evidence that larger batches traverse the middlebox).
+/// Trek 2 Stage 1 mini-lock Q8 keeps this at 1 — raising requires a Double
+/// Ratchet skip-key store audit (see `project_trek2_minilock_draft_2026_06_09.md`
+/// cross-cutting invariant 7).
 const POLL_MAX_ENVELOPES: usize = 1;
+
+// ── Trek 2 Stage 1 long-poll (SHORT-CYCLE-LONGPOLL1) constants ───────────────
+
+/// Canonical body size (bytes) every `PollResponse` is padded to so that
+/// empty-poll responses and envelope-bearing poll responses are
+/// byte-indistinguishable on the wire (Q4 lock 2026-06-09 after audit:
+/// max realistic envelope-bearing body ≈ 4154 bytes; 4608 leaves ≈ 454
+/// bytes padding margin and stays comfortably under the Tele2 ~5 KB
+/// cellular-middlebox cutoff documented in `project_t2_outcome_2026_06_05.md`).
+///
+/// Guardrail C — padding can be tuned later but NEVER reduced silently;
+/// any change requires tcpdump-based size-distribution proof first.
+pub const POLL_RESPONSE_CANONICAL_BYTES: usize = 4_608;
+
+/// Max distinct identities tracked in `AppState.notifiers` before the
+/// long-poll path degrades to immediate-return for new identities
+/// (defends against map-amplification: a single attacker authenticating
+/// as many identities and spamming polls would otherwise blow the map).
+/// Parallels `IDEMPOTENCY_LRU_CAP`.
+pub const POLL_HOLD_NOTIFIERS_LRU_CAP: usize = 50_000;
+
+/// Coalescing delay (ms) between a `notify_one()` wake and the
+/// post-wake queue re-check. Lets a burst of `/relay/send` calls
+/// for the same recipient batch into one poll response without
+/// waiting the full hold timeout (MTProto-style pattern).
+const POLL_HOLD_COALESCE_MS: u64 = 50;
+
+/// Rate-limit window count for `/relay/ack-deliver` per recipient
+/// identity. SEPARATE from `RelayConfig.rate_limit_per_window`
+/// (which counts `/relay/send` per sender) because the same identity
+/// can be both sender and recipient (self-test, system identities) —
+/// sharing the bucket would break independence (Q2 lock).
+pub const ACK_DELIVER_RATE_LIMIT_PER_WINDOW: u32 = 120;
+
+/// Trek 2 Stage 1 — quantize a millisecond wall-clock timestamp to the
+/// nearest 60-second boundary by flooring (`ts - (ts % 60_000)`).
+/// Removes sub-minute precision from the relay-visible `sequence_ts`
+/// field per Q5 lock. Applied unconditionally on the server side; the
+/// relay does NOT trust the client to pre-quantize. `u64::MAX` is safe
+/// because Rust modulo arithmetic on `u64` does not panic.
+#[inline]
+pub const fn quantize_sequence_ts_to_60s(ts_ms: u64) -> u64 {
+    ts_ms - (ts_ms % 60_000)
+}
 
 // ── Token store ───────────────────────────────────────────────────────────────
 
@@ -458,6 +505,13 @@ pub async fn mirror_envelope_to_rest_store(
     expires_at: u64,
 ) -> u64 {
     let seq = state.rest_seq.next(to).await;
+    // Trek 2 Stage 1 Q5 lock — quantize `sequence_ts` to the nearest
+    // 60-second boundary on the ONE shared storage path so both REST
+    // `/relay/send` and WS send (which both flow through this helper)
+    // produce identical reduced-precision timestamps in the stored
+    // RestEnvelope. Server-side, unconditional — the relay does not
+    // trust the client to pre-quantize (Q7 of security-reviewer).
+    let sequence_ts = quantize_sequence_ts_to_60s(sequence_ts);
     let rest_env = RestEnvelope {
         id: envelope_id.to_string(),
         from: String::new(),
@@ -555,6 +609,12 @@ pub struct SessionResponse {
     /// (e.g. `range_download`, `max_range_bytes`, `recommended_chunk_bytes`)
     /// land here without breaking older clients that ignore unknown fields.
     pub media_capabilities: MediaCapabilities,
+    /// Trek 2 Stage 1 — server-side long-poll hold-time in seconds.
+    /// `0` = short-poll (existing behaviour, kill switch). `>0` = upgraded
+    /// client uses this as `/relay/poll` request timeout target. Field is
+    /// **always present** (no `skip_serializing_if`) so old clients that
+    /// check for field presence see explicit `0` rather than absence.
+    pub poll_hold_secs: u32,
 }
 
 #[derive(Serialize)]
@@ -608,11 +668,193 @@ pub struct PollEnvelope {
 pub struct PollResponse {
     pub envelopes: Vec<PollEnvelope>,
     pub more: bool,
+    /// Trek 2 Stage 1 — exact-length padding to the canonical body size
+    /// (`POLL_RESPONSE_CANONICAL_BYTES`). Empty and envelope-bearing
+    /// responses both pad to identical total body bytes so a passive
+    /// observer cannot distinguish "message arrived" from "no message"
+    /// by response size. Server populates via `pad_poll_response`; old
+    /// clients ignore the unknown field (lenient JSON parsers).
+    ///
+    /// Field is always present (no `skip_serializing_if`) because if it
+    /// were omitted on the empty branch we'd reintroduce the bimodal
+    /// fingerprint we're trying to remove.
+    pub pad: String,
 }
 
 #[derive(Deserialize)]
 pub struct AckDeliverRequest {
     pub id: String,
+}
+
+// ── Trek 2 Stage 1 helpers ────────────────────────────────────────────────────
+
+/// Base64url-safe alphabet (`[A-Za-z0-9_-]`, 64 chars) used to fill the
+/// `PollResponse.pad` field. Each character is exactly 1 JSON byte (no
+/// escaping needed), so a string of length `N` adds exactly `N` body
+/// bytes — this is the property that lets us hit the canonical 4608
+/// byte target exactly regardless of whether the response carries an
+/// envelope or not.
+///
+/// Why this alphabet vs `hex::encode`: hex always produces an EVEN
+/// number of characters (each byte → 2 chars), so it cannot hit odd
+/// target lengths. Per Vladislav's Q4 padding correction we need exact
+/// byte length; the 1-char-per-byte alphabet below makes that trivial.
+const PAD_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Build a random padding string of EXACTLY `len` characters using
+/// `PAD_ALPHABET`. Each character drawn uniformly via `rand::thread_rng()`.
+/// Entropy at len ≈ 500 chars: 500 × log2(64) = 3000 bits → indistinguishable
+/// from base64-encoded ciphertext at this scale (security-reviewer Finding 4.B).
+fn random_padding_string(len: usize) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| {
+            let idx = rng.gen_range(0..PAD_ALPHABET.len());
+            PAD_ALPHABET[idx] as char
+        })
+        .collect()
+}
+
+/// Serialize `resp` to JSON bytes padded to EXACTLY
+/// `POLL_RESPONSE_CANONICAL_BYTES`. If the response without padding
+/// already meets or exceeds the canonical size (impossible for the
+/// current `PollEnvelope` shape under `REST_MAX_BODY_BYTES=4096`, but
+/// guard anyway), the response is returned with `pad` empty and a
+/// `tracing::warn!` is emitted — Guardrail C / Q4 explicit
+/// non-truncation rule.
+///
+/// Algorithm:
+///   1. Serialize `resp` with `pad: ""` (probe).
+///   2. Compute `needed = CANONICAL - probe_len`. If `needed <= 0` →
+///      oversize path (warn + return probe).
+///   3. Pad value of exactly `needed` random chars from `PAD_ALPHABET`.
+///   4. Re-serialize and assert exact-byte invariant in debug builds.
+pub fn pad_poll_response(mut resp: PollResponse) -> Vec<u8> {
+    resp.pad = String::new();
+    let probe = serde_json::to_vec(&resp).expect("PollResponse serialises");
+    let target = POLL_RESPONSE_CANONICAL_BYTES;
+    if probe.len() >= target {
+        tracing::warn!(
+            event       = "poll_response_exceeds_canonical_size",
+            unpadded_len = probe.len(),
+            canonical    = target,
+            "PollResponse cannot fit canonical padding budget — returning unpadded"
+        );
+        // Guardrail C: do NOT truncate ciphertext. Return the response as
+        // serialised. The size-distribution invariant is degraded only
+        // for this oversize case (which the audit says should not happen
+        // under current send-body limits).
+        return probe;
+    }
+    let needed = target - probe.len();
+    resp.pad = random_padding_string(needed);
+    let padded = serde_json::to_vec(&resp).expect("PollResponse serialises");
+    debug_assert_eq!(
+        padded.len(),
+        target,
+        "pad_poll_response invariant: padded body must equal canonical size"
+    );
+    padded
+}
+
+/// Trek 2 Stage 1 — long-poll hold loop for `/relay/poll`. Free
+/// function (not inlined into the axum handler) so the wait can be
+/// unit-tested with `tokio::time::pause` and deterministic stepping.
+///
+/// Contract:
+///   * If `rest_store` for `recipient` has eligible envelopes
+///     (`seq > since_seq` and not expired), returns immediately.
+///   * Else if `hold_secs == 0`, returns immediately with empty batch
+///     (kill-switch fast path — no Notify entry created, no map mutation).
+///   * Else looks up (or inserts, bounded by `POLL_HOLD_NOTIFIERS_LRU_CAP`)
+///     the recipient's `Arc<Notify>` and races (a) `notify_one()` arrival,
+///     (b) `hold_secs`-second timeout. On wake (a) sleeps
+///     `POLL_HOLD_COALESCE_MS` so a burst of sends batches, then re-reads
+///     the queue. On timeout (b) returns empty.
+///   * If the notifier map is at capacity AND the recipient has no entry,
+///     degrades to immediate-return short-poll (Guardrail A — envelope
+///     still in `rest_store` for the next poll cycle).
+///
+/// Returns `(envelopes, more)` — same shape the caller previously built
+/// inline. The caller is responsible for wrapping these in a
+/// `PollResponse` and applying `pad_poll_response`.
+pub async fn poll_hold_loop(
+    state: &Arc<AppState>,
+    recipient: &str,
+    since_seq: u64,
+    hold_secs: u32,
+) -> (Vec<PollEnvelope>, bool) {
+    // Phase 1 — initial queue check. If something is already pending,
+    // return immediately without registering a waiter.
+    if let Some(batch) = drain_eligible(state, recipient, since_seq).await {
+        return batch;
+    }
+    // Phase 2 — kill-switch fast path.
+    if hold_secs == 0 {
+        return (Vec::new(), false);
+    }
+    // Phase 3 — register on the per-recipient Notify and wait.
+    let notifier = match state.notifier_for(recipient, POLL_HOLD_NOTIFIERS_LRU_CAP).await {
+        Some(n) => n,
+        None => {
+            // Map at capacity. Degrade to short-poll behaviour for this
+            // request; an upgraded client will simply retry sooner.
+            return (Vec::new(), false);
+        }
+    };
+    let timeout = tokio::time::Duration::from_secs(hold_secs as u64);
+    let coalesce = tokio::time::Duration::from_millis(POLL_HOLD_COALESCE_MS);
+    let wake = tokio::time::timeout(timeout, notifier.notified()).await;
+    if wake.is_err() {
+        // Timeout — return empty without re-checking.
+        return (Vec::new(), false);
+    }
+    // Notify fired. Wait the coalescing window so multiple back-to-back
+    // sends batch into one response (POLL_MAX_ENVELOPES=1 still applies,
+    // but `more=true` then tells the client to immediately re-poll).
+    tokio::time::sleep(coalesce).await;
+    // Phase 4 — post-wake queue re-check.
+    drain_eligible(state, recipient, since_seq)
+        .await
+        .unwrap_or((Vec::new(), false))
+}
+
+/// Inspect the REST store for `recipient` and return the
+/// `(envelopes, more)` batch if there is at least one envelope with
+/// `seq > since_seq`. Returns `None` if there is nothing eligible
+/// (caller uses this to decide whether to wait on Notify).
+///
+/// Also purges expired envelopes from the queue as a side-effect — the
+/// existing handler did this each call, so the long-poll path preserves
+/// the same TTL-enforcement cadence.
+async fn drain_eligible(
+    state: &Arc<AppState>,
+    recipient: &str,
+    since_seq: u64,
+) -> Option<(Vec<PollEnvelope>, bool)> {
+    let mut rest_store = state.rest_store.write().await;
+    let queue = rest_store.entry(recipient.to_string()).or_default();
+    queue.retain(|e| !e.is_expired());
+    let eligible: Vec<&RestEnvelope> = queue.iter().filter(|e| e.seq > since_seq).collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    let more = eligible.len() > POLL_MAX_ENVELOPES;
+    let batch: Vec<PollEnvelope> = eligible
+        .into_iter()
+        .take(POLL_MAX_ENVELOPES)
+        .map(|e| PollEnvelope {
+            id: e.id.clone(),
+            from: e.from.clone(),
+            sealed_sender: e.sealed_sender.clone(),
+            payload: e.payload.clone(),
+            sequence_ts: e.sequence_ts,
+            seq: e.seq,
+        })
+        .collect();
+    Some((batch, more))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -725,6 +967,7 @@ pub async fn rest_session(
                         binary_v3: true,
                         max_upload_body_bytes: state.config.max_media_upload_body_bytes,
                     },
+                    poll_hold_secs: state.config.poll_hold_secs,
                 }),
             )
                 .into_response();
@@ -910,6 +1153,7 @@ pub async fn rest_session(
                 binary_v3: true,
                 max_upload_body_bytes: state.config.max_media_upload_body_bytes,
             },
+            poll_hold_secs: state.config.poll_hold_secs,
         }),
     )
         .into_response()
@@ -1104,6 +1348,12 @@ pub async fn rest_send(
     )
     .await;
 
+    // Trek 2 Stage 1 — wake any in-flight `/relay/poll` long-poll waiter
+    // for this recipient. Best-effort: if no waiter exists (offline /
+    // short-poll client), this is a no-op and the envelope is picked up
+    // on the next poll cycle. Read-lock-only to keep the send path hot.
+    let _ = state.notify_recipient(&req.to).await;
+
     // Also persist in the shared WS store so /ws reconnects see the same
     // envelope as a REST poller.
     {
@@ -1197,31 +1447,14 @@ pub async fn rest_poll(
     };
 
     let since_seq = q.since_seq.unwrap_or(0);
+    let hold_secs = state.config.poll_hold_secs;
 
-    // Read from REST-specific store (carries seq counter).
-    let (envelopes, more) = {
-        let mut rest_store = state.rest_store.write().await;
-        let queue = rest_store.entry(recipient_identity.clone()).or_default();
-        // Purge expired.
-        queue.retain(|e| !e.is_expired());
-        // Filter by since_seq.
-        let eligible: Vec<&RestEnvelope> =
-            queue.iter().filter(|e| e.seq > since_seq).collect();
-        let more = eligible.len() > POLL_MAX_ENVELOPES;
-        let batch: Vec<PollEnvelope> = eligible
-            .into_iter()
-            .take(POLL_MAX_ENVELOPES)
-            .map(|e| PollEnvelope {
-                id: e.id.clone(),
-                from: e.from.clone(),
-                sealed_sender: e.sealed_sender.clone(),
-                payload: e.payload.clone(),
-                sequence_ts: e.sequence_ts,
-                seq: e.seq,
-            })
-            .collect();
-        (batch, more)
-    };
+    // Trek 2 Stage 1 — long-poll hold. `poll_hold_loop` returns
+    // immediately if `hold_secs == 0` (kill switch) or if the queue is
+    // non-empty; otherwise it awaits a per-identity Notify with a
+    // ~50 ms coalescing window so a burst of sends batches.
+    let (envelopes, more) =
+        poll_hold_loop(&state, &recipient_identity, since_seq, hold_secs).await;
 
     let envelope_id_log = envelopes.first().map(|e| e.id.as_str()).unwrap_or("");
     tracing::info!(
@@ -1229,11 +1462,20 @@ pub async fn rest_poll(
         identity    = %&recipient_identity[..8.min(recipient_identity.len())],
         envelope_id = %envelope_id_log,
         more        = more,
+        hold_secs   = hold_secs,
     );
 
+    // Trek 2 Stage 1 Q4 — pad to canonical 4608-byte body so empty and
+    // envelope-bearing responses are byte-indistinguishable on the wire.
+    let body = pad_poll_response(PollResponse {
+        envelopes,
+        more,
+        pad: String::new(),
+    });
     (
         StatusCode::OK,
-        Json(PollResponse { envelopes, more }),
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
     )
         .into_response()
 }
@@ -1282,8 +1524,49 @@ pub async fn rest_ack_deliver(
             .into_response();
     }
 
+    // Trek 2 Stage 1 Q2 — rate-limit ack-deliver on a SEPARATE map
+    // (`state.ack_rate_limiter`) keyed on recipient identity. Must NOT
+    // share the `/relay/send` bucket because the same identity can be
+    // both sender and recipient (self-test, system identities) — sharing
+    // would block ack-deliver after 60 sends or block sends after 120
+    // acks. Limit: 120 / 60 s window per
+    // `ACK_DELIVER_RATE_LIMIT_PER_WINDOW`. Reuses the existing sliding-
+    // window pattern from `rest_send` above for shape consistency.
+    let ack_rate_ok = {
+        let mut limiter = state.ack_rate_limiter.write().await;
+        let entry = limiter
+            .entry(recipient_identity.clone())
+            .or_insert(crate::state::RateEntry {
+                count: 0,
+                window_start: std::time::Instant::now(),
+            });
+        if entry.window_start.elapsed().as_secs() >= state.config.rate_limit_window_secs {
+            entry.count = 1;
+            entry.window_start = std::time::Instant::now();
+            true
+        } else if entry.count < ACK_DELIVER_RATE_LIMIT_PER_WINDOW {
+            entry.count += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if !ack_rate_ok {
+        tracing::warn!(
+            event       = "rest_ack_deliver_rate_limited",
+            identity    = %&recipient_identity[..8.min(recipient_identity.len())],
+            envelope_id = %req.id,
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "rate limit exceeded" })),
+        )
+            .into_response();
+    }
+
     tracing::info!(
         event       = "rest_ack_deliver_received",
+        identity    = %&recipient_identity[..8.min(recipient_identity.len())],
         envelope_id = %req.id,
     );
 
@@ -1336,4 +1619,188 @@ fn now_ms_i64() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ── Trek 2 Stage 1 unit tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── sequence_ts quantization (Q5) ────────────────────────────────────────
+
+    #[test]
+    fn quantize_60s_floors_to_boundary() {
+        // Table-driven: (input_ms, expected_quantized_ms)
+        let cases = [
+            (0u64, 0u64),
+            (1, 0),
+            (59_999, 0),
+            (60_000, 60_000),
+            (60_001, 60_000),
+            (125_000, 120_000),
+            (1_700_000_000_000, 1_700_000_000_000 - (1_700_000_000_000 % 60_000)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                quantize_sequence_ts_to_60s(input),
+                expected,
+                "input={} expected={}",
+                input,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_60s_does_not_overflow_at_u64_max() {
+        // u64::MAX modulo arithmetic must not panic.
+        let q = quantize_sequence_ts_to_60s(u64::MAX);
+        assert_eq!(q, u64::MAX - (u64::MAX % 60_000));
+        assert_eq!(q % 60_000, 0);
+    }
+
+    // ── padding helper (Q4) ───────────────────────────────────────────────────
+
+    fn fixture_envelope(payload_bytes: usize) -> PollEnvelope {
+        PollEnvelope {
+            id: "00000000-0000-0000-0000-000000000000".to_string(), // 36 chars
+            from: "a".repeat(64),                                    // X25519 hex
+            sealed_sender: "".to_string(),
+            payload: "x".repeat(payload_bytes),
+            sequence_ts: 1_700_000_000_000,
+            seq: 42,
+        }
+    }
+
+    #[test]
+    fn pad_poll_response_empty_hits_canonical_size() {
+        let resp = PollResponse {
+            envelopes: Vec::new(),
+            more: false,
+            pad: String::new(),
+        };
+        let body = pad_poll_response(resp);
+        assert_eq!(
+            body.len(),
+            POLL_RESPONSE_CANONICAL_BYTES,
+            "empty poll body must equal canonical 4608 bytes exactly"
+        );
+    }
+
+    #[test]
+    fn pad_poll_response_small_envelope_hits_canonical_size() {
+        let resp = PollResponse {
+            envelopes: vec![fixture_envelope(256)],
+            more: false,
+            pad: String::new(),
+        };
+        let body = pad_poll_response(resp);
+        assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+    }
+
+    #[test]
+    fn pad_poll_response_max_realistic_envelope_hits_canonical_size() {
+        // ~3500-byte payload approximates the max realistic post-quantize
+        // PollEnvelope under REST_MAX_BODY_BYTES=4096 send-side cap.
+        let resp = PollResponse {
+            envelopes: vec![fixture_envelope(3_500)],
+            more: false,
+            pad: String::new(),
+        };
+        let body = pad_poll_response(resp);
+        assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+    }
+
+    #[test]
+    fn pad_poll_response_empty_and_with_envelope_have_identical_size() {
+        // The load-bearing security invariant test (Q4 / Decision 3):
+        // empty-poll and message-bearing-poll bodies must be byte-
+        // indistinguishable on the wire after JSON framing.
+        let empty = pad_poll_response(PollResponse {
+            envelopes: Vec::new(),
+            more: false,
+            pad: String::new(),
+        });
+        let with_env = pad_poll_response(PollResponse {
+            envelopes: vec![fixture_envelope(512)],
+            more: false,
+            pad: String::new(),
+        });
+        assert_eq!(empty.len(), with_env.len());
+        assert_eq!(empty.len(), POLL_RESPONSE_CANONICAL_BYTES);
+    }
+
+    #[test]
+    fn pad_poll_response_oversize_returns_unpadded_without_panic() {
+        // If the audit-stated max (≈4154 bytes) is ever exceeded, the
+        // helper must not panic and must not truncate ciphertext —
+        // it returns the unpadded body and emits a warn log.
+        let resp = PollResponse {
+            envelopes: vec![fixture_envelope(5_000)],
+            more: false,
+            pad: String::new(),
+        };
+        let body = pad_poll_response(resp);
+        // Body is unpadded so it is allowed to exceed canonical size.
+        assert!(body.len() > POLL_RESPONSE_CANONICAL_BYTES);
+    }
+
+    #[test]
+    fn random_padding_string_hits_exact_length_and_uses_valid_alphabet() {
+        for target_len in [0usize, 1, 7, 100, 1_234, 4_500] {
+            let s = random_padding_string(target_len);
+            assert_eq!(s.len(), target_len, "exact-length contract");
+            assert!(
+                s.bytes().all(|b| PAD_ALPHABET.contains(&b)),
+                "all padding chars must be from PAD_ALPHABET"
+            );
+        }
+    }
+
+    #[test]
+    fn random_padding_string_produces_distinct_outputs() {
+        // Two calls at the same length should differ almost certainly.
+        let a = random_padding_string(1_000);
+        let b = random_padding_string(1_000);
+        assert_ne!(a, b);
+    }
+
+    // ── PollResponse `pad` field serialization ───────────────────────────────
+
+    #[test]
+    fn poll_response_pad_field_is_always_present_in_json() {
+        let resp = PollResponse {
+            envelopes: Vec::new(),
+            more: false,
+            pad: "abc".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""pad":"abc""#), "json was: {}", json);
+    }
+
+    // ── ack-deliver rate-limit constant (Q2) ─────────────────────────────────
+
+    #[test]
+    fn ack_deliver_rate_limit_constant_is_120() {
+        // Lock from Q2: separate map, fixed 120/min, no config knob in Stage 1.
+        assert_eq!(ACK_DELIVER_RATE_LIMIT_PER_WINDOW, 120);
+    }
+
+    // ── canonical padding constant (Q4) ──────────────────────────────────────
+
+    #[test]
+    fn poll_canonical_size_is_4608() {
+        // Lock from Q4 audit: 4608 bytes covers max realistic envelope
+        // (~4154 bytes) + ~454 bytes empty-padding margin under Tele2
+        // ~5KB cutoff.
+        assert_eq!(POLL_RESPONSE_CANONICAL_BYTES, 4_608);
+    }
+
+    // ── notifier LRU cap (Q6) ────────────────────────────────────────────────
+
+    #[test]
+    fn notifier_cap_is_50k() {
+        assert_eq!(POLL_HOLD_NOTIFIERS_LRU_CAP, 50_000);
+    }
 }
