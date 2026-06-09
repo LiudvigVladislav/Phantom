@@ -690,17 +690,42 @@ pub struct PollResponse {
     pub envelopes: Vec<PollEnvelope>,
     pub more: bool,
     /// Trek 2 Stage 1 — exact-length padding to the canonical body size
-    /// (`POLL_RESPONSE_CANONICAL_BYTES`). Empty and envelope-bearing
-    /// responses both pad to identical total body bytes so a passive
-    /// observer cannot distinguish "message arrived" from "no message"
-    /// by response size. Server populates via `pad_poll_response`; old
-    /// clients ignore the unknown field (lenient JSON parsers).
+    /// (`POLL_RESPONSE_CANONICAL_BYTES`) for opted-in (Stage 2+) clients.
+    /// Empty and envelope-bearing responses BOTH pad to identical total
+    /// body bytes so a passive observer cannot distinguish "message
+    /// arrived" from "no message" by response size on the opt-in tier.
     ///
-    /// Field is always present (no `skip_serializing_if`) because if it
-    /// were omitted on the empty branch we'd reintroduce the bimodal
-    /// fingerprint we're trying to remove.
+    /// **Skipped on serialise when empty.** That is intentional — old
+    /// clients without the `X-Phantom-Long-Poll: 1` opt-in header get
+    /// a legacy small-body response (no `pad` field at all), saving
+    /// ~4.5 KB per poll on metered cellular plans (Vladislav PR #297
+    /// round-3 review P1: padding old-client responses to 4608 bytes
+    /// would have been a silent bandwidth regression on the old client
+    /// even after the hold-timeout fix). The full padding guarantee
+    /// activates only when the client opts in and signals it accepts
+    /// the larger body shape.
+    ///
+    /// Stage 1 = **two-tier** response shape:
+    ///   * No header   → small body, no `pad` field (legacy).
+    ///   * Header `=1` → exactly `POLL_RESPONSE_CANONICAL_BYTES` bytes,
+    ///                   `pad` carries random base64url-safe filler.
+    ///
+    /// Security invariant 1 (byte-indistinguishable empty vs envelope)
+    /// holds **within** the opt-in tier — old clients were already
+    /// distinguishable by body size before Stage 1, so this is not a
+    /// new regression; new opt-in clients gain the privacy upgrade.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub pad: String,
 }
+
+/// Number of bytes the `,"pad":""` field framing adds to a serialised
+/// `PollResponse` when `pad` is non-empty (i.e. opt-in path). Used by
+/// `pad_poll_response` to size the random padding string exactly so
+/// the total response body hits `POLL_RESPONSE_CANONICAL_BYTES`.
+///
+/// Breakdown of the 9 framing bytes (`,"pad":""`):
+///   `,` `"` `p` `a` `d` `"` `:` `"` `"` = 9 chars
+const POLL_RESPONSE_PAD_FIELD_FRAMING: usize = 9;
 
 #[derive(Deserialize)]
 pub struct AckDeliverRequest {
@@ -739,43 +764,57 @@ fn random_padding_string(len: usize) -> String {
 }
 
 /// Serialize `resp` to JSON bytes padded to EXACTLY
-/// `POLL_RESPONSE_CANONICAL_BYTES`. If the response without padding
-/// already meets or exceeds the canonical size (impossible for the
-/// current `PollEnvelope` shape under `REST_MAX_BODY_BYTES=4096`, but
-/// guard anyway), the response is returned with `pad` empty and a
-/// `tracing::warn!` is emitted — Guardrail C / Q4 explicit
-/// non-truncation rule.
+/// `POLL_RESPONSE_CANONICAL_BYTES`. Used on the opt-in
+/// (`X-Phantom-Long-Poll: 1`) path only — the no-header legacy path
+/// uses plain `serde_json::to_vec` so old clients get the original
+/// small-body shape.
 ///
-/// Algorithm:
-///   1. Serialize `resp` with `pad: ""` (probe).
-///   2. Compute `needed = CANONICAL - probe_len`. If `needed <= 0` →
-///      oversize path (warn + return probe).
-///   3. Pad value of exactly `needed` random chars from `PAD_ALPHABET`.
-///   4. Re-serialize and assert exact-byte invariant in debug builds.
+/// If the response without padding already meets or exceeds the
+/// canonical size minus the pad-field framing (impossible for the
+/// current `PollEnvelope` shape under `REST_MAX_BODY_BYTES=4096`, but
+/// guard anyway), the response is returned unpadded with a
+/// `tracing::warn!` emitted — Guardrail C / Q4 explicit non-truncation
+/// rule.
+///
+/// Algorithm (accounting for `#[serde(skip_serializing_if = "String::is_empty")]`
+/// on the `pad` field — when empty the field is OMITTED on probe, so
+/// the math must add back the framing overhead before computing the
+/// pad-string length):
+///   1. Serialize `resp` with `pad = ""` → field is skipped → small probe.
+///   2. The final padded body adds `,"pad":"<X>"` = 9 framing bytes plus
+///      the pad-string length. Solve:
+///         `target = probe_len + 9 + pad_len`
+///         `pad_len = target - probe_len - 9`
+///   3. Generate exactly `pad_len` chars of random `PAD_ALPHABET`.
+///   4. Re-serialize and debug-assert exact-byte invariant.
 pub fn pad_poll_response(mut resp: PollResponse) -> Vec<u8> {
     resp.pad = String::new();
     let probe = serde_json::to_vec(&resp).expect("PollResponse serialises");
     let target = POLL_RESPONSE_CANONICAL_BYTES;
-    if probe.len() >= target {
+    // probe + framing(9) + pad_len = target.
+    // If even `probe + framing` already meets or exceeds target there
+    // is no room for any padding string — emit warn and return the
+    // unpadded probe (Guardrail C: never truncate ciphertext).
+    if probe.len() + POLL_RESPONSE_PAD_FIELD_FRAMING >= target {
         tracing::warn!(
             event       = "poll_response_exceeds_canonical_size",
             unpadded_len = probe.len(),
             canonical    = target,
             "PollResponse cannot fit canonical padding budget — returning unpadded"
         );
-        // Guardrail C: do NOT truncate ciphertext. Return the response as
-        // serialised. The size-distribution invariant is degraded only
-        // for this oversize case (which the audit says should not happen
-        // under current send-body limits).
         return probe;
     }
-    let needed = target - probe.len();
-    resp.pad = random_padding_string(needed);
+    let pad_len = target - probe.len() - POLL_RESPONSE_PAD_FIELD_FRAMING;
+    resp.pad = random_padding_string(pad_len);
     let padded = serde_json::to_vec(&resp).expect("PollResponse serialises");
     debug_assert_eq!(
         padded.len(),
         target,
-        "pad_poll_response invariant: padded body must equal canonical size"
+        "pad_poll_response invariant: padded body must equal canonical size \
+         (probe={}, framing={}, pad_len={})",
+        probe.len(),
+        POLL_RESPONSE_PAD_FIELD_FRAMING,
+        pad_len,
     );
     padded
 }
@@ -1530,13 +1569,29 @@ pub async fn rest_poll(
         long_poll_opt_in   = long_poll_opt_in,
     );
 
-    // Trek 2 Stage 1 Q4 — pad to canonical 4608-byte body so empty and
-    // envelope-bearing responses are byte-indistinguishable on the wire.
-    let body = pad_poll_response(PollResponse {
-        envelopes,
-        more,
-        pad: String::new(),
-    });
+    // Trek 2 Stage 1 — two-tier response shape, gated by the same
+    // `X-Phantom-Long-Poll: 1` opt-in header as the hold time.
+    //   * Opt-in path: pad to canonical 4608-byte body so empty and
+    //     envelope-bearing responses are byte-indistinguishable on the
+    //     wire (Q4 / cross-cutting security invariant 1).
+    //   * No-header path: legacy small-body shape (no `pad` field,
+    //     skipped by serde). Old clients keep their original bandwidth
+    //     profile and never pay the ~4.5 KB-per-poll cost — Vladislav
+    //     PR #297 round-3 review P1 fix.
+    let body: Vec<u8> = if long_poll_opt_in {
+        pad_poll_response(PollResponse {
+            envelopes,
+            more,
+            pad: String::new(),
+        })
+    } else {
+        serde_json::to_vec(&PollResponse {
+            envelopes,
+            more,
+            pad: String::new(),
+        })
+        .expect("PollResponse serialises")
+    };
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1834,7 +1889,9 @@ mod tests {
     // ── PollResponse `pad` field serialization ───────────────────────────────
 
     #[test]
-    fn poll_response_pad_field_is_always_present_in_json() {
+    fn poll_response_pad_field_present_when_populated() {
+        // Opt-in path: server populates `pad` with random filler;
+        // serialised body MUST carry the field verbatim.
         let resp = PollResponse {
             envelopes: Vec::new(),
             more: false,
@@ -1842,6 +1899,22 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""pad":"abc""#), "json was: {}", json);
+    }
+
+    #[test]
+    fn poll_response_pad_field_omitted_when_empty() {
+        // Legacy / no-header path: server leaves `pad = String::new()`;
+        // serde's `skip_serializing_if = "String::is_empty"` MUST drop
+        // the field entirely so old Android clients see the original
+        // small-body shape they had before Stage 1 (Vladislav PR #297
+        // round-3 review P1 — no silent bandwidth regression).
+        let resp = PollResponse {
+            envelopes: Vec::new(),
+            more: false,
+            pad: String::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains(r#""pad""#), "pad field must be absent on legacy path; json was: {}", json);
     }
 
     // ── ack-deliver rate-limit constant (Q2) ─────────────────────────────────

@@ -173,10 +173,24 @@ async fn call_poll_with_long_poll_optin(
 /// value. 1 s is enough for deterministic E2E tests of the hold path
 /// without making the suite slow.
 fn build_app_with_hold(hold_secs: u32) -> axum::Router {
+    let (router, _state) = build_app_with_hold_and_state(hold_secs);
+    router
+}
+
+/// Variant that also returns the `Arc<AppState>` so a test can
+/// directly manipulate `rest_store` / `notifiers` / `rest_seq` for
+/// white-box scenarios (e.g. injecting an envelope without going
+/// through `/relay/send` so the `notify_recipient` wake is NOT
+/// triggered — used to exercise the `poll_hold_loop` timeout-branch
+/// re-check path that catches a missed notify).
+fn build_app_with_hold_and_state(
+    hold_secs: u32,
+) -> (axum::Router, Arc<phantom_relay::state::AppState>) {
     let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
     cfg.poll_hold_secs = hold_secs;
     let state = Arc::new(phantom_relay::state::AppState::new(cfg));
-    phantom_relay::routes::router(state)
+    let router = phantom_relay::routes::router(Arc::clone(&state));
+    (router, state)
 }
 
 async fn call_send_with_ts(
@@ -314,43 +328,79 @@ async fn old_struct_session_response_deserializes_without_poll_hold_secs() {
     );
 }
 
-// ── Q4: padded body exact-byte invariant on the wire ─────────────────────────
+// ── Q4: padded body exact-byte invariant on the wire (opt-in tier) ──────────
 
+/// Opt-in path: `X-Phantom-Long-Poll: 1` triggers canonical padding.
+/// This is the Stage 2+ client shape — empty and envelope-bearing
+/// responses are byte-indistinguishable per security invariant 1.
 #[tokio::test]
-async fn poll_response_body_is_exactly_canonical_size_when_empty() {
+async fn opt_in_poll_response_body_is_exactly_canonical_size_when_empty() {
     let app = build_app();
     let identity = identity_hex(3);
     let mut csprng = OsRng;
     let signing_kp = SigningKey::generate(&mut csprng);
     let (app, token) = obtain_token(app, &identity, &signing_kp).await;
-    let (_app, status, body) = call_poll_raw(app, &token).await;
+    let (_app, status, body) = call_poll_with_long_poll_optin(app, &token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body.len(),
         POLL_RESPONSE_CANONICAL_BYTES,
-        "empty poll body must equal canonical 4608 bytes on the wire"
+        "opt-in empty poll body must equal canonical 4608 bytes on the wire"
     );
 }
 
-// ── Q7: kill switch — poll_hold_secs=0 returns immediately + padded ──────────
-
+/// Legacy / no-header path: old Android clients (no opt-in header)
+/// receive the original small JSON body, NOT the 4608-byte padded
+/// shape. This proves Stage 1 does not silently regress bandwidth on
+/// existing clients (Vladislav PR #297 round-3 review P1 load-bearing).
 #[tokio::test]
-async fn poll_returns_immediately_when_hold_secs_zero() {
-    // Default test config has poll_hold_secs=0 (kill switch). Confirm
-    // the request returns OK quickly (well within 1 s) and that the body
-    // is still padded to canonical size.
+async fn no_opt_in_poll_response_body_is_legacy_small_when_empty() {
     let app = build_app();
+    let identity = identity_hex(40);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let (_app, status, body) = call_poll_raw(app, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    // Legacy shape is `{"envelopes":[],"more":false}` — exactly 28
+    // bytes. We assert "under 200" to give serde some flexibility but
+    // catch any regression where the canonical 4608-byte padding
+    // accidentally activates for an unopted-in caller.
+    assert!(
+        body.len() < 200,
+        "no-header poll body must be the legacy small shape, not 4608; \
+         body.len()={}",
+        body.len()
+    );
+    // And the `pad` field MUST be absent (not present-but-empty).
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !body_str.contains("\"pad\""),
+        "no-header response must NOT include `pad` field; body={}",
+        body_str
+    );
+}
+
+// ── Q7: kill switch — poll_hold_secs=0 returns immediately ──────────────────
+
+/// Kill switch fires regardless of opt-in: with `RELAY_POLL_HOLD_SECS=0`
+/// the server returns immediately on both tiers. Opt-in clients still
+/// get the padded canonical body (server distinguishes by tier, not by
+/// hold). No-header clients still get the legacy small body.
+#[tokio::test]
+async fn opt_in_poll_returns_immediately_when_hold_secs_zero_with_padded_body() {
+    let app = build_app(); // default cfg: hold=0
     let identity = identity_hex(4);
     let mut csprng = OsRng;
     let signing_kp = SigningKey::generate(&mut csprng);
     let (app, token) = obtain_token(app, &identity, &signing_kp).await;
     let start = std::time::Instant::now();
-    let (_app, status, body) = call_poll_raw(app, &token).await;
+    let (_app, status, body) = call_poll_with_long_poll_optin(app, &token).await;
     let elapsed = start.elapsed();
     assert_eq!(status, StatusCode::OK);
     assert!(
         elapsed.as_millis() < 1_000,
-        "poll with hold_secs=0 must return immediately (elapsed={:?})",
+        "opt-in poll with hold_secs=0 must return immediately (elapsed={:?})",
         elapsed
     );
     assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
@@ -474,10 +524,16 @@ async fn sequence_ts_is_quantized_to_60s_when_stored_and_returned_via_poll() {
     );
 }
 
-// ── Padded body byte-equality on the wire (Q4 load-bearing) ──────────────────
+// ── Padded body byte-equality on the wire (Q4 load-bearing, opt-in tier) ────
 
+/// Security invariant 1 of the Trek 2 mini-lock, evaluated on the
+/// opt-in tier where padding is engaged. Empty-poll and envelope-
+/// bearing poll responses MUST be byte-identical on the wire so a
+/// passive observer cannot tell from response size whether a message
+/// arrived. (For no-header legacy clients the invariant is degraded
+/// to its pre-Stage-1 baseline — no regression, just no upgrade.)
 #[tokio::test]
-async fn poll_empty_and_envelope_bearing_responses_have_identical_wire_size() {
+async fn opt_in_empty_and_envelope_bearing_responses_have_identical_wire_size() {
     let app = build_app();
     // Recipient identity.
     let recipient_id = identity_hex(9);
@@ -485,8 +541,9 @@ async fn poll_empty_and_envelope_bearing_responses_have_identical_wire_size() {
     let recipient_kp = SigningKey::generate(&mut csprng);
     let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
 
-    // First poll: queue is empty.
-    let (app, status_empty, body_empty) = call_poll_raw(app, &recipient_token).await;
+    // First opt-in poll: queue is empty.
+    let (app, status_empty, body_empty) =
+        call_poll_with_long_poll_optin(app, &recipient_token).await;
     assert_eq!(status_empty, StatusCode::OK);
     assert_eq!(body_empty.len(), POLL_RESPONSE_CANONICAL_BYTES);
 
@@ -504,17 +561,17 @@ async fn poll_empty_and_envelope_bearing_responses_have_identical_wire_size() {
     .await;
     assert_eq!(status_send, StatusCode::CREATED);
 
-    // Poll again — now carrying one envelope.
-    let (_app, status_full, body_full) = call_poll_raw(app, &recipient_token).await;
+    // Opt-in poll again — now carrying one envelope.
+    let (_app, status_full, body_full) =
+        call_poll_with_long_poll_optin(app, &recipient_token).await;
     assert_eq!(status_full, StatusCode::OK);
 
-    // Load-bearing assertion: empty and envelope-bearing responses are
-    // byte-identical in length on the wire (the security-invariant 1
-    // of the Trek 2 mini-lock).
+    // Load-bearing assertion: empty and envelope-bearing opt-in
+    // responses are byte-identical in length on the wire.
     assert_eq!(
         body_empty.len(),
         body_full.len(),
-        "empty-poll and envelope-bearing poll bodies must have identical wire size"
+        "empty-poll and envelope-bearing opt-in bodies must have identical wire size"
     );
     assert_eq!(body_full.len(), POLL_RESPONSE_CANONICAL_BYTES);
 }
@@ -552,8 +609,15 @@ async fn poll_without_opt_in_header_returns_immediately_even_with_hold_configure
          server poll_hold_secs=5; elapsed={:?}",
         elapsed
     );
-    // Body still padded (security invariant 1) regardless of opt-in.
-    assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+    // Round-3 fix (PR #297 P1): no-header path MUST return the legacy
+    // small body, NOT the 4608-byte padded shape. Otherwise old
+    // clients silently pay ~4.5 KB per poll on metered cellular.
+    assert!(
+        body.len() < 200,
+        "no-header path must keep legacy small body shape even when \
+         server hold>0 is configured; body.len()={}",
+        body.len()
+    );
 }
 
 /// Hold path with opt-in header but no envelope arriving — confirms the
@@ -675,21 +739,17 @@ async fn poll_with_opt_in_header_wakes_on_send_before_hold_timeout() {
     assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
 }
 
-/// Race-window regression (P2 fix from Vladislav PR #297 review): when
-/// the send happens BEFORE the poll has registered on the notifier
-/// (between the initial queue check and the `notifier_for` insert),
-/// the `notify_recipient` call from send sees no entry and is a no-op.
-/// The phase 3.5 re-check after `notifier_for` MUST catch the envelope
-/// instead of hanging until hold timeout.
-///
-/// We simulate this by issuing a send BEFORE the poll starts — the poll
-/// then reaches phase 3.5 with the envelope already in rest_store. The
-/// initial drain at phase 1 would normally catch it; we exercise the
-/// re-check by having the poll arrive immediately after the send. The
-/// fix guarantees we never hang on `notified()` for an envelope that's
-/// already pending.
+/// Pre-enqueue smoke (formerly misnamed
+/// `poll_recheck_after_notifier_registration_catches_concurrent_send` —
+/// rename honest per Vladislav PR #297 round-3 review P3): pre-enqueue
+/// is caught by `poll_hold_loop` PHASE 1 (the initial `drain_eligible`
+/// before any Notify registration), NOT by the phase 3.5 re-check.
+/// This test proves the loop short-circuits when the queue is already
+/// non-empty on entry; the phase 3.5 race path is exercised separately
+/// by `poll_hold_loop_timeout_recheck_catches_envelope_without_notify`
+/// below (which uses direct state injection to bypass `notify_recipient`).
 #[tokio::test]
-async fn poll_recheck_after_notifier_registration_catches_concurrent_send() {
+async fn pre_enqueued_envelope_short_circuits_hold_loop_at_phase_1() {
     let hold_secs = 3u32;
     let app = build_app_with_hold(hold_secs);
 
@@ -702,22 +762,20 @@ async fn poll_recheck_after_notifier_registration_catches_concurrent_send() {
     let sender_kp = SigningKey::generate(&mut csprng);
     let (app, sender_token) = obtain_token(app, &sender_id, &sender_kp).await;
 
-    // Pre-enqueue (the race-window worst case is "send already happened
-    // before phase 3 registration"). This proves the loop does NOT
-    // hang on Notify when the queue is already non-empty by the time
-    // the waiter would start awaiting.
+    // Pre-enqueue via the normal send path. By the time the poll
+    // starts, the envelope is already in `rest_store` and phase 1's
+    // initial `drain_eligible` catches it — the loop never reaches
+    // phase 3 or 3.5.
     let (app, send_status) = call_send_with_ts(
         app,
         &sender_token,
-        "recheck-1",
+        "phase1-1",
         &recipient_id,
         1_700_000_000_000,
     )
     .await;
     assert_eq!(send_status, StatusCode::CREATED);
 
-    // Poll with opt-in MUST return immediately (phase 1 catches the
-    // envelope before the notifier is ever registered).
     let start = std::time::Instant::now();
     let (_app, status, body) = call_poll_with_long_poll_optin(app, &recipient_token).await;
     let elapsed = start.elapsed();
@@ -725,12 +783,108 @@ async fn poll_recheck_after_notifier_registration_catches_concurrent_send() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         elapsed.as_millis() < 500,
-        "pre-enqueued envelope must be returned without engaging hold; \
-         elapsed={:?}",
+        "pre-enqueued envelope must return at phase 1 without engaging \
+         the hold wait; elapsed={:?}",
         elapsed
     );
     let v: Value = serde_json::from_slice(&body).unwrap();
     let envelopes = v["envelopes"].as_array().expect("envelopes array");
     assert_eq!(envelopes.len(), 1);
-    assert_eq!(envelopes[0]["id"].as_str(), Some("recheck-1"));
+    assert_eq!(envelopes[0]["id"].as_str(), Some("phase1-1"));
+}
+
+/// LOAD-BEARING phase 3.5 / timeout-branch re-check coverage (Vladislav
+/// PR #297 round-3 review P3 honest fix): directly inject an envelope
+/// into `state.rest_store` AFTER the poll has started — bypassing
+/// `notify_recipient` so the notifier never fires. The
+/// `poll_hold_loop` MUST re-check the queue on hold-timeout and
+/// return the envelope, NOT discard it.
+///
+/// Sequence:
+///   1. Build app with `poll_hold_secs = 1` and grab the `AppState` Arc.
+///   2. Start an opt-in `/relay/poll` in a background task. It runs
+///      phase 1 (empty), phase 3 (notifier registered), phase 3.5
+///      (still empty), then `notified().await`.
+///   3. After ~300 ms, inject an envelope DIRECTLY into
+///      `state.rest_store` for the recipient. Critically: do NOT call
+///      `state.notify_recipient` — this simulates the race where
+///      cleanup or a concurrent path silently dropped the wake.
+///   4. The `notified().await` hits the 1 s timeout. The
+///      timeout-branch re-check (`drain_eligible` after `Err(Elapsed)`)
+///      MUST see the injected envelope and return it.
+///   5. Poll returns with 1 envelope, NOT empty.
+#[tokio::test]
+async fn poll_hold_loop_timeout_recheck_catches_envelope_without_notify() {
+    use phantom_relay::rest_fallback::RestEnvelope;
+
+    let hold_secs = 1u32;
+    let (app, state) = build_app_with_hold_and_state(hold_secs);
+
+    let recipient_id = identity_hex(36);
+    let mut csprng = OsRng;
+    let recipient_kp = SigningKey::generate(&mut csprng);
+    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    // Background poll task — opt-in so the hold engages.
+    let poll_app = app.clone();
+    let poll_token = recipient_token.clone();
+    let poll_handle = tokio::spawn(async move {
+        let (_app, status, body) =
+            call_poll_with_long_poll_optin(poll_app, &poll_token).await;
+        (status, body)
+    });
+
+    // Wait for the poll to settle into the hold wait (~300 ms is a
+    // comfortable buffer past auth + phase 1 + notifier_for + phase 3.5
+    // checks on slow CI runners; well under the 1 s hold timeout).
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Inject envelope DIRECTLY into rest_store. No notify_recipient
+    // call — this is the explicit "send happened, notify silently
+    // dropped" scenario the re-check guards against.
+    let injected = RestEnvelope {
+        id: "timeout-recheck-1".to_string(),
+        from: String::new(),
+        sealed_sender: String::new(),
+        payload: "AAAA".to_string(),
+        sequence_ts: 1_700_000_000_000,
+        seq: 1,
+        // Far future so the queue retain in drain_eligible does not
+        // purge it as expired during the test.
+        expires_at: u64::MAX / 2,
+    };
+    {
+        let mut rest_store = state.rest_store.write().await;
+        rest_store
+            .entry(recipient_id.clone())
+            .or_default()
+            .push(injected);
+    }
+
+    // Poll MUST return WITH the envelope after the 1 s hold timeout.
+    // We allot up to 2.5 s wall-clock so the timeout itself plus the
+    // re-check overhead complete on slow CI.
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_millis(2_500),
+        poll_handle,
+    )
+    .await
+    .expect("poll task did not complete in time")
+    .expect("poll task panicked");
+
+    let (status, body) = result;
+    assert_eq!(status, StatusCode::OK);
+
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let envelopes = v["envelopes"].as_array().expect("envelopes array");
+    assert_eq!(
+        envelopes.len(),
+        1,
+        "timeout-branch re-check MUST return the injected envelope; \
+         body was {}",
+        std::str::from_utf8(&body).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(envelopes[0]["id"].as_str(), Some("timeout-recheck-1"));
+    // Opt-in body is still padded.
+    assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
 }
