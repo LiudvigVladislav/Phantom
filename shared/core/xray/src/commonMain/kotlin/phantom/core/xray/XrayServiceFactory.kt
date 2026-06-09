@@ -67,6 +67,24 @@ expect fun createXrayService(config: XrayServiceConfig): XrayService
  *   must also accept the override OR a separate diagnostic Reality
  *   inbound must serve the test traffic — production `:8443` is NOT
  *   modified by Trek 1.
+ * @property network Stream transport name passed verbatim into
+ *   `outbounds[].streamSettings.network`. Defaults to `tcp` (raw TCP),
+ *   matching production. Trek 1 Variant 3 (`drop-vision-xhttp`)
+ *   overrides this to `xhttp` to test whether the multi-segment outer
+ *   Reality ClientHello stall observed in Arm G v10/v11 + Trek 1
+ *   Variants 1 & 2 disappears when the data rides an HTTP-framed stream
+ *   instead of raw TCP. Per the official Xray transport documentation,
+ *   `realitySettings` is valid with `raw` / `xhttp` / `grpc` but NOT
+ *   `httpupgrade` — V4 `httpupgrade` is therefore deferred and must not
+ *   be added blindly as a Reality variant without a config validation
+ *   step that confirms the running Xray version accepts the combination.
+ *   When the client `network` is overridden, a matching diagnostic
+ *   inbound on the diagnostic Reality container must be present.
+ * @property xhttpPath HTTP path used by xhttp / httpupgrade transports.
+ *   Ignored when [network] is `tcp`. Must match the diagnostic Reality
+ *   inbound's `xhttpSettings.path` (server-side template renders the
+ *   exact same constant). Trek 1 Variant 3 hardcodes
+ *   `/wire1-xhttp-test` here.
  */
 data class XrayServiceConfig(
     val serverHost: String,
@@ -79,4 +97,6 @@ data class XrayServiceConfig(
     val socksPort: Int = 10808,
     val loglevel: String = "warning",
     val flow: String = "xtls-rprx-vision",
+    val network: String = "tcp",
+    val xhttpPath: String = "",
 )

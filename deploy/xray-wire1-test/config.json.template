@@ -1,28 +1,46 @@
 {
-  "//": "RC-LIBXRAY-REALITY-WIRE1 (Trek 1) Variant 2 DIAGNOSTIC Reality inbound.",
+  "//": "RC-LIBXRAY-REALITY-WIRE1 (Trek 1) Variants 2-3 DIAGNOSTIC Reality inbounds.",
   "//": "Mirrors `deploy/xray/config.json.template` for Reality auth (same",
   "//":   "privateKey / serverNames / shortIds / dest / SNI / routing) so that",
   "//":   "the embedded Android client's existing `OperatorXrayConfig.kt`",
-  "//":   "Reality keys work unchanged. The ONLY material delta vs production:",
-  "//":   "  clients[].flow = ''   (plain VLESS without XTLS-Vision)",
-  "//": "This config is mounted into a SEPARATE `phantom-xray-wire1` container",
-  "//":   "on host port :8444 (NAT'd to container :8443). Production",
-  "//":   "phantom-xray on host :8443 is NOT touched — per the Trek 1 mini-lock",
-  "//":   "Hard Gate 3 (production :8443 untouched, sha256 verified pre/post).",
+  "//":   "Reality keys work unchanged. Two diagnostic inbounds live in this",
+  "//":   "file (NOT replacing each other, both run concurrently in the same",
+  "//":   "container so a single overlay covers V2 + V3 field runs):",
+  "//":   "  Variant 2 (`vless-reality-in-wire1`)  on container :8443 → host :8444",
+  "//":   "    clients[].flow = ''   (plain VLESS without XTLS-Vision)",
+  "//":   "    streamSettings.network = 'tcp'",
+  "//":   "  Variant 3 (`vless-reality-in-wire1-xhttp`) on container :8445 → host :8445",
+  "//":   "    clients[].flow = ''   (plain VLESS without XTLS-Vision)",
+  "//":   "    streamSettings.network = 'xhttp'",
+  "//":   "    streamSettings.xhttpSettings.path = '/wire1-xhttp-test'",
+  "//": "This file is mounted into a SEPARATE `phantom-xray-wire1` container.",
+  "//":   "Production phantom-xray on host :8443 is NOT touched — per the Trek 1",
+  "//":   "mini-lock Hard Gate 3 (production :8443 untouched, sha256 verified",
+  "//":   "pre/post).",
   "//": "This file is a TEMPLATE. Render to config.json on the VPS via the",
   "//":   "operator runbook in `deploy/xray-wire1-test/README.md`. The REPLACE_",
   "//":   "markers below must be substituted with the SAME values as production",
   "//":   "(re-use `/home/phantom/Phantom/deploy/xray/.env` on the VPS) so the",
   "//":   "client's embedded `kDRy...` public key handshakes against an identical",
-  "//":   "REALITY keypair. Otherwise a Variant 2 FAIL would be ambiguous between",
+  "//":   "REALITY keypair. Otherwise a Variant 2/3 FAIL would be ambiguous between",
   "//":   "splice-race-not-removed and key-mismatch.",
+  "//": "Variant 4 (`httpupgrade`) is intentionally NOT added to this template.",
+  "//":   "Per the official Xray transport documentation, `realitySettings` is",
+  "//":   "valid with `raw` / `xhttp` / `grpc` but NOT `httpupgrade`. Adding it",
+  "//":   "blindly would either (a) be silently rejected by the Xray runtime,",
+  "//":   "producing an ambiguous FAIL that confounds the wire-stall discriminator,",
+  "//":   "or (b) start an inbound that the embedded Android libXray refuses to",
+  "//":   "dial. V4 is deferred until a Reality-compatible non-TCP transport gap",
+  "//":   "is identified (or V4 is reframed as a non-Reality control e.g.",
+  "//":   "`security=tls` with httpupgrade).",
 
   "log": {
     "loglevel": "warning",
     "//": "Why warning + access:none mirror production exactly: the diagnostic",
-    "//":   "config exists to isolate ONE variable (`flow`); any other delta",
-    "//":   "(log verbosity, access logging) could plausibly affect timing in",
-    "//":   "ways that mask or amplify the splice race we are trying to test.",
+    "//":   "config exists to isolate ONE variable (`flow` for V2, `network`",
+    "//":   "for V3); any other delta (log verbosity, access logging) could",
+    "//":   "plausibly affect timing in ways that mask or amplify the wire",
+    "//":   "stall we are trying to discriminate.",
     "access": "none"
   },
 
@@ -38,12 +56,12 @@
 
   "inbounds": [
     {
-      "//": "Tag differs from production (`vless-reality-in`) so routing rules",
-      "//":   "below and the access-log stream can be greped per-test without",
-      "//":   "polluting production diagnostic queries. The `clients[].flow`",
-      "//":   "field is the ONLY material delta vs production:",
+      "//": "Variant 2 inbound. Tag differs from production (`vless-reality-in`)",
+      "//":   "so routing rules below and the access-log stream can be greped",
+      "//":   "per-test without polluting production diagnostic queries. The",
+      "//":   "`clients[].flow` field is the ONLY material delta vs production:",
       "//":   "  production: 'xtls-rprx-vision'",
-      "//":   "  this file:  ''  (plain VLESS, no XTLS-Vision)",
+      "//":   "  this inbound: ''  (plain VLESS, no XTLS-Vision)",
       "tag": "vless-reality-in-wire1",
       "listen": "0.0.0.0",
       "port": 8443,
@@ -80,6 +98,63 @@
         "destOverride": ["http", "tls", "quic"],
         "routeOnly": true
       }
+    },
+    {
+      "//": "Variant 3 inbound (`drop-vision-xhttp`). Two material deltas vs",
+      "//":   "production AND vs the V2 inbound above:",
+      "//":   "  clients[].flow = ''           (same as V2 — no XTLS-Vision)",
+      "//":   "  streamSettings.network = 'xhttp'  (V3 NEW — HTTP-framed stream)",
+      "//":   "Per the official Xray transport documentation, `realitySettings`",
+      "//":   "is valid with `xhttp` (validated combination), so this inbound",
+      "//":   "is well-formed. The `xhttpSettings.path` MUST match the constant",
+      "//":   "`Wire1Variants.WIRE1_XHTTP_PATH` on the Android client side; any",
+      "//":   "drift between the two breaks the xhttp routing at the transport",
+      "//":   "layer with a 404 that masquerades as a wire-stall FAIL.",
+      "//": "The inbound listens on container :8445 (NAT'd to host :8445 by",
+      "//":   "the compose overlay). Tag distinguishes it from the V2 inbound",
+      "//":   "so per-variant access-log greps stay clean.",
+      "tag": "vless-reality-in-wire1-xhttp",
+      "listen": "0.0.0.0",
+      "port": 8445,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "REPLACE_UUID",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "xhttpSettings": {
+          "//": "Must match Wire1Variants.WIRE1_XHTTP_PATH on the Android side.",
+          "//":   "Changing one side without the other causes a 404 that the",
+          "//":   "field test mis-reports as a wire-stall FAIL.",
+          "path": "/wire1-xhttp-test"
+        },
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": [
+            "www.microsoft.com"
+          ],
+          "privateKey": "REPLACE_PRIVATE_KEY",
+          "shortIds": [
+            "",
+            "REPLACE_SHORT_ID"
+          ],
+          "minClientVer": "1.8.0"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      }
     }
   ],
 
@@ -95,16 +170,17 @@
   ],
 
   "routing": {
-    "//": "Identical three-rule structure as production. Rule 1 matches via",
-    "//":   "three domain-matcher syntaxes (defence in depth against version-",
-    "//":   "specific matcher quirks per the production config comments).",
-    "//":   "Rule 3 catchall blackhole prevents open-proxy abuse for the brief",
-    "//":   "diagnostic window.",
+    "//": "Identical three-rule structure as production, extended to match",
+    "//":   "BOTH diagnostic inbound tags so V2 and V3 traffic both reach",
+    "//":   "relay.phntm.pro. Rule 1 matches via three domain-matcher syntaxes",
+    "//":   "(defence in depth against version-specific matcher quirks per the",
+    "//":   "production config comments). Rule 3 catchall blackhole prevents",
+    "//":   "open-proxy abuse for the brief diagnostic window.",
     "domainStrategy": "AsIs",
     "rules": [
       {
         "type": "field",
-        "inboundTag": ["vless-reality-in-wire1"],
+        "inboundTag": ["vless-reality-in-wire1", "vless-reality-in-wire1-xhttp"],
         "domain": [
           "relay.phntm.pro",
           "domain:relay.phntm.pro",
@@ -114,13 +190,13 @@
       },
       {
         "type": "field",
-        "inboundTag": ["vless-reality-in-wire1"],
+        "inboundTag": ["vless-reality-in-wire1", "vless-reality-in-wire1-xhttp"],
         "port": "443",
         "outboundTag": "to-relay"
       },
       {
         "type": "field",
-        "inboundTag": ["vless-reality-in-wire1"],
+        "inboundTag": ["vless-reality-in-wire1", "vless-reality-in-wire1-xhttp"],
         "outboundTag": "block"
       }
     ]

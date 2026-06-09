@@ -101,8 +101,37 @@ internal fun buildXrayClientConfig(config: XrayServiceConfig): String {
                     }
                 }
                 putJsonObject("streamSettings") {
-                    put("network", "tcp")
+                    // Production default is `tcp` (set via
+                    // `XrayServiceConfig.network` default). The
+                    // RC-LIBXRAY-REALITY-WIRE1 Trek 1 Variant 3
+                    // discriminator overrides this to `xhttp` to test
+                    // whether the multi-segment outer Reality ClientHello
+                    // stall observed in Variants 1 & 2 disappears when
+                    // the data rides an HTTP-framed stream instead of
+                    // raw TCP. Variant 4 (`httpupgrade`) is intentionally
+                    // NOT batched here without a config validation step,
+                    // because per the official Xray documentation
+                    // `realitySettings` is valid with `raw` / `xhttp` /
+                    // `grpc` but NOT `httpupgrade` — adding it blindly
+                    // would produce an ambiguous FAIL.
+                    put("network", config.network)
                     put("security", "reality")
+                    if (config.network == "xhttp" || config.network == "httpupgrade") {
+                        val settingsKey =
+                            if (config.network == "xhttp") "xhttpSettings"
+                            else "httpupgradeSettings"
+                        putJsonObject(settingsKey) {
+                            put("path", config.xhttpPath)
+                            // `host` deliberately omitted — Xray defaults
+                            // to the request's TLS SNI (already set in
+                            // realitySettings.serverName), which is
+                            // identical to the production behaviour we
+                            // want to mimic. Setting an explicit host
+                            // would diverge from production and risk a
+                            // server-side routing mismatch that masks the
+                            // wire-level test signal.
+                        }
+                    }
                     putJsonObject("realitySettings") {
                         // utls fingerprint = chrome — most common on the
                         // wire, blends into the carrier's existing traffic.

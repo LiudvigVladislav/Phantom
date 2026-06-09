@@ -50,10 +50,27 @@ internal data class Wire1Variant(
      * touched — per the Trek 1 mini-lock Hard Gate 3.
      */
     val serverPort: Int,
+    /**
+     * HTTP path used by `xhttp` / `httpupgrade` variants. Empty for
+     * `tcp` variants. Must match the diagnostic Reality inbound's
+     * `xhttpSettings.path` (server-side template renders the exact same
+     * constant via `deploy/xray-wire1-test/config.json.template`).
+     */
+    val xhttpPath: String,
     val description: String,
 )
 
 internal object Wire1Variants {
+
+    /**
+     * Path constant shared between the Android client (here) and the
+     * server-side diagnostic Reality inbound (see
+     * `deploy/xray-wire1-test/config.json.template`). Any change to
+     * this constant MUST be paired with a server-side template re-
+     * render or the xhttp handshake fails at the routing layer with no
+     * relation to the wire-stall discriminator we are testing.
+     */
+    private const val WIRE1_XHTTP_PATH = "/wire1-xhttp-test"
 
     private val all = listOf(
         Wire1Variant(
@@ -61,6 +78,7 @@ internal object Wire1Variants {
             flow = "xtls-rprx-vision",
             network = "tcp",
             serverPort = 8443,
+            xhttpPath = "",
             description = "Production-equivalent Reality: XTLS-Vision + raw TCP",
         ),
         Wire1Variant(
@@ -68,17 +86,44 @@ internal object Wire1Variants {
             flow = "",
             network = "tcp",
             serverPort = 8444,
+            xhttpPath = "",
             description =
                 "Plain VLESS without XTLS-Vision over raw TCP via diagnostic " +
                 ":8444 inbound. Splice-race discriminator: removing Vision " +
                 "removes the CopyRawConnIfExist zero-copy path that is the " +
                 "leading hypothesis for the multi-segment write stall.",
         ),
-        // Variants 3 (`xhttp`) and 4 (`httpupgrade`) are added in
-        // subsequent commits ONLY after Variant 2 field result is in.
-        // The runner's `toXrayServiceConfig` fails fast for un-listed
-        // slugs to prevent a misconfigured run from silently producing
-        // evidence under the wrong config shape.
+        Wire1Variant(
+            slug = "drop-vision-xhttp",
+            flow = "",
+            network = "xhttp",
+            serverPort = 8445,
+            xhttpPath = WIRE1_XHTTP_PATH,
+            description =
+                "Plain VLESS without XTLS-Vision over xhttp (HTTP-framed " +
+                "stream) via diagnostic :8445 inbound. Stream-transport " +
+                "discriminator after the 2026-06-09 Variant 2 result " +
+                "showed that removing Vision alone did NOT remove the " +
+                "single-segment incomplete-ClientHello stall (50/50 fail, " +
+                "byte-identical wire signature to Variant 1 baseline). If " +
+                "this variant PASSES, the multi-segment raw-TCP write " +
+                "completion path itself is the bug and the production fix " +
+                "is to switch Reality stream transport to xhttp. If this " +
+                "variant FAILS with the same one-segment shape, the bug " +
+                "is upstream of the stream transport layer entirely.",
+        ),
+        // Variant 4 (`httpupgrade`) is intentionally NOT batched with
+        // Variant 3 because per the official Xray documentation
+        // `realitySettings` is valid with `raw` / `xhttp` / `grpc` but
+        // NOT `httpupgrade`. Adding `httpupgrade` blindly as a Reality
+        // variant would produce an ambiguous FAIL — we could not tell
+        // whether the wire stall remained because the splice/write
+        // hypothesis still holds OR because the Xray runtime rejected
+        // the config combination silently. V4 is reserved for a future
+        // commit ONLY after a config-validation step (e.g. `xray run
+        // -test`) confirms the running Xray version accepts the
+        // combination, OR it is reframed as a non-Reality control
+        // (e.g. `security=tls` with httpupgrade).
     )
 
     fun bySlug(slug: String): Wire1Variant? = all.firstOrNull { it.slug == slug }

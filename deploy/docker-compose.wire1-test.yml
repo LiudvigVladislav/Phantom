@@ -1,24 +1,41 @@
-# RC-LIBXRAY-REALITY-WIRE1 (Trek 1) Variant 2 diagnostic overlay.
+# RC-LIBXRAY-REALITY-WIRE1 (Trek 1) Variants 2-3 diagnostic overlay.
 #
-# Brings up a SECOND Xray container (`phantom-xray-wire1`) bound to host
-# port :8444 alongside the production `phantom-xray` on host port :8443.
+# Brings up a SECOND Xray container (`phantom-xray-wire1`) alongside the
+# production `phantom-xray`. The diagnostic container exposes TWO host
+# ports:
+#   - :8444 → container :8443  Variant 2 inbound (`flow=""`, `network=tcp`)
+#   - :8445 → container :8445  Variant 3 inbound (`flow=""`, `network=xhttp`,
+#                              xhttp path = `/wire1-xhttp-test`)
 # Production `:8443` is NOT modified by this overlay — per the Trek 1
 # mini-lock Hard Gate 3.
 #
 # What the diagnostic container provides:
 #   - Identical Reality keys (privateKey / serverNames / shortIds / dest /
-#     SNI) so the embedded Android client's `OperatorXrayConfig.kt`
-#     handshakes against an identical REALITY keypair. A Variant 2 FAIL
-#     would otherwise be ambiguous between splice-race-not-removed and
-#     key-mismatch.
-#   - Single material delta: `inbounds[0].settings.clients[0].flow = ""`
-#     (plain VLESS without XTLS-Vision). This is the Variant 2 / Trek 1
-#     splice-handoff-race discriminator per the claude.md analysis.
+#     SNI) on BOTH inbounds so the embedded Android client's
+#     `OperatorXrayConfig.kt` handshakes against an identical REALITY
+#     keypair regardless of variant. A Variant 2/3 FAIL would otherwise
+#     be ambiguous between wire-stall-not-removed and key-mismatch.
+#   - Variant 2 delta:  `clients[].flow = ""`  (no XTLS-Vision, raw TCP)
+#   - Variant 3 delta:  `clients[].flow = ""`  + `network=xhttp` over an
+#     HTTP-framed stream. Discriminator after the 2026-06-09 Variant 2
+#     result showed that removing Vision alone did NOT remove the single-
+#     segment incomplete-ClientHello stall (50/50 fail, byte-identical
+#     wire signature to V1 baseline). V3 tests whether the multi-segment
+#     raw-TCP write completion path itself is the bug; if V3 passes,
+#     production fix is to switch Reality stream transport off raw TCP.
+#
+# Variant 4 (`httpupgrade`) is intentionally NOT added. Per the official
+# Xray transport documentation, `realitySettings` is valid with `raw` /
+# `xhttp` / `grpc` but NOT `httpupgrade`. Adding it would produce an
+# ambiguous FAIL. V4 is deferred until either (a) a config-validation
+# pass confirms the combination is accepted by the running Xray version,
+# or (b) V4 is reframed as a non-Reality control (`security=tls` +
+# `network=httpupgrade`).
 #
 # Lifecycle (Arm A.2 pattern — open / verify / capture / teardown). Full
 # operator runbook in `deploy/xray-wire1-test/README.md`. Tear down with
 # `docker compose -f docker-compose.yml -f docker-compose.wire1-test.yml
-# down phantom-xray-wire1` once the field test completes.
+# down xray-wire1` once the field test completes.
 
 services:
   xray-wire1:
@@ -34,11 +51,15 @@ services:
     restart: "no"
     command: ["run", "-c", "/etc/xray/config.json"]
     ports:
-      # Host :8444 → container :8443. Production phantom-xray keeps host
-      # :8443 untouched. The Android test APK Variant 2 client config
-      # points at `:8444` via `Wire1Variant.serverPort = 8444` in the
+      # Host :8444 → container :8443  — Variant 2 (`drop-vision`, raw TCP).
+      # Host :8445 → container :8445  — Variant 3 (`drop-vision-xhttp`).
+      # Production phantom-xray keeps host :8443 untouched. The Android
+      # test APK selects which inbound to dial via the `--es variant`
+      # intent extra; `Wire1Variant.serverPort` carries the matching
+      # host port (`8444` for V2, `8445` for V3) in the
       # `apps/android-libxray-test` module.
       - "8444:8443/tcp"
+      - "8445:8445/tcp"
     volumes:
       # Rendered config — produced from
       # `deploy/xray-wire1-test/config.json.template` on the VPS by the

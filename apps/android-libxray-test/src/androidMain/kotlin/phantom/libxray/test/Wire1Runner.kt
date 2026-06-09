@@ -76,6 +76,27 @@ internal object Wire1Runner {
             "=== RUN START variant=${variant.slug} iterations=$iterations " +
                 "flow=${variant.flowOrEmpty()} network=${variant.network} ===",
         )
+        // Explicit per-variant diagnostic line. Trek 1 mini-lock Vladislav
+        // guardrail 2026-06-09 (V3 spec): every field that distinguishes
+        // variants must be visible in logcat without parsing the 240-char-
+        // truncated `PhantomXray configHead`. This line makes the variant
+        // shape unambiguous in a single grep.
+        val resolved = OperatorXrayConfig.toConfig(dataDirSentinel(variant)).copy(
+            serverPort = variant.serverPort,
+            flow = variant.flow,
+            network = variant.network,
+            xhttpPath = variant.xhttpPath,
+        )
+        logger(
+            "variant_config variant=${variant.slug} " +
+                "serverHost=${resolved.serverHost} " +
+                "serverPort=${resolved.serverPort} " +
+                "network=${resolved.network} " +
+                "flow=${variant.flowOrEmpty()} " +
+                "security=reality " +
+                "serverName=${resolved.sni} " +
+                "xhttpPath=${if (variant.xhttpPath.isEmpty()) "<none>" else variant.xhttpPath}",
+        )
 
         var passCount = 0
         var failCount = 0
@@ -225,18 +246,48 @@ internal object Wire1Runner {
                 // overlay; otherwise the server's VLESS auth rejects
                 // the flow mismatch and the test cannot distinguish a
                 // splice-race fix from an auth-level rejection.
+                //
+                // 2026-06-09 result: 50/50 FAIL with byte-identical
+                // wire signature to Variant 1 baseline. Vision-only
+                // splice hypothesis insufficient — see Variant 3.
                 serverPort = serverPort,
                 flow = flow,
             )
-            // Variants 3-4 (`xhttp`, `httpupgrade`) are added in
-            // subsequent commits ONLY after Variant 2 field result is in.
-            // The skeleton fails fast here so a misconfigured run cannot
-            // silently produce evidence under the wrong config shape.
+            "drop-vision-xhttp" -> OperatorXrayConfig.toConfig(dataDir).copy(
+                // Variant 3 discriminator (post-V2-FAIL pivot 2026-06-09):
+                // plain VLESS without Vision over xhttp (HTTP-framed
+                // stream) instead of raw TCP. Tests whether the multi-
+                // segment raw-write completion path is the bug. Server-
+                // side coordination required: the same diagnostic Reality
+                // container also serves an xhttp inbound on :8445 with
+                // path matching `Wire1Variants.WIRE1_XHTTP_PATH`. See
+                // `deploy/xray-wire1-test/config.json.template` for the
+                // server-side rendering.
+                serverPort = serverPort,
+                flow = flow,
+                network = network,
+                xhttpPath = xhttpPath,
+            )
+            // Variant 4 (`httpupgrade`) intentionally deferred — per the
+            // official Xray docs, `realitySettings` is NOT valid with
+            // `network=httpupgrade`. Adding it blindly would produce an
+            // ambiguous FAIL. The skeleton fails fast here to enforce
+            // the Vladislav guardrail.
             else -> error(
-                "Variant '$slug' not yet wired in this skeleton; the Trek 1 " +
-                    "mini-lock first-test-order gate requires Variant 2 result " +
-                    "before adding Variants 3-4. See " +
-                    "project_trek1_rc_libxray_reality_wire1_minilock_2026_06_09.md.",
+                "Variant '$slug' not yet wired in this skeleton; see " +
+                    "project_trek1_rc_libxray_reality_wire1_minilock_2026_06_09.md " +
+                    "for the first-test-order gate.",
             )
         }
+
+    /**
+     * Sentinel directory path used ONLY for the explicit-config-log line
+     * that runs once at RUN START. The path is not actually written to —
+     * we only need it because [OperatorXrayConfig.toConfig] requires a
+     * non-empty dataDir argument before applying the test variant
+     * overrides via `.copy(...)`. The per-iteration runs each get their
+     * own fresh dataDir via [File.absolutePath] inside [runIteration].
+     */
+    private fun dataDirSentinel(variant: Wire1Variant) =
+        "/tmp/wire1-${variant.slug}-config-log-sentinel"
 }
