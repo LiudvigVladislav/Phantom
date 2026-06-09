@@ -21,6 +21,8 @@ The following wording is locked verbatim by Vladislav 2026-06-10 and MUST appear
 - Accidental `seq` replay from dedup-bucket misuse producing duplicate `seq` values with inconsistent MACs.
 - Middleware or proxy layer silently reordering or truncating the envelope list before client receipt.
 
+**Precision on the DB-tamper scope.** `seq_mac` detects non-MAC-aware store corruption / row mismatch — i.e. a layer that mutates `envelope_id`, `seq`, or `sequence_ts` without also recomputing the stored `seq_mac` column over the new field values. It does NOT protect against an actor who can rewrite both the envelope fields AND the `seq_mac` column consistently using the relay-side root key. Layers that can mount the consistent-rewrite attack are equivalent to a fully malicious relay operator and are out of scope per the locked threat wording.
+
 **What `seq_mac` does NOT defend against:**
 
 - Malicious or fully compromised relay operator (holds the key, can forge valid MACs).
@@ -208,12 +210,15 @@ Both layers are required. Config clamp prevents operator misconfiguration; runti
 
 With `RELAY_POLL_HOLD_SECS=0` (production default kill switch):
 
-- **Lock-1.** `seq_mac` field added to `PollEnvelope`. Old clients ignore unknown JSON fields (additive contract). Server still computes MAC at store time — but the value is essentially unused by old clients. Storage cost ~64 chars per envelope row is acceptable.
-- **Lock-2.** New `X-Phantom-Padded-Poll` header. Old clients never send it. With `RELAY_POLL_HOLD_SECS=0`, no padding is applied regardless. Zero impact.
-- **Lock-3.** `issue()` doc-comment only. Behaviour byte-identical. Zero impact.
+- **Kill-switch semantic clarification.** `RELAY_POLL_HOLD_SECS=0` disables the **hold** path only — it does NOT disable padding. The Stage 1.x contract decouples the two:
+  - Old no-header clients still get the legacy small body (Stage 1 baseline preserved).
+  - Opt-in clients sending `X-Phantom-Padded-Poll: 1` still receive the padded 4608-byte body even when hold is disabled — this is required so Stage 2B-A's client-side circuit-breaker fallback (short-poll + padded) still works during the staging window where the operator is testing the hold path.
+- **Lock-1.** `seq_mac` field added to `PollEnvelope`. Old clients ignore unknown JSON fields (additive contract). Server still computes MAC at store time — value is essentially unused by old clients. Storage cost ~64 chars per envelope row is acceptable.
+- **Lock-2.** New `X-Phantom-Padded-Poll` header. Old no-header clients never send it → legacy small body. `X-Phantom-Padded-Poll: 1` clients get padded 4608 body regardless of `RELAY_POLL_HOLD_SECS` value.
+- **Lock-3.** `issue()` doc-comment only (deliverable depends on the invariant contract test). Behaviour byte-identical. Zero impact.
 - **Lock-4.** `max_poll_hold_secs` defaults to 480 but never reached when `poll_hold_secs=0`. Per-identity counter never incremented (guard at `effective_hold_secs > 0`). Zero impact.
 
-All four locks are safe to deploy with `RELAY_POLL_HOLD_SECS=0`. The kill switch remains effective.
+All four locks are safe to deploy with `RELAY_POLL_HOLD_SECS=0`. The hold kill switch remains effective; padding for opt-in clients is intentionally independent of the hold kill switch (this is what makes Stage 2B-A's circuit-breaker fallback semantically meaningful).
 
 **Deployment ordering.** Operator must provision `RELAY_SEQ_MAC_KEY` in the VPS `.env` file BEFORE redeploying the relay with Stage 1.x. The relay will fail-to-start if the key is absent. Document the key generation command in the deployment runbook:
 
@@ -303,8 +308,8 @@ This pins the key-derivation domain tag and the HMAC algorithm against future dr
 
 Recommended grouping (5 commits + tests):
 
-- **A1 — HMAC infrastructure**: add `hmac` and `zeroize` crates to workspace deps; add `seq_mac_key` field on `RelayConfig` with env-var parse + `[REDACTED]` Debug + fail-to-start on absent; define `compute_seq_mac()` function with byte-exact 135-byte canonical encoding.
-- **A2 — Lock-1**: store-time HMAC computation in `mirror_envelope_to_rest_store`; new `seq_mac TEXT NOT NULL` column on `RestEnvelope`; `seq_mac` field on `PollEnvelope` wired from stored column; client key publication in `SessionResponse`.
+- **A1 — HMAC infrastructure**: add `hmac` and `zeroize` crates to workspace deps; add `seq_mac_key` field on `RelayConfig` with env-var parse + `[REDACTED]` Debug + fail-to-start on absent; define `compute_seq_mac()` function with **variable-length canonical encoding (101 bytes + `envelope_id_len` bytes)**.
+- **A2 — Lock-1**: store-time HMAC computation in `mirror_envelope_to_rest_store`; new `seq_mac TEXT NOT NULL` column on `RestEnvelope`; `seq_mac` field on `PollEnvelope` wired from stored column; **publish derived per-identity `seq_mac_verify_key` in `SessionResponse`; never publish `RELAY_SEQ_MAC_KEY`**.
 - **A3 — Lock-2**: new `PADDED_POLL_OPT_IN_HEADER` constant; `padded_opt_in` derivation; padding gate replaced.
 - **A4 — Lock-3**: doc-comment on `issue()`; verify `rest_ack_deliver` token validation behavior (D10 grep gate); contract tests.
 - **A5 — Lock-4**: `HoldSlot` wrapper struct; `HoldGuard` RAII; per-identity cap CAS guard; `max_poll_hold_secs` config field + dual-layer enforcement; 429 response shape.
