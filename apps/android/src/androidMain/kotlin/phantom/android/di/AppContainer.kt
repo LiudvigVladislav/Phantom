@@ -972,6 +972,19 @@ class AppContainer(private val context: Context) {
                     // mutation; safe to call from any context, no mutex.
                     degradationDetectorRef?.emitStateTransitionSeen(reason)
                 },
+                // Trek 2 Stage 2A (A6) — pass the Stage 2B long-poll
+                // runtime gate through to the orchestrator. The value
+                // is stored unused in Stage 2A; Stage 2B will gate
+                // every long-poll runtime path on it. Mirrors the
+                // strict `=="1"` parse used by every other
+                // `DEBUG_RC_DIRECT_*` flag so an accidental
+                // `"true"` / `"yes"` / `"0"` / unset value fails closed
+                // to short-poll behaviour. Release builds pin the
+                // underlying buildConfigField to `"0"` (see
+                // `apps/android/build.gradle.kts` release block) so
+                // production release builds always see `false` here,
+                // independent of `BuildConfig.DEBUG`.
+                longPollEnabled = phantom.android.BuildConfig.LONGPOLL_V2_ENABLED == "1",
             )
 
             // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.

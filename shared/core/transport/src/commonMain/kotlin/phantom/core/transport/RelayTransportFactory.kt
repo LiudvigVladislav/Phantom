@@ -125,7 +125,22 @@ expect fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport
  * gating, retry loop, and the adaptive poll loop on top of the bare
  * I/O surface this factory exposes.
  */
-expect fun createRestFallbackTransport(): RestFallbackTransport
+/**
+ * Trek 2 Stage 2A (A4) — `socksProxyPort` is the local TCP port on which a
+ * SOCKS5 proxy listens for the call. When non-null, the Android actual
+ * binds the OkHttp client to `Proxy.Type.SOCKS @ 127.0.0.1:<port>`; when
+ * null (the Stage 2 Standard mode default), the client connects directly.
+ * Stages 3 / 4 will plumb in the live Reality / Tor ports from the
+ * transport-strategy layer. iOS / JVM actuals throw [NotImplementedError]
+ * regardless of the parameter — REST fallback remains Android-only for
+ * the current production path.
+ *
+ * Default `null` preserves byte-identical behaviour for every existing
+ * call site that constructs the transport without specifying the port.
+ */
+expect fun createRestFallbackTransport(
+    socksProxyPort: Int? = null,
+): RestFallbackTransport
 
 /**
  * Force-interrupts every thread in the active WebSocket engine's pool.

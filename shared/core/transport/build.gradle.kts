@@ -23,6 +23,13 @@ kotlin {
             // (commonMain interface) so the chain walk drives REALITY the same
             // way it drives Tor.
             implementation(project(":shared:core:xray"))
+            // Trek 2 Stage 2A (A5+A7) — `EnvelopeId.random()` uses the
+            // `LibsodiumCsprng` helper in the crypto module as the single
+            // CSPRNG source for both id generation and future jitter
+            // draws. Stage 2B will reuse the same helper for the hold-
+            // consumption and next-request jitter sites in
+            // RestFallbackOrchestrator.pollLoop.
+            implementation(project(":shared:core:crypto"))
         }
         androidMain.dependencies {
             implementation(libs.ktor.client.okhttp)
@@ -42,6 +49,15 @@ kotlin {
             implementation(libs.ktor.client.mock)
             implementation(libs.ktor.client.content.negotiation)
             implementation(libs.ktor.serialization.json)
+            // Trek 2 Stage 2A (PR #298 round-2 P2) — EnvelopeIdTest needs to
+            // exercise `EnvelopeId.random()` directly (not just indirectly
+            // via CsprngTest.hex(16) in the crypto module). That path
+            // requires `LibsodiumInitializer.initialize()` at test setup,
+            // which in turn needs the libsodium bindings on the test
+            // classpath. The crypto module pulls them in via
+            // `implementation` scope, so they do not leak to transport's
+            // test classpath transitively — we add them here explicitly.
+            implementation(libs.libsodium.bindings)
         }
     }
 }

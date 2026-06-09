@@ -70,6 +70,42 @@ class RestFallbackOrchestrator(
     // [phantom.core.transport.WsDegradationDetector] telemetry stream
     // without parsing log lines. Optional and defaults to no-op.
     private val onModeSwitched: ((from: RestMode, to: RestMode, reason: String) -> Unit)? = null,
+    /**
+     * Trek 2 Stage 2A (A4) — local SOCKS5 port for the future Reality
+     * (Stage 3) and Tor (Stage 4) tunnel paths. When non-null, the
+     * AppContainer wire-up is expected to have constructed [transport]
+     * with the same port so the long-poll surface inherits it. Stored
+     * here so Stage 2B can read the value (e.g. for diagnostic log
+     * fields) without re-deriving it from the transport.
+     *
+     * Stage 2 Standard mode passes `null` — no behaviour change. The
+     * field is unread in this commit; the wire-up + consumption land
+     * in later Stage 2A items (A6) and Stage 2B respectively.
+     */
+    @Suppress("unused")
+    private val socksProxyPort: Int? = null,
+    /**
+     * Trek 2 Stage 2A (A6) — runtime gate that lets the AppContainer
+     * wire-up flip every Stage 2B long-poll runtime path on or off
+     * from one place without recompiling. Mirrors the existing
+     * `DEBUG_RC_DIRECT_ARM` / `DEBUG_RC_DIRECT_HEARTBEAT_ECHO`
+     * `BuildConfig.DEBUG && <flag-string> == "1"` idiom.
+     *
+     * Per Vladislav OQ7 lock 2026-06-09 the Android-side flag is the
+     * String `"1"` / `"0"` `buildConfigField`; the AppContainer reads
+     * it, computes a Boolean, and passes that Boolean here.
+     *
+     * Stage 2A stores the value but does NOT consume it at runtime —
+     * Stage 2B's `wsActivePollJob`, opt-in header, raised socket
+     * timeout, jittered hold consumption, and persisted lastSeenSeq
+     * use will all gate on this single Boolean. Release builds always
+     * pin the underlying `buildConfigField` to `"0"` (defence in
+     * depth) so accidentally promoting Stage 2B runtime behaviour to
+     * release cannot happen without a deliberate code change AND a
+     * BuildConfig pin flip.
+     */
+    @Suppress("unused")
+    private val longPollEnabled: Boolean = false,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -214,6 +250,15 @@ class RestFallbackOrchestrator(
      *     `Failed` on hard failure.
      */
     suspend fun sendEnvelope(
+        // TODO(stage3-migration): ENVELOPE_ID_FULL_RETROFIT — Trek 2
+        // Stage 3 migration audit promotes this parameter to
+        // `envelopeId: phantom.core.transport.EnvelopeId` after every
+        // caller in the messaging module has been verified to source
+        // the id from `EnvelopeId.random()` (or `fromWire()` for relay-
+        // echoed ids on the inbound replay path) — never from payload
+        // hash or ratchet state. Per Vladislav OQ3=C lock 2026-06-09
+        // the signature stays `String` in Stage 2A so existing callers
+        // compile unchanged.
         envelopeId: String,
         toHex: String,
         payloadBase64: String,

@@ -50,7 +50,11 @@ sqldelight {
         create("PhantomDatabase") {
             packageName.set("phantom.core.storage.db")
             srcDirs("src/commonMain/sqldelight")
-            version = 19
+            // Trek 2 Stage 2A (A2) — `transport_seq_state` table added
+            // at schema version 20 (see 20.sqm migration). Lands in the
+            // existing SQLCipher-protected phantom.db per OQ5 lock
+            // 2026-06-09; no separate database file.
+            version = 20
         }
     }
 }

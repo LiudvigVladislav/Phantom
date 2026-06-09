@@ -43,7 +43,12 @@ actual fun forceShutdownActiveEngine() {
 // into RestFallbackOrchestrator rather than calling this factory, so this
 // function need not produce a working implementation. Throwing makes
 // accidental invocation visible at test time.
-actual fun createRestFallbackTransport(): RestFallbackTransport =
+//
+// Trek 2 Stage 2A (A4): `socksProxyPort` parameter accepted to match the
+// commonMain `expect` signature, but ignored — the stub throws regardless.
+actual fun createRestFallbackTransport(
+    @Suppress("UNUSED_PARAMETER") socksProxyPort: Int?,
+): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is Android-only. " +
             "Inject a fake RestFallbackTransport in tests.",

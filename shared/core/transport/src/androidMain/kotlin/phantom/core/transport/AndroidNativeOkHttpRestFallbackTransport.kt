@@ -15,6 +15,8 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.util.concurrent.TimeUnit
 
 /**
@@ -49,6 +51,20 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
     private val connectTimeoutMs: Long = CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Long = READ_TIMEOUT_MS,
     private val writeTimeoutMs: Long = WRITE_TIMEOUT_MS,
+    /**
+     * Trek 2 Stage 2A (A4) — local TCP port on which a SOCKS5 proxy
+     * listens for this transport's outbound calls. When `null` (the
+     * Stage 2 Standard mode default), every call uses direct TCP.
+     * When non-null, each fresh OkHttp client built by [buildClient]
+     * is wired to `Proxy.Type.SOCKS @ 127.0.0.1:<socksProxyPort>` —
+     * the same one-port-per-transport pattern the future Reality
+     * (Stage 3) and Tor (Stage 4) wire-ups will use.
+     *
+     * Stored as an immutable constructor field so the same transport
+     * instance always goes through the same proxy throughout its
+     * lifetime; the orchestrator caches one transport per app run.
+     */
+    private val socksProxyPort: Int? = null,
 ) : RestFallbackTransport {
 
     private val jsonCodec = Json {
@@ -197,6 +213,21 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
             .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
             .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
             .writeTimeout(writeTimeoutMs, TimeUnit.MILLISECONDS)
+            .also { builder ->
+                // Trek 2 Stage 2A (A4) — wire the SOCKS5 proxy iff the
+                // transport was constructed with a port. Null = direct
+                // TCP (Standard mode, the Stage 2 default), no proxy
+                // overhead. The future Reality / Tor wire-ups (Stages
+                // 3 / 4) pass a live local SOCKS port from the
+                // transport-strategy layer; nothing in Stage 2A invokes
+                // the non-null branch in production code paths.
+                val port = socksProxyPort
+                if (port != null) {
+                    builder.proxy(
+                        Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port)),
+                    )
+                }
+            }
             // PR-WS-HEALTH-STATE1 Commit 1 (2026-05-30): diagnostic-only
             // phase logging. Emits `REST_TRACE phase_event op=<op> key=<idem
             // or url> event=<dns|connect|secureConnect|responseHeaders|...>

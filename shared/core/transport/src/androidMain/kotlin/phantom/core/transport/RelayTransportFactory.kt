@@ -341,5 +341,7 @@ actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
  * itself is stateless (no shared OkHttpClient — every method allocates its
  * own per the locked native-OkHttp pattern).
  */
-actual fun createRestFallbackTransport(): RestFallbackTransport =
-    AndroidNativeOkHttpRestFallbackTransport()
+actual fun createRestFallbackTransport(
+    socksProxyPort: Int?,
+): RestFallbackTransport =
+    AndroidNativeOkHttpRestFallbackTransport(socksProxyPort = socksProxyPort)

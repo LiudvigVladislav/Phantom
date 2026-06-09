@@ -41,7 +41,14 @@ actual fun forceShutdownActiveEngine() {
 
 // iOS stub — PR-D1. REST fallback is currently Android-only production
 // path; iOS wiring is planned for Beta (PR-D3 parity track).
-actual fun createRestFallbackTransport(): RestFallbackTransport =
+//
+// Trek 2 Stage 2A (A4): `socksProxyPort` parameter accepted to match the
+// commonMain `expect` signature, but ignored — the stub throws regardless.
+// When iOS production wiring lands in Beta, the port will gate a Darwin
+// SOCKS proxy the same way the Android actual gates an OkHttp proxy().
+actual fun createRestFallbackTransport(
+    @Suppress("UNUSED_PARAMETER") socksProxyPort: Int?,
+): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is not implemented for iOS. " +
             "iOS production wiring is planned for Beta.",
