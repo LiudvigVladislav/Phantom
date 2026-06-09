@@ -1,0 +1,14 @@
+-- 20.sqm — transport_seq_state table for Trek 2 Stage 2A (A2).
+--
+-- Persists the per-recipient long-poll `?since_seq` cursor across
+-- cold starts. Lands in the existing SQLCipher-protected `phantom.db`
+-- per Vladislav OQ5 lock 2026-06-09 (no separate unencrypted SQLite
+-- file). Stage 2A wires the schema + repository; the runtime read /
+-- write from `RestFallbackOrchestrator.pollLoop` is a Stage 2B
+-- deliverable (no behaviour change in this migration alone).
+
+CREATE TABLE transport_seq_state (
+    identity_hex  TEXT    NOT NULL PRIMARY KEY,
+    last_seen_seq INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms INTEGER NOT NULL
+);

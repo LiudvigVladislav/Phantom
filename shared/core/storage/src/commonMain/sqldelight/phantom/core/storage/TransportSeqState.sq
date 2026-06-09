@@ -1,0 +1,86 @@
+-- TransportSeqState.sq — Trek 2 Stage 2A (A2) per-recipient long-poll
+-- resume cursor for the client's `/relay/poll` `?since_seq=<n>` query.
+--
+-- WHY THIS EXISTS
+--
+-- The Stage 1 server (master `dc6f52df`) hands every envelope it queues
+-- to a recipient a monotonic `seq` counter that lets the client resume
+-- after a process death or cold start without re-fetching the full
+-- retention window from `since_seq=0`. Before Stage 2 the client tracked
+-- `lastSeenSeq` only in-process inside `RestFallbackOrchestrator.pollLoop`,
+-- so an app force-stop, OS-driven process kill, or device reboot reset
+-- the cursor to 0 and the next poll over-fetched (worst case: the full
+-- 7-day relay TTL queue) — wasted bandwidth + a potential re-deliver
+-- storm that `RestInboundDeduplicator` then has to filter.
+--
+-- This table persists the cursor across cold starts. Encrypted at rest
+-- via SQLCipher under the existing `phantom.db` passphrase managed by
+-- the Android Keystore — `lastSeenSeq` is server-assigned metadata
+-- (volume + timing) that a device-seizure adversary breaking the
+-- SQLCipher layer would learn, never message content. Per Vladislav
+-- OQ5 lock 2026-06-09: lands in existing `phantom.db`, not a separate
+-- unencrypted SQLite file.
+--
+-- KEY SHAPE
+--
+-- Single-key `(identity_hex)` per Vladislav OQ6 lock 2026-06-09. The
+-- relay's `rest_seq` counter is per-recipient (not per-conversation),
+-- so the client cursor mirrors that shape exactly. Composite key with
+-- a `conversation_id` axis would over-specify the schema and create a
+-- mismatch with the server's `?since_seq` semantics.
+--
+-- STAGE 2A vs 2B
+--
+-- Stage 2A (this commit) lands ONLY the table + repository plumbing.
+-- The `RestFallbackOrchestrator.pollLoop()` still tracks `lastSeenSeq`
+-- in process memory and does NOT read/write this table at runtime.
+-- Stage 2B wires the repository into the always-on poll loop so cold
+-- start reads the persisted cursor and every `lastSeenSeq` increment
+-- writes it back. Default of `0` for unknown identity preserves
+-- byte-identical behaviour on first run.
+
+CREATE TABLE transport_seq_state (
+    -- Identity hex (X25519 pubkey, 64 chars). The local recipient
+    -- whose long-poll resume cursor this row tracks. There is exactly
+    -- one row per identity on this device — multi-account support
+    -- (one device, multiple identities) is not in scope for Stage 2,
+    -- but the PK shape leaves room for it without a future migration.
+    identity_hex TEXT NOT NULL PRIMARY KEY,
+
+    -- Last server-assigned `seq` value the client has seen for this
+    -- identity. Stage 2B reads this at poll-loop start and passes it
+    -- as `?since_seq=<n>` so the relay only ships envelopes with a
+    -- strictly greater seq.
+    last_seen_seq INTEGER NOT NULL DEFAULT 0,
+
+    -- Wall-clock (epoch ms) of the most recent update. Diagnostic
+    -- only — no production code reads it; on-device debug logs and
+    -- post-mortem queries use it to answer "when did this device
+    -- last hear from the relay for that identity".
+    updated_at_ms INTEGER NOT NULL
+);
+
+-- Hot path — read at orchestrator cold start to seed the in-memory
+-- `lastSeenSeq` cursor. Returns NULL on first run (the `lastSeen` flow
+-- in Stage 2B treats NULL identically to `0`).
+getLastSeenSeq:
+SELECT last_seen_seq FROM transport_seq_state WHERE identity_hex = ?;
+
+-- Upsert — runs after each successful poll that observed a new `seq`.
+-- INSERT OR REPLACE keeps the table single-row-per-identity without a
+-- two-statement guard. The caller is responsible for monotonicity
+-- (never write a value lower than the current one — `LastSeenSeqRepository`
+-- enforces this at the Kotlin layer so the SQL stays simple).
+upsertLastSeenSeq:
+INSERT OR REPLACE INTO transport_seq_state(identity_hex, last_seen_seq, updated_at_ms)
+VALUES (?, ?, ?);
+
+-- Diagnostic — returns the count of rows (typically 1 in production).
+-- Stage 2A integration tests use this to assert the migration created
+-- the table at all.
+countRows:
+SELECT COUNT(*) AS cnt FROM transport_seq_state;
+
+-- Wipe (used by test-reset paths only).
+deleteAll:
+DELETE FROM transport_seq_state;
