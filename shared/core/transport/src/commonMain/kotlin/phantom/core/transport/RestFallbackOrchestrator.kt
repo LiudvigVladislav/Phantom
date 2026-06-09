@@ -228,6 +228,15 @@ class RestFallbackOrchestrator(
      *     `Failed` on hard failure.
      */
     suspend fun sendEnvelope(
+        // TODO(stage3-migration): ENVELOPE_ID_FULL_RETROFIT — Trek 2
+        // Stage 3 migration audit promotes this parameter to
+        // `envelopeId: phantom.core.transport.EnvelopeId` after every
+        // caller in the messaging module has been verified to source
+        // the id from `EnvelopeId.random()` (or `fromWire()` for relay-
+        // echoed ids on the inbound replay path) — never from payload
+        // hash or ratchet state. Per Vladislav OQ3=C lock 2026-06-09
+        // the signature stays `String` in Stage 2A so existing callers
+        // compile unchanged.
         envelopeId: String,
         toHex: String,
         payloadBase64: String,

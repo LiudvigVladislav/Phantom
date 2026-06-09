@@ -23,6 +23,13 @@ kotlin {
             // (commonMain interface) so the chain walk drives REALITY the same
             // way it drives Tor.
             implementation(project(":shared:core:xray"))
+            // Trek 2 Stage 2A (A5+A7) — `EnvelopeId.random()` uses the
+            // `LibsodiumCsprng` helper in the crypto module as the single
+            // CSPRNG source for both id generation and future jitter
+            // draws. Stage 2B will reuse the same helper for the hold-
+            // consumption and next-request jitter sites in
+            // RestFallbackOrchestrator.pollLoop.
+            implementation(project(":shared:core:crypto"))
         }
         androidMain.dependencies {
             implementation(libs.ktor.client.okhttp)

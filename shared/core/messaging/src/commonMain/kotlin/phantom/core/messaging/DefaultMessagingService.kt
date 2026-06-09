@@ -1457,6 +1457,13 @@ class DefaultMessagingService(
                 )
                 val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
                 val paddedCiphertext = MessagePadding.pad(ciphertext)
+                // TODO(stage3-migration): ENVELOPE_ID_FULL_RETROFIT —
+                // Trek 2 Stage 3 migration audit converts this call site
+                // to `phantom.core.transport.EnvelopeId.random().value`
+                // after confirming this path never derives the id from
+                // payload / ratchet state. uuid4 is already CSPRNG-backed
+                // on Android (UUID.randomUUID delegates to SecureRandom
+                // on API 19+) so no security regression in Stage 2A.
                 val envelopeId = uuid4().toString()
 
                 messagingLog(
@@ -1612,6 +1619,13 @@ class DefaultMessagingService(
                     )
                     val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
                     val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
+                    // TODO(stage3-migration): ENVELOPE_ID_FULL_RETROFIT —
+                    // Trek 2 Stage 3 migration audit converts this call
+                    // site to `phantom.core.transport.EnvelopeId.random().value`
+                    // after confirming this path never derives the id
+                    // from payload / ratchet state. uuid4 is CSPRNG-backed
+                    // on Android (SecureRandom). See
+                    // `shared/core/transport/.../EnvelopeId.kt`.
                     val envelopeId = uuid4().toString()
 
                     transport.send(
