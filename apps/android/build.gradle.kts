@@ -393,6 +393,27 @@ android {
             // APK; whichever is needed by the current chain walk starts on
             // demand. Legacy local.properties keys `tor.enabled` /
             // `xray.enabled` are silently ignored.
+
+            // Trek 2 Stage 2A (A6) — single runtime gate for every Stage 2B
+            // long-poll behaviour (`wsActivePollJob`, `X-Phantom-Long-Poll: 1`
+            // opt-in header, raised OkHttp callTimeout/readTimeout, jittered
+            // hold consumption, persisted `lastSeenSeq` use, periodic
+            // re-auth ceiling). Values follow the existing
+            // `DEBUG_RC_DIRECT_ARM` String "1"/"0" idiom locked by Vladislav
+            // OQ7 2026-06-09. Debug builds default to "1" (long-poll on so
+            // beta phones exercise the path); release builds pin to "0"
+            // (defence in depth — Stage 2B promotion to production is a
+            // separate named PR + a deliberate buildConfigField flip in this
+            // release block).
+            //
+            // Override via `local.properties` `longPollV2Enabled=0` or env
+            // `LONGPOLL_V2_ENABLED=0` to force long-poll off on a debug build
+            // (e.g. when reproducing legacy short-poll behaviour during a
+            // bisect). Stage 2A's `RestFallbackOrchestrator.longPollEnabled`
+            // stores the parsed Boolean but does NOT consume it at runtime —
+            // Stage 2B wires every consumer.
+            val longPollV2Enabled = localOrEnv("longPollV2Enabled", "LONGPOLL_V2_ENABLED", "1")
+            buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"$longPollV2Enabled\"")
         }
         release {
             isMinifyEnabled = true
@@ -480,6 +501,16 @@ android {
             // diagnostic class. Defence-in-depth backstop per §14 hard
             // gate 1 + WORKING_RULES rule 8 narrow carve-out.
             buildConfigField("String", "DEBUG_RC_DIRECT_ARM_G_VIA_REALITY", "\"\"")
+            // Trek 2 Stage 2A (A6): release builds ALWAYS pin the long-poll
+            // V2 gate to "0". The AppContainer wire-up reads this value and
+            // computes the Boolean passed to
+            // `RestFallbackOrchestrator.longPollEnabled`, so a release build
+            // can never engage any Stage 2B runtime path even if a debug-only
+            // wire-up site forgot its `BuildConfig.DEBUG` guard. Stage 2B
+            // promotion to release is a separate named PR that flips this
+            // single line; defence-in-depth backstop per Vladislav OQ7 +
+            // OQ11 split locks 2026-06-09.
+            buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

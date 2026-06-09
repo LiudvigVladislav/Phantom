@@ -84,6 +84,28 @@ class RestFallbackOrchestrator(
      */
     @Suppress("unused")
     private val socksProxyPort: Int? = null,
+    /**
+     * Trek 2 Stage 2A (A6) — runtime gate that lets the AppContainer
+     * wire-up flip every Stage 2B long-poll runtime path on or off
+     * from one place without recompiling. Mirrors the existing
+     * `DEBUG_RC_DIRECT_ARM` / `DEBUG_RC_DIRECT_HEARTBEAT_ECHO`
+     * `BuildConfig.DEBUG && <flag-string> == "1"` idiom.
+     *
+     * Per Vladislav OQ7 lock 2026-06-09 the Android-side flag is the
+     * String `"1"` / `"0"` `buildConfigField`; the AppContainer reads
+     * it, computes a Boolean, and passes that Boolean here.
+     *
+     * Stage 2A stores the value but does NOT consume it at runtime —
+     * Stage 2B's `wsActivePollJob`, opt-in header, raised socket
+     * timeout, jittered hold consumption, and persisted lastSeenSeq
+     * use will all gate on this single Boolean. Release builds always
+     * pin the underlying `buildConfigField` to `"0"` (defence in
+     * depth) so accidentally promoting Stage 2B runtime behaviour to
+     * release cannot happen without a deliberate code change AND a
+     * BuildConfig pin flip.
+     */
+    @Suppress("unused")
+    private val longPollEnabled: Boolean = false,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
