@@ -161,6 +161,19 @@ data class AuthSessionResponse(
      * makes that case behave like `binary_v3=false` (client stays on v2).
      */
     @SerialName("media_capabilities") val mediaCapabilities: MediaCapabilities = MediaCapabilities(),
+    /**
+     * Trek 2 Stage 2 (Stage 2A) — long-poll hold-time in seconds
+     * announced by the relay. `0` means short-poll (the relay either
+     * has long-poll disabled via `RELAY_POLL_HOLD_SECS=0` or is an old
+     * pre-Stage-1 build that doesn't know the field). The Stage 1
+     * server contract ships this field always-present; older relays
+     * omit it and the default `0` makes that case behave like
+     * short-poll without any client behaviour change. Stage 2A is
+     * the foundation-only landing — the runtime gating of the
+     * `X-Phantom-Long-Poll: 1` opt-in header on this value is a
+     * Stage 2B deliverable (no behaviour change in this commit).
+     */
+    @SerialName("poll_hold_secs") val pollHoldSecs: Int = 0,
 )
 
 /**
@@ -268,6 +281,18 @@ data class RelayCapabilities(
     val mediaBinaryV3: Boolean,
     /** PR-M2f — relay's media upload body cap echoed in the session response. */
     val mediaUploadBodyBytes: Int,
+    /**
+     * Trek 2 Stage 2 (Stage 2A) — relay-announced long-poll hold-time
+     * in seconds (see [AuthSessionResponse.pollHoldSecs]). `0` means
+     * the relay is short-poll-only either because the operator left
+     * `RELAY_POLL_HOLD_SECS=0` (production default + kill switch) or
+     * because the relay is an old pre-Stage-1 build that does not
+     * announce the field. Default `0` preserves byte-identical runtime
+     * behaviour. Stage 2A surfaces this value through capabilities so
+     * Stage 2B can gate the `X-Phantom-Long-Poll: 1` opt-in header on
+     * it; Stage 2A itself does NOT consume the value at runtime.
+     */
+    val pollHoldSecs: Int,
 ) {
     companion object {
         /**
@@ -282,6 +307,7 @@ data class RelayCapabilities(
             pollMaxEnvelopes = 0,
             mediaBinaryV3 = false,
             mediaUploadBodyBytes = 0,
+            pollHoldSecs = 0,
         )
     }
 }
@@ -293,4 +319,5 @@ fun AuthSessionResponse.toCapabilities(): RelayCapabilities = RelayCapabilities(
     pollMaxEnvelopes = pollMaxEnvelopes,
     mediaBinaryV3 = mediaCapabilities.binaryV3,
     mediaUploadBodyBytes = mediaCapabilities.maxUploadBodyBytes,
+    pollHoldSecs = pollHoldSecs,
 )
