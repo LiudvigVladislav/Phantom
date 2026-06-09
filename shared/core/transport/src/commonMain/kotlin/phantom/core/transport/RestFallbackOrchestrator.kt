@@ -70,6 +70,20 @@ class RestFallbackOrchestrator(
     // [phantom.core.transport.WsDegradationDetector] telemetry stream
     // without parsing log lines. Optional and defaults to no-op.
     private val onModeSwitched: ((from: RestMode, to: RestMode, reason: String) -> Unit)? = null,
+    /**
+     * Trek 2 Stage 2A (A4) — local SOCKS5 port for the future Reality
+     * (Stage 3) and Tor (Stage 4) tunnel paths. When non-null, the
+     * AppContainer wire-up is expected to have constructed [transport]
+     * with the same port so the long-poll surface inherits it. Stored
+     * here so Stage 2B can read the value (e.g. for diagnostic log
+     * fields) without re-deriving it from the transport.
+     *
+     * Stage 2 Standard mode passes `null` — no behaviour change. The
+     * field is unread in this commit; the wire-up + consumption land
+     * in later Stage 2A items (A6) and Stage 2B respectively.
+     */
+    @Suppress("unused")
+    private val socksProxyPort: Int? = null,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
