@@ -140,6 +140,45 @@ async fn call_poll_raw(app: axum::Router, token: &str) -> (axum::Router, StatusC
     (app, status, bytes.to_vec())
 }
 
+/// `/relay/poll` with the `X-Phantom-Long-Poll: 1` opt-in header — the
+/// gate that lets the server actually apply `RelayConfig.poll_hold_secs`.
+/// Without this header, the server returns immediately (short-poll)
+/// regardless of env, so old Android clients with 10 s call/read
+/// timeout never see a hold longer than their socket budget. Stage 2
+/// client work raises the timeout AND sets this header in one atomic
+/// upgrade.
+async fn call_poll_with_long_poll_optin(
+    app: axum::Router,
+    token: &str,
+) -> (axum::Router, StatusCode, Vec<u8>) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/relay/poll")
+                .header("authorization", format!("Bearer {}", token))
+                .header("x-phantom-long-poll", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 16_384).await.unwrap();
+    (app, status, bytes.to_vec())
+}
+
+/// Build a test app with `poll_hold_secs` overridden to a specific
+/// value. 1 s is enough for deterministic E2E tests of the hold path
+/// without making the suite slow.
+fn build_app_with_hold(hold_secs: u32) -> axum::Router {
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.poll_hold_secs = hold_secs;
+    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    phantom_relay::routes::router(state)
+}
+
 async fn call_send_with_ts(
     app: axum::Router,
     token: &str,
@@ -478,4 +517,220 @@ async fn poll_empty_and_envelope_bearing_responses_have_identical_wire_size() {
         "empty-poll and envelope-bearing poll bodies must have identical wire size"
     );
     assert_eq!(body_full.len(), POLL_RESPONSE_CANONICAL_BYTES);
+}
+
+// ── P1 fix: request-level opt-in via X-Phantom-Long-Poll: 1 ──────────────────
+
+/// Backward-compatibility load-bearing test (Vladislav PR #297 review P1):
+/// existing Android clients on `master` have `CALL_TIMEOUT_MS = 10_000`
+/// and do NOT send the `X-Phantom-Long-Poll: 1` header. If the operator
+/// flips `RELAY_POLL_HOLD_SECS=20` globally, those clients MUST still
+/// see short-poll behaviour — otherwise an empty poll would hold for
+/// 20 s server-side, well past the client's 10 s socket budget, breaking
+/// the "Stage 1 = zero client risk" contract.
+#[tokio::test]
+async fn poll_without_opt_in_header_returns_immediately_even_with_hold_configured() {
+    // Server configured with poll_hold_secs=5 (a value that would
+    // exceed an old client's 10 s socket budget on any non-trivial
+    // hold path, but cheap for the test to wait through if it did
+    // accidentally engage).
+    let app = build_app_with_hold(5);
+    let recipient_id = identity_hex(30);
+    let mut csprng = OsRng;
+    let recipient_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    // Call WITHOUT the opt-in header (simulates old Android client).
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_raw(app, &token).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() < 500,
+        "old client (no opt-in header) must NOT be held even when \
+         server poll_hold_secs=5; elapsed={:?}",
+        elapsed
+    );
+    // Body still padded (security invariant 1) regardless of opt-in.
+    assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+}
+
+/// Hold path with opt-in header but no envelope arriving — confirms the
+/// server actually waits to the timeout and returns padded empty body
+/// (Guardrail A: no message loss, no hang).
+#[tokio::test]
+async fn poll_with_opt_in_header_and_no_send_returns_at_hold_timeout() {
+    let hold_secs = 1u32;
+    let app = build_app_with_hold(hold_secs);
+    let recipient_id = identity_hex(31);
+    let mut csprng = OsRng;
+    let recipient_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_long_poll_optin(app, &token).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(status, StatusCode::OK);
+    // Must have waited approximately hold_secs (1 s) before returning.
+    // Generous lower bound (800 ms) to tolerate scheduling jitter on
+    // slow CI runners; upper bound (2 s) catches a regression where
+    // the loop's `tokio::time::timeout` is bypassed.
+    assert!(
+        elapsed.as_millis() >= 800,
+        "hold must wait close to hold_secs ({} s); elapsed={:?}",
+        hold_secs,
+        elapsed
+    );
+    assert!(
+        elapsed.as_millis() < 2_000,
+        "hold must not exceed 60 s TimeoutLayer ceiling significantly; \
+         elapsed={:?}",
+        elapsed
+    );
+    assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+}
+
+/// LOAD-BEARING E2E (P3 fix from Vladislav PR #297 review): hold path
+/// with opt-in header AND a concurrent `/relay/send` to the recipient.
+/// The waiting poll MUST wake on `notify_one` from the send path and
+/// return the envelope well before the hold timeout.
+///
+/// This is the production-critical happy path that Stage 1 actually
+/// delivers — empty-poll wake-up under ~50 ms (plus coalescing).
+#[tokio::test]
+async fn poll_with_opt_in_header_wakes_on_send_before_hold_timeout() {
+    let hold_secs = 3u32;
+    let app = build_app_with_hold(hold_secs);
+
+    // Recipient (does the poll).
+    let recipient_id = identity_hex(32);
+    let mut csprng = OsRng;
+    let recipient_kp = SigningKey::generate(&mut csprng);
+    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    // Sender (separate identity to avoid sender==recipient confusion
+    // in the rate-limit bucket, even though they are independent).
+    let sender_id = identity_hex(33);
+    let sender_kp = SigningKey::generate(&mut csprng);
+    let (app, sender_token) = obtain_token(app, &sender_id, &sender_kp).await;
+
+    // Launch poll in the background — it will register on the
+    // recipient's Notify and await.
+    let poll_app = app.clone();
+    let poll_token = recipient_token.clone();
+    let poll_handle = tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let (_app, status, body) =
+            call_poll_with_long_poll_optin(poll_app, &poll_token).await;
+        (start.elapsed(), status, body)
+    });
+
+    // Give the poll handler enough head start to reach the
+    // `notifier.notified().await` phase. 200 ms is comfortable on
+    // slow CI runners and well under the 3 s hold timeout.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Send: this writes the envelope to rest_store AND calls
+    // `notify_recipient`, which should wake the poll.
+    let (_app2, send_status) = call_send_with_ts(
+        app,
+        &sender_token,
+        "hold-wake-1",
+        &recipient_id,
+        1_700_000_000_000,
+    )
+    .await;
+    assert_eq!(send_status, StatusCode::CREATED, "send must succeed");
+
+    // Poll should return WELL before the 3 s hold timeout — somewhere
+    // in the ~200 ms (initial sleep) + ~50 ms (coalesce) + handler
+    // overhead range. Upper bound 1500 ms is generous.
+    let (elapsed, status, body) = poll_handle
+        .await
+        .expect("poll task must not panic");
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() < 1_500,
+        "poll must wake on notify well before {} s timeout; elapsed={:?}",
+        hold_secs,
+        elapsed
+    );
+    assert!(
+        elapsed.as_millis() >= 200,
+        "elapsed must include the initial pre-send delay; got={:?}",
+        elapsed
+    );
+
+    // Body MUST contain the envelope we just sent.
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let envelopes = v["envelopes"]
+        .as_array()
+        .expect("envelopes array present");
+    assert_eq!(envelopes.len(), 1, "poll must return exactly one envelope");
+    assert_eq!(envelopes[0]["id"].as_str(), Some("hold-wake-1"));
+
+    // Padding invariant still holds even on the wake path.
+    assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+}
+
+/// Race-window regression (P2 fix from Vladislav PR #297 review): when
+/// the send happens BEFORE the poll has registered on the notifier
+/// (between the initial queue check and the `notifier_for` insert),
+/// the `notify_recipient` call from send sees no entry and is a no-op.
+/// The phase 3.5 re-check after `notifier_for` MUST catch the envelope
+/// instead of hanging until hold timeout.
+///
+/// We simulate this by issuing a send BEFORE the poll starts — the poll
+/// then reaches phase 3.5 with the envelope already in rest_store. The
+/// initial drain at phase 1 would normally catch it; we exercise the
+/// re-check by having the poll arrive immediately after the send. The
+/// fix guarantees we never hang on `notified()` for an envelope that's
+/// already pending.
+#[tokio::test]
+async fn poll_recheck_after_notifier_registration_catches_concurrent_send() {
+    let hold_secs = 3u32;
+    let app = build_app_with_hold(hold_secs);
+
+    let recipient_id = identity_hex(34);
+    let mut csprng = OsRng;
+    let recipient_kp = SigningKey::generate(&mut csprng);
+    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    let sender_id = identity_hex(35);
+    let sender_kp = SigningKey::generate(&mut csprng);
+    let (app, sender_token) = obtain_token(app, &sender_id, &sender_kp).await;
+
+    // Pre-enqueue (the race-window worst case is "send already happened
+    // before phase 3 registration"). This proves the loop does NOT
+    // hang on Notify when the queue is already non-empty by the time
+    // the waiter would start awaiting.
+    let (app, send_status) = call_send_with_ts(
+        app,
+        &sender_token,
+        "recheck-1",
+        &recipient_id,
+        1_700_000_000_000,
+    )
+    .await;
+    assert_eq!(send_status, StatusCode::CREATED);
+
+    // Poll with opt-in MUST return immediately (phase 1 catches the
+    // envelope before the notifier is ever registered).
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_long_poll_optin(app, &recipient_token).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() < 500,
+        "pre-enqueued envelope must be returned without engaging hold; \
+         elapsed={:?}",
+        elapsed
+    );
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let envelopes = v["envelopes"].as_array().expect("envelopes array");
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0]["id"].as_str(), Some("recheck-1"));
 }

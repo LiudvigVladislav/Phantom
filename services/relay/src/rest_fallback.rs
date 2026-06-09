@@ -110,6 +110,27 @@ const POLL_HOLD_COALESCE_MS: u64 = 50;
 /// sharing the bucket would break independence (Q2 lock).
 pub const ACK_DELIVER_RATE_LIMIT_PER_WINDOW: u32 = 120;
 
+/// HTTP request header that signals "this client knows about long-poll
+/// and has raised its socket read/call timeouts to accommodate up to
+/// `poll_hold_secs` of server-side hold time." Without this header,
+/// `/relay/poll` ALWAYS returns immediately (short-poll), regardless
+/// of `RelayConfig.poll_hold_secs`. With this header set to `"1"`,
+/// the server applies the configured hold.
+///
+/// Why request-level opt-in: existing Android clients on `master` have
+/// `CALL_TIMEOUT_MS = READ_TIMEOUT_MS = 10_000`. If the operator sets
+/// `RELAY_POLL_HOLD_SECS=20` globally, an old client polling on its
+/// short-poll cadence would see its socket timeout (10 s) fire long
+/// before the server's hold (20 s) returns, breaking the "old clients
+/// keep working unchanged" Stage 1 contract. Stage 2 client work
+/// raises the timeout AND sets this header in the same flight, so the
+/// upgrade is atomic from the client's perspective.
+///
+/// Value contract: `"1"` enables hold, anything else (including
+/// absence, empty string, `"true"`, `"yes"`, `"0"`) keeps short-poll
+/// behaviour. Strict equality so a typo cannot accidentally opt in.
+pub const LONG_POLL_OPT_IN_HEADER: &str = "x-phantom-long-poll";
+
 /// Trek 2 Stage 1 — quantize a millisecond wall-clock timestamp to the
 /// nearest 60-second boundary by flooring (`ts - (ts % 60_000)`).
 /// Removes sub-minute precision from the relay-visible `sequence_ts`
@@ -791,7 +812,8 @@ pub async fn poll_hold_loop(
     if let Some(batch) = drain_eligible(state, recipient, since_seq).await {
         return batch;
     }
-    // Phase 2 — kill-switch fast path.
+    // Phase 2 — kill-switch fast path. Either operator set hold_secs=0
+    // globally, or the client did not send the opt-in header.
     if hold_secs == 0 {
         return (Vec::new(), false);
     }
@@ -804,12 +826,36 @@ pub async fn poll_hold_loop(
             return (Vec::new(), false);
         }
     };
+    // Phase 3.5 — race-window re-check. Between phase 1's queue read
+    // and phase 3's notifier insert, a concurrent `/relay/send` could
+    // have:
+    //   (a) written the envelope into rest_store, AND
+    //   (b) called `notify_recipient` which found no entry in the map
+    //       (because we hadn't inserted yet) and silently dropped the
+    //       wake.
+    // The envelope is now in the queue but no notify will fire to wake
+    // us. Without this re-check we'd sit on `notified().await` until
+    // `hold_secs` timeout, adding up to 30 s of unnecessary latency to
+    // a delivery that should have been sub-50 ms (P2 fix per Vladislav
+    // PR #297 review).
+    if let Some(batch) = drain_eligible(state, recipient, since_seq).await {
+        return batch;
+    }
     let timeout = tokio::time::Duration::from_secs(hold_secs as u64);
     let coalesce = tokio::time::Duration::from_millis(POLL_HOLD_COALESCE_MS);
     let wake = tokio::time::timeout(timeout, notifier.notified()).await;
     if wake.is_err() {
-        // Timeout — return empty without re-checking.
-        return (Vec::new(), false);
+        // Timeout. P2 fix per Vladislav PR #297 review — re-check the
+        // queue before returning empty. A send that arrived in the few
+        // ms between phase 3.5 and timeout MAY have notify_one'd the
+        // notifier just as it expired, in which case the message is in
+        // rest_store but `notified()` already returned `Err(Elapsed)`.
+        // drain_eligible is cheap (one rwlock + one filter); the
+        // guaranteed-delivery invariant (Guardrail A) is more
+        // important than skipping the check.
+        return drain_eligible(state, recipient, since_seq)
+            .await
+            .unwrap_or((Vec::new(), false));
     }
     // Notify fired. Wait the coalescing window so multiple back-to-back
     // sends batch into one response (POLL_MAX_ENVELOPES=1 still applies,
@@ -1447,22 +1493,41 @@ pub async fn rest_poll(
     };
 
     let since_seq = q.since_seq.unwrap_or(0);
-    let hold_secs = state.config.poll_hold_secs;
+
+    // Trek 2 Stage 1 — request-level opt-in for long-poll hold.
+    // The server only applies `RelayConfig.poll_hold_secs` when the
+    // client sets `X-Phantom-Long-Poll: 1`. Old clients (no header)
+    // ALWAYS get short-poll, regardless of server env — preserves the
+    // "Stage 1 is zero-client-risk" contract even if the operator
+    // flips `RELAY_POLL_HOLD_SECS > 0` globally. Strict equality on
+    // the header value so a typo cannot accidentally opt in.
+    let long_poll_opt_in = headers
+        .get(LONG_POLL_OPT_IN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let effective_hold_secs = if long_poll_opt_in {
+        state.config.poll_hold_secs
+    } else {
+        0
+    };
 
     // Trek 2 Stage 1 — long-poll hold. `poll_hold_loop` returns
-    // immediately if `hold_secs == 0` (kill switch) or if the queue is
-    // non-empty; otherwise it awaits a per-identity Notify with a
-    // ~50 ms coalescing window so a burst of sends batches.
+    // immediately if `effective_hold_secs == 0` (kill switch OR client
+    // did not opt in) or if the queue is non-empty; otherwise it awaits
+    // a per-identity Notify with a ~50 ms coalescing window so a burst
+    // of sends batches into one response.
     let (envelopes, more) =
-        poll_hold_loop(&state, &recipient_identity, since_seq, hold_secs).await;
+        poll_hold_loop(&state, &recipient_identity, since_seq, effective_hold_secs).await;
 
     let envelope_id_log = envelopes.first().map(|e| e.id.as_str()).unwrap_or("");
     tracing::info!(
-        event       = "rest_poll_returned",
-        identity    = %&recipient_identity[..8.min(recipient_identity.len())],
-        envelope_id = %envelope_id_log,
-        more        = more,
-        hold_secs   = hold_secs,
+        event              = "rest_poll_returned",
+        identity           = %&recipient_identity[..8.min(recipient_identity.len())],
+        envelope_id        = %envelope_id_log,
+        more               = more,
+        hold_secs          = effective_hold_secs,
+        long_poll_opt_in   = long_poll_opt_in,
     );
 
     // Trek 2 Stage 1 Q4 — pad to canonical 4608-byte body so empty and
