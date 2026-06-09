@@ -490,10 +490,28 @@ class AppContainer(private val context: Context) {
         if (phantom.android.BuildConfig.DEBUG &&
             phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"
         ) {
+            // PR-G2 fixup v6 (2026-06-06): pass xrayDataDir instead of
+            // production xrayService singleton. Arm G now constructs
+            // its own ephemeral XrayService instances per reconnect-
+            // loop session so each session gets a fresh socksPort +
+            // fresh OkHttp client (per Vladislav's two guardrails on
+            // the Wi-Fi PARTIAL discriminator: fresh socks port AND
+            // fresh OkHttp connection pool per session). The production
+            // singleton (the `xrayService` lazy above) is no longer
+            // touched in Arm G mode — the lazy is only materialised by
+            // production transport.connect, which Arm G short-circuits
+            // before. dataDir is the same `xray-data` path the
+            // production singleton would use, so on-disk geo/cache
+            // files are shared (safe: gomobile libXray is per-process,
+            // and Arm G's stop-then-start sequence between sessions
+            // releases any file handles before the next iteration).
+            val xrayDataDir = context.applicationContext.filesDir
+                .resolve("xray-data")
+            xrayDataDir.mkdirs()
             phantom.android.diagnostic.RcDirectArmG(
                 identityManager = identityManager,
                 relayUrl = phantom.android.BuildConfig.RELAY_URL,
-                xrayService = xrayService,
+                xrayDataDir = xrayDataDir.absolutePath,
                 scope = appScope,
             )
         } else {

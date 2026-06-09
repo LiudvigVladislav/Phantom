@@ -36,13 +36,18 @@ on:
         required: false
         default: "main"
         type: string
+      ndk_version:
+        description: "Android NDK version (r26d / r26c / r27c). Default r27c (Play Store preflight clean for Android 15+). Override to r26d / r26c when an older libxray_ref expects the pre-r27 toolchain layout that still ships the standalone `clang` symlink. r27c removed the symlink, so older libXray build scripts that invoke `<abi>-android21-clang` (which wraps `clang`) crash with `clang: No such file or directory` — caught on workflow runs 27050083371 (libxray_ref=b87287dbdb9c, 2026-04-08) and 27051088022 (libxray_ref=9a86646da8d8, 2026-05-12) during RC-DIRECT-STABILITY1 §14 Arm G repair sprint 2026-06-06."
+        required: false
+        default: "r27c"
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build libXray.aar (ubuntu-24.04 + Go 1.26 + NDK r27c)
+    name: Build libXray.aar (ubuntu-24.04 + Go 1.26 + NDK ${{ inputs.ndk_version }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -99,7 +104,7 @@ jobs:
           go-version-file: libxray-src/go.mod
           check-latest: true
 
-      - name: Set up Android NDK r27c
+      - name: Set up Android NDK ${{ inputs.ndk_version }}
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
@@ -109,7 +114,20 @@ jobs:
           # the r27 line; produces 16 KB-page-aligned binaries that pass
           # Play Console preflight for Android 15+. r27c chosen over r28
           # because r28 is still in beta as of 2026-05.
-          ndk-version: r27c
+          #
+          # Override input (RC-DIRECT-STABILITY1 §14 Arm G repair 2026-06-06):
+          # older libXray refs whose go.mod pins Xray-core 26.3.27 stable
+          # (= server) ship a build script that calls `<abi>-android21-clang`
+          # which wraps the standalone `clang` binary. r27c removed that
+          # standalone symlink (compiler now lives behind versioned
+          # frontends only), so older build scripts crash at:
+          #     <abi>-android21-clang: line 4:
+          #     .../toolchains/llvm/prebuilt/linux-x86_64/bin/clang: No such file
+          # Override to `r26d` keeps the standalone symlink. r26d produced
+          # binary is NOT 16 KB-page-aligned for Android 15+ Play Store
+          # preflight — this override is for diagnostic / repair AAR only,
+          # NOT for release artifacts. Release pipeline stays on r27c.
+          ndk-version: ${{ inputs.ndk_version }}
           local-cache: true
 
       - name: Export NDK env vars consumed by gomobile
@@ -128,6 +146,46 @@ jobs:
           python3 --version
           echo "ANDROID_NDK_HOME = ${ANDROID_NDK_HOME:-(unset)}"
           ls "$ANDROID_NDK_HOME" 2>/dev/null | head || echo "(NDK dir not listable)"
+
+      - name: Preflight clang availability (NDK toolchain shape)
+        # RC-DIRECT-STABILITY1 §14 Arm G repair preflight 2026-06-06.
+        # Older libXray build scripts (pre-2026-04-25 commit
+        # `79f8487d54f8`) crash on r27c because they call
+        # `<abi>-android21-clang` which wraps a standalone `clang`
+        # symlink that r27c removed. Newer NDK lines (r26d / r26c) still
+        # ship the symlink. Failing this preflight loudly (rather than
+        # in a later gomobile invocation, where the error message is
+        # buried under hundreds of lines of cgo output) gives the
+        # operator a clear ndk_version override hint at the start of
+        # the run, not 5 minutes in.
+        #
+        # The check is non-fatal — it logs the toolchain shape; the
+        # actual build will still fail informatively if the symlink
+        # is missing AND the chosen libxray_ref needs it. Newer
+        # libxray_refs that have switched to the versioned-frontend
+        # invocation will pass this preflight on r27c too.
+        run: |
+          set +e  # diagnostic, do not abort on missing symlinks here
+          TOOLCHAIN_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "Checking standalone clang symlink (pre-r27 toolchain shape):"
+          if [ -f "$TOOLCHAIN_BIN/clang" ]; then
+              echo "  $TOOLCHAIN_BIN/clang PRESENT (NDK ships pre-r27 layout)"
+              "$TOOLCHAIN_BIN/clang" --version 2>&1 | head -3
+          else
+              echo "  $TOOLCHAIN_BIN/clang ABSENT (NDK r27+ layout; older libXray refs will fail)"
+              echo "  Fallback frontends present:"
+              ls "$TOOLCHAIN_BIN" 2>/dev/null | grep -E "clang$|clang-[0-9]+$" | head -5
+          fi
+          echo "Checking versioned per-ABI frontends (used by current libXray main):"
+          for abi in aarch64 armv7a x86_64 i686; do
+              wrap="$TOOLCHAIN_BIN/${abi}-linux-android21-clang"
+              if [ "$abi" = "armv7a" ]; then wrap="$TOOLCHAIN_BIN/armv7a-linux-androideabi21-clang"; fi
+              if [ -f "$wrap" ]; then
+                  echo "  $wrap PRESENT"
+              else
+                  echo "  $wrap ABSENT"
+              fi
+          done
 
       - name: Build libXray.aar
         working-directory: libxray-src

@@ -93,6 +93,24 @@ internal class XrayServiceAndroid(
      * `{"datDir":..., "mphCachePath":..., "configJSON":...}` and returns a
      * base64-encoded `{"success":bool,"data":string}` envelope. The builder
      * helpers below match that contract exactly.
+     *
+     * **API drift history (RC-DIRECT-STABILITY1 §14 Arm G repair sprint 2026-06-06):**
+     *   - Original 2026-05-07 vendoring (libXray main HEAD at that date):
+     *     3-arg `newXrayRunFromJSONRequest(datDir, mphCachePath, configJSON)`
+     *     bundling Xray-core dev commit after 26.3.27 stable.
+     *   - First refresh attempt 2026-06-06 (libXray main HEAD `f6ce61228b56`
+     *     of 2026-05-23, workflow run 27033765713): API became 2-arg
+     *     `(datDir, configJSON)`. Bundled Xray-core 26.5.9 dev. Reality
+     *     handshake silently rejected by server Xray-core 26.3.27 → server
+     *     fell back to dest=www.microsoft.com. Even server bump to v26.5.9
+     *     (Docker A/B 03:07 UTC) FAILED on matched-version client+server.
+     *     Path B (server bump) refuted.
+     *   - Repair vendoring 2026-06-06 (libXray ref `9a86646da8d8` of
+     *     2026-05-12, workflow run 27051293410 on NDK r26d via the
+     *     `ndk_version` workflow input added in the same session):
+     *     3-arg API restored, bundling Xray-core v1.260327.0 (= 26.3.27
+     *     stable) MATCHING server. This file is back to the 3-arg form
+     *     as a result. Provenance in `shared/core/xray/src/androidMain/libs/README.md`.
      */
     private fun startBlocking() {
         // Ensure the runtime's working directory exists; libXray will not
@@ -112,10 +130,20 @@ internal class XrayServiceAndroid(
             dirFile.list()?.toList()?.sorted()?.joinToString(",") ?: "<null>"
         }.getOrElse { "<list-failed: ${it.message}>" }
         val preState = runCatching { LibXray.getXrayState() }.getOrElse { "<state-call threw>" }
+        // XRAY-VERSION-LOCK1 precursor — surface the libXray-bundled Xray-core
+        // version at runtime so a future field-test outcome can correlate
+        // Reality handshake failure with server/client Xray-core version skew
+        // without needing a separate diagnostic build. Wrapped in runCatching
+        // because `xrayVersion()` is a relatively new libXray API (present in
+        // 2026-06-06 vendoring per shared/core/xray/src/androidMain/libs/README.md
+        // Provenance entry — may not be present in some refs); fail-safe to a
+        // sentinel string. No secrets in this call — Xray version is a public
+        // identifier already shipped to the server during handshake.
+        val xrayVersion = runCatching { LibXray.xrayVersion() }.getOrElse { "<version-call threw>" }
         Log.i(
             LOG_TAG,
             "startBlocking: datDir=$datDir exists=${dirFile.exists()} writable=${dirFile.canWrite()} " +
-                "contents=[$dirContents] preLibXrayState=$preState",
+                "contents=[$dirContents] preLibXrayState=$preState xrayVersion=$xrayVersion",
         )
 
         val xrayConfigJson = buildXrayClientConfig(config)
@@ -125,6 +153,13 @@ internal class XrayServiceAndroid(
                 xrayConfigJson.take(240).replace("\n", "\\n"),
         )
 
+        // Restore `mphCachePath` arg per 2026-06-06 §14 Arm G repair (see
+        // kdoc above + shared/core/xray/src/androidMain/libs/README.md
+        // provenance entry). The repair vendoring at libXray ref
+        // `9a86646da8d8` (2026-05-12, Xray-core v1.260327.0 / 26.3.27
+        // matching server) restored the 3-arg signature that the original
+        // 2026-05-07 vendoring used; the brief 2-arg variant was only on
+        // the 2026-05-23 main HEAD which we no longer ship.
         val requestB64 = LibXray.newXrayRunFromJSONRequest(datDir, mphCachePath, xrayConfigJson)
         Log.i(LOG_TAG, "startBlocking: requestB64Len=${requestB64.length}")
 
