@@ -792,6 +792,38 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 );
                 return;
             }
+
+            // Trek 2 Stage 1.x review fix — `to` is the recipient
+            // identity-hex that feeds the canonical input to
+            // `compute_seq_mac` inside `mirror_envelope_to_rest_store`.
+            // Validate the shape here (64 ASCII-hex characters) so a
+            // malformed recipient cannot reach the MAC path and so the
+            // log-prefix `&to[..16]` is safe to read.
+            if !crate::seq_mac::is_valid_recipient_identity_hex(&to) {
+                tracing::warn!(
+                    to_len  = to.len(),
+                    sealed  = !sealed_sender.is_empty(),
+                    "send dropped: recipient must be 64 hex chars"
+                );
+                return;
+            }
+
+            // Trek 2 Stage 1.x review fix — bound `messageId` byte length
+            // to the `u16-BE` length-prefix capacity used in the canonical
+            // `seq_mac` input. Without this guard a 65 KB-plus messageId
+            // from a malicious WS client would reach
+            // `mirror_envelope_to_rest_store` and used to be a `.expect()`
+            // panic; the helper now logs-and-skips, but rejecting at the
+            // boundary keeps the WS store, mirror store, and live deliver
+            // frame consistent.
+            if !crate::seq_mac::is_valid_envelope_id(&msg_id) {
+                tracing::warn!(
+                    msg_id_len = msg_id.len(),
+                    msg_id_max = crate::seq_mac::ENVELOPE_ID_MAX_BYTES,
+                    "send dropped: messageId UTF-8 byte length exceeds 65535"
+                );
+                return;
+            }
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -911,7 +943,10 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let _ws_sent_seq = crate::rest_fallback::mirror_envelope_to_rest_store(
+            // `Option<u64>` — `None` only when the helper's defense-in-depth
+            // length guard fires, which is unreachable after the upstream
+            // `msg_id.len()` check above.
+            let _ws_sent_seq: Option<u64> = crate::rest_fallback::mirror_envelope_to_rest_store(
                 state,
                 &to,
                 &msg_id,

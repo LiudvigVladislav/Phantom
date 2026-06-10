@@ -235,23 +235,33 @@ impl RestTokenStore {
     ///
     /// # Trek 2 Stage 1.x Lock-3 invalidation invariant
     ///
-    /// Removes the prior token from `by_token` under write lock BEFORE
-    /// inserting the new token, then updates `by_identity` to the new
-    /// token. Any concurrent `validate()` call during the window
-    /// between the two lock acquisitions observes at most a transient
-    /// `None` — never a successful validate against the prior token.
-    /// The window is benign in consequence: the old token is
-    /// structurally unreachable from any path that requires a
-    /// `by_token` hit.
+    /// Holds BOTH `by_token` and `by_identity` write locks across the
+    /// entire mutation: remove the prior token from `by_token`, insert
+    /// the new token, update `by_identity` to point at it. The locks
+    /// are acquired in the order `by_token` → `by_identity`, matching
+    /// the acquisition order in `purge_expired()` so a future
+    /// background-sweep + foreground-issue interleave cannot deadlock.
     ///
-    /// Contract pinned by the
-    /// `concurrent_issue_for_same_identity_is_serialised` test in
-    /// `tests/token_invalidation.rs`: after 3 concurrent `issue()` calls
-    /// for the same identity with distinct challenges, exactly one
-    /// returned token validates; the other two return `None`. If that
-    /// test ever fails, the implementation strategy moves from
-    /// invariant-driven to structural refactor (single critical section
-    /// across both maps).
+    /// Holding both locks across the whole operation is the only way
+    /// to ensure that a concurrent `issue()` for the same identity
+    /// observes either the fully-rotated state (old token gone, new
+    /// token bound) or the fully-pre-rotation state — never a
+    /// partial state where both old and new tokens validate. A split-
+    /// lock implementation would allow this interleave:
+    ///
+    /// ```text
+    /// A: by_token.write() → by_identity.read() (None) →
+    ///    by_token.insert(token_A) → release by_token
+    /// B: by_token.write() → by_identity.read() (still None) →
+    ///    by_token.insert(token_B) → release by_token
+    /// A: by_identity.write() → set X → token_A
+    /// B: by_identity.write() → set X → token_B
+    /// ```
+    ///
+    /// Final state: BOTH token_A and token_B sit in `by_token` and
+    /// both validate. The Lock-3 invariant "only one current token
+    /// per identity" would be violated. The merged critical section
+    /// closes the window structurally.
     ///
     /// Single-device-per-identity assumption: `by_identity` maps
     /// `identity → one token`. Multi-device support would require
@@ -269,15 +279,17 @@ impl RestTokenStore {
             identity: identity.to_string(),
             expires_at_ms,
         };
-        {
-            let mut by_token = self.by_token.write().await;
-            // Remove old token if any so the by_token map stays bounded.
-            if let Some(old_token) = self.by_identity.read().await.get(identity) {
-                by_token.remove(old_token.as_str());
-            }
-            by_token.insert(token.clone(), record);
+        // Lock acquisition order matches `purge_expired()` to keep all
+        // mutations of these two maps on a single ordering and prevent
+        // deadlock with the background sweeper.
+        let mut by_token = self.by_token.write().await;
+        let mut by_identity = self.by_identity.write().await;
+        if let Some(old_token) = by_identity.get(identity) {
+            by_token.remove(old_token.as_str());
         }
-        self.by_identity.write().await.insert(identity.to_string(), token.clone());
+        by_token.insert(token.clone(), record);
+        by_identity.insert(identity.to_string(), token.clone());
+        // Both guards drop here in reverse acquisition order.
         (token, expires_at_ms)
     }
 
@@ -295,6 +307,30 @@ impl RestTokenStore {
         // Extend lifetime.
         rec.expires_at_ms = now_ms + TOKEN_TTL_MS;
         Some((existing_token, rec.expires_at_ms))
+    }
+
+    /// Refresh a SPECIFIC token if it is still live in `by_token`. Used
+    /// by the `/auth/session` challenge-cache replay path so a cached
+    /// `(identity, challenge, sig)` tuple can only re-yield the token
+    /// that was originally minted for it — never the post-rotation
+    /// current token. Returns `None` if the token is unknown or
+    /// expired.
+    ///
+    /// Refreshing here is intentional: a successful replay extends the
+    /// token's lifetime, matching the semantic of the existing
+    /// `refresh_if_live` path for the live-by-identity branch.
+    pub async fn refresh_specific_token_if_live(
+        &self,
+        token: &str,
+    ) -> Option<(String, u64)> {
+        let mut by_token = self.by_token.write().await;
+        let rec = by_token.get_mut(token)?;
+        let now_ms = now_ms_u64();
+        if now_ms >= rec.expires_at_ms {
+            return None;
+        }
+        rec.expires_at_ms = now_ms + TOKEN_TTL_MS;
+        Some((token.to_string(), rec.expires_at_ms))
     }
 
     /// Validate a token from the Authorization header.
@@ -625,7 +661,27 @@ pub async fn mirror_envelope_to_rest_store(
     payload: &str,
     sequence_ts: u64,
     expires_at: u64,
-) -> u64 {
+) -> Option<u64> {
+    // Trek 2 Stage 1.x review fix — `envelope_id` reaches this helper
+    // from both REST `/relay/send` (validated upstream) and WS Send
+    // (validated upstream as of the same review). A defense-in-depth
+    // check here means an oversized id from a future caller cannot
+    // reach `compute_seq_mac` and panic the relay; we log and skip the
+    // mirror instead. Returning `None` signals "no MAC produced, no
+    // mirror written"; the WS store entry is still authoritative for
+    // recipients on the WS path.
+    if envelope_id.len() > crate::seq_mac::ENVELOPE_ID_MAX_BYTES {
+        tracing::error!(
+            event            = "mirror_envelope_id_too_long",
+            envelope_id_len  = envelope_id.len(),
+            envelope_id_max  = crate::seq_mac::ENVELOPE_ID_MAX_BYTES,
+            "envelope_id exceeds seq_mac u16-BE length-prefix capacity — \
+             upstream guard missed; mirror skipped to avoid panic on \
+             compute_seq_mac",
+        );
+        return None;
+    }
+
     let seq = state.rest_seq.next(to).await;
     // Trek 2 Stage 1 Q5 lock — quantize `sequence_ts` to the nearest
     // 60-second boundary on the ONE shared storage path so both REST
@@ -657,13 +713,23 @@ pub async fn mirror_envelope_to_rest_store(
     // `SessionResponse.seq_mac_verify_key` (see `rest_session`) so the
     // client can verify on receive.
     let verify_key = state.config.seq_mac_key.derive_verify_key(to);
-    let seq_mac_bytes = verify_key
-        .compute_seq_mac(to, seq, envelope_id, sequence_ts)
-        .expect(
-            "compute_seq_mac returns Err only on envelope_id length \
-             overflow, which is rejected upstream at the request boundary \
-             in rest_send and in the WS Send handler",
-        );
+    let seq_mac_bytes = match verify_key.compute_seq_mac(to, seq, envelope_id, sequence_ts) {
+        Ok(b) => b,
+        Err(err) => {
+            // Unreachable in steady state — the upstream length check
+            // above plus the REST/WS request-boundary guards already
+            // reject oversized envelope_ids. But the contract here is
+            // "never panic on client-controlled input"; log and skip.
+            tracing::error!(
+                event            = "mirror_compute_seq_mac_failed",
+                envelope_id_len  = envelope_id.len(),
+                error            = %err,
+                "compute_seq_mac returned Err inside the mirror — \
+                 mirror skipped (defense-in-depth, should be unreachable)",
+            );
+            return None;
+        }
+    };
     let seq_mac = crate::seq_mac::seq_mac_to_hex(&seq_mac_bytes);
 
     let rest_env = RestEnvelope {
@@ -689,7 +755,7 @@ pub async fn mirror_envelope_to_rest_store(
             "rest_store at capacity — mirror dropped"
         );
     }
-    seq
+    Some(seq)
 }
 
 /// Remove an envelope from `state.rest_store` for `recipient` — the
@@ -1214,14 +1280,20 @@ async fn drain_eligible(
 /// Single-round-trip auth: client supplies (identity, signing_pubkey,
 /// challenge, signature) and receives a bearer token.
 ///
-/// Retry-safe: same (identity, challenge, signature) within 5 minutes → same
-/// token returned. Different challenge → new token; old token stays valid.
+/// Retry-safe: same (identity, challenge, signature) within 5 minutes
+/// returns the SAME originally-issued token if it is still live
+/// (Trek 2 Stage 1.x Lock-3: a cache hit re-yields only the token
+/// minted for that exact tuple, never the post-rotation current
+/// token). Different challenge mints a NEW token AND immediately
+/// invalidates the prior token for that identity — the prior token
+/// is removed from the token store and stops validating on the next
+/// request.
 ///
 /// Status codes:
-///   200 — token returned (fresh or replayed from challenge cache)
+///   200 — token returned (fresh issue, or cache replay of a still-live cached token)
 ///   400 — malformed request
 ///   401 — signature verification failed
-///   410 — challenge expired or unknown
+///   410 — challenge expired, unknown, OR the cached token has been rotated away by a fresh-challenge issue
 pub async fn rest_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SessionRequest>,
@@ -1276,14 +1348,44 @@ pub async fn rest_session(
         .get(&req.identity, &req.challenge, &req.signing_pubkey, &req.signature)
         .await
     {
-        CacheLookup::Hit(_cached_token) => {
-            // Return the live token if still valid; re-issue if it just
-            // expired. The cached_token from the challenge cache is a
-            // pointer to the original issuance; the token store is the
-            // source of truth for current validity.
-            let (token, expires_at) = match state.rest_tokens.refresh_if_live(&req.identity).await {
+        CacheLookup::Hit(cached_token) => {
+            // Trek 2 Stage 1.x Lock-3 — the cache hit's `cached_token`
+            // is the token that was originally minted when this exact
+            // (identity, challenge, signing_pubkey, signature) tuple
+            // was first seen. A retry within the cache TTL must return
+            // ONLY that specific token, and only if it is still live in
+            // the token store. Falling back to "the identity's current
+            // token" would turn a captured (challenge, signature)
+            // tuple into a rolling-token retrieval channel and defeat
+            // the prior-token invalidation contract: an attacker who
+            // observed the original tuple could keep retrieving
+            // whichever token the identity is currently bound to.
+            let (token, expires_at) = match state
+                .rest_tokens
+                .refresh_specific_token_if_live(&cached_token)
+                .await
+            {
                 Some((t, exp)) => (t, exp),
-                None => state.rest_tokens.issue(&req.identity).await,
+                None => {
+                    // The cached token has been rotated away (a
+                    // subsequent /auth/session with a different
+                    // challenge minted a fresh token and removed this
+                    // one from `by_token`) or has expired. The replay
+                    // is no longer redeemable; require a fresh
+                    // challenge.
+                    tracing::warn!(
+                        event    = "rest_session_replay_rejected",
+                        identity = %&req.identity[..8],
+                        reason   = "cached_token_rotated_or_expired",
+                    );
+                    return (
+                        StatusCode::GONE,
+                        Json(serde_json::json!({
+                            "error": "session token rotated; obtain a fresh challenge"
+                        })),
+                    )
+                        .into_response();
+                }
             };
             tracing::info!(
                 event        = "rest_session_replay",
@@ -1654,11 +1756,26 @@ pub async fn rest_send(
     // canonical `seq_mac` input. Production sizes are ~32 bytes; the
     // 65535 ceiling is a defensive cap so an oversized id cannot reach
     // `compute_seq_mac` and force a panic on the store-time MAC path.
-    if req.envelope_id.len() > crate::seq_mac::ENVELOPE_ID_MAX_BYTES {
+    if !crate::seq_mac::is_valid_envelope_id(&req.envelope_id) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "envelope_id UTF-8 byte length exceeds 65535"
+            })),
+        )
+            .into_response();
+    }
+
+    // Trek 2 Stage 1.x review fix — `req.to` is the recipient identity-hex
+    // that flows into the canonical `compute_seq_mac` input inside
+    // `mirror_envelope_to_rest_store`. Validate the shape here (64
+    // ASCII-hex chars) so a malformed recipient cannot reach the MAC
+    // path and so the `&req.to[..8]` log prefix below is safe to read.
+    if !crate::seq_mac::is_valid_recipient_identity_hex(&req.to) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "to must be 64 ASCII-hex characters"
             })),
         )
             .into_response();
@@ -1722,7 +1839,10 @@ pub async fn rest_send(
 
     // Mirror into the REST poll store via the shared helper so a recipient
     // on REST polling always sees the same envelope as a WS-reconnect client.
-    let seq = mirror_envelope_to_rest_store(
+    // `None` here means the defense-in-depth guard inside the helper
+    // detected an oversized envelope_id (already rejected upstream). The
+    // request still completes — only the REST mirror is skipped.
+    let mirrored_seq = mirror_envelope_to_rest_store(
         &state,
         &req.to,
         &req.envelope_id,
@@ -1779,7 +1899,8 @@ pub async fn rest_send(
         from        = %&sender_identity[..8.min(sender_identity.len())],
         to          = %&req.to[..8.min(req.to.len())],
         size_b      = body.len(),
-        seq         = seq,
+        seq         = mirrored_seq.unwrap_or(0),
+        mirrored    = mirrored_seq.is_some(),
     );
 
     let resp_json = serde_json::json!({ "ok": 1 });

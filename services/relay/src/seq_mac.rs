@@ -47,6 +47,28 @@ pub const SEQ_MAC_KEY_DOMAIN_TAG: &[u8] = b"phantom-seq-mac-key-v1\x00";
 /// Production sizes are ~32 bytes; the 65535 ceiling is a defensive cap.
 pub const ENVELOPE_ID_MAX_BYTES: usize = u16::MAX as usize;
 
+/// Shape check for a recipient identity-hex used at REST `/relay/send`
+/// and WS Send entry. The recipient flows into the canonical input of
+/// `compute_seq_mac` via [`SeqMacVerifyKey::compute_seq_mac`]; rejecting
+/// malformed inputs at the request boundary keeps a malformed identity
+/// from reaching the MAC path and also keeps short log-prefix slicing
+/// safe.
+///
+/// True iff `s` is exactly 64 ASCII-hex characters.
+pub fn is_valid_recipient_identity_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Shape check for an envelope-id / WS messageId at the request
+/// boundary. Bounded by [`ENVELOPE_ID_MAX_BYTES`] (65535) so the value
+/// always fits the `u16-BE` length prefix in the canonical MAC input.
+/// Returns false for empty inputs as well — callers already enforce
+/// non-empty independently, but this helper keeps the boundary check
+/// single-call.
+pub fn is_valid_envelope_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= ENVELOPE_ID_MAX_BYTES
+}
+
 /// Fixed-size, zeroized-on-drop wrapper for the relay-side root MAC key.
 ///
 /// The root key NEVER leaves the relay process. It is sourced from the
@@ -429,5 +451,51 @@ mod tests {
         let s = seq_mac_to_hex(&mac);
         assert_eq!(s.len(), 64);
         assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    // ── Boundary-shape helpers (Trek 2 Stage 1.x review fix) ──────────
+
+    #[test]
+    fn is_valid_recipient_identity_hex_accepts_canonical_64_hex() {
+        assert!(is_valid_recipient_identity_hex(&test_identity()));
+        assert!(is_valid_recipient_identity_hex(&"0".repeat(64)));
+        assert!(is_valid_recipient_identity_hex(&"f".repeat(64)));
+        // Lower- and upper-case hex both accepted; canonical form is
+        // lower but the relay does not enforce case at the boundary.
+        assert!(is_valid_recipient_identity_hex(&"A".repeat(64)));
+    }
+
+    #[test]
+    fn is_valid_recipient_identity_hex_rejects_wrong_length() {
+        assert!(!is_valid_recipient_identity_hex(""));
+        assert!(!is_valid_recipient_identity_hex(&"a".repeat(63)));
+        assert!(!is_valid_recipient_identity_hex(&"a".repeat(65)));
+        assert!(!is_valid_recipient_identity_hex(&"a".repeat(128)));
+    }
+
+    #[test]
+    fn is_valid_recipient_identity_hex_rejects_non_hex_chars() {
+        // 64-char strings with non-hex bytes — common attack shapes.
+        let mut bad = "a".repeat(63);
+        bad.push('g'); // not a hex digit
+        assert!(!is_valid_recipient_identity_hex(&bad));
+        let mut bad2 = "a".repeat(63);
+        bad2.push('!');
+        assert!(!is_valid_recipient_identity_hex(&bad2));
+        let mut bad3 = "a".repeat(63);
+        bad3.push(' ');
+        assert!(!is_valid_recipient_identity_hex(&bad3));
+        // Multi-byte UTF-8: even 32 chars worth of 2-byte Cyrillic gives
+        // 64 bytes total — but as a char count it isn't 64, AND the
+        // bytes aren't hex. Either rejection path is correct.
+        assert!(!is_valid_recipient_identity_hex(&"ё".repeat(32)));
+    }
+
+    #[test]
+    fn is_valid_envelope_id_bounds_match_compute_path() {
+        assert!(is_valid_envelope_id("e"));
+        assert!(is_valid_envelope_id(&"x".repeat(ENVELOPE_ID_MAX_BYTES)));
+        assert!(!is_valid_envelope_id(""));
+        assert!(!is_valid_envelope_id(&"x".repeat(ENVELOPE_ID_MAX_BYTES + 1)));
     }
 }

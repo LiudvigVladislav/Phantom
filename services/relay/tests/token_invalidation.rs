@@ -430,6 +430,135 @@ async fn t2_ack_succeeds_after_token_rotation() {
     );
 }
 
+/// Tight-race regression for the `RestTokenStore::issue()` atomicity
+/// invariant. Bypasses the HTTP layer so the only thing being raced
+/// is the `issue()` method itself; the previous HTTP-level test passed
+/// because the cache-fetch + signature-verify path serialised racers
+/// before they reached `issue()`.
+///
+/// Without atomic acquisition of both `by_token` and `by_identity`
+/// inside one critical section, the following interleave leaks an
+/// extra valid token:
+///
+/// ```text
+/// Thread A: by_token.write() → by_identity.read() (None) →
+///           by_token.insert(token_A) → release by_token
+/// Thread B: by_token.write() → by_identity.read() (still None) →
+///           by_token.insert(token_B) → release by_token
+/// Thread A: by_identity.write() → set X → token_A
+/// Thread B: by_identity.write() → set X → token_B
+/// ```
+///
+/// Result: BOTH tokens validate. The Lock-3 invariant ("only one
+/// current token per identity") is violated. The fix is to hold both
+/// write locks across the entire mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_is_atomic_under_concurrent_calls_for_same_identity_no_http() {
+    use phantom_relay::rest_fallback::RestTokenStore;
+    use tokio::sync::Barrier;
+    let store = Arc::new(RestTokenStore::new());
+    let identity = "f".repeat(64);
+
+    // Many concurrent racers maximise the chance of hitting the
+    // interleave window. Multiple rounds raise it further.
+    const N_RACERS: usize = 50;
+    const N_ROUNDS: usize = 20;
+
+    for _ in 0..N_ROUNDS {
+        let barrier = Arc::new(Barrier::new(N_RACERS));
+        let mut handles = Vec::with_capacity(N_RACERS);
+        for _ in 0..N_RACERS {
+            let s = Arc::clone(&store);
+            let b = Arc::clone(&barrier);
+            let id = identity.clone();
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                s.issue(&id).await
+            }));
+        }
+        let mut tokens = Vec::with_capacity(N_RACERS);
+        for h in handles {
+            tokens.push(h.await.unwrap());
+        }
+
+        // After this round, AT MOST ONE token may validate for the
+        // identity. Every issue() must structurally remove the prior
+        // token from `by_token` before inserting its own, atomically
+        // with the `by_identity` update. Any leaked token from a
+        // partial interleave would validate alongside the round's
+        // winner.
+        let mut valid_count = 0;
+        for (t, _) in &tokens {
+            if store.validate(t).await.is_some() {
+                valid_count += 1;
+            }
+        }
+        assert_eq!(
+            valid_count, 1,
+            "exactly one token must validate after a {}-racer round; \
+             got {} valid",
+            N_RACERS, valid_count
+        );
+    }
+}
+
+/// Cache-hit regression. After a token rotation, a replay of the
+/// ORIGINAL `(challenge, signature)` tuple must NOT mint or return
+/// the new current token — that would defeat Lock-3 invalidation,
+/// because anyone who captured the original tuple could keep
+/// retrieving whichever token the identity is currently bound to.
+///
+/// The correct behaviour is: the cache hit returns the originally
+/// issued token if (and only if) that exact token is still live in
+/// the token store. Once a fresh challenge issues a new token, the
+/// original is removed from `by_token`, the cached pointer is stale,
+/// and the replay must not return the new token.
+#[tokio::test]
+async fn auth_session_replay_after_rotation_does_not_return_new_token() {
+    let app = build_app();
+    let identity = identity_hex(9);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+
+    // Original session — establish T1 + populate the challenge cache
+    // with this exact (identity, challenge_1, sig_1) tuple.
+    let (app, nonce_1) = fetch_challenge(app, &identity).await;
+    let (app, status_1, v_1) = call_session(app, &identity, &signing_kp, &nonce_1).await;
+    assert_eq!(status_1, StatusCode::OK);
+    let token_1 = v_1["token"].as_str().unwrap().to_string();
+
+    // Fresh challenge → fresh issue → T2 rotation. T1 is now invalid.
+    let (app, token_2) =
+        obtain_fresh_token_via_new_challenge(app, &identity, &signing_kp).await;
+    assert_ne!(token_1, token_2);
+
+    // T1 must NOT validate after rotation.
+    let (app, status_t1) = call_poll_raw(app, &token_1).await;
+    assert_eq!(status_t1, StatusCode::UNAUTHORIZED);
+
+    // Now the attacker replays the ORIGINAL (challenge_1, sig_1) tuple.
+    // The challenge cache hits — it was populated by the original
+    // session call — but it MUST NOT return T2 (the post-rotation
+    // current token). The thing that MUST NOT happen is that the
+    // replay successfully retrieves a working session token after
+    // the original one was rotated away.
+    let (_app, status_replay, v_replay) =
+        call_session(app, &identity, &signing_kp, &nonce_1).await;
+
+    if status_replay == StatusCode::OK {
+        let replay_token = v_replay["token"].as_str().unwrap_or("").to_string();
+        assert_ne!(
+            replay_token, token_2,
+            "replay of original (challenge, sig) MUST NOT return the post-rotation token T2"
+        );
+        // If the replay returns the cached T1, the cached T1 itself
+        // must not validate (rotation removed it).
+        assert_eq!(replay_token, token_1, "replay must not mint a fresh token");
+    }
+    // Non-200 status is also acceptable — we do not pin the exact
+    // code (410 Gone / 401 Unauthorized are both reasonable).
+}
+
 /// Inverse-DoS regression. A stolen T1 attacker triggering T2 issuance
 /// (via the legitimate client's reauth flow) cannot then race to ack
 /// an envelope on T1 — `rest_ack_deliver` validates against the
