@@ -127,10 +127,11 @@ async fn obtain_token(
     (app, token)
 }
 
-/// Force a fresh `issue()` by going through a NEW challenge fetch + sign
-/// + session call. The challenge cache keys on (identity, challenge,
-/// pubkey, signature), so a fresh challenge produces a fresh token even
-/// for the same identity + signing key.
+/// Force a fresh `issue()` by going through a NEW challenge fetch + sign + session call.
+///
+/// The challenge cache keys on the full identity, challenge, pubkey, signature
+/// tuple, so a fresh challenge produces a fresh token even for the same identity
+/// and signing key.
 async fn obtain_fresh_token_via_new_challenge(
     app: axum::Router,
     identity: &str,

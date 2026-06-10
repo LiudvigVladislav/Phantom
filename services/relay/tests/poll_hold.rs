@@ -582,6 +582,190 @@ async fn no_opt_in_headers_returns_legacy_small_body_short_poll() {
     );
 }
 
+// ── Trek 2 Stage 1.x Lock-1: SessionResponse seq_mac_verify_key + ───────────
+// ── PollEnvelope seq_mac wire-shape contracts ──────────────────────────────
+
+/// SessionResponse carries a `seq_mac_verify_key` field whose value is
+/// the per-identity verify key derived from the relay-side root key
+/// `(here [0u8; 32] in from_env_for_test)`. The field is always
+/// present and the value is byte-equal to the local recomputation
+/// using the production `SeqMacRootKey::derive_verify_key` path.
+#[tokio::test]
+async fn session_response_includes_seq_mac_verify_key_field() {
+    use phantom_relay::seq_mac::SeqMacRootKey;
+    let app = build_app();
+    let identity = identity_hex(200);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (_app, token) = obtain_token(app, &identity, &signing_kp).await;
+    assert!(!token.is_empty(), "should issue token");
+    // Re-issue to inspect the JSON shape directly (idempotent for same
+    // challenge/signature pair).
+    let app2 = build_app();
+    let (app2, nonce_hex) = fetch_challenge(app2, &identity).await;
+    let (_app2, status, v) = call_session(app2, &identity, &signing_kp, &nonce_hex).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let key_hex = v["seq_mac_verify_key"]
+        .as_str()
+        .expect("seq_mac_verify_key must be present");
+    assert_eq!(key_hex.len(), 64, "verify key must be 64-char hex");
+    assert!(
+        key_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "verify key must be lowercase hex"
+    );
+
+    // Independent recomputation must produce the same hex. Pins the
+    // (root, identity) → verify_key contract end-to-end.
+    let root = SeqMacRootKey::from_bytes([0u8; 32]);
+    let expected = root.derive_verify_key(&identity).to_hex();
+    assert_eq!(
+        key_hex, expected,
+        "SessionResponse.seq_mac_verify_key must match server-side derivation"
+    );
+}
+
+/// `/relay/send` rejects an over-sized `envelope_id`. In practice the
+/// 4096-byte `REST_MAX_BODY_BYTES` cap pre-rejects (413) before the
+/// 65535-byte `ENVELOPE_ID_MAX_BYTES` check fires (400), so the test
+/// asserts the request is rejected in SOME form — either status code
+/// is correct, but a 200 would mean an over-sized envelope_id reached
+/// the `seq_mac` computation path and risked a panic.
+///
+/// The `ENVELOPE_ID_MAX_BYTES` check inside `compute_seq_mac` is the
+/// real safety net for the WS Send path (which has its own body-size
+/// regime) and for defense-in-depth on the REST path if the body cap
+/// is ever raised above 65535.
+#[tokio::test]
+async fn rest_send_rejects_over_sized_envelope_id() {
+    let app = build_app();
+    let identity = identity_hex(201);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let huge_id = "x".repeat(65_536);
+    let body = json!({
+        "envelope_id":   huge_id,
+        "to":            identity_hex(202),
+        "sealed_sender": "",
+        "payload":       "AAAA",
+        "sequence_ts":   1_700_000_000_000u64,
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/relay/send")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .header("idempotency-key", "i-am-huge")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE,
+        "over-sized envelope_id must be rejected (got {})",
+        status
+    );
+    assert_ne!(
+        status,
+        StatusCode::CREATED,
+        "over-sized envelope_id must NOT reach the seq_mac computation path"
+    );
+}
+
+/// REST poll wire shape carries `seq_mac` as a 64-char lowercase hex
+/// string on every envelope returned. Pins the additive Lock-1 field
+/// presence + format that Stage 2B-A client wire decoders depend on.
+#[tokio::test]
+async fn rest_poll_envelope_carries_seq_mac_field() {
+    // hold=0 so the test returns immediately whether or not an
+    // envelope is enqueued. Send first, then poll.
+    let app = build_app();
+    let sender = identity_hex(210);
+    let recipient = identity_hex(211);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, sender_token) = obtain_token(app, &sender, &signing_kp).await;
+
+    // Send envelope from `sender` to `recipient`.
+    let (app, send_status) =
+        call_send_with_ts(app, &sender_token, "test-envelope-1", &recipient, 1_700_000_000_000)
+            .await;
+    assert_eq!(send_status, StatusCode::CREATED);
+
+    // Authenticate as the recipient and poll.
+    let signing_kp_recipient = SigningKey::generate(&mut csprng);
+    let (app, recipient_token) =
+        obtain_token(app, &recipient, &signing_kp_recipient).await;
+    let (_app, status, body) =
+        call_poll_with_long_poll_optin(app, &recipient_token).await;
+    assert_eq!(status, StatusCode::OK);
+    // Find the substring `"seq_mac":` and assert the field shape.
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        body_str.contains("\"seq_mac\":"),
+        "REST poll body MUST contain `seq_mac` field; body[0..200]={}",
+        &body_str[..body_str.len().min(200)]
+    );
+
+    // Parse and verify the value matches Stage 1.x expected shape.
+    #[derive(Deserialize)]
+    struct PollResp {
+        envelopes: Vec<PollEnvelopeShape>,
+    }
+    #[derive(Deserialize)]
+    struct PollEnvelopeShape {
+        seq_mac: String,
+    }
+    let parsed: PollResp = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed.envelopes.len(), 1);
+    let mac_hex = &parsed.envelopes[0].seq_mac;
+    assert_eq!(mac_hex.len(), 64, "seq_mac must be 64-char hex");
+    assert!(
+        mac_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "seq_mac must be lowercase hex"
+    );
+}
+
+/// WS-vs-REST asymmetry — the WS Deliver wire path does NOT carry the
+/// `seq_mac` field even when the same envelope is also stored in the
+/// REST poll store with a MAC. The Stage 2B-A client type-split rests
+/// on this contract: a `WsDeliver` Kotlin data class without a
+/// `seq_mac` field cannot accidentally try to verify a MAC that the
+/// server never sent.
+///
+/// This test asserts the server-side type-shape rather than the wire
+/// bytes (a full WS upgrade + frame parse is heavy for what is a
+/// type-level invariant): the `Envelope` WS-Deliver struct has no
+/// `seq_mac` field, so it cannot serialize one regardless of whether
+/// the mirrored `RestEnvelope` carries the column.
+#[test]
+fn ws_deliver_envelope_type_has_no_seq_mac_field() {
+    // The serde JSON serialization of the WS `Envelope` struct does
+    // not include any `seq_mac` key. We construct an Envelope with
+    // representative fields and assert by string substring.
+    let env = phantom_relay::envelope::Envelope {
+        id: "ws-msg-1".to_string(),
+        to: "b".repeat(64),
+        from: "a".repeat(64),
+        sealed_sender: String::new(),
+        payload: "AAAA".to_string(),
+        expires_at: 1_700_000_001_000,
+    };
+    let json = serde_json::to_string(&env).expect("Envelope serializes");
+    assert!(
+        !json.contains("seq_mac"),
+        "WS `Envelope` JSON MUST NOT carry a `seq_mac` field; json={}",
+        json
+    );
+}
+
 // ── Q2: ack-deliver rate-limit at 120/window ─────────────────────────────────
 
 #[tokio::test]
