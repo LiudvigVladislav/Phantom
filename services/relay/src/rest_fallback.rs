@@ -481,6 +481,20 @@ pub struct RestEnvelope {
     pub seq: u64,
     /// Unix epoch seconds when this envelope expires.
     pub expires_at: u64,
+    /// Trek 2 Stage 1.x `seq_mac` — HMAC-SHA-256 integrity tag computed
+    /// at store time over `(identity_hex, seq, envelope_id, sequence_ts)`
+    /// using the per-identity verify key derived from `RELAY_SEQ_MAC_KEY`.
+    /// 64-char lowercase hex. See `seq_mac::SeqMacVerifyKey::compute_seq_mac`
+    /// for the canonical input encoding and the threat-model wording on
+    /// `PollEnvelope::seq_mac`.
+    ///
+    /// `#[serde(default)]` so that any code path that deserializes a
+    /// `RestEnvelope` from a pre-Stage-1.x JSON form (e.g. snapshot
+    /// fixtures in tests) reads as the empty string rather than failing.
+    /// Production stores are in-memory only, so a relay restart begins
+    /// with this column populated by every new mirror call.
+    #[serde(default)]
+    pub seq_mac: String,
 }
 
 impl RestEnvelope {
@@ -533,6 +547,38 @@ pub async fn mirror_envelope_to_rest_store(
     // RestEnvelope. Server-side, unconditional — the relay does not
     // trust the client to pre-quantize (Q7 of security-reviewer).
     let sequence_ts = quantize_sequence_ts_to_60s(sequence_ts);
+
+    // Trek 2 Stage 1.x Lock-1 — compute the `seq_mac` integrity tag at
+    // STORE time over the canonical
+    // `(identity_hex, seq, envelope_id, sequence_ts)` tuple and persist
+    // it in the `seq_mac` column on `RestEnvelope`. The poll-response
+    // path (`drain_eligible`) reads this column verbatim — it does NOT
+    // recompute the MAC at response time.
+    //
+    // Why store-time and not response-time: response-time computation
+    // would HMAC over whatever the DB returns, including already-
+    // corrupted values; a client receiving such a MAC would verify
+    // successfully and consume the corrupted envelope. Store-time
+    // computation creates a persistent integrity anchor — any
+    // subsequent mutation to `envelope_id`, `seq`, or `sequence_ts`
+    // without also recomputing this column produces a mismatch when
+    // the client verifies on receive.
+    //
+    // Per-identity verify key derivation goes through the relay-side
+    // root key; the root key never leaves this process. The same
+    // derived key is published to the client in
+    // `SessionResponse.seq_mac_verify_key` (see `rest_session`) so the
+    // client can verify on receive.
+    let verify_key = state.config.seq_mac_key.derive_verify_key(to);
+    let seq_mac_bytes = verify_key
+        .compute_seq_mac(to, seq, envelope_id, sequence_ts)
+        .expect(
+            "compute_seq_mac returns Err only on envelope_id length \
+             overflow, which is rejected upstream at the request boundary \
+             in rest_send and in the WS Send handler",
+        );
+    let seq_mac = crate::seq_mac::seq_mac_to_hex(&seq_mac_bytes);
+
     let rest_env = RestEnvelope {
         id: envelope_id.to_string(),
         from: String::new(),
@@ -541,6 +587,7 @@ pub async fn mirror_envelope_to_rest_store(
         sequence_ts,
         seq,
         expires_at,
+        seq_mac,
     };
     let mut rest_store = state.rest_store.write().await;
     let queue = rest_store.entry(to.to_string()).or_default();
@@ -636,6 +683,21 @@ pub struct SessionResponse {
     /// **always present** (no `skip_serializing_if`) so old clients that
     /// check for field presence see explicit `0` rather than absence.
     pub poll_hold_secs: u32,
+    /// Trek 2 Stage 1.x — per-identity verify key for the `seq_mac`
+    /// integrity tag on `PollEnvelope`. 64-char lowercase hex (32-byte
+    /// HMAC-SHA-256 output). Derived from the relay-side root key
+    /// (which never leaves the relay process) and the bound identity.
+    ///
+    /// The same derived key is used by the server to compute each
+    /// envelope's `seq_mac` at store time AND by the client to verify
+    /// on receive. The client can verify MACs for envelopes addressed
+    /// to itself, and to itself only — without the root key, the client
+    /// cannot derive any other identity's key.
+    ///
+    /// Field is always present so the wire shape is stable; old
+    /// clients lacking awareness of the field simply ignore it (serde
+    /// `ignoreUnknownKeys` on the Android JSON codec).
+    pub seq_mac_verify_key: String,
 }
 
 #[derive(Serialize)]
@@ -683,6 +745,26 @@ pub struct PollEnvelope {
     pub payload: String,
     pub sequence_ts: u64,
     pub seq: u64,
+    /// Trek 2 Stage 1.x — HMAC-SHA-256 integrity tag over
+    /// `(identity_hex, seq, envelope_id, sequence_ts)`, computed at
+    /// envelope STORE time (inside `mirror_envelope_to_rest_store`),
+    /// persisted as a column on `RestEnvelope`, and read verbatim
+    /// here — never recomputed at response time. 64-char lowercase hex.
+    ///
+    /// Threat-model wording, verbatim from the locked scope doc — do
+    /// NOT soften:
+    ///
+    /// This protects against poll-layer / DB tamper / bugs (envelopes
+    /// mishandled by relay code, by-token cache corruption, accidental
+    /// seq replay from misuse of the dedup buckets), **not** a fully
+    /// malicious relay operator unless signing key is outside the
+    /// relay process. Do not pretend otherwise.
+    ///
+    /// Always present and non-empty on this REST-poll wire shape. The
+    /// WS Deliver wire shape (a distinct struct, see `routes.rs`)
+    /// does NOT carry a `seq_mac` field — verification semantics apply
+    /// only to the batched poll path.
+    pub seq_mac: String,
 }
 
 #[derive(Serialize)]
@@ -937,6 +1019,13 @@ async fn drain_eligible(
             payload: e.payload.clone(),
             sequence_ts: e.sequence_ts,
             seq: e.seq,
+            // Trek 2 Stage 1.x Lock-1 — read the stored MAC verbatim;
+            // store-time computation is the persistent integrity anchor.
+            // Recomputing here would silently re-sign over whatever the
+            // DB currently returns, collapsing the DB-tamper scope to
+            // "tamper between drain and wire" — a far narrower threat
+            // than the wording on `PollEnvelope::seq_mac` promises.
+            seq_mac: e.seq_mac.clone(),
         })
         .collect();
     Some((batch, more))
@@ -1040,6 +1129,15 @@ pub async fn rest_session(
                     expires_at,
                 )
                 .await;
+            // Trek 2 Stage 1.x Lock-1 — derive the per-identity verify
+            // key from the relay-side root key and publish its hex form
+            // to the client. The same key is used by the server to
+            // compute each envelope's `seq_mac` at store time.
+            let seq_mac_verify_key = state
+                .config
+                .seq_mac_key
+                .derive_verify_key(&req.identity)
+                .to_hex();
             return (
                 StatusCode::OK,
                 Json(SessionResponse {
@@ -1053,6 +1151,7 @@ pub async fn rest_session(
                         max_upload_body_bytes: state.config.max_media_upload_body_bytes,
                     },
                     poll_hold_secs: state.config.poll_hold_secs,
+                    seq_mac_verify_key,
                 }),
             )
                 .into_response();
@@ -1226,6 +1325,15 @@ pub async fn rest_session(
         token_prefix = %&token[..8],
     );
 
+    // Trek 2 Stage 1.x Lock-1 — derive + publish the per-identity verify
+    // key on the fresh-issuance path too. Mirrors the cache-hit branch
+    // above so both code paths return the same wire shape.
+    let seq_mac_verify_key = state
+        .config
+        .seq_mac_key
+        .derive_verify_key(&req.identity)
+        .to_hex();
+
     (
         StatusCode::OK,
         Json(SessionResponse {
@@ -1239,6 +1347,7 @@ pub async fn rest_session(
                 max_upload_body_bytes: state.config.max_media_upload_body_bytes,
             },
             poll_hold_secs: state.config.poll_hold_secs,
+            seq_mac_verify_key,
         }),
     )
         .into_response()
@@ -1359,6 +1468,21 @@ pub async fn rest_send(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "envelope_id, to, and payload are required"
+            })),
+        )
+            .into_response();
+    }
+
+    // Trek 2 Stage 1.x Lock-1 — bound the UTF-8 byte length of
+    // `envelope_id` to the `u16-BE` length-prefix capacity used in the
+    // canonical `seq_mac` input. Production sizes are ~32 bytes; the
+    // 65535 ceiling is a defensive cap so an oversized id cannot reach
+    // `compute_seq_mac` and force a panic on the store-time MAC path.
+    if req.envelope_id.len() > crate::seq_mac::ENVELOPE_ID_MAX_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "envelope_id UTF-8 byte length exceeds 65535"
             })),
         )
             .into_response();
@@ -1790,6 +1914,12 @@ mod tests {
             payload: "x".repeat(payload_bytes),
             sequence_ts: 1_700_000_000_000,
             seq: 42,
+            // Trek 2 Stage 1.x — the padding canonical-size tests use a
+            // 64-char placeholder MAC so the wire-size math reflects the
+            // Stage 1.x `seq_mac` field shape. Real MACs are byte-exact
+            // hex from `SeqMacVerifyKey::compute_seq_mac`; for padding
+            // sizing the bytes themselves don't matter, only the length.
+            seq_mac: "0".repeat(64),
         }
     }
 

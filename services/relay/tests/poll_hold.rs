@@ -852,6 +852,13 @@ async fn poll_hold_loop_timeout_recheck_catches_envelope_without_notify() {
         // Far future so the queue retain in drain_eligible does not
         // purge it as expired during the test.
         expires_at: u64::MAX / 2,
+        // Trek 2 Stage 1.x — this test bypasses `mirror_envelope_to_rest_store`
+        // (the only production path that computes the real MAC), so a
+        // placeholder hex string is sufficient for the queue-rescan
+        // assertion. Real-MAC contract tests live in the new
+        // `seq_mac_vectors.rs` integration suite and in the
+        // mirror-path integration tests below.
+        seq_mac: "0".repeat(64),
     };
     {
         let mut rest_store = state.rest_store.write().await;
