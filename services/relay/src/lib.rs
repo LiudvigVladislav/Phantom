@@ -17,4 +17,5 @@ pub mod prekeys;
 pub mod push;
 pub mod rest_fallback;
 pub mod routes;
+pub mod seq_mac;
 pub mod state;
