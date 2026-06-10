@@ -88,14 +88,21 @@ class RestFallbackOrchestratorTest {
         // standing up a real OkHttp client.
         val pollOptIns: MutableList<Boolean> = mutableListOf()
 
+        // Trek 2 Stage 2B-A (B2) — observe the per-call `readTimeoutMs`
+        // override so M2 can assert the L2 timeout gate (`null` = legacy
+        // short-poll timeout; non-null = lifted budget).
+        val pollReadTimeouts: MutableList<Long?> = mutableListOf()
+
         override suspend fun poll(
             url: String,
             token: String,
             sinceSeq: Long?,
             longPollOptIn: Boolean,
+            readTimeoutMs: Long?,
         ): RestFallbackResponse<PollResponse> {
             pollCalls += sinceSeq
             pollOptIns += longPollOptIn
+            pollReadTimeouts += readTimeoutMs
             return RestFallbackResponse(200, PollResponse(emptyList(), false), "{}", 1L)
         }
 

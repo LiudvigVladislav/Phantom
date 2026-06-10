@@ -540,14 +540,28 @@ class RestFallbackOrchestrator(
                 // on the single `longPollEnabled` Boolean computed by the
                 // wire-up layer from `LONGPOLL_V2_ENABLED`. Headers ride
                 // ONE flag in this stage; lock L1 forbids LP-alone and
-                // PP-alone client postures. Per-Stage 2B-A scope, no
-                // other behaviour change is gated by this flag here —
-                // timeout and parallel job join in B2 and B3.
+                // PP-alone client postures.
+                //
+                // Trek 2 Stage 2B-A (B2) — gate the raised OkHttp
+                // read / call timeout on `LONGPOLL_V2_ENABLED == "1"`
+                // AND `pollHoldSecs in 1..480` (lock L2). The L1 flag
+                // alone is not sufficient: an opt-in client whose
+                // server has the kill switch on (`pollHoldSecs == 0`)
+                // or which advertises a value out of the locked range
+                // gets the short-poll timeout — the headers go out,
+                // but the budget does not change. The two-condition
+                // gate is computed once per call in the companion
+                // helper so M2's 9-cell matrix can pin it without
+                // standing up an orchestrator.
                 transport.poll(
                     url = "$baseUrl/relay/poll",
                     token = token,
                     sinceSeq = lastSeenSeq,
                     longPollOptIn = longPollEnabled,
+                    readTimeoutMs = computeLongPollReadTimeoutMs(
+                        longPollEnabled = longPollEnabled,
+                        pollHoldSecs = _capabilities.value.pollHoldSecs,
+                    ),
                 )
             }
             val elapsed = now() - startMs
@@ -797,6 +811,72 @@ class RestFallbackOrchestrator(
     }
 
     companion object {
+        /**
+         * Trek 2 Stage 2B-A (B2) — minimum relay-advertised
+         * `pollHoldSecs` value at which the client raises its read /
+         * call timeout for `/relay/poll`. Mirrors lock L2 lower bound:
+         * the server allows holds in `[1, 480]`, and a value of `0`
+         * means the kill switch is active server-side and the client
+         * MUST short-poll regardless of the flag.
+         */
+        const val MIN_POLL_HOLD_SECS: Int = 1
+
+        /**
+         * Trek 2 Stage 2B-A (B2) — maximum relay-advertised
+         * `pollHoldSecs` value at which the client raises its timeout.
+         * Mirrors the server's `MAX_POLL_HOLD_SECS_CAP` constant in
+         * `services/relay/src/rest_fallback.rs`. A server advertising
+         * a value above this is out of spec; the client falls back to
+         * its legacy short-poll timeout rather than honouring the
+         * advertised value.
+         */
+        const val MAX_POLL_HOLD_SECS_CAP: Int = 480
+
+        /**
+         * Trek 2 Stage 2B-A (B2) — extra seconds added on top of
+         * `pollHoldSecs` to absorb TCP / TLS round-trip variance on
+         * the long-poll response without ballooning the hung-request
+         * budget on Tele2-class radios. Scope lock L2 pins this margin
+         * inside `[2, 8]` seconds; values outside that band require a
+         * re-lock. Five sits in the middle of the band and is the
+         * shipped value.
+         */
+        const val POLL_HOLD_SAFETY_MARGIN_SECS: Int = 5
+
+        /**
+         * Trek 2 Stage 2B-A (B2) — compute the read / call timeout
+         * override that the orchestrator passes to
+         * [RestFallbackTransport.poll]'s `readTimeoutMs` parameter for
+         * a single `/relay/poll` call.
+         *
+         * Returns the override in milliseconds when BOTH halves of L2
+         * hold:
+         *
+         *   * [longPollEnabled] is `true` (`LONGPOLL_V2_ENABLED == "1"`),
+         *     AND
+         *   * [pollHoldSecs] is in `[MIN_POLL_HOLD_SECS,
+         *     MAX_POLL_HOLD_SECS_CAP]` (inclusive).
+         *
+         * Returns `null` (legacy short-poll timeout) when either half
+         * fails. `null` is the byte-identical-with-Stage-1 default
+         * that the legacy `transport.poll(...)` call uses when the
+         * parameter is omitted.
+         *
+         * The override value is
+         * `([pollHoldSecs] + [POLL_HOLD_SAFETY_MARGIN_SECS]) * 1000`.
+         *
+         * Pure function, no I/O — kept in the companion so M2's
+         * 9-cell matrix can hit it without standing up an orchestrator.
+         */
+        fun computeLongPollReadTimeoutMs(
+            longPollEnabled: Boolean,
+            pollHoldSecs: Int,
+        ): Long? {
+            if (!longPollEnabled) return null
+            if (pollHoldSecs !in MIN_POLL_HOLD_SECS..MAX_POLL_HOLD_SECS_CAP) return null
+            return (pollHoldSecs + POLL_HOLD_SAFETY_MARGIN_SECS).toLong() * 1000L
+        }
+
         /**
          * Max attempts for a single [sendEnvelope] call. Five gives the
          * Tele2 middlebox five randomly-distributed windows to let a POST

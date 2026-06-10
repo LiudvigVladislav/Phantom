@@ -109,9 +109,16 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         token: String,
         sinceSeq: Long?,
         longPollOptIn: Boolean,
+        readTimeoutMs: Long?,
     ): RestFallbackResponse<PollResponse> = withContext(Dispatchers.IO) {
         val fullUrl = if (sinceSeq != null) "$url?since_seq=$sinceSeq" else url
-        val response = get(fullUrl, token, op = "poll", longPollOptIn = longPollOptIn)
+        val response = get(
+            url = fullUrl,
+            token = token,
+            op = "poll",
+            longPollOptIn = longPollOptIn,
+            readTimeoutOverrideMs = readTimeoutMs,
+        )
         decode(response, PollResponse.serializer())
     }
 
@@ -162,8 +169,13 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         token: String,
         op: String,
         longPollOptIn: Boolean = false,
+        readTimeoutOverrideMs: Long? = null,
     ): RawResponse {
-        val client = buildClient(op = op, correlationKey = url)
+        val client = buildClient(
+            op = op,
+            correlationKey = url,
+            readTimeoutOverrideMs = readTimeoutOverrideMs,
+        )
         val request = buildPollRequest(url = url, token = token, longPollOptIn = longPollOptIn)
         return execute(client, request)
     }
@@ -205,14 +217,28 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         )
     }
 
-    private fun buildClient(op: String, correlationKey: String): OkHttpClient =
-        OkHttpClient.Builder()
+    private fun buildClient(
+        op: String,
+        correlationKey: String,
+        readTimeoutOverrideMs: Long? = null,
+    ): OkHttpClient {
+        // Trek 2 Stage 2B-A (B2) — long-poll path needs BOTH read and
+        // call ceilings lifted, since OkHttp's `callTimeout` is the
+        // hard cap on the whole request. Lifting only `readTimeout`
+        // would let the call die at `callTimeoutMs` (~10 s) before the
+        // server's hold window completed. The override applies to
+        // both budgets symmetrically — same value, so the call cannot
+        // outlive the read budget but neither budget cuts the
+        // negotiated hold time short.
+        val effectiveReadMs = readTimeoutOverrideMs ?: readTimeoutMs
+        val effectiveCallMs = if (readTimeoutOverrideMs != null) readTimeoutOverrideMs else callTimeoutMs
+        return OkHttpClient.Builder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
             .retryOnConnectionFailure(false)
-            .callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+            .callTimeout(effectiveCallMs, TimeUnit.MILLISECONDS)
             .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
-            .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(effectiveReadMs, TimeUnit.MILLISECONDS)
             .writeTimeout(writeTimeoutMs, TimeUnit.MILLISECONDS)
             .also { builder ->
                 // Trek 2 Stage 2A (A4) — wire the SOCKS5 proxy iff the
@@ -245,6 +271,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
                 ),
             )
             .build()
+    }
 
     companion object {
         /**

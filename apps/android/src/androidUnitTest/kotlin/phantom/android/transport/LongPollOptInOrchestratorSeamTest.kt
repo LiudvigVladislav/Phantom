@@ -56,24 +56,32 @@ class LongPollOptInOrchestratorSeamTest {
     @Test
     fun orchestrator_has_exactly_one_transport_poll_call_site() {
         val source = orchestratorSource.readText(Charsets.UTF_8)
-        val callSites = Regex("""transport\.poll\(""").findAll(source).count()
+        // Match the actual call shape (`transport.poll(` immediately
+        // followed by a newline — i.e. multi-line argument list) so
+        // KDoc mentions of `transport.poll(...)` are not counted.
+        val callSites = Regex("""transport\.poll\(\r?\n""").findAll(source).count()
         assertEquals(
             1,
             callSites,
             "RestFallbackOrchestrator must carry exactly ONE `transport.poll(...)` call " +
-                "site for the L1 seam to be auditable. Found $callSites — a second " +
-                "call site would let one path forget the `longPollOptIn` parameter " +
-                "and silently disable Stage 2B-A's header emission.",
+                "site for the L1 / L2 seam to be auditable. Found $callSites — a " +
+                "second call site would let one path forget the `longPollOptIn` " +
+                "parameter or the `readTimeoutMs` parameter and silently disable " +
+                "Stage 2B-A's header emission or timeout gate.",
         )
     }
 
     @Test
     fun the_one_call_site_forwards_long_poll_enabled() {
         val source = orchestratorSource.readText(Charsets.UTF_8)
-        val callSiteStart = source.indexOf("transport.poll(")
+        val callSiteStart = Regex("""transport\.poll\(\r?\n""")
+            .find(source)
+            ?.range
+            ?.first
+            ?: -1
         assertNotNull(
             callSiteStart.takeIf { it >= 0 },
-            "Expected `transport.poll(` in RestFallbackOrchestrator.kt.",
+            "Expected `transport.poll(` (call form) in RestFallbackOrchestrator.kt.",
         )
         val callSiteBlock = extractBalancedParenBlock(source, callSiteStart)
             ?: fail("Could not extract balanced parentheses for the transport.poll(...) call.")
@@ -83,6 +91,41 @@ class LongPollOptInOrchestratorSeamTest {
                 "verbatim. Found call:\n  transport.poll($callSiteBlock)\n" +
                 "A future refactor that hard-codes `longPollOptIn = false` or drops the " +
                 "parameter would silently bypass the L1 flag.",
+        )
+    }
+
+    @Test
+    fun the_one_call_site_forwards_computed_read_timeout() {
+        // Trek 2 Stage 2B-A (B2) — pin that the orchestrator forwards
+        // the L2-gate result via the `readTimeoutMs` parameter rather
+        // than hard-coding `null` (which would short-circuit the L2
+        // gate) or computing the value inline (which would let the
+        // formula drift away from the locked
+        // `computeLongPollReadTimeoutMs` helper that M2 pins).
+        val source = orchestratorSource.readText(Charsets.UTF_8)
+        val callSiteStart = Regex("""transport\.poll\(\r?\n""")
+            .find(source)
+            ?.range
+            ?.first
+            ?: fail("Expected `transport.poll(` call form in orchestrator.")
+        val callSiteBlock = extractBalancedParenBlock(source, callSiteStart)
+            ?: fail("Could not extract balanced parentheses for the transport.poll(...) call.")
+        assertTrue(
+            callSiteBlock.contains("readTimeoutMs = computeLongPollReadTimeoutMs("),
+            "The `transport.poll(...)` call must forward `readTimeoutMs = " +
+                "computeLongPollReadTimeoutMs(...)` so the L2 gate runs through " +
+                "the locked helper. Found call:\n  transport.poll($callSiteBlock)",
+        )
+        // The computed call must include both gate inputs.
+        assertTrue(
+            callSiteBlock.contains("longPollEnabled = longPollEnabled"),
+            "L2 gate must take `longPollEnabled` as the first input — found " +
+                "call body:\n$callSiteBlock",
+        )
+        assertTrue(
+            callSiteBlock.contains("pollHoldSecs = "),
+            "L2 gate must take `pollHoldSecs` as the second input — found " +
+                "call body:\n$callSiteBlock",
         )
     }
 

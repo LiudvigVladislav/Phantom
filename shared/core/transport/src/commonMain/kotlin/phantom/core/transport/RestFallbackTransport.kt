@@ -93,12 +93,27 @@ interface RestFallbackTransport {
      * `"0"`). Backwards-compat default `false` means a call site that
      * has not been updated still produces a Stage-1-byte-identical
      * legacy short-poll request.
+     *
+     * Trek 2 Stage 2B-A (B2) — [readTimeoutMs] OPTIONALLY overrides the
+     * transport's default read-timeout for THIS call only. `null` (the
+     * legacy default) means "use the transport's own short-poll
+     * timeout" — the orchestrator passes a non-null value ONLY when
+     * both halves of lock L2 hold:
+     *
+     *   * `LONGPOLL_V2_ENABLED == "1"`, AND
+     *   * the relay-advertised `pollHoldSecs` is in `[1, 480]`.
+     *
+     * The override value is `(pollHoldSecs + safety_margin) * 1000`
+     * milliseconds, where `safety_margin` is a few seconds inside
+     * `[2, 8]`. The wire-up layer applies this override; legacy code
+     * paths that do not pass the parameter remain byte-identical.
      */
     suspend fun poll(
         url: String,
         token: String,
         sinceSeq: Long? = null,
         longPollOptIn: Boolean = false,
+        readTimeoutMs: Long? = null,
     ): RestFallbackResponse<PollResponse>
 
     /**
