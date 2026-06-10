@@ -97,6 +97,43 @@ pub const POLL_RESPONSE_CANONICAL_BYTES: usize = 4_608;
 /// Parallels `IDEMPOTENCY_LRU_CAP`.
 pub const POLL_HOLD_NOTIFIERS_LRU_CAP: usize = 50_000;
 
+/// Trek 2 Stage 1.x Lock-4 — per-identity concurrent-hold cap.
+///
+/// At most this many `/relay/poll` requests for the same identity may
+/// sit in the long-poll hold path at once. The 4th and subsequent
+/// concurrent holds receive `HTTP 429 Too Many Requests` with
+/// `Retry-After: 30`. A single buggy client (or attacker holding a
+/// stolen token) therefore cannot tie up an unbounded slice of the
+/// 50k-entry `notifiers` map for one identity.
+///
+/// The check is a `compare_exchange` CAS loop bounded by this constant,
+/// so the worst case is a few retries when concurrent racers each see
+/// the same pre-increment value. Decrement runs in `HoldGuard::drop`,
+/// which the Rust language guarantees fires whenever the owning future
+/// is actually dropped (request completion, panic, axum future drop
+/// on TCP close, server shutdown). The drop is NOT instantaneous from
+/// the caller's perspective under `JoinHandle::abort()` — tests that
+/// observe the counter must await task completion first.
+pub const PER_IDENTITY_HOLD_CAP: u8 = 3;
+
+/// Trek 2 Stage 1.x Lock-4 — server-side hard ceiling on per-request
+/// hold time, in seconds. Applied as a DUAL-LAYER clamp:
+///
+/// 1. **Config-parse-time clamp.** `RelayConfig::from_env()` clamps
+///    `RELAY_POLL_HOLD_SECS` to `min(parsed, MAX_POLL_HOLD_SECS_CAP)`
+///    so the value announced to clients in `SessionResponse.poll_hold_secs`
+///    is always within the ceiling.
+/// 2. **Runtime per-hold clamp.** Inside `poll_hold_loop`, the
+///    `tokio::time::timeout(...)` wrapping the notifier wait uses
+///    `min(hold_secs, MAX_POLL_HOLD_SECS_CAP)` as the duration. If a
+///    future code path bypasses the config clamp, the runtime cap
+///    still bounds the worst-case stale-hold duration.
+///
+/// 480 s (8 min) aligns with the Tor circuit rotation window in the
+/// Trek 2 mini-lock and keeps the worst-case TCP-RST-not-yet-observed
+/// stale slot bounded to the same horizon.
+pub const MAX_POLL_HOLD_SECS_CAP: u32 = 480;
+
 /// Coalescing delay (ms) between a `notify_one()` wake and the
 /// post-wake queue re-check. Lets a burst of `/relay/send` calls
 /// for the same recipient batch into one poll response without
@@ -951,51 +988,134 @@ pub fn pad_poll_response(mut resp: PollResponse) -> Vec<u8> {
     padded
 }
 
+/// Trek 2 Stage 1.x Lock-4 — RAII guard that increments
+/// `HoldSlot::hold_count` on acquisition and decrements on drop. The
+/// decrement runs whenever the owning future is actually dropped:
+/// normal completion of `poll_hold_loop`, panic, server shutdown, or
+/// the axum handler future being dropped by tokio after a TCP close.
+///
+/// Drop is NOT instantaneous from a `JoinHandle::abort()` caller's
+/// perspective — tokio drops the task's future when it processes the
+/// cancellation. Tests that abort a task and then read `hold_count`
+/// MUST first await the join handle (or observe completion via a
+/// watch channel signalled from the handler's `Drop`).
+pub struct HoldGuard {
+    slot: Arc<crate::state::HoldSlot>,
+}
+
+impl HoldGuard {
+    /// CAS-bounded increment. Returns `Some(guard)` on success, `None`
+    /// if the per-identity cap is already at [`PER_IDENTITY_HOLD_CAP`].
+    /// The retry loop is bounded by the cap value: a racer that always
+    /// loses can retry at most cap times before seeing the saturated
+    /// value and returning `None`.
+    pub fn try_acquire(slot: Arc<crate::state::HoldSlot>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = slot.hold_count.load(Ordering::Acquire);
+            if current >= PER_IDENTITY_HOLD_CAP {
+                return None;
+            }
+            if slot
+                .hold_count
+                .compare_exchange(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(Self { slot });
+            }
+            // Lost the race; another racer incremented first. Retry.
+        }
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.slot.hold_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Outcome of a `/relay/poll` long-poll request after the hold loop
+/// resolves. The handler maps this to either a success response
+/// (`Ready`) or a 429 + `Retry-After: 30` (`HoldCapExceeded`).
+pub enum PollOutcome {
+    /// Per-identity concurrent-hold cap exceeded — the handler must
+    /// return `HTTP 429 Too Many Requests` with `Retry-After: 30`.
+    HoldCapExceeded,
+    /// Normal completion — return the envelopes (possibly empty).
+    Ready { envelopes: Vec<PollEnvelope>, more: bool },
+}
+
 /// Trek 2 Stage 1 — long-poll hold loop for `/relay/poll`. Free
 /// function (not inlined into the axum handler) so the wait can be
 /// unit-tested with `tokio::time::pause` and deterministic stepping.
 ///
 /// Contract:
 ///   * If `rest_store` for `recipient` has eligible envelopes
-///     (`seq > since_seq` and not expired), returns immediately.
-///   * Else if `hold_secs == 0`, returns immediately with empty batch
-///     (kill-switch fast path — no Notify entry created, no map mutation).
-///   * Else looks up (or inserts, bounded by `POLL_HOLD_NOTIFIERS_LRU_CAP`)
-///     the recipient's `Arc<Notify>` and races (a) `notify_one()` arrival,
-///     (b) `hold_secs`-second timeout. On wake (a) sleeps
-///     `POLL_HOLD_COALESCE_MS` so a burst of sends batches, then re-reads
-///     the queue. On timeout (b) returns empty.
-///   * If the notifier map is at capacity AND the recipient has no entry,
-///     degrades to immediate-return short-poll (Guardrail A — envelope
-///     still in `rest_store` for the next poll cycle).
+///     (`seq > since_seq` and not expired), returns `Ready` immediately
+///     without consuming a hold-cap slot.
+///   * Else if `hold_secs == 0`, returns `Ready` (empty batch) — the
+///     kill-switch fast path. No Notify entry is created, no map
+///     mutation happens, and no hold-cap slot is consumed.
+///   * Else looks up (or inserts, bounded by
+///     [`POLL_HOLD_NOTIFIERS_LRU_CAP`]) the recipient's [`HoldSlot`]
+///     and attempts to acquire a per-identity hold slot via
+///     [`HoldGuard::try_acquire`]. On cap exceeded returns
+///     [`PollOutcome::HoldCapExceeded`]; the handler returns 429.
+///   * Otherwise races (a) `notify_one()` arrival, (b) the
+///     `min(hold_secs, MAX_POLL_HOLD_SECS_CAP)`-second timeout. On
+///     wake sleeps [`POLL_HOLD_COALESCE_MS`] so a burst of sends
+///     batches, then re-reads the queue. On timeout returns empty.
+///   * If the notifier map is at capacity AND the recipient has no
+///     entry, degrades to immediate-return short-poll (Guardrail A —
+///     envelope still in `rest_store` for the next poll cycle).
 ///
-/// Returns `(envelopes, more)` — same shape the caller previously built
-/// inline. The caller is responsible for wrapping these in a
-/// `PollResponse` and applying `pad_poll_response`.
+/// Returns a [`PollOutcome`]. The caller is responsible for shaping
+/// the success path into a `PollResponse` and applying
+/// `pad_poll_response`, and for shaping the 429 path.
 pub async fn poll_hold_loop(
     state: &Arc<AppState>,
     recipient: &str,
     since_seq: u64,
     hold_secs: u32,
-) -> (Vec<PollEnvelope>, bool) {
+) -> PollOutcome {
     // Phase 1 — initial queue check. If something is already pending,
-    // return immediately without registering a waiter.
-    if let Some(batch) = drain_eligible(state, recipient, since_seq).await {
-        return batch;
+    // return immediately without registering a waiter or consuming a
+    // hold-cap slot.
+    if let Some((envelopes, more)) = drain_eligible(state, recipient, since_seq).await {
+        return PollOutcome::Ready { envelopes, more };
     }
     // Phase 2 — kill-switch fast path. Either operator set hold_secs=0
-    // globally, or the client did not send the opt-in header.
+    // globally, or the client did not send the opt-in header. Returns
+    // immediately without consuming a hold-cap slot.
     if hold_secs == 0 {
-        return (Vec::new(), false);
+        return PollOutcome::Ready { envelopes: Vec::new(), more: false };
     }
-    // Phase 3 — register on the per-recipient Notify and wait.
-    let notifier = match state.notifier_for(recipient, POLL_HOLD_NOTIFIERS_LRU_CAP).await {
-        Some(n) => n,
+    // Phase 3 — register on the per-recipient HoldSlot.
+    let slot = match state.notifier_for(recipient, POLL_HOLD_NOTIFIERS_LRU_CAP).await {
+        Some(s) => s,
         None => {
             // Map at capacity. Degrade to short-poll behaviour for this
             // request; an upgraded client will simply retry sooner.
-            return (Vec::new(), false);
+            return PollOutcome::Ready { envelopes: Vec::new(), more: false };
         }
+    };
+    // Trek 2 Stage 1.x Lock-4 — per-identity concurrent-hold cap.
+    // Acquire a hold-cap slot via CAS; if the cap is already at
+    // PER_IDENTITY_HOLD_CAP for this identity, return HoldCapExceeded
+    // so the handler emits 429 with Retry-After: 30. The `_guard` lives
+    // in this function's stack frame for the lifetime of the hold;
+    // when the function returns (or is dropped by tokio on cancellation),
+    // the guard's `Drop` decrements `hold_count` synchronously inside
+    // that drop point.
+    let _guard = match HoldGuard::try_acquire(Arc::clone(&slot)) {
+        Some(g) => g,
+        None => return PollOutcome::HoldCapExceeded,
     };
     // Phase 3.5 — race-window re-check. Between phase 1's queue read
     // and phase 3's notifier insert, a concurrent `/relay/send` could
@@ -1007,35 +1127,41 @@ pub async fn poll_hold_loop(
     // The envelope is now in the queue but no notify will fire to wake
     // us. Without this re-check we'd sit on `notified().await` until
     // `hold_secs` timeout, adding up to 30 s of unnecessary latency to
-    // a delivery that should have been sub-50 ms (P2 fix per Vladislav
-    // PR #297 review).
-    if let Some(batch) = drain_eligible(state, recipient, since_seq).await {
-        return batch;
+    // a delivery that should have been sub-50 ms.
+    if let Some((envelopes, more)) = drain_eligible(state, recipient, since_seq).await {
+        return PollOutcome::Ready { envelopes, more };
     }
-    let timeout = tokio::time::Duration::from_secs(hold_secs as u64);
+    // Trek 2 Stage 1.x Lock-4 runtime layer — clamp the per-hold
+    // duration to MAX_POLL_HOLD_SECS_CAP. Pairs with the config-parse-
+    // time clamp in `RelayConfig::from_env`; both layers are required
+    // so a future code path that bypasses the config clamp still
+    // cannot exceed the ceiling.
+    let effective = hold_secs.min(MAX_POLL_HOLD_SECS_CAP);
+    let timeout = tokio::time::Duration::from_secs(effective as u64);
     let coalesce = tokio::time::Duration::from_millis(POLL_HOLD_COALESCE_MS);
-    let wake = tokio::time::timeout(timeout, notifier.notified()).await;
+    let wake = tokio::time::timeout(timeout, slot.notify.notified()).await;
     if wake.is_err() {
-        // Timeout. P2 fix per Vladislav PR #297 review — re-check the
-        // queue before returning empty. A send that arrived in the few
-        // ms between phase 3.5 and timeout MAY have notify_one'd the
-        // notifier just as it expired, in which case the message is in
-        // rest_store but `notified()` already returned `Err(Elapsed)`.
-        // drain_eligible is cheap (one rwlock + one filter); the
-        // guaranteed-delivery invariant (Guardrail A) is more
-        // important than skipping the check.
-        return drain_eligible(state, recipient, since_seq)
+        // Timeout. Re-check the queue before returning empty. A send
+        // that arrived in the few ms between phase 3.5 and timeout MAY
+        // have notify_one'd the notifier just as it expired, in which
+        // case the message is in rest_store but `notified()` already
+        // returned `Err(Elapsed)`. drain_eligible is cheap (one rwlock
+        // + one filter); the guaranteed-delivery invariant (Guardrail
+        // A) is more important than skipping the check.
+        let (envelopes, more) = drain_eligible(state, recipient, since_seq)
             .await
             .unwrap_or((Vec::new(), false));
+        return PollOutcome::Ready { envelopes, more };
     }
     // Notify fired. Wait the coalescing window so multiple back-to-back
     // sends batch into one response (POLL_MAX_ENVELOPES=1 still applies,
     // but `more=true` then tells the client to immediately re-poll).
     tokio::time::sleep(coalesce).await;
     // Phase 4 — post-wake queue re-check.
-    drain_eligible(state, recipient, since_seq)
+    let (envelopes, more) = drain_eligible(state, recipient, since_seq)
         .await
-        .unwrap_or((Vec::new(), false))
+        .unwrap_or((Vec::new(), false));
+    PollOutcome::Ready { envelopes, more }
 }
 
 /// Inspect the REST store for `recipient` and return the
@@ -1744,8 +1870,33 @@ pub async fn rest_poll(
     // did not opt in) or if the queue is non-empty; otherwise it awaits
     // a per-identity Notify with a ~50 ms coalescing window so a burst
     // of sends batches into one response.
+    //
+    // Trek 2 Stage 1.x Lock-4 — `poll_hold_loop` may return
+    // `HoldCapExceeded` when the per-identity cap is at
+    // `PER_IDENTITY_HOLD_CAP`. Handler returns `429 Too Many Requests`
+    // with `Retry-After: 30` and exits before producing a `PollResponse`.
     let (envelopes, more) =
-        poll_hold_loop(&state, &recipient_identity, since_seq, effective_hold_secs).await;
+        match poll_hold_loop(&state, &recipient_identity, since_seq, effective_hold_secs).await {
+            PollOutcome::Ready { envelopes, more } => (envelopes, more),
+            PollOutcome::HoldCapExceeded => {
+                tracing::info!(
+                    event    = "rest_poll_hold_cap_exceeded",
+                    identity = %&recipient_identity[..8.min(recipient_identity.len())],
+                    cap      = PER_IDENTITY_HOLD_CAP,
+                );
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": "too_many_concurrent_holds"
+                    })),
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert("retry-after", "30".parse().unwrap());
+                return response;
+            }
+        };
 
     let envelope_id_log = envelopes.first().map(|e| e.id.as_str()).unwrap_or("");
     tracing::info!(

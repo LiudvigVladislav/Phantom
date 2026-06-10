@@ -9,9 +9,45 @@ use crate::prekeys::PreKeyStore;
 use crate::rest_fallback::{IdempotencyCache, RestEnvelope, RestTokenStore, SeqCounter, SessionChallengeCache};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
+
+/// Trek 2 Stage 1.x Lock-4 — per-recipient hold slot.
+///
+/// Combines the existing per-recipient `Notify` (waker for the
+/// `/relay/poll` long-poll hold) with a per-identity concurrent-hold
+/// counter. The counter is incremented when a poll enters the hold
+/// path (via `HoldGuard::try_acquire`) and decremented when the guard
+/// drops — including the cases where the axum handler future is
+/// cancelled or the client closes the TCP connection. The Rust
+/// language guarantees `Drop` runs whenever the owning future is
+/// actually dropped.
+///
+/// The map value type was previously `Arc<Notify>`; widening it to
+/// `Arc<HoldSlot>` keeps the per-recipient lifetime aligned with the
+/// existing `Arc::strong_count == 1` cleanup pattern in `main.rs` —
+/// the counter rides the same drop path as the notifier for free, so
+/// the counter and the notifier cannot diverge.
+pub struct HoldSlot {
+    pub notify: Notify,
+    pub hold_count: AtomicU8,
+}
+
+impl HoldSlot {
+    pub fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            hold_count: AtomicU8::new(0),
+        }
+    }
+}
+
+impl Default for HoldSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Per-sender sliding-window rate-limit entry.
 #[derive(Debug)]
@@ -123,7 +159,7 @@ pub struct AppState {
     /// `rest_fallback.rs`) to defend against map-size amplification —
     /// when full the poll handler degrades to immediate return (no Notify
     /// registration) per Trek 2 mini-lock cross-cutting invariant 7.
-    pub notifiers: RwLock<HashMap<String, Arc<Notify>>>,
+    pub notifiers: RwLock<HashMap<String, Arc<HoldSlot>>>,
 
     /// Per-identity sliding-window rate limiter for `/relay/ack-deliver`.
     /// SEPARATE from `rate_limiter` (which counts `/relay/send` per sender)
@@ -212,7 +248,7 @@ impl AppState {
         &self,
         recipient: &str,
         cap: usize,
-    ) -> Option<Arc<Notify>> {
+    ) -> Option<Arc<HoldSlot>> {
         // Read-lock fast path.
         {
             let map = self.notifiers.read().await;
@@ -233,7 +269,7 @@ impl AppState {
             // for the next poll cycle).
             return None;
         }
-        let arc = Arc::new(Notify::new());
+        let arc = Arc::new(HoldSlot::new());
         map.insert(recipient.to_string(), Arc::clone(&arc));
         Some(arc)
     }
@@ -249,7 +285,7 @@ impl AppState {
     pub async fn notify_recipient(&self, recipient: &str) -> bool {
         let map = self.notifiers.read().await;
         if let Some(arc) = map.get(recipient) {
-            arc.notify_one();
+            arc.notify.notify_one();
             true
         } else {
             false

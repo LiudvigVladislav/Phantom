@@ -233,10 +233,19 @@ impl RelayConfig {
             // (existing behaviour). Operator opts-in by setting
             // `RELAY_POLL_HOLD_SECS=20` (or similar) in `.env` and restarting
             // the container; setting it back to 0 is the kill switch.
+            //
+            // Trek 2 Stage 1.x Lock-4 config-parse-time clamp — any value
+            // above `MAX_POLL_HOLD_SECS_CAP` (480 s) is silently capped here
+            // so the value announced to clients via `SessionResponse.poll_hold_secs`
+            // is always within the ceiling. Pairs with the runtime per-hold
+            // clamp inside `poll_hold_loop`; both layers are required so a
+            // future code path that bypasses this clamp still cannot
+            // exceed the ceiling.
             poll_hold_secs: std::env::var("RELAY_POLL_HOLD_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+                .unwrap_or(0u32)
+                .min(crate::rest_fallback::MAX_POLL_HOLD_SECS_CAP),
             // Trek 2 Stage 1.x: root key for the `seq_mac` integrity tag.
             // This is the ONLY required env var without a fallback default
             // — the relay refuses to start if it is absent or malformed.
