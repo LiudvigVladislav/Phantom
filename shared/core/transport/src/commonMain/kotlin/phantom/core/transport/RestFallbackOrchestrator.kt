@@ -104,8 +104,23 @@ class RestFallbackOrchestrator(
      * release cannot happen without a deliberate code change AND a
      * BuildConfig pin flip.
      */
-    @Suppress("unused")
     private val longPollEnabled: Boolean = false,
+    /**
+     * Trek 2 Stage 2B-A (B3, L4) — read-only seam for the parallel
+     * `wsActivePollJob`'s resume-cursor source. Optional; legacy
+     * callers and unit tests pass `null` (the default), in which case
+     * the parallel job runs without a since_seq query parameter
+     * (server treats `null` as "send me anything in the retention
+     * window").
+     *
+     * Lock L4: Stage 2B-A reads from this seam but writes nothing
+     * back. The fun-interface shape — single `getLastSeenSeq` method,
+     * no write API — enforces that invariant structurally: there is
+     * no method the parallel job could call to advance the cursor.
+     * Stage 2B-B will replace this with a full read/write seam guarded
+     * by `seq_mac` verify + storage dedup.
+     */
+    private val lastSeenSeqReader: LongPollCursorReader? = null,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -155,7 +170,43 @@ class RestFallbackOrchestrator(
     private var aliveTickJob: Job? = null
     private var stateObserverJob: Job? = null
 
+    /**
+     * Trek 2 Stage 2B-A (B3, L3) — parallel `/relay/poll` job that
+     * runs in addition to the legacy [pollJob], not as a replacement.
+     * Lifecycle is tied to [start] / [stop] / [shutdown] of the
+     * orchestrator and to the [longPollEnabled] flag — NOT to the
+     * WS connection's up/down state. Lock L3: the parallel job
+     * continues issuing polls while WS is up so the storage layer's
+     * envelope-id dedup keeps the message table consistent without
+     * either transport claiming primacy. The Direct WSS fast path
+     * stays active.
+     */
+    private var wsActivePollJob: Job? = null
+
     private var lastInboundOrSendAtMs: Long = 0L
+
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — session-scoped cache of the
+     * relay-advertised `seq_mac_verify_key`. Captured in [bootstrap]
+     * from [AuthSessionResponse.seqMacVerifyKey] and re-captured on
+     * every subsequent bootstrap (e.g. token rotation). Empty string
+     * when the relay does not announce the field — older relays or
+     * a Stage 1.x deployment without `RELAY_SEQ_MAC_KEY` provisioned.
+     *
+     * Stage 2B-A surfaces this value via [seqMacVerifyKey] but does
+     * NOT verify any MAC and does NOT advance `since_seq` based on
+     * the unverified key (locks L5, L4). Stage 2B-B picks the value
+     * up from here without a session-rotation handshake.
+     */
+    private var _seqMacVerifyKey: String = ""
+
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — read-only access to the cached
+     * session verify key. Visible for Stage 2B-B and for behaviour
+     * tests; the value is empty until [bootstrap] succeeds against a
+     * Stage 1.x-deployed relay.
+     */
+    val seqMacVerifyKey: String get() = _seqMacVerifyKey
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -205,7 +256,20 @@ class RestFallbackOrchestrator(
         stateObserverJob = scope.launch {
             stateMachine.state.collect { mode -> onModeChanged(mode) }
         }
-        log("REST_TRACE orchestrator_started")
+        // Trek 2 Stage 2B-A (B3, L3) — spawn the parallel REST poll
+        // job iff `LONGPOLL_V2_ENABLED == "1"` (gated through the
+        // `longPollEnabled` Boolean computed by the wire-up layer).
+        // The job runs in parallel with the legacy `pollJob` AND with
+        // the Direct WSS fast path; it never stops on
+        // `RestMode.WsActive` (unlike [pollLoop]) — see L3 in
+        // `docs/tracks/trek2-stage2b-a-client-shell.md`.
+        if (longPollEnabled) {
+            wsActivePollJob = scope.launch { wsActivePollLoop() }
+            log("REST_TRACE ws_active_poll_started long_poll_enabled=true")
+        } else {
+            log("REST_TRACE ws_active_poll_skipped long_poll_enabled=false")
+        }
+        log("REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled")
     }
 
     /**
@@ -216,6 +280,10 @@ class RestFallbackOrchestrator(
         pollJob?.cancel(); pollJob = null
         aliveTickJob?.cancel(); aliveTickJob = null
         stateObserverJob?.cancel(); stateObserverJob = null
+        // Trek 2 Stage 2B-A (B3, L3) — cancel the parallel poll job
+        // on every stop. Lifecycle is tied to the orchestrator's own
+        // start/stop, not to any WS mode transition.
+        wsActivePollJob?.cancel(); wsActivePollJob = null
     }
 
     /**
@@ -536,7 +604,34 @@ class RestFallbackOrchestrator(
             log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
             val startMs = now()
             val outcome = runCatching {
-                transport.poll(url = "$baseUrl/relay/poll", token = token, sinceSeq = lastSeenSeq)
+                // Trek 2 Stage 2B-A (B1) — gate the long-poll opt-in pair
+                // (`X-Phantom-Long-Poll: 1` + `X-Phantom-Padded-Poll: 1`)
+                // on the single `longPollEnabled` Boolean computed by the
+                // wire-up layer from `LONGPOLL_V2_ENABLED`. Headers ride
+                // ONE flag in this stage; lock L1 forbids LP-alone and
+                // PP-alone client postures.
+                //
+                // Trek 2 Stage 2B-A (B2) — gate the raised OkHttp
+                // read / call timeout on `LONGPOLL_V2_ENABLED == "1"`
+                // AND `pollHoldSecs in 1..480` (lock L2). The L1 flag
+                // alone is not sufficient: an opt-in client whose
+                // server has the kill switch on (`pollHoldSecs == 0`)
+                // or which advertises a value out of the locked range
+                // gets the short-poll timeout — the headers go out,
+                // but the budget does not change. The two-condition
+                // gate is computed once per call in the companion
+                // helper so M2's 9-cell matrix can pin it without
+                // standing up an orchestrator.
+                transport.poll(
+                    url = "$baseUrl/relay/poll",
+                    token = token,
+                    sinceSeq = lastSeenSeq,
+                    longPollOptIn = longPollEnabled,
+                    readTimeoutMs = computeLongPollReadTimeoutMs(
+                        longPollEnabled = longPollEnabled,
+                        pollHoldSecs = _capabilities.value.pollHoldSecs,
+                    ),
+                )
             }
             val elapsed = now() - startMs
 
@@ -619,6 +714,140 @@ class RestFallbackOrchestrator(
             delay(CANDIDATE_TICK_MS)
             stateMachine.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
             if (stateMachine.state.value != RestMode.WsCandidate) break
+        }
+    }
+
+    /**
+     * Trek 2 Stage 2B-A (B3, L3) — parallel `/relay/poll` loop that
+     * runs alongside the legacy [pollLoop] AND the Direct WSS fast
+     * path. The two loops issue independent poll requests; the
+     * storage layer's envelope-id dedup keeps the message table
+     * consistent.
+     *
+     * Lifecycle rules pinned by lock L3:
+     *   - Spawned from [start] iff [longPollEnabled] is true.
+     *   - Cancelled by [stop] / [shutdown] only. It is NOT
+     *     state-machine-driven and does NOT exit on
+     *     [RestMode.WsActive] (unlike [pollLoop]).
+     *   - On token failure, the same `acquireOrRefreshToken` path as
+     *     [pollLoop] is reused.
+     *
+     * Lock L4 — read-only cursor: the loop reads
+     * [lastSeenSeqReader] each iteration if non-null and passes the
+     * value as `since_seq` on the wire. It NEVER writes back to the
+     * reader (there is no write method on the interface — the
+     * invariant is enforced structurally). When [lastSeenSeqReader]
+     * is null, the loop polls without a `since_seq` parameter
+     * (server treats null as `since_seq=0`).
+     *
+     * Lock L5 — MAC unverified: the loop emits received
+     * `PollEnvelope`s to [_inbound] as today; the new `seqMac` field
+     * is presence-parsed into the DTO and forwarded unmodified.
+     * There is no MAC verification call site on this loop.
+     *
+     * Cadence: reuses [pollIntervalMs] so the parallel loop matches
+     * the legacy active/idle adaptive cadence. Stage 2B-B will
+     * replace this with a dedicated long-poll cadence policy.
+     */
+    private suspend fun wsActivePollLoop() {
+        var staleToken: String? = null
+        while (scope.isActive) {
+            val token = acquireOrRefreshToken(
+                reason = if (staleToken != null) "ws_active_poll_401" else "ws_active_poll",
+                staleToken = staleToken,
+            )
+            if (token == null) {
+                val nominalDelay = POLL_BACKOFF_NO_TOKEN_MS
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE ws_active_poll_call_skipped reason=no_token " +
+                        "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
+            staleToken = null
+
+            // Lock L4: read-only cursor. `null` reader means "no
+            // persisted cursor" — wire treats that as since_seq=0.
+            // The loop NEVER writes back regardless of the response.
+            val sinceSeq = lastSeenSeqReader?.getLastSeenSeq(identityHex)
+
+            val intervalMs = pollIntervalMs()
+            log(
+                "REST_TRACE ws_active_poll_call since_seq=${sinceSeq ?: -1L} " +
+                    "long_poll_enabled=true",
+            )
+            val startMs = now()
+            val outcome = runCatching {
+                // Same L1 + L2 gating as the legacy poll site below —
+                // both call sites of `transport.poll(...)` carry the
+                // same Stage 2B-A header and timeout invariants.
+                transport.poll(
+                    url = "$baseUrl/relay/poll",
+                    token = token,
+                    sinceSeq = sinceSeq,
+                    longPollOptIn = longPollEnabled,
+                    readTimeoutMs = computeLongPollReadTimeoutMs(
+                        longPollEnabled = longPollEnabled,
+                        pollHoldSecs = _capabilities.value.pollHoldSecs,
+                    ),
+                )
+            }
+            val elapsed = now() - startMs
+
+            if (outcome.isFailure) {
+                val ex = outcome.exceptionOrNull()!!
+                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE ws_active_poll_fail reason=${ex::class.simpleName} " +
+                        "elapsedMs=$elapsed next_delay_ms=$jitteredDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
+
+            val response = outcome.getOrThrow()
+            if (response.statusCode == 401) {
+                staleToken = token
+                log(
+                    "REST_TRACE ws_active_poll_unauthorised status=401 " +
+                        "elapsedMs=$elapsed — will refresh token",
+                )
+                continue
+            }
+            if (response.statusCode !in 200..299 || response.bodyParsed == null) {
+                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE ws_active_poll_unexpected_status " +
+                        "status=${response.statusCode} elapsedMs=$elapsed " +
+                        "next_delay_ms=$jitteredDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
+            val envelopes = response.bodyParsed.envelopes
+            log(
+                "REST_TRACE ws_active_poll_ok " +
+                    "envelopes=${envelopes.size} elapsedMs=$elapsed",
+            )
+            // Lock L5: emit envelopes to the same downstream as the
+            // legacy poll. The new `seqMac` field rides through the
+            // DTO unchanged. No MAC verification call site here.
+            for (env in envelopes) {
+                _inbound.tryEmit(env)
+            }
+            // Lock L4 reminder: do NOT update lastSeenSeq from the
+            // server response. Stage 2B-B will add cursor advancement
+            // gated on MAC verify + storage accept-or-dedup.
+            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+            val jitteredDelay = (intervalMs * jitterFactor).toLong()
+            delay(jitteredDelay)
         }
     }
 
@@ -712,6 +941,13 @@ class RestFallbackOrchestrator(
         sessionToken = response.token
         tokenExpiresAt = response.expiresAt
         _capabilities.value = response.toCapabilities()
+        // Trek 2 Stage 2B-A (B3, L5) — cache the session-scoped
+        // `seq_mac_verify_key` for Stage 2B-B to read without
+        // a session-rotation handshake. Empty string when the
+        // relay does not announce the field (old relay or Stage
+        // 1.x deployment without `RELAY_SEQ_MAC_KEY` provisioned).
+        // The cache is overwritten on every token refresh.
+        _seqMacVerifyKey = response.seqMacVerifyKey
         log(
             "REST_TRACE token_cached reason=$reason " +
                 "expiresInMs=${response.expiresAt - now()} " +
@@ -785,6 +1021,103 @@ class RestFallbackOrchestrator(
     }
 
     companion object {
+        /**
+         * Trek 2 Stage 2B-A (B2) — minimum relay-advertised
+         * `pollHoldSecs` value at which the client raises its read /
+         * call timeout for `/relay/poll`. Mirrors lock L2 lower bound:
+         * the server allows holds in `[1, 480]`, and a value of `0`
+         * means the kill switch is active server-side and the client
+         * MUST short-poll regardless of the flag.
+         */
+        const val MIN_POLL_HOLD_SECS: Int = 1
+
+        /**
+         * Trek 2 Stage 2B-A (B2) — maximum relay-advertised
+         * `pollHoldSecs` value at which the client raises its timeout.
+         * Mirrors the server's `MAX_POLL_HOLD_SECS_CAP` constant in
+         * `services/relay/src/rest_fallback.rs`. A server advertising
+         * a value above this is out of spec; the client falls back to
+         * its legacy short-poll timeout rather than honouring the
+         * advertised value.
+         */
+        const val MAX_POLL_HOLD_SECS_CAP: Int = 480
+
+        /**
+         * Trek 2 Stage 2B-A (B2) — extra seconds added on top of
+         * `pollHoldSecs` to absorb TCP / TLS round-trip variance on
+         * the long-poll response without ballooning the hung-request
+         * budget on Tele2-class radios. Scope lock L2 pins this margin
+         * inside `[2, 8]` seconds; values outside that band require a
+         * re-lock. Five sits in the middle of the band and is the
+         * shipped value.
+         */
+        const val POLL_HOLD_SAFETY_MARGIN_SECS: Int = 5
+
+        /**
+         * Trek 2 Stage 2B-A (B2) — legacy short-poll OkHttp read /
+         * call timeout floor in milliseconds. Single source of truth
+         * for the per-call ceilings the Android transport
+         * (`AndroidNativeOkHttpRestFallbackTransport`'s
+         * `READ_TIMEOUT_MS` and `CALL_TIMEOUT_MS`) applies on the
+         * `/relay/poll`, `/relay/send`, `/relay/ack-deliver` and
+         * `/auth/session` paths.
+         *
+         * The override returned by [computeLongPollReadTimeoutMs] is
+         * floored at this value: an override that would LOWER the
+         * timeout below the legacy floor (which can happen for tiny
+         * `pollHoldSecs` values such as `1..4`, where the raw formula
+         * `(hold + 5) * 1000 ≤ 9_000` is below the legacy 10_000 ms)
+         * is clamped UP so the long-poll path is never less patient
+         * than the legacy short-poll path. Override semantics must be
+         * strictly monotonic: enabling long-poll can only EXTEND
+         * timeouts, never shorten them.
+         */
+        const val LEGACY_SHORT_POLL_TIMEOUT_MS: Long = 10_000L
+
+        /**
+         * Trek 2 Stage 2B-A (B2) — compute the read / call timeout
+         * override that the orchestrator passes to
+         * [RestFallbackTransport.poll]'s `readTimeoutMs` parameter for
+         * a single `/relay/poll` call.
+         *
+         * Returns the override in milliseconds when BOTH halves of L2
+         * hold:
+         *
+         *   * [longPollEnabled] is `true` (`LONGPOLL_V2_ENABLED == "1"`),
+         *     AND
+         *   * [pollHoldSecs] is in `[MIN_POLL_HOLD_SECS,
+         *     MAX_POLL_HOLD_SECS_CAP]` (inclusive).
+         *
+         * Returns `null` (legacy short-poll timeout) when either half
+         * fails. `null` is the byte-identical-with-Stage-1 default
+         * that the legacy `transport.poll(...)` call uses when the
+         * parameter is omitted.
+         *
+         * The override value is
+         * `maxOf((pollHoldSecs + POLL_HOLD_SAFETY_MARGIN_SECS) * 1000,
+         *        LEGACY_SHORT_POLL_TIMEOUT_MS)`.
+         *
+         * The `maxOf` floor is load-bearing: for tiny `pollHoldSecs`
+         * values (`1..4`) the raw formula yields `6_000..9_000` ms,
+         * which is BELOW the legacy short-poll budget — without the
+         * floor a flag-on client would be LESS patient than a legacy
+         * short-poll client. L2's intent is that long-poll can only
+         * lift budgets, never shorten them. The floor enforces that
+         * monotonicity at the gate's only mathematical entry point.
+         *
+         * Pure function, no I/O — kept in the companion so M2's
+         * matrix can hit it without standing up an orchestrator.
+         */
+        fun computeLongPollReadTimeoutMs(
+            longPollEnabled: Boolean,
+            pollHoldSecs: Int,
+        ): Long? {
+            if (!longPollEnabled) return null
+            if (pollHoldSecs !in MIN_POLL_HOLD_SECS..MAX_POLL_HOLD_SECS_CAP) return null
+            val candidateMs = (pollHoldSecs + POLL_HOLD_SAFETY_MARGIN_SECS).toLong() * 1000L
+            return maxOf(candidateMs, LEGACY_SHORT_POLL_TIMEOUT_MS)
+        }
+
         /**
          * Max attempts for a single [sendEnvelope] call. Five gives the
          * Tele2 middlebox five randomly-distributed windows to let a POST

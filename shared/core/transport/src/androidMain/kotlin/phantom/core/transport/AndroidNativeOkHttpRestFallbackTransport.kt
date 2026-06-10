@@ -108,9 +108,17 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         url: String,
         token: String,
         sinceSeq: Long?,
+        longPollOptIn: Boolean,
+        readTimeoutMs: Long?,
     ): RestFallbackResponse<PollResponse> = withContext(Dispatchers.IO) {
         val fullUrl = if (sinceSeq != null) "$url?since_seq=$sinceSeq" else url
-        val response = get(fullUrl, token, op = "poll")
+        val response = get(
+            url = fullUrl,
+            token = token,
+            op = "poll",
+            longPollOptIn = longPollOptIn,
+            readTimeoutOverrideMs = readTimeoutMs,
+        )
         decode(response, PollResponse.serializer())
     }
 
@@ -156,14 +164,19 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         return execute(client, builder.build())
     }
 
-    private fun get(url: String, token: String, op: String): RawResponse {
-        val client = buildClient(op = op, correlationKey = url)
-        val request = Request.Builder()
-            .url(url)
-            .header("Connection", "close")
-            .header("Authorization", "Bearer $token")
-            .get()
-            .build()
+    private fun get(
+        url: String,
+        token: String,
+        op: String,
+        longPollOptIn: Boolean = false,
+        readTimeoutOverrideMs: Long? = null,
+    ): RawResponse {
+        val client = buildClient(
+            op = op,
+            correlationKey = url,
+            readTimeoutOverrideMs = readTimeoutOverrideMs,
+        )
+        val request = buildPollRequest(url = url, token = token, longPollOptIn = longPollOptIn)
         return execute(client, request)
     }
 
@@ -204,14 +217,28 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         )
     }
 
-    private fun buildClient(op: String, correlationKey: String): OkHttpClient =
-        OkHttpClient.Builder()
+    private fun buildClient(
+        op: String,
+        correlationKey: String,
+        readTimeoutOverrideMs: Long? = null,
+    ): OkHttpClient {
+        // Trek 2 Stage 2B-A (B2) — long-poll path needs BOTH read and
+        // call ceilings lifted, since OkHttp's `callTimeout` is the
+        // hard cap on the whole request. Lifting only `readTimeout`
+        // would let the call die at `callTimeoutMs` (~10 s) before the
+        // server's hold window completed. The override applies to
+        // both budgets symmetrically — same value, so the call cannot
+        // outlive the read budget but neither budget cuts the
+        // negotiated hold time short.
+        val effectiveReadMs = readTimeoutOverrideMs ?: readTimeoutMs
+        val effectiveCallMs = if (readTimeoutOverrideMs != null) readTimeoutOverrideMs else callTimeoutMs
+        return OkHttpClient.Builder()
             .protocols(listOf(Protocol.HTTP_1_1))
             .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
             .retryOnConnectionFailure(false)
-            .callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+            .callTimeout(effectiveCallMs, TimeUnit.MILLISECONDS)
             .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
-            .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(effectiveReadMs, TimeUnit.MILLISECONDS)
             .writeTimeout(writeTimeoutMs, TimeUnit.MILLISECONDS)
             .also { builder ->
                 // Trek 2 Stage 2A (A4) — wire the SOCKS5 proxy iff the
@@ -244,6 +271,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
                 ),
             )
             .build()
+    }
 
     companion object {
         /**
@@ -264,11 +292,48 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
          * `:673` (`CALL_TIMEOUT_MS = 10_000L`), which has run in production
          * since PR-M2 without trouble — i.e. it is the proven class of
          * budget for PHANTOM's networks, not a guess.
+         *
+         * Trek 2 Stage 2B-A (B2) — `CALL_TIMEOUT_MS` and `READ_TIMEOUT_MS`
+         * both reference [RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS]
+         * so the legacy-floor invariant inside
+         * [RestFallbackOrchestrator.computeLongPollReadTimeoutMs] cannot
+         * drift away from the actual OkHttp default applied here. The
+         * commonMain constant is the single source of truth; this
+         * companion just routes it to the right OkHttp builder fields.
          */
-        const val CALL_TIMEOUT_MS: Long = 10_000L
+        const val CALL_TIMEOUT_MS: Long = RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS
         const val CONNECT_TIMEOUT_MS: Long = 5_000L
-        const val READ_TIMEOUT_MS: Long = 10_000L
+        const val READ_TIMEOUT_MS: Long = RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS
         const val WRITE_TIMEOUT_MS: Long = 10_000L
+
+        /**
+         * Trek 2 Stage 2B-A (B1) — pure builder for the `/relay/poll` GET
+         * request. Pulled out of [get] so the header-emission contract
+         * can be asserted at the OkHttp `Request` level without standing
+         * up an `OkHttpClient`, an event loop, or a mock server.
+         * `internal` so a Kotlin test in the same module's test source
+         * set can call it directly.
+         *
+         * Coupling [LONG_POLL_OPT_IN_HEADER] and [PADDED_POLL_OPT_IN_HEADER]
+         * inside a single `if (longPollOptIn)` block is the structural
+         * enforcement of scope lock L1: a future caller cannot accidentally
+         * emit one header without the other.
+         */
+        internal fun buildPollRequest(
+            url: String,
+            token: String,
+            longPollOptIn: Boolean,
+        ): Request {
+            val builder = Request.Builder()
+                .url(url)
+                .header("Connection", "close")
+                .header("Authorization", "Bearer $token")
+            if (longPollOptIn) {
+                builder.header(LONG_POLL_OPT_IN_HEADER, "1")
+                builder.header(PADDED_POLL_OPT_IN_HEADER, "1")
+            }
+            return builder.get().build()
+        }
 
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
     }

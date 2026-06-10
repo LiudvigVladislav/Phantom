@@ -80,11 +80,40 @@ interface RestFallbackTransport {
      * until the client sends [ackDeliver]; subsequent poll calls keep
      * returning the same envelope until acked. Short-poll only — server
      * returns immediately, empty array if nothing.
+     *
+     * Trek 2 Stage 2B-A — [longPollOptIn] controls BOTH the
+     * `X-Phantom-Long-Poll: 1` and `X-Phantom-Padded-Poll: 1` opt-in
+     * headers as a single pair. When `true`, both headers are emitted;
+     * when `false`, neither is. The two headers are intentionally
+     * coupled at the boundary because the Stage 2B-A scope (lock L1)
+     * forbids any LP-alone or PP-alone client posture — a separate
+     * parameter per header would let a future caller break that
+     * invariant. The orchestrator decides the boolean by reading the
+     * `LONGPOLL_V2_ENABLED` BuildConfig flag (debug `"1"` / release
+     * `"0"`). Backwards-compat default `false` means a call site that
+     * has not been updated still produces a Stage-1-byte-identical
+     * legacy short-poll request.
+     *
+     * Trek 2 Stage 2B-A (B2) — [readTimeoutMs] OPTIONALLY overrides the
+     * transport's default read-timeout for THIS call only. `null` (the
+     * legacy default) means "use the transport's own short-poll
+     * timeout" — the orchestrator passes a non-null value ONLY when
+     * both halves of lock L2 hold:
+     *
+     *   * `LONGPOLL_V2_ENABLED == "1"`, AND
+     *   * the relay-advertised `pollHoldSecs` is in `[1, 480]`.
+     *
+     * The override value is `(pollHoldSecs + safety_margin) * 1000`
+     * milliseconds, where `safety_margin` is a few seconds inside
+     * `[2, 8]`. The wire-up layer applies this override; legacy code
+     * paths that do not pass the parameter remain byte-identical.
      */
     suspend fun poll(
         url: String,
         token: String,
         sinceSeq: Long? = null,
+        longPollOptIn: Boolean = false,
+        readTimeoutMs: Long? = null,
     ): RestFallbackResponse<PollResponse>
 
     /**
@@ -121,6 +150,40 @@ data class RestFallbackResponse<T>(
     /** Wall-clock elapsed time for this single HTTP round-trip, in ms. */
     val elapsedMs: Long,
 )
+
+// ── Trek 2 Stage 2B-A (B1) — long-poll opt-in header constants ───────────────
+
+/**
+ * Name of the `X-Phantom-Long-Poll` opt-in header. Strict equality
+ * `v == "1"` on the server side per Stage 1.x
+ * (`services/relay/src/rest_fallback.rs:1964-1968`); sending any other
+ * shape (e.g. `"true"`, mixed case in the value, trailing whitespace)
+ * is silently treated as legacy short-poll.
+ *
+ * Names are lowercase to match the relay's `HeaderMap` lookup key.
+ * OkHttp normalises outgoing header names to canonical case on the
+ * wire, so the casing of THIS constant does not change the bytes that
+ * leave the device — but keeping it lowercase keeps the constant
+ * value-equal to the server's literal, which is the property tests
+ * pin in M1.
+ *
+ * Const lives in commonMain so the orchestrator (commonMain) and the
+ * Android wire-up (androidMain) reference one source of truth.
+ */
+const val LONG_POLL_OPT_IN_HEADER: String = "x-phantom-long-poll"
+
+/**
+ * Name of the `X-Phantom-Padded-Poll` opt-in header. Same `v == "1"`
+ * strict equality contract as [LONG_POLL_OPT_IN_HEADER]
+ * (`services/relay/src/rest_fallback.rs:1972-1976`).
+ *
+ * Stage 2B-A always emits this header together with
+ * [LONG_POLL_OPT_IN_HEADER] (scope lock L1: no LP-alone or PP-alone
+ * client posture). The constant is exposed independently because the
+ * server contract treats them independently, and a future client
+ * stage may need them separately.
+ */
+const val PADDED_POLL_OPT_IN_HEADER: String = "x-phantom-padded-poll"
 
 // ── Wire models — /auth/session ──────────────────────────────────────────────
 
@@ -174,6 +237,23 @@ data class AuthSessionResponse(
      * Stage 2B deliverable (no behaviour change in this commit).
      */
     @SerialName("poll_hold_secs") val pollHoldSecs: Int = 0,
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — per-identity verify key for the
+     * `seq_mac` integrity tag on `/relay/poll` envelopes. 64-char
+     * lowercase hex (32-byte HMAC-SHA-256 output). Derived from the
+     * relay-side root key (which never leaves the relay process) and
+     * the bound identity per the Stage 1.x contract in
+     * `services/relay/src/rest_fallback.rs`.
+     *
+     * Stage 2B-A presence-parses the field for wire stability —
+     * the orchestrator caches the value in a session-scoped in-memory
+     * slot so Stage 2B-B can verify MACs without a session-rotation
+     * handshake. Stage 2B-A does NOT verify MACs and does NOT
+     * advance `since_seq` based on the unverified key (locks L5,
+     * L4). Default `""` makes the wire shape robust against older
+     * relays that have not been redeployed with Stage 1.x.
+     */
+    @SerialName("seq_mac_verify_key") val seqMacVerifyKey: String = "",
 )
 
 /**
@@ -242,6 +322,23 @@ data class PollEnvelope(
     @SerialName("payload") val payloadBase64: String,
     @SerialName("sequence_ts") val sequenceTs: Long,
     @SerialName("seq") val seq: Long,
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — per-envelope HMAC-SHA-256
+     * integrity tag computed at store time on the relay over the
+     * canonical `(identity_hex, seq, envelope_id, sequence_ts)`
+     * tuple. 64-char lowercase hex. See the server-side doc-comment
+     * in `services/relay/src/rest_fallback.rs` for the locked threat
+     * wording — verbatim, do not soften.
+     *
+     * Stage 2B-A presence-parses the field for wire stability; the
+     * orchestrator does NOT verify the MAC and does NOT advance
+     * `since_seq` based on the unverified value (locks L5, L4).
+     * Verification lands in Stage 2B-B together with the cursor
+     * advancement path, both gated on MAC verify + storage
+     * accept-or-dedup. Default `""` makes the wire shape robust
+     * against older relays that have not been redeployed.
+     */
+    @SerialName("seq_mac") val seqMac: String = "",
 )
 
 // ── Wire models — /relay/ack-deliver ─────────────────────────────────────────
@@ -293,6 +390,19 @@ data class RelayCapabilities(
      * it; Stage 2A itself does NOT consume the value at runtime.
      */
     val pollHoldSecs: Int,
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — per-identity `seq_mac` verify key
+     * projected from [AuthSessionResponse.seqMacVerifyKey]. 64-char
+     * lowercase hex (32 bytes HMAC-SHA-256 output). Empty when the
+     * relay does not announce the field — older relays or a Stage 1.x
+     * deployment without `RELAY_SEQ_MAC_KEY` provisioned.
+     *
+     * Stage 2B-A surfaces this value through capabilities so the
+     * orchestrator can cache it in a session-scoped slot for Stage
+     * 2B-B without a session-rotation handshake. Stage 2B-A itself
+     * does NOT verify MACs (lock L5).
+     */
+    val seqMacVerifyKey: String,
 ) {
     companion object {
         /**
@@ -308,6 +418,7 @@ data class RelayCapabilities(
             mediaBinaryV3 = false,
             mediaUploadBodyBytes = 0,
             pollHoldSecs = 0,
+            seqMacVerifyKey = "",
         )
     }
 }
@@ -320,4 +431,5 @@ fun AuthSessionResponse.toCapabilities(): RelayCapabilities = RelayCapabilities(
     mediaBinaryV3 = mediaCapabilities.binaryV3,
     mediaUploadBodyBytes = mediaCapabilities.maxUploadBodyBytes,
     pollHoldSecs = pollHoldSecs,
+    seqMacVerifyKey = seqMacVerifyKey,
 )
