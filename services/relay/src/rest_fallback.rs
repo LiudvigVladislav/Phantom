@@ -943,7 +943,7 @@ pub struct PollResponse {
     /// Stage 1 = **two-tier** response shape:
     ///   * No header   → small body, no `pad` field (legacy).
     ///   * Header `=1` → exactly `POLL_RESPONSE_CANONICAL_BYTES` bytes,
-    ///                   `pad` carries random base64url-safe filler.
+    ///     `pad` carries random base64url-safe filler.
     ///
     /// Security invariant 1 (byte-indistinguishable empty vs envelope)
     /// holds **within** the opt-in tier — old clients were already
@@ -1018,8 +1018,8 @@ fn random_padding_string(len: usize) -> String {
 ///   1. Serialize `resp` with `pad = ""` → field is skipped → small probe.
 ///   2. The final padded body adds `,"pad":"<X>"` = 9 framing bytes plus
 ///      the pad-string length. Solve:
-///         `target = probe_len + 9 + pad_len`
-///         `pad_len = target - probe_len - 9`
+///      `target = probe_len + 9 + pad_len`,
+///      `pad_len = target - probe_len - 9`.
 ///   3. Generate exactly `pad_len` chars of random `PAD_ALPHABET`.
 ///   4. Re-serialize and debug-assert exact-byte invariant.
 pub fn pad_poll_response(mut resp: PollResponse) -> Vec<u8> {

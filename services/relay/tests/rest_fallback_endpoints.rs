@@ -738,23 +738,25 @@ async fn ws_simulated_ack_clears_rest_poll() {
 
 // ── Trek 2 Stage 1.x review-fix regression tests ──────────────────────────────
 //
-// Three regression tests for the post-PR-#303 review feedback:
+// Coverage for the post-PR-#303 review feedback on the REST boundary.
+// Three integration tests below cover the REST `/relay/send` path:
+// non-hex 64-char `to` → 400, short `to` → 400, canonical 64-hex `to` →
+// 201 happy-path control.
 //
-//   1. REST `/relay/send` rejects a malformed recipient `to` with 400 before
-//      it can reach the seq_mac canonical input.
-//   2. REST `/relay/send` already rejects oversized `envelope_id` (covered by
-//      `rest_send_rejects_over_sized_envelope_id` elsewhere); we add the
-//      defense-in-depth pair here: a non-hex 64-char string that would pass
-//      a naive length check but not the shape check.
-//   3. WS path (`messageId` length) is covered by inline unit tests in
-//      `seq_mac.rs` for `is_valid_envelope_id` plus a routes-level test;
-//      see the new `rejects_oversized_messageid` test below.
+// The WS Send handler is a private free function on the upgraded
+// connection task with no public test seam, so its boundary checks
+// (recipient hex shape, messageId byte-length cap) are not covered by
+// an integration test in this file. They are covered by:
 //
-// The WS Send handler is a private free function, so the regression is
-// covered indirectly through (a) `is_valid_recipient_identity_hex` and
-// `is_valid_envelope_id` unit tests in `seq_mac.rs` and (b) the static
-// invariant that the helper now returns `Option<u64>` — the compile-time
-// type change forces every caller to handle the skip path explicitly.
+//   (a) shared `is_valid_recipient_identity_hex` / `is_valid_envelope_id`
+//       helpers in `src/seq_mac.rs` with inline unit tests, used by both
+//       the REST handler and the WS Send handler — so the REST tests
+//       below exercise the same predicates the WS path now relies on;
+//   (b) the compile-time invariant that
+//       `mirror_envelope_to_rest_store` returns `Option<u64>` — every
+//       caller, including the WS Send handler, must handle the skip
+//       path explicitly; the `.expect()` panic on client-controlled
+//       input is gone by type.
 
 #[tokio::test]
 async fn rest_send_rejects_non_hex_recipient_to() {

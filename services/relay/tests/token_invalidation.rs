@@ -503,18 +503,20 @@ async fn issue_is_atomic_under_concurrent_calls_for_same_identity_no_http() {
 }
 
 /// Cache-hit regression. After a token rotation, a replay of the
-/// ORIGINAL `(challenge, signature)` tuple must NOT mint or return
-/// the new current token — that would defeat Lock-3 invalidation,
-/// because anyone who captured the original tuple could keep
-/// retrieving whichever token the identity is currently bound to.
+/// ORIGINAL `(challenge, signature)` tuple must return `410 Gone`
+/// with a body identifying token rotation. Anything else — including
+/// returning the cached T1 (already invalidated) or, worse, the new
+/// T2 — would defeat Lock-3 invalidation, because anyone who captured
+/// the original tuple could keep retrieving a working session token
+/// for the identity.
 ///
-/// The correct behaviour is: the cache hit returns the originally
-/// issued token if (and only if) that exact token is still live in
-/// the token store. Once a fresh challenge issues a new token, the
-/// original is removed from `by_token`, the cached pointer is stale,
-/// and the replay must not return the new token.
+/// The handler's correct behaviour, locked by review on PR #303, is:
+/// the cache hit refreshes ONLY the originally cached_token; once
+/// that token is no longer live (rotated out by a fresh issue), the
+/// handler returns `410 Gone` with
+/// `"session token rotated; obtain a fresh challenge"`.
 #[tokio::test]
-async fn auth_session_replay_after_rotation_does_not_return_new_token() {
+async fn auth_session_replay_after_rotation_returns_410_gone() {
     let app = build_app();
     let identity = identity_hex(9);
     let mut csprng = OsRng;
@@ -537,26 +539,35 @@ async fn auth_session_replay_after_rotation_does_not_return_new_token() {
     assert_eq!(status_t1, StatusCode::UNAUTHORIZED);
 
     // Now the attacker replays the ORIGINAL (challenge_1, sig_1) tuple.
-    // The challenge cache hits — it was populated by the original
-    // session call — but it MUST NOT return T2 (the post-rotation
-    // current token). The thing that MUST NOT happen is that the
-    // replay successfully retrieves a working session token after
-    // the original one was rotated away.
+    // Per Lock-3 contract, this MUST return 410 Gone — NOT 200 with
+    // any token, NOT 401, NOT 409.
     let (_app, status_replay, v_replay) =
         call_session(app, &identity, &signing_kp, &nonce_1).await;
 
-    if status_replay == StatusCode::OK {
-        let replay_token = v_replay["token"].as_str().unwrap_or("").to_string();
+    assert_eq!(
+        status_replay,
+        StatusCode::GONE,
+        "replay of original (challenge, sig) after rotation MUST return 410 Gone, got {:?} (body: {:?})",
+        status_replay,
+        v_replay,
+    );
+    // Response body must carry the locked error string so a client can
+    // tell rotation from generic 410 (e.g. relay restart).
+    let err_str = v_replay["error"].as_str().unwrap_or("");
+    assert!(
+        err_str.contains("rotated") && err_str.contains("fresh challenge"),
+        "410 body must identify rotation per Lock-3, got: {:?}",
+        v_replay,
+    );
+    // Defense-in-depth: even on a wrong status code (if a regression
+    // ever flipped the handler back to 200), the response token must
+    // NOT equal T2.
+    if let Some(replay_token) = v_replay["token"].as_str() {
         assert_ne!(
             replay_token, token_2,
-            "replay of original (challenge, sig) MUST NOT return the post-rotation token T2"
+            "regardless of status, replay MUST NOT carry the post-rotation token T2",
         );
-        // If the replay returns the cached T1, the cached T1 itself
-        // must not validate (rotation removed it).
-        assert_eq!(replay_token, token_1, "replay must not mint a fresh token");
     }
-    // Non-200 status is also acceptable — we do not pin the exact
-    // code (410 Gone / 401 Unauthorized are both reasonable).
 }
 
 /// Inverse-DoS regression. A stolen T1 attacker triggering T2 issuance

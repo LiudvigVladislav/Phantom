@@ -4,8 +4,8 @@
 //! Integration tests for Trek 2 Stage 1 long-poll backbone changes.
 //!
 //! Coverage (locked in `project_trek2_stage1_locks_2026_06_09.md`):
-//!   * Q1 — `SessionResponse` carries `poll_hold_secs` field (default `0`)
-//!     + backward-compat: an old-shaped struct without the field still
+//!   * Q1 — `SessionResponse` carries `poll_hold_secs` field (default `0`).
+//!     Backward-compat: an old-shaped struct without the field still
 //!     deserializes a Stage 1 server's response.
 //!   * Q2 — `/relay/ack-deliver` is rate-limited at 120/window and uses a
 //!     SEPARATE bucket from `/relay/send` (a sender that filled the send
