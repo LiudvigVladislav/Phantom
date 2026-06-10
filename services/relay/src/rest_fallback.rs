@@ -195,6 +195,33 @@ impl RestTokenStore {
     /// Issue a fresh 32-byte random bearer token for `identity`.
     /// Replaces any existing token for that identity.
     /// Returns (token_hex, expires_at_ms).
+    ///
+    /// # Trek 2 Stage 1.x Lock-3 invalidation invariant
+    ///
+    /// Removes the prior token from `by_token` under write lock BEFORE
+    /// inserting the new token, then updates `by_identity` to the new
+    /// token. Any concurrent `validate()` call during the window
+    /// between the two lock acquisitions observes at most a transient
+    /// `None` — never a successful validate against the prior token.
+    /// The window is benign in consequence: the old token is
+    /// structurally unreachable from any path that requires a
+    /// `by_token` hit.
+    ///
+    /// Contract pinned by the
+    /// `concurrent_issue_for_same_identity_is_serialised` test in
+    /// `tests/token_invalidation.rs`: after 3 concurrent `issue()` calls
+    /// for the same identity with distinct challenges, exactly one
+    /// returned token validates; the other two return `None`. If that
+    /// test ever fails, the implementation strategy moves from
+    /// invariant-driven to structural refactor (single critical section
+    /// across both maps).
+    ///
+    /// Single-device-per-identity assumption: `by_identity` maps
+    /// `identity → one token`. Multi-device support would require
+    /// `identity → Vec<(device_id, token)>` and a `device_id`
+    /// parameter on `issue()` so a new-device token only invalidates
+    /// that device's prior token, not all devices'. Documented here so
+    /// a future multi-device migration is explicit.
     pub async fn issue(&self, identity: &str) -> (String, u64) {
         let mut raw = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut raw);
