@@ -1,12 +1,12 @@
 # Trek 2 Stage 1.x — Server-Side Prerequisite (Scope Mini-Lock DRAFT)
 
-**Status:** DRAFT — proposed Stage 1.x scope mini-lock awaiting Vladislav + Codex confirmation. No code written. Branch `feat/pr-trek2-stage1x-server-prereq` parked at master `f9c81937`. This document captures the synthesis of two-layer preflight (Layer 1 = Claude Code project subagents; Layer 2 = Ruflo MCP sonnet cross-check) conducted 2026-06-10.
+**Status:** Locked scope mini-lock for Stage 1.x. No code written. This document captures the synthesis of the multi-stage preflight conducted 2026-06-10.
 
 **Why this PR exists:** Trek 2 Stage 2B client preflight 2026-06-10 surfaced 4 server-side BLOCKERS that prevent the client-side long-poll runtime from being safe to ship. Stage 2B client implementation is PAUSED until this PR merges to master.
 
-## Vladislav-locked threat-model wording (verbatim, do NOT soften)
+## Locked threat-model wording (verbatim, do NOT soften)
 
-The following wording is locked verbatim by Vladislav 2026-06-10 and MUST appear unchanged in:
+The following wording is locked verbatim and MUST appear unchanged in:
 
 - This document.
 - The Stage 1.x PR description.
@@ -50,7 +50,7 @@ sequence_ts (big-endian u64)        8 bytes   POST-quantize value (60_000ms floo
 
 Total length = 101 bytes + `envelope_id_len` bytes. Output: 32 bytes → lowercase hex 64 chars on wire.
 
-**Why `envelope_id` is length-prefixed UTF-8, not fixed-width.** Vladislav verified against master `f9c81937` that the server-side `RestSendRequest.envelope_id` is typed as `String` (UTF-8, not enforced to a UUID shape), and Stage 2A `EnvelopeId.random()` generates a 32-char lowercase hex (NOT a 36-byte UUID canonical hyphenated form). The MAC encoding cannot assume a fixed 36-byte UUID and cannot assume ASCII either — Rust `String` is UTF-8 and can contain multi-byte characters. The canonical input therefore encodes the **exact UTF-8 byte sequence** of `envelope_id`, prefixed with its byte length (NOT character length).
+**Why `envelope_id` is length-prefixed UTF-8, not fixed-width.** I verified against master `f9c81937` that the server-side `RestSendRequest.envelope_id` is typed as `String` (UTF-8, not enforced to a UUID shape), and Stage 2A `EnvelopeId.random()` generates a 32-char lowercase hex (NOT a 36-byte UUID canonical hyphenated form). The MAC encoding cannot assume a fixed 36-byte UUID and cannot assume ASCII either — Rust `String` is UTF-8 and can contain multi-byte characters. The canonical input therefore encodes the **exact UTF-8 byte sequence** of `envelope_id`, prefixed with its byte length (NOT character length).
 
 **Server-side validation requirement.** The relay's REST send handler MUST reject any `RestSendRequest.envelope_id` whose UTF-8 byte length exceeds `65535` (the `u16-BE` length-prefix capacity). Production sizes are ~32 bytes; the 65535 ceiling is a defensive cap. If future requirements need to constrain `envelope_id` to ASCII or hex specifically, add that validation explicitly — do NOT silently assume it in the MAC encoding.
 
@@ -66,7 +66,7 @@ struct SeqMacRootKey(Zeroizing<[u8; 32]>);
 
 This shape is preferred over `Vec<u8>` because (a) the size is part of the type and cannot drift, (b) the inner `[u8; 32]` lives on the stack/struct embedding rather than the heap, reducing the surface where the key bytes could be cloned by accident, and (c) `Zeroizing<[u8; 32]>` from the `zeroize` crate guarantees the bytes are wiped on drop without requiring a manual `ZeroizeOnDrop` impl. The wrapper newtype provides a single chokepoint for the `[REDACTED]` `Debug` impl, mirroring the existing `secret_token` pattern at `config.rs:221`.
 
-`secrecy::SecretBox<[u8; 32]>` is an acceptable alternative but introduces a new dependency. Layer 1 + Layer 2 + Codex agree: stick with `Zeroizing<[u8; 32]>` + a newtype for Stage 1.x; promote to `secrecy::SecretBox` only if a future Codex round finds a concrete misuse path.
+`secrecy::SecretBox<[u8; 32]>` is an acceptable alternative but introduces a new dependency. After review, the selected design is `Zeroizing<[u8; 32]>` + a newtype for Stage 1.x; promote to `secrecy::SecretBox` only if a future review round finds a concrete misuse path.
 
 **The root key NEVER leaves the relay process.** It is used exclusively to derive per-identity verify keys (see "Client key distribution" below). Server-side MAC computation uses the derived per-identity key, NOT the root key directly.
 
@@ -106,7 +106,7 @@ seq_mac_verify_key = HMAC-SHA-256(
 - Server-side MAC computation: `seq_mac = HMAC-SHA-256(seq_mac_verify_key, canonical_input)`. The root key is touched ONLY in the key-derivation step.
 - A client cannot forge MACs for envelopes addressed to another identity, even with a leaked verify key — they don't know that other identity's derived key, and cannot derive it (no access to root).
 
-Documented as integrity signal for client-side anomaly detection, NOT as an access-control boundary. Matches the locked threat wording exactly: a fully malicious relay operator with the root key can still mint any verify key and forge any MAC, but the protection scope is precisely as Vladislav's wording states.
+Documented as integrity signal for client-side anomaly detection, NOT as an access-control boundary. Matches the locked threat wording exactly: a fully malicious relay operator with the root key can still mint any verify key and forge any MAC, but the protection scope is precisely as the locked wording states.
 
 ### Lock-2 — padded-vs-held server-side decoupling, two-header design
 
@@ -136,7 +136,7 @@ The `padded_opt_in` boolean replaces `long_poll_opt_in` at the padding gate (`re
 **Stage 2B-A client semantics:**
 
 - Normal long-poll: send BOTH headers.
-- Circuit-breaker open (Stage 2B client falls back to short-poll): drop `X-Phantom-Long-Poll`, retain `X-Phantom-Padded-Poll`. This preserves padding posture during the breaker's transient short-poll period — closes the guardrail C ("padding never reduced silently") gap that Layer 2 security identified.
+- Circuit-breaker open (Stage 2B client falls back to short-poll): drop `X-Phantom-Long-Poll`, retain `X-Phantom-Padded-Poll`. This preserves padding posture during the breaker's transient short-poll period — closes the guardrail C ("padding never reduced silently") gap identified during review.
 
 **Header strict equality:** `v == "1"`, matching the existing `LONG_POLL_OPT_IN_HEADER` pattern. Any other value treated as absent.
 
@@ -148,13 +148,13 @@ The `padded_opt_in` boolean replaces `long_poll_opt_in` at the padding gate (`re
 
 > After 3 concurrent `issue()` calls for the same identity with distinct challenges, **exactly one returned token validates** via `state.rest_tokens.validate(token).await` after `join_all` returns. The other two return `None`.
 
-**Implementation strategy is invariant-driven, not pre-locked.** Initial analysis (Layer 1 architect + tester + Layer 2 architecture) suggests the existing `RestTokenStore::issue()` at `rest_fallback.rs:175-194` already delivers this invariant via the write-lock removal of the prior token from `by_token` before inserting the new token. The TOCTOU window between releasing the `by_token` write lock and acquiring the `by_identity` write lock appears benign in consequence — a concurrent `validate()` observes at most a transient `None`, never a successful validate against the prior token.
+**Implementation strategy is invariant-driven, not pre-locked.** Initial analysis suggests the existing `RestTokenStore::issue()` at `rest_fallback.rs:175-194` already delivers this invariant via the write-lock removal of the prior token from `by_token` before inserting the new token. The TOCTOU window between releasing the `by_token` write lock and acquiring the `by_identity` write lock appears benign in consequence — a concurrent `validate()` observes at most a transient `None`, never a successful validate against the prior token.
 
 **If the concurrent-issue contract test passes against the existing code,** Stage 1.x Lock-3 deliverable reduces to:
 
 1. Doc-comment on `issue()` explicitly stating the invalidation invariant verbatim.
 2. The concurrent-issue contract test as the invariant-pinning gate (see Tests section below).
-3. **In-flight poll behavior locked as b2 — ack contract corrected by Codex round 2026-06-10:**
+3. **In-flight poll behavior locked as b2 — ack contract corrected during review:**
 
    - An in-flight long-poll request on T1 (when T2 is issued mid-stream) **completes naturally on T1**. The poll's bearer was validated at request start; the long-held connection state does not re-validate, so the envelope is returned to the client over the T1 connection.
    - The returned envelope is **NOT ackable via T1**. Ack is a separate HTTP request that re-validates the bearer against the current `TokenStore` at request start, and T1 has been removed from `by_token` upon T2's issuance.
@@ -163,9 +163,9 @@ The `padded_opt_in` boolean replaces `long_poll_opt_in` at the padding gate (`re
 
 **If the concurrent-issue contract test FAILS against the existing code, structural refactor enters scope.** Most likely refactor: collapse `issue()` into a single critical section that acquires `by_identity` write-lock first, then `by_token` write-lock (consistent lock-acquisition order across all `RestTokenStore` mutations), removing the split-lock TOCTOU pattern. The test, not a pre-locked design decision, drives whether refactor is required.
 
-**Inverse-DoS mitigation (Vladislav-confirmed against master `f9c81937`).** Layer 2 test-plan flagged an attack window: attacker with stolen T1 triggers T2 issuance (via legitimate client's reauth path), then races to ack the in-flight envelope on T1, draining it from the queue before the legitimate T2-holder polls.
+**Inverse-DoS mitigation (verified against master `f9c81937`).** Review flagged an attack window: attacker with stolen T1 triggers T2 issuance (via legitimate client's reauth path), then races to ack the in-flight envelope on T1, draining it from the queue before the legitimate T2-holder polls.
 
-This window is **structurally closed by the existing `rest_ack_deliver` behavior:** Vladislav confirmed against master that `rest_ack_deliver` validates the bearer via `state.rest_tokens.validate(token).await` at request start (not at connection open / not cached). Under b2, when T2 is issued, T1 is immediately removed from `by_token`, so any subsequent ack on T1 returns 401. No ack-handler modification is required.
+This window is **structurally closed by the existing `rest_ack_deliver` behavior:** I verified against master that `rest_ack_deliver` validates the bearer via `state.rest_tokens.validate(token).await` at request start (not at connection open / not cached). Under b2, when T2 is issued, T1 is immediately removed from `by_token`, so any subsequent ack on T1 returns 401. No ack-handler modification is required.
 
 **Stage 1.x MUST include an `inverse_dos_ack_blocked_after_token_rotation` regression test** to lock this contract against future drift (e.g. a future caching optimization in `rest_ack_deliver` that breaks the current behavior).
 
@@ -202,7 +202,7 @@ impl Drop for HoldGuard {
 }
 ```
 
-**Drop semantics — precise contract (Codex round 2026-06-10 amendment).**
+**Drop semantics — precise contract (review amendment).**
 
 The earlier draft over-claimed "Drop fires synchronously under `JoinHandle::abort()`". The correct contract is more nuanced:
 
@@ -308,8 +308,8 @@ This pins the key-derivation domain tag and the HMAC algorithm against future dr
 - `retry_safety_cache_hit_does_not_invalidate_existing_token` — Stage 1 `rest_fallback_endpoints.rs` 5-identical-calls retry-safety still passes (uses `SessionChallengeCache` path, not `issue()`).
 - `inflight_poll_on_old_token_completes_naturally` — `tokio::spawn` poll on T1 (opt-in, hold=3s); after 200ms, issue T2; assert poll task returns 200 (not 401 mid-stream); assert subsequent T1 poll returns 401.
 - `concurrent_issue_for_same_identity_is_serialised` — `tokio::sync::Barrier::new(3)` + 3 spawned `obtain_token` calls for same identity; after `join_all`, exactly one token validates.
-- `inverse_dos_ack_blocked_after_token_rotation` — T1 in-flight hold open; T2 issued; attacker attempts ack via T1; assert 401 (not 200). Pins the existing Vladislav-confirmed `rest_ack_deliver` token-validation-at-request-start contract against future drift.
-- `t1_in_flight_poll_returns_200_then_t1_ack_returns_401` — T1 poll started + held; T2 issued mid-stream; envelope arrives; T1 poll returns 200 with envelope; assert T1 ack returns 401. Codex round 2026-06-10 added this case to lock the precise b2 in-flight contract (poll completes naturally, ack does NOT).
+- `inverse_dos_ack_blocked_after_token_rotation` — T1 in-flight hold open; T2 issued; attacker attempts ack via T1; assert 401 (not 200). Pins the existing `rest_ack_deliver` token-validation-at-request-start contract against future drift.
+- `t1_in_flight_poll_returns_200_then_t1_ack_returns_401` — T1 poll started + held; T2 issued mid-stream; envelope arrives; T1 poll returns 200 with envelope; assert T1 ack returns 401. Locks the precise b2 in-flight contract (poll completes naturally, ack does NOT).
 - `t2_ack_for_envelope_returned_on_t1_poll_succeeds` — same fixture as above; after T1 poll returns the envelope, assert that the legitimate client can ack the envelope using T2 → assert 200. Confirms that the inverse-DoS mitigation does NOT cause envelope loss for the legitimate client (guardrail A preserved).
 
 **Lock-4 contract tests (in `hold_cap.rs`):**
@@ -319,7 +319,7 @@ This pins the key-derivation domain tag and the HMAC algorithm against future dr
 - `concurrent_holds_for_identity_y_not_blocked_by_x_cap`.
 - `hold_secs_request_above_cap_clamps_to_480` (config-parse-time + runtime-timeout dual enforcement).
 - `concurrent_hold_counter_retires_on_poll_completion`.
-- `concurrent_hold_counter_retires_on_client_disconnect` — abort the spawned `JoinHandle`, then **await its completion** (via `handle.await` ignoring the `JoinError`, OR via a watch channel signalled inside the handler's `Drop`); after the future has been observed to drop, assert `hold_count` is decremented. Do NOT assert immediately after `abort()` — tokio's cancellation processing races with the assertion. Codex round 2026-06-10 corrected this test description.
+- `concurrent_hold_counter_retires_on_client_disconnect` — abort the spawned `JoinHandle`, then **await its completion** (via `handle.await` ignoring the `JoinError`, OR via a watch channel signalled inside the handler's `Drop`); after the future has been observed to drop, assert `hold_count` is decremented. Do NOT assert immediately after `abort()` — tokio's cancellation processing races with the assertion.
 - `cap_exhaustion_does_not_drop_pending_envelopes` — guardrail A check.
 
 **Backward-compat regression tests:**
@@ -348,29 +348,29 @@ Recommended grouping (5 commits + tests):
 - **A5 — Lock-4**: `HoldSlot` wrapper struct; `HoldGuard` RAII; per-identity cap CAS guard; `max_poll_hold_secs` config field + dual-layer enforcement; 429 response shape.
 - **A6 — Tests + this doc**: all new contract tests + this `docs/tracks/trek2-stage1x-server-prereq.md`. Tests co-located with their A-commits where possible; this commit collects what didn't fit.
 
-## Vladislav-locked answers to scope OQs (2026-06-10)
+## Locked answers to scope OQs (2026-06-10)
 
 - **OQ-1 → YES.** Hard fail-to-start if `RELAY_SEQ_MAC_KEY` is missing. Deployment runbook must require provisioning the key before relay redeploy (`openssl rand -hex 32`).
 - **OQ-2 → CONFIRMED against master `f9c81937`.** `rest_ack_deliver` validates the bearer via `state.rest_tokens.validate(token).await` at request start. No ack-handler change needed unless implementation drifts; the `inverse_dos_ack_blocked_after_token_rotation` regression test locks the contract.
 - **OQ-3 → YES.** 60_000ms `sequence_ts` quantization floor confirmed by master: `quantize_sequence_ts_to_60s(ts_ms) = ts_ms - ts_ms % 60_000`.
 - **OQ-4 → YES.** Cap = 3 concurrent holds per identity.
 - **OQ-5 → REVERSED.** `envelope_id` is NOT a 36-byte UUID. Server `RestSendRequest.envelope_id` is typed `String`, and Stage 2A `EnvelopeId.random()` is 32-char lowercase hex. Encoding changed to length-prefixed `envelope_id` (`u16-BE len` + bytes) in the canonical HMAC input (see Lock-1 above).
-- **OQ-6 → SEPARATE DOCS PR FIRST.** This document ships as a standalone docs PR ahead of any implementation. Implementation PR opens only after this PR is merged + Codex review round completed.
-- **OQ-7 → YES.** `zeroize` crate addition is acceptable. Use for root key material. Do NOT add `secrecy` unless Codex review explicitly demands it.
+- **OQ-6 → SEPARATE DOCS PR FIRST.** This document ships as a standalone docs PR ahead of any implementation. Implementation PR opens only after this PR is merged + independent review round completed.
+- **OQ-7 → YES.** `zeroize` crate addition is acceptable. Use for root key material. Do NOT add `secrecy` unless an independent review finds a concrete misuse path.
 - **OQ-8 → YES.** Stage 1.x is a server-only PR. WORKING_RULES rule 8 carve-out applies — no Tele2 LTE smoke required for Stage 1.x. CI + contract tests + race tests are the merge gate. Stage 2B-B (client cursor + breaker + reauth) WILL need Tele2 smoke when it ships later.
 
-## Codex review outcome (2026-06-10)
+## Review outcome (2026-06-10)
 
-Codex independent review of PR #300 returned AMEND-REQUIRED on all 4 must-look-at items. The amendments are applied in PR-#300-Round-3 (this revision):
+Independent review of the original scope returned AMEND-REQUIRED on all 4 must-look-at items. The amendments are applied in this revision:
 
 - **Item 1 (HMAC domain separation):** `envelope_id_bytes` reframed as exact UTF-8 bytes (NOT ASCII assumption), with server-side max-length validation requirement.
 - **Item 2 (Key material handling):** root key type changed from `Vec<u8>` to fixed-size `Zeroizing<[u8; 32]>` newtype. Log-redaction rule expanded to include the derived per-identity `seq_mac_verify_key`.
 - **Item 3 (Inverse-DoS):** Lock-3 in-flight contract corrected — envelope returned on T1 poll is NOT ackable via T1; ack must use T2. Two new tests pin the precise contract (T1 ack → 401, T2 ack → 200).
 - **Item 4 (RAII HoldGuard):** "Drop fires synchronously under `JoinHandle::abort()`" reframed — Drop fires when the future is actually dropped; tests must await the JoinHandle before asserting `hold_count`. TCP-close wording corrected: cleanup is bounded by hold timeout, not at the exact network-close instant.
 
-## Codex review must-look-at items (original list, retained for historical context)
+## Review must-look-at items (original list, retained for historical context)
 
-Per Layer 2 security cross-check, the following design decisions warranted independent cryptographer review before merge. All 4 returned AMEND-REQUIRED and have been addressed above:
+The following design decisions warranted independent cryptographer review before merge. All 4 returned AMEND-REQUIRED and have been addressed above:
 
 1. **HMAC-SHA-256 input domain separation.** **AMENDED:** Tags confirmed distinct. `envelope_id_bytes` reframed as exact UTF-8 bytes (not ASCII assumption); server-side validation `len ≤ 65535` required.
 2. **Key material handling.** **AMENDED:** changed to fixed-size `Zeroizing<[u8; 32]>` newtype. Log-redaction rule expanded to include derived `seq_mac_verify_key`.
@@ -379,14 +379,11 @@ Per Layer 2 security cross-check, the following design decisions warranted indep
 
 ## Cross-references
 
-- Layer 1 + Layer 2 preflight synthesis: `~/.claude/projects/.../memory/project_trek2_stage1x_preflight_synthesis_2026_06_10.md` (local).
-- Vladislav's original 4-lock scope: `~/.claude/projects/.../memory/project_trek2_stage1x_minilock_2026_06_10.md` (local).
-- Stage 2B client mini-lock (PAUSED behind this PR): `~/.claude/projects/.../memory/project_trek2_stage2b_minilock_2026_06_10.md` (local).
-- Stage 2B preflight synthesis (surfaced the 4 server BLOCKERs): `~/.claude/projects/.../memory/project_trek2_stage2b_preflight_synthesis_2026_06_10.md` (local).
 - Stage 1 SHIPPED (the contract surface Stage 1.x extends): master `dc6f52df` (PR #297).
 - Stage 2A SHIPPED: master `30dc16f5` (PR #298).
 - Trek 2 mini-lock 2026-06-09 (9 decisions + 3 guardrails): in repo via PR #297 docs.
+- Stage 2B client implementation is PAUSED behind this Stage 1.x server PR.
 
 ---
 
-**End of DRAFT. Awaiting Vladislav + Codex confirmation before any code is written.**
+**End of locked scope. Implementation follows in a subsequent PR.**
