@@ -131,6 +131,29 @@ pub const ACK_DELIVER_RATE_LIMIT_PER_WINDOW: u32 = 120;
 /// behaviour. Strict equality so a typo cannot accidentally opt in.
 pub const LONG_POLL_OPT_IN_HEADER: &str = "x-phantom-long-poll";
 
+/// Trek 2 Stage 1.x Lock-2 — opt-in header that gates the **padded body
+/// shape** independently of the hold path. Separate from
+/// [`LONG_POLL_OPT_IN_HEADER`] so a client can request the padded 4608-
+/// byte response without also requesting a server-side hold, and vice
+/// versa.
+///
+/// 4-cell wire contract:
+/// - LP absent, PP absent → short-poll, legacy small body
+/// - LP present, PP absent → hold up to `poll_hold_secs`, padded 4608 bytes (Stage 1 legacy preserved)
+/// - LP absent, PP present → short-poll, padded 4608 bytes (Stage 2B-A circuit-breaker fallback)
+/// - LP present, PP present → hold up to `poll_hold_secs`, padded 4608 bytes
+///
+/// Padded gate is `padded_opt_in = long_poll_opt_in || padded_poll_opt_in`,
+/// so an LP-only request keeps the original Stage 1 hold+padded
+/// behaviour. The decoupling exists so a Stage 2B client whose
+/// circuit-breaker drops LP can still send PP and keep the padded
+/// posture — closes the guardrail C ("padding never reduced silently")
+/// gap during the breaker's transient short-poll period.
+///
+/// Value contract mirrors [`LONG_POLL_OPT_IN_HEADER`]: strict equality
+/// to `"1"`. Server stays stateless — no per-identity persistent flag.
+pub const PADDED_POLL_OPT_IN_HEADER: &str = "x-phantom-padded-poll";
+
 /// Trek 2 Stage 1 — quantize a millisecond wall-clock timestamp to the
 /// nearest 60-second boundary by flooring (`ts - (ts % 60_000)`).
 /// Removes sub-minute precision from the relay-visible `sequence_ts`
@@ -1669,6 +1692,20 @@ pub async fn rest_poll(
         .and_then(|v| v.to_str().ok())
         .map(|v| v == "1")
         .unwrap_or(false);
+    // Trek 2 Stage 1.x Lock-2 — independent gate for the padded
+    // response shape. Same strict `"1"` equality contract as the
+    // long-poll header.
+    let padded_poll_opt_in = headers
+        .get(PADDED_POLL_OPT_IN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    // Padded shape activates when EITHER header opts in. LP-only
+    // preserves the Stage 1 legacy behaviour (hold + padded). PP-only
+    // gives the Stage 2B circuit-breaker fallback its short-poll +
+    // padded posture so the on-wire footprint stays canonical while
+    // the breaker is open.
+    let padded_opt_in = long_poll_opt_in || padded_poll_opt_in;
     let effective_hold_secs = if long_poll_opt_in {
         state.config.poll_hold_secs
     } else {
@@ -1691,18 +1728,21 @@ pub async fn rest_poll(
         more               = more,
         hold_secs          = effective_hold_secs,
         long_poll_opt_in   = long_poll_opt_in,
+        padded_poll_opt_in = padded_poll_opt_in,
     );
 
-    // Trek 2 Stage 1 — two-tier response shape, gated by the same
-    // `X-Phantom-Long-Poll: 1` opt-in header as the hold time.
-    //   * Opt-in path: pad to canonical 4608-byte body so empty and
-    //     envelope-bearing responses are byte-indistinguishable on the
-    //     wire (Q4 / cross-cutting security invariant 1).
-    //   * No-header path: legacy small-body shape (no `pad` field,
-    //     skipped by serde). Old clients keep their original bandwidth
-    //     profile and never pay the ~4.5 KB-per-poll cost — Vladislav
-    //     PR #297 round-3 review P1 fix.
-    let body: Vec<u8> = if long_poll_opt_in {
+    // Trek 2 Stage 1.x Lock-2 — response shape is gated by
+    // `padded_opt_in = long_poll_opt_in || padded_poll_opt_in`, NOT by
+    // the long-poll header alone. This decouples the hold path from
+    // the padded body shape:
+    //   * `padded_opt_in == true`: pad to canonical 4608-byte body so
+    //     empty and envelope-bearing responses are byte-
+    //     indistinguishable on the wire.
+    //   * `padded_opt_in == false`: legacy small-body shape (no `pad`
+    //     field, skipped by serde). Old no-header clients keep their
+    //     original bandwidth profile and never pay the ~4.5 KB-per-
+    //     poll cost.
+    let body: Vec<u8> = if padded_opt_in {
         pad_poll_response(PollResponse {
             envelopes,
             more,

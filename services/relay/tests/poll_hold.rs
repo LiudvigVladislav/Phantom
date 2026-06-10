@@ -169,6 +169,59 @@ async fn call_poll_with_long_poll_optin(
     (app, status, bytes.to_vec())
 }
 
+/// Trek 2 Stage 1.x Lock-2 — poll with `X-Phantom-Padded-Poll: 1`
+/// alone (no `X-Phantom-Long-Poll`). Server returns the padded 4608-
+/// byte body without engaging the hold loop. This is the Stage 2B-A
+/// client's circuit-breaker fallback shape.
+async fn call_poll_with_padded_poll_optin(
+    app: axum::Router,
+    token: &str,
+) -> (axum::Router, StatusCode, Vec<u8>) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/relay/poll")
+                .header("authorization", format!("Bearer {}", token))
+                .header("x-phantom-padded-poll", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 16_384).await.unwrap();
+    (app, status, bytes.to_vec())
+}
+
+/// Trek 2 Stage 1.x Lock-2 — poll with BOTH `X-Phantom-Long-Poll: 1`
+/// AND `X-Phantom-Padded-Poll: 1`. Same wire shape as long-poll alone
+/// (held + padded), but pins that sending the redundant padded header
+/// does not break the hold path.
+async fn call_poll_with_both_optin_headers(
+    app: axum::Router,
+    token: &str,
+) -> (axum::Router, StatusCode, Vec<u8>) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/relay/poll")
+                .header("authorization", format!("Bearer {}", token))
+                .header("x-phantom-long-poll", "1")
+                .header("x-phantom-padded-poll", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 16_384).await.unwrap();
+    (app, status, bytes.to_vec())
+}
+
 /// Build a test app with `poll_hold_secs` overridden to a specific
 /// value. 1 s is enough for deterministic E2E tests of the hold path
 /// without making the suite slow.
@@ -404,6 +457,129 @@ async fn opt_in_poll_returns_immediately_when_hold_secs_zero_with_padded_body() 
         elapsed
     );
     assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+}
+
+// ── Trek 2 Stage 1.x Lock-2: padded-vs-held 4-cell wire matrix ───────────────
+
+/// Lock-2 cell (LP=absent, PP=present). The padded-only path returns
+/// the canonical 4608-byte response immediately, WITHOUT engaging the
+/// hold loop. This is the Stage 2B-A circuit-breaker fallback shape:
+/// short-poll + padded, so the breaker's transient short-poll period
+/// does not degrade the on-wire padding posture.
+#[tokio::test]
+async fn padded_poll_alone_returns_padded_short_poll() {
+    let app = build_app_with_hold(60); // hold_secs > 0 but we expect short-poll
+    let identity = identity_hex(150);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_padded_poll_optin(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() < 1_000,
+        "padded-only poll must return immediately even when hold_secs > 0 \
+         (elapsed={:?})",
+        elapsed
+    );
+    assert_eq!(
+        body.len(),
+        POLL_RESPONSE_CANONICAL_BYTES,
+        "padded-only response must equal canonical 4608 bytes"
+    );
+}
+
+/// Lock-2 cell (LP=present, PP=present). Sending both opt-in headers
+/// produces the same wire shape as long-poll alone — hold up to
+/// `poll_hold_secs` AND padded canonical body. Pins that the redundant
+/// padded header on the normal long-poll path does not silently break
+/// the hold loop.
+#[tokio::test]
+async fn padded_and_long_poll_together_returns_padded_held() {
+    let app = build_app_with_hold(1); // 1 s hold for deterministic timing
+    let identity = identity_hex(151);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_both_optin_headers(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() >= 950,
+        "both-headers poll must engage the hold loop (elapsed={:?})",
+        elapsed
+    );
+    assert_eq!(
+        body.len(),
+        POLL_RESPONSE_CANONICAL_BYTES,
+        "both-headers response must equal canonical 4608 bytes"
+    );
+}
+
+/// Lock-2 backward-compat cell (LP=present, PP=absent). The Stage 1
+/// legacy behaviour is preserved exactly: a long-poll-alone request
+/// still holds AND still pads, because `padded_opt_in = LP || PP`.
+/// This was the cell the architecture review tried to collapse; the
+/// matrix asserts the legacy contract survives the decoupling.
+#[tokio::test]
+async fn long_poll_alone_still_returns_padded_held_stage_1_legacy() {
+    let app = build_app_with_hold(1);
+    let identity = identity_hex(152);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_long_poll_optin(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() >= 950,
+        "LP-only poll must still engage the hold loop (elapsed={:?})",
+        elapsed
+    );
+    assert_eq!(
+        body.len(),
+        POLL_RESPONSE_CANONICAL_BYTES,
+        "LP-only response must still pad to canonical 4608 bytes \
+         (Stage 1 legacy contract)"
+    );
+}
+
+/// Lock-2 negative cell (LP=absent, PP=absent). Old clients without
+/// either header still receive the legacy small-body response — no
+/// hold, no padding. Pins that the new padded gate does not
+/// accidentally activate for old clients.
+#[tokio::test]
+async fn no_opt_in_headers_returns_legacy_small_body_short_poll() {
+    let app = build_app_with_hold(60);
+    let identity = identity_hex(153);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_raw(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() < 1_000,
+        "no-header poll must return immediately even when hold_secs > 0 \
+         (elapsed={:?})",
+        elapsed
+    );
+    assert!(
+        body.len() < 200,
+        "no-header response must be legacy small body, not 4608; \
+         body.len()={}",
+        body.len()
+    );
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !body_str.contains("\"pad\""),
+        "no-header response must NOT include `pad` field; body={}",
+        body_str
+    );
 }
 
 // ── Q2: ack-deliver rate-limit at 120/window ─────────────────────────────────
