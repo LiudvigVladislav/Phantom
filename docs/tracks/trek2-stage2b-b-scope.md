@@ -53,7 +53,26 @@ The orchestrator's verify-key state is one of three named values:
 
 - **`KeyAbsent`** — the relay never supplied a verify key in this orchestrator-session. Either an old relay (Stage 1.x not deployed) or a `RELAY_SEQ_MAC_KEY`-less deployment. Behaviour: legacy unverified pass-through with structured log `reason=no_verify_key`. This is the only state in which a `PollEnvelope` reaches the inbound flow without MAC verification.
 - **`KeyPresent(hexValue)`** — the most recent successful `acquireOrRefreshToken` returned a non-empty `seq_mac_verify_key`. Behaviour: verify on every envelope, gate cursor advance on the result. This is the normal operating state.
-- **`KeySuspended`** — the orchestrator cleared the key after a failed refresh. Behaviour: drop all envelopes, no emit, no cursor advance, until a subsequent successful `acquireOrRefreshToken` returns a fresh non-empty key (transition to `KeyPresent`).
+- **`KeySuspended`** — the orchestrator cleared the key after a failed refresh OR after a `KeyPresent` session received an empty/malformed key on a subsequent refresh. Behaviour: drop all envelopes, no emit, no cursor advance, until a subsequent successful `acquireOrRefreshToken` returns a fresh, non-empty, 64-hex key (transition to `KeyPresent`).
+
+**Locked transition matrix (load-bearing: prevents MAC-verify downgrade).** A `KeyPresent` session that subsequently receives an empty or malformed verify key from the relay MUST NOT regress to `KeyAbsent` — that would re-open the legacy unverified pass-through and constitute a MAC verify downgrade triggered by relay state. The matrix:
+
+| Current state | Refresh outcome | Next state | Notes |
+|---|---|---|---|
+| (initial, no bootstrap yet) | first bootstrap returns empty `seq_mac_verify_key` | `KeyAbsent` | The "old relay" path. Legacy unverified pass-through allowed. |
+| (initial, no bootstrap yet) | first bootstrap returns valid 64-hex key | `KeyPresent(hex)` | Normal Stage 1.x relay. |
+| `KeyAbsent` | refresh returns empty key | `KeyAbsent` | Steady state for an old-relay deployment. |
+| `KeyAbsent` | refresh returns valid 64-hex key | `KeyPresent(hex)` | Relay was upgraded mid-session. Verify path activates. |
+| `KeyPresent(_)` | refresh returns valid 64-hex key | `KeyPresent(newHex)` | Normal rotation. The new value replaces the old; cells under `_inboundStateMutex` see only one consistent value (M-B25). |
+| `KeyPresent(_)` | refresh returns empty key | `KeySuspended` | **Locked downgrade protection.** Even though the relay sent an empty value, the orchestrator does NOT regress to `KeyAbsent`. The relay's intent is ambiguous (genuine downgrade attempt or transient bug); the safer fallback is to suspend ingestion until a non-empty key reappears. |
+| `KeyPresent(_)` | refresh returns malformed key (non-hex, odd length, wrong size) | `KeySuspended` | Same downgrade protection. The malformed path also drives M-B19 fail-closed. |
+| `KeyPresent(_)` | refresh fails (null body, 4xx, 5xx, network exception) | `KeySuspended` | The L2 corollary (forced-refresh-failure rule). |
+| `KeySuspended` | refresh returns empty key | `KeySuspended` | Suspension persists. No transition back to `KeyAbsent` ever. |
+| `KeySuspended` | refresh returns malformed key | `KeySuspended` | Same. |
+| `KeySuspended` | refresh returns valid 64-hex key | `KeyPresent(hex)` | Normal recovery path. Ingestion resumes. |
+| `KeySuspended` | refresh fails again | `KeySuspended` | No regression; the L2 corollary's "no REST ingestion until successful re-authorisation" rule continues. |
+
+The transition matrix is implemented as an exhaustive `when` on `(currentState, refreshOutcome)` so a future contributor adding a new outcome cannot accidentally omit the downgrade-protection branch. Cell M-B11 covers every row.
 
 **Forced-refresh-failure corollary (locked, derives from D2 + D15).** If a forced session/key refresh under L7 itself fails (the relay returns `null` body, 4xx, 5xx, or a network exception), the verify-key state transitions to `KeySuspended` immediately. **No REST ingestion happens on either `wsActivePollJob` or the legacy `pollLoop` until a subsequent successful re-authorisation moves the state back to `KeyPresent`.** This is the single sentence the scope-doc must surface so an implementer does not silently keep ingesting under a stale-or-empty key after a failed refresh.
 
@@ -76,37 +95,64 @@ _inbound.emit(env)        // mutex released; consumer may run on a different thr
 
 The map is purely in-memory; on orchestrator restart it is empty and pending envelopes re-arrive on the next poll. Access to the map is serialised through `_inboundStateMutex` (see L6 below).
 
-**Step 2 — orchestrator entry point (two-phase mutex pattern).** The orchestrator exposes a new entry point `onEnvelopeAcked(identityHex: String, envelopeId: String, ackSucceeded: Boolean)`. Callers invoke it AFTER attempting `orchestrator.ackInbound(envelopeId)`, with `ackSucceeded` reflecting whether the relay returned a 2xx (`AckOutcome.Acked`). The implementation MUST follow this exact two-phase pattern so storage I/O is NEVER held under `_inboundStateMutex`:
+**Step 2 — orchestrator entry point (three-phase mutex pattern + bounded local retry on cursor-after-ack failure).** The orchestrator exposes a new entry point `onEnvelopeAcked(envelopeId: String, ackSucceeded: Boolean)`. The orchestrator is already constructor-bound to its `identityHex`; callers do NOT pass it. They invoke `onEnvelopeAcked` AFTER attempting `orchestrator.ackInbound(envelopeId)`, with `ackSucceeded` reflecting whether the relay returned a 2xx (`AckOutcome.Acked`).
+
+The implementation MUST follow this three-phase pattern so storage I/O is NEVER held under `_inboundStateMutex`. On `ackSucceeded == true` the cursor write is bounded-retried INSIDE the orchestrator because once the relay has 2xx'd the ack, it has already removed the envelope from its queue and will NOT re-deliver it — the `ReAck` branch will NOT fire and the entry cannot be relied on for an external retry.
 
 ```
 Phase 1 (mutex held):
     val pendingSeq = _inboundStateMutex.withLock {
-        if (!ackSucceeded) return    // no cursor advance; entry stays for retry
-        _pendingSeqForAck[envelopeId]  // read only; do NOT remove yet
+        if (!ackSucceeded) {
+            // ack failed: cursor stays, entry stays, ReAck will retry on next poll
+            return
+        }
+        _pendingSeqForAck[envelopeId]   // read only; do NOT remove yet
     } ?: return                          // no-op if absent
 
-Phase 2 (mutex released):
-    val upsertOk = runCatching {
-        cursorRepository.upsertLastSeenSeq(identityHex, pendingSeq, nowMs())
-    }.isSuccess
+Phase 2 (mutex released, bounded retry loop):
+    var attempt = 0
+    var upsertOk = false
+    while (attempt < CURSOR_WRITE_MAX_ATTEMPTS && !upsertOk) {
+        upsertOk = runCatching {
+            cursorRepository.upsertLastSeenSeq(identityHex, pendingSeq, nowMs())
+        }.isSuccess
+        if (!upsertOk) {
+            attempt++
+            delay(CURSOR_WRITE_RETRY_BACKOFF_MS[attempt - 1].coerceAtLeast(0L))
+        }
+    }
 
 Phase 3 (mutex held):
     _inboundStateMutex.withLock {
-        if (upsertOk) {
-            _pendingSeqForAck.remove(envelopeId)   // success path: drop entry
+        // Remove the entry whether upsert eventually succeeded OR the local retry
+        // budget was exhausted. Both outcomes are terminal for this envelope:
+        //   upsertOk == true  → cursor at pendingSeq; entry done
+        //   upsertOk == false → relay already removed envelope on ack 2xx;
+        //                       no ReAck path will fire; leaving the entry in
+        //                       the map would leak memory permanently. The
+        //                       sparse-sequence catch-up (M-B26) handles the
+        //                       missed seq: the next legitimate envelope's
+        //                       higher seq advances the cursor past it.
+        _pendingSeqForAck.remove(envelopeId)
+        if (!upsertOk) {
+            log("event=poll_cursor_write_exhausted envelope_id=${envelopeId.take(8)} seq=$pendingSeq attempts=$CURSOR_WRITE_MAX_ATTEMPTS")
         }
-        // failure path: entry stays for retry on next observation
     }
 ```
 
-The Phase 2 storage call runs WITHOUT the mutex; concurrent loops continue to observe the in-memory state during the I/O. If `upsertLastSeenSeq` throws (disk full, SQLCipher I/O error, transaction abort), `_pendingSeqForAck[envelopeId]` REMAINS so the next observation of the same envelope (e.g. via the `ReAck` branch on a subsequent poll, or a process restart triggering a fresh delivery) re-attempts the cursor advance. The repository's monotonicity guard (D5) makes the retry idempotent: a second successful `upsertLastSeenSeq` with the same `seq` is a silent no-op at the repository layer.
+**Locked constants for cursor-write retry:**
 
-If `ackSucceeded == false` → DO NOT advance the cursor. Leave the entry in `_pendingSeqForAck` for the next ack attempt. The relay still holds the envelope; the `ReAck` branch will trigger on the next poll and retry the ack.
+| Constant | Value | Rationale |
+|---|---|---|
+| `CURSOR_WRITE_MAX_ATTEMPTS` | `3` | One nominal + two retries. A SQLCipher failure that survives three attempts is structural (disk full, schema mismatch, file-corruption); further retries are a busy-loop. |
+| `CURSOR_WRITE_RETRY_BACKOFF_MS` | `longArrayOf(100, 500)` | Indexed by `attempt - 1` for retries before attempt `attempt + 1`. Tight initial retry catches transient lock contention; the second waits longer for a transient I/O fault. |
+
+On `ackSucceeded == false` → DO NOT advance the cursor. Leave the entry in `_pendingSeqForAck` for the next ack attempt. The relay still holds the envelope; the `ReAck` branch will trigger on the next poll and retry the ack. **This is the only branch that relies on ReAck-driven retry.**
 
 **Step 3 — `HybridRelayTransport.handleRestInbound` integration.** The inbound handler currently at `apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt:~954` already classifies REST-mirrored envelopes into four branches. Stage 2B-B wires `onEnvelopeAcked` at the existing acknowledgement sites without changing the classification logic. Branch-by-branch contract:
 
 - **First check — `processedEnvelopeRepository.exists(env.id) == true` (already-processed dedup, line ~961).** The handler already calls `orchestrator.ackInbound(env.id)`. Stage 2B-B adds `onEnvelopeAcked(identityHex, env.id, ackOutcome)` after that call, with `ackOutcome` reflecting whether the ack returned success. This is the canonical "WS already stored the message via its own `messageId` path; the REST poll mirror now ack's the relay copy and advances the cursor by the REST `seq` carried on the mirror." There is no `seq` field on `RelayMessage.Deliver` (`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RelayEnvelope.kt`); the cursor advance happens here exclusively because `seq` is observable only on the REST `PollEnvelope`.
-- **Second check (`RestInboundDeduplicator`) `Action.Emit` (fresh delivery, line ~975).** The handler emits a `RelayMessage.Deliver` on `_incoming`; `DefaultMessagingService` later decrypts, persists, and calls `sendDeliveryAck(messageId)`. The cursor advance fires inside `sendDeliveryAck` itself — see Step 4. **The pending-seq mapping is populated here**, at the `Emit` site, BEFORE the consumer touches the envelope.
+- **Second check (`RestInboundDeduplicator`) `Action.Emit` (fresh delivery, line ~975).** The handler emits a `RelayMessage.Deliver` on `_incoming`; `DefaultMessagingService` later decrypts, persists, and calls `sendDeliveryAck(messageId)`. The cursor advance fires inside `sendDeliveryAck` itself — see Step 4. The pending-seq mapping was already populated by the orchestrator at Step 1 (the single insertion site), BEFORE the envelope reached `_inbound` or `HybridRelayTransport`. The handler does NOT touch `_pendingSeqForAck`.
 - **Second check `Action.SkipNoAck` (line ~990).** `DefaultMessagingService` is still mid-decrypt. No ack, no cursor advance, no map mutation. The previous `Emit` for this id already populated the map; Step 4 will fire when the eventual `sendDeliveryAck` completes.
 - **Second check `Action.ReAck` (line ~999).** `DefaultMessagingService` already persisted the message and called `sendDeliveryAck` once, but the prior ack network round-trip failed. The handler retries `orchestrator.ackInbound(env.id)`. Stage 2B-B adds `onEnvelopeAcked(identityHex, env.id, ackOutcome)` after that retry call. If the retry succeeds, the cursor advances; if it fails again, the map entry stays for the next poll.
 
@@ -179,7 +225,7 @@ Concretely:
 - Every read-modify-write on `_pendingSeqForAck`, `_macFailCount`, `_macRefreshAttemptedFor`, `LongPollBreakerState`, any breaker counter, OR the L2 `seqMacVerifyKey` state machine value happens inside `_inboundStateMutex.withLock { ... }`. **The verify-key state machine is explicitly in scope of the mutex** — its reads (per-envelope verify lookup) and writes (`KeyPresent` ↔ `KeySuspended` ↔ `KeyAbsent` transitions on bootstrap / refresh / failed-refresh) MUST all flow through the mutex so a refresh-vs-poll race cannot produce a verify call that reads half a stale key and half a fresh one. The pattern for a per-envelope verify is "snapshot the verify-key state inside `_inboundStateMutex.withLock`, release, then run the verify against the snapshot."
 - The mutex is held only across in-memory operations. Network I/O (`acquireOrRefreshToken`, `transport.poll`, `ackInbound`) and storage I/O (`cursorRepository.upsertLastSeenSeq`) are released BEFORE the suspending call to avoid holding the mutex across a network round-trip. The L3 two-phase pattern is the canonical example.
 - `_inboundStateMutex` is distinct from `tokenMutex`. The order if both must be held: `tokenMutex` outer, `_inboundStateMutex` inner. No code path holds them in the reverse order; this is asserted by inspection at PR review time AND by the M-B23 ordering test.
-- A token refresh that mutates `seqMacVerifyKey` state must follow the ordering: enter `tokenMutex.withLock { ... acquireOrRefreshToken ... }`, then within that scope enter `_inboundStateMutex.withLock { update state machine }` for the state-machine publication. A poll loop reading the state holds ONLY `_inboundStateMutex`. The ordering forbids deadlock because no path holds the inner mutex while taking the outer.
+- A token refresh that mutates `seqMacVerifyKey` state publishes the new state from INSIDE `acquireOrRefreshToken`'s existing `tokenMutex.withLock { ... }` critical section. Kotlin's `Mutex` is NOT re-entrant; a caller that wraps its own `tokenMutex.withLock { acquireOrRefreshToken(...) }` would deadlock the instant `acquireOrRefreshToken` tried to re-acquire `tokenMutex` internally. The correct pattern: at the existing line where `acquireOrRefreshToken` already assigns `_seqMacVerifyKey = response.seqMacVerifyKey` (already inside `tokenMutex`), Stage 2B-B adds a brief `_inboundStateMutex.withLock { ... }` block that publishes the transition-matrix outcome (see L2 matrix) onto the state machine. The poll loop never wraps `acquireOrRefreshToken` in `tokenMutex` itself; it just calls it directly (the function takes the mutex internally).
 - `_inboundStateMutex` is initialised in the orchestrator's primary constructor body alongside `tokenMutex` and lives for the orchestrator's lifetime.
 
 This closes R2-S-B5: the breaker / suspension MUST NOT become a MAC verify downgrade. Neither REST poll loop is permitted to be an unverified ingestion bypass under any state, and neither is permitted to race past the shared state checks.
@@ -213,7 +259,7 @@ Cells M-B12 (counter increments, no ack, no cursor) + M-B13 (refresh latched exa
 
 **No hard local logout (OQ-4 LOCK).** Persistent 410 responses NEVER nuke the user's identity. The long-poll path may suspend or degrade per L7; Direct WSS remains operational. The identity binding is preserved across any 410 storm.
 
-**Hard timer caps (D11).** Any timer value derived from a relay-supplied field is clamped to a hard ceiling regardless of the existing range gates: **breaker cooldown ≤ 120 s (`BREAKER_COOLDOWN_CEILING_MS`); 410 reauth interval ≤ 60 s (`BREAKER_410_STORM_COOLDOWN_MS`); HTTP 429 `Retry-After` ≤ 120 s (`RETRY_AFTER_HARD_CAP_MS`)**.
+**Hard timer caps (D11).** Any timer value derived from a relay-supplied field is clamped to a hard ceiling regardless of the existing range gates: **breaker cooldown ≤ 120 s (`BREAKER_COOLDOWN_CEILING_MS`); 410 reauth interval ≤ 60 s (`BREAKER_410_STORM_COOLDOWN_MS`); HTTP 429 `Retry-After` ≤ 120 s (`RETRY_AFTER_HARD_CAP_SECONDS = 120`, then multiplied by 1000 for `delay`)**.
 
 **`Retry-After` plumbing — new in Stage 2B-B.** The current `RestFallbackResponse<T>` (`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackTransport.kt:~114`) carries `statusCode`, `bodyParsed`, `rawBody`, `elapsedMs` and NO HTTP headers. Stage 2B-B adds a typed field:
 
@@ -229,12 +275,18 @@ data class RestFallbackResponse<T>(
 
 The Android transport (`AndroidNativeOkHttpRestFallbackTransport`) parses the OkHttp `Response.header("Retry-After")` value into the typed field:
 
-- Non-numeric, empty, negative, or HTTP-date-form values → `null` (the client falls back to its own backoff).
+- Non-numeric, empty, negative, zero, or HTTP-date-form values → `null` (the client falls back to its own backoff).
 - Numeric values are parsed as `Long` seconds.
-- Overflow guard: values whose `seconds * 1000L` would overflow `Long.MAX_VALUE` (anything > ~9.2 × 10^9 seconds, roughly 292 years) → `null`.
-- Negative or zero seconds → `null`.
 
-The orchestrator clamps `retryAfterSeconds * 1000L` to `RETRY_AFTER_HARD_CAP_MS` before scheduling the next attempt. The clamp applies in both REST poll loops AND in any send-path retry that consumes the header (Stage 1.x `HoldCapExceeded` returns `Retry-After: 30`; that value passes through the clamp unchanged because 30 s ≪ 120 s ceiling). Existing transport fakes (`RestFallbackOrchestratorTest.FakeTransport` and any test fake added in this stage) MUST also expose the typed field so the clamp logic is testable without a real OkHttp client.
+The orchestrator clamps overflow-safely by clamping the SECONDS value to `RETRY_AFTER_HARD_CAP_SECONDS = 120` FIRST, then multiplying by `1000L`. This pattern avoids any `Long` arithmetic overflow regardless of the advertised value:
+
+```
+val clampedSeconds = retryAfterSeconds.coerceAtMost(RETRY_AFTER_HARD_CAP_SECONDS)
+val delayMs = clampedSeconds * 1000L     // safe: max value 120_000L
+delay(delayMs)
+```
+
+A relay sending `Retry-After: 86400` (one day) is clamped to 120 seconds before any multiplication; the multiplication can never overflow. The clamp applies in both REST poll loops AND in any send-path retry that consumes the header (Stage 1.x `HoldCapExceeded` returns `Retry-After: 30`; that value passes through the clamp unchanged because 30 s ≪ 120 s ceiling). Existing transport fakes (`RestFallbackOrchestratorTest.FakeTransport` and any test fake added in this stage) MUST also expose the typed field so the clamp logic is testable without a real OkHttp client.
 
 This plumbing landing in C5 unblocks M-B24; without the typed field on `RestFallbackResponse`, the orchestrator has no signal to clamp. A misconfigured or hostile relay sending `Retry-After: 86400` (one day) MUST NOT lock the client out for a day. This prevents a misbehaving relay from forcing arbitrarily long polling blackouts even if its `pollHoldSecs` value passes the existing `1..480` range gate.
 
@@ -248,7 +300,7 @@ The breaker is a lightweight `LongPollBreakerState` sealed type plus a counter, 
 
 - `Closed` — normal operation. Default at orchestrator `start()`.
 - `Open(reason: BreakerOpenReason, cooldownMs: Long)` — REST poll backs off; the breaker timer counts down `cooldownMs` to half-open.
-- `HalfOpen` — named state with cancel-safe re-entry. ONE probe poll is issued; on success → `Closed`; on failure → `Open` with grown cooldown.
+- `HalfOpen(probeInFlight: Boolean = false)` — named state with cancel-safe re-entry. EXACTLY ONE probe poll is issued per `HalfOpen` entry, guarded by an atomic `probeInFlight` permit held under `_inboundStateMutex`. On entering `HalfOpen` the permit is `false`; the first poll loop that observes `HalfOpen` claims the permit (`probeInFlight = true`) under `_inboundStateMutex.withLock` and proceeds to issue the probe. Any other poll loop observing `HalfOpen(probeInFlight = true)` short-circuits and does NOT issue a probe; it sleeps (`delay(intervalMs)`) and re-observes the state on the next iteration. The probe outcome resolves the state: success → `Closed` (permit becomes moot); failure → `Open(reason, cooldownMs * growth)` (permit becomes moot). The permit prevents two simultaneous probe round-trips when both REST poll loops wake at the same instant past the cooldown timer.
 - `SuspendedOnPoison` — entered exclusively by L7's poison posture. Exits only on orchestrator restart or explicit recovery; the breaker timer does NOT auto-recover this state.
 
 **`BreakerOpenReason` taxonomy:**
@@ -351,11 +403,13 @@ The implementation PR ships the following cells. M-prefixed cells extend the Sta
 | **M-B17** | commonTest, behavioural | After `SuspendedOnPoison`, the same bad envelope returned through the legacy `pollLoop` is NOT emitted, NOT acked, and does NOT advance the cursor; both loops enforce identical verify semantics under suspension |
 | **M-B18** | commonTest, behavioural with `StandardTestDispatcher + advanceTimeBy` | Breaker numeric contract: each constant from the L9 table is read at runtime from the orchestrator's companion and asserted to match the locked value (catches a future tuning drift); `K=3` 410 responses within `W=30_000` ms transitions to `Open(Status410Storm, cooldownMs=60_000)`; failed half-open probe doubles cooldown with `BREAKER_COOLDOWN_GROWTH_FACTOR = 2.0` capped at `BREAKER_COOLDOWN_CEILING_MS = 120_000`; closed-from-half-open-success resets cooldown to `BREAKER_INITIAL_COOLDOWN_MS = 5_000` |
 | **M-B19** | commonTest, behavioural fail-closed | Malformed verify-key and `seq_mac` inputs must fail closed without exceptions and without loop death. Sub-cells: (a) `seqMacVerifyKey` is non-hex string → state machine enters `KeySuspended`, no envelope ingestion; (b) `seqMacVerifyKey` has odd char length → `KeySuspended`; (c) `seqMacVerifyKey` is not 64 chars (32, 63, 65, 128 sampled) → `KeySuspended`; (d) `PollEnvelope.seqMac` is non-hex → drop with `reason=no_mac_field`; (e) `PollEnvelope.seqMac` has odd char length → drop with `reason=no_mac_field`; (f) `PollEnvelope.seqMac` is not 64 chars → drop with `reason=no_mac_field`. None of these cases throw; the loop continues; the orchestrator keeps polling |
-| **M-B20** | commonTest, behavioural | Ack network failure path: `onEnvelopeAcked(_, _, ackSucceeded = false)` does NOT advance the cursor; the `_pendingSeqForAck` entry remains; the next poll's `ReAck` branch retries the ack; on retry success the cursor advances exactly once |
+| **M-B20** | commonTest, behavioural | Ack network failure path: `onEnvelopeAcked(_, ackSucceeded = false)` does NOT advance the cursor; the `_pendingSeqForAck` entry remains; the next poll's `ReAck` branch retries the ack; on retry success the cursor advances exactly once |
+| **M-B27** | commonTest, behavioural | Cursor-write bounded retry on ack-success: `onEnvelopeAcked(_, ackSucceeded = true)` with the cursor repository throwing on the first attempt succeeds on retry; entry removed; cursor at expected seq. Exhaustion sub-cell: all three attempts throw → `event=poll_cursor_write_exhausted` log fires; entry REMOVED from `_pendingSeqForAck` (no memory leak); subsequent observation does NOT reattempt the upsert for this id; sparse-sequence catch-up via M-B26 covers recovery |
+| **M-B28** | commonTest, concurrency | Half-open probe singleton: both REST poll loops wake simultaneously past the cooldown timer with the breaker in `HalfOpen(probeInFlight = false)`; under `_inboundStateMutex` exactly ONE loop claims the permit and calls `transport.poll(...)` exactly ONCE; the other loop observes `HalfOpen(probeInFlight = true)`, short-circuits, and sleeps until the next iteration; the probe outcome resolves the state correctly for both loops |
 | **M-B21** | commonTest, behavioural with debug flag on | Debug-mode `FAILED_MAC` hold path: when `holdMacFailures == true` and the envelope produces `MacError`, `onEnvelopeAcked` is NOT called, the relay queue is NOT cleared, the cursor stays frozen; the X3DH-repair-path's eventual `sendDeliveryAck` advances the cursor at THAT point |
 | **M-B22** | commonTest, concurrency | Same `envelope_id` observed by `wsActivePollLoop` and the legacy `pollLoop` concurrently: `_macFailCount` increments exactly once per verify failure, `_macRefreshAttemptedFor` admits exactly one refresh, `_pendingSeqForAck` carries exactly one entry, the cursor advances exactly once on ack success |
 | **M-B23** | commonTest, concurrency | Concurrent breaker-open signals from both poll loops converge on `LongPollBreakerState.SuspendedOnPoison` with no inconsistent intermediate state visible to either loop; the `_inboundStateMutex` discipline holds; assertion that `tokenMutex` and `_inboundStateMutex` are NEVER acquired in reverse order across the code path |
-| **M-B24** | commonTest, behavioural | HTTP 429 `Retry-After` hard cap: the orchestrator honours `Retry-After: N` from the relay but clamps `N` to `RETRY_AFTER_HARD_CAP_MS = 120_000` regardless of advertised value (mirrors the D11 hard ceiling on relay-derived timers). A malicious or misconfigured relay sending `Retry-After: 86400` cannot lock the client out for a day. Test sub-cells: (a) typed `retryAfterSeconds: Long? = null` populated from the OkHttp `Response.header("Retry-After")` parse path; (b) malformed `Retry-After` (non-numeric, negative, HTTP-date form, empty) → treated as null + log; (c) overflow guard — values that would overflow `seconds * 1000L` (anything > `9_223_372_036` seconds, ~292 years) are treated as null; (d) the clamp applies in both REST poll loops and in the send-path retry that consumes the header |
+| **M-B24** | commonTest, behavioural | HTTP 429 `Retry-After` hard cap: the orchestrator honours `Retry-After: N` from the relay but clamps `N` to `RETRY_AFTER_HARD_CAP_SECONDS = 120` seconds BEFORE multiplying by `1000L`. A malicious or misconfigured relay sending `Retry-After: 86400` cannot lock the client out for a day, and no input value can overflow `Long` arithmetic because the clamp executes before the multiplication. Test sub-cells: (a) typed `retryAfterSeconds: Long? = null` populated from the OkHttp `Response.header("Retry-After")` parse path; (b) malformed `Retry-After` (non-numeric, negative, zero, HTTP-date form, empty) → treated as null + log; (c) overflow-safe clamp — `Retry-After: 86400` → effective delay 120_000 ms; `Retry-After: Long.MAX_VALUE` → effective delay 120_000 ms (no overflow); (d) the clamp applies in both REST poll loops and in the send-path retry that consumes the header |
 | **M-B25** | commonTest, concurrency | Refresh-vs-poll race: a token refresh that flips the verify-key state from `KeyPresent(hexA)` to `KeyPresent(hexB)` while a poll-loop verify is in flight against an envelope MUST NOT produce a verify call that uses half `hexA` and half `hexB`. The poll-loop snapshots the verify-key inside `_inboundStateMutex.withLock` BEFORE releasing the mutex and running the verify; the refresh path takes `tokenMutex` outer + `_inboundStateMutex` inner to publish the new state. Test exercises 100 concurrent poll-verify iterations interleaved with 100 refresh-induced state flips; assertion: every verify uses a single consistent key value end-to-end |
 | **M-B26** | commonTest, behavioural with sparse seq | Crash recovery via sparse-sequence skip: after a process kill between `ackInbound` success and the cursor write, the relay has already removed the envelope from its queue and will NOT redeliver it. The next poll arrives with a higher `seq` (the relay's next envelope for this identity), which the cursor advance path applies through the normal Step 4 / Step 3 flow. The persisted cursor "skips" the lost seq value; the gap is implicit because no envelope holds it. Test seeds `since_seq = 5`, simulates a crash mid-ack on `seq = 6`, brings up a fresh orchestrator, polls and receives `seq = 7`; persisted cursor ends at `7` with no anomaly logged. This is the actual crash-recovery mechanism — the relay's `ackInbound` is what triggers queue removal, not the cursor advance |
 
