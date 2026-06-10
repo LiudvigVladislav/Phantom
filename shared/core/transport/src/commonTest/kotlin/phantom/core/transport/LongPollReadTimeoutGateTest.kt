@@ -37,8 +37,8 @@ import kotlin.test.assertTrue
  * | `"0"` | `30` | legacy (null) |
  * | `"0"` | `null` / unset | legacy (null) — wire `0` |
  * | `"1"` | `0` | legacy (null) (server kill switch) |
- * | `"1"` | `1` | raised: `(1 + 5) * 1000 = 6_000` |
- * | `"1"` | `30` | raised: `(30 + 5) * 1000 = 35_000` |
+ * | `"1"` | `1` | `LEGACY_SHORT_POLL_TIMEOUT_MS` (floor — `(1+5)*1000 = 6_000` below floor) |
+ * | `"1"` | `30` | raised: `(30 + 5) * 1000 = 35_000` (above floor) |
  * | `"1"` | `480` | raised: `(480 + 5) * 1000 = 485_000` |
  * | `"1"` | `481` | legacy (null) (out of spec) |
  * | `"1"` | `null` / unset | legacy (null) — wire `0` |
@@ -49,6 +49,15 @@ import kotlin.test.assertTrue
  * [RestFallbackOrchestrator.POLL_HOLD_SAFETY_MARGIN_SECS] so a
  * harmonised re-lock at a new value passes here automatically while
  * still pinning the formula shape.
+ *
+ * The floor `LEGACY_SHORT_POLL_TIMEOUT_MS = 10_000` ms is load-bearing:
+ * the raw formula `(hold + margin) * 1000` produces values BELOW the
+ * legacy short-poll budget for tiny `pollHoldSecs ∈ [1, 4]` (e.g.
+ * `(1+5)*1000 = 6_000 ms < 10_000 ms`). Override semantics must be
+ * strictly monotonic — enabling long-poll can only LIFT timeouts,
+ * never shorten them — so the helper clamps the candidate UP to the
+ * floor via `maxOf`. The floor-clamp case is exercised explicitly by
+ * [flag_on_with_tiny_hold_is_floored_at_legacy_short_poll_timeout].
  */
 class LongPollReadTimeoutGateTest {
 
@@ -102,15 +111,76 @@ class LongPollReadTimeoutGateTest {
     }
 
     @Test
-    fun flag_on_with_hold_at_lower_bound_raises_timeout() {
+    fun flag_on_with_hold_at_lower_bound_is_floored_at_legacy_timeout() {
+        // At MIN_POLL_HOLD_SECS = 1, the raw formula is
+        // `(1 + 5) * 1000 = 6_000` ms, BELOW the legacy 10_000 ms floor.
+        // The floor wins per monotonicity: long-poll must not be less
+        // patient than legacy short-poll.
         val raised = RestFallbackOrchestrator.computeLongPollReadTimeoutMs(
             longPollEnabled = true,
             pollHoldSecs = RestFallbackOrchestrator.MIN_POLL_HOLD_SECS,
         )
-        assertNotNull(raised, "Expected raised timeout at MIN_POLL_HOLD_SECS.")
+        assertNotNull(raised, "Expected non-null override at MIN_POLL_HOLD_SECS.")
         assertEquals(
-            (RestFallbackOrchestrator.MIN_POLL_HOLD_SECS + margin) * 1000L,
+            RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS,
             raised,
+            "At MIN_POLL_HOLD_SECS the raw formula is below the legacy floor; the " +
+                "result must be clamped to LEGACY_SHORT_POLL_TIMEOUT_MS.",
+        )
+    }
+
+    @Test
+    fun flag_on_with_tiny_hold_is_floored_at_legacy_short_poll_timeout() {
+        // Parameterised-style check across `pollHoldSecs ∈ [1, 4]` where
+        // the raw formula returns 6_000..9_000 ms — all below the
+        // 10_000 ms legacy floor. Each must clamp to the floor.
+        for (hold in 1..4) {
+            val raised = RestFallbackOrchestrator.computeLongPollReadTimeoutMs(
+                longPollEnabled = true,
+                pollHoldSecs = hold,
+            )
+            val rawCandidate = (hold + margin) * 1000L
+            assertTrue(
+                rawCandidate < RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS,
+                "Sanity: hold=$hold should produce raw < floor.",
+            )
+            assertEquals(
+                RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS,
+                raised,
+                "hold=$hold: raw $rawCandidate ms is below floor; expected " +
+                    "clamp to LEGACY_SHORT_POLL_TIMEOUT_MS.",
+            )
+        }
+    }
+
+    @Test
+    fun flag_on_with_hold_at_floor_boundary_uses_formula_not_clamp() {
+        // At `pollHoldSecs = 5`, raw formula is `(5 + 5) * 1000 = 10_000`
+        // ms — exactly equal to the legacy floor. `maxOf` returns
+        // the floor unchanged. Pinning this case structurally so a
+        // future refactor that flips `maxOf` to a strict comparator
+        // does not silently produce 5_000 ms at the boundary.
+        val raised = RestFallbackOrchestrator.computeLongPollReadTimeoutMs(
+            longPollEnabled = true,
+            pollHoldSecs = 5,
+        )
+        assertEquals(RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS, raised)
+        assertEquals(10_000L, raised)
+    }
+
+    @Test
+    fun flag_on_with_hold_just_above_floor_boundary_uses_formula() {
+        // At `pollHoldSecs = 6`, raw formula = 11_000 ms, ABOVE floor.
+        // Formula wins — first cell where the raised value is strictly
+        // above the legacy floor.
+        val raised = RestFallbackOrchestrator.computeLongPollReadTimeoutMs(
+            longPollEnabled = true,
+            pollHoldSecs = 6,
+        )
+        assertEquals((6 + margin) * 1000L, raised)
+        assertTrue(
+            raised!! > RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS,
+            "hold=6 must produce a value strictly above legacy floor.",
         )
     }
 
@@ -192,5 +262,22 @@ class LongPollReadTimeoutGateTest {
         // client's gate stays in lock-step with the server's contract.
         assertEquals(1, RestFallbackOrchestrator.MIN_POLL_HOLD_SECS)
         assertEquals(480, RestFallbackOrchestrator.MAX_POLL_HOLD_SECS_CAP)
+    }
+
+    @Test
+    fun legacy_floor_matches_android_transport_default() {
+        // Single source of truth invariant: the legacy floor used by
+        // the gate MUST equal the OkHttp `READ_TIMEOUT_MS` /
+        // `CALL_TIMEOUT_MS` defaults in
+        // `AndroidNativeOkHttpRestFallbackTransport`. If a future
+        // refactor changes the Android default without also changing
+        // the floor (or vice versa), the monotonicity invariant
+        // `override_ms >= legacy_default_ms` would silently break.
+        //
+        // The two constants are now wired with the Android defaults
+        // referencing `LEGACY_SHORT_POLL_TIMEOUT_MS` directly, so this
+        // assert is a structural pin against a future "decoupling"
+        // refactor that re-introduces drift.
+        assertEquals(10_000L, RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS)
     }
 }

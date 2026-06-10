@@ -292,10 +292,18 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
          * `:673` (`CALL_TIMEOUT_MS = 10_000L`), which has run in production
          * since PR-M2 without trouble — i.e. it is the proven class of
          * budget for PHANTOM's networks, not a guess.
+         *
+         * Trek 2 Stage 2B-A (B2) — `CALL_TIMEOUT_MS` and `READ_TIMEOUT_MS`
+         * both reference [RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS]
+         * so the legacy-floor invariant inside
+         * [RestFallbackOrchestrator.computeLongPollReadTimeoutMs] cannot
+         * drift away from the actual OkHttp default applied here. The
+         * commonMain constant is the single source of truth; this
+         * companion just routes it to the right OkHttp builder fields.
          */
-        const val CALL_TIMEOUT_MS: Long = 10_000L
+        const val CALL_TIMEOUT_MS: Long = RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS
         const val CONNECT_TIMEOUT_MS: Long = 5_000L
-        const val READ_TIMEOUT_MS: Long = 10_000L
+        const val READ_TIMEOUT_MS: Long = RestFallbackOrchestrator.LEGACY_SHORT_POLL_TIMEOUT_MS
         const val WRITE_TIMEOUT_MS: Long = 10_000L
 
         /**

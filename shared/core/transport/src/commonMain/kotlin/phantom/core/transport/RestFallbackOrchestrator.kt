@@ -844,6 +844,27 @@ class RestFallbackOrchestrator(
         const val POLL_HOLD_SAFETY_MARGIN_SECS: Int = 5
 
         /**
+         * Trek 2 Stage 2B-A (B2) — legacy short-poll OkHttp read /
+         * call timeout floor in milliseconds. Single source of truth
+         * for the per-call ceilings the Android transport
+         * (`AndroidNativeOkHttpRestFallbackTransport`'s
+         * `READ_TIMEOUT_MS` and `CALL_TIMEOUT_MS`) applies on the
+         * `/relay/poll`, `/relay/send`, `/relay/ack-deliver` and
+         * `/auth/session` paths.
+         *
+         * The override returned by [computeLongPollReadTimeoutMs] is
+         * floored at this value: an override that would LOWER the
+         * timeout below the legacy floor (which can happen for tiny
+         * `pollHoldSecs` values such as `1..4`, where the raw formula
+         * `(hold + 5) * 1000 ≤ 9_000` is below the legacy 10_000 ms)
+         * is clamped UP so the long-poll path is never less patient
+         * than the legacy short-poll path. Override semantics must be
+         * strictly monotonic: enabling long-poll can only EXTEND
+         * timeouts, never shorten them.
+         */
+        const val LEGACY_SHORT_POLL_TIMEOUT_MS: Long = 10_000L
+
+        /**
          * Trek 2 Stage 2B-A (B2) — compute the read / call timeout
          * override that the orchestrator passes to
          * [RestFallbackTransport.poll]'s `readTimeoutMs` parameter for
@@ -863,10 +884,19 @@ class RestFallbackOrchestrator(
          * parameter is omitted.
          *
          * The override value is
-         * `([pollHoldSecs] + [POLL_HOLD_SAFETY_MARGIN_SECS]) * 1000`.
+         * `maxOf((pollHoldSecs + POLL_HOLD_SAFETY_MARGIN_SECS) * 1000,
+         *        LEGACY_SHORT_POLL_TIMEOUT_MS)`.
+         *
+         * The `maxOf` floor is load-bearing: for tiny `pollHoldSecs`
+         * values (`1..4`) the raw formula yields `6_000..9_000` ms,
+         * which is BELOW the legacy short-poll budget — without the
+         * floor a flag-on client would be LESS patient than a legacy
+         * short-poll client. L2's intent is that long-poll can only
+         * lift budgets, never shorten them. The floor enforces that
+         * monotonicity at the gate's only mathematical entry point.
          *
          * Pure function, no I/O — kept in the companion so M2's
-         * 9-cell matrix can hit it without standing up an orchestrator.
+         * matrix can hit it without standing up an orchestrator.
          */
         fun computeLongPollReadTimeoutMs(
             longPollEnabled: Boolean,
@@ -874,7 +904,8 @@ class RestFallbackOrchestrator(
         ): Long? {
             if (!longPollEnabled) return null
             if (pollHoldSecs !in MIN_POLL_HOLD_SECS..MAX_POLL_HOLD_SECS_CAP) return null
-            return (pollHoldSecs + POLL_HOLD_SAFETY_MARGIN_SECS).toLong() * 1000L
+            val candidateMs = (pollHoldSecs + POLL_HOLD_SAFETY_MARGIN_SECS).toLong() * 1000L
+            return maxOf(candidateMs, LEGACY_SHORT_POLL_TIMEOUT_MS)
         }
 
         /**
