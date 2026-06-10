@@ -6,7 +6,7 @@
 
 The two-round preflight (PR #307, master `f8cdc91a`, bundle at [docs/tracks/trek2-stage2b-b-preflight/](trek2-stage2b-b-preflight/)) consolidated four parallel domain reviews plus an independent second-pass cross-check into a single binding synthesis: 15 locked decisions D1-D15, six user locks OQ-1 through OQ-6, one rejected open question OQ-7. This scope-doc lifts those decisions into a per-lock contract that the implementation PR types itself against. **No new decisions are invented here.** Everything below either references a synthesis lock by tag or carries a single-sentence corollary that the synthesis already established.
 
-**What lands after this PR.** Stage 2B-C is the documentation cleanup (release notes, ADR rollup, public README updates). Once 2B-C ships, the long-poll backbone is complete and Direct WSS hardening is the next track per the strategic order.
+**What lands after this PR.** Stage 2B-C is the documentation cleanup (release notes, ADR rollup, public README updates). Stage 2B-D is the release-flag promotion + rollout-gate PR that actually flips `LONGPOLL_V2_ENABLED` to `"1"` in the release variant; until 2B-D ships, the backbone is wired but inactive in production builds. See the *After this PR* section at the end of this scope-doc for the full sequencing. Direct WSS hardening is the next track after 2B-D, not after 2B-C.
 
 ## Strategic frame
 
@@ -61,17 +61,25 @@ The state machine is observed by BOTH REST poll loops (L6). Cells M-B11 (state t
 
 ### L3 — Cursor advance via storage-acceptance callback (codifies D3 + OQ-2 LOCK)
 
-Cursor advancement (`upsertLastSeenSeq`) does NOT live in the orchestrator's poll loops. It lives in a callback wired into `RestFallbackOrchestrator` as a new constructor parameter:
+Cursor advancement (`upsertLastSeenSeq`) does NOT live in the orchestrator's poll loops. It is triggered by the same storage-acceptance signal that already drives `sendDeliveryAck` on the existing inbound pipeline. The wire-up layer (`AppContainer`) installs the trigger; the orchestrator NEVER calls `upsertLastSeenSeq` directly. Concretely:
 
-```
-onEnvelopePersisted: suspend (identityHex: String, seq: Long) -> Unit
-```
+**Step 1 — pending-seq mapping.** When `wsActivePollLoop` or the legacy `pollLoop` emits a verified envelope on `_inbound`, it ALSO inserts `(envelope_id → env.seq)` into an in-memory orchestrator-session map (`_pendingSeqForAck: MutableMap<String, Long>`). The map is the single point that survives the transport-layer signature gap (the downstream `HybridRelayTransport.sendDeliveryAck(messageId)` receives only the message id, never the `seq`). The map is purely in-memory; on orchestrator restart it is empty and pending envelopes re-arrive on the next poll.
 
-The wire-up layer (`AppContainer`) threads this callback through the downstream messaging consumer; the consumer invokes it after the message-table insert returns success **or** idempotent-duplicate. The orchestrator NEVER calls `upsertLastSeenSeq` directly.
+**Step 2 — storage-acceptance trigger.** The orchestrator exposes a new entry point `onEnvelopePersisted(identityHex: String, envelopeId: String)`. The downstream messaging consumer (`DefaultMessagingService.handleRestInbound`) calls it from EVERY branch that confirms persistence of the envelope's `seq` cursor — fresh insert, `alreadyProcessed` dedup, and `ReAck` replay. The trigger looks up `envelopeId` in `_pendingSeqForAck`, and if present, calls `cursorRepository.upsertLastSeenSeq(identityHex, seq, nowMs)` and removes the entry. If the envelope id is absent from the map (e.g. it was a WS Deliver, never observed by the parallel REST poll loop), the trigger is a no-op — the WS path's own cursor advancement is wired separately on its own seq sequence and is NOT in this scope.
 
-**Storage transaction discipline (OQ-2 LOCK).** Sequential commits are acceptable: message-table insert commits first, then the callback fires and `upsertLastSeenSeq` commits separately. Process kill between the two leaves the message persisted and the cursor frozen at the prior value — the next poll re-receives the envelope, the storage layer dedupes, the callback fires, the cursor catches up. Single SQLCipher transaction across both writes is nice-to-have, NOT a blocker. The repository contract's monotonicity guard (D5) makes the sequential discipline safe under process kill or concurrent writes.
+**Step 3 — `sendDeliveryAck` integration.** The existing `HybridRelayTransport.sendDeliveryAck(messageId)` call site (currently at `apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt:~1014`) fires `onEnvelopePersisted(identityHex, messageId)` BEFORE the WS-side ack-deliver send, so a process kill between cursor write and WS-ack leaves the cursor advanced (safe — the next poll sees `since_seq > seq` and the relay does not redeliver) rather than the cursor frozen (unsafe — the next poll re-receives the envelope, the storage layer dedupes, and without this trigger the cursor would stay frozen indefinitely).
 
-Cells M11 + M12 pin this.
+**Step 4 — branches that MUST trigger.** Inside `handleRestInbound`:
+- Fresh insert (envelope passes verify, decrypts, persists for the first time) → trigger.
+- `alreadyProcessed` (envelope's id is in the dedup table; the user already has the message) → trigger. The relay has already delivered this `seq` to a prior session; advancing the persisted cursor past it is safe and necessary to prevent re-delivery on the next poll.
+- `ReAck` (envelope is in flight on a different transport; ack-only path) → trigger. The cursor must catch up with the WS-side's view of the queue.
+- Decrypt failure that nonetheless persists the envelope in a quarantine table (existing `decryptFailedEnvelopeRepo` path) → trigger. The relay's queue copy is no longer needed; the local quarantine is the authoritative copy.
+
+**Step 5 — branches that MUST NOT trigger.** Storage write failure (disk full, SQLCipher I/O error, transaction abort that does NOT persist the envelope or any quarantine row) → DO NOT trigger. Drop the envelope, leave it in the relay queue for re-delivery on the next poll, log `event=poll_storage_fail_no_cursor_advance envelope_id=<8-char prefix>`. This is the rule that holds guardrail A under partial-write conditions.
+
+**Storage transaction discipline (OQ-2 LOCK).** Sequential commits are acceptable: message-table insert commits first, then `onEnvelopePersisted` fires and `upsertLastSeenSeq` commits separately. Process kill between the two leaves the message persisted and the cursor frozen at the prior value — the next poll re-receives the envelope, the storage layer dedupes via `alreadyProcessed`, the trigger fires, the cursor catches up. Single SQLCipher transaction across both writes is nice-to-have, NOT a blocker. The repository contract's monotonicity guard (D5) makes the sequential discipline safe under process kill or concurrent writes.
+
+Cells M11 + M12 + M-B16 pin this.
 
 ### L4 — Cursor repository seam shape (codifies D4 + OQ-6 LOCK + D10)
 
@@ -154,22 +162,44 @@ Cells M-B12 (counter increments, no ack, no cursor) + M-B13 (refresh latched exa
 
 Cells M14 (5 sub-cells covering: 410 → authSession → retry → 200; 410 reauth fails → no busy-loop; 410-then-410 within 30 s → ceiling; cursor preserved; 410 on `/relay/ack-deliver` does NOT trigger reauth dance per Stage 1.x Lock-3) pin this.
 
-### L9 — Circuit breaker mechanism (codifies D7)
+### L9 — Circuit breaker mechanism + quantitative numbers (codifies D7 + D11)
 
-The breaker is a lightweight `LongPollBreakerState` sealed type plus a counter, **separate from `RestStateMachine`**. States:
+The breaker is a lightweight `LongPollBreakerState` sealed type plus a counter, **separate from `RestStateMachine`**. All quantitative parameters are locked here; the implementation does NOT invent new constants.
 
-- `Closed` — normal operation.
-- `Open(reason: BreakerOpenReason)` — REST poll backs off aggressively; breaker timer counts down to half-open. Reasons include `ConsecutiveRestFailures` and `Status410Storm` (NOT `MacVerifyFailure` — that path goes through L7's SuspendedOnPoison instead).
-- `HalfOpen` — named state with cancel-safe re-entry. ONE probe poll is issued; on success → `Closed`; on failure → `Open` with refreshed timer.
-- `SuspendedOnPoison` — entered exclusively by L7's poison posture. Exits only on orchestrator restart or explicit recovery.
+**States:**
+
+- `Closed` — normal operation. Default at orchestrator `start()`.
+- `Open(reason: BreakerOpenReason, cooldownMs: Long)` — REST poll backs off; the breaker timer counts down `cooldownMs` to half-open.
+- `HalfOpen` — named state with cancel-safe re-entry. ONE probe poll is issued; on success → `Closed`; on failure → `Open` with grown cooldown.
+- `SuspendedOnPoison` — entered exclusively by L7's poison posture. Exits only on orchestrator restart or explicit recovery; the breaker timer does NOT auto-recover this state.
+
+**`BreakerOpenReason` taxonomy:**
+
+- `ConsecutiveRestFailures` — REST poll failed `N` consecutive times. Failure is one of: network `IOException` (DNS, connect, TLS, read), HTTP 5xx response, response timeout (the OkHttp `SocketTimeoutException` raised by the L2-gated read budget). Status 401 / 410 / 429 / 4xx-other are NOT transport failures (they have their own paths: 401 → token refresh, 410 → L8 reauth dance, 429 → respect `Retry-After`, other 4xx → drop + log + advance the counter only for diagnostic purposes).
+- `Status410Storm` — `K` consecutive `410 Gone` responses within `W` wall-clock seconds. Transitions to `Open` immediately on the `K`th 410, with the cooldown set to the L8 ceiling so the 410 dance and the breaker dance do not race.
+
+**Quantitative locks (final, no further tuning during implementation):**
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `BREAKER_CONSECUTIVE_FAIL_THRESHOLD` (N) | `5` | Five consecutive network-class failures is the same threshold the existing `pollFailureCount` patterns elsewhere in the orchestrator use; mirrors the `SEND_MAX_ATTEMPTS = 5` send-side budget. |
+| `BREAKER_INITIAL_COOLDOWN_MS` | `5_000` | Matches the existing `POLL_FAIL_BACKOFF_MS` floor used by the orchestrator's jittered backoff path. |
+| `BREAKER_COOLDOWN_GROWTH_FACTOR` | `2.0` | Standard exponential growth. Half-open failure doubles the next cooldown. |
+| `BREAKER_COOLDOWN_CEILING_MS` | `120_000` | Mirrors the D11 hard cap on relay-derived breaker cooldown — 120 s ceiling regardless of growth factor. |
+| `BREAKER_410_STORM_THRESHOLD` (K) | `3` | Three 410s in close succession is a clear rotation-loop signal. |
+| `BREAKER_410_STORM_WINDOW_MS` (W) | `30_000` | Mirrors the D6 "three consecutive 410s within 30 s → ceiling" trigger from L8 so the breaker and L8 do not race; they fire on the same condition. |
+| `BREAKER_410_STORM_COOLDOWN_MS` | `60_000` | Matches the L8 410-reauth-interval ceiling so the breaker exit timer aligns with the L8 backoff exit timer. |
+| `BREAKER_HALFOPEN_PROBE_BUDGET` | `1` | Exactly one probe poll per half-open entry. A failed probe re-opens with cooldown × `BREAKER_COOLDOWN_GROWTH_FACTOR`, capped at `BREAKER_COOLDOWN_CEILING_MS`. |
+
+**Cooldown growth contract.** After a failed half-open probe, the next `Open` cooldown is `min(currentCooldown * BREAKER_COOLDOWN_GROWTH_FACTOR, BREAKER_COOLDOWN_CEILING_MS)`. On entering `Closed` from `HalfOpen`-success, the cooldown resets to `BREAKER_INITIAL_COOLDOWN_MS` for the next potential open cycle.
 
 **Breaker open does NOT alter MAC verify semantics.** A loop running with breaker `Open` still gates cursor on verify, still observes the verify-key state machine, still uses the same `SeqMacVerifier`. Per R2-S-B5, the breaker MUST NOT become a MAC verify downgrade.
 
 **Interaction with `RestStateMachine`.** Breaker open emits a named `RestStateMachine.Event.RestPollDegraded` event (read-only signal); `RestStateMachine` does NOT transition `RestMode` purely because of breaker state. The existing `RestMode.{WsActive, WsCandidate, RestActive}` semantics remain governed by their existing inputs.
 
-**Breaker timer Job tracked and cancelled by `stop()`.** Same lifecycle discipline as `aliveTickJob` from Stage 2A. On `stop()` the timer Job is cancelled; the breaker state itself is reset to `Closed` on the next `start()` because Stage 2B-B does NOT persist breaker state across orchestrator lifecycles.
+**Breaker timer Job tracked and cancelled by `stop()`.** Same lifecycle discipline as `aliveTickJob` from Stage 2A. On `stop()` the timer Job is cancelled; the breaker state itself is reset to `Closed` on the next `start()` because Stage 2B-B does NOT persist breaker state across orchestrator lifecycles. The `SuspendedOnPoison` state has the same behaviour — reset on next `start()`, no persistence.
 
-Cells M13 (5 transition sub-cells + M-13e for `stop()` during `Open`) pin this.
+Cells M13 (5 transition sub-cells + M-13e for `stop()` during `Open`) + M-B18 (numeric values match the constants table verbatim) pin this.
 
 ### L10 — Jitter source migration (codifies D12)
 
@@ -206,7 +236,7 @@ The implementation PR ships the following cells. M-prefixed cells extend the Sta
 | **M15** | commonTest, behavioural + apps/android androidUnitTest, source-parse | Jitter source = `Csprng`; grep gate covers `Random.Default`, `java.util.Random`, `SecureRandom`; behavioural recording fake sees every draw |
 | **M16** | apps/android androidUnitTest | Release variant BuildConfig pin `LONGPOLL_V2_ENABLED == "0"` unchanged from Stage 2B-A |
 | **M17** | commonTest, behavioural | Old-relay `MissingMac` outcome class: when `_seqMacVerifyKey` is empty (`KeyAbsent`), envelopes pass through with `reason=no_verify_key`; when `_seqMacVerifyKey` is non-empty (`KeyPresent`) and `PollEnvelope.seqMac` is empty, envelopes are dropped with `reason=no_mac_field` — discriminated outcomes |
-| **M-B7** | commonTest, golden-vector | At least one golden vector with a multi-byte UTF-8 `envelope_id` (emoji or CJK); exercises the `String.length` vs `encodeToByteArray().size` trap |
+| **M-B7** | commonTest, golden-vector with INDEPENDENT Rust-generated expected MAC | At least one golden vector with a multi-byte UTF-8 `envelope_id` (emoji or CJK). The expected MAC for this vector MUST be generated by the Rust `seq_mac` implementation (a test-only entry added to `services/relay/tests/seq_mac_vectors.rs` or its JSON export, NOT the production wire surface) and byte-pinned in the Kotlin test fixture. The Kotlin verifier MUST NOT compute the expected MAC itself; that would let an `encodeToByteArray().size` vs `String.length` drift verify against itself silently. This is the same independent-oracle pattern Stage 1.x used for the existing 13 golden vectors |
 | **M-B8** | commonTest, behavioural | `identity_hex` derivation round-trip: server-generated MAC verifies against client-derived `identity_hex` using `RestFallbackOrchestrator.identityHex` (the receiving identity) |
 | **M-B9** | commonTest, behavioural | Hex-key-decode-before-use: assert MAC computed with `Auth.authHmacSha256(rawKeyBytes, message)` verifies; assert MAC computed with the hex `String` as ASCII bytes DOES NOT verify |
 | **M-B10** | commonTest, behavioural with structured-concurrency cancellation | Cancellation-safety on verify-then-emit boundary: cancellation injected between `emit` return and the storage-acceptance callback does NOT advance the cursor |
@@ -217,6 +247,8 @@ The implementation PR ships the following cells. M-prefixed cells extend the Sta
 | **M-B15** | commonTest, behavioural | Direct WSS path remains operational while both REST poll loops are suspended |
 | **M-B16** | commonTest, behavioural with fake storage | Persisted cursor and relay queue remain byte-identical to pre-poison state across all retry counts |
 | **M-B17** | commonTest, behavioural | After `SuspendedOnPoison`, the same bad envelope returned through the legacy `pollLoop` is NOT emitted, NOT acked, and does NOT advance the cursor; both loops enforce identical verify semantics under suspension |
+| **M-B18** | commonTest, behavioural with `StandardTestDispatcher + advanceTimeBy` | Breaker numeric contract: each constant from the L9 table is read at runtime from the orchestrator's companion and asserted to match the locked value (catches a future tuning drift); `K=3` 410 responses within `W=30_000` ms transitions to `Open(Status410Storm, cooldownMs=60_000)`; failed half-open probe doubles cooldown with `BREAKER_COOLDOWN_GROWTH_FACTOR = 2.0` capped at `BREAKER_COOLDOWN_CEILING_MS = 120_000`; closed-from-half-open-success resets cooldown to `BREAKER_INITIAL_COOLDOWN_MS = 5_000` |
+| **M-B19** | commonTest, behavioural fail-closed | Malformed verify-key and `seq_mac` inputs must fail closed without exceptions and without loop death. Sub-cells: (a) `seqMacVerifyKey` is non-hex string → state machine enters `KeySuspended`, no envelope ingestion; (b) `seqMacVerifyKey` has odd char length → `KeySuspended`; (c) `seqMacVerifyKey` is not 64 chars (32, 63, 65, 128 sampled) → `KeySuspended`; (d) `PollEnvelope.seqMac` is non-hex → drop with `reason=no_mac_field`; (e) `PollEnvelope.seqMac` has odd char length → drop with `reason=no_mac_field`; (f) `PollEnvelope.seqMac` is not 64 chars → drop with `reason=no_mac_field`. None of these cases throw; the loop continues; the orchestrator keeps polling |
 
 ## PR-commit boundary
 
@@ -258,4 +290,10 @@ Stage 2B-B is NOT shippable without the Tele2 LTE smoke. Rule 8 is binding and *
 
 ## After this PR
 
-After Stage 2B-B merges, the long-poll backbone is semantically complete: integrity-checked, cursor-advanced under storage acceptance, breaker-protected, reauth-aware, jitter-CSPRNG. The next deliverable is Stage 2B-C (documentation cleanup). After 2B-C, Direct WSS hardening is the next track per the locked strategic order.
+After Stage 2B-B merges, the long-poll backbone is **semantically wired but NOT yet active in production**: the release-mode APK still pins `LONGPOLL_V2_ENABLED == "0"` (Stage 2B-A scope L6). The backbone is therefore complete *as code* but not yet validated *in production*. The sequence after 2B-B is:
+
+1. **Stage 2B-C — documentation cleanup.** Release notes, ADR rollup, public README updates. No code change.
+2. **Stage 2B-D — release flag promotion + rollout gate.** A separate, deliberately ceremonial PR that flips `LONGPOLL_V2_ENABLED` to `"1"` in the release variant. Promotion is conditional on (i) a beta cohort running with the debug-mode flag for an agreed observation window, (ii) zero new `seq_mac_verify_fail` field reports beyond expected baseline, (iii) zero new cursor-monotonicity field reports, (iv) the Tele2 LTE smoke S1-S6 reproduced cleanly on a release build. The rollout gate's pass criteria are locked at the time the promotion PR opens.
+3. **Direct WSS hardening track opens.** The backbone is "active" only after Stage 2B-D promotion is green in production. Direct WSS hardening is the next track per the locked strategic order, but it starts only after Stage 2B-D, not after Stage 2B-C.
+
+This sequencing is explicit so the strategic frame's "backbone first" framing does not silently degrade into "backbone shipped but never validated; we have moved on to Direct WSS." The backbone is the un-killable-messenger guarantee at the product level; validating it under production load is the load-bearing step that justifies that guarantee.
