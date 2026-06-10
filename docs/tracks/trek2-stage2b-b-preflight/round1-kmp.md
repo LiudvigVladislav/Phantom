@@ -1,5 +1,7 @@
 # Trek 2 Stage 2B-B — KMP Implementation Preflight (Round 1)
 
+> **Status — historical review input.** This file is one of five review documents whose findings were consolidated into [synthesis.md](synthesis.md). The binding decisions for Stage 2B-B implementation are in `synthesis.md § User locks (2026-06-10)` + D1-D15. Some open questions and "recommended" options in this file have since been superseded or amended. Do NOT code against guidance in this file directly; consult the synthesis.
+
 **Scope:** HMAC-SHA-256 `seq_mac` verification, cursor write seam, circuit breaker, 410
 re-auth, cadence jitter.  
 **Base:** master `0ac29cf5` (Stage 2B-A merged as PR #306).  

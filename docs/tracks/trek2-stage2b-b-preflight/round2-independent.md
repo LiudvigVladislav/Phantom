@@ -1,5 +1,7 @@
 # Trek 2 Stage 2B-B — Round 2 Independent Preflight
 
+> **Status — historical review input.** This file is one of five review documents whose findings were consolidated into [synthesis.md](synthesis.md). The binding decisions for Stage 2B-B implementation are in `synthesis.md § User locks (2026-06-10)` + D1-D15. Some open questions and "recommended" options in this file have since been superseded or amended. Do NOT code against guidance in this file directly; consult the synthesis.
+
 Round 2 is a second-pass review of Round 1 across the three high-risk dimensions of Stage 2B-B: security, implementation risk, and the test matrix. This pass had no access to source code; it worked from Round 1 summaries plus excerpts. Its job is to find what the first round missed, to flag claims that do not hold up, and to strengthen what does.
 
 ---

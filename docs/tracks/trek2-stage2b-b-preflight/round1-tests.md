@@ -1,5 +1,7 @@
 # Trek 2 Stage 2B-B — Round 1 preflight: test-matrix review
 
+> **Status — historical review input.** This file is one of five review documents whose findings were consolidated into [synthesis.md](synthesis.md). The binding decisions for Stage 2B-B implementation are in `synthesis.md § User locks (2026-06-10)` + D1-D15. Some open questions and "recommended" options in this file have since been superseded or amended. Do NOT code against guidance in this file directly; consult the synthesis.
+
 Stage 2B-A shell merged today as PR #306 at master `0ac29cf5`. Stage 2B-B is the semantic layer: `seq_mac` HMAC-SHA-256 verify per envelope, cursor advance gated on `(verify ∧ accept/dedup)`, WS↔REST circuit breaker, re-auth on `410 Gone`, jitter via `Csprng`, plus the Tele2 LTE field gate.
 
 ## 1. Test-matrix blockers (P1)
