@@ -145,6 +145,8 @@ The orchestrator is already constructor-bound to its `identityHex`; callers do N
 
 The implementation MUST follow this three-phase pattern so storage I/O is NEVER held under `_inboundStateMutex`. On `AckOutcome.Acked` the cursor write is bounded-retried INSIDE the orchestrator because once the relay has 2xx'd the ack, it has already removed the envelope from its queue and will NOT re-deliver it — the `ReAck` branch will NOT fire and the entry cannot be relied on for an external retry.
 
+**Why the outer `withContext(NonCancellable)` of the previous draft was wrong.** Wrapping the entire post-ack region in `withContext(NonCancellable)` would have (a) prevented `CancellationException` propagation from `upsert` and `delay`, (b) made `coroutineContext[Job]?.isCancelled` always observe the `NonCancellable` job's `isCancelled = false` regardless of the caller's job state, and (c) potentially allowed the function to return successfully after caller cancellation without naturally rethrowing the cancellation signal (`withContext(NonCancellable)` can complete even after a parent job is cancelled — see Kotlin's `kotlinx-coroutines-core` documentation on `NonCancellable`). The corrected pattern keeps the retry loop fully cancellable and wraps ONLY the `finally` cleanup in `NonCancellable`, so caller cancellation aborts retries as intended, the entry is still removed from the map under the cleanup's `NonCancellable` umbrella, and `CancellationException` naturally rethrows to the caller after `finally` completes. Cancellation-status tracking uses an explicit `var wasCancelled` flag captured in the outer (cancellable) scope, NOT a runtime `Job` query from inside `NonCancellable`.
+
 ```
 suspend fun ackInboundAndAdvanceCursor(envelopeId: String): AckOutcome {
 
@@ -159,90 +161,84 @@ Phase 0 (cancellable — caller cancellation aborts before the ack fires):
     }
 
     // From here on the relay has CLEARED the envelope from its queue.
-    // The orchestrator is committed to attempt cursor write + cleanup
-    // regardless of caller cancellation. The NonCancellable wrapper
-    // suspends caller cancellation for the entire post-ack block; if
-    // the caller's scope is cancelled, the work below still completes,
-    // and the CancellationException is re-thrown to the caller AFTER
-    // cleanup finishes.
-    withContext(NonCancellable) {
+    // We MUST remove the `_pendingSeqForAck` entry regardless of what
+    // happens next, including cancellation. The retry loop ITSELF
+    // stays cancellable (so the caller can abort a slow shutdown);
+    // only the cleanup in `finally` is wrapped in NonCancellable.
+    //
+    // Critical: there is NO suspension point between the `return`
+    // above and the `try { ... }` block. Cancellation cannot leak
+    // into the gap. The first suspension point is
+    // `_inboundStateMutex.withLock` INSIDE the try; from that point
+    // on, `finally` guarantees cleanup.
 
-Phase 1 (mutex held):
-    val pendingSeq = _inboundStateMutex.withLock {
-        _pendingSeqForAck[envelopeId]   // read only; do NOT remove yet
-    } ?: return@withContext              // no-op if absent
-
-Phase 2 (mutex released, bounded retry loop in cancellation-safe try/finally):
+    var pendingSeq: Long? = null
     var upsertOk = false
+    var wasCancelled = false
     try {
-        // Index iteration to keep the backoff lookup in sync with the attempt
-        // counter. delay() runs only BETWEEN attempts, never after the last
-        // attempt — `CURSOR_WRITE_RETRY_BACKOFF_MS.size` must equal
-        // `CURSOR_WRITE_MAX_ATTEMPTS - 1` by contract.
-        for (attemptIdx in 0 until CURSOR_WRITE_MAX_ATTEMPTS) {
-            try {
-                cursorRepository.upsertLastSeenSeq(identityHex, pendingSeq, nowMs())
-                upsertOk = true
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                // Cancellation MUST propagate. `runCatching` would have
-                // silently caught and turned this into upsertOk=false,
-                // letting the orchestrator log a spurious
-                // `poll_cursor_write_exhausted` event and complete
-                // normally — a real cancellation must not be
-                // distinguishable from a successful exit. The `finally`
-                // block below still runs and cleans up
-                // `_pendingSeqForAck` under `NonCancellable`.
-                throw ce
-            } catch (t: Throwable) {
-                // All other failures (SQLCipher I/O, disk full,
-                // transaction abort, etc.) feed the retry loop.
+
+Phase 1 (mutex held — first suspension point):
+        pendingSeq = _inboundStateMutex.withLock {
+            _pendingSeqForAck[envelopeId]   // read only; do NOT remove yet
+        }
+        if (pendingSeq == null) return ackOutcome   // no-op; nothing to clean up
+
+Phase 2 (mutex released, bounded retry loop — fully cancellable):
+        try {
+            // Index iteration to keep the backoff lookup in sync with the attempt
+            // counter. delay() runs only BETWEEN attempts, never after the last
+            // attempt — `CURSOR_WRITE_RETRY_BACKOFF_MS.size` must equal
+            // `CURSOR_WRITE_MAX_ATTEMPTS - 1` by contract.
+            for (attemptIdx in 0 until CURSOR_WRITE_MAX_ATTEMPTS) {
+                try {
+                    cursorRepository.upsertLastSeenSeq(identityHex, pendingSeq!!, nowMs())
+                    upsertOk = true
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    // Cancellation MUST propagate. `runCatching` would
+                    // have silently caught it and turned this into
+                    // `upsertOk = false`. Rethrow to the outer catch,
+                    // which sets `wasCancelled = true` and re-throws,
+                    // unwinding through `finally`.
+                    throw ce
+                } catch (t: Throwable) {
+                    // All other failures (SQLCipher I/O, disk full,
+                    // transaction abort, etc.) feed the retry loop.
+                }
+                if (upsertOk) break
+                if (attemptIdx < CURSOR_WRITE_MAX_ATTEMPTS - 1) {
+                    delay(CURSOR_WRITE_RETRY_BACKOFF_MS[attemptIdx])
+                    // delay() throws CancellationException naturally;
+                    // the outer catch below tags it as cancellation.
+                }
             }
-            if (upsertOk) break
-            if (attemptIdx < CURSOR_WRITE_MAX_ATTEMPTS - 1) {
-                delay(CURSOR_WRITE_RETRY_BACKOFF_MS[attemptIdx])
-            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            wasCancelled = true
+            throw ce   // propagate to outer finally
         }
     } finally {
-        // Phase 3 runs unconditionally, even if the caller's coroutine is
-        // cancelled mid-retry. Without this `finally`, a cancellation between
-        // a successful ack and the cursor write would leak the entry in
-        // `_pendingSeqForAck` forever, because the relay has already removed
-        // the envelope from its queue and no ReAck will ever re-trigger the
-        // cleanup. `withContext(NonCancellable) { ... }` around the mutex
-        // claim ensures the cleanup itself cannot be cancelled inside the
-        // critical section.
+
+Phase 3 (cleanup — runs even under cancellation, wrapped narrowly in NonCancellable):
         withContext(NonCancellable) {
             _inboundStateMutex.withLock {
                 // Remove the entry whether upsert eventually succeeded OR the
                 // local retry budget was exhausted OR the coroutine was
-                // cancelled mid-retry. All three outcomes are terminal for
-                // this envelope:
-                //   upsertOk == true  → cursor at pendingSeq; entry done
-                //   upsertOk == false → relay already removed envelope on
-                //                       ack 2xx; no ReAck path will fire;
-                //                       sparse-sequence catch-up (M-B26)
-                //                       handles recovery via the next
-                //                       legitimate higher seq
-                //   cancellation      → same as upsertOk==false; entry must
-                //                       not leak past the orchestrator-session
+                // cancelled OR `pendingSeq == null` (cancellation hit the
+                // Phase 1 mutex read before the value was assigned).
+                // `remove` is idempotent: a no-op if absent.
                 _pendingSeqForAck.remove(envelopeId)
-                // Log the exhaustion event ONLY for a genuine
-                // attempt-budget exhaustion. If the function is in this
-                // finally because of CancellationException propagation,
-                // `upsertOk` is `false` but the cause is shutdown, not
-                // a structural failure of the storage layer. We
-                // distinguish by re-checking whether the coroutine is
-                // cancelled here. Logging a `poll_cursor_write_exhausted`
-                // for a routine cancellation would spam the log with
-                // false structural-error signals at every orchestrator
-                // shutdown.
-                if (!upsertOk && coroutineContext[Job]?.isCancelled != true) {
+                // Log the exhaustion event ONLY for a genuine attempt-budget
+                // exhaustion (`upsertOk == false`) AND not under cancellation
+                // (`wasCancelled == false`) AND only when we actually
+                // attempted a write (`pendingSeq != null`). The flag is
+                // captured in the outer (cancellable) scope before entering
+                // NonCancellable, so it correctly reports the caller's job
+                // state — not the NonCancellable Job's `isCancelled = false`.
+                if (!upsertOk && !wasCancelled && pendingSeq != null) {
                     log("event=poll_cursor_write_exhausted envelope_id=${envelopeId.take(8)} seq=$pendingSeq")
                 }
             }
         }
     }
-    }   // close withContext(NonCancellable)
     return ackOutcome
 }   // close ackInboundAndAdvanceCursor
 ```
@@ -332,7 +328,7 @@ Concretely:
 **Concurrency-safe shared state.** Both poll loops run on the orchestrator's `scope` under `Dispatchers.Default`, which dispatches to multiple threads. Plain `MutableMap` / `MutableSet` for `_pendingSeqForAck` (L3), `_macFailCount` (L7 Step 1), `_macRefreshAttemptedFor` (L7 Step 3), `LongPollBreakerState` (L9), the breaker counters, AND `seqMacVerifyKey` state (L2) are all NOT thread-safe — concurrent mutation produces lost updates, double-counting, missed latch checks, or a stale-key vs fresh-key read torn across loop iterations. Stage 2B-B introduces a single orchestrator-scoped `Mutex` (`_inboundStateMutex: Mutex`) that serialises ALL read-modify-write access to these structures. Discipline:
 
 - Every read-modify-write on `_pendingSeqForAck`, `_macFailCount`, `_macRefreshAttemptedFor`, `LongPollBreakerState`, any breaker counter, OR the L2 `seqMacVerifyKey` state machine value happens inside `_inboundStateMutex.withLock { ... }`. **The verify-key state machine is explicitly in scope of the mutex** — its reads (per-envelope verify lookup) and writes (`KeyPresent` ↔ `KeySuspended` ↔ `KeyAbsent` transitions on bootstrap / refresh / failed-refresh) MUST all flow through the mutex so a refresh-vs-poll race cannot produce a verify call that reads half a stale key and half a fresh one. The pattern for a per-envelope verify is "snapshot the verify-key state inside `_inboundStateMutex.withLock`, release, then run the verify against the snapshot."
-- The mutex is held only across in-memory operations. Network I/O (`acquireOrRefreshToken`, `transport.poll`, `ackInbound`) and storage I/O (`cursorRepository.upsertLastSeenSeq`) are released BEFORE the suspending call to avoid holding the mutex across a network round-trip. The L3 two-phase pattern is the canonical example.
+- The mutex is held only across in-memory operations. Network I/O (`acquireOrRefreshToken`, `transport.poll`, `ackInbound`) and storage I/O (`cursorRepository.upsertLastSeenSeq`) are released BEFORE the suspending call to avoid holding the mutex across a network round-trip. The L3 three-phase pattern is the canonical example.
 - `_inboundStateMutex` is distinct from `tokenMutex`. The order if both must be held: `tokenMutex` outer, `_inboundStateMutex` inner. No code path holds them in the reverse order; this is asserted by inspection at PR review time AND by the M-B23 ordering test.
 - A token refresh that mutates `seqMacVerifyKey` state publishes the new state from INSIDE `acquireOrRefreshToken`'s existing `tokenMutex.withLock { ... }` critical section. Kotlin's `Mutex` is NOT re-entrant; a caller that wraps its own `tokenMutex.withLock { acquireOrRefreshToken(...) }` would deadlock the instant `acquireOrRefreshToken` tried to re-acquire `tokenMutex` internally. The correct pattern: at the existing line where `acquireOrRefreshToken` already assigns `_seqMacVerifyKey = response.seqMacVerifyKey` (already inside `tokenMutex`), Stage 2B-B adds a brief `_inboundStateMutex.withLock { ... }` block that publishes the transition-matrix outcome (see L2 matrix) onto the state machine. The poll loop never wraps `acquireOrRefreshToken` in `tokenMutex` itself; it just calls it directly (the function takes the mutex internally).
 - `_inboundStateMutex` is initialised in the orchestrator's primary constructor body alongside `tokenMutex` and lives for the orchestrator's lifetime.
@@ -504,7 +500,7 @@ The implementation PR ships the following cells. M-prefixed cells extend the Sta
 | **M-B7** | commonTest, golden-vector with INDEPENDENT Rust-generated expected MAC | At least one golden vector with a multi-byte UTF-8 `envelope_id` (emoji or CJK). The expected MAC for this vector MUST be generated by the Rust `seq_mac` implementation (a test-only entry added to `services/relay/tests/seq_mac_vectors.rs` or its JSON export, NOT the production wire surface) and byte-pinned in the Kotlin test fixture. The Kotlin verifier MUST NOT compute the expected MAC itself; that would let an `encodeToByteArray().size` vs `String.length` drift verify against itself silently. This is the same independent-oracle pattern Stage 1.x used for the existing 13 golden vectors |
 | **M-B8** | commonTest, behavioural | `identity_hex` derivation round-trip: server-generated MAC verifies against client-derived `identity_hex` using `RestFallbackOrchestrator.identityHex` (the receiving identity) |
 | **M-B9** | commonTest, behavioural | Hex-key-decode-before-use: assert MAC computed with `Auth.authHmacSha256(rawKeyBytes, message)` verifies; assert MAC computed with the hex `String` as ASCII bytes DOES NOT verify |
-| **M-B10** | commonTest, behavioural with structured-concurrency cancellation | Cancellation-safety on verify-then-emit boundary: cancellation injected between `emit` return and the storage-acceptance callback does NOT advance the cursor |
+| **M-B10** | commonTest, behavioural with structured-concurrency cancellation | Cancellation-safety on verify-then-emit boundary: cancellation injected between `emit` return and the `ackInboundAndAdvanceCursor` invocation does NOT advance the cursor |
 | **M-B11** | commonTest, behavioural | Verify-key state machine transitions: `KeyAbsent → KeyPresent → KeySuspended → KeyPresent` paths exercised; the corollary path (failed refresh → `KeySuspended`) is exercised explicitly |
 | **M-B12** | commonTest, behavioural | MAC repeat counter increments under sustained verify-fail; no ack, no cursor advance under any count |
 | **M-B13** | commonTest, behavioural | First repeat triggers forced session refresh; latched exactly once per `envelope_id`; no second refresh on threshold multiples |
@@ -523,7 +519,7 @@ The implementation PR ships the following cells. M-prefixed cells extend the Sta
 | **M-B26** | commonTest, behavioural with sparse seq | Crash recovery via sparse-sequence skip: after a process kill between `ackInbound` success and the cursor write, the relay has already removed the envelope from its queue and will NOT redeliver it. The next poll arrives with a higher `seq` (the relay's next envelope for this identity), which the cursor advance path applies through the normal Step 4 / Step 3 flow. The persisted cursor "skips" the lost seq value; the gap is implicit because no envelope holds it. Test seeds `since_seq = 5`, simulates a crash mid-ack on `seq = 6`, brings up a fresh orchestrator, polls and receives `seq = 7`; persisted cursor ends at `7` with no anomaly logged. This is the actual crash-recovery mechanism — the relay's `ackInbound` is what triggers queue removal, not the cursor advance |
 | **M-B27** | commonTest, behavioural | Cursor-write bounded retry on ack-success, three sub-cells: (a) repository throws once then succeeds → entry removed; cursor at expected seq; (b) exhaustion: all three attempts throw → `event=poll_cursor_write_exhausted` log fires; entry REMOVED from `_pendingSeqForAck` (no memory leak); subsequent observation does NOT reattempt the upsert for this id; sparse-sequence catch-up via M-B26 covers recovery; (c) cancellation safety: cancel the caller's coroutine after `ackSucceeded = true` but before the first storage write completes → the `finally` + `withContext(NonCancellable)` block still removes the entry from `_pendingSeqForAck` under `_inboundStateMutex`; no entry leaks past cancellation; the `CancellationException` re-throws to the caller after cleanup |
 | **M-B28** | commonTest, concurrency | Half-open probe singleton with cancellation safety, three sub-cells: (a) both REST poll loops wake simultaneously past the cooldown timer with the breaker in `HalfOpen(probeInFlight = false)`; under `_inboundStateMutex` exactly ONE loop claims the permit and calls `transport.poll(...)` exactly ONCE; the other loop observes `HalfOpen(probeInFlight = true)`, short-circuits, and sleeps until the next iteration; the probe outcome resolves the state correctly for both loops; (b) claimant cancellation: the claimant loop's probe call is cancelled mid-flight (mode transition or scope cancellation); the `finally` + `withContext(NonCancellable)` block releases the permit (`HalfOpen(probeInFlight = true) → HalfOpen(probeInFlight = false)`); (c) recovery after claimant cancellation: on the next iteration the second loop observes `HalfOpen(probeInFlight = false)`, claims the permit, calls `transport.poll(...)` once, and resolves the state — proving the cancellation path does not strand the breaker permanently |
-| **M-B29** | commonTest, concurrency | Cancellation between `ackInbound` returning `Acked` and the cursor write does NOT leak `_pendingSeqForAck`. Test injects cancellation at three precise points inside `ackInboundAndAdvanceCursor`: (a) after `ackInbound` returns `Acked` but before the `withContext(NonCancellable) { ... }` block is entered → the `NonCancellable` block still runs to completion and cleanup happens; (b) during the bounded retry loop's third (last) `upsertLastSeenSeq` attempt → `CancellationException` propagates instead of being silently swallowed by `runCatching`; `_pendingSeqForAck` entry is removed in the `finally`; no `poll_cursor_write_exhausted` log fires (the path is shutdown, not structural error); (c) during the `delay(...)` BETWEEN retry attempts → cancellation propagates; `finally` cleanup still runs; entry removed |
+| **M-B29** | commonTest, concurrency | Cancellation between `ackInbound` returning `Acked` and the cursor write does NOT leak `_pendingSeqForAck`. Test injects cancellation at four precise points inside `ackInboundAndAdvanceCursor`: (a) at the Phase 1 mutex acquire (the first suspension point after `Acked`) → `pendingSeq` stays `null`; `finally` runs unconditionally and removes the entry via `_pendingSeqForAck.remove(envelopeId)` (idempotent); no `poll_cursor_write_exhausted` log fires; `CancellationException` re-throws to the caller; (b) during the bounded retry loop's third (last) `upsertLastSeenSeq` attempt → `CancellationException` propagates (not swallowed by `runCatching` because we use explicit `catch (ce: CancellationException) { throw ce }`); outer catch sets `wasCancelled = true`; `finally` removes entry; no exhaustion log fires; (c) during the `delay(...)` between retry attempts → `delay` throws `CancellationException` naturally; outer catch tags `wasCancelled = true`; `finally` removes entry; no exhaustion log; (d) after `Acked` returns but before the `try { ... }` block is entered — verified by construction that no suspension point exists in this gap, so cancellation cannot arrive here; the test confirms this by counting suspension points in the disassembled bytecode |
 
 ## PR-commit boundary
 
