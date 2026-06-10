@@ -172,6 +172,16 @@ class AppContainer(private val context: Context) {
     // signingPubHexForRest; the repository itself is always available.
     val voiceV2DownloadRepo = phantom.core.storage.SqlDelightVoiceV2DownloadRepository(dbHolder.database)
 
+    // Trek 2 Stage 2A (A3): persistent resume cursor for the parallel
+    // `/relay/poll` long-poll path. Constructed unconditionally so
+    // the wire-up below can always read from it; Stage 2B-A's
+    // `wsActivePollJob` reads the cursor and Stage 2B-B will start
+    // writing to it once `seq_mac` verify and storage dedup gate the
+    // advance. See `LastSeenSeqRepository` doc-comment for the
+    // monotonicity contract.
+    val lastSeenSeqRepo: phantom.core.storage.LastSeenSeqRepository =
+        phantom.core.storage.SqlDelightLastSeenSeqRepository(dbHolder.database)
+
     // Starts immediately — deletes expired messages while the app is alive.
     private val disappearingMessageScheduler = DisappearingMessageScheduler(messageRepo, appScope)
         .also { it.start() }
@@ -985,6 +995,20 @@ class AppContainer(private val context: Context) {
                 // production release builds always see `false` here,
                 // independent of `BuildConfig.DEBUG`.
                 longPollEnabled = phantom.android.BuildConfig.LONGPOLL_V2_ENABLED == "1",
+                // Trek 2 Stage 2B-A (B3, L4) — bridge the SQLDelight-backed
+                // `LastSeenSeqRepository` into the orchestrator's read-only
+                // cursor seam. The lambda is a SAM constructor for
+                // `LongPollCursorReader`; the interface has no write method
+                // so this bridge cannot become a write path even by
+                // accident. Stage 2B-B will replace the read-only seam
+                // with a full read/write contract gated on `seq_mac`
+                // verify + storage accept-or-dedup; the bridge
+                // construction site stays here and the lambda body
+                // evolves to call both read + write methods at that
+                // point.
+                lastSeenSeqReader = phantom.core.transport.LongPollCursorReader { identityHex ->
+                    lastSeenSeqRepo.getLastSeenSeq(identityHex)
+                },
             )
 
             // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.
