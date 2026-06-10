@@ -63,11 +63,45 @@ The state machine is observed by BOTH REST poll loops (L6). Cells M-B11 (state t
 
 Cursor advancement (`upsertLastSeenSeq`) does NOT live in the orchestrator's poll loops, and it does NOT fire before the relay's `/relay/ack-deliver` returns success. The cursor advance is the LAST step of a strict three-step chain: `storage accept-or-dedup → relay ack confirmed → cursor persist`. Reversing any pair in that chain breaks `HybridRelayTransport`'s self-healing `ReAck` path — if the cursor advanced before the ack landed, a relay still holding the envelope would re-deliver it, the next poll would arrive with `since_seq > env.seq` already, the `ReAck` branch would never get its second chance, and the envelope would be lost from the local view.
 
-**Step 1 — pending-seq mapping at emit time.** When `wsActivePollLoop` or the legacy `pollLoop` emits a verified envelope on `_inbound`, it inserts `(envelope_id → env.seq)` into an in-memory orchestrator-session map (`_pendingSeqForAck: MutableMap<String, Long>`). The map is the single point that survives the transport-layer signature gap — `HybridRelayTransport.sendDeliveryAck(messageId)` receives only the message id, never the `seq`. The map is purely in-memory; on orchestrator restart it is empty and pending envelopes re-arrive on the next poll. Access to the map is serialised through `_inboundStateMutex` (see L6 below).
+**Step 1 — pending-seq mapping at the orchestrator emit site (single insertion point).** The map insertion happens at EXACTLY ONE call site: inside the orchestrator's poll loop, immediately BEFORE `_inbound.emit(env)`. Pseudocode:
 
-**Step 2 — orchestrator entry point.** The orchestrator exposes a new entry point `onEnvelopeAcked(identityHex: String, envelopeId: String, ackSucceeded: Boolean)`. Callers invoke it AFTER attempting `orchestrator.ackInbound(envelopeId)`, with `ackSucceeded` reflecting whether the relay returned a 2xx (`AckOutcome.Acked`). Under `_inboundStateMutex`:
-- If `ackSucceeded == false` → DO NOT advance the cursor. Leave the entry in `_pendingSeqForAck` for the next ack attempt. The relay still holds the envelope; the `ReAck` branch will trigger on the next poll and retry the ack.
-- If `ackSucceeded == true` → look up `envelopeId` in `_pendingSeqForAck`; if present, call `cursorRepository.upsertLastSeenSeq(identityHex, seq, nowMs)` and then remove the entry. If absent, the trigger is a no-op (the envelope id never came through a REST poll loop in this session).
+```
+_inboundStateMutex.withLock {
+    _pendingSeqForAck[env.id] = env.seq
+}
+_inbound.emit(env)        // mutex released; consumer may run on a different thread
+```
+
+`HybridRelayTransport` is the consumer of `_inbound`, not a co-author of the map. The handler's `Action.Emit` branch documented in Step 3 below is the CONSUMPTION point (the consumer reads the envelope and eventually triggers `sendDeliveryAck`), not a second insertion point. There is no second emit-site in `HybridRelayTransport` or anywhere else that populates `_pendingSeqForAck`; a future caller that wants to advance the cursor by `seq` for an envelope that NEVER came through the orchestrator's poll loop has no path here and must use a different mechanism. This keeps the producer-consumer split clean: orchestrator produces (seq is observable on its `PollEnvelope`); transport consumes (seq is not on `RelayMessage.Deliver`).
+
+The map is purely in-memory; on orchestrator restart it is empty and pending envelopes re-arrive on the next poll. Access to the map is serialised through `_inboundStateMutex` (see L6 below).
+
+**Step 2 — orchestrator entry point (two-phase mutex pattern).** The orchestrator exposes a new entry point `onEnvelopeAcked(identityHex: String, envelopeId: String, ackSucceeded: Boolean)`. Callers invoke it AFTER attempting `orchestrator.ackInbound(envelopeId)`, with `ackSucceeded` reflecting whether the relay returned a 2xx (`AckOutcome.Acked`). The implementation MUST follow this exact two-phase pattern so storage I/O is NEVER held under `_inboundStateMutex`:
+
+```
+Phase 1 (mutex held):
+    val pendingSeq = _inboundStateMutex.withLock {
+        if (!ackSucceeded) return    // no cursor advance; entry stays for retry
+        _pendingSeqForAck[envelopeId]  // read only; do NOT remove yet
+    } ?: return                          // no-op if absent
+
+Phase 2 (mutex released):
+    val upsertOk = runCatching {
+        cursorRepository.upsertLastSeenSeq(identityHex, pendingSeq, nowMs())
+    }.isSuccess
+
+Phase 3 (mutex held):
+    _inboundStateMutex.withLock {
+        if (upsertOk) {
+            _pendingSeqForAck.remove(envelopeId)   // success path: drop entry
+        }
+        // failure path: entry stays for retry on next observation
+    }
+```
+
+The Phase 2 storage call runs WITHOUT the mutex; concurrent loops continue to observe the in-memory state during the I/O. If `upsertLastSeenSeq` throws (disk full, SQLCipher I/O error, transaction abort), `_pendingSeqForAck[envelopeId]` REMAINS so the next observation of the same envelope (e.g. via the `ReAck` branch on a subsequent poll, or a process restart triggering a fresh delivery) re-attempts the cursor advance. The repository's monotonicity guard (D5) makes the retry idempotent: a second successful `upsertLastSeenSeq` with the same `seq` is a silent no-op at the repository layer.
+
+If `ackSucceeded == false` → DO NOT advance the cursor. Leave the entry in `_pendingSeqForAck` for the next ack attempt. The relay still holds the envelope; the `ReAck` branch will trigger on the next poll and retry the ack.
 
 **Step 3 — `HybridRelayTransport.handleRestInbound` integration.** The inbound handler currently at `apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt:~954` already classifies REST-mirrored envelopes into four branches. Stage 2B-B wires `onEnvelopeAcked` at the existing acknowledgement sites without changing the classification logic. Branch-by-branch contract:
 
@@ -85,7 +119,12 @@ Cursor advancement (`upsertLastSeenSeq`) does NOT live in the orchestrator's pol
 
 **Step 6 — release-mode `FAILED_MAC` path.** In release mode `holdMacFailures == false` (production); the existing `markProcessed + sendDeliveryAck` path runs on a permanent decrypt failure exactly as it does today, treating the envelope as consumed. `sendDeliveryAck` fires Step 4 normally; the cursor advances on `AckOutcome.Acked`. This preserves Stage 2B-B's guardrail A by inheriting the existing release contract — a release client that cannot decrypt has no path to recover the message anyway, so retaining the relay copy gains nothing.
 
-**Storage transaction discipline (OQ-2 LOCK).** Sequential commits are acceptable: message-table insert commits first, then `sendDeliveryAck` returns, then `onEnvelopeAcked` fires and `upsertLastSeenSeq` commits separately. Process kill between message persist and ack network attempt leaves the cursor frozen at the prior value — the next poll re-delivers, the `processedEnvelopeRepository.exists == true` branch fires from Step 3, the cursor catches up there. Process kill between `ackInbound` success and the cursor write also leaves the cursor frozen — the next poll re-delivers, the relay had already cleared the envelope from the queue, the L1 `alreadyProcessed` branch handles the dedup but ALSO advances the cursor through `onEnvelopeAcked`. Single SQLCipher transaction across the message insert and the cursor write is nice-to-have, NOT a blocker; the four redundancy paths above cover the failure modes without it.
+**Storage transaction discipline (OQ-2 LOCK).** Sequential commits are acceptable: message-table insert commits first, then `sendDeliveryAck` returns, then `onEnvelopeAcked` fires and `upsertLastSeenSeq` commits separately. Crash recovery is correct under either ordering by the existing relay queue semantics:
+
+- **Crash between message persist and the ack network attempt.** The relay still holds the envelope. Next poll re-delivers it. The first check (`processedEnvelopeRepository.exists == true`) fires from Step 3 and re-ack's; on ack success the cursor advances normally.
+- **Crash between `ackInbound` success and the cursor write.** The relay has ALREADY cleared the envelope from its queue (the relay removed it on receipt of the successful ack). The relay does NOT re-deliver this envelope. Recovery is "natural": the next legitimate envelope for this identity arrives with a higher `seq` (the relay's next-issued sequence), the normal cursor-advance flow runs against THAT envelope's seq, and the persisted cursor implicitly "skips" the lost seq value. The gap is fine — no envelope ever held that seq from the client's perspective. This is the actual recovery mechanism; the cursor does NOT need to "catch up to the missing seq" because there is no missing seq, just a sparse-but-monotonic sequence the cursor follows. Cell M-B26 pins this end-to-end with a `since_seq = 5 → crash on seq=6 → next poll returns seq=7 → cursor ends at 7` test.
+
+Single SQLCipher transaction across the message insert and the cursor write is nice-to-have, NOT a blocker; the two redundancy paths above cover the failure modes without it.
 
 Cells M11 + M12 + M-B16 + M-B20 + M-B21 pin this. M-B20 specifically pins "ack network failure → no cursor advance, entry remains in `_pendingSeqForAck`, next poll's `ReAck` branch retries and on success advances the cursor"; M-B21 specifically pins "debug-mode `FAILED_MAC` hold path does NOT call `onEnvelopeAcked`, cursor stays frozen, relay queue copy remains for recovery."
 
@@ -135,11 +174,12 @@ Concretely:
 - The `LongPollBreakerState.SuspendedOnPoison` state from L7 is observed by BOTH loops; reaching that state in either loop suspends BOTH.
 - The `_macRefreshAttemptedFor` latch (L7) is shared between both loops; a refresh attempted because of `wsActivePollJob`'s envelope counts against the legacy `pollLoop`'s subsequent attempts on the same `envelope_id`.
 
-**Concurrency-safe shared state.** Both poll loops run on the orchestrator's `scope` under `Dispatchers.Default`, which dispatches to multiple threads. Plain `MutableMap` / `MutableSet` for `_pendingSeqForAck` (L3), `_macFailCount` (L7 Step 1), `_macRefreshAttemptedFor` (L7 Step 3), `LongPollBreakerState` (L9), and the breaker counters is NOT thread-safe — concurrent mutation produces lost updates, double-counting, and missed latch checks. Stage 2B-B introduces a single orchestrator-scoped `Mutex` (`_inboundStateMutex: Mutex`) that serialises ALL read-modify-write access to these structures. Discipline:
+**Concurrency-safe shared state.** Both poll loops run on the orchestrator's `scope` under `Dispatchers.Default`, which dispatches to multiple threads. Plain `MutableMap` / `MutableSet` for `_pendingSeqForAck` (L3), `_macFailCount` (L7 Step 1), `_macRefreshAttemptedFor` (L7 Step 3), `LongPollBreakerState` (L9), the breaker counters, AND `seqMacVerifyKey` state (L2) are all NOT thread-safe — concurrent mutation produces lost updates, double-counting, missed latch checks, or a stale-key vs fresh-key read torn across loop iterations. Stage 2B-B introduces a single orchestrator-scoped `Mutex` (`_inboundStateMutex: Mutex`) that serialises ALL read-modify-write access to these structures. Discipline:
 
-- Every read-modify-write on `_pendingSeqForAck`, `_macFailCount`, `_macRefreshAttemptedFor`, `LongPollBreakerState`, or any breaker counter happens inside `_inboundStateMutex.withLock { ... }`.
-- The mutex is held only across in-memory operations. Network I/O (`acquireOrRefreshToken`, `transport.poll`, `ackInbound`) and storage I/O (`cursorRepository.upsertLastSeenSeq`) are released BEFORE the suspending call to avoid holding the mutex across a network round-trip.
-- `_inboundStateMutex` is distinct from `tokenMutex`. The order if both must be held: `tokenMutex` outer, `_inboundStateMutex` inner. No code path holds them in the reverse order; this is asserted by inspection at PR review time.
+- Every read-modify-write on `_pendingSeqForAck`, `_macFailCount`, `_macRefreshAttemptedFor`, `LongPollBreakerState`, any breaker counter, OR the L2 `seqMacVerifyKey` state machine value happens inside `_inboundStateMutex.withLock { ... }`. **The verify-key state machine is explicitly in scope of the mutex** — its reads (per-envelope verify lookup) and writes (`KeyPresent` ↔ `KeySuspended` ↔ `KeyAbsent` transitions on bootstrap / refresh / failed-refresh) MUST all flow through the mutex so a refresh-vs-poll race cannot produce a verify call that reads half a stale key and half a fresh one. The pattern for a per-envelope verify is "snapshot the verify-key state inside `_inboundStateMutex.withLock`, release, then run the verify against the snapshot."
+- The mutex is held only across in-memory operations. Network I/O (`acquireOrRefreshToken`, `transport.poll`, `ackInbound`) and storage I/O (`cursorRepository.upsertLastSeenSeq`) are released BEFORE the suspending call to avoid holding the mutex across a network round-trip. The L3 two-phase pattern is the canonical example.
+- `_inboundStateMutex` is distinct from `tokenMutex`. The order if both must be held: `tokenMutex` outer, `_inboundStateMutex` inner. No code path holds them in the reverse order; this is asserted by inspection at PR review time AND by the M-B23 ordering test.
+- A token refresh that mutates `seqMacVerifyKey` state must follow the ordering: enter `tokenMutex.withLock { ... acquireOrRefreshToken ... }`, then within that scope enter `_inboundStateMutex.withLock { update state machine }` for the state-machine publication. A poll loop reading the state holds ONLY `_inboundStateMutex`. The ordering forbids deadlock because no path holds the inner mutex while taking the outer.
 - `_inboundStateMutex` is initialised in the orchestrator's primary constructor body alongside `tokenMutex` and lives for the orchestrator's lifetime.
 
 This closes R2-S-B5: the breaker / suspension MUST NOT become a MAC verify downgrade. Neither REST poll loop is permitted to be an unverified ingestion bypass under any state, and neither is permitted to race past the shared state checks.
@@ -173,7 +213,30 @@ Cells M-B12 (counter increments, no ack, no cursor) + M-B13 (refresh latched exa
 
 **No hard local logout (OQ-4 LOCK).** Persistent 410 responses NEVER nuke the user's identity. The long-poll path may suspend or degrade per L7; Direct WSS remains operational. The identity binding is preserved across any 410 storm.
 
-**Hard timer caps (D11).** Any timer value derived from a relay-supplied field is clamped to a hard ceiling regardless of the existing range gates: **breaker cooldown ≤ 120 s (`BREAKER_COOLDOWN_CEILING_MS`); 410 reauth interval ≤ 60 s (`BREAKER_410_STORM_COOLDOWN_MS`); HTTP 429 `Retry-After` ≤ 120 s (`RETRY_AFTER_HARD_CAP_MS`)**. The 429 cap is new in Stage 2B-B: the existing `rest_fallback` paths honour the relay-advertised `Retry-After` header (Stage 1.x `HoldCapExceeded` returns it), and a misconfigured or hostile relay sending `Retry-After: 86400` (one day) MUST NOT lock the client out for a day. Stage 2B-B clamps any incoming `Retry-After` value to `RETRY_AFTER_HARD_CAP_MS` before scheduling the next poll attempt. The clamp applies in both REST poll loops and in any send-path retry that consumes the header. This prevents a misbehaving relay from forcing arbitrarily long polling blackouts even if its `pollHoldSecs` value passes the existing `1..480` range gate.
+**Hard timer caps (D11).** Any timer value derived from a relay-supplied field is clamped to a hard ceiling regardless of the existing range gates: **breaker cooldown ≤ 120 s (`BREAKER_COOLDOWN_CEILING_MS`); 410 reauth interval ≤ 60 s (`BREAKER_410_STORM_COOLDOWN_MS`); HTTP 429 `Retry-After` ≤ 120 s (`RETRY_AFTER_HARD_CAP_MS`)**.
+
+**`Retry-After` plumbing — new in Stage 2B-B.** The current `RestFallbackResponse<T>` (`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackTransport.kt:~114`) carries `statusCode`, `bodyParsed`, `rawBody`, `elapsedMs` and NO HTTP headers. Stage 2B-B adds a typed field:
+
+```
+data class RestFallbackResponse<T>(
+    val statusCode: Int,
+    val bodyParsed: T?,
+    val rawBody: String,
+    val elapsedMs: Long,
+    val retryAfterSeconds: Long? = null,    // NEW in Stage 2B-B
+)
+```
+
+The Android transport (`AndroidNativeOkHttpRestFallbackTransport`) parses the OkHttp `Response.header("Retry-After")` value into the typed field:
+
+- Non-numeric, empty, negative, or HTTP-date-form values → `null` (the client falls back to its own backoff).
+- Numeric values are parsed as `Long` seconds.
+- Overflow guard: values whose `seconds * 1000L` would overflow `Long.MAX_VALUE` (anything > ~9.2 × 10^9 seconds, roughly 292 years) → `null`.
+- Negative or zero seconds → `null`.
+
+The orchestrator clamps `retryAfterSeconds * 1000L` to `RETRY_AFTER_HARD_CAP_MS` before scheduling the next attempt. The clamp applies in both REST poll loops AND in any send-path retry that consumes the header (Stage 1.x `HoldCapExceeded` returns `Retry-After: 30`; that value passes through the clamp unchanged because 30 s ≪ 120 s ceiling). Existing transport fakes (`RestFallbackOrchestratorTest.FakeTransport` and any test fake added in this stage) MUST also expose the typed field so the clamp logic is testable without a real OkHttp client.
+
+This plumbing landing in C5 unblocks M-B24; without the typed field on `RestFallbackResponse`, the orchestrator has no signal to clamp. A misconfigured or hostile relay sending `Retry-After: 86400` (one day) MUST NOT lock the client out for a day. This prevents a misbehaving relay from forcing arbitrarily long polling blackouts even if its `pollHoldSecs` value passes the existing `1..480` range gate.
 
 Cells M14 (5 sub-cells covering: 410 → authSession → retry → 200; 410 reauth fails → no busy-loop; 410-then-410 within 30 s → ceiling; cursor preserved; 410 on `/relay/ack-deliver` does NOT trigger reauth dance per Stage 1.x Lock-3) pin this.
 
@@ -218,22 +281,46 @@ Cells M13 (5 transition sub-cells + M-13e for `stop()` during `Open`) + M-B18 (n
 
 ### L10 — Jitter source migration (codifies D12)
 
-All nine existing `Random.Default.nextDouble()` sites in `RestFallbackOrchestrator` (currently at `:415, :468, :487, :591, :644, :662, :699, :803, :824, :848` — exact line numbers shift post-implementation) migrate to draws from the existing `Csprng` interface (`Csprng.uniformLong`) introduced in Stage 2A. The migration is total: NO `Random.Default`, `java.util.Random`, or `SecureRandom` references remain in the orchestrator after this stage. Tests pin both layers: a grep gate on `Random.Default | java.util.Random | SecureRandom` patterns plus a behavioural pin where a recording `Csprng` fake sees every jitter draw.
+All **eleven** existing `Random.Default.nextDouble()` sites in `RestFallbackOrchestrator` migrate to draws from the existing `Csprng` interface (`Csprng.uniformLong`) introduced in Stage 2A. The line numbers verified against master `f8cdc91a` are: **`:415, :468, :487, :591, :644, :662, :699, :761, :803, :824, :848`** (eleven sites, not nine; the earlier draft of this scope-doc miscounted). Exact line numbers shift post-implementation; the migration target is total replacement of every `Random.Default` reference in the orchestrator.
+
+The migration is total: NO `Random.Default`, `java.util.Random`, or `SecureRandom` references remain in the orchestrator after this stage. Tests pin both layers: a grep gate on `Random.Default | java.util.Random | SecureRandom` patterns plus a behavioural pin where a recording `Csprng` fake sees every jitter draw. The expected draw count over a known orchestrator scenario is part of M15's assertion: a recorded N draws against the fake matches the deterministic count for the scenario.
 
 Cell M15 pins this.
 
 ## Tele2 LTE smoke gate (codifies D14 + OQ-5 LOCK)
 
-WORKING_RULES rule 8 is binding for Stage 2B-B and **NOT waivable**. Stage 2B-B is NOT shippable without a real-device smoke test on Tecno + Tele2 LTE. The smoke covers six scenarios:
+WORKING_RULES rule 8 is binding for Stage 2B-B and **NOT waivable**. Stage 2B-B is NOT shippable without a real-device smoke test on Tecno + Tele2 LTE.
 
-- **S1 — WS up, REST poll arrives, MAC verifies, no decrypt regression.** Five envelopes from peer; pass when every envelope reaches the chat exactly once, no `seq_mac_verify_fail`, no `decrypt_fail`, both `ws_active_poll_ok` and WS Deliver increment without storage-table duplicates.
+**APK build requirement (load-bearing).** The smoke MUST run on a debug or beta APK built with `LONGPOLL_V2_ENABLED == "1"` so the Stage 2B-B runtime paths actually fire. A smoke that uses a release APK (pinned at `LONGPOLL_V2_ENABLED == "0"` per L6 / Stage 2B-A scope L6) does NOT exercise any Stage 2B-B code and is NOT a valid smoke. The implementation PR description MUST cite the APK SHA-256, the build variant (debug or beta), AND a logcat excerpt proving `LONGPOLL_V2_ENABLED=1` was the runtime value.
+
+**Per-scenario log-line evidence (load-bearing).** Each scenario's pass criterion includes specific logcat lines that the implementation PR description quotes verbatim. A scenario passes ONLY when ALL of the following appear in the captured logs during the smoke window:
+
+- The feature flag is on: `LONGPOLL_V2_ENABLED=1` at orchestrator construction.
+- The verify-key state is `KeyPresent`: `seq_mac_verify_key_state=KeyPresent` at least once before envelope ingestion.
+- At least one envelope passes verify: at least one `seq_mac_verified` log line (or equivalent verify-pass log shape).
+- The cursor is actually persisted: at least one `cursor_advanced seq=<n>` log line with a strictly-monotonic `seq` value.
+- The long-poll headers are emitted on at least one request: `X-Phantom-Long-Poll: 1` AND `X-Phantom-Padded-Poll: 1` visible in REST_TRACE.
+
+A pass log block that omits any of the five proofs is not a pass, regardless of subjective verdict.
+
+**Six scenarios:**
+
+- **S1 — WS up, REST poll arrives, MAC verifies, no decrypt regression.** Five envelopes from peer; pass when every envelope reaches the chat exactly once, no `seq_mac_verify_fail`, no `decrypt_fail`, both `ws_active_poll_ok` and WS Deliver increment without storage-table duplicates, plus the five log-line proofs above.
 - **S2 — WS down, REST primary, multi-envelope batch.** Four envelopes with `more=true` on the first poll; pass when all four arrive in `seq` order, the persisted cursor advances to the highest, and a cold restart polls with that `since_seq` and gets zero duplicates.
 - **S3 — Token rotation mid-poll, 410 fires, re-auth + retry.** Pass when `poll_410_token_rotated` logs, a fresh `session_request` logs at re-auth, `ws_active_poll_ok` logs after retry, no envelope is duplicated or lost, cursor is preserved.
 - **S4 — Server kill switch `RELAY_POLL_HOLD_SECS=0`.** Operator flips the env var on the VPS. Pass when the client receives short-poll cadence with the padded body shape, `poll_hold_secs=0` is parsed, the L8 timer gate returns the legacy timeout, and chat continues.
 - **S5 — Voice notes uniform-functionality.** Voice notes from peer arrive in the same poll window as text sent at the same instant. Privacy-modes uniform-functionality lock holds: long-poll does not degrade voice.
-- **S6 — Breaker open under Tele2 byte-budget death (mandatory per OQ-5 LOCK).** Sustain Tele2 LTE upload pressure to provoke Mode-2 cutoff (5-14 KB upload then silence per the byte-threshold finding). Pass when `breaker_open` logs within the threshold, cursor is preserved across the transition, envelopes continue on whichever path the breaker selects. Time-box ≥ 30 minutes; a controllable trigger is acceptable if natural Mode-2 does not reproduce in the window.
+- **S6 — Breaker open under Tele2 byte-budget death (mandatory per OQ-5 LOCK).** Sustain Tele2 LTE upload pressure to provoke Mode-2 cutoff (5-14 KB upload then silence per the byte-threshold finding). The breaker does NOT "select" a transport; it controls the REST poll cadence. Pass criteria (all required):
+  1. `breaker_open reason=ConsecutiveRestFailures cooldownMs=<n>` logs within the threshold (`BREAKER_CONSECUTIVE_FAIL_THRESHOLD = 5`).
+  2. REST poll enters the cooldown (`POLL_TRACE rest_breaker_open_skip` lines fire for at least `BREAKER_INITIAL_COOLDOWN_MS = 5_000` ms).
+  3. Direct WSS continues delivering messages during the cooldown (at least one WS Deliver log inside the cooldown window).
+  4. At cooldown expiry, the breaker transitions to `HalfOpen` and issues exactly one probe poll (`breaker_halfopen_probe` log).
+  5. The probe outcome transitions the breaker correctly: probe success → `breaker_closed`; probe failure → `breaker_open cooldownMs=<doubled>` capped at `BREAKER_COOLDOWN_CEILING_MS = 120_000`.
+  6. Cursor is preserved across all transitions (M-B16 applies in the field).
 
-The smoke is run on the implementation PR before merge. The PR description records the device, carrier, time-box, and the pass / fail verdict per scenario.
+  Time-box ≥ 30 minutes; a controllable trigger (e.g. a debug-mode helper that simulates `BREAKER_CONSECUTIVE_FAIL_THRESHOLD` consecutive REST poll failures) is acceptable if natural Mode-2 does not reproduce in the window. If the controllable trigger is used, the PR description names it explicitly.
+
+The smoke is run on the implementation PR before merge. The PR description records the device, carrier, APK SHA-256, build variant, time-box, the pass / fail verdict per scenario, AND the log-line evidence block for each scenario as inline quotes.
 
 ## Test matrix M8-M17 + new cells
 
@@ -268,7 +355,9 @@ The implementation PR ships the following cells. M-prefixed cells extend the Sta
 | **M-B21** | commonTest, behavioural with debug flag on | Debug-mode `FAILED_MAC` hold path: when `holdMacFailures == true` and the envelope produces `MacError`, `onEnvelopeAcked` is NOT called, the relay queue is NOT cleared, the cursor stays frozen; the X3DH-repair-path's eventual `sendDeliveryAck` advances the cursor at THAT point |
 | **M-B22** | commonTest, concurrency | Same `envelope_id` observed by `wsActivePollLoop` and the legacy `pollLoop` concurrently: `_macFailCount` increments exactly once per verify failure, `_macRefreshAttemptedFor` admits exactly one refresh, `_pendingSeqForAck` carries exactly one entry, the cursor advances exactly once on ack success |
 | **M-B23** | commonTest, concurrency | Concurrent breaker-open signals from both poll loops converge on `LongPollBreakerState.SuspendedOnPoison` with no inconsistent intermediate state visible to either loop; the `_inboundStateMutex` discipline holds; assertion that `tokenMutex` and `_inboundStateMutex` are NEVER acquired in reverse order across the code path |
-| **M-B24** | commonTest, behavioural | HTTP 429 `Retry-After` hard cap: the orchestrator honours `Retry-After: N` from the relay but clamps `N` to `RETRY_AFTER_HARD_CAP_MS = 120_000` regardless of advertised value (mirrors the D11 hard ceiling on relay-derived timers). A malicious or misconfigured relay sending `Retry-After: 86400` cannot lock the client out for a day |
+| **M-B24** | commonTest, behavioural | HTTP 429 `Retry-After` hard cap: the orchestrator honours `Retry-After: N` from the relay but clamps `N` to `RETRY_AFTER_HARD_CAP_MS = 120_000` regardless of advertised value (mirrors the D11 hard ceiling on relay-derived timers). A malicious or misconfigured relay sending `Retry-After: 86400` cannot lock the client out for a day. Test sub-cells: (a) typed `retryAfterSeconds: Long? = null` populated from the OkHttp `Response.header("Retry-After")` parse path; (b) malformed `Retry-After` (non-numeric, negative, HTTP-date form, empty) → treated as null + log; (c) overflow guard — values that would overflow `seconds * 1000L` (anything > `9_223_372_036` seconds, ~292 years) are treated as null; (d) the clamp applies in both REST poll loops and in the send-path retry that consumes the header |
+| **M-B25** | commonTest, concurrency | Refresh-vs-poll race: a token refresh that flips the verify-key state from `KeyPresent(hexA)` to `KeyPresent(hexB)` while a poll-loop verify is in flight against an envelope MUST NOT produce a verify call that uses half `hexA` and half `hexB`. The poll-loop snapshots the verify-key inside `_inboundStateMutex.withLock` BEFORE releasing the mutex and running the verify; the refresh path takes `tokenMutex` outer + `_inboundStateMutex` inner to publish the new state. Test exercises 100 concurrent poll-verify iterations interleaved with 100 refresh-induced state flips; assertion: every verify uses a single consistent key value end-to-end |
+| **M-B26** | commonTest, behavioural with sparse seq | Crash recovery via sparse-sequence skip: after a process kill between `ackInbound` success and the cursor write, the relay has already removed the envelope from its queue and will NOT redeliver it. The next poll arrives with a higher `seq` (the relay's next envelope for this identity), which the cursor advance path applies through the normal Step 4 / Step 3 flow. The persisted cursor "skips" the lost seq value; the gap is implicit because no envelope holds it. Test seeds `since_seq = 5`, simulates a crash mid-ack on `seq = 6`, brings up a fresh orchestrator, polls and receives `seq = 7`; persisted cursor ends at `7` with no anomaly logged. This is the actual crash-recovery mechanism — the relay's `ackInbound` is what triggers queue removal, not the cursor advance |
 
 ## PR-commit boundary
 
@@ -276,10 +365,10 @@ The implementation PR is structured as six commits, each independently green and
 
 - **C1 — `SeqMacVerifier` + commonMain BE helpers + constant-time compare.** Implements L1 + L5. Ships M8, M9, M-B7, M-B9.
 - **C2 — Verify-key state machine + forced-refresh-failure corollary.** Implements L2 + the L2 corollary path. Ships M-B11.
-- **C3 — `LongPollCursorRepository` seam + storage-acceptance signal wired into `HybridRelayTransport.handleRestInbound` / `sendDeliveryAck` per L3 Steps 1-6 + legacy `pollLoop` in-memory cursor decommission + `_inboundStateMutex` introduced.** Implements L3 + L4 + the L6 concurrency-safe shared-state plumbing. Ships M11, M12, M-B20. `AppContainer` bridge upgraded to implement both read and write methods. M-B16 (poison-state cursor invariant) and M-B21 (debug-mode `FAILED_MAC` hold path) ship in C4 because they exercise behaviour introduced in C4.
-- **C4 — Both REST poll loops symmetric verify + bad-MAC posture + concurrent-state discipline.** Implements L6 (symmetric verify) + L7 (poison posture). Wires the MAC verify into both `wsActivePollLoop` AND the legacy `pollLoop`; introduces `_macFailCount`, `_macRefreshAttemptedFor`, `LongPollBreakerState.SuspendedOnPoison`. Ships M10, M17, M-B8, M-B10, M-B12, M-B13, M-B14, M-B15, M-B16, M-B17, M-B21, M-B22, M-B23.
-- **C5 — 410 reauth backoff + circuit breaker + hard timer caps (incl. 429 `Retry-After` clamp).** Implements L8 + L9 + D11. Ships M13, M14, M-B18, M-B24.
-- **C6 — Jitter source migration + fail-closed input handling + Tele2 LTE smoke runbook.** Implements L10. Ships M15, M-B19. Adds a `docs/tracks/trek2-stage2b-b-tele2-smoke.md` runbook describing the device, carrier, scenarios, and pass criteria for the mandatory Tele2 smoke. M16 release-pin contract test runs against the C6 head.
+- **C3 — `LongPollCursorRepository` seam + storage-acceptance signal wired into `HybridRelayTransport.handleRestInbound` / `sendDeliveryAck` per L3 Steps 1-6 + legacy `pollLoop` in-memory cursor decommission + `_inboundStateMutex` introduced.** Implements L3 + L4 + the L6 concurrency-safe shared-state plumbing. Ships M11, M12, M-B20, M-B26. `AppContainer` bridge upgraded to implement both read and write methods. M-B16 (poison-state cursor invariant) and M-B21 (debug-mode `FAILED_MAC` hold path) ship in C4 because they exercise behaviour introduced in C4.
+- **C4 — Both REST poll loops symmetric verify + bad-MAC posture + concurrent-state discipline.** Implements L6 (symmetric verify, incl. verify-key state under mutex) + L7 (poison posture). Wires the MAC verify into both `wsActivePollLoop` AND the legacy `pollLoop`; introduces `_macFailCount`, `_macRefreshAttemptedFor`, `LongPollBreakerState.SuspendedOnPoison`. Ships M10, M17, M-B8, M-B10, M-B12, M-B13, M-B14, M-B15, M-B16, M-B17, M-B21, M-B22, M-B23, M-B25.
+- **C5 — 410 reauth backoff + circuit breaker + hard timer caps + typed `Retry-After` plumbing.** Implements L8 + L9 + D11. Adds `retryAfterSeconds: Long? = null` to `RestFallbackResponse`; parses `Retry-After` in the Android OkHttp transport; updates transport fakes. Ships M13, M14, M-B18, M-B24.
+- **C6 — Jitter source migration + fail-closed input handling + Tele2 LTE smoke runbook.** Implements L10 (eleven `Random.Default.nextDouble()` sites migrated). Ships M15, M-B19. Adds a `docs/tracks/trek2-stage2b-b-tele2-smoke.md` runbook describing the device, carrier, APK build variant (`LONGPOLL_V2_ENABLED=1` debug/beta APK mandatory), per-scenario log-line evidence requirements, and pass criteria for the mandatory Tele2 smoke. M16 release-pin contract test runs against the C6 head.
 
 The Tele2 LTE smoke run is performed against the C6 head (or a later C6+ release if review-fix commits land). The PR description records the smoke verdict per scenario before the PR exits draft.
 
