@@ -59,6 +59,20 @@ lru = "0.12"
 # sha2 transitively; declaring it explicitly here keeps the dep audit honest.
 sha2 = "0.10"
 
+# HMAC-SHA-256 for Stage 1.x `seq_mac` integrity tag on `/relay/poll` envelopes.
+# Pairs with the existing `sha2 = "0.10"` dep; same `digest = "0.10"` trait
+# family, no version conflict. Used in two places: (i) per-identity verify-key
+# derivation from the relay-side root key, and (ii) MAC computation over the
+# canonical `(identity, seq, envelope_id, sequence_ts)` tuple at store time.
+hmac = "0.12"
+
+# `Zeroizing<[u8; 32]>` for the relay-side `RELAY_SEQ_MAC_KEY` root key and
+# its per-identity derivatives. Wipes the key bytes on drop without a manual
+# `ZeroizeOnDrop` impl. Stage 1.x picks `Zeroizing` over `secrecy::SecretBox`
+# to avoid a second secret-handling crate; promote to `secrecy` if a future
+# review surfaces a concrete misuse path.
+zeroize = "1"
+
 # Base64 encoding/decoding for media ciphertext blobs (PR-M1r). reqwest pulls
 # base64 v0.22 transitively; declaring it explicitly pins the version used
 # in media.rs and keeps the dep audit honest.

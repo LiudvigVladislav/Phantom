@@ -109,6 +109,11 @@ impl ChallengeStore {
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
     }
+
+    #[cfg(test)]
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
+    }
 }
 
 /// In-memory mapping from X25519 identity pubkey to its bound Ed25519 signing

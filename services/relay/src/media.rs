@@ -233,6 +233,7 @@ struct UploadChunkResponse {
 ///  - `total > 256` → 413 `too_many_chunks`
 ///  - cumulative ciphertext bytes > 1 MiB → 413 `media_quota_exceeded`
 ///  - raw body > 3072 bytes → 413 `body_too_large`
+///
 /// True if the client sent `Prefer: return=minimal` (RFC 7240 §4.2).
 ///
 /// PR-M2d.1: when present, successful upload responses are `204 No Content`

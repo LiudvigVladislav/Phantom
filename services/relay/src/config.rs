@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Willen LLC
 
+use std::sync::Arc;
+
+use crate::seq_mac::SeqMacRootKey;
+
 /// Relay configuration loaded from environment variables.
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -101,6 +105,27 @@ pub struct RelayConfig {
     /// Recommended Stage 2+ values per Trek 2 mini-lock: 10–25 s active /
     /// idle / long-idle on Standard + Private; 30 s on Ghost.
     pub poll_hold_secs: u32,
+
+    // ── Trek 2 Stage 1.x sequence-MAC ─────────────────────────────────────────
+
+    /// Relay-side root key for the Stage 1.x `seq_mac` integrity tag.
+    ///
+    /// Sourced from the `RELAY_SEQ_MAC_KEY` environment variable (64-char
+    /// hex = 32 bytes). The relay process FAILS TO START if the variable
+    /// is absent or malformed at production startup — see
+    /// `RelayConfig::from_env`. `from_env_for_test` uses an all-zero
+    /// fixture key so integration tests are deterministic.
+    ///
+    /// The root key NEVER leaves the relay process. The `Debug` impl on
+    /// `SeqMacRootKey` redacts the bytes as `[REDACTED]`, and the
+    /// `Zeroizing<[u8; 32]>` inner type wipes the bytes on drop. The
+    /// client only ever sees a per-identity verify key derived via
+    /// `SeqMacRootKey::derive_verify_key`.
+    ///
+    /// Wrapped in `Arc` so cloning `RelayConfig` does not copy the key
+    /// bytes — the `Clone` derive on `RelayConfig` becomes refcount work
+    /// rather than a memcpy of secret material.
+    pub seq_mac_key: Arc<SeqMacRootKey>,
 }
 
 impl RelayConfig {
@@ -135,6 +160,12 @@ impl RelayConfig {
             // this set to a non-zero value (typically 1 s, with
             // `tokio::time::pause()` to make the wait deterministic).
             poll_hold_secs: 0,
+            // Trek 2 Stage 1.x: deterministic test-fixture root key.
+            // Tests that need byte-pinned MAC vectors construct a
+            // `SeqMacRootKey::from_bytes(...)` directly with a known
+            // value; this default of `[0u8; 32]` is the universal
+            // "no real secret" placeholder.
+            seq_mac_key: Arc::new(SeqMacRootKey::from_bytes([0u8; 32])),
         }
     }
 
@@ -202,12 +233,47 @@ impl RelayConfig {
             // (existing behaviour). Operator opts-in by setting
             // `RELAY_POLL_HOLD_SECS=20` (or similar) in `.env` and restarting
             // the container; setting it back to 0 is the kill switch.
+            //
+            // Trek 2 Stage 1.x Lock-4 config-parse-time clamp — any value
+            // above `MAX_POLL_HOLD_SECS_CAP` (480 s) is silently capped here
+            // so the value announced to clients via `SessionResponse.poll_hold_secs`
+            // is always within the ceiling. Pairs with the runtime per-hold
+            // clamp inside `poll_hold_loop`; both layers are required so a
+            // future code path that bypasses this clamp still cannot
+            // exceed the ceiling.
             poll_hold_secs: std::env::var("RELAY_POLL_HOLD_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+                .unwrap_or(0u32)
+                .min(crate::rest_fallback::MAX_POLL_HOLD_SECS_CAP),
+            // Trek 2 Stage 1.x: root key for the `seq_mac` integrity tag.
+            // This is the ONLY required env var without a fallback default
+            // — the relay refuses to start if it is absent or malformed.
+            // Rationale: silently running with no MAC key would ship a
+            // relay that violates its own security contract; a startup
+            // crash is the honest failure mode.
+            //
+            // Generate with `openssl rand -hex 32` and provision in the
+            // VPS `.env` BEFORE redeploying the Stage 1.x relay image.
+            seq_mac_key: Arc::new(load_seq_mac_root_key_from_env()),
         }
     }
+}
+
+/// Parse and validate the `RELAY_SEQ_MAC_KEY` env var, or panic with a
+/// clear startup error.
+fn load_seq_mac_root_key_from_env() -> SeqMacRootKey {
+    let raw = std::env::var("RELAY_SEQ_MAC_KEY").unwrap_or_else(|_| {
+        eprintln!(
+            "FATAL: RELAY_SEQ_MAC_KEY is required (64 lowercase hex chars). \
+             Generate one with: openssl rand -hex 32"
+        );
+        std::process::exit(2);
+    });
+    SeqMacRootKey::from_hex(&raw).unwrap_or_else(|err| {
+        eprintln!("FATAL: {err}");
+        std::process::exit(2);
+    })
 }
 
 impl std::fmt::Debug for RelayConfig {
@@ -229,6 +295,11 @@ impl std::fmt::Debug for RelayConfig {
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
             .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)
             .field("poll_hold_secs", &self.poll_hold_secs)
+            // `seq_mac_key` carries its own `[REDACTED]` Debug impl from
+            // `SeqMacRootKey`, but we still elide the wrapping `Arc` here
+            // so a stray operator never sees the field in startup logs
+            // even if the inner impl ever changed.
+            .field("seq_mac_key", &"[REDACTED]")
             .finish()
     }
 }

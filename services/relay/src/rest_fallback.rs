@@ -97,6 +97,43 @@ pub const POLL_RESPONSE_CANONICAL_BYTES: usize = 4_608;
 /// Parallels `IDEMPOTENCY_LRU_CAP`.
 pub const POLL_HOLD_NOTIFIERS_LRU_CAP: usize = 50_000;
 
+/// Trek 2 Stage 1.x Lock-4 — per-identity concurrent-hold cap.
+///
+/// At most this many `/relay/poll` requests for the same identity may
+/// sit in the long-poll hold path at once. The 4th and subsequent
+/// concurrent holds receive `HTTP 429 Too Many Requests` with
+/// `Retry-After: 30`. A single buggy client (or attacker holding a
+/// stolen token) therefore cannot tie up an unbounded slice of the
+/// 50k-entry `notifiers` map for one identity.
+///
+/// The check is a `compare_exchange` CAS loop bounded by this constant,
+/// so the worst case is a few retries when concurrent racers each see
+/// the same pre-increment value. Decrement runs in `HoldGuard::drop`,
+/// which the Rust language guarantees fires whenever the owning future
+/// is actually dropped (request completion, panic, axum future drop
+/// on TCP close, server shutdown). The drop is NOT instantaneous from
+/// the caller's perspective under `JoinHandle::abort()` — tests that
+/// observe the counter must await task completion first.
+pub const PER_IDENTITY_HOLD_CAP: u8 = 3;
+
+/// Trek 2 Stage 1.x Lock-4 — server-side hard ceiling on per-request
+/// hold time, in seconds. Applied as a DUAL-LAYER clamp:
+///
+/// 1. **Config-parse-time clamp.** `RelayConfig::from_env()` clamps
+///    `RELAY_POLL_HOLD_SECS` to `min(parsed, MAX_POLL_HOLD_SECS_CAP)`
+///    so the value announced to clients in `SessionResponse.poll_hold_secs`
+///    is always within the ceiling.
+/// 2. **Runtime per-hold clamp.** Inside `poll_hold_loop`, the
+///    `tokio::time::timeout(...)` wrapping the notifier wait uses
+///    `min(hold_secs, MAX_POLL_HOLD_SECS_CAP)` as the duration. If a
+///    future code path bypasses the config clamp, the runtime cap
+///    still bounds the worst-case stale-hold duration.
+///
+/// 480 s (8 min) aligns with the Tor circuit rotation window in the
+/// Trek 2 mini-lock and keeps the worst-case TCP-RST-not-yet-observed
+/// stale slot bounded to the same horizon.
+pub const MAX_POLL_HOLD_SECS_CAP: u32 = 480;
+
 /// Coalescing delay (ms) between a `notify_one()` wake and the
 /// post-wake queue re-check. Lets a burst of `/relay/send` calls
 /// for the same recipient batch into one poll response without
@@ -130,6 +167,29 @@ pub const ACK_DELIVER_RATE_LIMIT_PER_WINDOW: u32 = 120;
 /// absence, empty string, `"true"`, `"yes"`, `"0"`) keeps short-poll
 /// behaviour. Strict equality so a typo cannot accidentally opt in.
 pub const LONG_POLL_OPT_IN_HEADER: &str = "x-phantom-long-poll";
+
+/// Trek 2 Stage 1.x Lock-2 — opt-in header that gates the **padded body
+/// shape** independently of the hold path. Separate from
+/// [`LONG_POLL_OPT_IN_HEADER`] so a client can request the padded 4608-
+/// byte response without also requesting a server-side hold, and vice
+/// versa.
+///
+/// 4-cell wire contract:
+/// - LP absent, PP absent → short-poll, legacy small body
+/// - LP present, PP absent → hold up to `poll_hold_secs`, padded 4608 bytes (Stage 1 legacy preserved)
+/// - LP absent, PP present → short-poll, padded 4608 bytes (Stage 2B-A circuit-breaker fallback)
+/// - LP present, PP present → hold up to `poll_hold_secs`, padded 4608 bytes
+///
+/// Padded gate is `padded_opt_in = long_poll_opt_in || padded_poll_opt_in`,
+/// so an LP-only request keeps the original Stage 1 hold+padded
+/// behaviour. The decoupling exists so a Stage 2B client whose
+/// circuit-breaker drops LP can still send PP and keep the padded
+/// posture — closes the guardrail C ("padding never reduced silently")
+/// gap during the breaker's transient short-poll period.
+///
+/// Value contract mirrors [`LONG_POLL_OPT_IN_HEADER`]: strict equality
+/// to `"1"`. Server stays stateless — no per-identity persistent flag.
+pub const PADDED_POLL_OPT_IN_HEADER: &str = "x-phantom-padded-poll";
 
 /// Trek 2 Stage 1 — quantize a millisecond wall-clock timestamp to the
 /// nearest 60-second boundary by flooring (`ts - (ts % 60_000)`).
@@ -172,6 +232,43 @@ impl RestTokenStore {
     /// Issue a fresh 32-byte random bearer token for `identity`.
     /// Replaces any existing token for that identity.
     /// Returns (token_hex, expires_at_ms).
+    ///
+    /// # Trek 2 Stage 1.x Lock-3 invalidation invariant
+    ///
+    /// Holds BOTH `by_token` and `by_identity` write locks across the
+    /// entire mutation: remove the prior token from `by_token`, insert
+    /// the new token, update `by_identity` to point at it. The locks
+    /// are acquired in the order `by_token` → `by_identity`, matching
+    /// the acquisition order in `purge_expired()` so a future
+    /// background-sweep + foreground-issue interleave cannot deadlock.
+    ///
+    /// Holding both locks across the whole operation is the only way
+    /// to ensure that a concurrent `issue()` for the same identity
+    /// observes either the fully-rotated state (old token gone, new
+    /// token bound) or the fully-pre-rotation state — never a
+    /// partial state where both old and new tokens validate. A split-
+    /// lock implementation would allow this interleave:
+    ///
+    /// ```text
+    /// A: by_token.write() → by_identity.read() (None) →
+    ///    by_token.insert(token_A) → release by_token
+    /// B: by_token.write() → by_identity.read() (still None) →
+    ///    by_token.insert(token_B) → release by_token
+    /// A: by_identity.write() → set X → token_A
+    /// B: by_identity.write() → set X → token_B
+    /// ```
+    ///
+    /// Final state: BOTH token_A and token_B sit in `by_token` and
+    /// both validate. The Lock-3 invariant "only one current token
+    /// per identity" would be violated. The merged critical section
+    /// closes the window structurally.
+    ///
+    /// Single-device-per-identity assumption: `by_identity` maps
+    /// `identity → one token`. Multi-device support would require
+    /// `identity → Vec<(device_id, token)>` and a `device_id`
+    /// parameter on `issue()` so a new-device token only invalidates
+    /// that device's prior token, not all devices'. Documented here so
+    /// a future multi-device migration is explicit.
     pub async fn issue(&self, identity: &str) -> (String, u64) {
         let mut raw = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut raw);
@@ -182,15 +279,17 @@ impl RestTokenStore {
             identity: identity.to_string(),
             expires_at_ms,
         };
-        {
-            let mut by_token = self.by_token.write().await;
-            // Remove old token if any so the by_token map stays bounded.
-            if let Some(old_token) = self.by_identity.read().await.get(identity) {
-                by_token.remove(old_token.as_str());
-            }
-            by_token.insert(token.clone(), record);
+        // Lock acquisition order matches `purge_expired()` to keep all
+        // mutations of these two maps on a single ordering and prevent
+        // deadlock with the background sweeper.
+        let mut by_token = self.by_token.write().await;
+        let mut by_identity = self.by_identity.write().await;
+        if let Some(old_token) = by_identity.get(identity) {
+            by_token.remove(old_token.as_str());
         }
-        self.by_identity.write().await.insert(identity.to_string(), token.clone());
+        by_token.insert(token.clone(), record);
+        by_identity.insert(identity.to_string(), token.clone());
+        // Both guards drop here in reverse acquisition order.
         (token, expires_at_ms)
     }
 
@@ -208,6 +307,30 @@ impl RestTokenStore {
         // Extend lifetime.
         rec.expires_at_ms = now_ms + TOKEN_TTL_MS;
         Some((existing_token, rec.expires_at_ms))
+    }
+
+    /// Refresh a SPECIFIC token if it is still live in `by_token`. Used
+    /// by the `/auth/session` challenge-cache replay path so a cached
+    /// `(identity, challenge, sig)` tuple can only re-yield the token
+    /// that was originally minted for it — never the post-rotation
+    /// current token. Returns `None` if the token is unknown or
+    /// expired.
+    ///
+    /// Refreshing here is intentional: a successful replay extends the
+    /// token's lifetime, matching the semantic of the existing
+    /// `refresh_if_live` path for the live-by-identity branch.
+    pub async fn refresh_specific_token_if_live(
+        &self,
+        token: &str,
+    ) -> Option<(String, u64)> {
+        let mut by_token = self.by_token.write().await;
+        let rec = by_token.get_mut(token)?;
+        let now_ms = now_ms_u64();
+        if now_ms >= rec.expires_at_ms {
+            return None;
+        }
+        rec.expires_at_ms = now_ms + TOKEN_TTL_MS;
+        Some((token.to_string(), rec.expires_at_ms))
     }
 
     /// Validate a token from the Authorization header.
@@ -481,6 +604,20 @@ pub struct RestEnvelope {
     pub seq: u64,
     /// Unix epoch seconds when this envelope expires.
     pub expires_at: u64,
+    /// Trek 2 Stage 1.x `seq_mac` — HMAC-SHA-256 integrity tag computed
+    /// at store time over `(identity_hex, seq, envelope_id, sequence_ts)`
+    /// using the per-identity verify key derived from `RELAY_SEQ_MAC_KEY`.
+    /// 64-char lowercase hex. See `seq_mac::SeqMacVerifyKey::compute_seq_mac`
+    /// for the canonical input encoding and the threat-model wording on
+    /// `PollEnvelope::seq_mac`.
+    ///
+    /// `#[serde(default)]` so that any code path that deserializes a
+    /// `RestEnvelope` from a pre-Stage-1.x JSON form (e.g. snapshot
+    /// fixtures in tests) reads as the empty string rather than failing.
+    /// Production stores are in-memory only, so a relay restart begins
+    /// with this column populated by every new mirror call.
+    #[serde(default)]
+    pub seq_mac: String,
 }
 
 impl RestEnvelope {
@@ -524,7 +661,27 @@ pub async fn mirror_envelope_to_rest_store(
     payload: &str,
     sequence_ts: u64,
     expires_at: u64,
-) -> u64 {
+) -> Option<u64> {
+    // Trek 2 Stage 1.x review fix — `envelope_id` reaches this helper
+    // from both REST `/relay/send` (validated upstream) and WS Send
+    // (validated upstream as of the same review). A defense-in-depth
+    // check here means an oversized id from a future caller cannot
+    // reach `compute_seq_mac` and panic the relay; we log and skip the
+    // mirror instead. Returning `None` signals "no MAC produced, no
+    // mirror written"; the WS store entry is still authoritative for
+    // recipients on the WS path.
+    if envelope_id.len() > crate::seq_mac::ENVELOPE_ID_MAX_BYTES {
+        tracing::error!(
+            event            = "mirror_envelope_id_too_long",
+            envelope_id_len  = envelope_id.len(),
+            envelope_id_max  = crate::seq_mac::ENVELOPE_ID_MAX_BYTES,
+            "envelope_id exceeds seq_mac u16-BE length-prefix capacity — \
+             upstream guard missed; mirror skipped to avoid panic on \
+             compute_seq_mac",
+        );
+        return None;
+    }
+
     let seq = state.rest_seq.next(to).await;
     // Trek 2 Stage 1 Q5 lock — quantize `sequence_ts` to the nearest
     // 60-second boundary on the ONE shared storage path so both REST
@@ -533,6 +690,48 @@ pub async fn mirror_envelope_to_rest_store(
     // RestEnvelope. Server-side, unconditional — the relay does not
     // trust the client to pre-quantize (Q7 of security-reviewer).
     let sequence_ts = quantize_sequence_ts_to_60s(sequence_ts);
+
+    // Trek 2 Stage 1.x Lock-1 — compute the `seq_mac` integrity tag at
+    // STORE time over the canonical
+    // `(identity_hex, seq, envelope_id, sequence_ts)` tuple and persist
+    // it in the `seq_mac` column on `RestEnvelope`. The poll-response
+    // path (`drain_eligible`) reads this column verbatim — it does NOT
+    // recompute the MAC at response time.
+    //
+    // Why store-time and not response-time: response-time computation
+    // would HMAC over whatever the DB returns, including already-
+    // corrupted values; a client receiving such a MAC would verify
+    // successfully and consume the corrupted envelope. Store-time
+    // computation creates a persistent integrity anchor — any
+    // subsequent mutation to `envelope_id`, `seq`, or `sequence_ts`
+    // without also recomputing this column produces a mismatch when
+    // the client verifies on receive.
+    //
+    // Per-identity verify key derivation goes through the relay-side
+    // root key; the root key never leaves this process. The same
+    // derived key is published to the client in
+    // `SessionResponse.seq_mac_verify_key` (see `rest_session`) so the
+    // client can verify on receive.
+    let verify_key = state.config.seq_mac_key.derive_verify_key(to);
+    let seq_mac_bytes = match verify_key.compute_seq_mac(to, seq, envelope_id, sequence_ts) {
+        Ok(b) => b,
+        Err(err) => {
+            // Unreachable in steady state — the upstream length check
+            // above plus the REST/WS request-boundary guards already
+            // reject oversized envelope_ids. But the contract here is
+            // "never panic on client-controlled input"; log and skip.
+            tracing::error!(
+                event            = "mirror_compute_seq_mac_failed",
+                envelope_id_len  = envelope_id.len(),
+                error            = %err,
+                "compute_seq_mac returned Err inside the mirror — \
+                 mirror skipped (defense-in-depth, should be unreachable)",
+            );
+            return None;
+        }
+    };
+    let seq_mac = crate::seq_mac::seq_mac_to_hex(&seq_mac_bytes);
+
     let rest_env = RestEnvelope {
         id: envelope_id.to_string(),
         from: String::new(),
@@ -541,6 +740,7 @@ pub async fn mirror_envelope_to_rest_store(
         sequence_ts,
         seq,
         expires_at,
+        seq_mac,
     };
     let mut rest_store = state.rest_store.write().await;
     let queue = rest_store.entry(to.to_string()).or_default();
@@ -555,7 +755,7 @@ pub async fn mirror_envelope_to_rest_store(
             "rest_store at capacity — mirror dropped"
         );
     }
-    seq
+    Some(seq)
 }
 
 /// Remove an envelope from `state.rest_store` for `recipient` — the
@@ -636,6 +836,21 @@ pub struct SessionResponse {
     /// **always present** (no `skip_serializing_if`) so old clients that
     /// check for field presence see explicit `0` rather than absence.
     pub poll_hold_secs: u32,
+    /// Trek 2 Stage 1.x — per-identity verify key for the `seq_mac`
+    /// integrity tag on `PollEnvelope`. 64-char lowercase hex (32-byte
+    /// HMAC-SHA-256 output). Derived from the relay-side root key
+    /// (which never leaves the relay process) and the bound identity.
+    ///
+    /// The same derived key is used by the server to compute each
+    /// envelope's `seq_mac` at store time AND by the client to verify
+    /// on receive. The client can verify MACs for envelopes addressed
+    /// to itself, and to itself only — without the root key, the client
+    /// cannot derive any other identity's key.
+    ///
+    /// Field is always present so the wire shape is stable; old
+    /// clients lacking awareness of the field simply ignore it (serde
+    /// `ignoreUnknownKeys` on the Android JSON codec).
+    pub seq_mac_verify_key: String,
 }
 
 #[derive(Serialize)]
@@ -683,6 +898,26 @@ pub struct PollEnvelope {
     pub payload: String,
     pub sequence_ts: u64,
     pub seq: u64,
+    /// Trek 2 Stage 1.x — HMAC-SHA-256 integrity tag over
+    /// `(identity_hex, seq, envelope_id, sequence_ts)`, computed at
+    /// envelope STORE time (inside `mirror_envelope_to_rest_store`),
+    /// persisted as a column on `RestEnvelope`, and read verbatim
+    /// here — never recomputed at response time. 64-char lowercase hex.
+    ///
+    /// Threat-model wording, verbatim from the locked scope doc — do
+    /// NOT soften:
+    ///
+    /// This protects against poll-layer / DB tamper / bugs (envelopes
+    /// mishandled by relay code, by-token cache corruption, accidental
+    /// seq replay from misuse of the dedup buckets), **not** a fully
+    /// malicious relay operator unless signing key is outside the
+    /// relay process. Do not pretend otherwise.
+    ///
+    /// Always present and non-empty on this REST-poll wire shape. The
+    /// WS Deliver wire shape (a distinct struct, see `routes.rs`)
+    /// does NOT carry a `seq_mac` field — verification semantics apply
+    /// only to the batched poll path.
+    pub seq_mac: String,
 }
 
 #[derive(Serialize)]
@@ -708,7 +943,7 @@ pub struct PollResponse {
     /// Stage 1 = **two-tier** response shape:
     ///   * No header   → small body, no `pad` field (legacy).
     ///   * Header `=1` → exactly `POLL_RESPONSE_CANONICAL_BYTES` bytes,
-    ///                   `pad` carries random base64url-safe filler.
+    ///     `pad` carries random base64url-safe filler.
     ///
     /// Security invariant 1 (byte-indistinguishable empty vs envelope)
     /// holds **within** the opt-in tier — old clients were already
@@ -783,8 +1018,8 @@ fn random_padding_string(len: usize) -> String {
 ///   1. Serialize `resp` with `pad = ""` → field is skipped → small probe.
 ///   2. The final padded body adds `,"pad":"<X>"` = 9 framing bytes plus
 ///      the pad-string length. Solve:
-///         `target = probe_len + 9 + pad_len`
-///         `pad_len = target - probe_len - 9`
+///      `target = probe_len + 9 + pad_len`,
+///      `pad_len = target - probe_len - 9`.
 ///   3. Generate exactly `pad_len` chars of random `PAD_ALPHABET`.
 ///   4. Re-serialize and debug-assert exact-byte invariant.
 pub fn pad_poll_response(mut resp: PollResponse) -> Vec<u8> {
@@ -819,51 +1054,134 @@ pub fn pad_poll_response(mut resp: PollResponse) -> Vec<u8> {
     padded
 }
 
+/// Trek 2 Stage 1.x Lock-4 — RAII guard that increments
+/// `HoldSlot::hold_count` on acquisition and decrements on drop. The
+/// decrement runs whenever the owning future is actually dropped:
+/// normal completion of `poll_hold_loop`, panic, server shutdown, or
+/// the axum handler future being dropped by tokio after a TCP close.
+///
+/// Drop is NOT instantaneous from a `JoinHandle::abort()` caller's
+/// perspective — tokio drops the task's future when it processes the
+/// cancellation. Tests that abort a task and then read `hold_count`
+/// MUST first await the join handle (or observe completion via a
+/// watch channel signalled from the handler's `Drop`).
+pub struct HoldGuard {
+    slot: Arc<crate::state::HoldSlot>,
+}
+
+impl HoldGuard {
+    /// CAS-bounded increment. Returns `Some(guard)` on success, `None`
+    /// if the per-identity cap is already at [`PER_IDENTITY_HOLD_CAP`].
+    /// The retry loop is bounded by the cap value: a racer that always
+    /// loses can retry at most cap times before seeing the saturated
+    /// value and returning `None`.
+    pub fn try_acquire(slot: Arc<crate::state::HoldSlot>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = slot.hold_count.load(Ordering::Acquire);
+            if current >= PER_IDENTITY_HOLD_CAP {
+                return None;
+            }
+            if slot
+                .hold_count
+                .compare_exchange(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(Self { slot });
+            }
+            // Lost the race; another racer incremented first. Retry.
+        }
+    }
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.slot.hold_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Outcome of a `/relay/poll` long-poll request after the hold loop
+/// resolves. The handler maps this to either a success response
+/// (`Ready`) or a 429 + `Retry-After: 30` (`HoldCapExceeded`).
+pub enum PollOutcome {
+    /// Per-identity concurrent-hold cap exceeded — the handler must
+    /// return `HTTP 429 Too Many Requests` with `Retry-After: 30`.
+    HoldCapExceeded,
+    /// Normal completion — return the envelopes (possibly empty).
+    Ready { envelopes: Vec<PollEnvelope>, more: bool },
+}
+
 /// Trek 2 Stage 1 — long-poll hold loop for `/relay/poll`. Free
 /// function (not inlined into the axum handler) so the wait can be
 /// unit-tested with `tokio::time::pause` and deterministic stepping.
 ///
 /// Contract:
 ///   * If `rest_store` for `recipient` has eligible envelopes
-///     (`seq > since_seq` and not expired), returns immediately.
-///   * Else if `hold_secs == 0`, returns immediately with empty batch
-///     (kill-switch fast path — no Notify entry created, no map mutation).
-///   * Else looks up (or inserts, bounded by `POLL_HOLD_NOTIFIERS_LRU_CAP`)
-///     the recipient's `Arc<Notify>` and races (a) `notify_one()` arrival,
-///     (b) `hold_secs`-second timeout. On wake (a) sleeps
-///     `POLL_HOLD_COALESCE_MS` so a burst of sends batches, then re-reads
-///     the queue. On timeout (b) returns empty.
-///   * If the notifier map is at capacity AND the recipient has no entry,
-///     degrades to immediate-return short-poll (Guardrail A — envelope
-///     still in `rest_store` for the next poll cycle).
+///     (`seq > since_seq` and not expired), returns `Ready` immediately
+///     without consuming a hold-cap slot.
+///   * Else if `hold_secs == 0`, returns `Ready` (empty batch) — the
+///     kill-switch fast path. No Notify entry is created, no map
+///     mutation happens, and no hold-cap slot is consumed.
+///   * Else looks up (or inserts, bounded by
+///     [`POLL_HOLD_NOTIFIERS_LRU_CAP`]) the recipient's [`HoldSlot`]
+///     and attempts to acquire a per-identity hold slot via
+///     [`HoldGuard::try_acquire`]. On cap exceeded returns
+///     [`PollOutcome::HoldCapExceeded`]; the handler returns 429.
+///   * Otherwise races (a) `notify_one()` arrival, (b) the
+///     `min(hold_secs, MAX_POLL_HOLD_SECS_CAP)`-second timeout. On
+///     wake sleeps [`POLL_HOLD_COALESCE_MS`] so a burst of sends
+///     batches, then re-reads the queue. On timeout returns empty.
+///   * If the notifier map is at capacity AND the recipient has no
+///     entry, degrades to immediate-return short-poll (Guardrail A —
+///     envelope still in `rest_store` for the next poll cycle).
 ///
-/// Returns `(envelopes, more)` — same shape the caller previously built
-/// inline. The caller is responsible for wrapping these in a
-/// `PollResponse` and applying `pad_poll_response`.
+/// Returns a [`PollOutcome`]. The caller is responsible for shaping
+/// the success path into a `PollResponse` and applying
+/// `pad_poll_response`, and for shaping the 429 path.
 pub async fn poll_hold_loop(
     state: &Arc<AppState>,
     recipient: &str,
     since_seq: u64,
     hold_secs: u32,
-) -> (Vec<PollEnvelope>, bool) {
+) -> PollOutcome {
     // Phase 1 — initial queue check. If something is already pending,
-    // return immediately without registering a waiter.
-    if let Some(batch) = drain_eligible(state, recipient, since_seq).await {
-        return batch;
+    // return immediately without registering a waiter or consuming a
+    // hold-cap slot.
+    if let Some((envelopes, more)) = drain_eligible(state, recipient, since_seq).await {
+        return PollOutcome::Ready { envelopes, more };
     }
     // Phase 2 — kill-switch fast path. Either operator set hold_secs=0
-    // globally, or the client did not send the opt-in header.
+    // globally, or the client did not send the opt-in header. Returns
+    // immediately without consuming a hold-cap slot.
     if hold_secs == 0 {
-        return (Vec::new(), false);
+        return PollOutcome::Ready { envelopes: Vec::new(), more: false };
     }
-    // Phase 3 — register on the per-recipient Notify and wait.
-    let notifier = match state.notifier_for(recipient, POLL_HOLD_NOTIFIERS_LRU_CAP).await {
-        Some(n) => n,
+    // Phase 3 — register on the per-recipient HoldSlot.
+    let slot = match state.notifier_for(recipient, POLL_HOLD_NOTIFIERS_LRU_CAP).await {
+        Some(s) => s,
         None => {
             // Map at capacity. Degrade to short-poll behaviour for this
             // request; an upgraded client will simply retry sooner.
-            return (Vec::new(), false);
+            return PollOutcome::Ready { envelopes: Vec::new(), more: false };
         }
+    };
+    // Trek 2 Stage 1.x Lock-4 — per-identity concurrent-hold cap.
+    // Acquire a hold-cap slot via CAS; if the cap is already at
+    // PER_IDENTITY_HOLD_CAP for this identity, return HoldCapExceeded
+    // so the handler emits 429 with Retry-After: 30. The `_guard` lives
+    // in this function's stack frame for the lifetime of the hold;
+    // when the function returns (or is dropped by tokio on cancellation),
+    // the guard's `Drop` decrements `hold_count` synchronously inside
+    // that drop point.
+    let _guard = match HoldGuard::try_acquire(Arc::clone(&slot)) {
+        Some(g) => g,
+        None => return PollOutcome::HoldCapExceeded,
     };
     // Phase 3.5 — race-window re-check. Between phase 1's queue read
     // and phase 3's notifier insert, a concurrent `/relay/send` could
@@ -875,35 +1193,41 @@ pub async fn poll_hold_loop(
     // The envelope is now in the queue but no notify will fire to wake
     // us. Without this re-check we'd sit on `notified().await` until
     // `hold_secs` timeout, adding up to 30 s of unnecessary latency to
-    // a delivery that should have been sub-50 ms (P2 fix per Vladislav
-    // PR #297 review).
-    if let Some(batch) = drain_eligible(state, recipient, since_seq).await {
-        return batch;
+    // a delivery that should have been sub-50 ms.
+    if let Some((envelopes, more)) = drain_eligible(state, recipient, since_seq).await {
+        return PollOutcome::Ready { envelopes, more };
     }
-    let timeout = tokio::time::Duration::from_secs(hold_secs as u64);
+    // Trek 2 Stage 1.x Lock-4 runtime layer — clamp the per-hold
+    // duration to MAX_POLL_HOLD_SECS_CAP. Pairs with the config-parse-
+    // time clamp in `RelayConfig::from_env`; both layers are required
+    // so a future code path that bypasses the config clamp still
+    // cannot exceed the ceiling.
+    let effective = hold_secs.min(MAX_POLL_HOLD_SECS_CAP);
+    let timeout = tokio::time::Duration::from_secs(effective as u64);
     let coalesce = tokio::time::Duration::from_millis(POLL_HOLD_COALESCE_MS);
-    let wake = tokio::time::timeout(timeout, notifier.notified()).await;
+    let wake = tokio::time::timeout(timeout, slot.notify.notified()).await;
     if wake.is_err() {
-        // Timeout. P2 fix per Vladislav PR #297 review — re-check the
-        // queue before returning empty. A send that arrived in the few
-        // ms between phase 3.5 and timeout MAY have notify_one'd the
-        // notifier just as it expired, in which case the message is in
-        // rest_store but `notified()` already returned `Err(Elapsed)`.
-        // drain_eligible is cheap (one rwlock + one filter); the
-        // guaranteed-delivery invariant (Guardrail A) is more
-        // important than skipping the check.
-        return drain_eligible(state, recipient, since_seq)
+        // Timeout. Re-check the queue before returning empty. A send
+        // that arrived in the few ms between phase 3.5 and timeout MAY
+        // have notify_one'd the notifier just as it expired, in which
+        // case the message is in rest_store but `notified()` already
+        // returned `Err(Elapsed)`. drain_eligible is cheap (one rwlock
+        // + one filter); the guaranteed-delivery invariant (Guardrail
+        // A) is more important than skipping the check.
+        let (envelopes, more) = drain_eligible(state, recipient, since_seq)
             .await
             .unwrap_or((Vec::new(), false));
+        return PollOutcome::Ready { envelopes, more };
     }
     // Notify fired. Wait the coalescing window so multiple back-to-back
     // sends batch into one response (POLL_MAX_ENVELOPES=1 still applies,
     // but `more=true` then tells the client to immediately re-poll).
     tokio::time::sleep(coalesce).await;
     // Phase 4 — post-wake queue re-check.
-    drain_eligible(state, recipient, since_seq)
+    let (envelopes, more) = drain_eligible(state, recipient, since_seq)
         .await
-        .unwrap_or((Vec::new(), false))
+        .unwrap_or((Vec::new(), false));
+    PollOutcome::Ready { envelopes, more }
 }
 
 /// Inspect the REST store for `recipient` and return the
@@ -937,6 +1261,13 @@ async fn drain_eligible(
             payload: e.payload.clone(),
             sequence_ts: e.sequence_ts,
             seq: e.seq,
+            // Trek 2 Stage 1.x Lock-1 — read the stored MAC verbatim;
+            // store-time computation is the persistent integrity anchor.
+            // Recomputing here would silently re-sign over whatever the
+            // DB currently returns, collapsing the DB-tamper scope to
+            // "tamper between drain and wire" — a far narrower threat
+            // than the wording on `PollEnvelope::seq_mac` promises.
+            seq_mac: e.seq_mac.clone(),
         })
         .collect();
     Some((batch, more))
@@ -949,14 +1280,20 @@ async fn drain_eligible(
 /// Single-round-trip auth: client supplies (identity, signing_pubkey,
 /// challenge, signature) and receives a bearer token.
 ///
-/// Retry-safe: same (identity, challenge, signature) within 5 minutes → same
-/// token returned. Different challenge → new token; old token stays valid.
+/// Retry-safe: same (identity, challenge, signature) within 5 minutes
+/// returns the SAME originally-issued token if it is still live
+/// (Trek 2 Stage 1.x Lock-3: a cache hit re-yields only the token
+/// minted for that exact tuple, never the post-rotation current
+/// token). Different challenge mints a NEW token AND immediately
+/// invalidates the prior token for that identity — the prior token
+/// is removed from the token store and stops validating on the next
+/// request.
 ///
 /// Status codes:
-///   200 — token returned (fresh or replayed from challenge cache)
+///   200 — token returned (fresh issue, or cache replay of a still-live cached token)
 ///   400 — malformed request
 ///   401 — signature verification failed
-///   410 — challenge expired or unknown
+///   410 — challenge expired, unknown, OR the cached token has been rotated away by a fresh-challenge issue
 pub async fn rest_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SessionRequest>,
@@ -1011,14 +1348,44 @@ pub async fn rest_session(
         .get(&req.identity, &req.challenge, &req.signing_pubkey, &req.signature)
         .await
     {
-        CacheLookup::Hit(_cached_token) => {
-            // Return the live token if still valid; re-issue if it just
-            // expired. The cached_token from the challenge cache is a
-            // pointer to the original issuance; the token store is the
-            // source of truth for current validity.
-            let (token, expires_at) = match state.rest_tokens.refresh_if_live(&req.identity).await {
+        CacheLookup::Hit(cached_token) => {
+            // Trek 2 Stage 1.x Lock-3 — the cache hit's `cached_token`
+            // is the token that was originally minted when this exact
+            // (identity, challenge, signing_pubkey, signature) tuple
+            // was first seen. A retry within the cache TTL must return
+            // ONLY that specific token, and only if it is still live in
+            // the token store. Falling back to "the identity's current
+            // token" would turn a captured (challenge, signature)
+            // tuple into a rolling-token retrieval channel and defeat
+            // the prior-token invalidation contract: an attacker who
+            // observed the original tuple could keep retrieving
+            // whichever token the identity is currently bound to.
+            let (token, expires_at) = match state
+                .rest_tokens
+                .refresh_specific_token_if_live(&cached_token)
+                .await
+            {
                 Some((t, exp)) => (t, exp),
-                None => state.rest_tokens.issue(&req.identity).await,
+                None => {
+                    // The cached token has been rotated away (a
+                    // subsequent /auth/session with a different
+                    // challenge minted a fresh token and removed this
+                    // one from `by_token`) or has expired. The replay
+                    // is no longer redeemable; require a fresh
+                    // challenge.
+                    tracing::warn!(
+                        event    = "rest_session_replay_rejected",
+                        identity = %&req.identity[..8],
+                        reason   = "cached_token_rotated_or_expired",
+                    );
+                    return (
+                        StatusCode::GONE,
+                        Json(serde_json::json!({
+                            "error": "session token rotated; obtain a fresh challenge"
+                        })),
+                    )
+                        .into_response();
+                }
             };
             tracing::info!(
                 event        = "rest_session_replay",
@@ -1040,6 +1407,15 @@ pub async fn rest_session(
                     expires_at,
                 )
                 .await;
+            // Trek 2 Stage 1.x Lock-1 — derive the per-identity verify
+            // key from the relay-side root key and publish its hex form
+            // to the client. The same key is used by the server to
+            // compute each envelope's `seq_mac` at store time.
+            let seq_mac_verify_key = state
+                .config
+                .seq_mac_key
+                .derive_verify_key(&req.identity)
+                .to_hex();
             return (
                 StatusCode::OK,
                 Json(SessionResponse {
@@ -1053,6 +1429,7 @@ pub async fn rest_session(
                         max_upload_body_bytes: state.config.max_media_upload_body_bytes,
                     },
                     poll_hold_secs: state.config.poll_hold_secs,
+                    seq_mac_verify_key,
                 }),
             )
                 .into_response();
@@ -1226,6 +1603,15 @@ pub async fn rest_session(
         token_prefix = %&token[..8],
     );
 
+    // Trek 2 Stage 1.x Lock-1 — derive + publish the per-identity verify
+    // key on the fresh-issuance path too. Mirrors the cache-hit branch
+    // above so both code paths return the same wire shape.
+    let seq_mac_verify_key = state
+        .config
+        .seq_mac_key
+        .derive_verify_key(&req.identity)
+        .to_hex();
+
     (
         StatusCode::OK,
         Json(SessionResponse {
@@ -1239,6 +1625,7 @@ pub async fn rest_session(
                 max_upload_body_bytes: state.config.max_media_upload_body_bytes,
             },
             poll_hold_secs: state.config.poll_hold_secs,
+            seq_mac_verify_key,
         }),
     )
         .into_response()
@@ -1364,6 +1751,36 @@ pub async fn rest_send(
             .into_response();
     }
 
+    // Trek 2 Stage 1.x Lock-1 — bound the UTF-8 byte length of
+    // `envelope_id` to the `u16-BE` length-prefix capacity used in the
+    // canonical `seq_mac` input. Production sizes are ~32 bytes; the
+    // 65535 ceiling is a defensive cap so an oversized id cannot reach
+    // `compute_seq_mac` and force a panic on the store-time MAC path.
+    if !crate::seq_mac::is_valid_envelope_id(&req.envelope_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "envelope_id UTF-8 byte length exceeds 65535"
+            })),
+        )
+            .into_response();
+    }
+
+    // Trek 2 Stage 1.x review fix — `req.to` is the recipient identity-hex
+    // that flows into the canonical `compute_seq_mac` input inside
+    // `mirror_envelope_to_rest_store`. Validate the shape here (64
+    // ASCII-hex chars) so a malformed recipient cannot reach the MAC
+    // path and so the `&req.to[..8]` log prefix below is safe to read.
+    if !crate::seq_mac::is_valid_recipient_identity_hex(&req.to) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "to must be 64 ASCII-hex characters"
+            })),
+        )
+            .into_response();
+    }
+
     // Blocklist check.
     {
         let bl = state.blocklist.read().await;
@@ -1422,7 +1839,10 @@ pub async fn rest_send(
 
     // Mirror into the REST poll store via the shared helper so a recipient
     // on REST polling always sees the same envelope as a WS-reconnect client.
-    let seq = mirror_envelope_to_rest_store(
+    // `None` here means the defense-in-depth guard inside the helper
+    // detected an oversized envelope_id (already rejected upstream). The
+    // request still completes — only the REST mirror is skipped.
+    let mirrored_seq = mirror_envelope_to_rest_store(
         &state,
         &req.to,
         &req.envelope_id,
@@ -1479,7 +1899,8 @@ pub async fn rest_send(
         from        = %&sender_identity[..8.min(sender_identity.len())],
         to          = %&req.to[..8.min(req.to.len())],
         size_b      = body.len(),
-        seq         = seq,
+        seq         = mirrored_seq.unwrap_or(0),
+        mirrored    = mirrored_seq.is_some(),
     );
 
     let resp_json = serde_json::json!({ "ok": 1 });
@@ -1545,6 +1966,20 @@ pub async fn rest_poll(
         .and_then(|v| v.to_str().ok())
         .map(|v| v == "1")
         .unwrap_or(false);
+    // Trek 2 Stage 1.x Lock-2 — independent gate for the padded
+    // response shape. Same strict `"1"` equality contract as the
+    // long-poll header.
+    let padded_poll_opt_in = headers
+        .get(PADDED_POLL_OPT_IN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    // Padded shape activates when EITHER header opts in. LP-only
+    // preserves the Stage 1 legacy behaviour (hold + padded). PP-only
+    // gives the Stage 2B circuit-breaker fallback its short-poll +
+    // padded posture so the on-wire footprint stays canonical while
+    // the breaker is open.
+    let padded_opt_in = long_poll_opt_in || padded_poll_opt_in;
     let effective_hold_secs = if long_poll_opt_in {
         state.config.poll_hold_secs
     } else {
@@ -1556,8 +1991,33 @@ pub async fn rest_poll(
     // did not opt in) or if the queue is non-empty; otherwise it awaits
     // a per-identity Notify with a ~50 ms coalescing window so a burst
     // of sends batches into one response.
+    //
+    // Trek 2 Stage 1.x Lock-4 — `poll_hold_loop` may return
+    // `HoldCapExceeded` when the per-identity cap is at
+    // `PER_IDENTITY_HOLD_CAP`. Handler returns `429 Too Many Requests`
+    // with `Retry-After: 30` and exits before producing a `PollResponse`.
     let (envelopes, more) =
-        poll_hold_loop(&state, &recipient_identity, since_seq, effective_hold_secs).await;
+        match poll_hold_loop(&state, &recipient_identity, since_seq, effective_hold_secs).await {
+            PollOutcome::Ready { envelopes, more } => (envelopes, more),
+            PollOutcome::HoldCapExceeded => {
+                tracing::info!(
+                    event    = "rest_poll_hold_cap_exceeded",
+                    identity = %&recipient_identity[..8.min(recipient_identity.len())],
+                    cap      = PER_IDENTITY_HOLD_CAP,
+                );
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": "too_many_concurrent_holds"
+                    })),
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert("retry-after", "30".parse().unwrap());
+                return response;
+            }
+        };
 
     let envelope_id_log = envelopes.first().map(|e| e.id.as_str()).unwrap_or("");
     tracing::info!(
@@ -1567,18 +2027,21 @@ pub async fn rest_poll(
         more               = more,
         hold_secs          = effective_hold_secs,
         long_poll_opt_in   = long_poll_opt_in,
+        padded_poll_opt_in = padded_poll_opt_in,
     );
 
-    // Trek 2 Stage 1 — two-tier response shape, gated by the same
-    // `X-Phantom-Long-Poll: 1` opt-in header as the hold time.
-    //   * Opt-in path: pad to canonical 4608-byte body so empty and
-    //     envelope-bearing responses are byte-indistinguishable on the
-    //     wire (Q4 / cross-cutting security invariant 1).
-    //   * No-header path: legacy small-body shape (no `pad` field,
-    //     skipped by serde). Old clients keep their original bandwidth
-    //     profile and never pay the ~4.5 KB-per-poll cost — Vladislav
-    //     PR #297 round-3 review P1 fix.
-    let body: Vec<u8> = if long_poll_opt_in {
+    // Trek 2 Stage 1.x Lock-2 — response shape is gated by
+    // `padded_opt_in = long_poll_opt_in || padded_poll_opt_in`, NOT by
+    // the long-poll header alone. This decouples the hold path from
+    // the padded body shape:
+    //   * `padded_opt_in == true`: pad to canonical 4608-byte body so
+    //     empty and envelope-bearing responses are byte-
+    //     indistinguishable on the wire.
+    //   * `padded_opt_in == false`: legacy small-body shape (no `pad`
+    //     field, skipped by serde). Old no-header clients keep their
+    //     original bandwidth profile and never pay the ~4.5 KB-per-
+    //     poll cost.
+    let body: Vec<u8> = if padded_opt_in {
         pad_poll_response(PollResponse {
             envelopes,
             more,
@@ -1790,6 +2253,12 @@ mod tests {
             payload: "x".repeat(payload_bytes),
             sequence_ts: 1_700_000_000_000,
             seq: 42,
+            // Trek 2 Stage 1.x — the padding canonical-size tests use a
+            // 64-char placeholder MAC so the wire-size math reflects the
+            // Stage 1.x `seq_mac` field shape. Real MACs are byte-exact
+            // hex from `SeqMacVerifyKey::compute_seq_mac`; for padding
+            // sizing the bytes themselves don't matter, only the length.
+            seq_mac: "0".repeat(64),
         }
     }
 

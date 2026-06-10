@@ -4,8 +4,8 @@
 //! Integration tests for Trek 2 Stage 1 long-poll backbone changes.
 //!
 //! Coverage (locked in `project_trek2_stage1_locks_2026_06_09.md`):
-//!   * Q1 — `SessionResponse` carries `poll_hold_secs` field (default `0`)
-//!     + backward-compat: an old-shaped struct without the field still
+//!   * Q1 — `SessionResponse` carries `poll_hold_secs` field (default `0`).
+//!     Backward-compat: an old-shaped struct without the field still
 //!     deserializes a Stage 1 server's response.
 //!   * Q2 — `/relay/ack-deliver` is rate-limited at 120/window and uses a
 //!     SEPARATE bucket from `/relay/send` (a sender that filled the send
@@ -159,6 +159,59 @@ async fn call_poll_with_long_poll_optin(
                 .uri("/relay/poll")
                 .header("authorization", format!("Bearer {}", token))
                 .header("x-phantom-long-poll", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 16_384).await.unwrap();
+    (app, status, bytes.to_vec())
+}
+
+/// Trek 2 Stage 1.x Lock-2 — poll with `X-Phantom-Padded-Poll: 1`
+/// alone (no `X-Phantom-Long-Poll`). Server returns the padded 4608-
+/// byte body without engaging the hold loop. This is the Stage 2B-A
+/// client's circuit-breaker fallback shape.
+async fn call_poll_with_padded_poll_optin(
+    app: axum::Router,
+    token: &str,
+) -> (axum::Router, StatusCode, Vec<u8>) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/relay/poll")
+                .header("authorization", format!("Bearer {}", token))
+                .header("x-phantom-padded-poll", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 16_384).await.unwrap();
+    (app, status, bytes.to_vec())
+}
+
+/// Trek 2 Stage 1.x Lock-2 — poll with BOTH `X-Phantom-Long-Poll: 1`
+/// AND `X-Phantom-Padded-Poll: 1`. Same wire shape as long-poll alone
+/// (held + padded), but pins that sending the redundant padded header
+/// does not break the hold path.
+async fn call_poll_with_both_optin_headers(
+    app: axum::Router,
+    token: &str,
+) -> (axum::Router, StatusCode, Vec<u8>) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/relay/poll")
+                .header("authorization", format!("Bearer {}", token))
+                .header("x-phantom-long-poll", "1")
+                .header("x-phantom-padded-poll", "1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -404,6 +457,313 @@ async fn opt_in_poll_returns_immediately_when_hold_secs_zero_with_padded_body() 
         elapsed
     );
     assert_eq!(body.len(), POLL_RESPONSE_CANONICAL_BYTES);
+}
+
+// ── Trek 2 Stage 1.x Lock-2: padded-vs-held 4-cell wire matrix ───────────────
+
+/// Lock-2 cell (LP=absent, PP=present). The padded-only path returns
+/// the canonical 4608-byte response immediately, WITHOUT engaging the
+/// hold loop. This is the Stage 2B-A circuit-breaker fallback shape:
+/// short-poll + padded, so the breaker's transient short-poll period
+/// does not degrade the on-wire padding posture.
+#[tokio::test]
+async fn padded_poll_alone_returns_padded_short_poll() {
+    let app = build_app_with_hold(60); // hold_secs > 0 but we expect short-poll
+    let identity = identity_hex(150);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_padded_poll_optin(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() < 1_000,
+        "padded-only poll must return immediately even when hold_secs > 0 \
+         (elapsed={:?})",
+        elapsed
+    );
+    assert_eq!(
+        body.len(),
+        POLL_RESPONSE_CANONICAL_BYTES,
+        "padded-only response must equal canonical 4608 bytes"
+    );
+}
+
+/// Lock-2 cell (LP=present, PP=present). Sending both opt-in headers
+/// produces the same wire shape as long-poll alone — hold up to
+/// `poll_hold_secs` AND padded canonical body. Pins that the redundant
+/// padded header on the normal long-poll path does not silently break
+/// the hold loop.
+#[tokio::test]
+async fn padded_and_long_poll_together_returns_padded_held() {
+    let app = build_app_with_hold(1); // 1 s hold for deterministic timing
+    let identity = identity_hex(151);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_both_optin_headers(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() >= 950,
+        "both-headers poll must engage the hold loop (elapsed={:?})",
+        elapsed
+    );
+    assert_eq!(
+        body.len(),
+        POLL_RESPONSE_CANONICAL_BYTES,
+        "both-headers response must equal canonical 4608 bytes"
+    );
+}
+
+/// Lock-2 backward-compat cell (LP=present, PP=absent). The Stage 1
+/// legacy behaviour is preserved exactly: a long-poll-alone request
+/// still holds AND still pads, because `padded_opt_in = LP || PP`.
+/// This was the cell the architecture review tried to collapse; the
+/// matrix asserts the legacy contract survives the decoupling.
+#[tokio::test]
+async fn long_poll_alone_still_returns_padded_held_stage_1_legacy() {
+    let app = build_app_with_hold(1);
+    let identity = identity_hex(152);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_with_long_poll_optin(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() >= 950,
+        "LP-only poll must still engage the hold loop (elapsed={:?})",
+        elapsed
+    );
+    assert_eq!(
+        body.len(),
+        POLL_RESPONSE_CANONICAL_BYTES,
+        "LP-only response must still pad to canonical 4608 bytes \
+         (Stage 1 legacy contract)"
+    );
+}
+
+/// Lock-2 negative cell (LP=absent, PP=absent). Old clients without
+/// either header still receive the legacy small-body response — no
+/// hold, no padding. Pins that the new padded gate does not
+/// accidentally activate for old clients.
+#[tokio::test]
+async fn no_opt_in_headers_returns_legacy_small_body_short_poll() {
+    let app = build_app_with_hold(60);
+    let identity = identity_hex(153);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let start = std::time::Instant::now();
+    let (_app, status, body) = call_poll_raw(app, &token).await;
+    let elapsed = start.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        elapsed.as_millis() < 1_000,
+        "no-header poll must return immediately even when hold_secs > 0 \
+         (elapsed={:?})",
+        elapsed
+    );
+    assert!(
+        body.len() < 200,
+        "no-header response must be legacy small body, not 4608; \
+         body.len()={}",
+        body.len()
+    );
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !body_str.contains("\"pad\""),
+        "no-header response must NOT include `pad` field; body={}",
+        body_str
+    );
+}
+
+// ── Trek 2 Stage 1.x Lock-1: SessionResponse seq_mac_verify_key + ───────────
+// ── PollEnvelope seq_mac wire-shape contracts ──────────────────────────────
+
+/// SessionResponse carries a `seq_mac_verify_key` field whose value is
+/// the per-identity verify key derived from the relay-side root key
+/// `(here [0u8; 32] in from_env_for_test)`. The field is always
+/// present and the value is byte-equal to the local recomputation
+/// using the production `SeqMacRootKey::derive_verify_key` path.
+#[tokio::test]
+async fn session_response_includes_seq_mac_verify_key_field() {
+    use phantom_relay::seq_mac::SeqMacRootKey;
+    let app = build_app();
+    let identity = identity_hex(200);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (_app, token) = obtain_token(app, &identity, &signing_kp).await;
+    assert!(!token.is_empty(), "should issue token");
+    // Re-issue to inspect the JSON shape directly (idempotent for same
+    // challenge/signature pair).
+    let app2 = build_app();
+    let (app2, nonce_hex) = fetch_challenge(app2, &identity).await;
+    let (_app2, status, v) = call_session(app2, &identity, &signing_kp, &nonce_hex).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let key_hex = v["seq_mac_verify_key"]
+        .as_str()
+        .expect("seq_mac_verify_key must be present");
+    assert_eq!(key_hex.len(), 64, "verify key must be 64-char hex");
+    assert!(
+        key_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "verify key must be lowercase hex"
+    );
+
+    // Independent recomputation must produce the same hex. Pins the
+    // (root, identity) → verify_key contract end-to-end.
+    let root = SeqMacRootKey::from_bytes([0u8; 32]);
+    let expected = root.derive_verify_key(&identity).to_hex();
+    assert_eq!(
+        key_hex, expected,
+        "SessionResponse.seq_mac_verify_key must match server-side derivation"
+    );
+}
+
+/// `/relay/send` rejects an over-sized `envelope_id`. In practice the
+/// 4096-byte `REST_MAX_BODY_BYTES` cap pre-rejects (413) before the
+/// 65535-byte `ENVELOPE_ID_MAX_BYTES` check fires (400), so the test
+/// asserts the request is rejected in SOME form — either status code
+/// is correct, but a 200 would mean an over-sized envelope_id reached
+/// the `seq_mac` computation path and risked a panic.
+///
+/// The `ENVELOPE_ID_MAX_BYTES` check inside `compute_seq_mac` is the
+/// real safety net for the WS Send path (which has its own body-size
+/// regime) and for defense-in-depth on the REST path if the body cap
+/// is ever raised above 65535.
+#[tokio::test]
+async fn rest_send_rejects_over_sized_envelope_id() {
+    let app = build_app();
+    let identity = identity_hex(201);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let huge_id = "x".repeat(65_536);
+    let body = json!({
+        "envelope_id":   huge_id,
+        "to":            identity_hex(202),
+        "sealed_sender": "",
+        "payload":       "AAAA",
+        "sequence_ts":   1_700_000_000_000u64,
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/relay/send")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .header("idempotency-key", "i-am-huge")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE,
+        "over-sized envelope_id must be rejected (got {})",
+        status
+    );
+    assert_ne!(
+        status,
+        StatusCode::CREATED,
+        "over-sized envelope_id must NOT reach the seq_mac computation path"
+    );
+}
+
+/// REST poll wire shape carries `seq_mac` as a 64-char lowercase hex
+/// string on every envelope returned. Pins the additive Lock-1 field
+/// presence + format that Stage 2B-A client wire decoders depend on.
+#[tokio::test]
+async fn rest_poll_envelope_carries_seq_mac_field() {
+    // hold=0 so the test returns immediately whether or not an
+    // envelope is enqueued. Send first, then poll.
+    let app = build_app();
+    let sender = identity_hex(210);
+    let recipient = identity_hex(211);
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let (app, sender_token) = obtain_token(app, &sender, &signing_kp).await;
+
+    // Send envelope from `sender` to `recipient`.
+    let (app, send_status) =
+        call_send_with_ts(app, &sender_token, "test-envelope-1", &recipient, 1_700_000_000_000)
+            .await;
+    assert_eq!(send_status, StatusCode::CREATED);
+
+    // Authenticate as the recipient and poll.
+    let signing_kp_recipient = SigningKey::generate(&mut csprng);
+    let (app, recipient_token) =
+        obtain_token(app, &recipient, &signing_kp_recipient).await;
+    let (_app, status, body) =
+        call_poll_with_long_poll_optin(app, &recipient_token).await;
+    assert_eq!(status, StatusCode::OK);
+    // Find the substring `"seq_mac":` and assert the field shape.
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(
+        body_str.contains("\"seq_mac\":"),
+        "REST poll body MUST contain `seq_mac` field; body[0..200]={}",
+        &body_str[..body_str.len().min(200)]
+    );
+
+    // Parse and verify the value matches Stage 1.x expected shape.
+    #[derive(Deserialize)]
+    struct PollResp {
+        envelopes: Vec<PollEnvelopeShape>,
+    }
+    #[derive(Deserialize)]
+    struct PollEnvelopeShape {
+        seq_mac: String,
+    }
+    let parsed: PollResp = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed.envelopes.len(), 1);
+    let mac_hex = &parsed.envelopes[0].seq_mac;
+    assert_eq!(mac_hex.len(), 64, "seq_mac must be 64-char hex");
+    assert!(
+        mac_hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "seq_mac must be lowercase hex"
+    );
+}
+
+/// WS-vs-REST asymmetry — the WS Deliver wire path does NOT carry the
+/// `seq_mac` field even when the same envelope is also stored in the
+/// REST poll store with a MAC. The Stage 2B-A client type-split rests
+/// on this contract: a `WsDeliver` Kotlin data class without a
+/// `seq_mac` field cannot accidentally try to verify a MAC that the
+/// server never sent.
+///
+/// This test asserts the server-side type-shape rather than the wire
+/// bytes (a full WS upgrade + frame parse is heavy for what is a
+/// type-level invariant): the `Envelope` WS-Deliver struct has no
+/// `seq_mac` field, so it cannot serialize one regardless of whether
+/// the mirrored `RestEnvelope` carries the column.
+#[test]
+fn ws_deliver_envelope_type_has_no_seq_mac_field() {
+    // The serde JSON serialization of the WS `Envelope` struct does
+    // not include any `seq_mac` key. We construct an Envelope with
+    // representative fields and assert by string substring.
+    let env = phantom_relay::envelope::Envelope {
+        id: "ws-msg-1".to_string(),
+        to: "b".repeat(64),
+        from: "a".repeat(64),
+        sealed_sender: String::new(),
+        payload: "AAAA".to_string(),
+        expires_at: 1_700_000_001_000,
+    };
+    let json = serde_json::to_string(&env).expect("Envelope serializes");
+    assert!(
+        !json.contains("seq_mac"),
+        "WS `Envelope` JSON MUST NOT carry a `seq_mac` field; json={}",
+        json
+    );
 }
 
 // ── Q2: ack-deliver rate-limit at 120/window ─────────────────────────────────
@@ -852,6 +1212,13 @@ async fn poll_hold_loop_timeout_recheck_catches_envelope_without_notify() {
         // Far future so the queue retain in drain_eligible does not
         // purge it as expired during the test.
         expires_at: u64::MAX / 2,
+        // Trek 2 Stage 1.x — this test bypasses `mirror_envelope_to_rest_store`
+        // (the only production path that computes the real MAC), so a
+        // placeholder hex string is sufficient for the queue-rescan
+        // assertion. Real-MAC contract tests live in the new
+        // `seq_mac_vectors.rs` integration suite and in the
+        // mirror-path integration tests below.
+        seq_mac: "0".repeat(64),
     };
     {
         let mut rest_store = state.rest_store.write().await;

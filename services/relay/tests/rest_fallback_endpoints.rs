@@ -735,3 +735,119 @@ async fn ws_simulated_ack_clears_rest_poll() {
         "REST poll must be empty after WS-simulated ack cleared the store",
     );
 }
+
+// ── Trek 2 Stage 1.x review-fix regression tests ──────────────────────────────
+//
+// Coverage for the post-PR-#303 review feedback on the REST boundary.
+// Three integration tests below cover the REST `/relay/send` path:
+// non-hex 64-char `to` → 400, short `to` → 400, canonical 64-hex `to` →
+// 201 happy-path control.
+//
+// The WS Send handler is a private free function on the upgraded
+// connection task with no public test seam, so its boundary checks
+// (recipient hex shape, messageId byte-length cap) are not covered by
+// an integration test in this file. They are covered by:
+//
+//   (a) shared `is_valid_recipient_identity_hex` / `is_valid_envelope_id`
+//       helpers in `src/seq_mac.rs` with inline unit tests, used by both
+//       the REST handler and the WS Send handler — so the REST tests
+//       below exercise the same predicates the WS path now relies on;
+//   (b) the compile-time invariant that
+//       `mirror_envelope_to_rest_store` returns `Option<u64>` — every
+//       caller, including the WS Send handler, must handle the skip
+//       path explicitly; the `.expect()` panic on client-controlled
+//       input is gone by type.
+
+#[tokio::test]
+async fn rest_send_rejects_non_hex_recipient_to() {
+    let app = build_app();
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let sender_id = identity_hex(40);
+    let (app, sender_token) = obtain_token(app, &sender_id, &signing_kp).await;
+
+    // 64 chars but contains 'g' — fails the hex shape check.
+    let mut bad_recipient = "a".repeat(63);
+    bad_recipient.push('g');
+    assert_eq!(bad_recipient.len(), 64);
+
+    let body = serde_json::json!({
+        "envelope_id": "non-hex-to-001",
+        "to":          bad_recipient,
+        "payload":     "x",
+        "sequence_ts": 1_700_000_000_000_u64,
+    })
+    .to_string();
+    let (_app, status, v) =
+        call_send_raw(app, &sender_token, "non-hex-to-001", body.as_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "non-hex 64-char `to` must be rejected before reaching seq_mac path: {:?}",
+        v,
+    );
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("64 ASCII-hex"),
+        "error message must mention the 64 hex constraint: {:?}",
+        v,
+    );
+}
+
+#[tokio::test]
+async fn rest_send_rejects_short_recipient_to() {
+    let app = build_app();
+    let mut csprng = OsRng;
+    let signing_kp = SigningKey::generate(&mut csprng);
+    let sender_id = identity_hex(41);
+    let (app, sender_token) = obtain_token(app, &sender_id, &signing_kp).await;
+
+    // 63 chars — one shy of canonical 64.
+    let short = "a".repeat(63);
+
+    let body = serde_json::json!({
+        "envelope_id": "short-to-001",
+        "to":          short,
+        "payload":     "x",
+        "sequence_ts": 1_700_000_000_000_u64,
+    })
+    .to_string();
+    let (_app, status, v) =
+        call_send_raw(app, &sender_token, "short-to-001", body.as_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "short `to` must be rejected before reaching seq_mac path: {:?}",
+        v,
+    );
+}
+
+#[tokio::test]
+async fn rest_send_accepts_canonical_64_hex_recipient() {
+    // Positive control — the new shape check must not break the happy path.
+    let app = build_app();
+    let mut csprng = OsRng;
+    let sender_kp = SigningKey::generate(&mut csprng);
+    let recipient_kp = SigningKey::generate(&mut csprng);
+    let sender_id = identity_hex(42);
+    let recipient_id = identity_hex(43);
+    let (app, sender_token) = obtain_token(app, &sender_id, &sender_kp).await;
+    let (app, _recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    let body = serde_json::json!({
+        "envelope_id": "ok-to-001",
+        "to":          recipient_id,
+        "payload":     "x",
+        "sequence_ts": 1_700_000_000_000_u64,
+    })
+    .to_string();
+    let (_app, status, _v) =
+        call_send_raw(app, &sender_token, "ok-to-001", body.as_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "canonical 64-hex recipient must still be accepted",
+    );
+}
