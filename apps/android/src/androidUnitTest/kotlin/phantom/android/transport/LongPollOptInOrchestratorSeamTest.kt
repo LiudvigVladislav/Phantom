@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
+package phantom.android.transport
+
+import java.io.File
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+import kotlin.test.fail
+
+/**
+ * Trek 2 Stage 2B-A — M1 seam contract test (orchestrator → transport).
+ *
+ * Pins that `RestFallbackOrchestrator.kt` carries exactly ONE
+ * `transport.poll(...)` call site, and that call site forwards the
+ * orchestrator's `longPollEnabled` Boolean to the transport as the
+ * `longPollOptIn` parameter. A future refactor that introduces a
+ * second call site, or drops the parameter on the existing one, would
+ * silently break the L1 lock (header emission no longer follows the
+ * flag).
+ *
+ * Why a parse test instead of a running orchestrator: the running
+ * `pollLoop` is gated by `RestStateMachine` mode transitions which
+ * need a full bootstrap + capability=true + mode=RestActive setup to
+ * exercise. The seam this test actually pins — "the one call site
+ * propagates the flag" — is structural and a parse test catches it
+ * faster than driving the state machine. Wire-level header emission
+ * is locked separately by [LongPollOptInWireRequestTest] and the
+ * constants are pinned by [LongPollOptInHeaderSeamTest] in the
+ * commonTest source set.
+ */
+class LongPollOptInOrchestratorSeamTest {
+
+    /**
+     * The orchestrator source path, resolved relative to the JVM
+     * unit-test working directory. Gradle's
+     * `:apps:android:testDebugUnitTest` runs with the module
+     * directory as cwd, so the relative path traverses up to the
+     * repo root and then into `shared/core/transport`.
+     */
+    private val orchestratorSource: File by lazy {
+        val candidates = listOf(
+            File("../../shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackOrchestrator.kt"),
+            File("shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackOrchestrator.kt"),
+            File("../shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackOrchestrator.kt"),
+        )
+        candidates.firstOrNull { it.exists() && it.isFile }
+            ?: fail(
+                "Could not locate RestFallbackOrchestrator.kt from the unit-test " +
+                    "working directory. Tried: ${candidates.joinToString { it.absolutePath }}",
+            )
+    }
+
+    @Test
+    fun orchestrator_has_exactly_one_transport_poll_call_site() {
+        val source = orchestratorSource.readText(Charsets.UTF_8)
+        val callSites = Regex("""transport\.poll\(""").findAll(source).count()
+        assertEquals(
+            1,
+            callSites,
+            "RestFallbackOrchestrator must carry exactly ONE `transport.poll(...)` call " +
+                "site for the L1 seam to be auditable. Found $callSites — a second " +
+                "call site would let one path forget the `longPollOptIn` parameter " +
+                "and silently disable Stage 2B-A's header emission.",
+        )
+    }
+
+    @Test
+    fun the_one_call_site_forwards_long_poll_enabled() {
+        val source = orchestratorSource.readText(Charsets.UTF_8)
+        val callSiteStart = source.indexOf("transport.poll(")
+        assertNotNull(
+            callSiteStart.takeIf { it >= 0 },
+            "Expected `transport.poll(` in RestFallbackOrchestrator.kt.",
+        )
+        val callSiteBlock = extractBalancedParenBlock(source, callSiteStart)
+            ?: fail("Could not extract balanced parentheses for the transport.poll(...) call.")
+        assertTrue(
+            callSiteBlock.contains("longPollOptIn = longPollEnabled"),
+            "The `transport.poll(...)` call must forward `longPollOptIn = longPollEnabled` " +
+                "verbatim. Found call:\n  transport.poll($callSiteBlock)\n" +
+                "A future refactor that hard-codes `longPollOptIn = false` or drops the " +
+                "parameter would silently bypass the L1 flag.",
+        )
+    }
+
+    /**
+     * Return the substring between the matching `(` and `)` of the
+     * `transport.poll(` call starting at [startIdx] (which points at
+     * the `t`). Returns `null` if the parentheses never balance.
+     */
+    private fun extractBalancedParenBlock(source: String, startIdx: Int): String? {
+        val openIdx = source.indexOf('(', startIndex = startIdx)
+        if (openIdx < 0) return null
+        var depth = 1
+        var i = openIdx + 1
+        while (i < source.length && depth > 0) {
+            when (source[i]) {
+                '(' -> depth++
+                ')' -> depth--
+            }
+            i++
+        }
+        if (depth != 0) return null
+        return source.substring(openIdx + 1, i - 1)
+    }
+}

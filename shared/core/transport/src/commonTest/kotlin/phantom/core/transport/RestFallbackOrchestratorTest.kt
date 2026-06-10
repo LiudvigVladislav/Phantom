@@ -83,12 +83,19 @@ class RestFallbackOrchestratorTest {
             return script(call)
         }
 
+        // Trek 2 Stage 2B-A (B1) — observe the `longPollOptIn` flag the
+        // orchestrator passes here so M1 can assert header gating without
+        // standing up a real OkHttp client.
+        val pollOptIns: MutableList<Boolean> = mutableListOf()
+
         override suspend fun poll(
             url: String,
             token: String,
             sinceSeq: Long?,
+            longPollOptIn: Boolean,
         ): RestFallbackResponse<PollResponse> {
             pollCalls += sinceSeq
+            pollOptIns += longPollOptIn
             return RestFallbackResponse(200, PollResponse(emptyList(), false), "{}", 1L)
         }
 
@@ -107,6 +114,7 @@ class RestFallbackOrchestratorTest {
     private fun orchestrator(
         transport: FakeTransport,
         clockMs: () -> Long = { 0L },
+        longPollEnabled: Boolean = false,
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
         baseUrl = "https://relay.test",
         identityHex = "aa".repeat(32),
@@ -115,6 +123,7 @@ class RestFallbackOrchestratorTest {
         signChallenge = { _ -> ByteArray(64) { 0xDD.toByte() } },
         transport = transport,
         now = clockMs,
+        longPollEnabled = longPollEnabled,
         dispatcher = UnconfinedTestDispatcher(),
     )
 

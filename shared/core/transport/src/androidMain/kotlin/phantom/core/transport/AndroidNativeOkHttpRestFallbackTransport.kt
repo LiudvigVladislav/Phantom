@@ -108,9 +108,10 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         url: String,
         token: String,
         sinceSeq: Long?,
+        longPollOptIn: Boolean,
     ): RestFallbackResponse<PollResponse> = withContext(Dispatchers.IO) {
         val fullUrl = if (sinceSeq != null) "$url?since_seq=$sinceSeq" else url
-        val response = get(fullUrl, token, op = "poll")
+        val response = get(fullUrl, token, op = "poll", longPollOptIn = longPollOptIn)
         decode(response, PollResponse.serializer())
     }
 
@@ -156,14 +157,14 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         return execute(client, builder.build())
     }
 
-    private fun get(url: String, token: String, op: String): RawResponse {
+    private fun get(
+        url: String,
+        token: String,
+        op: String,
+        longPollOptIn: Boolean = false,
+    ): RawResponse {
         val client = buildClient(op = op, correlationKey = url)
-        val request = Request.Builder()
-            .url(url)
-            .header("Connection", "close")
-            .header("Authorization", "Bearer $token")
-            .get()
-            .build()
+        val request = buildPollRequest(url = url, token = token, longPollOptIn = longPollOptIn)
         return execute(client, request)
     }
 
@@ -269,6 +270,35 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         const val CONNECT_TIMEOUT_MS: Long = 5_000L
         const val READ_TIMEOUT_MS: Long = 10_000L
         const val WRITE_TIMEOUT_MS: Long = 10_000L
+
+        /**
+         * Trek 2 Stage 2B-A (B1) — pure builder for the `/relay/poll` GET
+         * request. Pulled out of [get] so the header-emission contract
+         * can be asserted at the OkHttp `Request` level without standing
+         * up an `OkHttpClient`, an event loop, or a mock server.
+         * `internal` so a Kotlin test in the same module's test source
+         * set can call it directly.
+         *
+         * Coupling [LONG_POLL_OPT_IN_HEADER] and [PADDED_POLL_OPT_IN_HEADER]
+         * inside a single `if (longPollOptIn)` block is the structural
+         * enforcement of scope lock L1: a future caller cannot accidentally
+         * emit one header without the other.
+         */
+        internal fun buildPollRequest(
+            url: String,
+            token: String,
+            longPollOptIn: Boolean,
+        ): Request {
+            val builder = Request.Builder()
+                .url(url)
+                .header("Connection", "close")
+                .header("Authorization", "Bearer $token")
+            if (longPollOptIn) {
+                builder.header(LONG_POLL_OPT_IN_HEADER, "1")
+                builder.header(PADDED_POLL_OPT_IN_HEADER, "1")
+            }
+            return builder.get().build()
+        }
 
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
     }

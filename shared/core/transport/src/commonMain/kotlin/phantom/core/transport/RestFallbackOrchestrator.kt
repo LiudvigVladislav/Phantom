@@ -104,7 +104,6 @@ class RestFallbackOrchestrator(
      * release cannot happen without a deliberate code change AND a
      * BuildConfig pin flip.
      */
-    @Suppress("unused")
     private val longPollEnabled: Boolean = false,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
@@ -536,7 +535,20 @@ class RestFallbackOrchestrator(
             log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
             val startMs = now()
             val outcome = runCatching {
-                transport.poll(url = "$baseUrl/relay/poll", token = token, sinceSeq = lastSeenSeq)
+                // Trek 2 Stage 2B-A (B1) — gate the long-poll opt-in pair
+                // (`X-Phantom-Long-Poll: 1` + `X-Phantom-Padded-Poll: 1`)
+                // on the single `longPollEnabled` Boolean computed by the
+                // wire-up layer from `LONGPOLL_V2_ENABLED`. Headers ride
+                // ONE flag in this stage; lock L1 forbids LP-alone and
+                // PP-alone client postures. Per-Stage 2B-A scope, no
+                // other behaviour change is gated by this flag here —
+                // timeout and parallel job join in B2 and B3.
+                transport.poll(
+                    url = "$baseUrl/relay/poll",
+                    token = token,
+                    sinceSeq = lastSeenSeq,
+                    longPollOptIn = longPollEnabled,
+                )
             }
             val elapsed = now() - startMs
 

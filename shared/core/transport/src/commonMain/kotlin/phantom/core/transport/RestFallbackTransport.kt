@@ -80,11 +80,25 @@ interface RestFallbackTransport {
      * until the client sends [ackDeliver]; subsequent poll calls keep
      * returning the same envelope until acked. Short-poll only — server
      * returns immediately, empty array if nothing.
+     *
+     * Trek 2 Stage 2B-A — [longPollOptIn] controls BOTH the
+     * `X-Phantom-Long-Poll: 1` and `X-Phantom-Padded-Poll: 1` opt-in
+     * headers as a single pair. When `true`, both headers are emitted;
+     * when `false`, neither is. The two headers are intentionally
+     * coupled at the boundary because the Stage 2B-A scope (lock L1)
+     * forbids any LP-alone or PP-alone client posture — a separate
+     * parameter per header would let a future caller break that
+     * invariant. The orchestrator decides the boolean by reading the
+     * `LONGPOLL_V2_ENABLED` BuildConfig flag (debug `"1"` / release
+     * `"0"`). Backwards-compat default `false` means a call site that
+     * has not been updated still produces a Stage-1-byte-identical
+     * legacy short-poll request.
      */
     suspend fun poll(
         url: String,
         token: String,
         sinceSeq: Long? = null,
+        longPollOptIn: Boolean = false,
     ): RestFallbackResponse<PollResponse>
 
     /**
@@ -121,6 +135,40 @@ data class RestFallbackResponse<T>(
     /** Wall-clock elapsed time for this single HTTP round-trip, in ms. */
     val elapsedMs: Long,
 )
+
+// ── Trek 2 Stage 2B-A (B1) — long-poll opt-in header constants ───────────────
+
+/**
+ * Name of the `X-Phantom-Long-Poll` opt-in header. Strict equality
+ * `v == "1"` on the server side per Stage 1.x
+ * (`services/relay/src/rest_fallback.rs:1964-1968`); sending any other
+ * shape (e.g. `"true"`, mixed case in the value, trailing whitespace)
+ * is silently treated as legacy short-poll.
+ *
+ * Names are lowercase to match the relay's `HeaderMap` lookup key.
+ * OkHttp normalises outgoing header names to canonical case on the
+ * wire, so the casing of THIS constant does not change the bytes that
+ * leave the device — but keeping it lowercase keeps the constant
+ * value-equal to the server's literal, which is the property tests
+ * pin in M1.
+ *
+ * Const lives in commonMain so the orchestrator (commonMain) and the
+ * Android wire-up (androidMain) reference one source of truth.
+ */
+const val LONG_POLL_OPT_IN_HEADER: String = "x-phantom-long-poll"
+
+/**
+ * Name of the `X-Phantom-Padded-Poll` opt-in header. Same `v == "1"`
+ * strict equality contract as [LONG_POLL_OPT_IN_HEADER]
+ * (`services/relay/src/rest_fallback.rs:1972-1976`).
+ *
+ * Stage 2B-A always emits this header together with
+ * [LONG_POLL_OPT_IN_HEADER] (scope lock L1: no LP-alone or PP-alone
+ * client posture). The constant is exposed independently because the
+ * server contract treats them independently, and a future client
+ * stage may need them separately.
+ */
+const val PADDED_POLL_OPT_IN_HEADER: String = "x-phantom-padded-poll"
 
 // ── Wire models — /auth/session ──────────────────────────────────────────────
 
