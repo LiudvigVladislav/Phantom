@@ -86,9 +86,24 @@ These are recommendations the scope-doc should adopt or explicitly reject. Each 
 
 ---
 
-## Open questions for the user (locked decisions deferred)
+## User locks (2026-06-10)
 
-These the scope-doc cannot answer alone; the user must lock them before implementation opens.
+The six open questions below were locked verbatim by the user after the synthesis review. These are the binding answers the scope-doc draft consumes; the open-question text below is preserved for audit trail.
+
+- **OQ-1 LOCK** — Skip-and-continue. Bad-MAC envelope: drop, no emit, no cursor advance, no ack; the batch continues. The parallel loop does NOT halt on a single bad envelope.
+- **OQ-2 LOCK** — Sequential commits are OK for Stage 2B-B. The cursor write happens **only after** the storage layer accepts or dedupes the envelope. Single SQLCipher transaction across message-table insert + cursor write is nice-to-have, NOT a blocker.
+- **OQ-3 LOCK** — `MISSING_MAC` (`seqMac == ""` while verify-key state is `KeyPresent`): drop the envelope. No quarantine in this PR.
+- **OQ-4 LOCK** — No hard local logout on consecutive 410s. Use the capped 410 backoff (D6). Long-poll may suspend or degrade; the user identity must NOT be nuked by relay-side 410 storms.
+- **OQ-5 LOCK** — S6 (breaker open under byte-budget pressure) is mandatory. Minimum smoke time-box ≥ 30 min on Tele2 LTE. If natural Mode-2 does not reproduce in the window, a controllable trigger is acceptable.
+- **OQ-6 LOCK** — Decommission the legacy `pollLoop` in-memory cursor IN Stage 2B-B, not in a follow-up. D10's option (b) — single source of truth `since_seq` via the persisted cursor for both loops — is now binding.
+
+Decisions D1-D14 stand as recommended; the user did not contradict any of them. The scope-doc lock proceeds against D1-D14 + these six OQ locks combined.
+
+---
+
+## Open questions for the user (original, preserved for audit)
+
+These were the six open questions before the lock above. They are kept here so the lock decisions remain auditable against the original framing.
 
 - **OQ-1 — Verify-fail behaviour scope.** On a verify failure inside a multi-envelope batch, the loop should (a) skip that envelope and continue with the rest of the batch, or (b) halt the parallel `wsActivePollLoop` entirely and surface a fatal event. Round 1 architect recommended (a); security review concurred. The user lock is whether (a) is the final posture or whether a halt-surface is more appropriate for the Alpha threat model.
 - **OQ-2 — Storage transaction atomicity.** Are the message-table insert and the `upsertLastSeenSeq` cursor write wrapped in a SINGLE SQLCipher transaction, or are they sequential commits? Sequential is safe under monotonicity (process kill leaves cursor behind, never ahead); single-transaction gives stronger atomicity at the cost of a wider transaction scope. The repository contract today supports both; the user must lock the discipline.
