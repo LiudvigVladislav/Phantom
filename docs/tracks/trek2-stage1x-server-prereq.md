@@ -43,20 +43,30 @@ Wire-shape addition: `PollEnvelope` gains one new field `seq_mac: String` (alway
 b"phantom-seq-mac-v1\x00"         19 bytes   UTF-8 + null terminator domain tag
 identity_hex                       64 bytes   lowercase ASCII (fixed by construction)
 seq (big-endian u64)                8 bytes
-envelope_id_len (big-endian u16)    2 bytes
-envelope_id_bytes                  variable   ASCII string (length-prefixed)
+envelope_id_len (big-endian u16)    2 bytes   byte length of UTF-8 encoded envelope_id
+envelope_id_bytes                  variable   exact UTF-8 bytes of envelope_id
 sequence_ts (big-endian u64)        8 bytes   POST-quantize value (60_000ms floor)
 ```
 
 Total length = 101 bytes + `envelope_id_len` bytes. Output: 32 bytes → lowercase hex 64 chars on wire.
 
-**Why `envelope_id` is length-prefixed, not fixed-width.** Vladislav verified against master `f9c81937` that the server-side `RestSendRequest.envelope_id` is typed as `String` (not enforced to a UUID shape), and Stage 2A `EnvelopeId.random()` generates a 32-char lowercase hex (NOT a 36-byte UUID canonical hyphenated form). The MAC encoding cannot assume a fixed 36-byte UUID. Length-prefix with a `u16-BE` length field closes the variable-length ambiguity that motivates collision-free domain separation; the server-side request handler must enforce `envelope_id` length ≤ 65535 bytes (a generous ceiling — production sizes are ~32 chars).
+**Why `envelope_id` is length-prefixed UTF-8, not fixed-width.** Vladislav verified against master `f9c81937` that the server-side `RestSendRequest.envelope_id` is typed as `String` (UTF-8, not enforced to a UUID shape), and Stage 2A `EnvelopeId.random()` generates a 32-char lowercase hex (NOT a 36-byte UUID canonical hyphenated form). The MAC encoding cannot assume a fixed 36-byte UUID and cannot assume ASCII either — Rust `String` is UTF-8 and can contain multi-byte characters. The canonical input therefore encodes the **exact UTF-8 byte sequence** of `envelope_id`, prefixed with its byte length (NOT character length).
+
+**Server-side validation requirement.** The relay's REST send handler MUST reject any `RestSendRequest.envelope_id` whose UTF-8 byte length exceeds `65535` (the `u16-BE` length-prefix capacity). Production sizes are ~32 bytes; the 65535 ceiling is a defensive cap. If future requirements need to constrain `envelope_id` to ASCII or hex specifically, add that validation explicitly — do NOT silently assume it in the MAC encoding.
 
 **Domain tag rationale.** The `\x00` null terminator cannot appear in the subsequent ASCII `identity_hex` field, making domain separation unambiguous at the boundary. The `v1` version string enables future MAC scheme rotation (`v2\x00`) without changing the field layout.
 
 **Why store-time computation, not response-time.** Response-time HMAC computed inside `drain_eligible` would be computed over whatever values the DB returns — including already-corrupted values. A client receiving a response-time MAC over corrupted data would verify successfully and consume the corrupted envelope. This collapses the locked "DB tamper" threat scope to "tamper between drain and wire" — a far narrower threat than the wording promises. Store-time computation creates a persistent integrity anchor: the MAC reflects the envelope state at the moment of write; any subsequent corruption causes a mismatch when re-read.
 
-**HMAC root key sourcing.** Environment variable `RELAY_SEQ_MAC_KEY` (64-char hex = 32 bytes), parsed at startup into `Vec<u8>`. Stored in `RelayConfig` with `[REDACTED]` `Debug` impl mirroring the existing `secret_token` pattern at `config.rs:221`. Key bytes implement `Zeroize` / `ZeroizeOnDrop` (low cost, correct practice for 32-byte key material).
+**HMAC root key sourcing.** Environment variable `RELAY_SEQ_MAC_KEY` (64-char hex = 32 bytes), parsed at startup into a **fixed-size, type-level-bounded newtype** rather than a heap-allocated `Vec<u8>`:
+
+```rust
+struct SeqMacRootKey(Zeroizing<[u8; 32]>);
+```
+
+This shape is preferred over `Vec<u8>` because (a) the size is part of the type and cannot drift, (b) the inner `[u8; 32]` lives on the stack/struct embedding rather than the heap, reducing the surface where the key bytes could be cloned by accident, and (c) `Zeroizing<[u8; 32]>` from the `zeroize` crate guarantees the bytes are wiped on drop without requiring a manual `ZeroizeOnDrop` impl. The wrapper newtype provides a single chokepoint for the `[REDACTED]` `Debug` impl, mirroring the existing `secret_token` pattern at `config.rs:221`.
+
+`secrecy::SecretBox<[u8; 32]>` is an acceptable alternative but introduces a new dependency. Layer 1 + Layer 2 + Codex agree: stick with `Zeroizing<[u8; 32]>` + a newtype for Stage 1.x; promote to `secrecy::SecretBox` only if a future Codex round finds a concrete misuse path.
 
 **The root key NEVER leaves the relay process.** It is used exclusively to derive per-identity verify keys (see "Client key distribution" below). Server-side MAC computation uses the derived per-identity key, NOT the root key directly.
 
@@ -64,7 +74,11 @@ Total length = 101 bytes + `envelope_id_len` bytes. Output: 32 bytes → lowerca
 
 **Test fixture key.** `[0u8; 32]` hardcoded in `RelayConfig::from_env_for_test()`. Deterministic, never used in production paths.
 
-**Log redaction.** `seq_mac` values MUST NOT appear in any `tracing` event at any level. The MAC value is observable on the wire, but log-to-wire correlation enables traffic analysis. HMAC key bytes MUST NOT appear in logs at any level.
+**Log redaction.** The following three classes of secret/sensitive bytes MUST NOT appear in any `tracing` event at any level:
+
+1. **`RELAY_SEQ_MAC_KEY`** (the root key) — secret, redacted in `Debug` via the newtype impl.
+2. **Derived `seq_mac_verify_key`** values — although delivered to the client in `SessionResponse`, log emission is forbidden to prevent correlation between relay-log identity records and out-of-band verify-key compromise reports.
+3. **`seq_mac`** values — observable on the wire to anyone who controls a TLS-terminating proxy, but log-to-wire correlation still enables traffic analysis even without bulk capture.
 
 **Crate dependencies.** `hmac = "0.12"` added to `services/Cargo.toml` workspace deps. Pairs with existing `sha2 = "0.10"`. `zeroize` crate added for key-byte zeroization.
 
@@ -140,7 +154,12 @@ The `padded_opt_in` boolean replaces `long_poll_opt_in` at the padding gate (`re
 
 1. Doc-comment on `issue()` explicitly stating the invalidation invariant verbatim.
 2. The concurrent-issue contract test as the invariant-pinning gate (see Tests section below).
-3. **In-flight poll behavior locked as b2:** an in-flight long-poll request on T1 (when T2 is issued mid-stream) completes naturally on T1. The returned envelope may be ack'd via T1 while the connection is still open. The next poll request on T1 returns 401.
+3. **In-flight poll behavior locked as b2 — ack contract corrected by Codex round 2026-06-10:**
+
+   - An in-flight long-poll request on T1 (when T2 is issued mid-stream) **completes naturally on T1**. The poll's bearer was validated at request start; the long-held connection state does not re-validate, so the envelope is returned to the client over the T1 connection.
+   - The returned envelope is **NOT ackable via T1**. Ack is a separate HTTP request that re-validates the bearer against the current `TokenStore` at request start, and T1 has been removed from `by_token` upon T2's issuance.
+   - **Ack must use T2.** The legitimate client (who possesses T2 from the reauth flow) is the only party that can complete the ack. A stolen-T1 attacker holding only T1 reads the envelope but cannot drain it from the queue — closing the inverse-DoS window structurally.
+   - Subsequent poll requests on T1 (after the in-flight one completes) also return 401, because they re-validate against the current `TokenStore`.
 
 **If the concurrent-issue contract test FAILS against the existing code, structural refactor enters scope.** Most likely refactor: collapse `issue()` into a single critical section that acquires `by_identity` write-lock first, then `by_token` write-lock (consistent lock-acquisition order across all `RestTokenStore` mutations), removing the split-lock TOCTOU pattern. The test, not a pre-locked design decision, drives whether refactor is required.
 
@@ -183,7 +202,19 @@ impl Drop for HoldGuard {
 }
 ```
 
-**Synchronous-drop guarantee.** Rust language guarantee (NOT a tokio policy): `Drop` fires synchronously when the owning future is dropped, including under `JoinHandle::abort()`. The tokio runtime drops the future in-place on the thread executing the abort, before scheduling the next task. `Drop` is not deferred to a finalizer thread. This guarantee covers: hold loop completion (timeout or wake), axum handler future drop on client TCP close, server shutdown / runtime drop, panic / early return paths, and external `JoinHandle::abort()`.
+**Drop semantics — precise contract (Codex round 2026-06-10 amendment).**
+
+The earlier draft over-claimed "Drop fires synchronously under `JoinHandle::abort()`". The correct contract is more nuanced:
+
+- **`Drop` fires when the owning future is actually dropped.** This is a Rust language guarantee, NOT a tokio policy.
+- **`JoinHandle::abort()` requests cancellation; the task's future is dropped when tokio processes that cancellation.** The drop is not instantaneous from the caller's perspective. Tests that abort a task and then assert on `hold_count` MUST `await` the `JoinHandle` (or otherwise observe task completion via a watch channel / atomic flag) before reading the counter. A naive "abort then immediately read" pattern races with tokio's cancellation processing.
+- **Hold loop completion (timeout or wake), panic, and server shutdown** all drop the future via normal mechanisms; the guard's `Drop` runs synchronously inside those paths.
+
+**Client TCP close / RST behaviour.**
+
+- A client TCP close (FIN) or reset (RST) may not be observed by the server **immediately**. The server learns of the disconnect when the next socket write fails or when keep-alive / read timeout fires. Until the handler future is dropped, the hold slot remains occupied.
+- Stale hold slots are **bounded** by the runtime hold timeout (`tokio::time::timeout(hold_secs, slot.notify.notified())` — see "Bounded hold secs" below). At most `hold_secs` of staleness; with the 480-second cap, this is the worst case.
+- RAII guarantees cleanup once the handler future is dropped, but NOT at the exact network-close instant. Operators reading the hold-count metric should not expect sub-second precision against client-side TCP close events.
 
 **Lock-acquisition order (deadlock prevention).** Always acquire the notifier map write-lock AFTER all `AtomicU8` operations on `hold_count` complete. NEVER hold the notifier map lock while awaiting.
 
@@ -278,6 +309,8 @@ This pins the key-derivation domain tag and the HMAC algorithm against future dr
 - `inflight_poll_on_old_token_completes_naturally` — `tokio::spawn` poll on T1 (opt-in, hold=3s); after 200ms, issue T2; assert poll task returns 200 (not 401 mid-stream); assert subsequent T1 poll returns 401.
 - `concurrent_issue_for_same_identity_is_serialised` — `tokio::sync::Barrier::new(3)` + 3 spawned `obtain_token` calls for same identity; after `join_all`, exactly one token validates.
 - `inverse_dos_ack_blocked_after_token_rotation` — T1 in-flight hold open; T2 issued; attacker attempts ack via T1; assert 401 (not 200). Pins the existing Vladislav-confirmed `rest_ack_deliver` token-validation-at-request-start contract against future drift.
+- `t1_in_flight_poll_returns_200_then_t1_ack_returns_401` — T1 poll started + held; T2 issued mid-stream; envelope arrives; T1 poll returns 200 with envelope; assert T1 ack returns 401. Codex round 2026-06-10 added this case to lock the precise b2 in-flight contract (poll completes naturally, ack does NOT).
+- `t2_ack_for_envelope_returned_on_t1_poll_succeeds` — same fixture as above; after T1 poll returns the envelope, assert that the legitimate client can ack the envelope using T2 → assert 200. Confirms that the inverse-DoS mitigation does NOT cause envelope loss for the legitimate client (guardrail A preserved).
 
 **Lock-4 contract tests (in `hold_cap.rs`):**
 
@@ -286,7 +319,7 @@ This pins the key-derivation domain tag and the HMAC algorithm against future dr
 - `concurrent_holds_for_identity_y_not_blocked_by_x_cap`.
 - `hold_secs_request_above_cap_clamps_to_480` (config-parse-time + runtime-timeout dual enforcement).
 - `concurrent_hold_counter_retires_on_poll_completion`.
-- `concurrent_hold_counter_retires_on_client_disconnect` — drop the spawned `JoinHandle`; assert hold_count decremented synchronously.
+- `concurrent_hold_counter_retires_on_client_disconnect` — abort the spawned `JoinHandle`, then **await its completion** (via `handle.await` ignoring the `JoinError`, OR via a watch channel signalled inside the handler's `Drop`); after the future has been observed to drop, assert `hold_count` is decremented. Do NOT assert immediately after `abort()` — tokio's cancellation processing races with the assertion. Codex round 2026-06-10 corrected this test description.
 - `cap_exhaustion_does_not_drop_pending_envelopes` — guardrail A check.
 
 **Backward-compat regression tests:**
@@ -326,14 +359,23 @@ Recommended grouping (5 commits + tests):
 - **OQ-7 → YES.** `zeroize` crate addition is acceptable. Use for root key material. Do NOT add `secrecy` unless Codex review explicitly demands it.
 - **OQ-8 → YES.** Stage 1.x is a server-only PR. WORKING_RULES rule 8 carve-out applies — no Tele2 LTE smoke required for Stage 1.x. CI + contract tests + race tests are the merge gate. Stage 2B-B (client cursor + breaker + reauth) WILL need Tele2 smoke when it ships later.
 
-## Codex review must-look-at items
+## Codex review outcome (2026-06-10)
 
-Per Layer 2 security cross-check, the following design decisions warrant independent cryptographer review before merge:
+Codex independent review of PR #300 returned AMEND-REQUIRED on all 4 must-look-at items. The amendments are applied in PR-#300-Round-3 (this revision):
 
-1. **HMAC-SHA-256 input domain separation.** Confirm the `b"phantom-seq-mac-v1\x00"` MAC-computation domain tag AND the `b"phantom-seq-mac-key-v1\x00"` key-derivation domain tag are distinct and free from cross-domain reuse. Verify the length-prefixed encoding (`u16-BE len(envelope_id)` + envelope_id_bytes) produces an injective mapping across all production envelope_id formats (32-char hex from Stage 2A, plus any other shapes the server accepts). Confirm quantized `sequence_ts` + length-prefixed `envelope_id` + monotonic `seq` + fixed-length `identity_hex` yields collision-free MAC inputs.
-2. **Key material handling.** Confirm `Vec<u8>` + `Zeroize` / `ZeroizeOnDrop` is the correct Rust memory-handling approach. Evaluate whether the `secrecy::Secret<[u8; 32]>` pattern is warranted (stronger compile-time guarantee but adds a dep).
-3. **Lock-3 inverse-DoS scenario.** Verify the D10 mitigation (ack validates current token state at ack time) actually closes the attack window. Confirm there is no alternative path where T1 ack succeeds after T2 issuance.
-4. **Lock-4 RAII guard under tokio cancellation.** Confirm `Drop` fires synchronously on `JoinHandle::abort()` under multi-thread runtime. The Rust language guarantee holds, but verify no tokio-specific path defers Drop to a finalizer.
+- **Item 1 (HMAC domain separation):** `envelope_id_bytes` reframed as exact UTF-8 bytes (NOT ASCII assumption), with server-side max-length validation requirement.
+- **Item 2 (Key material handling):** root key type changed from `Vec<u8>` to fixed-size `Zeroizing<[u8; 32]>` newtype. Log-redaction rule expanded to include the derived per-identity `seq_mac_verify_key`.
+- **Item 3 (Inverse-DoS):** Lock-3 in-flight contract corrected — envelope returned on T1 poll is NOT ackable via T1; ack must use T2. Two new tests pin the precise contract (T1 ack → 401, T2 ack → 200).
+- **Item 4 (RAII HoldGuard):** "Drop fires synchronously under `JoinHandle::abort()`" reframed — Drop fires when the future is actually dropped; tests must await the JoinHandle before asserting `hold_count`. TCP-close wording corrected: cleanup is bounded by hold timeout, not at the exact network-close instant.
+
+## Codex review must-look-at items (original list, retained for historical context)
+
+Per Layer 2 security cross-check, the following design decisions warranted independent cryptographer review before merge. All 4 returned AMEND-REQUIRED and have been addressed above:
+
+1. **HMAC-SHA-256 input domain separation.** **AMENDED:** Tags confirmed distinct. `envelope_id_bytes` reframed as exact UTF-8 bytes (not ASCII assumption); server-side validation `len ≤ 65535` required.
+2. **Key material handling.** **AMENDED:** changed to fixed-size `Zeroizing<[u8; 32]>` newtype. Log-redaction rule expanded to include derived `seq_mac_verify_key`.
+3. **Lock-3 inverse-DoS scenario.** **AMENDED:** in-flight ack contract corrected — T1 ack returns 401, T2 ack for same envelope returns 200. Two new tests pin the contract.
+4. **Lock-4 RAII guard under tokio cancellation.** **AMENDED:** Drop semantics reframed — fires when future is actually dropped (not at `abort()` instant); tests must await JoinHandle before asserting `hold_count`. TCP-close cleanup bounded by hold timeout, not network-close instant.
 
 ## Cross-references
 
