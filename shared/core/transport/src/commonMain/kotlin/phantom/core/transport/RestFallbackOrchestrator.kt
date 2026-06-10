@@ -105,6 +105,22 @@ class RestFallbackOrchestrator(
      * BuildConfig pin flip.
      */
     private val longPollEnabled: Boolean = false,
+    /**
+     * Trek 2 Stage 2B-A (B3, L4) — read-only seam for the parallel
+     * `wsActivePollJob`'s resume-cursor source. Optional; legacy
+     * callers and unit tests pass `null` (the default), in which case
+     * the parallel job runs without a since_seq query parameter
+     * (server treats `null` as "send me anything in the retention
+     * window").
+     *
+     * Lock L4: Stage 2B-A reads from this seam but writes nothing
+     * back. The fun-interface shape — single `getLastSeenSeq` method,
+     * no write API — enforces that invariant structurally: there is
+     * no method the parallel job could call to advance the cursor.
+     * Stage 2B-B will replace this with a full read/write seam guarded
+     * by `seq_mac` verify + storage dedup.
+     */
+    private val lastSeenSeqReader: LongPollCursorReader? = null,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -154,7 +170,43 @@ class RestFallbackOrchestrator(
     private var aliveTickJob: Job? = null
     private var stateObserverJob: Job? = null
 
+    /**
+     * Trek 2 Stage 2B-A (B3, L3) — parallel `/relay/poll` job that
+     * runs in addition to the legacy [pollJob], not as a replacement.
+     * Lifecycle is tied to [start] / [stop] / [shutdown] of the
+     * orchestrator and to the [longPollEnabled] flag — NOT to the
+     * WS connection's up/down state. Lock L3: the parallel job
+     * continues issuing polls while WS is up so the storage layer's
+     * envelope-id dedup keeps the message table consistent without
+     * either transport claiming primacy. The Direct WSS fast path
+     * stays active.
+     */
+    private var wsActivePollJob: Job? = null
+
     private var lastInboundOrSendAtMs: Long = 0L
+
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — session-scoped cache of the
+     * relay-advertised `seq_mac_verify_key`. Captured in [bootstrap]
+     * from [AuthSessionResponse.seqMacVerifyKey] and re-captured on
+     * every subsequent bootstrap (e.g. token rotation). Empty string
+     * when the relay does not announce the field — older relays or
+     * a Stage 1.x deployment without `RELAY_SEQ_MAC_KEY` provisioned.
+     *
+     * Stage 2B-A surfaces this value via [seqMacVerifyKey] but does
+     * NOT verify any MAC and does NOT advance `since_seq` based on
+     * the unverified key (locks L5, L4). Stage 2B-B picks the value
+     * up from here without a session-rotation handshake.
+     */
+    private var _seqMacVerifyKey: String = ""
+
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — read-only access to the cached
+     * session verify key. Visible for Stage 2B-B and for behaviour
+     * tests; the value is empty until [bootstrap] succeeds against a
+     * Stage 1.x-deployed relay.
+     */
+    val seqMacVerifyKey: String get() = _seqMacVerifyKey
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -204,7 +256,20 @@ class RestFallbackOrchestrator(
         stateObserverJob = scope.launch {
             stateMachine.state.collect { mode -> onModeChanged(mode) }
         }
-        log("REST_TRACE orchestrator_started")
+        // Trek 2 Stage 2B-A (B3, L3) — spawn the parallel REST poll
+        // job iff `LONGPOLL_V2_ENABLED == "1"` (gated through the
+        // `longPollEnabled` Boolean computed by the wire-up layer).
+        // The job runs in parallel with the legacy `pollJob` AND with
+        // the Direct WSS fast path; it never stops on
+        // `RestMode.WsActive` (unlike [pollLoop]) — see L3 in
+        // `docs/tracks/trek2-stage2b-a-client-shell.md`.
+        if (longPollEnabled) {
+            wsActivePollJob = scope.launch { wsActivePollLoop() }
+            log("REST_TRACE ws_active_poll_started long_poll_enabled=true")
+        } else {
+            log("REST_TRACE ws_active_poll_skipped long_poll_enabled=false")
+        }
+        log("REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled")
     }
 
     /**
@@ -215,6 +280,10 @@ class RestFallbackOrchestrator(
         pollJob?.cancel(); pollJob = null
         aliveTickJob?.cancel(); aliveTickJob = null
         stateObserverJob?.cancel(); stateObserverJob = null
+        // Trek 2 Stage 2B-A (B3, L3) — cancel the parallel poll job
+        // on every stop. Lifecycle is tied to the orchestrator's own
+        // start/stop, not to any WS mode transition.
+        wsActivePollJob?.cancel(); wsActivePollJob = null
     }
 
     /**
@@ -649,6 +718,140 @@ class RestFallbackOrchestrator(
     }
 
     /**
+     * Trek 2 Stage 2B-A (B3, L3) — parallel `/relay/poll` loop that
+     * runs alongside the legacy [pollLoop] AND the Direct WSS fast
+     * path. The two loops issue independent poll requests; the
+     * storage layer's envelope-id dedup keeps the message table
+     * consistent.
+     *
+     * Lifecycle rules pinned by lock L3:
+     *   - Spawned from [start] iff [longPollEnabled] is true.
+     *   - Cancelled by [stop] / [shutdown] only. It is NOT
+     *     state-machine-driven and does NOT exit on
+     *     [RestMode.WsActive] (unlike [pollLoop]).
+     *   - On token failure, the same `acquireOrRefreshToken` path as
+     *     [pollLoop] is reused.
+     *
+     * Lock L4 — read-only cursor: the loop reads
+     * [lastSeenSeqReader] each iteration if non-null and passes the
+     * value as `since_seq` on the wire. It NEVER writes back to the
+     * reader (there is no write method on the interface — the
+     * invariant is enforced structurally). When [lastSeenSeqReader]
+     * is null, the loop polls without a `since_seq` parameter
+     * (server treats null as `since_seq=0`).
+     *
+     * Lock L5 — MAC unverified: the loop emits received
+     * `PollEnvelope`s to [_inbound] as today; the new `seqMac` field
+     * is presence-parsed into the DTO and forwarded unmodified.
+     * There is no MAC verification call site on this loop.
+     *
+     * Cadence: reuses [pollIntervalMs] so the parallel loop matches
+     * the legacy active/idle adaptive cadence. Stage 2B-B will
+     * replace this with a dedicated long-poll cadence policy.
+     */
+    private suspend fun wsActivePollLoop() {
+        var staleToken: String? = null
+        while (scope.isActive) {
+            val token = acquireOrRefreshToken(
+                reason = if (staleToken != null) "ws_active_poll_401" else "ws_active_poll",
+                staleToken = staleToken,
+            )
+            if (token == null) {
+                val nominalDelay = POLL_BACKOFF_NO_TOKEN_MS
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE ws_active_poll_call_skipped reason=no_token " +
+                        "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
+            staleToken = null
+
+            // Lock L4: read-only cursor. `null` reader means "no
+            // persisted cursor" — wire treats that as since_seq=0.
+            // The loop NEVER writes back regardless of the response.
+            val sinceSeq = lastSeenSeqReader?.getLastSeenSeq(identityHex)
+
+            val intervalMs = pollIntervalMs()
+            log(
+                "REST_TRACE ws_active_poll_call since_seq=${sinceSeq ?: -1L} " +
+                    "long_poll_enabled=true",
+            )
+            val startMs = now()
+            val outcome = runCatching {
+                // Same L1 + L2 gating as the legacy poll site below —
+                // both call sites of `transport.poll(...)` carry the
+                // same Stage 2B-A header and timeout invariants.
+                transport.poll(
+                    url = "$baseUrl/relay/poll",
+                    token = token,
+                    sinceSeq = sinceSeq,
+                    longPollOptIn = longPollEnabled,
+                    readTimeoutMs = computeLongPollReadTimeoutMs(
+                        longPollEnabled = longPollEnabled,
+                        pollHoldSecs = _capabilities.value.pollHoldSecs,
+                    ),
+                )
+            }
+            val elapsed = now() - startMs
+
+            if (outcome.isFailure) {
+                val ex = outcome.exceptionOrNull()!!
+                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE ws_active_poll_fail reason=${ex::class.simpleName} " +
+                        "elapsedMs=$elapsed next_delay_ms=$jitteredDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
+
+            val response = outcome.getOrThrow()
+            if (response.statusCode == 401) {
+                staleToken = token
+                log(
+                    "REST_TRACE ws_active_poll_unauthorised status=401 " +
+                        "elapsedMs=$elapsed — will refresh token",
+                )
+                continue
+            }
+            if (response.statusCode !in 200..299 || response.bodyParsed == null) {
+                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE ws_active_poll_unexpected_status " +
+                        "status=${response.statusCode} elapsedMs=$elapsed " +
+                        "next_delay_ms=$jitteredDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
+            val envelopes = response.bodyParsed.envelopes
+            log(
+                "REST_TRACE ws_active_poll_ok " +
+                    "envelopes=${envelopes.size} elapsedMs=$elapsed",
+            )
+            // Lock L5: emit envelopes to the same downstream as the
+            // legacy poll. The new `seqMac` field rides through the
+            // DTO unchanged. No MAC verification call site here.
+            for (env in envelopes) {
+                _inbound.tryEmit(env)
+            }
+            // Lock L4 reminder: do NOT update lastSeenSeq from the
+            // server response. Stage 2B-B will add cursor advancement
+            // gated on MAC verify + storage accept-or-dedup.
+            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+            val jitteredDelay = (intervalMs * jitterFactor).toLong()
+            delay(jitteredDelay)
+        }
+    }
+
+    /**
      * Polling cadence based on recent traffic activity.
      */
     private fun pollIntervalMs(): Long {
@@ -738,6 +941,13 @@ class RestFallbackOrchestrator(
         sessionToken = response.token
         tokenExpiresAt = response.expiresAt
         _capabilities.value = response.toCapabilities()
+        // Trek 2 Stage 2B-A (B3, L5) — cache the session-scoped
+        // `seq_mac_verify_key` for Stage 2B-B to read without
+        // a session-rotation handshake. Empty string when the
+        // relay does not announce the field (old relay or Stage
+        // 1.x deployment without `RELAY_SEQ_MAC_KEY` provisioned).
+        // The cache is overwritten on every token refresh.
+        _seqMacVerifyKey = response.seqMacVerifyKey
         log(
             "REST_TRACE token_cached reason=$reason " +
                 "expiresInMs=${response.expiresAt - now()} " +

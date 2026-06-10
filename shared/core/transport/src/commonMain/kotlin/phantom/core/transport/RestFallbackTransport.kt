@@ -237,6 +237,23 @@ data class AuthSessionResponse(
      * Stage 2B deliverable (no behaviour change in this commit).
      */
     @SerialName("poll_hold_secs") val pollHoldSecs: Int = 0,
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — per-identity verify key for the
+     * `seq_mac` integrity tag on `/relay/poll` envelopes. 64-char
+     * lowercase hex (32-byte HMAC-SHA-256 output). Derived from the
+     * relay-side root key (which never leaves the relay process) and
+     * the bound identity per the Stage 1.x contract in
+     * `services/relay/src/rest_fallback.rs`.
+     *
+     * Stage 2B-A presence-parses the field for wire stability —
+     * the orchestrator caches the value in a session-scoped in-memory
+     * slot so Stage 2B-B can verify MACs without a session-rotation
+     * handshake. Stage 2B-A does NOT verify MACs and does NOT
+     * advance `since_seq` based on the unverified key (locks L5,
+     * L4). Default `""` makes the wire shape robust against older
+     * relays that have not been redeployed with Stage 1.x.
+     */
+    @SerialName("seq_mac_verify_key") val seqMacVerifyKey: String = "",
 )
 
 /**
@@ -305,6 +322,23 @@ data class PollEnvelope(
     @SerialName("payload") val payloadBase64: String,
     @SerialName("sequence_ts") val sequenceTs: Long,
     @SerialName("seq") val seq: Long,
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — per-envelope HMAC-SHA-256
+     * integrity tag computed at store time on the relay over the
+     * canonical `(identity_hex, seq, envelope_id, sequence_ts)`
+     * tuple. 64-char lowercase hex. See the server-side doc-comment
+     * in `services/relay/src/rest_fallback.rs` for the locked threat
+     * wording — verbatim, do not soften.
+     *
+     * Stage 2B-A presence-parses the field for wire stability; the
+     * orchestrator does NOT verify the MAC and does NOT advance
+     * `since_seq` based on the unverified value (locks L5, L4).
+     * Verification lands in Stage 2B-B together with the cursor
+     * advancement path, both gated on MAC verify + storage
+     * accept-or-dedup. Default `""` makes the wire shape robust
+     * against older relays that have not been redeployed.
+     */
+    @SerialName("seq_mac") val seqMac: String = "",
 )
 
 // ── Wire models — /relay/ack-deliver ─────────────────────────────────────────
@@ -356,6 +390,19 @@ data class RelayCapabilities(
      * it; Stage 2A itself does NOT consume the value at runtime.
      */
     val pollHoldSecs: Int,
+    /**
+     * Trek 2 Stage 2B-A (B3, L5) — per-identity `seq_mac` verify key
+     * projected from [AuthSessionResponse.seqMacVerifyKey]. 64-char
+     * lowercase hex (32 bytes HMAC-SHA-256 output). Empty when the
+     * relay does not announce the field — older relays or a Stage 1.x
+     * deployment without `RELAY_SEQ_MAC_KEY` provisioned.
+     *
+     * Stage 2B-A surfaces this value through capabilities so the
+     * orchestrator can cache it in a session-scoped slot for Stage
+     * 2B-B without a session-rotation handshake. Stage 2B-A itself
+     * does NOT verify MACs (lock L5).
+     */
+    val seqMacVerifyKey: String,
 ) {
     companion object {
         /**
@@ -371,6 +418,7 @@ data class RelayCapabilities(
             mediaBinaryV3 = false,
             mediaUploadBodyBytes = 0,
             pollHoldSecs = 0,
+            seqMacVerifyKey = "",
         )
     }
 }
@@ -383,4 +431,5 @@ fun AuthSessionResponse.toCapabilities(): RelayCapabilities = RelayCapabilities(
     mediaBinaryV3 = mediaCapabilities.binaryV3,
     mediaUploadBodyBytes = mediaCapabilities.maxUploadBodyBytes,
     pollHoldSecs = pollHoldSecs,
+    seqMacVerifyKey = seqMacVerifyKey,
 )

@@ -54,79 +54,78 @@ class LongPollOptInOrchestratorSeamTest {
     }
 
     @Test
-    fun orchestrator_has_exactly_one_transport_poll_call_site() {
+    fun orchestrator_has_exactly_two_transport_poll_call_sites_legacy_plus_parallel() {
         val source = orchestratorSource.readText(Charsets.UTF_8)
         // Match the actual call shape (`transport.poll(` immediately
         // followed by a newline — i.e. multi-line argument list) so
         // KDoc mentions of `transport.poll(...)` are not counted.
+        //
+        // Trek 2 Stage 2B-A (B3) — there are now exactly TWO call
+        // sites: the legacy `pollLoop()` and the parallel
+        // `wsActivePollLoop()`. Both must forward the L1 / L2
+        // invariants (asserted by the next two tests). A third call
+        // site would mean a new code path that needs reviewing for
+        // those invariants — the count assert is the gate that flags
+        // it for explicit attention.
         val callSites = Regex("""transport\.poll\(\r?\n""").findAll(source).count()
         assertEquals(
-            1,
+            2,
             callSites,
-            "RestFallbackOrchestrator must carry exactly ONE `transport.poll(...)` call " +
-                "site for the L1 / L2 seam to be auditable. Found $callSites — a " +
-                "second call site would let one path forget the `longPollOptIn` " +
-                "parameter or the `readTimeoutMs` parameter and silently disable " +
-                "Stage 2B-A's header emission or timeout gate.",
+            "RestFallbackOrchestrator must carry exactly TWO `transport.poll(...)` " +
+                "call sites (legacy pollLoop + parallel wsActivePollLoop). Found " +
+                "$callSites — anything else would mean either the parallel job has " +
+                "been removed (L3 violation) or a new third call site has been " +
+                "added without verifying L1 / L2 forwarding.",
         )
     }
 
     @Test
-    fun the_one_call_site_forwards_long_poll_enabled() {
+    fun all_call_sites_forward_long_poll_enabled() {
         val source = orchestratorSource.readText(Charsets.UTF_8)
-        val callSiteStart = Regex("""transport\.poll\(\r?\n""")
-            .find(source)
-            ?.range
-            ?.first
-            ?: -1
-        assertNotNull(
-            callSiteStart.takeIf { it >= 0 },
-            "Expected `transport.poll(` (call form) in RestFallbackOrchestrator.kt.",
-        )
-        val callSiteBlock = extractBalancedParenBlock(source, callSiteStart)
-            ?: fail("Could not extract balanced parentheses for the transport.poll(...) call.")
-        assertTrue(
-            callSiteBlock.contains("longPollOptIn = longPollEnabled"),
-            "The `transport.poll(...)` call must forward `longPollOptIn = longPollEnabled` " +
-                "verbatim. Found call:\n  transport.poll($callSiteBlock)\n" +
-                "A future refactor that hard-codes `longPollOptIn = false` or drops the " +
-                "parameter would silently bypass the L1 flag.",
-        )
+        val matches = Regex("""transport\.poll\(\r?\n""").findAll(source).toList()
+        assertTrue(matches.isNotEmpty(), "Expected at least one transport.poll(...) call form.")
+        for ((idx, match) in matches.withIndex()) {
+            val callSiteBlock = extractBalancedParenBlock(source, match.range.first)
+                ?: fail("Could not extract balanced parens for call site #$idx at offset ${match.range.first}.")
+            assertTrue(
+                callSiteBlock.contains("longPollOptIn = longPollEnabled"),
+                "Call site #$idx must forward `longPollOptIn = longPollEnabled` " +
+                    "verbatim. Found call body:\n  transport.poll($callSiteBlock)\n" +
+                    "A future refactor that hard-codes `longPollOptIn = false` or " +
+                    "drops the parameter would silently bypass the L1 flag.",
+            )
+        }
     }
 
     @Test
-    fun the_one_call_site_forwards_computed_read_timeout() {
-        // Trek 2 Stage 2B-A (B2) — pin that the orchestrator forwards
-        // the L2-gate result via the `readTimeoutMs` parameter rather
-        // than hard-coding `null` (which would short-circuit the L2
-        // gate) or computing the value inline (which would let the
-        // formula drift away from the locked
-        // `computeLongPollReadTimeoutMs` helper that M2 pins).
+    fun all_call_sites_forward_computed_read_timeout() {
+        // Trek 2 Stage 2B-A (B2) + (B3) — every call site must funnel
+        // its timeout through the L2 helper, NOT hard-code `null` and
+        // NOT compute the value inline. Pins the helper as the single
+        // mathematical entry point M2 covers.
         val source = orchestratorSource.readText(Charsets.UTF_8)
-        val callSiteStart = Regex("""transport\.poll\(\r?\n""")
-            .find(source)
-            ?.range
-            ?.first
-            ?: fail("Expected `transport.poll(` call form in orchestrator.")
-        val callSiteBlock = extractBalancedParenBlock(source, callSiteStart)
-            ?: fail("Could not extract balanced parentheses for the transport.poll(...) call.")
-        assertTrue(
-            callSiteBlock.contains("readTimeoutMs = computeLongPollReadTimeoutMs("),
-            "The `transport.poll(...)` call must forward `readTimeoutMs = " +
-                "computeLongPollReadTimeoutMs(...)` so the L2 gate runs through " +
-                "the locked helper. Found call:\n  transport.poll($callSiteBlock)",
-        )
-        // The computed call must include both gate inputs.
-        assertTrue(
-            callSiteBlock.contains("longPollEnabled = longPollEnabled"),
-            "L2 gate must take `longPollEnabled` as the first input — found " +
-                "call body:\n$callSiteBlock",
-        )
-        assertTrue(
-            callSiteBlock.contains("pollHoldSecs = "),
-            "L2 gate must take `pollHoldSecs` as the second input — found " +
-                "call body:\n$callSiteBlock",
-        )
+        val matches = Regex("""transport\.poll\(\r?\n""").findAll(source).toList()
+        assertTrue(matches.isNotEmpty())
+        for ((idx, match) in matches.withIndex()) {
+            val callSiteBlock = extractBalancedParenBlock(source, match.range.first)
+                ?: fail("Could not extract balanced parens for call site #$idx.")
+            assertTrue(
+                callSiteBlock.contains("readTimeoutMs = computeLongPollReadTimeoutMs("),
+                "Call site #$idx must forward `readTimeoutMs = " +
+                    "computeLongPollReadTimeoutMs(...)`. Found call body:\n" +
+                    "  transport.poll($callSiteBlock)",
+            )
+            assertTrue(
+                callSiteBlock.contains("longPollEnabled = longPollEnabled"),
+                "Call site #$idx L2 gate must take `longPollEnabled` as the " +
+                    "first input — found call body:\n$callSiteBlock",
+            )
+            assertTrue(
+                callSiteBlock.contains("pollHoldSecs = "),
+                "Call site #$idx L2 gate must take `pollHoldSecs` as the " +
+                    "second input — found call body:\n$callSiteBlock",
+            )
+        }
     }
 
     /**
