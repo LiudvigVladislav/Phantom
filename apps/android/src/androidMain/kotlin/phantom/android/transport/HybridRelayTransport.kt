@@ -963,7 +963,13 @@ class HybridRelayTransport(
                 TAG,
                 "REST_TRACE inbound_skip_already_processed id=${env.id.take(8)}",
             )
-            runCatching { orchestrator.ackInbound(env.id) }
+            // Trek 2 Stage 2B-B (C3, L3 Step 3) — already-processed
+            // envelopes ack via the combined method. The orchestrator
+            // owns the entire post-ack lifecycle including cursor
+            // advance under cancellation safety; the consumer keeps
+            // the existing `runCatching` wrapper for non-cancellation
+            // failures.
+            runCatching { orchestrator.ackInboundAndAdvanceCursor(env.id) }
             return
         }
 
@@ -1004,7 +1010,12 @@ class HybridRelayTransport(
                     TAG,
                     "REST_TRACE inbound_reack_after_ack id=${env.id.take(8)}",
                 )
-                runCatching { orchestrator.ackInbound(env.id) }
+                // Trek 2 Stage 2B-B (C3, L3 Step 3) — ReAck path uses
+                // the combined method so a successful retry not only
+                // clears the relay queue but also advances the
+                // persisted cursor that the FIRST ack attempt
+                // missed. M-B20 pins the success-after-retry path.
+                runCatching { orchestrator.ackInboundAndAdvanceCursor(env.id) }
             }
         }
     }
@@ -1023,8 +1034,15 @@ class HybridRelayTransport(
         // DMS only calls sendDeliveryAck AFTER markProcessed + insertMessage,
         // so by the time we get here the envelope is durably stored locally.
         // This is the load-bearing ACK-after-persistence invariant.
+        //
+        // Trek 2 Stage 2B-B (C3, L3 Step 4) — the combined method
+        // wraps `ackInbound` + the persistent cursor advance into a
+        // single cancellation-safe call. The outcome classification
+        // below is unchanged; on `Failed` the entry stays in
+        // `_pendingSeqForAck` for the ReAck path's retry. On `Acked`
+        // the cursor is already persisted by the time this returns.
         Log.i(TAG, "REST_TRACE ack_after_save id=${messageId.take(8)}")
-        val outcome = runCatching { orchestrator.ackInbound(messageId) }
+        val outcome = runCatching { orchestrator.ackInboundAndAdvanceCursor(messageId) }
             .getOrElse { AckOutcome.Failed(statusCode = null, reason = it::class.simpleName ?: "Throwable") }
         // Mark acknowledged regardless of network outcome — DMS has
         // persisted the envelope. If the relay re-delivers because our ack

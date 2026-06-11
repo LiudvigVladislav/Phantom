@@ -3,9 +3,11 @@
 
 package phantom.core.transport
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -19,6 +21,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlin.coroutines.CoroutineContext
 import kotlin.random.Random
 
@@ -106,23 +109,44 @@ class RestFallbackOrchestrator(
      */
     private val longPollEnabled: Boolean = false,
     /**
-     * Trek 2 Stage 2B-A (B3, L4) — read-only seam for the parallel
-     * `wsActivePollJob`'s resume-cursor source. Optional; legacy
-     * callers and unit tests pass `null` (the default), in which case
-     * the parallel job runs without a since_seq query parameter
-     * (server treats `null` as "send me anything in the retention
-     * window").
+     * Trek 2 Stage 2B-B (C3, L4) — full read/write cursor seam used
+     * by BOTH REST poll loops as the single source of truth for
+     * `since_seq`. Replaces the Stage 2B-A read-only
+     * [LongPollCursorReader] parameter; the read-only interface is
+     * retained in the codebase for diagnostic / non-orchestrator
+     * callers. Optional; tests and legacy callers pass `null` (the
+     * default), in which case both loops poll without a `since_seq`
+     * parameter (server treats `null` as `since_seq=0`) and the
+     * orchestrator's cursor-advance path is a no-op.
      *
-     * Lock L4: Stage 2B-A reads from this seam but writes nothing
-     * back. The fun-interface shape — single `getLastSeenSeq` method,
-     * no write API — enforces that invariant structurally: there is
-     * no method the parallel job could call to advance the cursor.
-     * Stage 2B-B will replace this with a full read/write seam guarded
-     * by `seq_mac` verify + storage dedup.
+     * Writes happen ONLY from inside [ackInboundAndAdvanceCursor]
+     * after the relay's `/relay/ack-deliver` has returned 2xx — never
+     * from the poll loops directly. The interface itself does not
+     * retry; the call site bounds retry via
+     * [CURSOR_WRITE_MAX_ATTEMPTS] / [CURSOR_WRITE_RETRY_BACKOFF_MS].
+     *
+     * Lock L4: both loops share the persisted cursor; the legacy
+     * `pollLoop`'s in-memory `lastSeenSeq` variable is decommissioned
+     * in Stage 2B-B (OQ-6 LOCK).
      */
-    private val lastSeenSeqReader: LongPollCursorReader? = null,
+    private val cursorRepository: LongPollCursorRepository? = null,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) {
+
+    init {
+        // Trek 2 Stage 2B-B (C3, L3) — backoff-array contract: there
+        // is exactly one wait BETWEEN attempts and NONE after the
+        // final attempt. An array mismatch would either skip a
+        // backoff (size < N-1) or index out of bounds at the third
+        // attempt's pre-delay lookup (size > N-1). Construction-time
+        // assertion catches the mismatch on every orchestrator
+        // instantiation, including in the test suite.
+        check(CURSOR_WRITE_RETRY_BACKOFF_MS.size == CURSOR_WRITE_MAX_ATTEMPTS - 1) {
+            "CURSOR_WRITE_RETRY_BACKOFF_MS.size (${CURSOR_WRITE_RETRY_BACKOFF_MS.size}) " +
+                "must equal CURSOR_WRITE_MAX_ATTEMPTS - 1 (${CURSOR_WRITE_MAX_ATTEMPTS - 1})"
+        }
+    }
+
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatcher)
 
     /** Pure state machine. Public so the wire-up layer can observe + submit events. */
@@ -162,6 +186,58 @@ class RestFallbackOrchestrator(
      * Locked PR-D1c.1 (2026-05-17) after Test #50 reproduced this race.
      */
     private val tokenMutex = Mutex()
+
+    /**
+     * Trek 2 Stage 2B-B (C3, L6) — orchestrator-scoped mutex that
+     * serialises every read-modify-write on the in-memory shared
+     * state introduced by Stage 2B-B (and the upcoming C4 verify-key
+     * state machine + bad-MAC posture + breaker fields).
+     *
+     * Owned fields under this mutex (this commit ships the first two;
+     * the rest land in C4 / C5):
+     *   * [_pendingSeqForAck] — envelope-id → seq mapping populated at
+     *     emit time, consumed by [ackInboundAndAdvanceCursor].
+     *
+     * **Lock order (L6).** `tokenMutex` outer, `_inboundStateMutex`
+     * inner. Code that needs both MUST acquire `tokenMutex` first; no
+     * call path holds them in the reverse order. The orchestrator's
+     * own `acquireOrRefreshToken` already takes `tokenMutex`
+     * internally, so callers MUST NOT wrap a call to it in
+     * `tokenMutex.withLock { ... }` (Kotlin Mutex is NOT re-entrant
+     * and would self-deadlock). Future C4 verify-key state publication
+     * runs INSIDE `acquireOrRefreshToken`'s existing critical section.
+     *
+     * **Discipline.** Network I/O (`acquireOrRefreshToken`,
+     * `transport.poll`, `transport.ackDeliver`) and storage I/O
+     * (`cursorRepository.upsertLastSeenSeq`) MUST NOT be invoked
+     * while holding this mutex — the three-phase pattern in
+     * [ackInboundAndAdvanceCursor] is the canonical example.
+     */
+    private val _inboundStateMutex = Mutex()
+
+    /**
+     * Trek 2 Stage 2B-B (C3, L3) — in-memory `envelope_id → seq`
+     * mapping populated at the orchestrator's emit site, before
+     * `_inbound.emit(env)`. Consumed exactly once per envelope by
+     * [ackInboundAndAdvanceCursor]: read inside `_inboundStateMutex`
+     * to snapshot the pending seq, then removed in the cleanup
+     * `finally` block regardless of cursor-write success/failure.
+     *
+     * **Single insertion point.** The map is populated ONLY from the
+     * orchestrator's poll loops (legacy [pollLoop] + Stage 2B-A
+     * `wsActivePollLoop`). The consumer (`HybridRelayTransport.handleRestInbound`)
+     * is NOT a co-author — it reads the envelope and eventually
+     * triggers `ackInboundAndAdvanceCursor` via `sendDeliveryAck`,
+     * which reads (and removes) the entry. A future caller that wants
+     * to advance the cursor for an envelope that never came through
+     * the poll loops has no path here and must use a different
+     * mechanism.
+     *
+     * The map is purely in-memory: on orchestrator restart it is
+     * empty; pending envelopes re-arrive on the next poll. Access is
+     * serialised through [_inboundStateMutex].
+     */
+    private val _pendingSeqForAck: MutableMap<String, Long> = mutableMapOf()
 
     private var sessionToken: String? = null
     private var tokenExpiresAt: Long = 0L
@@ -542,6 +618,210 @@ class RestFallbackOrchestrator(
         }
     }
 
+    /**
+     * Trek 2 Stage 2B-B (C3, L3) — single combined "ack the envelope
+     * AND advance the persisted cursor" entry point.
+     *
+     * Replaces the previous split between [ackInbound] returning
+     * `AckOutcome.Acked` and a separate cursor-advance call site at
+     * the consumer (`HybridRelayTransport`). The split was structurally
+     * unsafe: a coroutine cancellation arriving AFTER `ackInbound`
+     * returned `Acked` but BEFORE the consumer's cursor-advance call
+     * fired would have left the relay queue cleared, the cursor
+     * un-advanced, and [_pendingSeqForAck]`[envelopeId]` leaked until
+     * orchestrator restart. The combined method closes this window by
+     * owning the entire post-ack lifecycle internally.
+     *
+     * **Three-phase pattern.** The retry loop ITSELF stays
+     * fully cancellable so the caller can abort a slow shutdown; only
+     * the cleanup in the outer `finally` block is wrapped in
+     * [NonCancellable] so the in-memory [_pendingSeqForAck] entry is
+     * always removed under [_inboundStateMutex] regardless of
+     * cancellation. Wrapping the entire post-ack region in
+     * `withContext(NonCancellable)` (a tempting earlier draft) would
+     * have (a) prevented `CancellationException` propagation from
+     * `upsert` and `delay`, (b) made `coroutineContext[Job]?.isCancelled`
+     * always observe `NonCancellable.isCancelled = false` regardless
+     * of the caller's job state, and (c) potentially allowed the
+     * function to return successfully after caller cancellation. The
+     * corrected pattern keeps the retry loop fully cancellable, wraps
+     * ONLY the `finally` cleanup in `NonCancellable`, and tracks
+     * cancellation via an explicit `var wasCancelled` flag captured
+     * in the OUTER (cancellable) scope — NOT a runtime
+     * `coroutineContext[Job]?.isCancelled` query from inside
+     * `NonCancellable`.
+     *
+     * **Cursor-write bounded retry.** Once the relay has 2xx'd the
+     * ack, the relay's copy of the envelope is gone — `ReAck` will
+     * NOT trigger on a subsequent poll. The cursor write therefore
+     * must be retried INSIDE the orchestrator; otherwise a transient
+     * SQLCipher failure on the FIRST attempt would silently drop the
+     * cursor advance and the entry would leak in
+     * [_pendingSeqForAck]. The retry budget is bounded by
+     * [CURSOR_WRITE_MAX_ATTEMPTS] = 3 attempts with `delay()` between
+     * attempts only, per [CURSOR_WRITE_RETRY_BACKOFF_MS] = `[100, 500]`
+     * ms. A structural failure that survives three attempts is
+     * logged as `poll_cursor_write_exhausted` and the entry is
+     * removed from the map (no leak), but the cursor stays at its
+     * pre-failure value; sparse-sequence recovery (M-B26) catches up
+     * via the next legitimate envelope arrival.
+     *
+     * **No-op cases.**
+     *   * Returns the ack's outcome unchanged when it is not `Acked`
+     *     (network failure, 5xx, DisabledByCapability). The cursor
+     *     stays at its current value, the `_pendingSeqForAck` entry
+     *     remains for the next ack attempt (the relay still holds
+     *     the envelope; the `ReAck` branch will trigger on the next
+     *     poll and retry the ack).
+     *   * Returns `Acked` when [_pendingSeqForAck] has no entry for
+     *     [envelopeId] — the relay ack succeeded but no cursor seq
+     *     was registered (e.g. an envelope acked through the legacy
+     *     non-poll-loop path before Stage 2B-B wiring). The cursor
+     *     stays at its current value; nothing to clean up.
+     *
+     * **L3 contract on the orchestrator side.**
+     *   * Map insertion happens ONLY in the poll loops, BEFORE
+     *     `_inbound.emit(env)`, under [_inboundStateMutex] (Step 1 in
+     *     the scope-doc). Consumers do NOT populate the map.
+     *   * This method is the SOLE consumer that removes the entry.
+     *
+     * Cells M11 + M-B20 + M-B27 + M-B29 pin this.
+     */
+    suspend fun ackInboundAndAdvanceCursor(envelopeId: String): AckOutcome {
+        // Phase 0 — cancellable: relay ack call.
+        val ackOutcome = ackInbound(envelopeId)
+        if (ackOutcome !is AckOutcome.Acked) {
+            // Ack failed (network, 5xx, capability disabled). Cursor
+            // stays; entry stays in _pendingSeqForAck for the next
+            // ack attempt. The relay still holds the envelope; the
+            // ReAck branch will trigger on the next poll and retry
+            // the ack.
+            return ackOutcome
+        }
+
+        // From here on the relay has CLEARED the envelope from its
+        // queue. We MUST remove the _pendingSeqForAck entry regardless
+        // of what happens next, including cancellation. The retry
+        // loop ITSELF stays cancellable (so the caller can abort a
+        // slow shutdown); only the cleanup in `finally` is wrapped
+        // in NonCancellable.
+        //
+        // Critical: there is NO suspension point between the `return`
+        // above and the `try { ... }` block. Cancellation cannot leak
+        // into the gap. The first suspension point is
+        // `_inboundStateMutex.withLock` INSIDE the try; from that
+        // point on, `finally` guarantees cleanup. (M-B29 sub-cell (d)
+        // verifies the absence of a suspension point structurally.)
+        var pendingSeq: Long? = null
+        var upsertOk = false
+        var wasCancelled = false
+        try {
+            // Phase 1 — mutex held (cancellable, first suspension point):
+            // snapshot the pending seq. Read-only; the remove happens
+            // in the Phase 3 cleanup under the same mutex.
+            pendingSeq = _inboundStateMutex.withLock {
+                _pendingSeqForAck[envelopeId]
+            }
+            if (pendingSeq == null) {
+                // The relay ack succeeded but the orchestrator never
+                // registered a seq for this envelope (e.g. acked
+                // through a non-poll-loop path before Stage 2B-B
+                // wiring landed). Cursor stays; nothing to clean up.
+                // We fall through to the `finally`, which is now a
+                // no-op because `pendingSeq == null` suppresses the
+                // exhaustion log AND `_pendingSeqForAck.remove` on a
+                // missing key is itself a no-op.
+                return ackOutcome
+            }
+
+            // Phase 2 — mutex released, bounded retry loop (fully
+            // cancellable):
+            try {
+                for (attemptIdx in 0 until CURSOR_WRITE_MAX_ATTEMPTS) {
+                    if (cursorRepository == null) {
+                        // No repository wired (legacy / test stub
+                        // without storage). Treat as success so the
+                        // entry is cleaned up; nothing to write.
+                        upsertOk = true
+                        break
+                    }
+                    try {
+                        cursorRepository.upsertLastSeenSeq(
+                            identityHex = identityHex,
+                            seq = pendingSeq!!,
+                            nowMs = now(),
+                        )
+                        upsertOk = true
+                    } catch (ce: CancellationException) {
+                        // Cancellation MUST propagate. `runCatching`
+                        // would have silently caught it and turned
+                        // this into `upsertOk = false`. Rethrow to
+                        // the outer catch, which sets
+                        // `wasCancelled = true` and re-throws,
+                        // unwinding through `finally`.
+                        throw ce
+                    } catch (t: Throwable) {
+                        // All other failures (SQLCipher I/O, disk
+                        // full, transaction abort, etc.) feed the
+                        // retry loop. Log once per attempt for
+                        // diagnostic triage.
+                        log(
+                            "REST_TRACE poll_cursor_write_attempt_fail " +
+                                "id=${envelopeId.take(8)} seq=$pendingSeq " +
+                                "attempt=${attemptIdx + 1} of=$CURSOR_WRITE_MAX_ATTEMPTS " +
+                                "reason=${t::class.simpleName}",
+                        )
+                    }
+                    if (upsertOk) break
+                    if (attemptIdx < CURSOR_WRITE_MAX_ATTEMPTS - 1) {
+                        // delay() throws CancellationException
+                        // naturally; the outer catch tags it as
+                        // cancellation.
+                        delay(CURSOR_WRITE_RETRY_BACKOFF_MS[attemptIdx])
+                    }
+                }
+            } catch (ce: CancellationException) {
+                wasCancelled = true
+                throw ce // propagate to outer finally
+            }
+        } finally {
+            // Phase 3 — cleanup. Runs even under cancellation,
+            // wrapped narrowly in NonCancellable so the
+            // _pendingSeqForAck.remove + the conditional exhaustion
+            // log are guaranteed to complete. The retry loop above
+            // stays cancellable — only THIS cleanup is non-cancellable.
+            withContext(NonCancellable) {
+                _inboundStateMutex.withLock {
+                    // Remove the entry whether upsert eventually
+                    // succeeded OR the local retry budget was
+                    // exhausted OR the coroutine was cancelled OR
+                    // `pendingSeq == null` (cancellation hit Phase 1
+                    // before the snapshot completed). `remove` is
+                    // idempotent: a no-op if absent.
+                    _pendingSeqForAck.remove(envelopeId)
+                    // Log the exhaustion event ONLY when it was a
+                    // genuine attempt-budget exhaustion. Three
+                    // conditions must hold: the upsert never
+                    // succeeded (`!upsertOk`); the coroutine was NOT
+                    // cancelled (`!wasCancelled` — the flag is
+                    // captured in the OUTER cancellable scope before
+                    // entering NonCancellable, so it reflects the
+                    // caller's job state, NOT NonCancellable.isCancelled
+                    // which is always `false`); and a seq was
+                    // actually attempted (`pendingSeq != null`).
+                    if (!upsertOk && !wasCancelled && pendingSeq != null) {
+                        log(
+                            "REST_TRACE poll_cursor_write_exhausted " +
+                                "id=${envelopeId.take(8)} seq=$pendingSeq " +
+                                "attempts=$CURSOR_WRITE_MAX_ATTEMPTS",
+                        )
+                    }
+                }
+            }
+        }
+        return ackOutcome
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     private fun onModeChanged(mode: RestMode) {
@@ -569,7 +849,11 @@ class RestFallbackOrchestrator(
     }
 
     private suspend fun pollLoop() {
-        var lastSeenSeq: Long? = null
+        // Trek 2 Stage 2B-B (C3, L4 + OQ-6 LOCK) — legacy in-memory
+        // `lastSeenSeq` decommissioned. Both REST poll loops now read
+        // the single source of truth from `cursorRepository` at the
+        // start of every iteration. `null` means "no persisted
+        // cursor" — wire treats it as `since_seq=0`.
         // PR-D1c.1: same CAS discipline as sendEnvelope — remember the
         // token that just got 401'd, and let acquireOrRefreshToken either
         // refresh it or CAS-reuse what a concurrent caller already
@@ -601,6 +885,11 @@ class RestFallbackOrchestrator(
 
             val intervalMs = pollIntervalMs()
             val pollMode = pollMode()
+            // L4 + OQ-6 LOCK: read the persisted cursor at the start
+            // of every iteration. Both poll loops share this single
+            // source of truth; the legacy in-memory `lastSeenSeq`
+            // variable is gone.
+            val lastSeenSeq = cursorRepository?.getLastSeenSeq(identityHex)
             log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
             val startMs = now()
             val outcome = runCatching {
@@ -681,7 +970,17 @@ class RestFallbackOrchestrator(
                                 "from=${env.fromHex.take(8)} elapsedMs=$elapsed more=${parsed.more}",
                         )
                         lastInboundOrSendAtMs = now()
-                        lastSeenSeq = env.seq
+                        // L3 Step 1 — single insertion point for the
+                        // pending-seq mapping. Populated BEFORE
+                        // emitting so the consumer (`HybridRelayTransport`)
+                        // can rely on `ackInboundAndAdvanceCursor`
+                        // finding the seq when the consumer's
+                        // `sendDeliveryAck` lands. The map is gated
+                        // by `_inboundStateMutex` for concurrent
+                        // access from both poll loops.
+                        _inboundStateMutex.withLock {
+                            _pendingSeqForAck[env.id] = env.seq
+                        }
                         _inbound.emit(env)
                     }
                     // Drain immediately if server says there's more.
@@ -732,13 +1031,12 @@ class RestFallbackOrchestrator(
      *   - On token failure, the same `acquireOrRefreshToken` path as
      *     [pollLoop] is reused.
      *
-     * Lock L4 — read-only cursor: the loop reads
-     * [lastSeenSeqReader] each iteration if non-null and passes the
-     * value as `since_seq` on the wire. It NEVER writes back to the
-     * reader (there is no write method on the interface — the
-     * invariant is enforced structurally). When [lastSeenSeqReader]
-     * is null, the loop polls without a `since_seq` parameter
-     * (server treats null as `since_seq=0`).
+     * Lock L4 — full read/write cursor seam (Stage 2B-B): the loop
+     * reads [cursorRepository] each iteration if non-null and passes
+     * the value as `since_seq` on the wire. Writes happen ONLY
+     * through [ackInboundAndAdvanceCursor] after the relay 2xx's the
+     * ack. When [cursorRepository] is null, the loop polls without a
+     * `since_seq` parameter (server treats null as `since_seq=0`).
      *
      * Lock L5 — MAC unverified: the loop emits received
      * `PollEnvelope`s to [_inbound] as today; the new `seqMac` field
@@ -769,10 +1067,14 @@ class RestFallbackOrchestrator(
             }
             staleToken = null
 
-            // Lock L4: read-only cursor. `null` reader means "no
-            // persisted cursor" — wire treats that as since_seq=0.
-            // The loop NEVER writes back regardless of the response.
-            val sinceSeq = lastSeenSeqReader?.getLastSeenSeq(identityHex)
+            // L4 + OQ-6 LOCK: both REST poll loops share the
+            // persisted cursor via the same `cursorRepository` seam.
+            // `null` repository means "no persisted cursor" — wire
+            // treats that as `since_seq=0`. Writes happen ONLY
+            // through `ackInboundAndAdvanceCursor` after the relay
+            // 2xx's the ack; this loop NEVER writes back from the
+            // poll response directly.
+            val sinceSeq = cursorRepository?.getLastSeenSeq(identityHex)
 
             val intervalMs = pollIntervalMs()
             log(
@@ -838,13 +1140,22 @@ class RestFallbackOrchestrator(
             )
             // Lock L5: emit envelopes to the same downstream as the
             // legacy poll. The new `seqMac` field rides through the
-            // DTO unchanged. No MAC verification call site here.
+            // DTO unchanged. No MAC verification call site here
+            // (lands in C4).
+            //
+            // L3 Step 1 — single insertion point for the pending-seq
+            // mapping, mirrored on this loop. Populated BEFORE
+            // emitting so the consumer can rely on
+            // `ackInboundAndAdvanceCursor` finding the seq.
             for (env in envelopes) {
+                _inboundStateMutex.withLock {
+                    _pendingSeqForAck[env.id] = env.seq
+                }
                 _inbound.tryEmit(env)
             }
-            // Lock L4 reminder: do NOT update lastSeenSeq from the
-            // server response. Stage 2B-B will add cursor advancement
-            // gated on MAC verify + storage accept-or-dedup.
+            // L4: cursor advance happens inside
+            // `ackInboundAndAdvanceCursor` after the relay 2xx's the
+            // ack. NOT here from the poll response directly.
             val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
             val jitteredDelay = (intervalMs * jitterFactor).toLong()
             delay(jitteredDelay)
@@ -955,6 +1266,44 @@ class RestFallbackOrchestrator(
         )
         response.token
     }
+
+    // ── Test seams (Trek 2 Stage 2B-B C3) ─────────────────────────────────────
+
+    /**
+     * Trek 2 Stage 2B-B (C3) — test-only seam that primes
+     * [_pendingSeqForAck] directly. Production callers populate the
+     * map exclusively from the orchestrator's poll-loop emit sites
+     * (`pollLoop` and `wsActivePollLoop` under
+     * [_inboundStateMutex]); this helper mirrors that exact
+     * operation so commonTest can exercise
+     * [ackInboundAndAdvanceCursor] in isolation without driving the
+     * full state-machine + poll-loop pipeline.
+     *
+     * Visibility: `internal` — only the `:shared:core:transport`
+     * module's tests can call it. The wire-up layer in
+     * `apps/android` cannot reach it; production callers have no
+     * legitimate use.
+     */
+    internal suspend fun primePendingSeqForAckForTest(envelopeId: String, seq: Long) {
+        _inboundStateMutex.withLock {
+            _pendingSeqForAck[envelopeId] = seq
+        }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C3) — read-only test-only inspection of the
+     * pending-seq map. Returns the current seq for [envelopeId] or
+     * `null` when absent. Used in tests to assert that
+     * [ackInboundAndAdvanceCursor]'s `finally` cleanup removed the
+     * entry (or, in the cancellation tests, that no leak survived).
+     *
+     * Visibility: `internal` — same module-scope constraint as
+     * [primePendingSeqForAckForTest].
+     */
+    internal suspend fun peekPendingSeqForAckForTest(envelopeId: String): Long? =
+        _inboundStateMutex.withLock {
+            _pendingSeqForAck[envelopeId]
+        }
 
     /**
      * Public CAS facade for media token acquisition (PR-M1w).
@@ -1192,6 +1541,34 @@ class RestFallbackOrchestrator(
          * the actual wire size is computed at the transport layer.
          */
         const val APPROX_SEND_BODY_OVERHEAD_BYTES: Int = 256
+
+        /**
+         * Trek 2 Stage 2B-B (C3, L3) — maximum cursor-write attempts
+         * inside [ackInboundAndAdvanceCursor] after the relay's ack
+         * has returned 2xx. One nominal + two retries. A SQLCipher
+         * failure that survives three attempts is structural (disk
+         * full, schema mismatch, file corruption); further retries
+         * are a busy-loop and degrade overall ingestion.
+         */
+        const val CURSOR_WRITE_MAX_ATTEMPTS: Int = 3
+
+        /**
+         * Trek 2 Stage 2B-B (C3, L3) — backoff durations BETWEEN
+         * cursor-write retry attempts. Indexed by `attemptIdx` for
+         * waits before attempt `attemptIdx + 1`; `delay()` runs only
+         * BETWEEN attempts, NEVER after the final attempt. By
+         * contract, `CURSOR_WRITE_RETRY_BACKOFF_MS.size == CURSOR_WRITE_MAX_ATTEMPTS - 1`
+         * — asserted in the orchestrator `init` block so a future
+         * tuning of one constant without the other surfaces at
+         * construction, including in the test suite.
+         *
+         * Values: tight 100 ms catches transient lock contention; the
+         * second 500 ms waits longer for a transient I/O fault to
+         * clear. A third attempt with no further wait keeps the
+         * overall budget low — total worst-case 600 ms across three
+         * attempts.
+         */
+        val CURSOR_WRITE_RETRY_BACKOFF_MS: LongArray = longArrayOf(100L, 500L)
 
         private fun defaultNowMs(): Long =
             kotlinx.datetime.Clock.System.now().toEpochMilliseconds()

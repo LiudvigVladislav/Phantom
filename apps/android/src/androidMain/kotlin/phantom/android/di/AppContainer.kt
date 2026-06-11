@@ -995,19 +995,29 @@ class AppContainer(private val context: Context) {
                 // production release builds always see `false` here,
                 // independent of `BuildConfig.DEBUG`.
                 longPollEnabled = phantom.android.BuildConfig.LONGPOLL_V2_ENABLED == "1",
-                // Trek 2 Stage 2B-A (B3, L4) — bridge the SQLDelight-backed
-                // `LastSeenSeqRepository` into the orchestrator's read-only
-                // cursor seam. The lambda is a SAM constructor for
-                // `LongPollCursorReader`; the interface has no write method
-                // so this bridge cannot become a write path even by
-                // accident. Stage 2B-B will replace the read-only seam
-                // with a full read/write contract gated on `seq_mac`
-                // verify + storage accept-or-dedup; the bridge
-                // construction site stays here and the lambda body
-                // evolves to call both read + write methods at that
-                // point.
-                lastSeenSeqReader = phantom.core.transport.LongPollCursorReader { identityHex ->
-                    lastSeenSeqRepo.getLastSeenSeq(identityHex)
+                // Trek 2 Stage 2B-B (C3, L4 + OQ-6 LOCK) — bridge
+                // the SQLDelight-backed `LastSeenSeqRepository` into
+                // the orchestrator's full read/write cursor seam.
+                // Both REST poll loops share this single source of
+                // truth for `since_seq`; writes happen ONLY through
+                // `orchestrator.ackInboundAndAdvanceCursor` after the
+                // relay 2xx's the ack. The interface has two methods
+                // (`getLastSeenSeq` + `upsertLastSeenSeq`) so the
+                // bridge is an object literal — the SAM-constructor
+                // form is reserved for the legacy
+                // `LongPollCursorReader` read-only contract that
+                // remains in the codebase for diagnostic callers.
+                cursorRepository = object : phantom.core.transport.LongPollCursorRepository {
+                    override suspend fun getLastSeenSeq(identityHex: String): Long? =
+                        lastSeenSeqRepo.getLastSeenSeq(identityHex)
+
+                    override suspend fun upsertLastSeenSeq(
+                        identityHex: String,
+                        seq: Long,
+                        nowMs: Long,
+                    ) {
+                        lastSeenSeqRepo.upsertLastSeenSeq(identityHex, seq, nowMs)
+                    }
                 },
             )
 
