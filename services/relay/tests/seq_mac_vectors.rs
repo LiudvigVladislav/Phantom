@@ -267,3 +267,40 @@ fn boundary_multi_byte_utf8_envelope_id_is_encoded_by_byte_length() {
         .unwrap();
     assert_ne!(mac_omega, mac_x);
 }
+
+// ── M-B7 oracle pin (Stage 2B-B C1) ──────────────────────────────────────────
+
+/// Trek 2 Stage 2B-B M-B7 — byte-pinned hex oracle for a multi-byte
+/// UTF-8 envelope_id. The Kotlin commonTest equivalent at
+/// `shared/core/transport/src/commonTest/kotlin/phantom/core/transport/SeqMacVerifierTest.kt::mb7_multi_byte_utf8_byte_pinned_oracle_matches_rust`
+/// pins the SAME hex value computed against the SAME inputs. A change
+/// to the canonical encoding on either side breaks both tests
+/// simultaneously, surfacing the drift before any wire packet ships.
+///
+/// Inputs:
+///
+///   root_key      = [0u8; 32]
+///   identity_hex  = "a" × 64
+///   verify_key    = derive_verify_key(root_key, identity)
+///   seq           = 42
+///   envelope_id   = "Ω"   (Greek capital omega, 2 UTF-8 bytes 0xCE 0xA9)
+///   sequence_ts   = 1_700_000_000_000  (already on the 60s quantize boundary)
+#[test]
+fn vector_mb7_multi_byte_utf8_oracle_pin() {
+    let root = zero_root();
+    let identity = all_a_identity();
+    let key = root.derive_verify_key(&identity);
+    let mac = key
+        .compute_seq_mac(&identity, 42, "Ω", 1_700_000_000_000)
+        .unwrap();
+    let hex = seq_mac_to_hex(&mac);
+    // Pinned hex — captured by running this test once with a placeholder
+    // (`assert_eq!(hex, "FAILME")`) and pasting the observed value into
+    // both this file AND the Kotlin commonTest pin. Re-generating
+    // requires editing both files together.
+    assert_eq!(
+        hex,
+        "9173956a76ba212e35989fee7768defd962c5fdff610b12ba5c584adda2af3dd",
+        "M-B7 oracle pin must match the Kotlin commonTest pin verbatim",
+    );
+}
