@@ -785,20 +785,24 @@ class AckInboundAndAdvanceCursorTest {
             )
     }
 
-    // ── M12 — cursor monotonicity (real concurrent dual-loop test) ──────────
+    // ── M12 — cursor monotonicity (sequential-ack unit slice) ───────────────
+    //
+    // The load-bearing M12 test that drives BOTH poll loops
+    // concurrently lives in [RestFallbackOrchestratorPollLoopTest]
+    // (C3 review-fix round 2). The unit-slice test below exercises
+    // a tighter invariant: with a monotonic storage mirror, an
+    // out-of-order sequence of ack calls produces a strictly
+    // increasing sequence of ACCEPTED writes — pinning the
+    // orchestrator's "forward every (id, seq) to upsert" contract
+    // against the storage no-op-on-lower contract. The real
+    // concurrent two-loop test is the canonical scope-doc M12 cell
+    // ship.
 
     /**
-     * Trek 2 Stage 2B-B (C3 review-fix) — M12-required monotonic
-     * storage mirror that ENFORCES the invariant: the underlying
-     * SQLDelight `upsertLastSeenSeq` transaction NO-OPs on
-     * `newSeq <= persistedSeq` (Stage 2A D5 contract). This fake
-     * mirrors that behaviour faithfully so the M12 assertion below
-     * can pin "writer never accepts a value ≤ persisted" as an
-     * end-to-end property rather than relying on the live
-     * SQLCipher transaction.
-     *
-     * Records the full call log AND the accepted-writes log so the
-     * test can prove both:
+     * Monotonic storage mirror that ENFORCES the SQLDelight
+     * `upsertLastSeenSeq` D5 contract: writes with
+     * `newSeq <= persistedSeq` no-op. Records the full call log
+     * AND the accepted-writes log so the test below can prove both:
      *   1. The orchestrator forwards every (id, seq) attempt through
      *      the seam (we do NOT filter in the orchestrator).
      *   2. The storage layer no-ops on non-monotonic attempts, so
@@ -838,7 +842,7 @@ class AckInboundAndAdvanceCursorTest {
     }
 
     @Test
-    fun m12_two_concurrent_poll_loops_interleaved_3_5_4_6_keep_persisted_monotonic() = runTest {
+    fun m12_unit_orchestrator_forwards_all_seqs_storage_no_ops_on_lower() = runTest {
         // Real concurrent test per scope-doc M12 cell. Two
         // independent coroutines simulate `wsActivePollLoop` and
         // the legacy `pollLoop` running in parallel; each receives
@@ -935,14 +939,15 @@ class AckInboundAndAdvanceCursorTest {
     }
 
     @Test
-    fun m12_no_torn_seq_value_under_concurrent_emit_and_consume() = runTest {
-        // Companion test: under high concurrency, the
-        // `_inboundStateMutex` discipline must guarantee that
-        // `_pendingSeqForAck` reads always see whole, well-formed
-        // seq values — never a torn read across an emit/consume
-        // pair. We exercise this by running many concurrent
-        // emit→ack pairs and asserting the orchestrator forwarded
-        // EXACTLY the primed seq for each envelope.
+    fun m12_unit_no_torn_seq_value_under_concurrent_ack_pressure() = runTest {
+        // Unit-slice companion: under high concurrency through the
+        // `_inboundStateMutex`-protected map, the orchestrator
+        // forwards every primed seq exactly once with no torn
+        // reads. NOT a two-loop test — see
+        // [RestFallbackOrchestratorPollLoopTest::m12_two_poll_loops_run_concurrently_proven_by_barrier_envelopes_interleaved]
+        // for the canonical concurrent dual-loop M12 ship. This
+        // slice covers a finer invariant: many concurrent ack
+        // calls do not corrupt or duplicate map entries.
         val transport = FakeTransport(
             sessionScript = { SESSION_RESPONSE_OK },
             ackScript = ackOk200(),
@@ -951,13 +956,11 @@ class AckInboundAndAdvanceCursorTest {
         val orch = buildOrchestrator(transport, cursor)
         bootstrapped(orch)
 
-        // 50 envelopes with monotonic seqs, interleaved across two
-        // simulated loops.
+        // 50 concurrent ack coroutines, interleaved via `yield()`.
         val jobs = mutableListOf<Job>()
         for (i in 1..50) {
             val seq = i.toLong()
             val id = "env-$i"
-            val coro = if (i % 2 == 0) "loopA" else "loopB"
             jobs += launch {
                 orch.primePendingSeqForAckForTest(id, seq)
                 yield() // interleave deliberately

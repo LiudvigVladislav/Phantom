@@ -890,14 +890,27 @@ class RestFallbackOrchestrator(
             // source of truth; the legacy in-memory `lastSeenSeq`
             // variable is gone.
             //
-            // C3 review-fix — wrap the storage read so a transient
-            // SQLCipher / repository exception does NOT terminate the
-            // poll-loop coroutine. CancellationException always
-            // rethrows; other throwables degrade to `null` (server
-            // treats null as `since_seq=0`, a slight over-fetch on
-            // the next legitimate iteration but no envelope loss).
-            // The next iteration retries the read.
-            val lastSeenSeq = readCursorSafely(loopTag = "pollLoop")
+            // C3 review-fix (P2) — discriminate `NoCursor` vs
+            // `ReadFailure`. A transient storage exception must NOT
+            // degrade to `since_seq=null` because that re-fetches
+            // the entire retention window of envelopes on every
+            // iteration. Skip + back off so the next retry can
+            // either recover or repeat the same skip safely.
+            val lastSeenSeq: Long? = when (val outcome = readCursorSafely(loopTag = "pollLoop")) {
+                is CursorReadOutcome.Persisted -> outcome.seq
+                CursorReadOutcome.NoCursor -> null
+                CursorReadOutcome.ReadFailure -> {
+                    val nominalDelay = POLL_FAIL_BACKOFF_MS
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE poll_call_skipped reason=cursor_read_fail " +
+                            "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                    )
+                    delay(jitteredDelay)
+                    continue
+                }
+            }
             log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
             val startMs = now()
             val outcome = runCatching {
@@ -1077,16 +1090,31 @@ class RestFallbackOrchestrator(
 
             // L4 + OQ-6 LOCK: both REST poll loops share the
             // persisted cursor via the same `cursorRepository` seam.
-            // `null` repository means "no persisted cursor" — wire
-            // treats that as `since_seq=0`. Writes happen ONLY
-            // through `ackInboundAndAdvanceCursor` after the relay
-            // 2xx's the ack; this loop NEVER writes back from the
-            // poll response directly.
+            // `null` means "no persisted cursor" — wire treats that
+            // as `since_seq=0`. Writes happen ONLY through
+            // `ackInboundAndAdvanceCursor` after the relay 2xx's
+            // the ack; this loop NEVER writes back from the poll
+            // response directly.
             //
-            // C3 review-fix — wrap the storage read so a transient
-            // repository exception does not terminate the parallel
-            // poll-loop coroutine (CancellationException rethrows).
-            val sinceSeq = readCursorSafely(loopTag = "wsActivePollLoop")
+            // C3 review-fix (P2) — discriminate `NoCursor` vs
+            // `ReadFailure` to avoid blindly polling with
+            // `since_seq=null` under a transient storage error.
+            // Mirrors the legacy `pollLoop` decision tree.
+            val sinceSeq: Long? = when (val outcome = readCursorSafely(loopTag = "wsActivePollLoop")) {
+                is CursorReadOutcome.Persisted -> outcome.seq
+                CursorReadOutcome.NoCursor -> null
+                CursorReadOutcome.ReadFailure -> {
+                    val nominalDelay = POLL_FAIL_BACKOFF_MS
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE ws_active_poll_call_skipped reason=cursor_read_fail " +
+                            "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                    )
+                    delay(jitteredDelay)
+                    continue
+                }
+            }
 
             val intervalMs = pollIntervalMs()
             log(
@@ -1160,30 +1188,28 @@ class RestFallbackOrchestrator(
             // emitting so the consumer can rely on
             // `ackInboundAndAdvanceCursor` finding the seq.
             //
-            // C3 review-fix — `tryEmit` returns `false` when the
-            // SharedFlow buffer is full (slow consumer + parallel
-            // loop running ahead of decrypt/persist). In that case
-            // the consumer NEVER sees the envelope, and a leaked
-            // `_pendingSeqForAck` entry would persist until
-            // orchestrator restart. Roll back the map insertion so
-            // the relay queue + dedup ledger are the only
-            // authoritative state for this envelope; the next poll
-            // re-delivers it and the emit retries.
+            // C3 review-fix (P1.1) — use the SUSPENDING `_inbound.emit(env)`
+            // instead of the non-suspending `tryEmit(env)`. The
+            // previous rollback-on-`tryEmit=false` pattern had a
+            // narrow race: between this loop emitting env-X and
+            // observing the `false` return, the legacy `pollLoop`
+            // could ingest the same env-X (relay re-delivery on
+            // back-pressure), populate `_pendingSeqForAck[env-X]`
+            // afresh, and successfully emit. The wsActivePollLoop's
+            // subsequent `_pendingSeqForAck.remove(env-X)` would
+            // then drop the LEGITIMATE new mapping, the consumer's
+            // ack would succeed, and the cursor would never advance.
+            // Suspending `emit` eliminates the entire `tryEmit==false`
+            // branch and therefore the rollback class of races.
+            // Back-pressure on a slow consumer manifests as the
+            // parallel loop slowing down to consumer cadence —
+            // acceptable, and what the legacy `pollLoop` already
+            // does today.
             for (env in envelopes) {
                 _inboundStateMutex.withLock {
                     _pendingSeqForAck[env.id] = env.seq
                 }
-                val emitted = _inbound.tryEmit(env)
-                if (!emitted) {
-                    _inboundStateMutex.withLock {
-                        _pendingSeqForAck.remove(env.id)
-                    }
-                    log(
-                        "REST_TRACE ws_active_poll_emit_dropped " +
-                            "id=${env.id.take(8)} reason=buffer_full " +
-                            "pending_seq_rolled_back=true",
-                    )
-                }
+                _inbound.emit(env)
             }
             // L4: cursor advance happens inside
             // `ackInboundAndAdvanceCursor` after the relay 2xx's the
@@ -1303,36 +1329,62 @@ class RestFallbackOrchestrator(
      * Trek 2 Stage 2B-B (C3 review-fix) — defensive read of
      * [cursorRepository] used by both poll loops at iteration start.
      *
-     * Returns `null` when the repository is unwired OR when the read
-     * throws a non-cancellation exception (transient SQLCipher I/O,
-     * file lock contention, transaction abort). The poll loop
-     * proceeds with `since_seq = null`, which the server treats as
-     * `since_seq = 0` — a slight over-fetch on this iteration, but
-     * envelope-id dedup at both layers (relay queue + storage layer)
-     * absorbs the duplicate without lost or double-delivered
-     * messages. The next iteration retries the read; recurrent
-     * storage failure surfaces in repeated
-     * `poll_cursor_read_fail` log lines without crashing the loop.
+     * Discriminates THREE outcomes so the caller can choose the
+     * right next action:
+     *
+     *   * [CursorReadOutcome.NoCursor] — the repository is unwired
+     *     OR has never persisted a value for this identity (cold
+     *     start). The poll loop proceeds with `since_seq = null`,
+     *     which the server treats as `since_seq = 0`. This is the
+     *     legitimate "first run" state, not an error condition.
+     *
+     *   * [CursorReadOutcome.Persisted] — the read succeeded with a
+     *     non-null `seq` value. The poll loop forwards `seq` to the
+     *     server.
+     *
+     *   * [CursorReadOutcome.ReadFailure] — the read threw a
+     *     non-cancellation exception (transient SQLCipher I/O, file
+     *     lock contention, transaction abort, schema mismatch). The
+     *     caller MUST skip this poll iteration and back off rather
+     *     than blindly polling with `since_seq = 0`. Polling with
+     *     `since_seq = 0` under a transient storage failure would
+     *     replay the entire retention window of envelopes back to
+     *     the consumer on every iteration until storage recovers —
+     *     a duplicate-traffic storm that the dedup ledger absorbs
+     *     functionally but that wastes bandwidth and CPU. C3
+     *     review-fix (P2) discriminates this case explicitly.
      *
      * `CancellationException` rethrows so structured-concurrency
-     * shutdown still tears the loop down cleanly. The compiler can
-     * inline this helper into both poll-loop sites; the explicit
-     * function exists so the discipline is in one place and any
-     * future hardening lands once.
+     * shutdown still tears the loop down cleanly.
      */
-    private suspend fun readCursorSafely(loopTag: String): Long? {
-        if (cursorRepository == null) return null
+    private suspend fun readCursorSafely(loopTag: String): CursorReadOutcome {
+        if (cursorRepository == null) return CursorReadOutcome.NoCursor
         return try {
-            cursorRepository.getLastSeenSeq(identityHex)
+            val persisted = cursorRepository.getLastSeenSeq(identityHex)
+            if (persisted == null) {
+                CursorReadOutcome.NoCursor
+            } else {
+                CursorReadOutcome.Persisted(persisted)
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
             log(
                 "REST_TRACE poll_cursor_read_fail loop=$loopTag " +
-                    "reason=${t::class.simpleName} continuing_with_null",
+                    "reason=${t::class.simpleName} skipping_poll_iteration",
             )
-            null
+            CursorReadOutcome.ReadFailure
         }
+    }
+
+    /** Outcome of [readCursorSafely]. See helper kdoc for the three-case discriminator. */
+    internal sealed class CursorReadOutcome {
+        /** Repository unwired or no value persisted yet — proceed with `since_seq = null`. */
+        object NoCursor : CursorReadOutcome()
+        /** Successful read with a persisted value. */
+        data class Persisted(val seq: Long) : CursorReadOutcome()
+        /** Storage read threw — caller MUST skip this poll iteration and back off. */
+        object ReadFailure : CursorReadOutcome()
     }
 
     // ── Test seams (Trek 2 Stage 2B-B C3) ─────────────────────────────────────
