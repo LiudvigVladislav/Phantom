@@ -106,9 +106,33 @@ sealed class VerifyKeyState {
     data class KeyPresent(val hex: String) : VerifyKeyState() {
         init {
             require(isValidLowercaseHexVerifyKey(hex)) {
-                "KeyPresent.hex must be 64-char lowercase hex; was \"$hex\""
+                // Do NOT echo the offending value back in the message —
+                // the rejection might still surface in logs and the
+                // verify-key hex is treated as a session secret per
+                // the locked threat model. The classifier's failure
+                // log line (when wired in C4) carries enough diagnostic
+                // context (response length, offending char index) for
+                // operator triage without leaking the key material
+                // itself.
+                "KeyPresent.hex must be 64-char lowercase hex"
             }
         }
+
+        /**
+         * Redact the verify-key payload from string output. The default
+         * `data class` `toString()` would emit the full 64-char hex,
+         * leaking the per-identity session secret into any log line,
+         * assertion message, or exception surface that prints a
+         * `VerifyKeyState`. The verify key is a session-scoped MAC
+         * verifier — an attacker with access to logs that contain it
+         * can verify (and therefore forge in concert with the relay's
+         * canonical-input encoding) any envelope MAC for the bound
+         * identity. The short 8-char prefix keeps logs disambiguatable
+         * across multiple sessions without disclosing the rest of the
+         * key.
+         */
+        override fun toString(): String =
+            "KeyPresent(hex=${hex.take(VERIFY_KEY_HEX_LOG_PREFIX_LENGTH)}...REDACTED)"
     }
 
     /** Drop all envelopes; no emit, no cursor advance. Recovery is the
@@ -136,9 +160,23 @@ sealed class RefreshOutcome {
     data class Valid(val hex: String) : RefreshOutcome() {
         init {
             require(isValidLowercaseHexVerifyKey(hex)) {
-                "Valid.hex must be 64-char lowercase hex; was \"$hex\""
+                // Do NOT echo the offending value back in the message —
+                // see the matching KeyPresent.init comment for the
+                // threat-model rationale.
+                "Valid.hex must be 64-char lowercase hex"
             }
         }
+
+        /**
+         * Redact the verify-key payload from string output. The
+         * default `data class` `toString()` would emit the full
+         * 64-char hex, leaking the per-identity session secret into
+         * any log line, assertion message, or exception surface that
+         * prints a `RefreshOutcome`. See [VerifyKeyState.KeyPresent.toString]
+         * for the threat-model rationale.
+         */
+        override fun toString(): String =
+            "Valid(hex=${hex.take(VERIFY_KEY_HEX_LOG_PREFIX_LENGTH)}...REDACTED)"
     }
 
     /**
@@ -176,6 +214,15 @@ sealed class RefreshOutcome {
  * independently).
  */
 internal const val VERIFY_KEY_HEX_LENGTH: Int = 64
+
+/**
+ * Number of leading hex characters preserved in the redacted
+ * [VerifyKeyState.KeyPresent.toString] / [RefreshOutcome.Valid.toString]
+ * output. Eight characters (32 bits) is enough to disambiguate
+ * different verify keys across logs without disclosing enough material
+ * to reconstruct the full key.
+ */
+internal const val VERIFY_KEY_HEX_LOG_PREFIX_LENGTH: Int = 8
 
 /**
  * Classify a 2xx response's `seq_mac_verify_key` field value into one

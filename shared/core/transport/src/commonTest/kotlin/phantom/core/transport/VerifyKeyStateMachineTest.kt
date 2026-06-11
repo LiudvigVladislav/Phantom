@@ -6,6 +6,8 @@ package phantom.core.transport
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 /**
  * Trek 2 Stage 2B-B (C2) — unit tests for [VerifyKeyState] /
@@ -347,6 +349,87 @@ class VerifyKeyStateMachineTest {
                     "the legacy unverified ingestion bypass per R2-S-B5"
             }
         }
+    }
+
+    // ── Verify-key redaction in toString (P2 review fix) ────────────────────
+
+    @Test
+    fun KeyPresent_toString_does_not_leak_full_hex_payload() {
+        // Default `data class` toString would emit the full 64-char
+        // hex. The override redacts to an 8-char prefix + "REDACTED"
+        // suffix so the verify-key cannot leak via logs, assertion
+        // messages, or any caller that prints the state.
+        val sensitiveHex = "deadbeef".repeat(8) // 64-char fixture
+        val rendered = VerifyKeyState.KeyPresent(sensitiveHex).toString()
+        assertFalse(
+            sensitiveHex in rendered,
+            "verify-key full hex leaked through toString: \"$rendered\"",
+        )
+        // 8-char prefix retained for diagnostic disambiguation.
+        assertTrue(
+            "deadbeef" in rendered,
+            "expected 8-char hex prefix in redacted toString: \"$rendered\"",
+        )
+        // Explicit redaction signal so a reviewer scanning logs sees
+        // the value was deliberately omitted.
+        assertTrue(
+            "REDACTED" in rendered,
+            "expected REDACTED marker in toString: \"$rendered\"",
+        )
+    }
+
+    @Test
+    fun KeyPresent_toString_with_different_hex_renders_with_different_prefix() {
+        // Make sure the redaction isn't so aggressive that two
+        // distinct keys collapse to the same string. The 8-char
+        // prefix is 32 bits — operationally unique across a session.
+        val a = VerifyKeyState.KeyPresent("deadbeef".repeat(8)).toString()
+        val b = VerifyKeyState.KeyPresent("cafebabe".repeat(8)).toString()
+        assertTrue(a != b, "redacted toString must preserve diagnostic prefix")
+        assertTrue("deadbeef" in a)
+        assertTrue("cafebabe" in b)
+    }
+
+    @Test
+    fun Valid_outcome_toString_does_not_leak_full_hex_payload() {
+        // Same redaction contract on the RefreshOutcome side. The
+        // outcome carries the same verify-key payload as
+        // VerifyKeyState.KeyPresent so any code path that prints
+        // a RefreshOutcome (logs, assertion messages, exception
+        // surfaces) must not leak the secret.
+        val sensitiveHex = "deadbeef".repeat(8)
+        val rendered = RefreshOutcome.Valid(sensitiveHex).toString()
+        assertFalse(
+            sensitiveHex in rendered,
+            "verify-key full hex leaked through Valid.toString: \"$rendered\"",
+        )
+        assertTrue("deadbeef" in rendered)
+        assertTrue("REDACTED" in rendered)
+    }
+
+    @Test
+    fun construction_failure_message_does_not_echo_offending_hex() {
+        // A failed `require` on KeyPresent or Valid would surface the
+        // offending hex if the message used `$hex` interpolation. The
+        // value is rejected as malformed but is still attacker- or
+        // bug-controllable; echoing it through logs that catch the
+        // IllegalArgumentException is an unnecessary disclosure
+        // channel. Both init blocks must avoid the echo.
+        val malformedSecretishHex = "deadbeef".repeat(7) // 56 chars, malformed length
+        val keyPresentErr = runCatching { VerifyKeyState.KeyPresent(malformedSecretishHex) }
+            .exceptionOrNull()?.message
+            ?: error("KeyPresent did not throw on malformed hex")
+        assertFalse(
+            malformedSecretishHex in keyPresentErr,
+            "KeyPresent.init message leaked the offending hex: \"$keyPresentErr\"",
+        )
+        val validErr = runCatching { RefreshOutcome.Valid(malformedSecretishHex) }
+            .exceptionOrNull()?.message
+            ?: error("Valid did not throw on malformed hex")
+        assertFalse(
+            malformedSecretishHex in validErr,
+            "Valid.init message leaked the offending hex: \"$validErr\"",
+        )
     }
 
     @Test
