@@ -424,9 +424,494 @@ class RestFallbackOrchestratorBreakerTest {
         runCurrent()
     }
 
+    // ── M13 — breaker state transitions ─────────────────────────────────────
+
+    @Test
+    fun m13a_closed_to_open_on_N_consecutive_failures() = runTest(timeout = 5.minutes) {
+        // Drive `BREAKER_CONSECUTIVE_FAIL_THRESHOLD` consecutive
+        // network-class failures through the production pollLoop
+        // and assert the breaker transitions from Closed to
+        // Open(ConsecutiveRestFailures, BREAKER_INITIAL_COOLDOWN_MS).
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 500,
+                    bodyParsed = null,
+                    rawBody = "internal-server-error",
+                    elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // The 5xx branch sleeps `intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)`
+            // = 5_000 ms jittered between iterations. Capture the FIRST
+            // Open transition (cooldown == BREAKER_INITIAL_COOLDOWN_MS)
+            // before the cooldown timer fires and triggers a probe cycle
+            // that doubles the cooldown. Sample at fine 500 ms
+            // granularity so a long advance does not envelop both the
+            // first Open AND the cooldown timer + failed probe within
+            // one dispatch.
+            var firstOpen: LongPollBreakerState.Open? = null
+            repeat(200) {
+                if (firstOpen != null) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                val s = orch.peekBreakerStateForTest()
+                if (s is LongPollBreakerState.Open && firstOpen == null) {
+                    firstOpen = s
+                }
+            }
+            val state = firstOpen
+            assertTrue(
+                state != null,
+                "after ≥ N consecutive 5xx failures the breaker must enter Open at least once. " +
+                    "pollCalls=${transport.pollCalls.size}.",
+            )
+            assertEquals(
+                BreakerOpenReason.ConsecutiveRestFailures,
+                state.reason,
+                "Open reason must be ConsecutiveRestFailures for 5xx burst",
+            )
+            assertEquals(
+                RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                state.cooldownMs,
+                "first opening uses BREAKER_INITIAL_COOLDOWN_MS verbatim",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun m13b_open_to_halfopen_after_cooldown_window() = runTest(timeout = 5.minutes) {
+        // Trip the breaker via a 5xx burst, then advance virtual
+        // time by the cooldown so the timer Job's delay fires.
+        // Capture the FIRST HalfOpen observation because subsequent
+        // cycles oscillate.
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 500, bodyParsed = null,
+                    rawBody = "", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump enough virtual time to trip Open AND observe the
+            // subsequent timer-driven Open → HalfOpen transition.
+            // Each 5xx iteration: ~5_000 ms jittered ⇒ 5 iterations to
+            // trip ≈ 25_000-30_000 ms; then +cooldown (5_000 ms) ⇒
+            // ≈ 35_000 ms total to first HalfOpen. Sample at fine
+            // 500 ms granularity for up to 300 checkpoints (150_000 ms
+            // virtual time) so a long advance does not envelop both
+            // the timer fire AND the subsequent failed probe within
+            // one dispatch (which would skip the HalfOpen observable
+            // window entirely).
+            var firstHalfOpen: LongPollBreakerState.HalfOpen? = null
+            repeat(300) {
+                if (firstHalfOpen != null) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                val s = orch.peekBreakerStateForTest()
+                if (s is LongPollBreakerState.HalfOpen && firstHalfOpen == null) {
+                    firstHalfOpen = s
+                }
+            }
+            val state = firstHalfOpen
+            assertTrue(
+                state != null,
+                "after cooldown elapses the timer must transition Open → HalfOpen. " +
+                    "pollCalls=${transport.pollCalls.size}.",
+            )
+            assertEquals(
+                false,
+                state.probeInFlight,
+                "the HalfOpen permit must start at probeInFlight=false so the next iteration on " +
+                    "either loop can claim it",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun m13c_halfopen_plus_success_probe_returns_to_closed_and_resets_cooldown() = runTest(timeout = 5.minutes) {
+        // Seed HalfOpen(probeInFlight=false). Run a production poll
+        // iteration that returns 200 OK. Assert state transitions to
+        // Closed AND cooldown resets to BREAKER_INITIAL_COOLDOWN_MS.
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                    rawBody = "{}", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // start() resets `_breakerState` to Closed and clears the
+            // counters. Seed HalfOpen AFTER start so the first
+            // post-seed iteration of the pollLoop observes HalfOpen
+            // and claims the probe permit.
+            orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = false))
+            // 200 OK delays `intervalMs` (POLL_ACTIVE_MS = 2_000 ms),
+            // so advance by 2_100 ms for each iteration. The first
+            // iteration claims the probe permit, polls, gets 200,
+            // and resolves to Closed.
+            val perIteration = RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L
+            var observed: LongPollBreakerState? = null
+            repeat(10) {
+                if (observed == LongPollBreakerState.Closed) return@repeat
+                advanceTimeBy(perIteration)
+                runCurrent()
+                observed = orch.peekBreakerStateForTest()
+            }
+            assertEquals(
+                LongPollBreakerState.Closed,
+                observed,
+                "successful probe must transition HalfOpen → Closed. " +
+                    "pollCalls=${transport.pollCalls.size}.",
+            )
+            assertEquals(
+                RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                orch.peekBreakerCooldownMsForTest(),
+                "cooldown must reset to BREAKER_INITIAL_COOLDOWN_MS on success",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun m13d_halfopen_plus_failure_probe_reopens_with_doubled_cooldown() = runTest(timeout = 5.minutes) {
+        // Seed HalfOpen(probeInFlight=false). Force the probe to
+        // fail (5xx). Assert state re-opens with cooldown doubled
+        // per BREAKER_COOLDOWN_GROWTH_FACTOR (capped at
+        // BREAKER_COOLDOWN_CEILING_MS).
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 500, bodyParsed = null,
+                    rawBody = "internal-server-error", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Same rationale as m13c: seed HalfOpen AFTER start so
+            // the first post-seed iteration sees the HalfOpen state
+            // (start resets it to Closed). _breakerCurrentCooldownMs
+            // is also reset to BREAKER_INITIAL_COOLDOWN_MS by start,
+            // so the failed probe doubles 5_000 → 10_000.
+            orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = false))
+            // 5xx iterations delay POLL_FAIL_BACKOFF_MS (5_000 ms)
+            // jittered. The FIRST iteration after the seed claims the
+            // probe, polls, gets 500, runs recordRestFailure which
+            // doubles the cooldown 5_000 → 10_000. Sample at fine
+            // 500 ms granularity to capture this transition before
+            // the next cooldown timer fires (which would double again
+            // 10_000 → 20_000 on the next failed probe).
+            var firstOpen: LongPollBreakerState.Open? = null
+            repeat(200) {
+                if (firstOpen != null) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                val s = orch.peekBreakerStateForTest()
+                if (s is LongPollBreakerState.Open && firstOpen == null) {
+                    firstOpen = s
+                }
+            }
+            val state = firstOpen
+            assertTrue(
+                state != null,
+                "failed probe must transition HalfOpen → Open at least once. " +
+                    "pollCalls=${transport.pollCalls.size}.",
+            )
+            assertEquals(
+                BreakerOpenReason.ConsecutiveRestFailures,
+                state.reason,
+                "reopen reason after failed probe is ConsecutiveRestFailures",
+            )
+            val expectedDoubled = (RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS.toDouble()
+                * RestFallbackOrchestrator.BREAKER_COOLDOWN_GROWTH_FACTOR)
+                .toLong()
+                .coerceAtMost(RestFallbackOrchestrator.BREAKER_COOLDOWN_CEILING_MS)
+            assertEquals(
+                expectedDoubled,
+                state.cooldownMs,
+                "failed probe doubles the cooldown via BREAKER_COOLDOWN_GROWTH_FACTOR " +
+                    "(capped at BREAKER_COOLDOWN_CEILING_MS). " +
+                    "Got ${state.cooldownMs}, expected $expectedDoubled.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    // ── M-B28 — half-open probe singleton with cancellation safety ──────────
+
+    @Test
+    fun mb28a_atomic_probe_permit_claim_is_exclusive_across_concurrent_callers() = runTest {
+        // The atomic claim is the load-bearing property: two REST
+        // poll loops waking on the same tick MUST NOT each issue a
+        // probe. The CAS lives inside `gateBreakerForIteration`
+        // under `_inboundStateMutex`. Drive both calls through the
+        // production seam back-to-back; the second call sees
+        // probeInFlight=true and skips.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ ->
+            RestFallbackResponse(statusCode = 200, bodyParsed = null, rawBody = "", elapsedMs = 1L)
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = false))
+
+        val firstDecision = orch.gateBreakerForIterationForTest()
+        assertEquals(
+            "probe",
+            firstDecision,
+            "first caller on HalfOpen(probeInFlight=false) must claim the probe permit",
+        )
+        val afterFirstClaim = orch.peekBreakerStateForTest()
+        assertEquals(
+            LongPollBreakerState.HalfOpen(probeInFlight = true),
+            afterFirstClaim,
+            "after the first claim the state must flip to HalfOpen(probeInFlight=true)",
+        )
+
+        val secondDecision = orch.gateBreakerForIterationForTest()
+        assertEquals(
+            "skip:breaker_half_open_probe_in_flight",
+            secondDecision,
+            "second caller on HalfOpen(probeInFlight=true) must skip with the probe-in-flight reason",
+        )
+        val afterSecondCall = orch.peekBreakerStateForTest()
+        assertEquals(
+            LongPollBreakerState.HalfOpen(probeInFlight = true),
+            afterSecondCall,
+            "the second caller MUST NOT flip the permit — only the first caller's probe owns it",
+        )
+    }
+
+    @Test
+    fun mb28b_cancellation_safe_release_resets_permit_when_state_is_still_inflight() = runTest {
+        // Simulate the cancellation path: the claimant loop was
+        // mid-probe (state = HalfOpen(probeInFlight=true)) and gets
+        // cancelled. The finally block invokes
+        // `releaseProbePermitIfStillHeld` under
+        // `withContext(NonCancellable)`. The state must reset to
+        // HalfOpen(probeInFlight=false).
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ -> error("not used") })
+        val orch = buildOrchestrator(transport, testScheduler)
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
+        check(orch.peekBreakerStateForTest() == LongPollBreakerState.HalfOpen(probeInFlight = true))
+
+        orch.releaseProbePermitIfStillHeldForTest()
+        assertEquals(
+            LongPollBreakerState.HalfOpen(probeInFlight = false),
+            orch.peekBreakerStateForTest(),
+            "release MUST flip HalfOpen(probeInFlight=true) → HalfOpen(probeInFlight=false)",
+        )
+    }
+
+    @Test
+    fun mb28b_release_is_noop_when_state_has_already_resolved() = runTest {
+        // The release MUST be idempotent / no-op when the probe
+        // already resolved into Closed (via recordRestSuccess) or
+        // Open (via recordRestFailure). The finally fires AFTER
+        // the resolution; the state is no longer HalfOpen.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ -> error("not used") })
+        val orch = buildOrchestrator(transport, testScheduler)
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+
+        orch.setBreakerStateForTest(LongPollBreakerState.Closed)
+        orch.releaseProbePermitIfStillHeldForTest()
+        assertEquals(
+            LongPollBreakerState.Closed,
+            orch.peekBreakerStateForTest(),
+            "release MUST NOT touch Closed state (probe already resolved to success)",
+        )
+
+        orch.setBreakerStateForTest(LongPollBreakerState.Open(BreakerOpenReason.ConsecutiveRestFailures, 5_000L))
+        orch.releaseProbePermitIfStillHeldForTest()
+        val openAfterRelease = orch.peekBreakerStateForTest()
+        assertTrue(
+            openAfterRelease is LongPollBreakerState.Open,
+            "release MUST NOT touch Open state (probe already resolved to failure)",
+        )
+    }
+
+    @Test
+    fun mb28c_recovery_after_claimant_cancellation_next_caller_reclaims_permit() = runTest {
+        // The cancellation path MUST NOT strand the breaker
+        // permanently. After the release flips state back to
+        // HalfOpen(probeInFlight=false), the next call to
+        // `gateBreakerForIteration` on either loop claims the
+        // permit and proceeds with a fresh probe.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ -> error("not used") })
+        val orch = buildOrchestrator(transport, testScheduler)
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        // Seed mid-cancellation state.
+        orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
+        orch.releaseProbePermitIfStillHeldForTest()
+        check(orch.peekBreakerStateForTest() == LongPollBreakerState.HalfOpen(probeInFlight = false))
+
+        // Next caller claims fresh.
+        val decision = orch.gateBreakerForIterationForTest()
+        assertEquals(
+            "probe",
+            decision,
+            "after cancellation+release, the next caller MUST be able to re-claim the probe permit",
+        )
+        assertEquals(
+            LongPollBreakerState.HalfOpen(probeInFlight = true),
+            orch.peekBreakerStateForTest(),
+            "the re-claim flips state back to HalfOpen(probeInFlight=true)",
+        )
+    }
+
     // ── Fixtures ────────────────────────────────────────────────────────────
 
     private val IDENTITY: String = "aa".repeat(32)
+
+    private suspend fun init() {
+        if (!com.ionspin.kotlin.crypto.LibsodiumInitializer.isInitialized()) {
+            com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
+        }
+    }
+
+    /**
+     * Scriptable transport for breaker behaviour tests. Each poll
+     * call increments the script index; the script can return any
+     * response shape. Bootstrap always succeeds with
+     * `restFallback=true`.
+     */
+    private class BreakerTestTransport(
+        var pollScript: (callIndex: Int) -> RestFallbackResponse<PollResponse>,
+    ) : RestFallbackTransport {
+        val pollCalls: MutableList<Long?> = mutableListOf()
+        val authCalls: MutableList<Unit> = mutableListOf()
+        override suspend fun authSession(
+            url: String,
+            body: AuthSessionRequest,
+        ): RestFallbackResponse<AuthSessionResponse> {
+            authCalls += Unit
+            return RestFallbackResponse(
+                statusCode = 200,
+                bodyParsed = AuthSessionResponse(
+                    token = "tok-${authCalls.size}",
+                    expiresAt = Long.MAX_VALUE,
+                    restFallback = true,
+                    maxSendBodyBytes = 4096,
+                    pollMaxEnvelopes = 1,
+                    pollHoldSecs = 30,
+                    seqMacVerifyKey = "",
+                ),
+                rawBody = "{}",
+                elapsedMs = 1L,
+            )
+        }
+        override suspend fun send(
+            url: String, token: String, idempotencyKey: String, body: SendRequest,
+        ): RestFallbackResponse<SendResponse> = fail("send not used in breaker tests")
+        override suspend fun poll(
+            url: String, token: String, sinceSeq: Long?,
+            longPollOptIn: Boolean, readTimeoutMs: Long?,
+        ): RestFallbackResponse<PollResponse> {
+            pollCalls += sinceSeq
+            return pollScript(pollCalls.size - 1)
+        }
+        override suspend fun ackDeliver(
+            url: String, token: String, body: AckDeliverRequest,
+        ): RestFallbackResponse<AckDeliverResponse> = RestFallbackResponse(
+            statusCode = 200,
+            bodyParsed = AckDeliverResponse(ok = 1),
+            rawBody = "{}",
+            elapsedMs = 1L,
+        )
+    }
+
+    private fun buildOrchestrator(
+        transport: BreakerTestTransport,
+        scheduler: TestCoroutineScheduler,
+        longPollEnabled: Boolean = false,
+        logSink: (String) -> Unit = {},
+    ): RestFallbackOrchestrator = RestFallbackOrchestrator(
+        baseUrl = "https://relay.test",
+        identityHex = IDENTITY,
+        signingPubkeyHex = "bb".repeat(32),
+        getChallenge = { _ -> "cc".repeat(32) },
+        signChallenge = { _ -> ByteArray(64) { 0xDD.toByte() } },
+        transport = transport,
+        now = { 0L },
+        log = logSink,
+        longPollEnabled = longPollEnabled,
+        cursorRepository = NoopCursor(),
+        dispatcher = StandardTestDispatcher(scheduler),
+    )
 
     private class RetryAfterTransport(
         var pollScript: (callIndex: Int) -> RestFallbackResponse<PollResponse>,

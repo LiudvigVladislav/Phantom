@@ -95,7 +95,23 @@ class RestStateMachine(
             is Event.WsAliveTickElapsed -> onAliveTick()
             is Event.ActiveOutboundAckTimeout -> onActiveOutboundAckTimeout(event)
             is Event.InboundIdleTimeout -> onInboundIdleTimeout(event)
+            is Event.RestPollDegraded -> onRestPollDegraded(event)
         }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — read-only telemetry signal that
+     * the REST poll breaker entered [LongPollBreakerState.Open].
+     * The state machine does NOT transition `RestMode` on this event
+     * (scope §L9: "RestStateMachine does NOT transition RestMode
+     * purely because of breaker state"). The handler logs for
+     * diagnostic separation and forwards through the existing
+     * [onModeSwitched] surface so the AppContainer wire-up can mirror
+     * the reason into the
+     * [phantom.core.transport.WsDegradationDetector] stream.
+     */
+    private fun onRestPollDegraded(event: Event.RestPollDegraded) {
+        log("REST_TRACE rest_poll_degraded reason=${event.reason}")
     }
 
     private fun onWsSessionEnded(event: Event.WsSessionEnded) {
@@ -354,6 +370,25 @@ class RestStateMachine(
          * the state machine. Handler: see [onInboundIdleTimeout].
          */
         data class InboundIdleTimeout(val sinceLastInboundMs: Long) : Event()
+
+        /**
+         * Trek 2 Stage 2B-B (C5, L9) — REST poll path entered
+         * [LongPollBreakerState.Open]. Read-only telemetry signal:
+         * the state machine does NOT change [RestMode] in response.
+         * Existing [RestMode.{WsActive, WsCandidate, RestActive}]
+         * semantics remain governed by their existing inputs.
+         *
+         * Surfaced so the AppContainer wire-up and the existing
+         * [phantom.core.transport.WsDegradationDetector] telemetry
+         * can discriminate sustained network failure
+         * ([BreakerOpenReason.ConsecutiveRestFailures]) from a
+         * `410 Gone` rotation loop
+         * ([BreakerOpenReason.Status410Storm]) without parsing log
+         * lines.
+         *
+         * @param reason Discriminator for the open trigger.
+         */
+        data class RestPollDegraded(val reason: BreakerOpenReason) : Event()
     }
 
     companion object {

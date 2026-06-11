@@ -322,15 +322,64 @@ class RestFallbackOrchestrator(
     private val _macRefreshStatus: MutableMap<String, MacRefreshStatus> = mutableMapOf()
 
     /**
-     * Trek 2 Stage 2B-B (C4, L9) — current breaker state. Both REST
-     * poll loops snapshot this under [_inboundStateMutex] and gate
-     * ingestion accordingly. C4 only uses [LongPollBreakerState.Closed]
-     * and [LongPollBreakerState.SuspendedOnPoison]; C5 will add the
-     * full circuit-breaker `Open` + `HalfOpen` states.
+     * Trek 2 Stage 2B-B (C4, L9; extended in C5) — current breaker
+     * state. Both REST poll loops snapshot this under
+     * [_inboundStateMutex] and gate ingestion accordingly. C4 used
+     * only [LongPollBreakerState.Closed] and
+     * [LongPollBreakerState.SuspendedOnPoison]; C5 adds the full
+     * circuit-breaker [LongPollBreakerState.Open] +
+     * [LongPollBreakerState.HalfOpen] states.
      *
-     * Initial state is [LongPollBreakerState.Closed].
+     * Initial state is [LongPollBreakerState.Closed]. Reset on
+     * every [start] (scope §L9: "the breaker state itself is reset
+     * to Closed on the next start() because Stage 2B-B does NOT
+     * persist breaker state across orchestrator lifecycles").
      */
     private var _breakerState: LongPollBreakerState = LongPollBreakerState.Closed
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — running count of consecutive
+     * network-class REST poll failures observed since the last
+     * success. Accessed only under [_inboundStateMutex]. Reset on
+     * orchestrator restart AND on each successful poll observation
+     * (any HTTP response 200-499 / 5xx / IOException paths covered
+     * via [recordRestSuccess] / [recordRestFailure]).
+     *
+     * When the count reaches [BREAKER_CONSECUTIVE_FAIL_THRESHOLD]
+     * the breaker transitions to
+     * `Open(ConsecutiveRestFailures, _breakerCurrentCooldownMs)`
+     * and the counter is reset to 0.
+     */
+    private var _breakerFailCount: Int = 0
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — current cooldown for a new
+     * [LongPollBreakerState.Open] opening (excluding the
+     * [BreakerOpenReason.Status410Storm] reason, which pins to
+     * [BREAKER_410_STORM_COOLDOWN_MS]). Starts at
+     * [BREAKER_INITIAL_COOLDOWN_MS]; doubles per scope-locked
+     * [BREAKER_COOLDOWN_GROWTH_FACTOR] on a failed [HalfOpen] probe;
+     * capped at [BREAKER_COOLDOWN_CEILING_MS]; resets to the initial
+     * value when the breaker returns to [LongPollBreakerState.Closed]
+     * (either via a successful probe or via an
+     * [recordRestSuccess] call from a normal Closed-state poll).
+     */
+    private var _breakerCurrentCooldownMs: Long = BREAKER_INITIAL_COOLDOWN_MS
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — breaker cooldown timer.
+     * Launched into [scope] when the breaker enters
+     * [LongPollBreakerState.Open]; sleeps for the open `cooldownMs`;
+     * under [_inboundStateMutex] transitions
+     * [LongPollBreakerState.Open] →
+     * `HalfOpen(probeInFlight = false)` so the next REST poll
+     * iteration on either loop can claim the probe permit.
+     *
+     * Cancelled and joined as part of [cancelAndJoinAll]. Same
+     * lifecycle discipline as [aliveTickJob] from Stage 2A. The
+     * job self-terminates after a single tick — no `while` loop.
+     */
+    private var _breakerTimerJob: Job? = null
 
     private var sessionToken: String? = null
     private var tokenExpiresAt: Long = 0L
@@ -507,6 +556,12 @@ class RestFallbackOrchestrator(
                     _breakerState = LongPollBreakerState.Closed
                     _macFailCount.clear()
                     _macRefreshStatus.clear()
+                    // Trek 2 Stage 2B-B (C5, L9) — scope §L9: "Stage
+                    // 2B-B does NOT persist breaker state across
+                    // orchestrator lifecycles." Reset the C5 counters
+                    // alongside the C4 poison state.
+                    _breakerFailCount = 0
+                    _breakerCurrentCooldownMs = BREAKER_INITIAL_COOLDOWN_MS
                 }
                 log("REST_TRACE poison_state_reset_on_start")
                 stateObserverJob = scope.launch {
@@ -601,11 +656,15 @@ class RestFallbackOrchestrator(
             }
         }
         // Phase 2 — observer is dead; whatever it spawned is now
-        // captured by re-reading the fields.
-        val tail = listOfNotNull(pollJob, aliveTickJob, wsActivePollJob)
+        // captured by re-reading the fields. The C5 breaker timer
+        // is NOT spawned by the observer (it is spawned from the
+        // poll loops on transition-to-Open), so it is captured here
+        // alongside the loops.
+        val tail = listOfNotNull(pollJob, aliveTickJob, wsActivePollJob, _breakerTimerJob)
         pollJob = null
         aliveTickJob = null
         wsActivePollJob = null
+        _breakerTimerJob = null
         for (job in tail) {
             job.cancel()
         }
@@ -1192,28 +1251,28 @@ class RestFallbackOrchestrator(
 
             val intervalMs = pollIntervalMs()
             val pollMode = pollMode()
-            // Trek 2 Stage 2B-B (C4 review-fix P1.2) — breaker gate
-            // BEFORE `transport.poll(...)`. Without this gate, a
-            // `SuspendedOnPoison` breaker only stopped envelope
-            // INGESTION (verify gate inside `processInboundEnvelopeWithVerify`)
-            // — both loops kept polling the relay forever and
-            // dropping the same poison envelope. Scope L7 step 4
-            // intent is "Suspend BOTH REST poll loops"; that
-            // requires stopping the polling itself, not just the
-            // post-response gate. Skip + jittered backoff so a
-            // manual recovery path can flip the breaker back to
-            // Closed and resume polling on the next iteration.
-            if (_inboundStateMutex.withLock { _breakerState } is LongPollBreakerState.SuspendedOnPoison) {
+            // Trek 2 Stage 2B-B (C4 review-fix P1.2, extended in C5,
+            // L9) — breaker gate BEFORE `transport.poll(...)`. The
+            // C4 gate covered only [LongPollBreakerState.SuspendedOnPoison];
+            // C5 adds [LongPollBreakerState.Open] +
+            // [LongPollBreakerState.HalfOpen] via
+            // [gateBreakerForIteration], which also atomically claims
+            // the HalfOpen probe permit under [_inboundStateMutex]
+            // when applicable. M-B28 sub-cell (a) pins the
+            // permit's exclusivity across the two loops.
+            val breakerDecision = gateBreakerForIteration()
+            if (breakerDecision is BreakerIterationDecision.Skip) {
                 val nominalDelay = POLL_FAIL_BACKOFF_MS
                 val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                 val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                 log(
-                    "REST_TRACE poll_call_skipped reason=breaker_suspended_on_poison " +
+                    "REST_TRACE poll_call_skipped reason=${breakerDecision.reason} " +
                         "loop=pollLoop next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
                 )
                 delay(jitteredDelay)
                 continue
             }
+            val isProbe = breakerDecision is BreakerIterationDecision.Probe
             // L4 + OQ-6 LOCK: read the persisted cursor at the start
             // of every iteration. Both poll loops share this single
             // source of truth; the legacy in-memory `lastSeenSeq`
@@ -1240,148 +1299,204 @@ class RestFallbackOrchestrator(
                     continue
                 }
             }
-            log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
-            val startMs = now()
-            val outcome = runCatching {
-                // Trek 2 Stage 2B-A (B1) — gate the long-poll opt-in pair
-                // (`X-Phantom-Long-Poll: 1` + `X-Phantom-Padded-Poll: 1`)
-                // on the single `longPollEnabled` Boolean computed by the
-                // wire-up layer from `LONGPOLL_V2_ENABLED`. Headers ride
-                // ONE flag in this stage; lock L1 forbids LP-alone and
-                // PP-alone client postures.
-                //
-                // Trek 2 Stage 2B-A (B2) — gate the raised OkHttp
-                // read / call timeout on `LONGPOLL_V2_ENABLED == "1"`
-                // AND `pollHoldSecs in 1..480` (lock L2). The L1 flag
-                // alone is not sufficient: an opt-in client whose
-                // server has the kill switch on (`pollHoldSecs == 0`)
-                // or which advertises a value out of the locked range
-                // gets the short-poll timeout — the headers go out,
-                // but the budget does not change. The two-condition
-                // gate is computed once per call in the companion
-                // helper so M2's 9-cell matrix can pin it without
-                // standing up an orchestrator.
-                transport.poll(
-                    url = "$baseUrl/relay/poll",
-                    token = token,
-                    sinceSeq = lastSeenSeq,
-                    longPollOptIn = longPollEnabled,
-                    readTimeoutMs = computeLongPollReadTimeoutMs(
-                        longPollEnabled = longPollEnabled,
-                        pollHoldSecs = _capabilities.value.pollHoldSecs,
-                    ),
-                )
-            }
-            val elapsed = now() - startMs
+            // Trek 2 Stage 2B-B (C5, L9, M-B28 sub-cell (b)) —
+            // wrap the transport.poll call + response handling in
+            // a try / finally so a mid-flight cancellation on a
+            // HalfOpen probe releases the probe permit under
+            // `withContext(NonCancellable)`. Non-probe iterations
+            // pay no cost beyond the empty finally branch.
+            try {
+                log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
+                val startMs = now()
+                val outcome = runCatching {
+                    // Trek 2 Stage 2B-A (B1) — gate the long-poll opt-in pair
+                    // (`X-Phantom-Long-Poll: 1` + `X-Phantom-Padded-Poll: 1`)
+                    // on the single `longPollEnabled` Boolean computed by the
+                    // wire-up layer from `LONGPOLL_V2_ENABLED`. Headers ride
+                    // ONE flag in this stage; lock L1 forbids LP-alone and
+                    // PP-alone client postures.
+                    //
+                    // Trek 2 Stage 2B-A (B2) — gate the raised OkHttp
+                    // read / call timeout on `LONGPOLL_V2_ENABLED == "1"`
+                    // AND `pollHoldSecs in 1..480` (lock L2). The L1 flag
+                    // alone is not sufficient: an opt-in client whose
+                    // server has the kill switch on (`pollHoldSecs == 0`)
+                    // or which advertises a value out of the locked range
+                    // gets the short-poll timeout — the headers go out,
+                    // but the budget does not change. The two-condition
+                    // gate is computed once per call in the companion
+                    // helper so M2's 9-cell matrix can pin it without
+                    // standing up an orchestrator.
+                    transport.poll(
+                        url = "$baseUrl/relay/poll",
+                        token = token,
+                        sinceSeq = lastSeenSeq,
+                        longPollOptIn = longPollEnabled,
+                        readTimeoutMs = computeLongPollReadTimeoutMs(
+                            longPollEnabled = longPollEnabled,
+                            pollHoldSecs = _capabilities.value.pollHoldSecs,
+                        ),
+                    )
+                }
+                val elapsed = now() - startMs
 
-            if (outcome.isFailure) {
-                val ex = outcome.exceptionOrNull()!!
-                // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
-                // backoff. `next_delay_ms` is the actual wait;
-                // `nominal_delay_ms` is the un-jittered source.
-                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
-                log(
-                    "REST_TRACE poll_fail reason=${ex::class.simpleName} elapsedMs=$elapsed " +
-                        "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
-                )
-                delay(jitteredDelay)
-                continue
-            }
-
-            val response = outcome.getOrThrow()
-            when (response.statusCode) {
-                401 -> {
-                    staleToken = token
+                if (outcome.isFailure) {
+                    val ex = outcome.exceptionOrNull()!!
+                    // Trek 2 Stage 2B-B (C5, L9) — record network-class
+                    // failure for the breaker. May trip Closed → Open
+                    // (5th consecutive) OR HalfOpen → Open (failed probe).
+                    recordRestFailure()
                     // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
-                    // backoff. Token-stale on a burst can herd if multiple
-                    // poll iterations all 401 at the same moment.
-                    val nominalDelay = POLL_FAIL_BACKOFF_MS
+                    // backoff. `next_delay_ms` is the actual wait;
+                    // `nominal_delay_ms` is the un-jittered source.
+                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                     val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                     log(
-                        "REST_TRACE poll_401_token_stale elapsedMs=$elapsed " +
+                        "REST_TRACE poll_fail reason=${ex::class.simpleName} elapsedMs=$elapsed " +
                             "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
                     )
                     delay(jitteredDelay)
                     continue
                 }
-                in 200..299 -> {
-                    val parsed = response.bodyParsed
-                    if (parsed == null || parsed.envelopes.isEmpty()) {
-                        log("REST_TRACE poll_empty elapsedMs=$elapsed")
-                        delay(intervalMs)
-                        continue
-                    }
-                    for (env in parsed.envelopes) {
-                        log(
-                            "REST_TRACE poll_received id=${env.id.take(8)} " +
-                                "from=${env.fromHex.take(8)} elapsedMs=$elapsed more=${parsed.more}",
-                        )
-                        // Trek 2 Stage 2B-B (C4, L6 + L7) — verify
-                        // the envelope against the snapshotted
-                        // verify-key state and gate ingestion on the
-                        // outcome. The helper handles all L2 / L6 /
-                        // L7 cases including the bad-MAC posture;
-                        // `lastInboundOrSendAtMs` is bumped only on
-                        // a successful emit (verified path or
-                        // KeyAbsent unverified pass-through).
-                        val emitted = processInboundEnvelopeWithVerify(
-                            env = env,
-                            currentToken = token,
-                            loopTag = "pollLoop",
-                        )
-                        if (emitted) {
-                            lastInboundOrSendAtMs = now()
-                        }
-                    }
-                    // Drain immediately if server says there's more.
-                    if (parsed.more) {
-                        delay(POLL_DRAIN_IMMEDIATE_MS)
-                        continue
-                    }
-                    delay(intervalMs)
-                }
-                429 -> {
-                    // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour
-                    // the relay's `Retry-After` header, clamped to
-                    // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
-                    // multiplying by 1_000L. Falls back to the
-                    // existing intervalMs/POLL_FAIL_BACKOFF_MS
-                    // jittered backoff when the header is absent or
-                    // malformed.
-                    val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
-                    val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
-                        // No jitter — the relay's scheduling
-                        // suggestion is its own discipline.
-                        clampedRetryAfterMs to clampedRetryAfterMs
-                    } else {
-                        val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+
+                val response = outcome.getOrThrow()
+                when (response.statusCode) {
+                    401 -> {
+                        // Trek 2 Stage 2B-B (C5, L9) — 401 is a token
+                        // issue, not a transport failure. The relay
+                        // answered; the breaker treats this as a
+                        // successful observation (resets counters /
+                        // exits Open or HalfOpen).
+                        recordRestSuccess()
+                        staleToken = token
+                        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                        // backoff. Token-stale on a burst can herd if multiple
+                        // poll iterations all 401 at the same moment.
+                        val nominalDelay = POLL_FAIL_BACKOFF_MS
                         val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                        nominal to (nominal * jitterFactor).toLong()
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        log(
+                            "REST_TRACE poll_401_token_stale elapsedMs=$elapsed " +
+                                "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                        )
+                        delay(jitteredDelay)
+                        continue
                     }
-                    log(
-                        "REST_TRACE poll_429 elapsedMs=$elapsed " +
-                            "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
-                            "retry_after_secs=${response.retryAfterSeconds ?: -1L} " +
-                            "loop=pollLoop",
-                    )
-                    delay(effectiveDelay)
+                    in 200..299 -> {
+                        recordRestSuccess()
+                        val parsed = response.bodyParsed
+                        if (parsed == null || parsed.envelopes.isEmpty()) {
+                            log("REST_TRACE poll_empty elapsedMs=$elapsed")
+                            delay(intervalMs)
+                            continue
+                        }
+                        for (env in parsed.envelopes) {
+                            log(
+                                "REST_TRACE poll_received id=${env.id.take(8)} " +
+                                    "from=${env.fromHex.take(8)} elapsedMs=$elapsed more=${parsed.more}",
+                            )
+                            // Trek 2 Stage 2B-B (C4, L6 + L7) — verify
+                            // the envelope against the snapshotted
+                            // verify-key state and gate ingestion on the
+                            // outcome. The helper handles all L2 / L6 /
+                            // L7 cases including the bad-MAC posture;
+                            // `lastInboundOrSendAtMs` is bumped only on
+                            // a successful emit (verified path or
+                            // KeyAbsent unverified pass-through).
+                            val emitted = processInboundEnvelopeWithVerify(
+                                env = env,
+                                currentToken = token,
+                                loopTag = "pollLoop",
+                            )
+                            if (emitted) {
+                                lastInboundOrSendAtMs = now()
+                            }
+                        }
+                        // Drain immediately if server says there's more.
+                        if (parsed.more) {
+                            delay(POLL_DRAIN_IMMEDIATE_MS)
+                            continue
+                        }
+                        delay(intervalMs)
+                    }
+                    429 -> {
+                        // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour
+                        // the relay's `Retry-After` header, clamped to
+                        // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
+                        // multiplying by 1_000L. Falls back to the
+                        // existing intervalMs/POLL_FAIL_BACKOFF_MS
+                        // jittered backoff when the header is absent or
+                        // malformed. 429 is rate-limit, not transport
+                        // failure: the relay answered; record as
+                        // success for the breaker.
+                        recordRestSuccess()
+                        val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
+                        val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
+                            // No jitter — the relay's scheduling
+                            // suggestion is its own discipline.
+                            clampedRetryAfterMs to clampedRetryAfterMs
+                        } else {
+                            val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                            nominal to (nominal * jitterFactor).toLong()
+                        }
+                        log(
+                            "REST_TRACE poll_429 elapsedMs=$elapsed " +
+                                "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
+                                "retry_after_secs=${response.retryAfterSeconds ?: -1L} " +
+                                "loop=pollLoop",
+                        )
+                        delay(effectiveDelay)
+                    }
+                    in 500..599 -> {
+                        // Trek 2 Stage 2B-B (C5, L9) — 5xx is a
+                        // transport-class failure per scope §L9
+                        // taxonomy. Counts toward the breaker.
+                        recordRestFailure()
+                        val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        log(
+                            "REST_TRACE poll_5xx status=${response.statusCode} " +
+                                "elapsedMs=$elapsed " +
+                                "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                        )
+                        delay(jitteredDelay)
+                    }
+                    else -> {
+                        // Trek 2 Stage 2B-B (C5, L9) — 4xx-other
+                        // (incl. 410 in C5-B; 410 gets its own dance
+                        // in C5-C via Status410Storm). The relay
+                        // answered, so the breaker records success
+                        // for the consecutive-fail dimension.
+                        recordRestSuccess()
+                        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
+                        // backoff. Server-unexpected-status retries can herd
+                        // when a transient relay condition rejects many polls.
+                        val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        log(
+                            "REST_TRACE poll_unexpected_status status=${response.statusCode} " +
+                                "elapsedMs=$elapsed " +
+                                "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                        )
+                        delay(jitteredDelay)
+                    }
                 }
-                else -> {
-                    // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
-                    // backoff. Server-unexpected-status retries can herd
-                    // when a transient relay condition rejects many polls.
-                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
-                    log(
-                        "REST_TRACE poll_unexpected_status status=${response.statusCode} " +
-                            "elapsedMs=$elapsed " +
-                            "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
-                    )
-                    delay(jitteredDelay)
+            } finally {
+                if (isProbe) {
+                    // Trek 2 Stage 2B-B (C5, L9, M-B28 sub-cell (b))
+                    // — cancellation-safe permit release. Idempotent:
+                    // a no-op when the probe already resolved into
+                    // Closed (via recordRestSuccess) or Open (via
+                    // recordRestFailure). The NonCancellable wrapper
+                    // guarantees the reset itself cannot be cancelled
+                    // inside its own critical section.
+                    withContext(NonCancellable) {
+                        releaseProbePermitIfStillHeld()
+                    }
                 }
             }
         }
@@ -1446,21 +1561,28 @@ class RestFallbackOrchestrator(
             }
             staleToken = null
 
-            // Trek 2 Stage 2B-B (C4 review-fix P1.2) — same breaker
-            // gate as the legacy pollLoop above. `SuspendedOnPoison`
-            // STOPS polling, not just envelope ingestion. Scope L7
-            // step 4 intent: "Suspend BOTH REST poll loops".
-            if (_inboundStateMutex.withLock { _breakerState } is LongPollBreakerState.SuspendedOnPoison) {
+            // Trek 2 Stage 2B-B (C4 review-fix P1.2, extended in C5,
+            // L9) — same shape as the legacy pollLoop above. The C4
+            // gate covered only [LongPollBreakerState.SuspendedOnPoison];
+            // C5 adds [LongPollBreakerState.Open] +
+            // [LongPollBreakerState.HalfOpen] via
+            // [gateBreakerForIteration], which atomically claims the
+            // HalfOpen probe permit under [_inboundStateMutex] when
+            // applicable. M-B28 sub-cell (a) pins the permit's
+            // exclusivity across both loops.
+            val breakerDecision = gateBreakerForIteration()
+            if (breakerDecision is BreakerIterationDecision.Skip) {
                 val nominalDelay = POLL_FAIL_BACKOFF_MS
                 val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                 val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                 log(
-                    "REST_TRACE ws_active_poll_call_skipped reason=breaker_suspended_on_poison " +
+                    "REST_TRACE ws_active_poll_call_skipped reason=${breakerDecision.reason} " +
                         "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
                 )
                 delay(jitteredDelay)
                 continue
             }
+            val isProbe = breakerDecision is BreakerIterationDecision.Probe
             // L4 + OQ-6 LOCK: both REST poll loops share the
             // persisted cursor via the same `cursorRepository` seam.
             // `null` means "no persisted cursor" — wire treats that
@@ -1490,121 +1612,159 @@ class RestFallbackOrchestrator(
             }
 
             val intervalMs = pollIntervalMs()
-            log(
-                "REST_TRACE ws_active_poll_call since_seq=${sinceSeq ?: -1L} " +
-                    "long_poll_enabled=true",
-            )
-            val startMs = now()
-            val outcome = runCatching {
-                // Same L1 + L2 gating as the legacy poll site below —
-                // both call sites of `transport.poll(...)` carry the
-                // same Stage 2B-A header and timeout invariants.
-                transport.poll(
-                    url = "$baseUrl/relay/poll",
-                    token = token,
-                    sinceSeq = sinceSeq,
-                    longPollOptIn = longPollEnabled,
-                    readTimeoutMs = computeLongPollReadTimeoutMs(
-                        longPollEnabled = longPollEnabled,
-                        pollHoldSecs = _capabilities.value.pollHoldSecs,
-                    ),
-                )
-            }
-            val elapsed = now() - startMs
-
-            if (outcome.isFailure) {
-                val ex = outcome.exceptionOrNull()!!
-                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+            // Trek 2 Stage 2B-B (C5, L9, M-B28 sub-cell (b)) — wrap
+            // the transport.poll call + response handling in a try /
+            // finally so a mid-flight cancellation on a HalfOpen
+            // probe releases the probe permit under
+            // `withContext(NonCancellable)`. Non-probe iterations
+            // pay no cost beyond the empty finally branch.
+            try {
                 log(
-                    "REST_TRACE ws_active_poll_fail reason=${ex::class.simpleName} " +
-                        "elapsedMs=$elapsed next_delay_ms=$jitteredDelay",
+                    "REST_TRACE ws_active_poll_call since_seq=${sinceSeq ?: -1L} " +
+                        "long_poll_enabled=true",
                 )
-                delay(jitteredDelay)
-                continue
-            }
-
-            val response = outcome.getOrThrow()
-            if (response.statusCode == 401) {
-                staleToken = token
-                log(
-                    "REST_TRACE ws_active_poll_unauthorised status=401 " +
-                        "elapsedMs=$elapsed — will refresh token",
-                )
-                continue
-            }
-            if (response.statusCode == 429) {
-                // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour the
-                // relay's `Retry-After` header, clamped to
-                // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
-                // multiplying by 1_000L. Falls back to the existing
-                // jittered backoff when the header is absent or
-                // malformed. Same shape as the legacy `pollLoop`'s
-                // 429 branch.
-                val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
-                val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
-                    clampedRetryAfterMs to clampedRetryAfterMs
-                } else {
-                    val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                    nominal to (nominal * jitterFactor).toLong()
+                val startMs = now()
+                val outcome = runCatching {
+                    // Same L1 + L2 gating as the legacy poll site below —
+                    // both call sites of `transport.poll(...)` carry the
+                    // same Stage 2B-A header and timeout invariants.
+                    transport.poll(
+                        url = "$baseUrl/relay/poll",
+                        token = token,
+                        sinceSeq = sinceSeq,
+                        longPollOptIn = longPollEnabled,
+                        readTimeoutMs = computeLongPollReadTimeoutMs(
+                            longPollEnabled = longPollEnabled,
+                            pollHoldSecs = _capabilities.value.pollHoldSecs,
+                        ),
+                    )
                 }
+                val elapsed = now() - startMs
+
+                if (outcome.isFailure) {
+                    val ex = outcome.exceptionOrNull()!!
+                    recordRestFailure()
+                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE ws_active_poll_fail reason=${ex::class.simpleName} " +
+                            "elapsedMs=$elapsed next_delay_ms=$jitteredDelay",
+                    )
+                    delay(jitteredDelay)
+                    continue
+                }
+
+                val response = outcome.getOrThrow()
+                if (response.statusCode == 401) {
+                    recordRestSuccess()
+                    staleToken = token
+                    log(
+                        "REST_TRACE ws_active_poll_unauthorised status=401 " +
+                            "elapsedMs=$elapsed — will refresh token",
+                    )
+                    continue
+                }
+                if (response.statusCode == 429) {
+                    // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour the
+                    // relay's `Retry-After` header, clamped to
+                    // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
+                    // multiplying by 1_000L. Falls back to the existing
+                    // jittered backoff when the header is absent or
+                    // malformed. Same shape as the legacy `pollLoop`'s
+                    // 429 branch.
+                    recordRestSuccess()
+                    val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
+                    val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
+                        clampedRetryAfterMs to clampedRetryAfterMs
+                    } else {
+                        val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        nominal to (nominal * jitterFactor).toLong()
+                    }
+                    log(
+                        "REST_TRACE ws_active_poll_429 elapsedMs=$elapsed " +
+                            "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
+                            "retry_after_secs=${response.retryAfterSeconds ?: -1L}",
+                    )
+                    delay(effectiveDelay)
+                    continue
+                }
+                if (response.statusCode in 500..599) {
+                    // Trek 2 Stage 2B-B (C5, L9) — 5xx counts toward
+                    // the breaker per scope §L9 taxonomy.
+                    recordRestFailure()
+                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE ws_active_poll_5xx status=${response.statusCode} " +
+                            "elapsedMs=$elapsed next_delay_ms=$jitteredDelay",
+                    )
+                    delay(jitteredDelay)
+                    continue
+                }
+                if (response.statusCode !in 200..299 || response.bodyParsed == null) {
+                    // Trek 2 Stage 2B-B (C5, L9) — 4xx-other (incl.
+                    // 410 in C5-B; 410 gets its own dance in C5-C
+                    // via Status410Storm). The relay answered, so
+                    // the breaker records success for the
+                    // consecutive-fail dimension.
+                    recordRestSuccess()
+                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                    log(
+                        "REST_TRACE ws_active_poll_unexpected_status " +
+                            "status=${response.statusCode} elapsedMs=$elapsed " +
+                            "next_delay_ms=$jitteredDelay",
+                    )
+                    delay(jitteredDelay)
+                    continue
+                }
+                recordRestSuccess()
+                val envelopes = response.bodyParsed.envelopes
                 log(
-                    "REST_TRACE ws_active_poll_429 elapsedMs=$elapsed " +
-                        "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
-                        "retry_after_secs=${response.retryAfterSeconds ?: -1L}",
+                    "REST_TRACE ws_active_poll_ok " +
+                        "envelopes=${envelopes.size} elapsedMs=$elapsed",
                 )
-                delay(effectiveDelay)
-                continue
-            }
-            if (response.statusCode !in 200..299 || response.bodyParsed == null) {
-                val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                // Lock L5: emit envelopes to the same downstream as the
+                // legacy poll. The new `seqMac` field rides through the
+                // DTO unchanged. No MAC verification call site here
+                // (lands in C4).
+                //
+                // L3 Step 1 — single insertion point for the pending-seq
+                // mapping, mirrored on this loop. Populated BEFORE
+                // emitting so the consumer can rely on
+                // `ackInboundAndAdvanceCursor` finding the seq.
+                //
+                // Trek 2 Stage 2B-B (C4, L6 + L7) — same verify-and-emit
+                // gate as the legacy `pollLoop` site above. Both REST
+                // poll loops enforce IDENTICAL `seq_mac` verify
+                // semantics; the bad-MAC posture's counter / latch /
+                // suspension state is shared via [_inboundStateMutex],
+                // so a fail observed on one loop drives both loops'
+                // ingestion decisions.
+                for (env in envelopes) {
+                    processInboundEnvelopeWithVerify(
+                        env = env,
+                        currentToken = token,
+                        loopTag = "wsActivePollLoop",
+                    )
+                }
+                // L4: cursor advance happens inside
+                // `ackInboundAndAdvanceCursor` after the relay 2xx's the
+                // ack. NOT here from the poll response directly.
                 val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
-                log(
-                    "REST_TRACE ws_active_poll_unexpected_status " +
-                        "status=${response.statusCode} elapsedMs=$elapsed " +
-                        "next_delay_ms=$jitteredDelay",
-                )
+                val jitteredDelay = (intervalMs * jitterFactor).toLong()
                 delay(jitteredDelay)
-                continue
+            } finally {
+                if (isProbe) {
+                    withContext(NonCancellable) {
+                        releaseProbePermitIfStillHeld()
+                    }
+                }
             }
-            val envelopes = response.bodyParsed.envelopes
-            log(
-                "REST_TRACE ws_active_poll_ok " +
-                    "envelopes=${envelopes.size} elapsedMs=$elapsed",
-            )
-            // Lock L5: emit envelopes to the same downstream as the
-            // legacy poll. The new `seqMac` field rides through the
-            // DTO unchanged. No MAC verification call site here
-            // (lands in C4).
-            //
-            // L3 Step 1 — single insertion point for the pending-seq
-            // mapping, mirrored on this loop. Populated BEFORE
-            // emitting so the consumer can rely on
-            // `ackInboundAndAdvanceCursor` finding the seq.
-            //
-            // Trek 2 Stage 2B-B (C4, L6 + L7) — same verify-and-emit
-            // gate as the legacy `pollLoop` site above. Both REST
-            // poll loops enforce IDENTICAL `seq_mac` verify
-            // semantics; the bad-MAC posture's counter / latch /
-            // suspension state is shared via [_inboundStateMutex],
-            // so a fail observed on one loop drives both loops'
-            // ingestion decisions.
-            for (env in envelopes) {
-                processInboundEnvelopeWithVerify(
-                    env = env,
-                    currentToken = token,
-                    loopTag = "wsActivePollLoop",
-                )
-            }
-            // L4: cursor advance happens inside
-            // `ackInboundAndAdvanceCursor` after the relay 2xx's the
-            // ack. NOT here from the poll response directly.
-            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-            val jitteredDelay = (intervalMs * jitterFactor).toLong()
-            delay(jitteredDelay)
         }
     }
 
@@ -1812,6 +1972,203 @@ class RestFallbackOrchestrator(
      *        * `MalformedSeqMac` → L7 bad-MAC posture with reason
      *          `no_mac_field` (covers empty + non-hex + wrong-length).
      */
+    // ── Trek 2 Stage 2B-B (C5, L9) — breaker mechanism ──────────────────────
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — per-iteration decision returned
+     * by [gateBreakerForIteration]. Both REST poll loops consume
+     * this exclusive decision at the top of each iteration:
+     *
+     *   * [Proceed] — breaker is [LongPollBreakerState.Closed].
+     *     Normal flow; record success / failure on response.
+     *   * [Probe] — breaker is
+     *     `HalfOpen(probeInFlight = false)`. THIS loop has claimed
+     *     the permit (CAS-style under `_inboundStateMutex`) and
+     *     must run exactly one probe call wrapped in a
+     *     `try { ... } finally { withContext(NonCancellable) {
+     *     releaseProbePermitIfStillHeld() } }` block so a
+     *     mid-probe cancellation does not strand the permit at
+     *     `probeInFlight = true`.
+     *   * [Skip] — breaker is in a non-pollable state
+     *     ([LongPollBreakerState.SuspendedOnPoison],
+     *     [LongPollBreakerState.Open], or
+     *     `HalfOpen(probeInFlight = true)` — another loop owns the
+     *     probe permit). Caller logs the [reason] and delays before
+     *     the next iteration.
+     *
+     * The decision sealed type is `private` so the breaker
+     * mechanics never leak across the orchestrator's wire surface.
+     */
+    private sealed class BreakerIterationDecision {
+        object Proceed : BreakerIterationDecision()
+        object Probe : BreakerIterationDecision()
+        data class Skip(val reason: String) : BreakerIterationDecision()
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — single CAS-style entry that
+     * snapshots [_breakerState] under [_inboundStateMutex] and, if
+     * the state is `HalfOpen(probeInFlight = false)`, atomically
+     * claims the probe permit (flips to
+     * `HalfOpen(probeInFlight = true)`) before returning [Probe].
+     * The atomicity is load-bearing: M-B28 sub-cell (a) drives both
+     * REST poll loops past the cooldown timer simultaneously and
+     * asserts that exactly ONE loop receives [Probe] and issues the
+     * probe call; the other receives [Skip].
+     */
+    private suspend fun gateBreakerForIteration(): BreakerIterationDecision {
+        return _inboundStateMutex.withLock {
+            when (val current = _breakerState) {
+                is LongPollBreakerState.Closed -> BreakerIterationDecision.Proceed
+                is LongPollBreakerState.SuspendedOnPoison ->
+                    BreakerIterationDecision.Skip("breaker_suspended_on_poison")
+                is LongPollBreakerState.Open ->
+                    BreakerIterationDecision.Skip("breaker_open_${current.reason}")
+                is LongPollBreakerState.HalfOpen -> {
+                    if (current.probeInFlight) {
+                        BreakerIterationDecision.Skip("breaker_half_open_probe_in_flight")
+                    } else {
+                        _breakerState = LongPollBreakerState.HalfOpen(probeInFlight = true)
+                        BreakerIterationDecision.Probe
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — increment the consecutive-fail
+     * counter and, if the counter reached
+     * [BREAKER_CONSECUTIVE_FAIL_THRESHOLD] (or this call is a
+     * failed HalfOpen probe), transition the breaker to
+     * `Open(ConsecutiveRestFailures, cooldownMs)` and spawn the
+     * breaker timer.
+     *
+     * Called from BOTH poll loops on transport-class failures:
+     * `IOException` / read-timeout / HTTP 5xx. Status 401 / 410 /
+     * 429 / 4xx-other are NOT transport failures per scope §L9 and
+     * route through [recordRestSuccess] instead (they prove the
+     * transport works even if the relay refuses to serve us).
+     */
+    private suspend fun recordRestFailure() {
+        val openedReason: BreakerOpenReason? = _inboundStateMutex.withLock {
+            when (val current = _breakerState) {
+                is LongPollBreakerState.Closed -> {
+                    _breakerFailCount += 1
+                    if (_breakerFailCount >= BREAKER_CONSECUTIVE_FAIL_THRESHOLD) {
+                        transitionToOpenUnderMutex(
+                            BreakerOpenReason.ConsecutiveRestFailures,
+                            _breakerCurrentCooldownMs,
+                        )
+                        BreakerOpenReason.ConsecutiveRestFailures
+                    } else null
+                }
+                is LongPollBreakerState.HalfOpen -> {
+                    if (current.probeInFlight) {
+                        val nextCooldown = (_breakerCurrentCooldownMs.toDouble() * BREAKER_COOLDOWN_GROWTH_FACTOR)
+                            .toLong()
+                            .coerceAtMost(BREAKER_COOLDOWN_CEILING_MS)
+                        _breakerCurrentCooldownMs = nextCooldown
+                        transitionToOpenUnderMutex(
+                            BreakerOpenReason.ConsecutiveRestFailures,
+                            nextCooldown,
+                        )
+                        BreakerOpenReason.ConsecutiveRestFailures
+                    } else null
+                }
+                is LongPollBreakerState.Open, is LongPollBreakerState.SuspendedOnPoison -> null
+            }
+        }
+        if (openedReason != null) {
+            log("REST_TRACE breaker_open reason=$openedReason cooldown_ms=${_inboundStateMutex.withLock { _breakerCurrentCooldownMs }}")
+            stateMachine.onEvent(RestStateMachine.Event.RestPollDegraded(openedReason))
+        }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — caller holds [_inboundStateMutex].
+     * Drops the consecutive-fail counter, replaces the current
+     * breaker state with [LongPollBreakerState.Open], cancels any
+     * pre-existing timer, and spawns a fresh timer that transitions
+     * `Open → HalfOpen(probeInFlight = false)` after [cooldownMs]
+     * wall-clock (virtual under tests).
+     */
+    private fun transitionToOpenUnderMutex(reason: BreakerOpenReason, cooldownMs: Long) {
+        _breakerFailCount = 0
+        _breakerState = LongPollBreakerState.Open(reason, cooldownMs)
+        _breakerTimerJob?.cancel()
+        _breakerTimerJob = scope.launch {
+            delay(cooldownMs)
+            _inboundStateMutex.withLock {
+                if (_breakerState is LongPollBreakerState.Open) {
+                    _breakerState = LongPollBreakerState.HalfOpen(probeInFlight = false)
+                    log("REST_TRACE breaker_half_open")
+                }
+            }
+        }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — reset the consecutive-fail
+     * counter and, if the breaker was in
+     * [LongPollBreakerState.Open] or [LongPollBreakerState.HalfOpen],
+     * transition back to [LongPollBreakerState.Closed]. Resets
+     * [_breakerCurrentCooldownMs] to [BREAKER_INITIAL_COOLDOWN_MS]
+     * so a future open cycle starts fresh (scope §L9: "On entering
+     * Closed from HalfOpen-success, the cooldown resets to
+     * BREAKER_INITIAL_COOLDOWN_MS").
+     *
+     * Cancels the breaker timer if a transition fires — once we're
+     * Closed there is no Open → HalfOpen tick to drive. Does NOT
+     * touch [LongPollBreakerState.SuspendedOnPoison] (qualitatively
+     * different recovery path per C4 §L7).
+     */
+    private suspend fun recordRestSuccess() {
+        val transitioned: Boolean = _inboundStateMutex.withLock {
+            _breakerFailCount = 0
+            when (_breakerState) {
+                is LongPollBreakerState.Open, is LongPollBreakerState.HalfOpen -> {
+                    _breakerState = LongPollBreakerState.Closed
+                    _breakerCurrentCooldownMs = BREAKER_INITIAL_COOLDOWN_MS
+                    _breakerTimerJob?.cancel()
+                    _breakerTimerJob = null
+                    true
+                }
+                is LongPollBreakerState.Closed, is LongPollBreakerState.SuspendedOnPoison -> false
+            }
+        }
+        if (transitioned) {
+            log("REST_TRACE breaker_closed")
+        }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9, M-B28) — cancellation-safe permit
+     * release. Called from the `finally` block of a probe call. If
+     * the breaker state is STILL
+     * `HalfOpen(probeInFlight = true)` at the moment of the finally
+     * (i.e., the probe was cancelled mid-flight before its outcome
+     * resolved the state), reset to
+     * `HalfOpen(probeInFlight = false)` so the next poll iteration
+     * on either loop can claim the permit. If the probe already
+     * resolved into [LongPollBreakerState.Closed] or
+     * [LongPollBreakerState.Open] (via [recordRestSuccess] or
+     * [recordRestFailure]) before the `finally`, this method is a
+     * no-op.
+     *
+     * MUST be called inside `withContext(NonCancellable)` so the
+     * reset itself cannot be cancelled inside its critical section.
+     */
+    private suspend fun releaseProbePermitIfStillHeld() {
+        _inboundStateMutex.withLock {
+            val current = _breakerState
+            if (current is LongPollBreakerState.HalfOpen && current.probeInFlight) {
+                _breakerState = LongPollBreakerState.HalfOpen(probeInFlight = false)
+                log("REST_TRACE breaker_probe_permit_released_on_cancel")
+            }
+        }
+    }
+
     private suspend fun processInboundEnvelopeWithVerify(
         env: PollEnvelope,
         currentToken: String,
@@ -2236,6 +2593,41 @@ class RestFallbackOrchestrator(
      */
     internal suspend fun <T> withLifecycleMutexHeldForTest(block: suspend () -> T): T =
         _lifecycleMutex.withLock { block() }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9) — test-only peek for the current
+     * breaker cooldown value (used by M13 sub-cells to assert the
+     * doubling-and-reset semantic of [_breakerCurrentCooldownMs]).
+     * Reads under [_inboundStateMutex] for consistency with the
+     * production read path.
+     */
+    internal suspend fun peekBreakerCooldownMsForTest(): Long =
+        _inboundStateMutex.withLock { _breakerCurrentCooldownMs }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9, M-B28 sub-cell (a)) — string-typed
+     * decision exposing the production [gateBreakerForIteration]
+     * path so commonTest can pin the atomic-permit-claim semantic
+     * without driving two real poll loops to wake on the same
+     * virtual tick. Each call mutates state exactly as the real
+     * loops do; returns the bucket of the production sealed type.
+     */
+    internal suspend fun gateBreakerForIterationForTest(): String =
+        when (val d = gateBreakerForIteration()) {
+            is BreakerIterationDecision.Proceed -> "proceed"
+            is BreakerIterationDecision.Probe -> "probe"
+            is BreakerIterationDecision.Skip -> "skip:${d.reason}"
+        }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L9, M-B28 sub-cell (b)) — direct
+     * exposure of [releaseProbePermitIfStillHeld] so commonTest can
+     * pin the cancellation-safe permit release without standing up
+     * a controllable suspending transport for the claimant loop.
+     */
+    internal suspend fun releaseProbePermitIfStillHeldForTest() {
+        releaseProbePermitIfStillHeld()
+    }
 
     /**
      * Public CAS facade for media token acquisition (PR-M1w).
