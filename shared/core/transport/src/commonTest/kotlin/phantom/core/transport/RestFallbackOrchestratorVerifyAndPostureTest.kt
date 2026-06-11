@@ -1257,6 +1257,165 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
     }
 
+    // ── M-B25 — C4 review-fix round 3 P2 — deterministic snapshot proofs ────
+
+    @Test
+    fun mb25_barrier_verify_alone_under_held_mutex_snapshots_original_key_and_verifies() = runTest {
+        // C4 review-fix round 3 (P2): the 100x100 stochastic stress
+        // test above proves "no torn crash" but does NOT prove the
+        // snapshot semantic (that verify reads the key value at its
+        // own lock-acquire moment, not at queue-time or after a later
+        // flip). On `StandardTestDispatcher`, all 100 verify jobs are
+        // dispatched before any refresh job; verify has no suspension
+        // point between dispatch and its mutex critical section, so
+        // every verify acquires the mutex BEFORE the first refresh
+        // even starts. The stochastic outcome carries no information
+        // about snapshot vs torn-read discipline.
+        //
+        // This barrier test makes the snapshot semantic explicit and
+        // deterministic. Setup:
+        //   1. State = KeyPresent(hexA).
+        //   2. Envelope MAC'd against hexA.
+        //   3. Hold `_inboundStateMutex` externally.
+        //   4. Launch verify INSIDE the held block; verify suspends
+        //      at its `_inboundStateMutex.withLock` (queue position 1).
+        //   5. Release holder.
+        //   6. Verify resumes, snapshots KeyPresent(hexA), HMAC'd
+        //      envelope passes → returns true.
+        //
+        // No second waiter is queued, so there is no flip to race
+        // against; this isolates the "no other waiter" arm and pins
+        // the happy-path snapshot semantic.
+        init()
+        val rootKey = ByteArray(32)
+        val derivedKeyA = deriveVerifyKey(rootKey, IDENTITY)
+        val keyAHex = derivedKeyA.toLowerHex()
+        val transport = VerifyTransport(sessionScript = {
+            RestFallbackResponse(
+                200, AuthSessionResponse(
+                    token = "tok", expiresAt = Long.MAX_VALUE,
+                    restFallback = true, maxSendBodyBytes = 4096,
+                    pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                    seqMacVerifyKey = keyAHex,
+                ), "{}", 1L,
+            )
+        })
+        val orch = buildOrchestrator(transport, RecordingCursorRepo(), testScheduler)
+        bootstrapped(orch)
+        assertEquals(VerifyKeyState.KeyPresent(keyAHex), orch.peekVerifyKeyStateForTest())
+
+        val env = makeVerifiedEnvelope(IDENTITY, 1L, "env-mb25-barrier-a", 60_000L, derivedKeyA)
+
+        var verifyOutcome: Boolean? = null
+        orch.withInboundStateMutexHeldForTest {
+            launch {
+                verifyOutcome = orch.processInboundEnvelopeWithVerifyForTest(
+                    env, "tok", "test-barrier-a",
+                )
+            }
+            // Drain to verify's suspension on the held mutex. After
+            // this `runCurrent` returns, verify is parked on the
+            // `_inboundStateMutex.withLock` waiter queue.
+            runCurrent()
+        }
+        // Mutex released. Verify resumes, snapshots state under its
+        // own withLock acquisition, releases, then HMAC-checks.
+        runCurrent()
+
+        assertEquals(
+            true,
+            verifyOutcome,
+            "verify acquires the mutex AFTER the holder releases (no other waiters queued), " +
+                "snapshots KeyPresent(hexA), and hexA-MAC'd envelope verifies",
+        )
+    }
+
+    @Test
+    fun mb25_barrier_flip_queued_before_verify_makes_verify_snapshot_fresh_key_and_fail() = runTest {
+        // C4 review-fix round 3 (P2): the load-bearing barrier
+        // assertion. `_inboundStateMutex` is held externally; we
+        // queue a state flip FIRST, then queue the verify. FIFO
+        // mutex resume after the holder releases:
+        //
+        //   1. Flip resumes first → publishes KeyPresent(hexB) under
+        //      its own `_inboundStateMutex.withLock`.
+        //   2. Verify resumes second → its
+        //      `_inboundStateMutex.withLock` acquires AFTER the flip
+        //      has committed, snapshots the FRESH KeyPresent(hexB),
+        //      and the hexA-MAC'd envelope fails HMAC under hexB.
+        //
+        // The fail outcome is the DETERMINISTIC proof of the
+        // snapshot-at-lock-acquire semantic: if verify had snapshotted
+        // at queue-time (an erroneous semantic) it would have read
+        // hexA and incorrectly passed; if verify had torn-read (the
+        // other erroneous semantic) the HMAC primitive's behaviour
+        // is undefined and the count assertion at the bottom would
+        // not be a defined boolean.
+        init()
+        val rootKey = ByteArray(32)
+        val derivedKeyA = deriveVerifyKey(rootKey, IDENTITY)
+        val keyAHex = derivedKeyA.toLowerHex()
+        val transport = VerifyTransport(sessionScript = {
+            RestFallbackResponse(
+                200, AuthSessionResponse(
+                    token = "tok", expiresAt = Long.MAX_VALUE,
+                    restFallback = true, maxSendBodyBytes = 4096,
+                    pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                    seqMacVerifyKey = keyAHex,
+                ), "{}", 1L,
+            )
+        })
+        val orch = buildOrchestrator(transport, RecordingCursorRepo(), testScheduler)
+        bootstrapped(orch)
+        assertEquals(VerifyKeyState.KeyPresent(keyAHex), orch.peekVerifyKeyStateForTest())
+
+        val env = makeVerifiedEnvelope(IDENTITY, 1L, "env-mb25-barrier-b", 60_000L, derivedKeyA)
+
+        var verifyOutcome: Boolean? = null
+        orch.withInboundStateMutexHeldForTest {
+            // Queue position 1 — the flip. Uses the test seam
+            // `setVerifyKeyStateForTest` which itself enters
+            // `_inboundStateMutex.withLock` and so will queue
+            // behind the externally-held mutex.
+            launch {
+                orch.setVerifyKeyStateForTest(VerifyKeyState.KeyPresent(HEX_KEY_B))
+            }
+            runCurrent()
+            // Queue position 2 — the verify. Suspends at its own
+            // `_inboundStateMutex.withLock` snapshot acquire, BEHIND
+            // the flip per FIFO.
+            launch {
+                verifyOutcome = orch.processInboundEnvelopeWithVerifyForTest(
+                    env, "tok", "test-barrier-b",
+                )
+            }
+            runCurrent()
+        }
+        // Mutex released. FIFO resume:
+        //   1. Flip wakes, publishes KeyPresent(HEX_KEY_B).
+        //   2. Verify wakes, snapshots fresh KeyPresent(HEX_KEY_B);
+        //      hexA-MAC'd envelope fails under hexB.
+        runCurrent()
+
+        assertEquals(
+            false,
+            verifyOutcome,
+            "FIFO mutex resume after holder release: flip queued first publishes KeyPresent(HEX_KEY_B) " +
+                "BEFORE verify acquires; verify queued second snapshots the fresh key and the hexA-MAC'd " +
+                "envelope fails. This is the deterministic proof of snapshot-at-lock-acquire semantics " +
+                "(neither queue-time snapshot nor torn read across the rotation).",
+        )
+        // Post-condition: the published state is the fresh one. The
+        // peek confirms the flip actually committed, ruling out
+        // "verify ran first by accident" as a path to the false
+        // outcome.
+        assertEquals(
+            VerifyKeyState.KeyPresent(HEX_KEY_B),
+            orch.peekVerifyKeyStateForTest(),
+            "post-barrier state must be the flipped key, proving the flip ran ahead of the verify",
+        )
+    }
+
     // ── C4 review-fix P1.1 — refresh latch race regression pin ───────────────
 
     @Test

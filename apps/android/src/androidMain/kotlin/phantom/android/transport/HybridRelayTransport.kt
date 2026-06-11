@@ -7,6 +7,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -15,6 +16,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import phantom.core.storage.ProcessedEnvelopeRepository
 import phantom.core.transport.AckOutcome
 import phantom.core.transport.KtorRelayTransport
@@ -239,6 +241,17 @@ class HybridRelayTransport(
      * Guards [maybeRetryBootstrap] so only one retry runs at a time.
      */
     private val bootstrapRetryLock = Mutex()
+
+    /**
+     * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.2) — serialises
+     * [activateRestCollectors] so a concurrent call from
+     * [bootstrapAndStart] and [maybeRetryBootstrap] cannot both pass
+     * the `restCapabilityActive` check, launch two inbound
+     * collectors, and call `orchestrator.start()` twice. The check
+     * is now re-evaluated UNDER the mutex; rollback of a partial
+     * launch is also serialised here.
+     */
+    private val restActivationMutex = Mutex()
 
     /**
      * Wall-clock ms of the last bootstrap attempt (success or fail). Used by
@@ -543,32 +556,76 @@ class HybridRelayTransport(
     /**
      * Switch the wrapper into REST-fallback-aware mode. Idempotent — safe
      * to call from a retry path.
+     *
+     * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.2) — the body runs
+     * under [restActivationMutex] so a concurrent call from
+     * [bootstrapAndStart] and [maybeRetryBootstrap] cannot interleave
+     * the `restCapabilityActive` check with the actual launch.
+     * Without the mutex both callers passed the check, both launched
+     * a `restInboundJob`, both called `orchestrator.start()` — two
+     * sets of `stateObserverJob` + `wsActivePollJob` were spawned,
+     * and the first set was orphaned when the second overwrote
+     * the field references.
+     *
+     * If anything between collector launch and the `restCapabilityActive`
+     * flip throws (including `CancellationException`), the launched
+     * collector is rolled back under [NonCancellable] so a cancelled
+     * caller does not leak a half-activated state.
      */
     private suspend fun activateRestCollectors() {
-        if (restCapabilityActive) {
-            return
+        restActivationMutex.withLock {
+            if (restCapabilityActive) {
+                return@withLock
+            }
+            // Trek 2 Stage 2B-B (C3 review-fix) — register the inbound
+            // collector BEFORE starting the orchestrator. `SharedFlow`
+            // with `replay=0` does NOT buffer envelopes for retroactive
+            // subscribers; a poll-loop emit that lands before the
+            // collector is registered is lost. `CoroutineStart.UNDISPATCHED`
+            // runs the launched body eagerly on the current thread up to
+            // the first suspension point (the `collect` call), so by
+            // the time `launch` returns the collector is registered on
+            // `inbound` and ready to receive emits.
+            val launched: Job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                orchestrator.inbound.collect { handleRestInbound(it) }
+            }
+            restInboundJob = launched
+            try {
+                // Now safe to start the orchestrator — its poll loops
+                // can begin emitting and the collector is guaranteed
+                // to be listening. Trek 2 Stage 2B-B (C4 review-fix
+                // round 2 P1.1) — start() is now suspending so it can
+                // `cancelAndJoinAll` prior jobs before resetting state.
+                orchestrator.start()
+                // Flip flag AFTER the inbound collector is registered
+                // so any event already in flight is processed correctly.
+                restCapabilityActive = true
+            } catch (t: Throwable) {
+                // Rollback the half-launched collector under
+                // `NonCancellable` so even a `CancellationException` on
+                // the caller does not skip the cleanup. Re-throw after
+                // rollback (CE included) so the caller observes the
+                // original failure.
+                withContext(NonCancellable) {
+                    launched.cancel()
+                    try {
+                        launched.join()
+                    } catch (_: Throwable) {
+                        // Diagnostic; join() is to ensure the body has
+                        // fully unwound regardless of completion outcome.
+                    }
+                    if (restInboundJob === launched) {
+                        restInboundJob = null
+                    }
+                    // Defensive: in case `orchestrator.start()` had
+                    // partially armed itself before throwing.
+                    orchestrator.stop()
+                }
+                // Re-throw (CE included) so the caller observes the
+                // original failure after rollback completes.
+                throw t
+            }
         }
-        // Trek 2 Stage 2B-B (C3 review-fix) — register the inbound
-        // collector BEFORE starting the orchestrator. `SharedFlow` with
-        // `replay=0` does NOT buffer envelopes for retroactive
-        // subscribers; a poll-loop emit that lands before the collector
-        // is registered is lost. `CoroutineStart.UNDISPATCHED` runs the
-        // launched body eagerly on the current thread up to the first
-        // suspension point (the `collect` call), so by the time
-        // `launch` returns the collector is registered on `inbound` and
-        // ready to receive emits.
-        restInboundJob = scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
-            orchestrator.inbound.collect { handleRestInbound(it) }
-        }
-        // Now safe to start the orchestrator — its poll loops can begin
-        // emitting and the collector is guaranteed to be listening.
-        // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) — start()
-        // is now suspending so it can `cancelAndJoinAll` prior jobs
-        // before resetting state.
-        orchestrator.start()
-        // Flip flag AFTER the inbound collector is registered so any event
-        // already in flight is processed correctly.
-        restCapabilityActive = true
     }
 
     /**

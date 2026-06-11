@@ -340,6 +340,16 @@ class RestFallbackOrchestrator(
     private var stateObserverJob: Job? = null
 
     /**
+     * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1) — serialises the
+     * lifecycle methods [start] / [stop] / [close] / [shutdown] so a
+     * second `start()` cannot run its `cancelAndJoinAll()` while a
+     * prior `start()` is still resetting state under
+     * [_inboundStateMutex]. The lifecycle mutex is strictly OUTER to
+     * [_inboundStateMutex]; never acquired the other way round.
+     */
+    private val _lifecycleMutex: Mutex = Mutex()
+
+    /**
      * Trek 2 Stage 2B-A (B3, L3) — parallel `/relay/poll` job that
      * runs in addition to the legacy [pollJob], not as a replacement.
      * Lifecycle is tied to [start] / [stop] / [shutdown] of the
@@ -417,47 +427,54 @@ class RestFallbackOrchestrator(
      * re-created.
      */
     suspend fun start() {
-        if (!_capabilities.value.restFallback) {
-            log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
-            return
+        // Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1) — serialise
+        // the full lifecycle reset under [_lifecycleMutex] so a
+        // concurrent `start()` cannot run its own `cancelAndJoinAll`
+        // while this one is still mid-reset. The mutex is strictly
+        // OUTER to [_inboundStateMutex]; the order is never inverted.
+        _lifecycleMutex.withLock {
+            if (!_capabilities.value.restFallback) {
+                log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
+                return@withLock
+            }
+            // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) —
+            // `stop()` only calls `cancel()` (non-blocking); a job
+            // that was suspended inside
+            // `_inboundStateMutex.withLock { ... }` could legitimately
+            // still hold the mutex when `start()` tries to acquire it,
+            // and a CANCELLED job's continuation can still observe
+            // the resume signal and write to state AFTER our reset.
+            //
+            // Resolution: `start()` is now `suspend` and uses
+            // `cancelAndJoinAll()` to fully await every prior job
+            // before resetting state. The reset then happens under a
+            // genuine `withLock` (not `tryLock`); by that point no
+            // orphan job can race the write.
+            cancelAndJoinAll()
+            _inboundStateMutex.withLock {
+                _breakerState = LongPollBreakerState.Closed
+                _macFailCount.clear()
+                _macRefreshStatus.clear()
+            }
+            log("REST_TRACE poison_state_reset_on_start")
+            stateObserverJob = scope.launch {
+                stateMachine.state.collect { mode -> onModeChanged(mode) }
+            }
+            // Trek 2 Stage 2B-A (B3, L3) — spawn the parallel REST
+            // poll job iff `LONGPOLL_V2_ENABLED == "1"` (gated through
+            // the `longPollEnabled` Boolean computed by the wire-up
+            // layer). The job runs in parallel with the legacy
+            // `pollJob` AND with the Direct WSS fast path; it never
+            // stops on `RestMode.WsActive` (unlike [pollLoop]) — see
+            // L3 in `docs/tracks/trek2-stage2b-a-client-shell.md`.
+            if (longPollEnabled) {
+                wsActivePollJob = scope.launch { wsActivePollLoop() }
+                log("REST_TRACE ws_active_poll_started long_poll_enabled=true")
+            } else {
+                log("REST_TRACE ws_active_poll_skipped long_poll_enabled=false")
+            }
+            log("REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled")
         }
-        // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) —
-        // `stop()` only calls `cancel()` (non-blocking); a job that
-        // was suspended inside `_inboundStateMutex.withLock { ... }`
-        // could legitimately still hold the mutex when `start()`
-        // tries to acquire it, and a CANCELLED job's continuation
-        // can still observe the resume signal and write to state
-        // AFTER our reset.
-        //
-        // Resolution: `start()` is now `suspend` and uses
-        // `cancelAndJoinAll()` to fully await every prior job
-        // before resetting state. The reset then happens under a
-        // genuine `withLock` (not `tryLock`); by that point no
-        // orphan job can race the write.
-        cancelAndJoinAll()
-        _inboundStateMutex.withLock {
-            _breakerState = LongPollBreakerState.Closed
-            _macFailCount.clear()
-            _macRefreshStatus.clear()
-        }
-        log("REST_TRACE poison_state_reset_on_start")
-        stateObserverJob = scope.launch {
-            stateMachine.state.collect { mode -> onModeChanged(mode) }
-        }
-        // Trek 2 Stage 2B-A (B3, L3) — spawn the parallel REST poll
-        // job iff `LONGPOLL_V2_ENABLED == "1"` (gated through the
-        // `longPollEnabled` Boolean computed by the wire-up layer).
-        // The job runs in parallel with the legacy `pollJob` AND with
-        // the Direct WSS fast path; it never stops on
-        // `RestMode.WsActive` (unlike [pollLoop]) — see L3 in
-        // `docs/tracks/trek2-stage2b-a-client-shell.md`.
-        if (longPollEnabled) {
-            wsActivePollJob = scope.launch { wsActivePollLoop() }
-            log("REST_TRACE ws_active_poll_started long_poll_enabled=true")
-        } else {
-            log("REST_TRACE ws_active_poll_skipped long_poll_enabled=false")
-        }
-        log("REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled")
     }
 
     /**
@@ -475,33 +492,60 @@ class RestFallbackOrchestrator(
     }
 
     /**
-     * Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) — cancel
-     * every prior job AND wait for it to finish. Used by [start]
-     * to guarantee no orphan job can race the lifecycle reset
-     * (mutex write to `_breakerState`, `_macFailCount`,
-     * `_macRefreshStatus`). Non-blocking `stop()` (above) only
-     * cancels; an orphan still running between the cancel and the
-     * coroutine's next suspension point could write stale state.
+     * Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1, hardened in
+     * round 3) — cancel every prior job AND wait for it to finish.
+     * Used by [start] to guarantee no orphan job can race the
+     * lifecycle reset (mutex write to `_breakerState`, `_macFailCount`,
+     * `_macRefreshStatus`).
+     *
+     * Round-3 fix: a single snapshot of all four jobs was unsafe.
+     * `stateObserverJob` is the spawning parent for `pollJob` and
+     * `aliveTickJob` (via [onModeChanged] reacting to state-machine
+     * transitions); between the snapshot and the `cancel()` it could
+     * legitimately spawn a NEW `pollJob` that was not captured in the
+     * snapshot, leaving an orphan exactly as the original race did.
+     *
+     * Resolution: two-phase teardown.
+     *   * Phase 1: capture, null, cancel, and JOIN [stateObserverJob]
+     *     first. After phase 1 returns no further callback into
+     *     [onModeChanged] is possible — the spawning parent is gone.
+     *   * Phase 2: snapshot [pollJob], [aliveTickJob], [wsActivePollJob]
+     *     (which now includes anything the observer spawned right up
+     *     to its cancellation), null fields, cancel + join each.
+     *
+     * Callers MUST already hold [_lifecycleMutex].
      */
     private suspend fun cancelAndJoinAll() {
-        val jobs = listOfNotNull(pollJob, aliveTickJob, stateObserverJob, wsActivePollJob)
+        // Phase 1 — stop the spawning parent first.
+        val observer = stateObserverJob
+        stateObserverJob = null
+        if (observer != null) {
+            observer.cancel()
+            try {
+                observer.join()
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                // Diagnostic; join() guarantees coroutine body has
+                // fully unwound regardless of completion outcome.
+            }
+        }
+        // Phase 2 — observer is dead; whatever it spawned is now
+        // captured by re-reading the fields.
+        val tail = listOfNotNull(pollJob, aliveTickJob, wsActivePollJob)
         pollJob = null
         aliveTickJob = null
-        stateObserverJob = null
         wsActivePollJob = null
-        for (job in jobs) {
+        for (job in tail) {
             job.cancel()
         }
-        for (job in jobs) {
+        for (job in tail) {
             try {
                 job.join()
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
             } catch (_: Throwable) {
-                // Job-completion exceptions other than cancellation
-                // are diagnostic; the join's purpose is to wait
-                // for the coroutine body to fully unwind, not to
-                // surface its result.
+                // Diagnostic; same rationale as Phase 1.
             }
         }
     }
