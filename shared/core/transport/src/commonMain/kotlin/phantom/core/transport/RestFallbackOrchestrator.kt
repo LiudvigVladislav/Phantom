@@ -12,7 +12,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -342,14 +341,35 @@ class RestFallbackOrchestrator(
     private var stateObserverJob: Job? = null
 
     /**
-     * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1) — serialises the
-     * lifecycle methods [start] / [stop] / [close] / [shutdown] so a
-     * second `start()` cannot run its `cancelAndJoinAll()` while a
-     * prior `start()` is still resetting state under
-     * [_inboundStateMutex]. The lifecycle mutex is strictly OUTER to
-     * [_inboundStateMutex]; never acquired the other way round.
+     * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1, round 5 P1.1
+     * extended) — serialises the lifecycle methods [start] / [stop]
+     * / [close] / [shutdown] so a second `start()` cannot run its
+     * `cancelAndJoinAll()` while a prior `start()` is still
+     * resetting state under [_inboundStateMutex]. The lifecycle
+     * mutex is strictly OUTER to [_inboundStateMutex]; never
+     * acquired the other way round.
+     *
+     * Round 5 P1.1: the mutex ACQUIRE itself runs under
+     * [NonCancellable] in each lifecycle entry point. Under round 4
+     * the acquire was cancellable — a caller cancelled while
+     * waiting for the mutex would never run [cancelAndJoinAll],
+     * leaving the orchestrator in an indeterminate state if the
+     * caller had intended to wind it down.
      */
     private val _lifecycleMutex: Mutex = Mutex()
+
+    /**
+     * Trek 2 Stage 2B-B (C4 review-fix round 5 P1.2) — terminal
+     * flag set by [close]. Subsequent [start] / [stop] calls
+     * become no-ops; an unguarded `start()` after `close()` would
+     * happily `scope.launch { ... }` into the already-cancelled
+     * scope, immediately dying and leaving log noise that misleads
+     * the operator into thinking the orchestrator is alive.
+     *
+     * Read and written ONLY under [_lifecycleMutex]; the lifecycle
+     * methods are the sole entry points that observe or mutate it.
+     */
+    private var _closed: Boolean = false
 
     /**
      * Trek 2 Stage 2B-A (B3, L3) — parallel `/relay/poll` job that
@@ -430,78 +450,100 @@ class RestFallbackOrchestrator(
      */
     suspend fun start() {
         // Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1, extended in
-        // round 4) — serialise the full lifecycle reset under
-        // [_lifecycleMutex]. Round 3 only covered `start()`; round 4
-        // covers `stop()` and `close()` too. The mutex is strictly
-        // OUTER to [_inboundStateMutex]; the order is never inverted.
-        _lifecycleMutex.withLock {
-            if (!_capabilities.value.restFallback) {
-                log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
-                return@withLock
-            }
-            // Trek 2 Stage 2B-B (C4 review-fix round 4 P1) —
-            // teardown runs under `NonCancellable` so a caller
-            // cancellation cannot tear off mid-teardown leaving
-            // orphan jobs OR a partially-reset state. Both
-            // `cancelAndJoinAll()` and the state reset are
-            // atomic with respect to caller cancellation; the
-            // caller's cancellation is honoured AFTER teardown
-            // completes via the `ensureActive()` gate below,
-            // BEFORE any new jobs are launched.
-            withContext(NonCancellable) {
+        // round 4 to cover stop/close, hardened in round 5 P1.1) —
+        // serialise the full lifecycle reset under [_lifecycleMutex].
+        // The mutex is strictly OUTER to [_inboundStateMutex]; the
+        // order is never inverted.
+        //
+        // Round 5 P1.1: `withContext(NonCancellable)` wraps the
+        // ENTIRE mutex hold — including the acquire itself. Under
+        // round 4 the acquire was cancellable; a caller cancellation
+        // during waiter time would abort the entire lifecycle call,
+        // skipping teardown. With NonCancellable around the acquire
+        // the cancellation is held off until [cancelAndJoinAll] and
+        // the state reset complete; the caller-cancellation is
+        // honoured AFTER teardown via the [Job.isCancelled] check
+        // below, BEFORE any new jobs are launched.
+        val callerJob = currentCoroutineContext()[Job]
+        withContext(NonCancellable) {
+            _lifecycleMutex.withLock {
+                // Round 5 P1.2: terminal-state guard. `start()`
+                // after `close()` must NOT spawn new jobs into the
+                // cancelled scope.
+                if (_closed) {
+                    log("REST_TRACE orchestrator_start_skipped reason=closed")
+                    return@withLock
+                }
+                if (!_capabilities.value.restFallback) {
+                    log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
+                    return@withLock
+                }
                 cancelAndJoinAll()
                 _inboundStateMutex.withLock {
                     _breakerState = LongPollBreakerState.Closed
                     _macFailCount.clear()
                     _macRefreshStatus.clear()
                 }
+                // Caller-cancellation gate: if the caller was
+                // cancelled while we held the mutex, honour the
+                // cancellation NOW rather than spawn new jobs that
+                // would outlive the caller's intent. We're inside
+                // `withContext(NonCancellable)` so reading the
+                // CURRENT context's `isActive` would always return
+                // true; instead inspect the CALLER's job state
+                // captured before the NonCancellable transition.
+                if (callerJob?.isCancelled == true) {
+                    log("REST_TRACE orchestrator_start_aborted reason=caller_cancelled_post_teardown")
+                    return@withLock
+                }
+                log("REST_TRACE poison_state_reset_on_start")
+                stateObserverJob = scope.launch {
+                    stateMachine.state.collect { mode -> onModeChanged(mode) }
+                }
+                // Trek 2 Stage 2B-A (B3, L3) — spawn the parallel
+                // REST poll job iff `LONGPOLL_V2_ENABLED == "1"`
+                // (gated through the `longPollEnabled` Boolean
+                // computed by the wire-up layer). The job runs in
+                // parallel with the legacy `pollJob` AND with the
+                // Direct WSS fast path; it never stops on
+                // `RestMode.WsActive` (unlike [pollLoop]) — see L3
+                // in `docs/tracks/trek2-stage2b-a-client-shell.md`.
+                if (longPollEnabled) {
+                    wsActivePollJob = scope.launch { wsActivePollLoop() }
+                    log("REST_TRACE ws_active_poll_started long_poll_enabled=true")
+                } else {
+                    log("REST_TRACE ws_active_poll_skipped long_poll_enabled=false")
+                }
+                log("REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled")
             }
-            // Caller-cancellation gate: if the caller was cancelled
-            // during the non-cancellable teardown, propagate the
-            // cancellation now BEFORE spawning new jobs so a
-            // cancelled re-arm cannot leave live workers behind.
-            currentCoroutineContext().ensureActive()
-            log("REST_TRACE poison_state_reset_on_start")
-            stateObserverJob = scope.launch {
-                stateMachine.state.collect { mode -> onModeChanged(mode) }
-            }
-            // Trek 2 Stage 2B-A (B3, L3) — spawn the parallel REST
-            // poll job iff `LONGPOLL_V2_ENABLED == "1"` (gated through
-            // the `longPollEnabled` Boolean computed by the wire-up
-            // layer). The job runs in parallel with the legacy
-            // `pollJob` AND with the Direct WSS fast path; it never
-            // stops on `RestMode.WsActive` (unlike [pollLoop]) — see
-            // L3 in `docs/tracks/trek2-stage2b-a-client-shell.md`.
-            if (longPollEnabled) {
-                wsActivePollJob = scope.launch { wsActivePollLoop() }
-                log("REST_TRACE ws_active_poll_started long_poll_enabled=true")
-            } else {
-                log("REST_TRACE ws_active_poll_skipped long_poll_enabled=false")
-            }
-            log("REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled")
         }
     }
 
     /**
      * Cancel all background jobs (poll loop, alive tick, state
      * observer) AND wait for each to fully unwind. Idempotent. The
-     * orchestrator can be re-armed by another [start] call.
+     * orchestrator can be re-armed by another [start] call (unless
+     * [close] was called — see [_closed]).
      *
-     * Trek 2 Stage 2B-B (C4 review-fix round 4 P1) — `stop()` is now
-     * `suspend` and runs under [_lifecycleMutex] so concurrent
-     * `start()` and `stop()` calls are serialised. The previous
-     * non-suspending shape nulled job-handle fields IMMEDIATELY on
-     * cancel — a concurrent `start()` re-reading the tail fields in
-     * Phase 2 of [cancelAndJoinAll] would see nulls and skip the
-     * join, while the cancelled job was still unwinding its
-     * `finally` blocks and could write stale state after the reset.
-     *
-     * Teardown runs under [NonCancellable] so a caller-cancellation
-     * cannot abort mid-stop and leak orphan jobs.
+     * Trek 2 Stage 2B-B (C4 review-fix round 4 P1, round 5 P1.1
+     * hardening) — `stop()` is `suspend` and the ENTIRE mutex hold
+     * (including the acquire itself) runs under [NonCancellable].
+     * Under round 4 only the body inside the mutex was non-
+     * cancellable; a caller cancelled while waiting for the mutex
+     * abandoned the cleanup entirely. With NonCancellable around
+     * the acquire the cleanup ALWAYS lands once the mutex is
+     * eventually free, regardless of caller cancellation state.
      */
     suspend fun stop() {
-        _lifecycleMutex.withLock {
-            withContext(NonCancellable) {
+        withContext(NonCancellable) {
+            _lifecycleMutex.withLock {
+                // Idempotent: after `close()` everything is already
+                // cancelled. Logging here avoids surprising the
+                // operator with a "stopped" trace on a dead
+                // orchestrator.
+                if (_closed) {
+                    return@withLock
+                }
                 cancelAndJoinAll()
             }
         }
@@ -568,21 +610,29 @@ class RestFallbackOrchestrator(
 
     /**
      * Fully tear down. After this the orchestrator is dead — construct a
-     * fresh instance to re-arm.
+     * fresh instance to re-arm. Subsequent [start] / [stop] calls
+     * become no-ops via the [_closed] terminal flag.
      *
-     * Trek 2 Stage 2B-B (C4 review-fix round 4 P1) — `close()` is now
-     * `suspend` and runs under [_lifecycleMutex] so it serialises
-     * with concurrent `start()` / `stop()` calls. Teardown runs
-     * under [NonCancellable] for the same reason as [stop]: caller
-     * cancellation must not be able to abort cleanup mid-way and
-     * leak orphan jobs.
+     * Trek 2 Stage 2B-B (C4 review-fix round 4 P1, round 5 P1.1
+     * hardening + round 5 P1.2 terminal flag) — `close()` is
+     * `suspend`; the ENTIRE mutex hold (including the acquire
+     * itself) runs under [NonCancellable]; the [_closed] flag is
+     * set BEFORE `scope.cancel()` so a concurrent `start()` that
+     * was queued on the same mutex sees the terminal state and
+     * skips spawning into a dying scope.
+     *
+     * Idempotent: a second `close()` is a no-op.
      */
     suspend fun close() {
-        _lifecycleMutex.withLock {
-            withContext(NonCancellable) {
+        withContext(NonCancellable) {
+            _lifecycleMutex.withLock {
+                if (_closed) {
+                    return@withLock
+                }
                 cancelAndJoinAll()
+                _closed = true
+                scope.cancel()
             }
-            scope.cancel()
         }
     }
 
@@ -2079,6 +2129,22 @@ class RestFallbackOrchestrator(
      */
     internal suspend fun <T> withInboundStateMutexHeldForTest(block: suspend () -> T): T =
         _inboundStateMutex.withLock { block() }
+
+    /**
+     * Trek 2 Stage 2B-B (C4 review-fix round 5 P2) — test-only seam
+     * that holds [_lifecycleMutex] for the duration of [block] so
+     * commonTest can deterministically force a concurrent [stop] /
+     * [start] to suspend on the lifecycle mutex acquire. Used by
+     * the round-5 cancelled-waiter regression pin: a `stop()`
+     * suspended on the mutex with its caller cancelled must still
+     * complete the teardown once the mutex frees, because the
+     * acquire itself runs under `withContext(NonCancellable)`.
+     *
+     * Visibility: `internal` — only the `:shared:core:transport`
+     * module's tests can call it.
+     */
+    internal suspend fun <T> withLifecycleMutexHeldForTest(block: suspend () -> T): T =
+        _lifecycleMutex.withLock { block() }
 
     /**
      * Public CAS facade for media token acquisition (PR-M1w).

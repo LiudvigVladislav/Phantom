@@ -1110,6 +1110,288 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
     }
 
+    // ── C4 review-fix round 5 P2 — reverse-order race + cancelled waiter + terminal close ─
+
+    @Test
+    fun p15_concurrent_stop_then_start_serializes_and_leaves_new_jobs_polling() = runTest {
+        // Round 5 P2.a: round-4's p14 fixed `start()` then `stop()`
+        // launch order. Reverse the order so the FIFO mutex queue
+        // serialises stop → start. After the race, the second
+        // `start()`'s body must have run (new observer + new
+        // `wsActivePollJob` spawned), so subsequent polling SHOULD
+        // resume — the opposite outcome to p14.
+        init()
+        val transport = PollLoopCountingTransport(
+            sessionScript = { _ ->
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = "",
+                    ), "{}", 1L,
+                )
+            },
+        )
+        val logLines = mutableListOf<String>()
+        val orch = buildOrchestratorWithPollLoops(
+            transport = transport, cursor = RecordingCursorRepo(),
+            scheduler = testScheduler, longPollEnabled = true,
+            logSink = { logLines += it },
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                ),
+            )
+        }
+        check(orch.stateMachine.state.value == RestMode.RestActive)
+
+        orch.start()
+        runCurrent()
+        repeat(5) {
+            advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+            runCurrent()
+        }
+        assertTrue(
+            transport.pollEnterCount >= 2,
+            "expected both loops to have polled at least once before the race; pollEnterCount=${transport.pollEnterCount}",
+        )
+
+        // REVERSE launch order: stop FIRST, start SECOND. Under
+        // FIFO mutex resume, stop acquires first; start queues
+        // behind. After stop completes (cancels all jobs), start
+        // runs (resets state + spawns new observer + new
+        // wsActivePollJob). Net effect: the orchestrator is alive
+        // again after the race.
+        val stopJob = launch { orch.stop() }
+        val startJob = launch { orch.start() }
+        advanceTimeBy(60_000L)
+        runCurrent()
+        stopJob.join()
+        startJob.join()
+
+        // The second start ran: assert by counting
+        // `poison_state_reset_on_start` logs (one before race + one
+        // from the second start = two total).
+        val resetLogs = logLines.count { it.contains("poison_state_reset_on_start") }
+        assertEquals(
+            2, resetLogs,
+            "second start under FIFO must have logged a reset; got $resetLogs total reset logs",
+        )
+
+        // Polling SHOULD resume after the race — proves the second
+        // start's spawn block ran (caller-cancel gate did not fire,
+        // _closed did not fire, capability still enabled).
+        val pollCountAfterRace = transport.pollEnterCount
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS * 5L)
+        runCurrent()
+        assertTrue(
+            transport.pollEnterCount > pollCountAfterRace,
+            "after stop→start race, polling MUST resume (the second start's spawn block ran). " +
+                "Got before=$pollCountAfterRace, after=${transport.pollEnterCount}.",
+        )
+
+        // Clean up.
+        orch.stop()
+        runCurrent()
+    }
+
+    @Test
+    fun p15_cancelled_stop_waiter_completes_cleanup_after_mutex_release() = runTest {
+        // Round 5 P1.1 regression pin: the lifecycle mutex acquire
+        // itself must run under NonCancellable. Under round 4 a
+        // `stop()` suspended waiting for the lifecycle mutex would
+        // ABORT entirely if its caller was cancelled — the cleanup
+        // never ran. Under round 5 the acquire-then-cleanup
+        // sequence is all under NonCancellable; once the mutex
+        // frees, the teardown runs regardless of caller cancel
+        // state.
+        init()
+        val transport = PollLoopCountingTransport(
+            sessionScript = { _ ->
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = "",
+                    ), "{}", 1L,
+                )
+            },
+        )
+        val orch = buildOrchestratorWithPollLoops(
+            transport = transport, cursor = RecordingCursorRepo(),
+            scheduler = testScheduler, longPollEnabled = true,
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                ),
+            )
+        }
+        orch.start()
+        runCurrent()
+        repeat(5) {
+            advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+            runCurrent()
+        }
+        val pollCountBeforeRace = transport.pollEnterCount
+        assertTrue(
+            pollCountBeforeRace >= 2,
+            "expected both loops alive before race; got pollEnterCount=$pollCountBeforeRace",
+        )
+
+        // Hold the lifecycle mutex externally so the stop() suspends
+        // on the acquire.
+        val release = CompletableDeferred<Unit>()
+        val holder = launch {
+            orch.withLifecycleMutexHeldForTest { release.await() }
+        }
+        runCurrent()
+
+        // stop() suspends on the lifecycle mutex acquire.
+        val stopCompleted = CompletableDeferred<Unit>()
+        val stopCaller = launch {
+            orch.stop()
+            stopCompleted.complete(Unit)
+        }
+        runCurrent()
+        assertFalse(
+            stopCompleted.isCompleted,
+            "stop() should still be suspended waiting for the externally-held lifecycle mutex",
+        )
+
+        // Cancel the stop's caller WHILE IT WAITS on the mutex.
+        // Under round 4 this would abort the stop entirely.
+        stopCaller.cancel()
+        runCurrent()
+        assertFalse(
+            stopCompleted.isCompleted,
+            "stop() body has not started yet (still waiting on mutex)",
+        )
+
+        // Release the holder. Now the mutex frees; the cancelled
+        // stop()'s NonCancellable-wrapped acquire proceeds; the
+        // teardown runs to completion.
+        release.complete(Unit)
+        holder.join()
+        runCurrent()
+        // Drain in case cancelAndJoinAll has any virtual-time work.
+        advanceTimeBy(1_000L)
+        runCurrent()
+
+        assertTrue(
+            stopCompleted.isCompleted,
+            "stop() body ran to completion AFTER mutex release, even though its caller was cancelled — " +
+                "proves the mutex acquire is under NonCancellable",
+        )
+
+        // Polling has stopped (jobs were cancelled + joined by the
+        // cleanup that proceeded despite caller cancellation).
+        val pollCountAfterCleanup = transport.pollEnterCount
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS * 50L)
+        runCurrent()
+        assertEquals(
+            pollCountAfterCleanup,
+            transport.pollEnterCount,
+            "after cancelled-waiter stop ran cleanup, pollEnterCount MUST be static. " +
+                "A diff means cleanup did NOT run — the cancellation aborted the stop, OR mutex acquire is still cancellable.",
+        )
+    }
+
+    @Test
+    fun p15_start_after_close_is_terminal_noop_no_new_jobs_spawned() = runTest {
+        // Round 5 P1.2 regression pin: `close()` is terminal. A
+        // subsequent `start()` MUST NOT spawn new jobs into the
+        // cancelled scope; under round 4 it would happily `launch
+        // { ... }` and the resulting jobs died immediately, leaving
+        // log noise and a misleading `orchestrator_started` trace.
+        init()
+        val transport = PollLoopCountingTransport(
+            sessionScript = { _ ->
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = "",
+                    ), "{}", 1L,
+                )
+            },
+        )
+        val logLines = mutableListOf<String>()
+        val orch = buildOrchestratorWithPollLoops(
+            transport = transport, cursor = RecordingCursorRepo(),
+            scheduler = testScheduler, longPollEnabled = true,
+            logSink = { logLines += it },
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                ),
+            )
+        }
+        orch.start()
+        runCurrent()
+        repeat(5) {
+            advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+            runCurrent()
+        }
+        val pollCountBeforeClose = transport.pollEnterCount
+
+        // Terminal close.
+        orch.close()
+        runCurrent()
+        advanceTimeBy(1_000L)
+        runCurrent()
+
+        // Idempotent: second close is a no-op.
+        orch.close()
+        runCurrent()
+
+        // Re-arm attempt MUST be a no-op (terminal flag).
+        val resetLogsBeforeReArm = logLines.count { it.contains("poison_state_reset_on_start") }
+        orch.start()
+        runCurrent()
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS * 50L)
+        runCurrent()
+
+        val resetLogsAfterReArm = logLines.count { it.contains("poison_state_reset_on_start") }
+        assertEquals(
+            resetLogsBeforeReArm,
+            resetLogsAfterReArm,
+            "start() after close() MUST NOT log `poison_state_reset_on_start`. " +
+                "Got before=$resetLogsBeforeReArm, after=$resetLogsAfterReArm.",
+        )
+        assertTrue(
+            logLines.any { it.contains("orchestrator_start_skipped") && it.contains("reason=closed") },
+            "start() after close() MUST log `orchestrator_start_skipped reason=closed`. " +
+                "Captured logs:\n${logLines.takeLast(10).joinToString("\n")}",
+        )
+        // No new poll calls happened — proves no new pollJob /
+        // wsActivePollJob was spawned.
+        assertEquals(
+            pollCountBeforeClose,
+            transport.pollEnterCount,
+            "start() after close() MUST NOT spawn new poll jobs. " +
+                "Got pollEnterCount before=$pollCountBeforeClose after=${transport.pollEnterCount}.",
+        )
+
+        // stop() after close() is also a no-op (idempotent).
+        orch.stop()
+        runCurrent()
+    }
+
     /**
      * Transport that returns empty poll responses + counts poll
      * calls; used by the real two-loop tests below. Distinct from
