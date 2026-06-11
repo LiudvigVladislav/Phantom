@@ -145,6 +145,17 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         val statusCode: Int,
         val rawBody: String,
         val elapsedMs: Long,
+        /**
+         * Trek 2 Stage 2B-B (C5, L8 + M-B24) — parsed `Retry-After`
+         * header value in seconds. `null` when absent / malformed
+         * (HTTP-date form, non-numeric, empty, zero, negative — all
+         * normalised to `null` by
+         * [RestFallbackOrchestrator.parseRetryAfterHeader]). The
+         * orchestrator clamps to `RETRY_AFTER_HARD_CAP_SECONDS = 120`
+         * before multiplying by 1_000L (see
+         * [RestFallbackOrchestrator.clampRetryAfterMs]).
+         */
+        val retryAfterSeconds: Long? = null,
     )
 
     private fun post(
@@ -185,11 +196,24 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         client.newCall(request).execute().use { response: Response ->
             val raw = response.body?.string() ?: ""
             val elapsedMs = System.currentTimeMillis() - startMs
+            // Trek 2 Stage 2B-B (C5, L8) — parse `Retry-After` INSIDE
+            // the `.use { }` block. OkHttp's `Response.header(name)`
+            // returns the value verbatim; the parse normalises
+            // malformed inputs to `null`. The orchestrator clamps
+            // the typed value to `RETRY_AFTER_HARD_CAP_SECONDS = 120`
+            // before multiplying by 1_000L (see
+            // `RestFallbackOrchestrator.clampRetryAfterMs`). Reading
+            // the header here is cheap and avoids surfacing the raw
+            // OkHttp Response object outside the `.use { }` boundary.
+            val retryAfterSeconds = RestFallbackOrchestrator.parseRetryAfterHeader(
+                response.header("Retry-After"),
+            )
             // Status log INSIDE use{} per PR-R0.3 guardrail.
             return RawResponse(
                 statusCode = response.code,
                 rawBody = raw,
                 elapsedMs = elapsedMs,
+                retryAfterSeconds = retryAfterSeconds,
             )
         }
     }
@@ -214,6 +238,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
             bodyParsed = parsed,
             rawBody = raw.rawBody,
             elapsedMs = raw.elapsedMs,
+            retryAfterSeconds = raw.retryAfterSeconds,
         )
     }
 

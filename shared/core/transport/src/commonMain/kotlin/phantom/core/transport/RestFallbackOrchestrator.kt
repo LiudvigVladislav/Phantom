@@ -815,16 +815,45 @@ class RestFallbackOrchestrator(
                 in 500..599, 408, 429 -> {
                     lastReason = "retryable_status_${response.statusCode}"
                     if (attempt < SEND_MAX_ATTEMPTS) {
-                        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30):
-                        // jittered backoff per the design note shape.
-                        val nominalDelay = delayForRetry(attempt)
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        // Trek 2 Stage 2B-B (C5, L8 + M-B24) — on 429
+                        // the relay may advertise a `Retry-After`
+                        // value. Honour it but clamp at
+                        // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
+                        // multiplying by 1_000L (see
+                        // `clampRetryAfterMs`). The clamp is
+                        // overflow-safe: a hostile relay sending
+                        // `Retry-After: 86400` (one day) cannot lock
+                        // the client out for a day, and no input
+                        // value can overflow `Long` arithmetic.
+                        // For 5xx / 408 / 429-without-Retry-After we
+                        // fall back to the existing jittered
+                        // `delayForRetry(attempt)` budget.
+                        val clampedRetryAfterMs = if (response.statusCode == 429) {
+                            clampRetryAfterMs(response.retryAfterSeconds)
+                        } else {
+                            null
+                        }
+                        val (nominalDelay, jitteredDelay) = if (clampedRetryAfterMs != null) {
+                            // Honour `Retry-After` verbatim (post-
+                            // clamp). No jitter applied — the relay
+                            // has explicitly requested this beat;
+                            // herding is not a concern because the
+                            // relay's wait suggestion is its scheduling
+                            // discipline.
+                            clampedRetryAfterMs to clampedRetryAfterMs
+                        } else {
+                            // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30):
+                            // jittered backoff per the design note shape.
+                            val nominal = delayForRetry(attempt)
+                            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                            nominal to (nominal * jitterFactor).toLong()
+                        }
                         log(
                             "REST_TRACE send_retry id=${envelopeId.take(8)} " +
                                 "reason=$lastReason attempt=$attempt " +
                                 "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay " +
-                                "status=${response.statusCode}",
+                                "status=${response.statusCode} " +
+                                "retry_after_secs=${response.retryAfterSeconds ?: -1L}",
                         )
                         delay(jitteredDelay)
                         continue
@@ -1314,6 +1343,32 @@ class RestFallbackOrchestrator(
                     }
                     delay(intervalMs)
                 }
+                429 -> {
+                    // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour
+                    // the relay's `Retry-After` header, clamped to
+                    // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
+                    // multiplying by 1_000L. Falls back to the
+                    // existing intervalMs/POLL_FAIL_BACKOFF_MS
+                    // jittered backoff when the header is absent or
+                    // malformed.
+                    val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
+                    val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
+                        // No jitter — the relay's scheduling
+                        // suggestion is its own discipline.
+                        clampedRetryAfterMs to clampedRetryAfterMs
+                    } else {
+                        val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        nominal to (nominal * jitterFactor).toLong()
+                    }
+                    log(
+                        "REST_TRACE poll_429 elapsedMs=$elapsed " +
+                            "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
+                            "retry_after_secs=${response.retryAfterSeconds ?: -1L} " +
+                            "loop=pollLoop",
+                    )
+                    delay(effectiveDelay)
+                }
                 else -> {
                     // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
                     // backoff. Server-unexpected-status retries can herd
@@ -1477,6 +1532,30 @@ class RestFallbackOrchestrator(
                     "REST_TRACE ws_active_poll_unauthorised status=401 " +
                         "elapsedMs=$elapsed — will refresh token",
                 )
+                continue
+            }
+            if (response.statusCode == 429) {
+                // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour the
+                // relay's `Retry-After` header, clamped to
+                // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
+                // multiplying by 1_000L. Falls back to the existing
+                // jittered backoff when the header is absent or
+                // malformed. Same shape as the legacy `pollLoop`'s
+                // 429 branch.
+                val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
+                val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
+                    clampedRetryAfterMs to clampedRetryAfterMs
+                } else {
+                    val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    nominal to (nominal * jitterFactor).toLong()
+                }
+                log(
+                    "REST_TRACE ws_active_poll_429 elapsedMs=$elapsed " +
+                        "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
+                        "retry_after_secs=${response.retryAfterSeconds ?: -1L}",
+                )
+                delay(effectiveDelay)
                 continue
             }
             if (response.statusCode !in 200..299 || response.bodyParsed == null) {
@@ -2451,6 +2530,135 @@ class RestFallbackOrchestrator(
          * leak more bad-MAC outcomes before recovery.
          */
         const val MAC_REPEAT_REFRESH_THRESHOLD: Int = 2
+
+        // ── Trek 2 Stage 2B-B (C5, L8 + L9 + D11) — breaker constants ────
+
+        /**
+         * L9 — N consecutive REST poll failures before the breaker
+         * trips to [LongPollBreakerState.Open] with reason
+         * [BreakerOpenReason.ConsecutiveRestFailures]. Mirrors the
+         * existing [SEND_MAX_ATTEMPTS] send-side budget.
+         */
+        const val BREAKER_CONSECUTIVE_FAIL_THRESHOLD: Int = 5
+
+        /**
+         * L9 — initial cooldown for [LongPollBreakerState.Open] from
+         * a [BreakerOpenReason.ConsecutiveRestFailures] trigger.
+         * Matches [POLL_FAIL_BACKOFF_MS].
+         */
+        const val BREAKER_INITIAL_COOLDOWN_MS: Long = 5_000L
+
+        /**
+         * L9 — growth factor on failed half-open probe. The next
+         * cooldown is
+         * `min(currentCooldownMs * BREAKER_COOLDOWN_GROWTH_FACTOR, BREAKER_COOLDOWN_CEILING_MS)`.
+         */
+        const val BREAKER_COOLDOWN_GROWTH_FACTOR: Double = 2.0
+
+        /**
+         * L9 + D11 — hard ceiling on any breaker cooldown regardless
+         * of growth factor. A relay-derived signal cannot push the
+         * cooldown above this value.
+         */
+        const val BREAKER_COOLDOWN_CEILING_MS: Long = 120_000L
+
+        /**
+         * L8 + L9 — K consecutive `410 Gone` responses within
+         * [BREAKER_410_STORM_WINDOW_MS] trips the breaker to
+         * [LongPollBreakerState.Open] with reason
+         * [BreakerOpenReason.Status410Storm].
+         */
+        const val BREAKER_410_STORM_THRESHOLD: Int = 3
+
+        /**
+         * L8 + L9 — wall-clock window in milliseconds within which
+         * [BREAKER_410_STORM_THRESHOLD] 410s constitute a storm.
+         * Mirrors the L8 "three consecutive 410s within 30 s →
+         * ceiling" trigger so the breaker and L8 fire on the same
+         * condition.
+         */
+        const val BREAKER_410_STORM_WINDOW_MS: Long = 30_000L
+
+        /**
+         * L8 + L9 — cooldown for a [BreakerOpenReason.Status410Storm]
+         * opening. Matches the L8 410-reauth-interval ceiling so the
+         * breaker exit timer aligns with the L8 backoff exit timer.
+         */
+        const val BREAKER_410_STORM_COOLDOWN_MS: Long = 60_000L
+
+        /**
+         * L9 — number of probe polls issued per
+         * [LongPollBreakerState.HalfOpen] entry. Exactly one. The
+         * permit is enforced by the `probeInFlight` Boolean under
+         * `_inboundStateMutex`; the constant exists so the M-B18
+         * pin can grep-match the value.
+         */
+        const val BREAKER_HALFOPEN_PROBE_BUDGET: Int = 1
+
+        /**
+         * L8 + D11 + M-B24 — hard cap on a relay-supplied
+         * `Retry-After` header value, in seconds. The orchestrator
+         * clamps `retryAfterSeconds` to this value BEFORE multiplying
+         * by 1_000L so the multiplication can never overflow `Long`
+         * regardless of the advertised value, AND a misconfigured or
+         * hostile relay sending `Retry-After: 86400` (one day) cannot
+         * lock the client out for a day. 120 s matches
+         * [BREAKER_COOLDOWN_CEILING_MS] expressed in seconds — the
+         * 429 cap and the breaker cap share one ceiling.
+         */
+        const val RETRY_AFTER_HARD_CAP_SECONDS: Long = 120L
+
+        /**
+         * Trek 2 Stage 2B-B (C5, M-B24) — clamp a relay-supplied
+         * `Retry-After` value (already parsed to seconds; `null` when
+         * absent / malformed) to a safe millisecond delay.
+         *
+         * Returns `null` when [retryAfterSeconds] is `null` so the
+         * caller can fall back to its own backoff. Returns the
+         * milliseconds delay equal to
+         * `retryAfterSeconds.coerceAtMost(RETRY_AFTER_HARD_CAP_SECONDS) * 1000L`
+         * when the value is non-null.
+         *
+         * Clamping FIRST then multiplying is load-bearing:
+         * `Long.MAX_VALUE * 1000L` would overflow, but
+         * `120L * 1000L` is safe. The clamp must run on the seconds
+         * value, not on the milliseconds value, because the wire
+         * value arrives in seconds and the overflow risk is on the
+         * multiplication.
+         *
+         * Pure function so M-B24's overflow-safety sub-cell can
+         * exercise the clamp with `Long.MAX_VALUE` without standing
+         * up a transport.
+         */
+        fun clampRetryAfterMs(retryAfterSeconds: Long?): Long? {
+            if (retryAfterSeconds == null) return null
+            val clamped = retryAfterSeconds.coerceAtMost(RETRY_AFTER_HARD_CAP_SECONDS)
+            return clamped * 1_000L
+        }
+
+        /**
+         * Trek 2 Stage 2B-B (C5, L8) — parse a raw `Retry-After`
+         * header value into a non-negative `Long` seconds count, or
+         * `null` for any malformed or non-numeric input.
+         *
+         * Normalisation rules (M-B24 sub-cell (b)):
+         *   * `null` / empty / whitespace-only → `null`.
+         *   * Non-numeric (HTTP-date form, alphabetic, mixed) → `null`.
+         *   * Negative or zero → `null` (callers fall back to their
+         *     own backoff rather than poll the relay immediately).
+         *   * Non-negative integer → the parsed value.
+         *
+         * Kept on the companion so the Android transport's parse
+         * path and tests share one source of truth. Per scope §L8
+         * the orchestrator clamps the parsed value via
+         * [clampRetryAfterMs] before applying it.
+         */
+        fun parseRetryAfterHeader(rawHeader: String?): Long? {
+            if (rawHeader.isNullOrBlank()) return null
+            val parsed = rawHeader.trim().toLongOrNull() ?: return null
+            if (parsed <= 0L) return null
+            return parsed
+        }
 
         private fun defaultNowMs(): Long =
             kotlinx.datetime.Clock.System.now().toEpochMilliseconds()
