@@ -363,11 +363,50 @@ class RestFallbackOrchestratorPollLoopTest {
             pumpIterations += 1
         }
 
+        // C3 review-fix round 3 (P3) — the barrier alone proves
+        // TWO concurrent poll coroutines, but NOT that they
+        // originated as the legacy `pollLoop` and the parallel
+        // `wsActivePollLoop` respectively (a regression that
+        // mistakenly spawned the same loop twice would also resolve
+        // the barrier). Pin loop ORIGIN by asserting BOTH
+        // distinctive `REST_TRACE` log prefixes appear:
+        //
+        //   * `poll_call ` — emitted ONLY by the legacy `pollLoop`.
+        //   * `ws_active_poll_call ` — emitted ONLY by the parallel
+        //     `wsActivePollLoop`.
+        assertTrue(
+            logLines.any { it.contains("REST_TRACE poll_call ") },
+            "legacy pollLoop did not fire a `REST_TRACE poll_call ` log; " +
+                "captured ${logLines.size} log lines:\n${logLines.takeLast(20).joinToString("\n")}",
+        )
+        assertTrue(
+            logLines.any { it.contains("REST_TRACE ws_active_poll_call ") },
+            "parallel wsActivePollLoop did not fire a `REST_TRACE ws_active_poll_call ` log; " +
+                "captured ${logLines.size} log lines:\n${logLines.takeLast(20).joinToString("\n")}",
+        )
+
         // Tear down explicitly so leaked coroutines surface in this
         // test rather than masking failures of later tests.
         orch.stop()
         collectorJob.cancel()
         runCurrent()
+
+        // C3 review-fix round 3 (P3) — post-stop poll-count freeze:
+        // verify that both poll jobs are actually quiesced after
+        // `stop()`. We snapshot the count, advance virtual time, and
+        // assert the count did NOT grow. A regression that failed
+        // to cancel one or both jobs would surface here as extra
+        // poll calls landing during the post-stop time window.
+        val pollCountAtStop = transport.pollEnterCount
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS * 10L)
+        runCurrent()
+        assertEquals(
+            pollCountAtStop,
+            transport.pollEnterCount,
+            "poll count must not grow after `stop()`. Got $pollCountAtStop before " +
+                "advancing time, ${transport.pollEnterCount} after. A leaked poll " +
+                "job is the most likely cause.",
+        )
 
         // Teardown invariants — neither poll loop nor the inbound
         // collector remains active.
@@ -444,6 +483,27 @@ class RestFallbackOrchestratorPollLoopTest {
         orch.start()
         runCurrent()
 
+        // C3 review-fix round 3 (P2) — pin the load-bearing
+        // invariant: the FAILED-read iteration MUST NOT have called
+        // `transport.poll(...)`. Without this check, the previous
+        // round's test only asserted recovery; it could have passed
+        // even if the loop had blindly polled with `since_seq=null`
+        // on the failed iteration.
+        assertEquals(
+            0,
+            transport.pollEnterCount,
+            "failed cursor-read iteration MUST NOT call transport.poll(...). " +
+                "Got pollEnterCount=${transport.pollEnterCount} after " +
+                "the initial runCurrent (before any backoff advancement).",
+        )
+        // The skip path's log fires at the failed iteration.
+        assertTrue(
+            logLines.any { it.contains("poll_call_skipped") && it.contains("cursor_read_fail") },
+            "expected `poll_call_skipped reason=cursor_read_fail` log AFTER the " +
+                "failed iteration but BEFORE backoff advancement; got:\n" +
+                logLines.joinToString("\n"),
+        )
+
         // Pump time across the backoff + next iteration. The skip
         // path uses POLL_FAIL_BACKOFF_MS = 5_000 ms; the recovery
         // iteration adds another poll cadence. Generous budget.
@@ -460,15 +520,13 @@ class RestFallbackOrchestratorPollLoopTest {
 
         assertTrue(!collectorJob.isActive, "inbound collector must be torn down")
         assertTrue(readCallCount >= 2, "cursor read retried after initial failure")
-        // The skipped iteration logged the discriminating reason.
-        assertTrue(
-            logLines.any { it.contains("poll_call_skipped") && it.contains("cursor_read_fail") },
-            "expected `poll_call_skipped reason=cursor_read_fail` log; got:\n" +
-                logLines.joinToString("\n"),
-        )
         // The recovery iteration actually polled and got the envelope.
         assertEquals(1, received.size, "exactly one envelope received after recovery")
         assertEquals(11L, received.single().seq)
+        assertTrue(
+            transport.pollEnterCount >= 1,
+            "recovery iteration must have polled; pollEnterCount=${transport.pollEnterCount}",
+        )
     }
 
     @Test
@@ -515,6 +573,22 @@ class RestFallbackOrchestratorPollLoopTest {
         orch.start()
         runCurrent()
 
+        // C3 review-fix round 3 (P2) — same load-bearing invariant
+        // as the legacy-loop test above: a failed cursor read MUST
+        // NOT call `transport.poll(...)` for that iteration.
+        assertEquals(
+            0,
+            transport.pollEnterCount,
+            "failed wsActive cursor-read iteration MUST NOT call transport.poll(...). " +
+                "Got pollEnterCount=${transport.pollEnterCount} after the initial runCurrent.",
+        )
+        assertTrue(
+            logLines.any { it.contains("ws_active_poll_call_skipped") && it.contains("cursor_read_fail") },
+            "expected `ws_active_poll_call_skipped reason=cursor_read_fail` log " +
+                "AFTER the failed iteration but BEFORE backoff; got:\n" +
+                logLines.joinToString("\n"),
+        )
+
         var pumpIterations = 0
         while (received.isEmpty() && pumpIterations < 20) {
             advanceTimeBy(RestFallbackOrchestrator.POLL_FAIL_BACKOFF_MS + 1_000L)
@@ -528,12 +602,163 @@ class RestFallbackOrchestratorPollLoopTest {
 
         assertTrue(!collectorJob.isActive, "inbound collector must be torn down")
         assertTrue(readCallCount >= 2)
-        assertTrue(
-            logLines.any { it.contains("ws_active_poll_call_skipped") && it.contains("cursor_read_fail") },
-            "expected `ws_active_poll_call_skipped reason=cursor_read_fail` log; got:\n" +
-                logLines.joinToString("\n"),
-        )
         assertEquals(1, received.size)
         assertEquals(13L, received.single().seq)
+        assertTrue(
+            transport.pollEnterCount >= 1,
+            "recovery iteration must have polled; pollEnterCount=${transport.pollEnterCount}",
+        )
+    }
+
+    // ── P1 review-fix round 3 — cancellation-safe emit + generation token ───
+
+    @Test
+    fun emit_cancellation_during_backpressure_rolls_back_own_pending_mapping() = runTest {
+        // Load-bearing scenario for the C3-round-3 generation-token
+        // emit cleanup: a cancellation during a suspended emit MUST
+        // remove the just-inserted `_pendingSeqForAck` entry so the
+        // mapping does not leak past orchestrator restart.
+        //
+        // Setup: register a NON-CONSUMING subscriber so the
+        // SharedFlow buffer fills. Emit through the cancel-safe
+        // helper from a dedicated coroutine; let it land in the
+        // suspend; cancel; assert the mapping is gone.
+        val transport = MultiLoopFakeTransport().apply { sessionScript = { SESSION_RESPONSE_OK } }
+        val cursor = MonotonicCursorRepo()
+        val orch = buildOrchestrator(
+            transport, cursor,
+            scheduler = testScheduler,
+            longPollEnabled = false,
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+
+        // Non-consuming subscriber holds the first emission; the
+        // SharedFlow's extraBufferCapacity = 32 fills with the next
+        // emissions; the 33rd suspends.
+        val nonConsumer = launch {
+            orch.inbound.collect {
+                kotlinx.coroutines.awaitCancellation()
+            }
+        }
+        runCurrent()
+
+        // Fill the buffer to backpressure. Each helper call inserts
+        // mapping + emits; the first call's emit is held by the
+        // subscriber; the next 32 fill the buffer; the 34th emit
+        // suspends.
+        val targetEnvelope = pollEnvelope(7L)
+        repeat(33) { i ->
+            orch.emitWithCancellationSafeRollbackForTest(pollEnvelope((1000 + i).toLong()))
+        }
+        runCurrent()
+
+        // The trial emit that will suspend on backpressure.
+        val emitJob = launch {
+            try {
+                orch.emitWithCancellationSafeRollbackForTest(targetEnvelope)
+                fail("expected CancellationException — buffer should be full")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // Expected.
+            }
+        }
+        runCurrent()
+
+        // Mapping should be in place before cancellation.
+        assertEquals(
+            7L,
+            orch.peekPendingSeqForAckForTest(targetEnvelope.id),
+            "mapping must be inserted under _inboundStateMutex BEFORE the emit suspends",
+        )
+
+        // Cancel the suspended emit.
+        emitJob.cancel()
+        runCurrent()
+
+        // The cancel-safe rollback must have removed the mapping
+        // (no other loop overwrote it, so the generation token
+        // still matches).
+        assertEquals(
+            null,
+            orch.peekPendingSeqForAckForTest(targetEnvelope.id),
+            "cancelled emit must roll back its own (env.id, seq) mapping",
+        )
+
+        nonConsumer.cancel()
+        runCurrent()
+    }
+
+    @Test
+    fun emit_cancellation_does_not_remove_other_loops_overwritten_mapping() = runTest {
+        // The CONCURRENT scenario the generation token guards:
+        //   * Loop A inserts (env-X, 7L, gen=A); emit suspends on
+        //     backpressure.
+        //   * Loop B (simulated here via `primePendingSeqForAckForTest`)
+        //     overwrites (env-X, 7L, gen=B); B's emit succeeds.
+        //   * Loop A is cancelled.
+        //   * A's rollback inspects the entry, sees the generation
+        //     does NOT match A's; LEAVES B's mapping intact.
+        //
+        // Without the generation guard, A's blanket
+        // `_pendingSeqForAck.remove(env.id)` would delete B's
+        // correct mapping; the consumer's ack would find a null and
+        // never advance the cursor.
+        val transport = MultiLoopFakeTransport().apply { sessionScript = { SESSION_RESPONSE_OK } }
+        val cursor = MonotonicCursorRepo()
+        val orch = buildOrchestrator(
+            transport, cursor,
+            scheduler = testScheduler,
+            longPollEnabled = false,
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+
+        val nonConsumer = launch {
+            orch.inbound.collect { kotlinx.coroutines.awaitCancellation() }
+        }
+        runCurrent()
+
+        // Fill the buffer.
+        repeat(33) { i ->
+            orch.emitWithCancellationSafeRollbackForTest(pollEnvelope((1000 + i).toLong()))
+        }
+        runCurrent()
+
+        val targetEnvelope = pollEnvelope(7L)
+        // Loop A's emit (will suspend on backpressure).
+        val loopAEmitJob = launch {
+            try {
+                orch.emitWithCancellationSafeRollbackForTest(targetEnvelope)
+                fail("Loop A emit should suspend then cancel")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // Expected.
+            }
+        }
+        runCurrent()
+
+        // Loop A has inserted (env-7, 7L, gen=A). Verify.
+        assertEquals(7L, orch.peekPendingSeqForAckForTest(targetEnvelope.id))
+
+        // Loop B overwrites with a FRESH generation (the prime seam
+        // increments the counter). The peeked seq stays 7L but the
+        // generation changes — A's rollback will detect this.
+        orch.primePendingSeqForAckForTest(targetEnvelope.id, 7L)
+        runCurrent()
+
+        // Cancel Loop A.
+        loopAEmitJob.cancel()
+        runCurrent()
+
+        // Load-bearing assertion: B's mapping survives A's rollback
+        // because the generation guard caught the mismatch.
+        assertEquals(
+            7L,
+            orch.peekPendingSeqForAckForTest(targetEnvelope.id),
+            "Loop B's mapping (overwriter) MUST NOT be removed by Loop A's cancel-rollback. " +
+                "The generation guard differentiates A's attempt from B's.",
+        )
+
+        nonConsumer.cancel()
+        runCurrent()
     }
 }

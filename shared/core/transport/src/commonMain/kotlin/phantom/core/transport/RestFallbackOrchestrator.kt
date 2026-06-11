@@ -216,28 +216,50 @@ class RestFallbackOrchestrator(
     private val _inboundStateMutex = Mutex()
 
     /**
-     * Trek 2 Stage 2B-B (C3, L3) — in-memory `envelope_id → seq`
-     * mapping populated at the orchestrator's emit site, before
-     * `_inbound.emit(env)`. Consumed exactly once per envelope by
+     * Trek 2 Stage 2B-B (C3, L3) — in-memory `envelope_id → (seq, generation)`
+     * mapping populated at the orchestrator's emit site BEFORE
+     * `_inbound.emit(env)`. The generation token, incremented under
+     * [_inboundStateMutex] on every insertion, lets the emit-side
+     * cancellation cleanup (see [emitWithCancellationSafeRollback])
+     * differentiate "MY suspended attempt was cancelled and the entry
+     * is still mine to remove" from "another loop's emit landed and
+     * overwrote my entry with their own attempt — leave their mapping
+     * intact." Without the generation guard, a cancel-during-emit
+     * rollback could delete a concurrent loop's CORRECT mapping for
+     * the same envelope id (relay redelivery scenario across the two
+     * REST poll loops), and the consumer's ack would not advance the
+     * cursor.
+     *
+     * Consumed exactly once per envelope by
      * [ackInboundAndAdvanceCursor]: read inside `_inboundStateMutex`
      * to snapshot the pending seq, then removed in the cleanup
      * `finally` block regardless of cursor-write success/failure.
      *
      * **Single insertion point.** The map is populated ONLY from the
-     * orchestrator's poll loops (legacy [pollLoop] + Stage 2B-A
-     * `wsActivePollLoop`). The consumer (`HybridRelayTransport.handleRestInbound`)
-     * is NOT a co-author — it reads the envelope and eventually
-     * triggers `ackInboundAndAdvanceCursor` via `sendDeliveryAck`,
-     * which reads (and removes) the entry. A future caller that wants
-     * to advance the cursor for an envelope that never came through
-     * the poll loops has no path here and must use a different
-     * mechanism.
+     * orchestrator's poll loops (legacy [pollLoop] +
+     * `wsActivePollLoop`), each via
+     * [emitWithCancellationSafeRollback]. The consumer
+     * (`HybridRelayTransport.handleRestInbound`) is NOT a co-author —
+     * it reads the envelope and eventually triggers
+     * `ackInboundAndAdvanceCursor` via `sendDeliveryAck`, which reads
+     * (and removes) the entry.
      *
      * The map is purely in-memory: on orchestrator restart it is
      * empty; pending envelopes re-arrive on the next poll. Access is
      * serialised through [_inboundStateMutex].
      */
-    private val _pendingSeqForAck: MutableMap<String, Long> = mutableMapOf()
+    private data class PendingEntry(val seq: Long, val generation: Long)
+    private val _pendingSeqForAck: MutableMap<String, PendingEntry> = mutableMapOf()
+
+    /**
+     * Generation counter for [_pendingSeqForAck] insertions. Always
+     * incremented under [_inboundStateMutex] before assignment so
+     * every (envelope_id, attempt) pair carries a strictly-increasing
+     * token. The token is used by the cancel-safe emit cleanup to
+     * detect whether another loop has overwritten the entry; see the
+     * [_pendingSeqForAck] kdoc.
+     */
+    private var _emitGenerationCounter: Long = 0L
 
     private var sessionToken: String? = null
     private var tokenExpiresAt: Long = 0L
@@ -717,10 +739,11 @@ class RestFallbackOrchestrator(
         var wasCancelled = false
         try {
             // Phase 1 — mutex held (cancellable, first suspension point):
-            // snapshot the pending seq. Read-only; the remove happens
-            // in the Phase 3 cleanup under the same mutex.
+            // snapshot the pending seq from the (seq, generation)
+            // entry. Read-only; the remove happens in the Phase 3
+            // cleanup under the same mutex.
             pendingSeq = _inboundStateMutex.withLock {
-                _pendingSeqForAck[envelopeId]
+                _pendingSeqForAck[envelopeId]?.seq
             }
             if (pendingSeq == null) {
                 // The relay ack succeeded but the orchestrator never
@@ -991,18 +1014,16 @@ class RestFallbackOrchestrator(
                                 "from=${env.fromHex.take(8)} elapsedMs=$elapsed more=${parsed.more}",
                         )
                         lastInboundOrSendAtMs = now()
-                        // L3 Step 1 — single insertion point for the
-                        // pending-seq mapping. Populated BEFORE
-                        // emitting so the consumer (`HybridRelayTransport`)
-                        // can rely on `ackInboundAndAdvanceCursor`
-                        // finding the seq when the consumer's
-                        // `sendDeliveryAck` lands. The map is gated
-                        // by `_inboundStateMutex` for concurrent
-                        // access from both poll loops.
-                        _inboundStateMutex.withLock {
-                            _pendingSeqForAck[env.id] = env.seq
-                        }
-                        _inbound.emit(env)
+                        // L3 Step 1 — single insertion point via the
+                        // cancel-safe helper. Inserts the mapping
+                        // under `_inboundStateMutex` with a fresh
+                        // generation token, then emits; if cancel
+                        // hits during a buffer-full backpressure
+                        // suspension, only THIS attempt's mapping is
+                        // rolled back (a concurrent loop's mapping
+                        // for the same id is preserved by the
+                        // generation guard).
+                        emitWithCancellationSafeRollback(env)
                     }
                     // Drain immediately if server says there's more.
                     if (parsed.more) {
@@ -1188,28 +1209,18 @@ class RestFallbackOrchestrator(
             // emitting so the consumer can rely on
             // `ackInboundAndAdvanceCursor` finding the seq.
             //
-            // C3 review-fix (P1.1) — use the SUSPENDING `_inbound.emit(env)`
-            // instead of the non-suspending `tryEmit(env)`. The
-            // previous rollback-on-`tryEmit=false` pattern had a
-            // narrow race: between this loop emitting env-X and
-            // observing the `false` return, the legacy `pollLoop`
-            // could ingest the same env-X (relay re-delivery on
-            // back-pressure), populate `_pendingSeqForAck[env-X]`
-            // afresh, and successfully emit. The wsActivePollLoop's
-            // subsequent `_pendingSeqForAck.remove(env-X)` would
-            // then drop the LEGITIMATE new mapping, the consumer's
-            // ack would succeed, and the cursor would never advance.
-            // Suspending `emit` eliminates the entire `tryEmit==false`
-            // branch and therefore the rollback class of races.
-            // Back-pressure on a slow consumer manifests as the
-            // parallel loop slowing down to consumer cadence —
-            // acceptable, and what the legacy `pollLoop` already
-            // does today.
+            // C3 review-fix (P1.1) — use the SUSPENDING
+            // `emitWithCancellationSafeRollback` instead of the
+            // earlier non-suspending `tryEmit(env)` + rollback. The
+            // helper inserts the pending-seq mapping under
+            // `_inboundStateMutex` with a fresh GENERATION TOKEN,
+            // then emits; on cancel-during-emit it rolls back ONLY
+            // its own attempt's mapping (the generation guard leaves
+            // a concurrent loop's mapping intact). C3 review-fix
+            // round 3 closed the emit-cancellation gap that the
+            // suspending-emit-without-rollback fix had left open.
             for (env in envelopes) {
-                _inboundStateMutex.withLock {
-                    _pendingSeqForAck[env.id] = env.seq
-                }
-                _inbound.emit(env)
+                emitWithCancellationSafeRollback(env)
             }
             // L4: cursor advance happens inside
             // `ackInboundAndAdvanceCursor` after the relay 2xx's the
@@ -1326,6 +1337,55 @@ class RestFallbackOrchestrator(
     }
 
     /**
+     * Trek 2 Stage 2B-B (C3 review-fix round 3) — cancel-safe
+     * insertion of `(env.id, env.seq)` into [_pendingSeqForAck]
+     * followed by [_inbound] emission. If the emission suspends on
+     * backpressure and is cancelled (typically by [stop] tearing
+     * down the loop), the mapping is rolled back ONLY when the
+     * entry still belongs to this caller (generation token still
+     * matches). If a CONCURRENT call (e.g. the other REST poll
+     * loop ingesting the same relay-redelivered envelope) overwrote
+     * the entry while this caller was suspended in emit, the
+     * cleanup detects the generation mismatch and leaves the
+     * concurrent caller's mapping intact.
+     *
+     * Without the generation guard the rollback could delete a
+     * legitimate concurrent mapping; the consumer's subsequent ack
+     * would find `_pendingSeqForAck[env.id] == null` and return
+     * `Acked` WITHOUT advancing the cursor — a silent regression
+     * the suspending-emit P1.1 fix did not catch.
+     *
+     * `CancellationException` rethrows after cleanup so structured
+     * concurrency teardown propagates correctly.
+     */
+    private suspend fun emitWithCancellationSafeRollback(env: PollEnvelope) {
+        val myGeneration: Long
+        _inboundStateMutex.withLock {
+            _emitGenerationCounter += 1
+            myGeneration = _emitGenerationCounter
+            _pendingSeqForAck[env.id] = PendingEntry(env.seq, myGeneration)
+        }
+        try {
+            _inbound.emit(env)
+        } catch (ce: CancellationException) {
+            withContext(NonCancellable) {
+                _inboundStateMutex.withLock {
+                    val current = _pendingSeqForAck[env.id]
+                    // Conditional remove: only if entry still
+                    // belongs to OUR attempt. A concurrent loop
+                    // overwriting with its own attempt produces a
+                    // different generation; leave their mapping
+                    // intact.
+                    if (current != null && current.generation == myGeneration) {
+                        _pendingSeqForAck.remove(env.id)
+                    }
+                }
+            }
+            throw ce
+        }
+    }
+
+    /**
      * Trek 2 Stage 2B-B (C3 review-fix) — defensive read of
      * [cursorRepository] used by both poll loops at iteration start.
      *
@@ -1406,7 +1466,8 @@ class RestFallbackOrchestrator(
      */
     internal suspend fun primePendingSeqForAckForTest(envelopeId: String, seq: Long) {
         _inboundStateMutex.withLock {
-            _pendingSeqForAck[envelopeId] = seq
+            _emitGenerationCounter += 1
+            _pendingSeqForAck[envelopeId] = PendingEntry(seq, _emitGenerationCounter)
         }
     }
 
@@ -1422,8 +1483,19 @@ class RestFallbackOrchestrator(
      */
     internal suspend fun peekPendingSeqForAckForTest(envelopeId: String): Long? =
         _inboundStateMutex.withLock {
-            _pendingSeqForAck[envelopeId]
+            _pendingSeqForAck[envelopeId]?.seq
         }
+
+    /**
+     * Trek 2 Stage 2B-B (C3 review-fix round 3) — test-only seam
+     * that drives the cancel-safe emit pattern directly. Production
+     * callers are the two poll-loop emit sites; commonTest uses
+     * this seam to exercise the cancellation-rollback contract
+     * without standing up a full poll-loop pipeline.
+     */
+    internal suspend fun emitWithCancellationSafeRollbackForTest(env: PollEnvelope) {
+        emitWithCancellationSafeRollback(env)
+    }
 
     /**
      * Trek 2 Stage 2B-B (C3 review-fix) — test-only seam that holds
