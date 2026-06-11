@@ -67,6 +67,22 @@ class RestStateMachine(
     // transitions per design note §6. Optional and defaults to no-op
     // for backward compatibility with existing tests.
     private val onModeSwitched: ((from: RestMode, to: RestMode, reason: String) -> Unit)? = null,
+    /**
+     * Trek 2 Stage 2B-B (C5, L9; review-fix P2 added the actual
+     * invocation surface) — telemetry hook fired when the REST
+     * poll breaker enters [LongPollBreakerState.Open]. Receives
+     * the [BreakerOpenReason] that triggered the opening so the
+     * AppContainer wire-up can mirror the signal into the
+     * existing [phantom.core.transport.WsDegradationDetector] stream
+     * (`ConsecutiveRestFailures` vs `Status410Storm`
+     * discriminator surfacing as a typed value, not just a log
+     * substring).
+     *
+     * Per scope §L9 the handler is read-only — it does NOT
+     * cause a `RestMode` transition. Optional; defaults to no-op
+     * for backward compatibility with existing tests.
+     */
+    private val onRestPollDegraded: ((BreakerOpenReason) -> Unit)? = null,
 ) {
     private val _state = MutableStateFlow<RestMode>(RestMode.WsActive)
     val state: StateFlow<RestMode> = _state.asStateFlow()
@@ -112,6 +128,12 @@ class RestStateMachine(
      */
     private fun onRestPollDegraded(event: Event.RestPollDegraded) {
         log("REST_TRACE rest_poll_degraded reason=${event.reason}")
+        // Trek 2 Stage 2B-B (C5-C review-fix P2) — fire the
+        // observation hook. Previous shape only logged, so the
+        // wire-up's typed degradation surface never received the
+        // signal. The callback fires AFTER the log line so the
+        // log remains the audit-trail anchor.
+        onRestPollDegraded?.invoke(event.reason)
     }
 
     private fun onWsSessionEnded(event: Event.WsSessionEnded) {

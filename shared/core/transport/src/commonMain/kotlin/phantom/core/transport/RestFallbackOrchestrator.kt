@@ -74,6 +74,22 @@ class RestFallbackOrchestrator(
     // without parsing log lines. Optional and defaults to no-op.
     private val onModeSwitched: ((from: RestMode, to: RestMode, reason: String) -> Unit)? = null,
     /**
+     * Trek 2 Stage 2B-B (C5, L9; review-fix P2 surfaced the
+     * actual invocation) — telemetry hook fired when the REST
+     * poll breaker enters [LongPollBreakerState.Open]. Passed
+     * through to [RestStateMachine.onRestPollDegraded] which
+     * fires after the
+     * `REST_TRACE rest_poll_degraded reason=...` log line on
+     * every [RestStateMachine.Event.RestPollDegraded]. Lets the
+     * AppContainer wire-up mirror the typed reason
+     * ([BreakerOpenReason.ConsecutiveRestFailures] /
+     * [BreakerOpenReason.Status410Storm]) into the existing
+     * [phantom.core.transport.WsDegradationDetector] stream
+     * without parsing log substrings. Optional and defaults to
+     * no-op for backward compatibility with existing call sites.
+     */
+    private val onRestPollDegraded: ((BreakerOpenReason) -> Unit)? = null,
+    /**
      * Trek 2 Stage 2A (A4) — local SOCKS5 port for the future Reality
      * (Stage 3) and Tor (Stage 4) tunnel paths. When non-null, the
      * AppContainer wire-up is expected to have constructed [transport]
@@ -154,6 +170,7 @@ class RestFallbackOrchestrator(
         now = now,
         log = log,
         onModeSwitched = onModeSwitched,
+        onRestPollDegraded = onRestPollDegraded,
     )
 
     /** Convenience flow proxying [stateMachine.state]. */
@@ -1371,6 +1388,30 @@ class RestFallbackOrchestrator(
 
                 if (outcome.isFailure) {
                     val ex = outcome.exceptionOrNull()!!
+                    // Trek 2 Stage 2B-B (C5-C review-fix P1.1) —
+                    // `runCatching` swallows `CancellationException`
+                    // along with everything else. A pollJob cancelled
+                    // mid-suspend in `transport.poll(...)` would land
+                    // here with `outcome.isFailure = true`, the CE
+                    // would be classified as a transport-class
+                    // failure, and `recordRestFailure` would
+                    // (a) increment `_breakerFailCount` ignorantly
+                    // toward the next Open trigger or
+                    // (b) on a HalfOpen probe, transition the
+                    // breaker BACK to Open and spawn a fresh timer
+                    // Job. The new timer Job spawns AFTER the Phase-1
+                    // observer cancellation, so the Phase-2 tail
+                    // snapshot (`pollJob`, `aliveTickJob`,
+                    // `wsActivePollJob`, `_breakerTimerJob`) does NOT
+                    // include it ⇒ orphan timer.
+                    //
+                    // Re-throw CE so the iteration's `finally`
+                    // releases the probe permit and the pollLoop
+                    // body unwinds cleanly without touching breaker
+                    // state.
+                    if (ex is CancellationException) {
+                        throw ex
+                    }
                     // Trek 2 Stage 2B-B (C5, L9) — record network-class
                     // failure for the breaker. May trip Closed → Open
                     // (5th consecutive) OR HalfOpen → Open (failed probe).
@@ -1690,6 +1731,13 @@ class RestFallbackOrchestrator(
 
                 if (outcome.isFailure) {
                     val ex = outcome.exceptionOrNull()!!
+                    // Trek 2 Stage 2B-B (C5-C review-fix P1.1) —
+                    // see the legacy `pollLoop` site above for the
+                    // full rationale. Same orphan-timer risk
+                    // applies symmetrically here.
+                    if (ex is CancellationException) {
+                        throw ex
+                    }
                     recordRestFailure()
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                     val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
@@ -2108,6 +2156,16 @@ class RestFallbackOrchestrator(
      */
     private suspend fun recordRestFailure() {
         val openedReason: BreakerOpenReason? = _inboundStateMutex.withLock {
+            // Trek 2 Stage 2B-B (C5-C review-fix P1.3) — scope §L9
+            // pins the storm trigger as "K consecutive 410 Gone
+            // responses within W wall-clock seconds." A non-410
+            // response (5xx, IOException, read timeout — anything
+            // that lands here in `recordRestFailure`) breaks the
+            // consecutive sequence and resets the storm window.
+            // The L8 410-backoff exponent (`_current410BackoffMs`)
+            // is NOT reset here — only a successful 200 OK
+            // (`recordRestSuccess`) returns to the 5 s floor.
+            _status410StormTimestamps.clear()
             when (val current = _breakerState) {
                 is LongPollBreakerState.Closed -> {
                     _breakerFailCount += 1
@@ -2285,9 +2343,15 @@ class RestFallbackOrchestrator(
                 openedStorm = true
                 effectiveDelayMs = BREAKER_410_STORM_COOLDOWN_MS
             } else {
+                // Trek 2 Stage 2B-B (C5-C review-fix P1.2) — scope §L8
+                // pins the sequence as "The first 410 backs off 5 s;
+                // each subsequent 410 doubles up to 60 s." Return the
+                // CURRENT backoff (5 s on the first 410), then double
+                // FOR THE NEXT call. Pre-fix the order was inverted
+                // (double-then-return) so the first 410 waited 10 s.
+                effectiveDelayMs = _current410BackoffMs
                 _current410BackoffMs = (_current410BackoffMs * 2).coerceAtMost(BREAKER_410_STORM_COOLDOWN_MS)
                 openedStorm = false
-                effectiveDelayMs = _current410BackoffMs
             }
         }
         if (openedStorm) {

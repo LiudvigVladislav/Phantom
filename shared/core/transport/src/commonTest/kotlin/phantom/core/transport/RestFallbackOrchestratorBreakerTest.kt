@@ -5,6 +5,7 @@
 
 package phantom.core.transport
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
@@ -1390,6 +1391,401 @@ class RestFallbackOrchestratorBreakerTest {
         }
     }
 
+    // ── C5-C review-fix regression pins ─────────────────────────────────────
+
+    @Test
+    fun cf_p11_mid_probe_cancellation_releases_permit_and_does_not_open_breaker() = runTest(timeout = 5.minutes) {
+        // Round-1 C5-C review (P1.1): the poll loops wrapped
+        // `transport.poll(...)` in `runCatching`, which swallows
+        // `CancellationException`. A pollJob cancelled mid-suspend
+        // in transport.poll would land in `outcome.isFailure` →
+        // `recordRestFailure()` would (on a HalfOpen probe)
+        // transition the breaker BACK to Open and spawn a NEW
+        // timer Job. The new timer would spawn AFTER the Phase-1
+        // observer cancellation in `cancelAndJoinAll`, so the
+        // Phase-2 tail snapshot would miss it ⇒ orphan timer.
+        //
+        // Repro: pre-seed HalfOpen(probeInFlight=false), suspend
+        // `transport.poll(...)` on a deferred, let the pollLoop
+        // claim the probe and suspend mid-poll, then `stop()`.
+        // Post-stop assertions:
+        //   * Breaker state is `HalfOpen(probeInFlight=false)` —
+        //     the `finally` block fired `releaseProbePermitIfStillHeld`,
+        //     so the permit cleared. If `recordRestFailure` had
+        //     run, state would be Open(...).
+        init()
+        val probeGate = CompletableDeferred<Unit>()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                probeGate.await()
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                    rawBody = "{}", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            // Seed HalfOpen BEFORE runCurrent so the observer's
+            // onModeChanged dispatches AFTER state is HalfOpen,
+            // and the first pollLoop iteration claims the probe
+            // permit (rather than seeing Closed and pretending
+            // it's a normal iteration).
+            orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = false))
+            runCurrent()
+            // Pump until the pollLoop claims the probe AND
+            // suspends in `transport.poll`.
+            repeat(20) {
+                if (transport.pollCalls.isNotEmpty()) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            check(transport.pollCalls.isNotEmpty()) {
+                "expected the pollLoop to have entered transport.poll before the cancellation"
+            }
+            check(orch.peekBreakerStateForTest() == LongPollBreakerState.HalfOpen(probeInFlight = true)) {
+                "expected the probe permit to be claimed; got ${orch.peekBreakerStateForTest()}"
+            }
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+        // POST-stop assertions: the cancellation flowed through the
+        // try/finally and the permit was released. If the round-1
+        // C5-C bug were still here, recordRestFailure would have
+        // transitioned to Open and the state would NOT be HalfOpen.
+        val state = orch.peekBreakerStateForTest()
+        assertEquals(
+            LongPollBreakerState.HalfOpen(probeInFlight = false),
+            state,
+            "mid-probe cancellation MUST release the probe permit via the finally " +
+                "(state HalfOpen(probeInFlight=false)). If state is Open(...), the bug is back: " +
+                "runCatching swallowed CancellationException and recordRestFailure spawned an " +
+                "orphan timer Job. Got $state.",
+        )
+    }
+
+    @Test
+    fun cf_p12_first_410_delays_exactly_5_seconds_then_doubles_to_10_seconds() = runTest(timeout = 5.minutes) {
+        // Round-1 C5-C review (P1.2): handle410 doubled the backoff
+        // BEFORE returning, so the first 410 waited 10 s instead of
+        // the scope-locked 5 s floor. Fix returns the current
+        // backoff first, then doubles for next.
+        //
+        // Drive a 410 sequence: 1st poll = 410, 2nd poll = 410,
+        // 3rd poll = 200. Use fine virtual-time sampling around
+        // 5_000 ms / 15_000 ms ticks to pin the deterministic
+        // sequence 5 s → 10 s → 200 (storm trigger would land on
+        // 3rd, but we settle on 200 before that).
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { i ->
+                when (i) {
+                    0, 1 -> RestFallbackResponse(
+                        statusCode = 410, bodyParsed = null,
+                        rawBody = "gone", elapsedMs = 1L,
+                    )
+                    else -> RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                }
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Wait for the 1st poll (returns 410).
+            repeat(20) {
+                if (transport.pollCalls.size >= 1) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            check(transport.pollCalls.size == 1) {
+                "expected 1st poll to have landed; got ${transport.pollCalls.size}"
+            }
+            // Advance just under the 5 s first-410 floor; assert no
+            // 2nd call yet.
+            advanceTimeBy(4_500L)
+            runCurrent()
+            assertEquals(
+                1,
+                transport.pollCalls.size,
+                "first 410 MUST delay 5 s — at the 4.5 s mark no 2nd poll fires. " +
+                    "Got pollCalls.size=${transport.pollCalls.size}.",
+            )
+            // Cross the 5 s mark. The 2nd poll should land within
+            // a few hundred ms after the delay fires.
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertTrue(
+                transport.pollCalls.size >= 2,
+                "first 410 MUST release the loop within the 5 s + 0.5 s slack window. " +
+                    "Got pollCalls.size=${transport.pollCalls.size}.",
+            )
+            // 2nd 410 → backoff doubles to 10 s.
+            advanceTimeBy(9_000L)
+            runCurrent()
+            assertEquals(
+                2,
+                transport.pollCalls.size,
+                "second 410 MUST delay 10 s (post-double) — at the 9 s mark no 3rd poll fires. " +
+                    "Got pollCalls.size=${transport.pollCalls.size}.",
+            )
+            advanceTimeBy(2_000L)
+            runCurrent()
+            assertTrue(
+                transport.pollCalls.size >= 3,
+                "second 410 MUST release the loop within the 10 s + 1 s slack window. " +
+                    "Got pollCalls.size=${transport.pollCalls.size}.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf_p13_non_consecutive_410s_separated_by_500_do_NOT_trip_storm() = runTest(timeout = 5.minutes) {
+        // Round-1 C5-C review (P1.3): scope §L8/§L9 pin the storm
+        // trigger as "K CONSECUTIVE 410 Gone responses within W
+        // wall-clock seconds." Pre-fix the storm timestamp list
+        // was NOT cleared on non-410 responses, so an alternating
+        // 410/500/410/500/410 sequence would falsely trip
+        // Status410Storm on the third 410. Fix: `recordRestFailure`
+        // clears the storm window on every transport-class failure
+        // (which includes 5xx). 4xx-other and 200 go through
+        // `recordRestSuccess` which already cleared the window.
+        //
+        // This test drives 7 polls (410, 500, 410, 500, 410, 500,
+        // 410) and asserts the breaker is NEVER in
+        // Open(Status410Storm, ...). The breaker MAY trip to
+        // Open(ConsecutiveRestFailures, ...) if the 5xx fail count
+        // reaches the threshold — but Status410Storm specifically
+        // MUST NOT fire.
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { i ->
+                val status = if (i % 2 == 0) 410 else 500
+                val body = if (status == 410) "gone" else "boom"
+                RestFallbackResponse(
+                    statusCode = status, bodyParsed = null,
+                    rawBody = body, elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump 7 polls' worth of virtual time; capture whether
+            // the breaker EVER entered Status410Storm.
+            var observedStorm = false
+            repeat(400) {
+                if (transport.pollCalls.size >= 7 && observedStorm) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                val s = orch.peekBreakerStateForTest()
+                if (s is LongPollBreakerState.Open && s.reason == BreakerOpenReason.Status410Storm) {
+                    observedStorm = true
+                }
+                if (transport.pollCalls.size >= 7 && !observedStorm) return@repeat
+            }
+            assertTrue(
+                transport.pollCalls.size >= 7,
+                "expected ≥ 7 poll calls; got ${transport.pollCalls.size}",
+            )
+            assertEquals(
+                false,
+                observedStorm,
+                "non-consecutive 410s (410/500/410/500/410/500/410) MUST NOT trip " +
+                    "Status410Storm — the 500s break the consecutive sequence per scope §L8. " +
+                    "Got observedStorm=$observedStorm.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf_p2_onRestPollDegraded_callback_fires_on_breaker_open() = runTest(timeout = 5.minutes) {
+        // Round-1 C5-C review (P2): the `RestStateMachine.Event.RestPollDegraded`
+        // handler only logged; the callback surface was wired
+        // through the constructor but never invoked. Fix: the
+        // handler now invokes `onRestPollDegraded?.invoke(reason)`
+        // after the log line.
+        //
+        // Wire a recording callback through the orchestrator's
+        // constructor; trip the breaker to Open via a 5xx burst;
+        // assert the callback receives reason =
+        // ConsecutiveRestFailures.
+        init()
+        val degradedReasons = mutableListOf<BreakerOpenReason>()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 500, bodyParsed = null,
+                    rawBody = "", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = RestFallbackOrchestrator(
+            baseUrl = "https://relay.test",
+            identityHex = IDENTITY,
+            signingPubkeyHex = "bb".repeat(32),
+            getChallenge = { _ -> "cc".repeat(32) },
+            signChallenge = { _ -> ByteArray(64) { 0xDD.toByte() } },
+            transport = transport,
+            now = { 0L },
+            log = {},
+            longPollEnabled = false,
+            cursorRepository = NoopCursor(),
+            dispatcher = StandardTestDispatcher(testScheduler),
+            onRestPollDegraded = { reason -> degradedReasons += reason },
+        )
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump until the breaker trips at least once.
+            repeat(200) {
+                if (degradedReasons.isNotEmpty()) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            assertTrue(
+                degradedReasons.isNotEmpty(),
+                "onRestPollDegraded callback MUST fire when the breaker enters Open. " +
+                    "Got degradedReasons=$degradedReasons.",
+            )
+            assertEquals(
+                BreakerOpenReason.ConsecutiveRestFailures,
+                degradedReasons.first(),
+                "the callback MUST receive the typed BreakerOpenReason — " +
+                    "ConsecutiveRestFailures for the 5xx burst trigger",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun mb24d_ws_active_poll_loop_429_with_Retry_After_consumes_typed_field_and_delays_exactly() = runTest(timeout = 5.minutes) {
+        // Mirror of `mb24d_poll_loop_429_with_Retry_After_consumes_typed_field_and_delays_exactly`
+        // for the parallel `wsActivePollLoop` — round-1 C5-C
+        // review noted that the original M-B24(d) only covered
+        // the legacy `pollLoop`. The parallel loop's 429 branch
+        // was added in C5-A but never exercised end-to-end in a
+        // test. This test pins the parallel branch's
+        // `clampRetryAfterMs` consumption symmetrically.
+        init()
+        val pollCalls = mutableListOf<Int>()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                pollCalls += 1
+                if (pollCalls.size == 1) {
+                    RestFallbackResponse(
+                        statusCode = 429,
+                        bodyParsed = null,
+                        rawBody = "",
+                        elapsedMs = 1L,
+                        retryAfterSeconds = 30L,
+                    )
+                } else {
+                    RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                }
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler, longPollEnabled = true)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            // With longPollEnabled=true, the wsActivePollJob runs
+            // independent of state-machine mode. Do NOT submit
+            // events that would also spawn the legacy pollLoop
+            // (we want to isolate the wsActivePollLoop's 429
+            // branch).
+            orch.start()
+            runCurrent()
+            advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+            runCurrent()
+            val callsAfterFirst = pollCalls.size
+            assertTrue(
+                callsAfterFirst >= 1,
+                "expected at least one poll call after start; got $callsAfterFirst",
+            )
+            // Advance past the legacy backoff (5_000 ms × 1.2
+            // jitter ≤ 6_000) but BEFORE the consumed 30_000 ms
+            // window expires. If the wsActivePollLoop ignored the
+            // typed field, a second call would land here.
+            advanceTimeBy(15_000L)
+            runCurrent()
+            assertEquals(
+                callsAfterFirst,
+                pollCalls.size,
+                "the wsActivePollLoop MUST consume `retryAfterSeconds` and delay for " +
+                    "30_000 ms; a poll at the 15 s mark proves it fell back to legacy backoff. " +
+                    "Got pollCalls.size=${pollCalls.size}, expected $callsAfterFirst.",
+            )
+            // Cross the 30 s mark.
+            advanceTimeBy(16_000L)
+            runCurrent()
+            assertTrue(
+                pollCalls.size > callsAfterFirst,
+                "after the Retry-After delay elapses, the wsActivePollLoop MUST resume polling. " +
+                    "Got pollCalls.size=${pollCalls.size}, expected > $callsAfterFirst.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
     // ── Fixtures ────────────────────────────────────────────────────────────
 
     private val IDENTITY: String = "aa".repeat(32)
@@ -1407,7 +1803,7 @@ class RestFallbackOrchestratorBreakerTest {
      * `restFallback=true`.
      */
     private class BreakerTestTransport(
-        var pollScript: (callIndex: Int) -> RestFallbackResponse<PollResponse>,
+        var pollScript: suspend (callIndex: Int) -> RestFallbackResponse<PollResponse>,
         var sessionScript: ((callIndex: Int) -> RestFallbackResponse<AuthSessionResponse>)? = null,
         var ackScript: ((callIndex: Int, envelopeId: String) -> RestFallbackResponse<AckDeliverResponse>)? = null,
     ) : RestFallbackTransport {
