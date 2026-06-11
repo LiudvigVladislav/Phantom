@@ -968,6 +968,148 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         runCurrent()
     }
 
+    // ── C4 review-fix round 4 P2 — start ↔ stop race regression pin ─────────
+
+    @Test
+    fun p14_concurrent_start_and_stop_serialize_under_lifecycle_mutex_no_orphan_polls() = runTest {
+        // Round 3 only put `start()` under `_lifecycleMutex`; the
+        // (non-suspending) `stop()` nulled job-handle fields
+        // IMMEDIATELY on cancel. A concurrent `start()` re-reading
+        // tail fields in Phase 2 of `cancelAndJoinAll` would see
+        // nulls and skip the join, while a cancelled job's
+        // `finally` block was still unwinding and could write stale
+        // state AFTER the reset had landed.
+        //
+        // Round 4 makes `stop()` (and `close()`) suspending and
+        // serialised under the same `_lifecycleMutex`, with the
+        // teardown body itself wrapped in `withContext(NonCancellable)`
+        // so a caller-cancellation cannot abort cleanup mid-way.
+        //
+        // This test repros the race window deterministically:
+        //
+        //   1. Drive state to `RestActive` so the production observer
+        //      spawns `pollJob`; the parallel `wsActivePollJob` also
+        //      runs. Both loops actually poll (`pollEnterCount >= 2`).
+        //   2. Launch a SECOND `start()` and a concurrent `stop()`.
+        //      Under round 3 these could interleave arbitrarily and
+        //      leak orphan jobs; under round 4 they FIFO-serialise on
+        //      `_lifecycleMutex`.
+        //   3. Wait for both to complete.
+        //   4. Advance virtual time. Assert `pollEnterCount` is
+        //      perfectly static — proves no orphan poll job is still
+        //      alive after the race.
+        //   5. Assert `peekBreakerStateForTest()` is `Closed` — proves
+        //      the reset was atomic (not torn by a concurrent stop).
+        //
+        // Determinism: `StandardTestDispatcher(testScheduler)` runs
+        // launched coroutines in launch order; `Mutex` resumes
+        // queued waiters FIFO.
+        init()
+        val transport = PollLoopCountingTransport(
+            sessionScript = { _ ->
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = "",
+                    ), "{}", 1L,
+                )
+            },
+        )
+        val logLines = mutableListOf<String>()
+        val orch = buildOrchestratorWithPollLoops(
+            transport = transport, cursor = RecordingCursorRepo(),
+            scheduler = testScheduler, longPollEnabled = true,
+            logSink = { logLines += it },
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                ),
+            )
+        }
+        check(orch.stateMachine.state.value == RestMode.RestActive)
+
+        // First start: spawns observer + wsActivePollJob; observer's
+        // `onModeChanged(RestActive)` spawns the legacy `pollJob`.
+        orch.start()
+        runCurrent()
+        repeat(5) {
+            advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+            runCurrent()
+        }
+        assertTrue(
+            transport.pollEnterCount >= 2,
+            "expected both loops to have polled at least once before the race; " +
+                "pollEnterCount=${transport.pollEnterCount}",
+        )
+        val resetLogsBeforeRace = logLines.count { it.contains("poison_state_reset_on_start") }
+        check(resetLogsBeforeRace == 1) {
+            "expected exactly one `poison_state_reset_on_start` log line after the first start; " +
+                "got $resetLogsBeforeRace. captured ${logLines.size} log lines."
+        }
+
+        // Concurrent second `start()` and `stop()`. Under
+        // `StandardTestDispatcher`, the first `launch` dispatches
+        // first → acquires `_lifecycleMutex` first → runs its full
+        // body (teardown under NonCancellable + reset + spawn new
+        // jobs) → releases. The second `launch` queues on the
+        // mutex and runs after. Either order proves the
+        // serialisation; this test fixes the order via launch order
+        // for determinism but the assertions hold either way.
+        val secondStart = launch { orch.start() }
+        val stopJob = launch { orch.stop() }
+        // Drain. Both calls should complete without throwing.
+        advanceTimeBy(60_000L)
+        runCurrent()
+        secondStart.join()
+        stopJob.join()
+
+        // Both lifecycle methods entered their critical section.
+        // `start()` logs `poison_state_reset_on_start`; `stop()`
+        // does NOT log a reset (it only cancels). So we observed
+        // exactly one additional reset (from the second start),
+        // for a total of 2 — proves the second start's body ran
+        // under the mutex AND the stop did not double-reset.
+        val resetLogsAfterRace = logLines.count { it.contains("poison_state_reset_on_start") }
+        assertEquals(
+            2,
+            resetLogsAfterRace,
+            "exactly one additional reset must have landed (from the second start). " +
+                "Got $resetLogsAfterRace total. The stop() must NOT log a reset.",
+        )
+
+        // After the race resolves, no jobs are alive. Advance
+        // significant virtual time and verify `pollEnterCount` is
+        // perfectly static. Any orphan job from a torn lifecycle
+        // teardown would keep polling at `POLL_ACTIVE_MS` cadence.
+        val pollCountAfterRace = transport.pollEnterCount
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS * 50L)
+        runCurrent()
+        assertEquals(
+            pollCountAfterRace,
+            transport.pollEnterCount,
+            "after the start()/stop() race resolves, pollEnterCount MUST be perfectly static. " +
+                "Got before=$pollCountAfterRace, after=${transport.pollEnterCount}. " +
+                "A diff means an orphan job survived the teardown — the lifecycle mutex did NOT serialise " +
+                "the race, OR the two-phase `cancelAndJoinAll` did not catch a job spawned between phases.",
+        )
+
+        // The reset is atomic: breaker stays `Closed`. A stale
+        // write from a torn teardown could land here as
+        // SuspendedOnPoison (if any job had its `finally` write
+        // race the reset). A clean Closed value confirms atomicity.
+        assertEquals(
+            LongPollBreakerState.Closed,
+            orch.peekBreakerStateForTest(),
+            "after the race resolves, breaker MUST be Closed — proves the second start's reset was atomic w.r.t. the racing stop",
+        )
+    }
+
     /**
      * Transport that returns empty poll responses + counts poll
      * calls; used by the real two-loop tests below. Distinct from

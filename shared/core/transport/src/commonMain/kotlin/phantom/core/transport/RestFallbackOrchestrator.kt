@@ -10,7 +10,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -427,35 +429,38 @@ class RestFallbackOrchestrator(
      * re-created.
      */
     suspend fun start() {
-        // Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1) — serialise
-        // the full lifecycle reset under [_lifecycleMutex] so a
-        // concurrent `start()` cannot run its own `cancelAndJoinAll`
-        // while this one is still mid-reset. The mutex is strictly
+        // Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1, extended in
+        // round 4) — serialise the full lifecycle reset under
+        // [_lifecycleMutex]. Round 3 only covered `start()`; round 4
+        // covers `stop()` and `close()` too. The mutex is strictly
         // OUTER to [_inboundStateMutex]; the order is never inverted.
         _lifecycleMutex.withLock {
             if (!_capabilities.value.restFallback) {
                 log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
                 return@withLock
             }
-            // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) —
-            // `stop()` only calls `cancel()` (non-blocking); a job
-            // that was suspended inside
-            // `_inboundStateMutex.withLock { ... }` could legitimately
-            // still hold the mutex when `start()` tries to acquire it,
-            // and a CANCELLED job's continuation can still observe
-            // the resume signal and write to state AFTER our reset.
-            //
-            // Resolution: `start()` is now `suspend` and uses
-            // `cancelAndJoinAll()` to fully await every prior job
-            // before resetting state. The reset then happens under a
-            // genuine `withLock` (not `tryLock`); by that point no
-            // orphan job can race the write.
-            cancelAndJoinAll()
-            _inboundStateMutex.withLock {
-                _breakerState = LongPollBreakerState.Closed
-                _macFailCount.clear()
-                _macRefreshStatus.clear()
+            // Trek 2 Stage 2B-B (C4 review-fix round 4 P1) —
+            // teardown runs under `NonCancellable` so a caller
+            // cancellation cannot tear off mid-teardown leaving
+            // orphan jobs OR a partially-reset state. Both
+            // `cancelAndJoinAll()` and the state reset are
+            // atomic with respect to caller cancellation; the
+            // caller's cancellation is honoured AFTER teardown
+            // completes via the `ensureActive()` gate below,
+            // BEFORE any new jobs are launched.
+            withContext(NonCancellable) {
+                cancelAndJoinAll()
+                _inboundStateMutex.withLock {
+                    _breakerState = LongPollBreakerState.Closed
+                    _macFailCount.clear()
+                    _macRefreshStatus.clear()
+                }
             }
+            // Caller-cancellation gate: if the caller was cancelled
+            // during the non-cancellable teardown, propagate the
+            // cancellation now BEFORE spawning new jobs so a
+            // cancelled re-arm cannot leave live workers behind.
+            currentCoroutineContext().ensureActive()
             log("REST_TRACE poison_state_reset_on_start")
             stateObserverJob = scope.launch {
                 stateMachine.state.collect { mode -> onModeChanged(mode) }
@@ -478,17 +483,28 @@ class RestFallbackOrchestrator(
     }
 
     /**
-     * Cancel all background jobs (poll loop, alive tick, state observer).
-     * Idempotent. The orchestrator can be re-armed by another [start] call.
+     * Cancel all background jobs (poll loop, alive tick, state
+     * observer) AND wait for each to fully unwind. Idempotent. The
+     * orchestrator can be re-armed by another [start] call.
+     *
+     * Trek 2 Stage 2B-B (C4 review-fix round 4 P1) — `stop()` is now
+     * `suspend` and runs under [_lifecycleMutex] so concurrent
+     * `start()` and `stop()` calls are serialised. The previous
+     * non-suspending shape nulled job-handle fields IMMEDIATELY on
+     * cancel — a concurrent `start()` re-reading the tail fields in
+     * Phase 2 of [cancelAndJoinAll] would see nulls and skip the
+     * join, while the cancelled job was still unwinding its
+     * `finally` blocks and could write stale state after the reset.
+     *
+     * Teardown runs under [NonCancellable] so a caller-cancellation
+     * cannot abort mid-stop and leak orphan jobs.
      */
-    fun stop() {
-        pollJob?.cancel(); pollJob = null
-        aliveTickJob?.cancel(); aliveTickJob = null
-        stateObserverJob?.cancel(); stateObserverJob = null
-        // Trek 2 Stage 2B-A (B3, L3) — cancel the parallel poll job
-        // on every stop. Lifecycle is tied to the orchestrator's own
-        // start/stop, not to any WS mode transition.
-        wsActivePollJob?.cancel(); wsActivePollJob = null
+    suspend fun stop() {
+        _lifecycleMutex.withLock {
+            withContext(NonCancellable) {
+                cancelAndJoinAll()
+            }
+        }
     }
 
     /**
@@ -553,10 +569,21 @@ class RestFallbackOrchestrator(
     /**
      * Fully tear down. After this the orchestrator is dead — construct a
      * fresh instance to re-arm.
+     *
+     * Trek 2 Stage 2B-B (C4 review-fix round 4 P1) — `close()` is now
+     * `suspend` and runs under [_lifecycleMutex] so it serialises
+     * with concurrent `start()` / `stop()` calls. Teardown runs
+     * under [NonCancellable] for the same reason as [stop]: caller
+     * cancellation must not be able to abort cleanup mid-way and
+     * leak orphan jobs.
      */
-    fun close() {
-        stop()
-        scope.cancel()
+    suspend fun close() {
+        _lifecycleMutex.withLock {
+            withContext(NonCancellable) {
+                cancelAndJoinAll()
+            }
+            scope.cancel()
+        }
     }
 
     /** Forward an event into the state machine. */
@@ -1805,19 +1832,23 @@ class RestFallbackOrchestrator(
                 // state machine onto the published outcome (Valid /
                 // Empty / Malformed / Failure).
                 //
-                // C4 review-fix round 2 (P1.2) — distinguish three
-                // exit paths:
+                // C4 review-fix round 2 (P1.2), round-4 P3 wording
+                // alignment — two exit paths, ONE rollback semantic
+                // for every non-normal exit:
                 //
                 //   * Normal completion → status = `Completed`.
                 //     The L7 step 4 trigger ("repeat-after-refresh
                 //     → suspend") fires on subsequent failures.
-                //   * Cancellation → status = `NotAttempted`
-                //     (rollback). The refresh did NOT get its
-                //     chance; the next bad-MAC must retry the
-                //     refresh, not immediately suspend.
-                //   * Other throwable → status = `Completed`. The
-                //     attempt happened; the failure is real-world
-                //     evidence that the refresh path is broken.
+                //   * Cancellation OR any other throwable → status =
+                //     `NotAttempted` (rollback). The next bad-MAC
+                //     must retry the refresh rather than falsely
+                //     suspend. This is safe in both cases: on a
+                //     non-CE refresh failure, `acquireOrRefreshToken`
+                //     has already published the L2 failure outcome
+                //     (Failure → KeySuspended) so subsequent
+                //     ingestion is already gated by the verify-key
+                //     state machine — the breaker does not need to
+                //     also fire.
                 //
                 // The status update runs under
                 // `withContext(NonCancellable)` so a caller
