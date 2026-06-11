@@ -664,25 +664,36 @@ class RestFallbackOrchestrator(
 
     /**
      * Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1, hardened in
-     * round 3) — cancel every prior job AND wait for it to finish.
+     * round 3; C5-C round-2 review-fix P1.2 added the third
+     * phase) — cancel every prior job AND wait for it to finish.
      * Used by [start] to guarantee no orphan job can race the
-     * lifecycle reset (mutex write to `_breakerState`, `_macFailCount`,
-     * `_macRefreshStatus`).
+     * lifecycle reset (mutex write to `_breakerState`,
+     * `_macFailCount`, `_macRefreshStatus`).
      *
-     * Round-3 fix: a single snapshot of all four jobs was unsafe.
-     * `stateObserverJob` is the spawning parent for `pollJob` and
-     * `aliveTickJob` (via [onModeChanged] reacting to state-machine
-     * transitions); between the snapshot and the `cancel()` it could
-     * legitimately spawn a NEW `pollJob` that was not captured in the
-     * snapshot, leaving an orphan exactly as the original race did.
+     * Three-phase teardown:
      *
-     * Resolution: two-phase teardown.
-     *   * Phase 1: capture, null, cancel, and JOIN [stateObserverJob]
-     *     first. After phase 1 returns no further callback into
-     *     [onModeChanged] is possible — the spawning parent is gone.
-     *   * Phase 2: snapshot [pollJob], [aliveTickJob], [wsActivePollJob]
-     *     (which now includes anything the observer spawned right up
-     *     to its cancellation), null fields, cancel + join each.
+     *   * **Phase 1:** capture, null, cancel, and JOIN
+     *     [stateObserverJob]. The observer is the spawning parent
+     *     for `pollJob` and `aliveTickJob` (via [onModeChanged]
+     *     reacting to state-machine transitions). After Phase 1
+     *     returns no further `onModeChanged` callback is possible.
+     *   * **Phase 2:** snapshot + cancel + JOIN every POLL
+     *     PRODUCER ([pollJob], [aliveTickJob], [wsActivePollJob])
+     *     and fully unwind them. C5-C round-2 P1.2: this MUST
+     *     finish BEFORE Phase 3. A cancelled poll loop that had
+     *     already received a 5xx response BEFORE the cancel
+     *     signal arrived can call `recordRestFailure` during its
+     *     unwinding, which spawns a fresh `_breakerTimerJob`. The
+     *     previous (two-phase) teardown snapshot grabbed
+     *     `_breakerTimerJob` at the same instant as the poll
+     *     producers; the new timer spawned during their unwinding
+     *     was therefore an orphan that outlived `stop()`.
+     *   * **Phase 3:** with all poll producers gone, no more
+     *     spawn paths into `_breakerTimerJob` exist. Snapshot the
+     *     current value (which includes anything the unwinding
+     *     poll producers spawned right before terminating),
+     *     cancel + JOIN it. Single-pass: read the field
+     *     post-Phase-2 and tear down whatever is there.
      *
      * Callers MUST already hold [_lifecycleMutex].
      */
@@ -702,21 +713,41 @@ class RestFallbackOrchestrator(
             }
         }
         // Phase 2 — observer is dead; whatever it spawned is now
-        // captured by re-reading the fields. The C5 breaker timer
-        // is NOT spawned by the observer (it is spawned from the
-        // poll loops on transition-to-Open), so it is captured here
-        // alongside the loops.
-        val tail = listOfNotNull(pollJob, aliveTickJob, wsActivePollJob, _breakerTimerJob)
+        // captured by re-reading the fields. Cancel + join the
+        // poll producers and let them FULLY UNWIND before moving
+        // on to Phase 3 (the breaker timer). A poll loop unwinding
+        // here may legitimately call `recordRestFailure` on a 5xx
+        // response received before the cancel arrived, which
+        // spawns a new `_breakerTimerJob`. We MUST drain that
+        // spawn path before snapshotting the timer field.
+        val producers = listOfNotNull(pollJob, aliveTickJob, wsActivePollJob)
         pollJob = null
         aliveTickJob = null
         wsActivePollJob = null
-        _breakerTimerJob = null
-        for (job in tail) {
+        for (job in producers) {
             job.cancel()
         }
-        for (job in tail) {
+        for (job in producers) {
             try {
                 job.join()
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                // Diagnostic; same rationale as Phase 1.
+            }
+        }
+        // Phase 3 — poll producers are fully dead and no other
+        // spawn paths into `_breakerTimerJob` remain (the timer is
+        // spawned exclusively from `transitionToOpenUnderMutex`,
+        // which is called from the producers or the timer itself).
+        // Re-read the field; whatever value is there is the final
+        // one. Cancel + join.
+        val timer = _breakerTimerJob
+        _breakerTimerJob = null
+        if (timer != null) {
+            timer.cancel()
+            try {
+                timer.join()
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
             } catch (_: Throwable) {
@@ -1415,7 +1446,7 @@ class RestFallbackOrchestrator(
                     // Trek 2 Stage 2B-B (C5, L9) — record network-class
                     // failure for the breaker. May trip Closed → Open
                     // (5th consecutive) OR HalfOpen → Open (failed probe).
-                    recordRestFailure()
+                    recordRestFailure(isProbe = isProbe)
                     // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
                     // backoff. `next_delay_ms` is the actual wait;
                     // `nominal_delay_ms` is the un-jittered source.
@@ -1438,7 +1469,7 @@ class RestFallbackOrchestrator(
                         // answered; the breaker treats this as a
                         // successful observation (resets counters /
                         // exits Open or HalfOpen).
-                        recordRestSuccess()
+                        recordRestSuccess(isProbe = isProbe)
                         staleToken = token
                         // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
                         // backoff. Token-stale on a burst can herd if multiple
@@ -1454,7 +1485,7 @@ class RestFallbackOrchestrator(
                         continue
                     }
                     in 200..299 -> {
-                        recordRestSuccess()
+                        recordRestSuccess(isProbe = isProbe)
                         val parsed = response.bodyParsed
                         if (parsed == null || parsed.envelopes.isEmpty()) {
                             log("REST_TRACE poll_empty elapsedMs=$elapsed")
@@ -1500,7 +1531,7 @@ class RestFallbackOrchestrator(
                         // malformed. 429 is rate-limit, not transport
                         // failure: the relay answered; record as
                         // success for the breaker.
-                        recordRestSuccess()
+                        recordRestSuccess(isProbe = isProbe)
                         val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
                         val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
                             // No jitter — the relay's scheduling
@@ -1523,7 +1554,7 @@ class RestFallbackOrchestrator(
                         // Trek 2 Stage 2B-B (C5, L9) — 5xx is a
                         // transport-class failure per scope §L9
                         // taxonomy. Counts toward the breaker.
-                        recordRestFailure()
+                        recordRestFailure(isProbe = isProbe)
                         val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                         val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
@@ -1558,7 +1589,7 @@ class RestFallbackOrchestrator(
                         // The relay answered, so the breaker
                         // records success for the consecutive-fail
                         // dimension.
-                        recordRestSuccess()
+                        recordRestSuccess(isProbe = isProbe)
                         // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
                         // backoff. Server-unexpected-status retries can herd
                         // when a transient relay condition rejects many polls.
@@ -1738,7 +1769,7 @@ class RestFallbackOrchestrator(
                     if (ex is CancellationException) {
                         throw ex
                     }
-                    recordRestFailure()
+                    recordRestFailure(isProbe = isProbe)
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                     val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
@@ -1752,7 +1783,7 @@ class RestFallbackOrchestrator(
 
                 val response = outcome.getOrThrow()
                 if (response.statusCode == 401) {
-                    recordRestSuccess()
+                    recordRestSuccess(isProbe = isProbe)
                     staleToken = token
                     log(
                         "REST_TRACE ws_active_poll_unauthorised status=401 " +
@@ -1768,7 +1799,7 @@ class RestFallbackOrchestrator(
                     // jittered backoff when the header is absent or
                     // malformed. Same shape as the legacy `pollLoop`'s
                     // 429 branch.
-                    recordRestSuccess()
+                    recordRestSuccess(isProbe = isProbe)
                     val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
                     val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
                         clampedRetryAfterMs to clampedRetryAfterMs
@@ -1788,7 +1819,7 @@ class RestFallbackOrchestrator(
                 if (response.statusCode in 500..599) {
                     // Trek 2 Stage 2B-B (C5, L9) — 5xx counts toward
                     // the breaker per scope §L9 taxonomy.
-                    recordRestFailure()
+                    recordRestFailure(isProbe = isProbe)
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                     val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
@@ -1814,7 +1845,7 @@ class RestFallbackOrchestrator(
                     // 410; 410 has its own dance above). The relay
                     // answered, so the breaker records success for
                     // the consecutive-fail dimension.
-                    recordRestSuccess()
+                    recordRestSuccess(isProbe = isProbe)
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                     val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
@@ -1826,7 +1857,7 @@ class RestFallbackOrchestrator(
                     delay(jitteredDelay)
                     continue
                 }
-                recordRestSuccess()
+                recordRestSuccess(isProbe = isProbe)
                 val envelopes = response.bodyParsed.envelopes
                 log(
                     "REST_TRACE ws_active_poll_ok " +
@@ -2141,20 +2172,35 @@ class RestFallbackOrchestrator(
     }
 
     /**
-     * Trek 2 Stage 2B-B (C5, L9) — increment the consecutive-fail
+     * Trek 2 Stage 2B-B (C5, L9; round-2 review-fix P1.1
+     * extended to take [isProbe]) — increment the consecutive-fail
      * counter and, if the counter reached
-     * [BREAKER_CONSECUTIVE_FAIL_THRESHOLD] (or this call is a
-     * failed HalfOpen probe), transition the breaker to
-     * `Open(ConsecutiveRestFailures, cooldownMs)` and spawn the
-     * breaker timer.
+     * [BREAKER_CONSECUTIVE_FAIL_THRESHOLD] (or this call is the
+     * probe-owning loop on a failed HalfOpen probe), transition
+     * the breaker to `Open(ConsecutiveRestFailures, cooldownMs)`
+     * and spawn the breaker timer.
      *
      * Called from BOTH poll loops on transport-class failures:
      * `IOException` / read-timeout / HTTP 5xx. Status 401 / 410 /
      * 429 / 4xx-other are NOT transport failures per scope §L9 and
      * route through [recordRestSuccess] instead (they prove the
      * transport works even if the relay refuses to serve us).
+     *
+     * **Probe ownership contract (round-2 review-fix P1.1):**
+     *   * A loop with `isProbe = false` may only mutate breaker
+     *     state while [_breakerState] is [LongPollBreakerState.Closed]
+     *     — its failure increments the consecutive-fail counter
+     *     and may trip Closed → Open. A late non-probe failure
+     *     arriving while the breaker is already
+     *     [LongPollBreakerState.Open] / [LongPollBreakerState.HalfOpen] /
+     *     [LongPollBreakerState.SuspendedOnPoison] is a no-op —
+     *     the cooldown timer / probe permit / poison handler own
+     *     those state transitions, not a stale normal loop.
+     *   * A loop with `isProbe = true` is the probe owner. It MAY
+     *     resolve `HalfOpen(probeInFlight = true)` to `Open` on
+     *     failure (the cooldown doubles).
      */
-    private suspend fun recordRestFailure() {
+    private suspend fun recordRestFailure(isProbe: Boolean) {
         val openedReason: BreakerOpenReason? = _inboundStateMutex.withLock {
             // Trek 2 Stage 2B-B (C5-C review-fix P1.3) — scope §L9
             // pins the storm trigger as "K consecutive 410 Gone
@@ -2178,7 +2224,15 @@ class RestFallbackOrchestrator(
                     } else null
                 }
                 is LongPollBreakerState.HalfOpen -> {
-                    if (current.probeInFlight) {
+                    // Round-2 review-fix P1.1: only the probe owner
+                    // can resolve HalfOpen. A stale non-probe loop
+                    // that finished AFTER another loop tripped the
+                    // breaker into HalfOpen via its own probe MUST
+                    // NOT also reopen — that would short-circuit
+                    // the cooldown timer and effectively double the
+                    // open cycle. The non-probe failure is dropped
+                    // silently here; the cooldown timer continues.
+                    if (isProbe && current.probeInFlight) {
                         val nextCooldown = (_breakerCurrentCooldownMs.toDouble() * BREAKER_COOLDOWN_GROWTH_FACTOR)
                             .toLong()
                             .coerceAtMost(BREAKER_COOLDOWN_CEILING_MS)
@@ -2190,6 +2244,10 @@ class RestFallbackOrchestrator(
                         BreakerOpenReason.ConsecutiveRestFailures
                     } else null
                 }
+                // Round-2 review-fix P1.1: Open and SuspendedOnPoison
+                // are owned by their own recovery paths (the breaker
+                // timer / orchestrator restart respectively). A late
+                // failure from a stale loop does not transition them.
                 is LongPollBreakerState.Open, is LongPollBreakerState.SuspendedOnPoison -> null
             }
         }
@@ -2237,25 +2295,72 @@ class RestFallbackOrchestrator(
      * touch [LongPollBreakerState.SuspendedOnPoison] (qualitatively
      * different recovery path per C4 §L7).
      */
-    private suspend fun recordRestSuccess() {
+    /**
+     * Trek 2 Stage 2B-B (C5, L9; round-2 review-fix P1.1
+     * extended to take [isProbe]) — record a non-failure poll
+     * response (200 / 401 / 429 / 4xx-other).
+     *
+     * **Probe ownership contract (round-2 review-fix P1.1):**
+     *   * A loop with `isProbe = false` resets only `Closed`-state
+     *     bookkeeping (consecutive-fail counter +
+     *     [_current410BackoffMs] floor + storm timestamps). A
+     *     non-probe success arriving while the breaker is
+     *     [LongPollBreakerState.Open] / [LongPollBreakerState.HalfOpen] /
+     *     [LongPollBreakerState.SuspendedOnPoison] MUST NOT
+     *     transition state. Otherwise a stale poll that succeeded
+     *     against a transient relay window before the network
+     *     broke would short-circuit the cooldown and re-arm
+     *     polling against a now-broken transport.
+     *   * A loop with `isProbe = true` is the probe owner. It MAY
+     *     resolve `HalfOpen(probeInFlight = true)` to Closed on
+     *     success — the cooldown resets and the timer is
+     *     cancelled.
+     *
+     * `Closed`-state counter / 410-floor / storm-window resets
+     * happen unconditionally (regardless of [isProbe]) under any
+     * non-failure observation because the reset semantic is "this
+     * loop saw the relay answer at this moment" — which a
+     * non-probe loop's response also evidences.
+     */
+    private suspend fun recordRestSuccess(isProbe: Boolean) {
         val transitioned: Boolean = _inboundStateMutex.withLock {
-            _breakerFailCount = 0
             // Trek 2 Stage 2B-B (C5, L8) — a successful poll exits
             // the 410 reauth backoff: reset the floor and clear the
             // storm window. A future 410 will start the 5 s floor
             // afresh and a new storm window will be measured from
-            // scratch.
+            // scratch. These resets apply regardless of [isProbe] —
+            // a non-probe success also evidences that the relay
+            // answered.
             _current410BackoffMs = BREAKER_INITIAL_COOLDOWN_MS
             _status410StormTimestamps.clear()
             when (_breakerState) {
-                is LongPollBreakerState.Open, is LongPollBreakerState.HalfOpen -> {
-                    _breakerState = LongPollBreakerState.Closed
-                    _breakerCurrentCooldownMs = BREAKER_INITIAL_COOLDOWN_MS
-                    _breakerTimerJob?.cancel()
-                    _breakerTimerJob = null
-                    true
+                is LongPollBreakerState.Closed -> {
+                    // Reset the consecutive-fail counter on any
+                    // non-failure observation in the normal
+                    // operating state.
+                    _breakerFailCount = 0
+                    false
                 }
-                is LongPollBreakerState.Closed, is LongPollBreakerState.SuspendedOnPoison -> false
+                is LongPollBreakerState.HalfOpen -> {
+                    // Round-2 review-fix P1.1: only the probe
+                    // owner resolves HalfOpen → Closed. A late
+                    // non-probe success during the probe window
+                    // does not close the breaker.
+                    if (isProbe && (_breakerState as LongPollBreakerState.HalfOpen).probeInFlight) {
+                        _breakerState = LongPollBreakerState.Closed
+                        _breakerFailCount = 0
+                        _breakerCurrentCooldownMs = BREAKER_INITIAL_COOLDOWN_MS
+                        _breakerTimerJob?.cancel()
+                        _breakerTimerJob = null
+                        true
+                    } else false
+                }
+                // Round-2 review-fix P1.1: Open is owned by the
+                // cooldown timer. A late non-probe success MUST
+                // NOT bypass the cooldown by force-closing the
+                // breaker. SuspendedOnPoison is owned by its own
+                // recovery path; same rule.
+                is LongPollBreakerState.Open, is LongPollBreakerState.SuspendedOnPoison -> false
             }
         }
         if (transitioned) {
@@ -2838,6 +2943,36 @@ class RestFallbackOrchestrator(
     internal suspend fun releaseProbePermitIfStillHeldForTest() {
         releaseProbePermitIfStillHeld()
     }
+
+    /**
+     * Trek 2 Stage 2B-B (C5 round-2 review-fix P1.1) — direct
+     * entry to [recordRestSuccess] so commonTest can pin the
+     * probe-owner gating contract (non-probe success on Open /
+     * HalfOpen is a no-op; probe owner closes HalfOpen).
+     */
+    internal suspend fun recordRestSuccessForTest(isProbe: Boolean) {
+        recordRestSuccess(isProbe = isProbe)
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5 round-2 review-fix P1.1) — direct
+     * entry to [recordRestFailure] so commonTest can pin the
+     * probe-owner gating contract (non-probe failure during
+     * HalfOpen is a no-op; probe owner reopens with doubled
+     * cooldown).
+     */
+    internal suspend fun recordRestFailureForTest(isProbe: Boolean) {
+        recordRestFailure(isProbe = isProbe)
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5 round-2 review-fix P1.2) — read-only
+     * peek for `_breakerTimerJob != null` so commonTest can pin
+     * the three-phase cancelAndJoinAll contract (after stop, the
+     * timer field MUST be null — no orphan timer).
+     */
+    internal fun peekHasBreakerTimerForTest(): Boolean =
+        _breakerTimerJob != null
 
     /**
      * Public CAS facade for media token acquisition (PR-M1w).

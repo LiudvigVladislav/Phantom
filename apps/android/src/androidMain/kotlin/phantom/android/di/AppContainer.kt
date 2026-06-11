@@ -982,6 +982,20 @@ class AppContainer(private val context: Context) {
                     // mutation; safe to call from any context, no mutex.
                     degradationDetectorRef?.emitStateTransitionSeen(reason)
                 },
+                onRestPollDegraded = { reason ->
+                    // Trek 2 Stage 2B-B (C5, L9; round-2 review-fix P2):
+                    // mirror the typed BreakerOpenReason (e.g.
+                    // ConsecutiveRestFailures vs Status410Storm) into the
+                    // WS_DEGRADED_TELEMETRY stream so calibration can
+                    // discriminate without parsing the `REST_TRACE
+                    // breaker_open` log substring. Uses the same var-trick
+                    // as onModeSwitched: the detector is constructed
+                    // immediately after this orchestrator and assigned to
+                    // `degradationDetectorRef` synchronously on this
+                    // thread BEFORE any state-machine event can fire (the
+                    // WS collectors only start after bootstrapAndStart).
+                    degradationDetectorRef?.emitRestPollDegradedSeen(reason)
+                },
                 // Trek 2 Stage 2A (A6) — pass the Stage 2B long-poll
                 // runtime gate through to the orchestrator. The value
                 // is stored unused in Stage 2A; Stage 2B will gate

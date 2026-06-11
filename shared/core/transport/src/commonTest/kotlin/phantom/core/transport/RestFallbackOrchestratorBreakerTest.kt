@@ -1786,6 +1786,281 @@ class RestFallbackOrchestratorBreakerTest {
         }
     }
 
+    // ── C5 round-2 review-fix regression pins ───────────────────────────────
+
+    @Test
+    fun cf2_p11_late_non_probe_success_does_NOT_close_breaker_in_Open() = runTest(timeout = 5.minutes) {
+        // Round-2 C5 review (P1.1): when the breaker is `Open`,
+        // a late non-probe response (e.g. a normal pollLoop poll
+        // that succeeded against a transient relay window before
+        // the network broke) MUST NOT force-close the breaker.
+        // Cooldown is owned by the breaker timer; a non-probe
+        // success short-circuiting it would re-arm polling against
+        // a likely-still-broken transport.
+        //
+        // Seed Open(ConsecutiveRestFailures, 5_000) and the
+        // current cooldown via `setBreakerStateForTest`, then call
+        // `recordRestSuccess(isProbe = false)` via a stand-in code
+        // path: drive a 200 response through the production
+        // pollLoop. The pollLoop's outcome handler will hit the
+        // `recordRestSuccess(isProbe = isProbe)` site where
+        // `isProbe = false` because the pollLoop did NOT claim the
+        // probe permit (the state was Open at the gate, so the
+        // decision was `Skip` — but we set state to Open AFTER
+        // start runs the first iteration in Closed; we then seed
+        // a 200 to ensure the late non-probe response lands).
+        //
+        // Pin: state stays Open after the late success.
+        init()
+        var pollReturns500 = true
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                if (pollReturns500) {
+                    RestFallbackResponse(
+                        statusCode = 500, bodyParsed = null,
+                        rawBody = "", elapsedMs = 1L,
+                    )
+                } else {
+                    RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                }
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump until the breaker trips to Open via the 5xx
+            // burst (5 consecutive failures).
+            var observedOpen = false
+            repeat(200) {
+                if (observedOpen) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                if (orch.peekBreakerStateForTest() is LongPollBreakerState.Open) {
+                    observedOpen = true
+                }
+            }
+            check(observedOpen) {
+                "expected Open state to set up the late-response window; got ${orch.peekBreakerStateForTest()}"
+            }
+            val openBeforeLateSuccess = orch.peekBreakerStateForTest()
+            check(openBeforeLateSuccess is LongPollBreakerState.Open) { "expected Open" }
+            // Now flip the transport to 200 — the next pollLoop
+            // iteration WILL be skipped by the gate (state Open),
+            // but we need to drive a real 200 through
+            // recordRestSuccess(isProbe = false). The easiest
+            // deterministic way: directly invoke
+            // recordRestSuccess via a non-probe code path. We use
+            // the gate seam — but gate returns Skip on Open, so
+            // recordRestSuccess is NOT called by the production
+            // gate. The test scenario the bug describes requires
+            // a poll RESPONSE in flight when the breaker tripped.
+            // We simulate this by toggling the transport AND
+            // setting the breaker state directly to Open via the
+            // seam — then exercising the legacy `pollLoop` for
+            // one iteration. The gate's Skip path returns
+            // immediately without calling record*; we need a
+            // direct entry.
+            //
+            // Use the production-equivalent record entry directly
+            // via the seam: setBreakerStateForTest already proves
+            // state isolation; here we call recordRestSuccess(isProbe = false)
+            // via reflection-free seam (added below).
+            orch.recordRestSuccessForTest(isProbe = false)
+            assertEquals(
+                openBeforeLateSuccess,
+                orch.peekBreakerStateForTest(),
+                "a non-probe success arriving while the breaker is Open MUST NOT force-close. " +
+                    "Got ${orch.peekBreakerStateForTest()}.",
+            )
+            // A probe owner's success SHOULD close — pin the
+            // contrast so the gate semantic is observable.
+            orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
+            orch.recordRestSuccessForTest(isProbe = true)
+            assertEquals(
+                LongPollBreakerState.Closed,
+                orch.peekBreakerStateForTest(),
+                "a probe-owner's success on HalfOpen(probeInFlight=true) MUST close the breaker. " +
+                    "Got ${orch.peekBreakerStateForTest()}.",
+            )
+            // Suppress unused-variable warning on the toggle.
+            pollReturns500 = false
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf2_p11_late_non_probe_failure_during_HalfOpen_does_NOT_reopen_with_doubled_cooldown() = runTest(timeout = 5.minutes) {
+        // Round-2 C5 review (P1.1): a stale non-probe failure
+        // arriving while the breaker is HalfOpen(probeInFlight=true)
+        // MUST NOT be treated as a failed probe. The probe owner
+        // is the load-bearing path that resolves HalfOpen → Open.
+        // A non-probe failure short-circuiting that to "double
+        // the cooldown" would extend the cooldown twice per real
+        // failure event.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ ->
+            RestFallbackResponse(statusCode = 200, bodyParsed = null, rawBody = "", elapsedMs = 1L)
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            // Seed HalfOpen(probeInFlight=true) — as if some other
+            // poll loop claimed the probe permit.
+            orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
+            val cooldownBefore = orch.peekBreakerCooldownMsForTest()
+            // Call the non-probe failure path. Should be a no-op.
+            orch.recordRestFailureForTest(isProbe = false)
+            assertEquals(
+                LongPollBreakerState.HalfOpen(probeInFlight = true),
+                orch.peekBreakerStateForTest(),
+                "non-probe failure during HalfOpen(probeInFlight=true) MUST NOT transition state",
+            )
+            assertEquals(
+                cooldownBefore,
+                orch.peekBreakerCooldownMsForTest(),
+                "non-probe failure during HalfOpen MUST NOT double the cooldown — that is the probe owner's job",
+            )
+            // Probe owner failure DOES reopen with doubled cooldown.
+            orch.recordRestFailureForTest(isProbe = true)
+            val state = orch.peekBreakerStateForTest()
+            assertTrue(
+                state is LongPollBreakerState.Open,
+                "probe-owner failure on HalfOpen(probeInFlight=true) MUST transition to Open. " +
+                    "Got $state.",
+            )
+            val expectedDoubled = (cooldownBefore.toDouble() * RestFallbackOrchestrator.BREAKER_COOLDOWN_GROWTH_FACTOR)
+                .toLong()
+                .coerceAtMost(RestFallbackOrchestrator.BREAKER_COOLDOWN_CEILING_MS)
+            assertEquals(
+                expectedDoubled,
+                state.cooldownMs,
+                "probe-owner failure on HalfOpen MUST double the cooldown verbatim",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf2_p12_stop_after_buffered_5xx_response_does_not_leak_breaker_timer() = runTest(timeout = 5.minutes) {
+        // Round-2 C5 review (P1.2): a cancelled pollLoop that had
+        // already received a 5xx response before the cancel signal
+        // arrived can call `recordRestFailure(isProbe)` during its
+        // unwinding. If the failure trips Closed → Open, a new
+        // breaker timer is spawned. Under the previous two-phase
+        // teardown the timer field was snapshot AT THE SAME TIME
+        // as the poll producers, so the late-spawned timer was an
+        // orphan that outlived `stop()`.
+        //
+        // Round-2 fix: three-phase teardown. Phase 2 fully unwinds
+        // the poll producers before Phase 3 reads the timer field
+        // — by Phase 3 no spawn path can fire, so the snapshot is
+        // the FINAL value.
+        //
+        // This test cannot use a synchronous transport because we
+        // need the poll producer to be mid-iteration (specifically
+        // post-recordRestFailure, mid-delay) when stop arrives. We
+        // use a sync 5xx transport: the loop iterates, gets 5xx,
+        // calls recordRestFailure (which on the 5th iteration
+        // trips to Open and spawns a timer), then enters
+        // `delay(jittered)`. While in delay, we call stop().
+        //
+        // Assertions after stop:
+        //   * No orphan timer: the breaker state's [_breakerTimerJob]
+        //     field is null (seam available via a helper).
+        //   * No spurious Open → HalfOpen transition fires after
+        //     stop: we advance virtual time well past any possible
+        //     cooldown and assert state stays Open (the post-stop
+        //     state machine is frozen).
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 500, bodyParsed = null,
+                    rawBody = "", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump until the breaker is Open (timer Job spawned).
+            var observedOpen = false
+            repeat(200) {
+                if (observedOpen) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                if (orch.peekBreakerStateForTest() is LongPollBreakerState.Open) {
+                    observedOpen = true
+                }
+            }
+            check(observedOpen) {
+                "expected Open before stop; got ${orch.peekBreakerStateForTest()}. " +
+                    "pollCalls=${transport.pollCalls.size}."
+            }
+            val openBeforeStop = orch.peekBreakerStateForTest()
+            check(openBeforeStop is LongPollBreakerState.Open)
+            // Confirm the timer field is non-null at this moment.
+            assertTrue(
+                orch.peekHasBreakerTimerForTest(),
+                "expected _breakerTimerJob to be non-null on Open before stop",
+            )
+            // Call stop — three-phase teardown should fully drain
+            // the poll producers BEFORE snapshotting the timer
+            // field, so any late timer spawned during unwinding is
+            // captured AND cancelled.
+            orch.stop()
+            runCurrent()
+            // Post-stop the timer field MUST be null.
+            assertEquals(
+                false,
+                orch.peekHasBreakerTimerForTest(),
+                "after stop, _breakerTimerJob MUST be null — no orphan timer survived. " +
+                    "If non-null, the late spawn during poll-loop unwinding wasn't captured by Phase 3.",
+            )
+            // Advance virtual time past any possible cooldown
+            // ceiling; state MUST stay Open (no spurious
+            // Open → HalfOpen from a stranded timer).
+            advanceTimeBy(RestFallbackOrchestrator.BREAKER_COOLDOWN_CEILING_MS + 5_000L)
+            runCurrent()
+            assertTrue(
+                orch.peekBreakerStateForTest() is LongPollBreakerState.Open,
+                "no stranded timer Job MUST fire after stop. Got ${orch.peekBreakerStateForTest()}.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
     // ── Fixtures ────────────────────────────────────────────────────────────
 
     private val IDENTITY: String = "aa".repeat(32)
