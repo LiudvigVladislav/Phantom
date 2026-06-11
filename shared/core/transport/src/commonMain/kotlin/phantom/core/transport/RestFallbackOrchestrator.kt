@@ -292,17 +292,34 @@ class RestFallbackOrchestrator(
     private val _macFailCount: MutableMap<String, Int> = mutableMapOf()
 
     /**
-     * Trek 2 Stage 2B-B (C4, L7 step 3) — latch set recording each
-     * `envelope_id` for which the orchestrator has already attempted
-     * a forced session/key refresh under the L7 posture. Subsequent
-     * verify failures on the SAME envelope_id do NOT trigger
-     * another refresh — they instead transition the breaker to
-     * [LongPollBreakerState.SuspendedOnPoison] (step 4).
+     * Trek 2 Stage 2B-B (C4, L7 step 3 + C4 review-fix) — per-
+     * envelope_id refresh attempt status. THREE states differentiate
+     * "no refresh attempted yet" from "refresh in flight" from
+     * "refresh completed". Only the [MacRefreshStatus.Completed]
+     * state allows a subsequent verify failure to transition the
+     * breaker to [LongPollBreakerState.SuspendedOnPoison] (step 4).
+     *
+     * Original C4 design used a `Set<String>` latch that was set
+     * BEFORE the refresh fired; a third bad-MAC arriving while the
+     * refresh was still in flight saw the latch and incorrectly
+     * triggered suspension before the refresh had a chance to
+     * recover the verify-key state. The three-state machine closes
+     * the gap: `InFlight` drops the envelope (telemetry only) and
+     * waits for the refresh to land before counting toward
+     * suspension.
      *
      * Resets only on orchestrator restart. Accessed only under
      * [_inboundStateMutex]. Shared by BOTH REST poll loops per L6.
      */
-    private val _macRefreshAttemptedFor: MutableSet<String> = mutableSetOf()
+    internal enum class MacRefreshStatus {
+        /** No refresh has been attempted for this envelope_id yet. */
+        NotAttempted,
+        /** Refresh is in flight; subsequent fails drop without suspending. */
+        InFlight,
+        /** Refresh has completed; the next fail suspends both REST loops. */
+        Completed,
+    }
+    private val _macRefreshStatus: MutableMap<String, MacRefreshStatus> = mutableMapOf()
 
     /**
      * Trek 2 Stage 2B-B (C4, L9) — current breaker state. Both REST
@@ -405,6 +422,38 @@ class RestFallbackOrchestrator(
             return
         }
         stop()
+        // Trek 2 Stage 2B-B (C4 review-fix P1.3) — reset the L7
+        // poison surface SYNCHRONOUSLY on every `start()`. The
+        // scope-doc (L9) pins: "Stage 2B-B does NOT persist
+        // breaker state across orchestrator lifecycles ...
+        // `SuspendedOnPoison` reset on next `start()`, no
+        // persistence." Without this reset, one poison envelope
+        // leaves the orchestrator permanently blocked even after
+        // a `stop()` + `start()` cycle until the entire object is
+        // reconstructed. The same reset discipline applies to the
+        // L7 counter and the refresh-status map: stale entries
+        // would gate subsequent poison-trigger logic incorrectly
+        // on the next session.
+        //
+        // `tryLock` is non-suspending and succeeds immediately
+        // because `stop()` cancelled all jobs that could hold
+        // `_inboundStateMutex`. We use it instead of `withLock`
+        // so the reset completes BEFORE any new poll-loop
+        // coroutine could spawn and read stale state. The `check`
+        // catches a future regression that called `start()` while
+        // an external caller held the mutex.
+        check(_inboundStateMutex.tryLock()) {
+            "_inboundStateMutex must be uncontended after stop() — caller is " +
+                "holding the mutex across the orchestrator lifecycle boundary"
+        }
+        try {
+            _breakerState = LongPollBreakerState.Closed
+            _macFailCount.clear()
+            _macRefreshStatus.clear()
+        } finally {
+            _inboundStateMutex.unlock()
+        }
+        log("REST_TRACE poison_state_reset_on_start")
         stateObserverJob = scope.launch {
             stateMachine.state.collect { mode -> onModeChanged(mode) }
         }
@@ -962,6 +1011,28 @@ class RestFallbackOrchestrator(
 
             val intervalMs = pollIntervalMs()
             val pollMode = pollMode()
+            // Trek 2 Stage 2B-B (C4 review-fix P1.2) — breaker gate
+            // BEFORE `transport.poll(...)`. Without this gate, a
+            // `SuspendedOnPoison` breaker only stopped envelope
+            // INGESTION (verify gate inside `processInboundEnvelopeWithVerify`)
+            // — both loops kept polling the relay forever and
+            // dropping the same poison envelope. Scope L7 step 4
+            // intent is "Suspend BOTH REST poll loops"; that
+            // requires stopping the polling itself, not just the
+            // post-response gate. Skip + jittered backoff so a
+            // manual recovery path can flip the breaker back to
+            // Closed and resume polling on the next iteration.
+            if (_inboundStateMutex.withLock { _breakerState } is LongPollBreakerState.SuspendedOnPoison) {
+                val nominalDelay = POLL_FAIL_BACKOFF_MS
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE poll_call_skipped reason=breaker_suspended_on_poison " +
+                        "loop=pollLoop next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
             // L4 + OQ-6 LOCK: read the persisted cursor at the start
             // of every iteration. Both poll loops share this single
             // source of truth; the legacy in-memory `lastSeenSeq`
@@ -1168,6 +1239,21 @@ class RestFallbackOrchestrator(
             }
             staleToken = null
 
+            // Trek 2 Stage 2B-B (C4 review-fix P1.2) — same breaker
+            // gate as the legacy pollLoop above. `SuspendedOnPoison`
+            // STOPS polling, not just envelope ingestion. Scope L7
+            // step 4 intent: "Suspend BOTH REST poll loops".
+            if (_inboundStateMutex.withLock { _breakerState } is LongPollBreakerState.SuspendedOnPoison) {
+                val nominalDelay = POLL_FAIL_BACKOFF_MS
+                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                log(
+                    "REST_TRACE ws_active_poll_call_skipped reason=breaker_suspended_on_poison " +
+                        "next_delay_ms=$jitteredDelay nominal_delay_ms=$nominalDelay",
+                )
+                delay(jitteredDelay)
+                continue
+            }
             // L4 + OQ-6 LOCK: both REST poll loops share the
             // persisted cursor via the same `cursorRepository` seam.
             // `null` means "no persisted cursor" — wire treats that
@@ -1601,27 +1687,40 @@ class RestFallbackOrchestrator(
     ) {
         // Step 1 + Step 4 under a single mutex critical section so
         // concurrent failures on the same envelope_id from both
-        // loops cannot race past the latch check.
+        // loops cannot race past the status check.
         val decision: BadMacDecision = _inboundStateMutex.withLock {
             val newCount = (_macFailCount[env.id] ?: 0) + 1
             _macFailCount[env.id] = newCount
-            val alreadyLatched = env.id in _macRefreshAttemptedFor
-            when {
-                alreadyLatched -> {
-                    // Step 4: repeat-after-refresh → suspension.
+            val currentStatus = _macRefreshStatus[env.id] ?: MacRefreshStatus.NotAttempted
+            when (currentStatus) {
+                MacRefreshStatus.Completed -> {
+                    // Step 4: repeat AFTER refresh completed →
+                    // suspension. The refresh got its chance to
+                    // recover the verify-key state and the failure
+                    // persisted; suspend both REST loops.
                     _breakerState = LongPollBreakerState.SuspendedOnPoison
                     BadMacDecision(newCount = newCount, action = BadMacAction.Suspend)
                 }
-                newCount >= MAC_REPEAT_REFRESH_THRESHOLD -> {
-                    // Step 3: threshold reached, latch was empty —
-                    // set the latch and signal the caller to
-                    // trigger the refresh (outside the mutex; the
-                    // refresh path takes `tokenMutex` outer).
-                    _macRefreshAttemptedFor += env.id
-                    BadMacDecision(newCount = newCount, action = BadMacAction.TriggerRefresh)
-                }
-                else -> {
+                MacRefreshStatus.InFlight -> {
+                    // C4 review-fix (P1.1): refresh is still in
+                    // flight; the verify-key state may still be
+                    // stale. DO NOT suspend yet — telemetry only
+                    // and drop. When the in-flight refresh lands
+                    // it will mark status=Completed; subsequent
+                    // failures from that point onward suspend.
                     BadMacDecision(newCount = newCount, action = BadMacAction.JustLog)
+                }
+                MacRefreshStatus.NotAttempted -> {
+                    if (newCount >= MAC_REPEAT_REFRESH_THRESHOLD) {
+                        // Step 3: threshold reached, no refresh yet.
+                        // Mark InFlight under the SAME critical
+                        // section so a concurrent loop racing past
+                        // here observes InFlight and JustLogs.
+                        _macRefreshStatus[env.id] = MacRefreshStatus.InFlight
+                        BadMacDecision(newCount = newCount, action = BadMacAction.TriggerRefresh)
+                    } else {
+                        BadMacDecision(newCount = newCount, action = BadMacAction.JustLog)
+                    }
                 }
             }
         }
@@ -1637,15 +1736,29 @@ class RestFallbackOrchestrator(
             BadMacAction.JustLog -> { /* no additional action */ }
             BadMacAction.TriggerRefresh -> {
                 // Step 3: forced refresh outside `_inboundStateMutex`
-                // because `acquireOrRefreshToken` takes
-                // `tokenMutex` outer + `_inboundStateMutex` inner.
-                // The refresh response classifier transitions the
-                // verify-key state machine onto the published
-                // outcome (Valid / Empty / Malformed / Failure).
-                acquireOrRefreshToken(
-                    reason = "poll_mac_repeat",
-                    staleToken = currentToken,
-                )
+                // because `acquireOrRefreshToken` takes `tokenMutex`
+                // outer + `_inboundStateMutex` inner. The refresh
+                // response classifier transitions the verify-key
+                // state machine onto the published outcome (Valid /
+                // Empty / Malformed / Failure).
+                try {
+                    acquireOrRefreshToken(
+                        reason = "poll_mac_repeat",
+                        staleToken = currentToken,
+                    )
+                } finally {
+                    // C4 review-fix (P1.1): mark Completed AFTER the
+                    // refresh attempt lands. Subsequent failures
+                    // from this point can suspend. The `finally`
+                    // ensures the transition happens even if the
+                    // refresh call threw — otherwise an exceptional
+                    // exit would leave status pinned at InFlight
+                    // forever and the L7 posture would never be
+                    // able to suspend on persistent failures.
+                    _inboundStateMutex.withLock {
+                        _macRefreshStatus[env.id] = MacRefreshStatus.Completed
+                    }
+                }
             }
             BadMacAction.Suspend -> {
                 log(
@@ -1789,9 +1902,15 @@ class RestFallbackOrchestrator(
     internal suspend fun peekMacFailCountForTest(envelopeId: String): Int =
         _inboundStateMutex.withLock { _macFailCount[envelopeId] ?: 0 }
 
-    /** Peek refresh-attempted latch membership. */
-    internal suspend fun peekMacRefreshAttemptedForTest(envelopeId: String): Boolean =
-        _inboundStateMutex.withLock { envelopeId in _macRefreshAttemptedFor }
+    /**
+     * Peek the per-envelope_id refresh-attempt status. Returns
+     * [MacRefreshStatus.NotAttempted] when no entry exists.
+     * The status drives the L7 step 4 suspension trigger:
+     * `Completed` + verify failure → `SuspendedOnPoison`;
+     * `InFlight` + verify failure → telemetry only.
+     */
+    internal suspend fun peekMacRefreshStatusForTest(envelopeId: String): MacRefreshStatus =
+        _inboundStateMutex.withLock { _macRefreshStatus[envelopeId] ?: MacRefreshStatus.NotAttempted }
 
     /**
      * Test-only seam that drives the per-envelope verify-and-emit

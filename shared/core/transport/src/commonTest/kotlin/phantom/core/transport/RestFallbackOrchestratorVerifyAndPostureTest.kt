@@ -7,6 +7,7 @@ package phantom.core.transport
 
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import com.ionspin.kotlin.crypto.auth.Auth
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
@@ -14,8 +15,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -173,7 +176,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
      * on poll; success session response with [HEX_KEY_A].
      */
     private class VerifyTransport(
-        var sessionScript: (callIndex: Int) -> RestFallbackResponse<AuthSessionResponse>,
+        var sessionScript: suspend (callIndex: Int) -> RestFallbackResponse<AuthSessionResponse>,
     ) : RestFallbackTransport {
 
         var ackScript: (envelopeId: String) -> RestFallbackResponse<AckDeliverResponse> = { _ ->
@@ -659,7 +662,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         assertFalse(emitted1)
         assertEquals(1, orch.peekMacFailCountForTest("env-bad"))
         assertEquals(LongPollBreakerState.Closed, orch.peekBreakerStateForTest())
-        assertFalse(orch.peekMacRefreshAttemptedForTest("env-bad"))
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.NotAttempted, orch.peekMacRefreshStatusForTest("env-bad"))
 
         // No ack call, no cursor write.
         assertEquals(0, transport.ackCalls.size)
@@ -694,13 +697,13 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
         assertEquals(1, orch.peekMacFailCountForTest("env-mb13"))
         assertEquals(authBeforePost, transport.authCalls.size, "no refresh on first fail")
-        assertFalse(orch.peekMacRefreshAttemptedForTest("env-mb13"))
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.NotAttempted, orch.peekMacRefreshStatusForTest("env-mb13"))
 
         // Second failure: counter=2 = THRESHOLD. Refresh fires; latch set.
         orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
         assertEquals(2, orch.peekMacFailCountForTest("env-mb13"))
         assertEquals(authBeforePost + 1, transport.authCalls.size, "refresh fires at threshold")
-        assertTrue(orch.peekMacRefreshAttemptedForTest("env-mb13"))
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.Completed, orch.peekMacRefreshStatusForTest("env-mb13"))
     }
 
     @Test
@@ -822,44 +825,148 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         assertEquals(0, cursor.writes.size)
     }
 
-    // ── M-B17 — both loops share the gate (same processing helper) ──────────
+    // ── M-B17 — real two-loop run under SuspendedOnPoison ───────────────────
 
     @Test
-    fun mb17_both_loops_use_same_processInboundEnvelopeWithVerify_helper() = runTest {
-        // Both REST poll loops call the same private helper
-        // [processInboundEnvelopeWithVerify]; the test seam exposes
-        // exactly that helper. A single call site mismatch (one
-        // loop bypassing the gate) would be a compile-time
-        // regression in this test file, since both loops are
-        // wired through the same internal function.
+    fun mb17_real_both_poll_loops_stop_polling_under_SuspendedOnPoison() = runTest {
+        // C4 review-fix (P2.4): the earlier draft of M-B17 called
+        // the test helper twice with different loop-tag strings —
+        // it did NOT prove BOTH production poll loops actually
+        // observe the breaker. This version drives the real
+        // `pollLoop` AND `wsActivePollLoop` via
+        // `orchestrator.start()`, flipping state to RestActive so
+        // the legacy loop spawns alongside the parallel one.
         //
-        // Behavioural witness: under SuspendedOnPoison, both
-        // simulated loop tags return `false` (drop) for the same
-        // envelope.
+        // We then set the breaker to SuspendedOnPoison via a
+        // direct seam and assert that `transport.pollEnterCount`
+        // stops growing — proving the new C4 P1.2 fix actually
+        // GATES THE POLL CALL ITSELF, not just the envelope
+        // ingestion afterward.
         init()
-        val rootKey = ByteArray(32)
-        val derivedKey = deriveVerifyKey(rootKey, IDENTITY)
-        val keyHex = derivedKey.toLowerHex()
-        val transport = VerifyTransport(sessionScript = {
-            RestFallbackResponse(
-                200, AuthSessionResponse(
-                    token = "tok", expiresAt = Long.MAX_VALUE,
-                    restFallback = true, maxSendBodyBytes = 4096,
-                    pollMaxEnvelopes = 1, pollHoldSecs = 30,
-                    seqMacVerifyKey = keyHex,
-                ), "{}", 1L,
+        val transport = PollLoopCountingTransport(
+            sessionScript = { _ ->
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = "",
+                    ), "{}", 1L,
+                )
+            },
+        )
+        val orch = buildOrchestratorWithPollLoops(
+            transport = transport, cursor = RecordingCursorRepo(),
+            scheduler = testScheduler, longPollEnabled = true,
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        // Flip state to RestActive so the legacy pollLoop also spawns.
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L,
+                    inboundFrames = 0,
+                    pendingAcksAtClose = 1,
+                ),
             )
-        })
-        val orch = buildOrchestrator(transport, RecordingCursorRepo(), testScheduler)
-        bootstrapped(orch)
-        orch.setBreakerStateForTest(LongPollBreakerState.SuspendedOnPoison)
+        }
+        check(orch.stateMachine.state.value == RestMode.RestActive)
 
-        val env = makeVerifiedEnvelope(IDENTITY, 1L, "env-mb17", 60_000L, derivedKey)
-        val emittedLegacy = orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "pollLoop")
-        val emittedWsActive = orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "wsActivePollLoop")
-        assertFalse(emittedLegacy, "legacy pollLoop must drop under SuspendedOnPoison")
-        assertFalse(emittedWsActive, "wsActivePollLoop must drop under SuspendedOnPoison")
+        orch.start()
+        runCurrent()
+        // Pump a few iterations to confirm BOTH loops poll.
+        repeat(5) {
+            advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+            runCurrent()
+        }
+        val pollCountBeforeSuspension = transport.pollEnterCount
+        assertTrue(
+            pollCountBeforeSuspension >= 2,
+            "expected both poll loops to have polled at least once; pollEnterCount=$pollCountBeforeSuspension",
+        )
+
+        // Flip the breaker to SuspendedOnPoison via the test seam.
+        orch.setBreakerStateForTest(LongPollBreakerState.SuspendedOnPoison)
+        runCurrent()
+
+        // Advance virtual time many iterations and confirm BOTH
+        // loops actually STOPPED polling — the breaker gate is
+        // BEFORE `transport.poll(...)`.
+        val pollCountAtFreezeMoment = transport.pollEnterCount
+        advanceTimeBy(RestFallbackOrchestrator.POLL_FAIL_BACKOFF_MS * 20L)
+        runCurrent()
+        // Some grace polls may land if a poll was already in flight,
+        // but eventually polling should freeze. We bound at +2 to
+        // tolerate one in-flight poll per loop.
+        assertTrue(
+            transport.pollEnterCount - pollCountAtFreezeMoment <= 2,
+            "poll count grew unexpectedly after SuspendedOnPoison: " +
+                "before=$pollCountAtFreezeMoment, after=${transport.pollEnterCount}. " +
+                "The breaker MUST gate `transport.poll(...)` itself, not just " +
+                "envelope ingestion.",
+        )
+
+        // Now snapshot and verify total freeze over a further interval.
+        val pollCountFrozen = transport.pollEnterCount
+        advanceTimeBy(RestFallbackOrchestrator.POLL_FAIL_BACKOFF_MS * 100L)
+        runCurrent()
+        assertEquals(
+            pollCountFrozen,
+            transport.pollEnterCount,
+            "after the breaker freeze settles, poll count must be perfectly static",
+        )
+
+        orch.stop()
+        runCurrent()
     }
+
+    /**
+     * Transport that returns empty poll responses + counts poll
+     * calls; used by the real two-loop tests below. Distinct from
+     * the verify-path [VerifyTransport] which fails poll on entry.
+     */
+    private class PollLoopCountingTransport(
+        var sessionScript: (callIndex: Int) -> RestFallbackResponse<AuthSessionResponse>,
+    ) : RestFallbackTransport {
+        val ackCalls: MutableList<String> = mutableListOf()
+        val authCalls: MutableList<Unit> = mutableListOf()
+        var pollEnterCount: Int = 0
+        private val counterMutex: Mutex = Mutex()
+        override suspend fun authSession(url: String, body: AuthSessionRequest): RestFallbackResponse<AuthSessionResponse> {
+            authCalls += Unit
+            return sessionScript(authCalls.size - 1)
+        }
+        override suspend fun send(url: String, token: String, idempotencyKey: String, body: SendRequest): RestFallbackResponse<SendResponse> = fail("send unexpected")
+        override suspend fun poll(url: String, token: String, sinceSeq: Long?, longPollOptIn: Boolean, readTimeoutMs: Long?): RestFallbackResponse<PollResponse> {
+            counterMutex.withLock { pollEnterCount += 1 }
+            return RestFallbackResponse(200, PollResponse(envelopes = emptyList(), more = false), "{}", 1L)
+        }
+        override suspend fun ackDeliver(url: String, token: String, body: AckDeliverRequest): RestFallbackResponse<AckDeliverResponse> {
+            ackCalls += body.id
+            return RestFallbackResponse(200, AckDeliverResponse(ok = 1), "{}", 1L)
+        }
+    }
+
+    private fun buildOrchestratorWithPollLoops(
+        transport: PollLoopCountingTransport,
+        cursor: LongPollCursorRepository?,
+        scheduler: TestCoroutineScheduler,
+        longPollEnabled: Boolean = true,
+        logSink: (String) -> Unit = {},
+    ): RestFallbackOrchestrator = RestFallbackOrchestrator(
+        baseUrl = "https://relay.test",
+        identityHex = IDENTITY,
+        signingPubkeyHex = "bb".repeat(32),
+        getChallenge = { _ -> "cc".repeat(32) },
+        signChallenge = { _ -> ByteArray(64) { 0xDD.toByte() } },
+        transport = transport,
+        now = { 0L },
+        log = logSink,
+        longPollEnabled = longPollEnabled,
+        cursorRepository = cursor,
+        dispatcher = StandardTestDispatcher(scheduler),
+    )
 
     // ── M-B21 — verify failure does NOT advance the cursor (debug hold note) ─
 
@@ -932,7 +1039,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         assertEquals(2, orch.peekMacFailCountForTest("env-concurrent"))
         // Latch fired exactly once (the second fail set the latch
         // BEFORE either could trigger a second refresh).
-        assertTrue(orch.peekMacRefreshAttemptedForTest("env-concurrent"))
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.Completed, orch.peekMacRefreshStatusForTest("env-concurrent"))
         // Exactly ONE refresh call landed on authSession (the L7
         // step 3 refresh).
         assertEquals(authBefore + 1, transport.authCalls.size, "exactly one refresh under concurrent contention")
@@ -964,7 +1071,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         val env = makeEnvelopeWithSeqMac(1L, "env-mb23", 60_000L, "0".repeat(64))
         // Pre-seed: trigger the latched refresh.
         repeat(2) { orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test") }
-        assertTrue(orch.peekMacRefreshAttemptedForTest("env-mb23"))
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.Completed, orch.peekMacRefreshStatusForTest("env-mb23"))
 
         // Now two concurrent post-refresh failures from both loops.
         val loopA = async { orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "pollLoop") }
@@ -1030,38 +1137,190 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         var verified = 0
         var failed = 0
 
-        // 30 concurrent verify-vs-flip races. Each verify is
-        // expected to be EITHER fully verified (snapshotted before
-        // flip) OR fully failed (snapshotted after flip) — never
-        // torn.
-        val ops = (0 until 30).map { i ->
-            val env = makeVerifiedEnvelope(IDENTITY, (i + 1).toLong(), "env-mb25-$i", 60_000L, derivedKeyA)
-            launch {
-                val emitted = orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
-                verifySuccesses.withLock {
-                    if (emitted) verified += 1 else failed += 1
+        // C4 review-fix (P2.5): scope locks 100 × 100 stress (100
+        // concurrent verify-vs-flip races, 100 refresh-induced
+        // flips). Earlier draft used 30 × 5 and was rejected.
+        // Bumped to 100 × 100. Each verify must produce a defined
+        // outcome (Verified or MacMismatch); a torn read would
+        // crash the SeqMacVerifier's hex-decode or HMAC primitive.
+        // We wrap in `withTimeout` so a deadlock surfaces by name
+        // rather than wedging gradle.
+        withTimeout(30_000L) {
+            val ops = (0 until 100).map { i ->
+                val env = makeVerifiedEnvelope(IDENTITY, (i + 1).toLong(), "env-mb25-$i", 60_000L, derivedKeyA)
+                launch {
+                    val emitted = orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
+                    verifySuccesses.withLock {
+                        if (emitted) verified += 1 else failed += 1
+                    }
                 }
             }
-        }
 
-        // Concurrent flips between hexA and hexB.
-        val flips = (0 until 5).map {
-            launch {
-                orch.setVerifyKeyStateForTest(VerifyKeyState.KeyPresent(HEX_KEY_B))
-                orch.setVerifyKeyStateForTest(VerifyKeyState.KeyPresent(keyAHex))
+            // Concurrent flips between hexA and hexB. Each flip pair
+            // counts as 2 transitions; 100 flips = 50 pairs.
+            val flips = (0 until 100).map {
+                launch {
+                    orch.setVerifyKeyStateForTest(VerifyKeyState.KeyPresent(HEX_KEY_B))
+                    orch.setVerifyKeyStateForTest(VerifyKeyState.KeyPresent(keyAHex))
+                }
             }
+
+            runCurrent()
+            ops.forEach { it.join() }
+            flips.forEach { it.join() }
         }
 
-        runCurrent()
-        ops.forEach { it.join() }
-        flips.forEach { it.join() }
-
-        // Sum is exactly the number of operations — proves no
-        // operation crashed or produced an undefined outcome.
+        // Defined outcome for every operation. A torn read would
+        // throw inside SeqMacVerifier (hex-decode failure or HMAC
+        // primitive throw); crashes propagate through `launch`
+        // and would manifest as the count being less than 100.
         assertEquals(
-            30,
+            100,
             verified + failed,
-            "every concurrent verify operation produced a defined outcome (no torn / undefined results)",
+            "every concurrent verify operation must produce a defined outcome (no torn read crash, no operation lost). " +
+                "Got verified=$verified failed=$failed sum=${verified + failed}",
         )
+    }
+
+    // ── C4 review-fix P1.1 — refresh latch race regression pin ───────────────
+
+    @Test
+    fun p11_inflight_refresh_does_not_falsely_trigger_SuspendedOnPoison_on_third_fail() = runTest {
+        // C4 review-fix P1.1: the original implementation set the
+        // refresh-attempted latch BEFORE the refresh actually
+        // completed. A third bad-MAC arriving while the refresh
+        // was still in flight saw the latch and (incorrectly)
+        // transitioned the breaker to SuspendedOnPoison.
+        //
+        // The fix replaces the boolean latch with a three-state
+        // status: NotAttempted / InFlight / Completed. Suspension
+        // fires ONLY on Completed. While InFlight, additional
+        // failures just log (the in-flight refresh may yet recover
+        // the verify-key state).
+        //
+        // We model this by delaying the second authSession call
+        // (the refresh triggered at threshold) via a deferred. The
+        // third fail arrives BEFORE the refresh completes; the
+        // breaker MUST stay Closed.
+        init()
+        val refreshUnblock = CompletableDeferred<Unit>()
+        var callIndex = 0
+        val transport = VerifyTransport(sessionScript = {
+            val idx = callIndex
+            callIndex += 1
+            if (idx == 0) {
+                // Bootstrap.
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = HEX_KEY_A,
+                    ), "{}", 1L,
+                )
+            } else {
+                // Refresh — block until the test releases.
+                refreshUnblock.await()
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = HEX_KEY_A,
+                    ), "{}", 1L,
+                )
+            }
+        })
+        val orch = buildOrchestrator(transport, RecordingCursorRepo(), testScheduler)
+        bootstrapped(orch)
+
+        val env = makeEnvelopeWithSeqMac(1L, "env-p11", 60_000L, "0".repeat(64))
+        // First fail: count=1, NotAttempted, justLog.
+        orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.NotAttempted, orch.peekMacRefreshStatusForTest("env-p11"))
+
+        // Second fail: count=2, threshold, status → InFlight,
+        // refresh fires. But because authSession awaits
+        // refreshUnblock, the refresh hangs. We launch the second
+        // fail in a coroutine so the test can proceed.
+        val secondFailJob = launch {
+            orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
+        }
+        runCurrent()
+        // The refresh is in flight; status should be InFlight.
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.InFlight, orch.peekMacRefreshStatusForTest("env-p11"))
+
+        // Third fail arrives while refresh is in flight. The
+        // status is InFlight → JustLog. Breaker MUST stay Closed.
+        orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
+        assertEquals(
+            LongPollBreakerState.Closed,
+            orch.peekBreakerStateForTest(),
+            "Third bad-MAC during InFlight refresh MUST NOT prematurely suspend",
+        )
+
+        // Release the refresh; secondFailJob completes; status → Completed.
+        refreshUnblock.complete(Unit)
+        runCurrent()
+        secondFailJob.join()
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.Completed, orch.peekMacRefreshStatusForTest("env-p11"))
+
+        // NOW a fresh fail (post-Completed) DOES suspend.
+        orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
+        assertEquals(
+            LongPollBreakerState.SuspendedOnPoison,
+            orch.peekBreakerStateForTest(),
+            "Fail AFTER refresh Completed must suspend",
+        )
+    }
+
+    // ── C4 review-fix P1.3 — start() resets poison state ─────────────────────
+
+    @Test
+    fun p13_start_resets_breakerState_macFailCount_macRefreshStatus_to_initial() = runTest {
+        // C4 review-fix P1.3: `stop()` + `start()` must reset the
+        // L7 poison surface. Scope L9: "Stage 2B-B does NOT persist
+        // breaker state across orchestrator lifecycles ...
+        // SuspendedOnPoison reset on next start(), no persistence."
+        init()
+        val transport = VerifyTransport(sessionScript = { SESSION_RESPONSE_OK_WITH_KEY_A })
+        val orch = buildOrchestrator(transport, RecordingCursorRepo(), testScheduler)
+        bootstrapped(orch)
+
+        // Simulate prior poison-state.
+        val env = makeEnvelopeWithSeqMac(1L, "env-p13", 60_000L, "0".repeat(64))
+        repeat(2) { orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test") }
+        // Force the breaker into SuspendedOnPoison via test seam to
+        // simulate a finalised poison cycle.
+        orch.setBreakerStateForTest(LongPollBreakerState.SuspendedOnPoison)
+
+        // Sanity check the pre-restart state.
+        assertEquals(LongPollBreakerState.SuspendedOnPoison, orch.peekBreakerStateForTest())
+        assertTrue(orch.peekMacFailCountForTest("env-p13") >= 2)
+        assertEquals(RestFallbackOrchestrator.MacRefreshStatus.Completed, orch.peekMacRefreshStatusForTest("env-p13"))
+
+        // stop() + start() resets.
+        orch.stop()
+        orch.start()
+        runCurrent()
+
+        // All three poison-surface fields reset to initial values.
+        assertEquals(
+            LongPollBreakerState.Closed,
+            orch.peekBreakerStateForTest(),
+            "start() must reset _breakerState to Closed",
+        )
+        assertEquals(
+            0,
+            orch.peekMacFailCountForTest("env-p13"),
+            "start() must clear _macFailCount",
+        )
+        assertEquals(
+            RestFallbackOrchestrator.MacRefreshStatus.NotAttempted,
+            orch.peekMacRefreshStatusForTest("env-p13"),
+            "start() must clear _macRefreshStatus",
+        )
+
+        orch.stop()
     }
 }
