@@ -416,42 +416,29 @@ class RestFallbackOrchestrator(
      * Safe to call multiple times; existing observers are cancelled and
      * re-created.
      */
-    fun start() {
+    suspend fun start() {
         if (!_capabilities.value.restFallback) {
             log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
             return
         }
-        stop()
-        // Trek 2 Stage 2B-B (C4 review-fix P1.3) — reset the L7
-        // poison surface SYNCHRONOUSLY on every `start()`. The
-        // scope-doc (L9) pins: "Stage 2B-B does NOT persist
-        // breaker state across orchestrator lifecycles ...
-        // `SuspendedOnPoison` reset on next `start()`, no
-        // persistence." Without this reset, one poison envelope
-        // leaves the orchestrator permanently blocked even after
-        // a `stop()` + `start()` cycle until the entire object is
-        // reconstructed. The same reset discipline applies to the
-        // L7 counter and the refresh-status map: stale entries
-        // would gate subsequent poison-trigger logic incorrectly
-        // on the next session.
+        // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) —
+        // `stop()` only calls `cancel()` (non-blocking); a job that
+        // was suspended inside `_inboundStateMutex.withLock { ... }`
+        // could legitimately still hold the mutex when `start()`
+        // tries to acquire it, and a CANCELLED job's continuation
+        // can still observe the resume signal and write to state
+        // AFTER our reset.
         //
-        // `tryLock` is non-suspending and succeeds immediately
-        // because `stop()` cancelled all jobs that could hold
-        // `_inboundStateMutex`. We use it instead of `withLock`
-        // so the reset completes BEFORE any new poll-loop
-        // coroutine could spawn and read stale state. The `check`
-        // catches a future regression that called `start()` while
-        // an external caller held the mutex.
-        check(_inboundStateMutex.tryLock()) {
-            "_inboundStateMutex must be uncontended after stop() — caller is " +
-                "holding the mutex across the orchestrator lifecycle boundary"
-        }
-        try {
+        // Resolution: `start()` is now `suspend` and uses
+        // `cancelAndJoinAll()` to fully await every prior job
+        // before resetting state. The reset then happens under a
+        // genuine `withLock` (not `tryLock`); by that point no
+        // orphan job can race the write.
+        cancelAndJoinAll()
+        _inboundStateMutex.withLock {
             _breakerState = LongPollBreakerState.Closed
             _macFailCount.clear()
             _macRefreshStatus.clear()
-        } finally {
-            _inboundStateMutex.unlock()
         }
         log("REST_TRACE poison_state_reset_on_start")
         stateObserverJob = scope.launch {
@@ -485,6 +472,38 @@ class RestFallbackOrchestrator(
         // on every stop. Lifecycle is tied to the orchestrator's own
         // start/stop, not to any WS mode transition.
         wsActivePollJob?.cancel(); wsActivePollJob = null
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) — cancel
+     * every prior job AND wait for it to finish. Used by [start]
+     * to guarantee no orphan job can race the lifecycle reset
+     * (mutex write to `_breakerState`, `_macFailCount`,
+     * `_macRefreshStatus`). Non-blocking `stop()` (above) only
+     * cancels; an orphan still running between the cancel and the
+     * coroutine's next suspension point could write stale state.
+     */
+    private suspend fun cancelAndJoinAll() {
+        val jobs = listOfNotNull(pollJob, aliveTickJob, stateObserverJob, wsActivePollJob)
+        pollJob = null
+        aliveTickJob = null
+        stateObserverJob = null
+        wsActivePollJob = null
+        for (job in jobs) {
+            job.cancel()
+        }
+        for (job in jobs) {
+            try {
+                job.join()
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                // Job-completion exceptions other than cancellation
+                // are diagnostic; the join's purpose is to wait
+                // for the coroutine body to fully unwind, not to
+                // surface its result.
+            }
+        }
     }
 
     /**
@@ -1741,22 +1760,44 @@ class RestFallbackOrchestrator(
                 // response classifier transitions the verify-key
                 // state machine onto the published outcome (Valid /
                 // Empty / Malformed / Failure).
+                //
+                // C4 review-fix round 2 (P1.2) — distinguish three
+                // exit paths:
+                //
+                //   * Normal completion → status = `Completed`.
+                //     The L7 step 4 trigger ("repeat-after-refresh
+                //     → suspend") fires on subsequent failures.
+                //   * Cancellation → status = `NotAttempted`
+                //     (rollback). The refresh did NOT get its
+                //     chance; the next bad-MAC must retry the
+                //     refresh, not immediately suspend.
+                //   * Other throwable → status = `Completed`. The
+                //     attempt happened; the failure is real-world
+                //     evidence that the refresh path is broken.
+                //
+                // The status update runs under
+                // `withContext(NonCancellable)` so a caller
+                // cancellation cannot itself prevent the
+                // status-publication step from completing.
+                var refreshNormallyCompleted = false
                 try {
                     acquireOrRefreshToken(
                         reason = "poll_mac_repeat",
                         staleToken = currentToken,
                     )
+                    refreshNormallyCompleted = true
                 } finally {
-                    // C4 review-fix (P1.1): mark Completed AFTER the
-                    // refresh attempt lands. Subsequent failures
-                    // from this point can suspend. The `finally`
-                    // ensures the transition happens even if the
-                    // refresh call threw — otherwise an exceptional
-                    // exit would leave status pinned at InFlight
-                    // forever and the L7 posture would never be
-                    // able to suspend on persistent failures.
-                    _inboundStateMutex.withLock {
-                        _macRefreshStatus[env.id] = MacRefreshStatus.Completed
+                    withContext(NonCancellable) {
+                        _inboundStateMutex.withLock {
+                            _macRefreshStatus[env.id] = if (refreshNormallyCompleted) {
+                                MacRefreshStatus.Completed
+                            } else {
+                                // Cancellation OR other throw: roll
+                                // back to NotAttempted so the next
+                                // poll cycle can retry the refresh.
+                                MacRefreshStatus.NotAttempted
+                            }
+                        }
                     }
                 }
             }
@@ -1981,21 +2022,32 @@ class RestFallbackOrchestrator(
 
     private suspend fun authSessionOnce(): AuthSessionResponse? {
         log("REST_TRACE session_request identity=${identityHex.take(8)}")
-        val challengeHex = runCatching { getChallenge(identityHex) }
-            .onFailure { ex ->
-                log("REST_TRACE session_challenge_fail reason=${ex::class.simpleName}")
-            }
-            .getOrNull() ?: return null
+        // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.2) — explicit
+        // `try { ... } catch (CancellationException) { throw }`
+        // pattern. The earlier `runCatching` calls swallowed
+        // `CancellationException` as if it were an ordinary network
+        // error, breaking structured-concurrency teardown and
+        // letting the L7 bad-MAC path leak a refresh attempt that
+        // was cancelled mid-flight.
+        val challengeHex = try {
+            getChallenge(identityHex)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (ex: Throwable) {
+            log("REST_TRACE session_challenge_fail reason=${ex::class.simpleName}")
+            return null
+        }
 
-        val signatureHex = runCatching {
+        val signatureHex = try {
             val challengeBytes = hexToBytes(challengeHex)
             val sigBytes = signChallenge(challengeBytes)
             bytesToHex(sigBytes)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (ex: Throwable) {
+            log("REST_TRACE session_sign_fail reason=${ex::class.simpleName}")
+            return null
         }
-            .onFailure { ex ->
-                log("REST_TRACE session_sign_fail reason=${ex::class.simpleName}")
-            }
-            .getOrNull() ?: return null
 
         val body = AuthSessionRequest(
             identityHex = identityHex,
@@ -2005,17 +2057,16 @@ class RestFallbackOrchestrator(
         )
 
         val startMs = now()
-        val outcome = runCatching {
+        val response: RestFallbackResponse<AuthSessionResponse> = try {
             transport.authSession(url = "$baseUrl/auth/session", body = body)
-        }
-        val elapsed = now() - startMs
-
-        if (outcome.isFailure) {
-            val ex = outcome.exceptionOrNull()!!
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (ex: Throwable) {
+            val elapsed = now() - startMs
             log("REST_TRACE session_fail reason=${ex::class.simpleName} elapsedMs=$elapsed")
             return null
         }
-        val response = outcome.getOrThrow()
+        val elapsed = now() - startMs
         if (response.statusCode !in 200..299 || response.bodyParsed == null) {
             log("REST_TRACE session_fail status=${response.statusCode} elapsedMs=$elapsed")
             return null

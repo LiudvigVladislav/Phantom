@@ -544,7 +544,7 @@ class HybridRelayTransport(
      * Switch the wrapper into REST-fallback-aware mode. Idempotent — safe
      * to call from a retry path.
      */
-    private fun activateRestCollectors() {
+    private suspend fun activateRestCollectors() {
         if (restCapabilityActive) {
             return
         }
@@ -562,6 +562,9 @@ class HybridRelayTransport(
         }
         // Now safe to start the orchestrator — its poll loops can begin
         // emitting and the collector is guaranteed to be listening.
+        // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.1) — start()
+        // is now suspending so it can `cancelAndJoinAll` prior jobs
+        // before resetting state.
         orchestrator.start()
         // Flip flag AFTER the inbound collector is registered so any event
         // already in flight is processed correctly.
