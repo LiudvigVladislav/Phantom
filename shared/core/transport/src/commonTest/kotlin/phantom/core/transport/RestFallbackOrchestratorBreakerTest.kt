@@ -833,6 +833,563 @@ class RestFallbackOrchestratorBreakerTest {
         )
     }
 
+    // ── M14 — 410 reauth dance ──────────────────────────────────────────────
+
+    @Test
+    fun m14a_410_then_authSession_refresh_then_200_emits_envelope() = runTest(timeout = 5.minutes) {
+        // The poll loop hits 410 on the first call; handle410
+        // refreshes the token; the second poll uses the new token
+        // and returns 200 with one envelope. Assert: the envelope
+        // reaches the orchestrator's `inbound` SharedFlow AND a
+        // second authSession call happened.
+        init()
+        val envelope = PollEnvelope(
+            id = "env-m14a",
+            fromHex = "ff".repeat(32),
+            payloadBase64 = "AA==",
+            sequenceTs = 1_000L,
+            seq = 1L,
+            seqMac = "",
+        )
+        val transport = BreakerTestTransport(
+            pollScript = { i ->
+                if (i == 0) {
+                    RestFallbackResponse(
+                        statusCode = 410, bodyParsed = null,
+                        rawBody = "gone", elapsedMs = 1L,
+                    )
+                } else {
+                    RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = PollResponse(envelopes = listOf(envelope), more = false),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                }
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        val received = mutableListOf<PollEnvelope>()
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            val collectJob = launch { orch.inbound.collect { received += it } }
+            runCurrent()
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump enough virtual time for the 410 dance + the
+            // 5_000 ms post-410 delay + the 200 follow-up poll.
+            repeat(50) {
+                if (received.isNotEmpty()) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            assertTrue(
+                received.isNotEmpty(),
+                "after 410 dance + 200 follow-up, the envelope MUST reach inbound flow. " +
+                    "pollCalls=${transport.pollCalls.size} authCalls=${transport.authCalls.size}.",
+            )
+            assertTrue(
+                transport.authCalls.size >= 2,
+                "handle410 MUST trigger a session refresh (authSession call). " +
+                    "Got authCalls=${transport.authCalls.size} (≥ 2 expected: bootstrap + refresh).",
+            )
+            collectJob.cancel()
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun m14b_410_then_reauth_fails_publishes_KeySuspended_via_L2_corollary() = runTest(timeout = 5.minutes) {
+        // 410 triggers handle410 → acquireOrRefreshToken. The
+        // session script returns a NON-200 on the second call so
+        // the refresh fails. The L2 corollary
+        // (Failure → KeySuspended) fires through the existing
+        // classifier inside acquireOrRefreshToken. Assert:
+        // peekVerifyKeyStateForTest() == KeySuspended.
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 410, bodyParsed = null,
+                    rawBody = "gone", elapsedMs = 1L,
+                )
+            },
+            sessionScript = { i ->
+                if (i == 0) {
+                    // Bootstrap succeeds.
+                    RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = AuthSessionResponse(
+                            token = "tok-bootstrap",
+                            expiresAt = Long.MAX_VALUE,
+                            restFallback = true,
+                            maxSendBodyBytes = 4096,
+                            pollMaxEnvelopes = 1,
+                            pollHoldSecs = 30,
+                            seqMacVerifyKey = "0123456789abcdef".repeat(4),
+                        ),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                } else {
+                    // Refresh fails.
+                    RestFallbackResponse(
+                        statusCode = 503, bodyParsed = null,
+                        rawBody = "service-unavailable", elapsedMs = 1L,
+                    )
+                }
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            check(orch.peekVerifyKeyStateForTest() is VerifyKeyState.KeyPresent)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump until KeySuspended is observed.
+            var observedSuspended = false
+            repeat(50) {
+                if (observedSuspended) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                if (orch.peekVerifyKeyStateForTest() == VerifyKeyState.KeySuspended) {
+                    observedSuspended = true
+                }
+            }
+            assertTrue(
+                observedSuspended,
+                "after 410 dance triggers a failed refresh, the L2 corollary MUST publish " +
+                    "KeySuspended. Got ${orch.peekVerifyKeyStateForTest()}. " +
+                    "pollCalls=${transport.pollCalls.size} authCalls=${transport.authCalls.size}.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun m14c_three_consecutive_410s_trips_breaker_to_Open_with_Status410Storm() = runTest(timeout = 5.minutes) {
+        // 3 consecutive 410s within 30 s wall-clock trip the
+        // breaker to Open(Status410Storm,
+        // BREAKER_410_STORM_COOLDOWN_MS=60_000 ms). With now()
+        // mocked to 0 in the test fixture, every timestamp lands
+        // at 0 — well within any window — so the threshold-th 410
+        // trips deterministically on the 3rd call regardless of
+        // virtual time.
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 410, bodyParsed = null,
+                    rawBody = "gone", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Capture the FIRST Open observation; assert it carries
+            // the Status410Storm reason and the ceiling cooldown.
+            var firstOpen: LongPollBreakerState.Open? = null
+            repeat(200) {
+                if (firstOpen != null) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                val s = orch.peekBreakerStateForTest()
+                if (s is LongPollBreakerState.Open && firstOpen == null) {
+                    firstOpen = s
+                }
+            }
+            val state = firstOpen
+            assertTrue(
+                state != null,
+                "3 consecutive 410s within 30 s MUST trip the breaker. " +
+                    "pollCalls=${transport.pollCalls.size}.",
+            )
+            assertEquals(
+                BreakerOpenReason.Status410Storm,
+                state.reason,
+                "Open reason on 410 storm MUST be Status410Storm (NOT ConsecutiveRestFailures)",
+            )
+            assertEquals(
+                RestFallbackOrchestrator.BREAKER_410_STORM_COOLDOWN_MS,
+                state.cooldownMs,
+                "Storm open cooldown MUST be BREAKER_410_STORM_COOLDOWN_MS (60 s ceiling)",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun m14d_cursor_is_not_advanced_during_410_dance() = runTest(timeout = 5.minutes) {
+        // Cursor advancement only happens via
+        // ackInboundAndAdvanceCursor (called by the downstream
+        // consumer after successful decrypt + persist). The 410
+        // dance MUST NOT advance the cursor. Assert: after one 410
+        // followed by a 200 with empty body, no cursor write
+        // happened.
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { i ->
+                when (i) {
+                    0 -> RestFallbackResponse(
+                        statusCode = 410, bodyParsed = null,
+                        rawBody = "gone", elapsedMs = 1L,
+                    )
+                    1 -> RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                    else -> RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                }
+            },
+        )
+        val cursor = RecordingCursorRepo()
+        cursor.stored = 42L  // pre-seed; assert it stays.
+        val orch = buildOrchestrator(transport, testScheduler, cursor = cursor)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump enough time for the 410 + 200 cycle.
+            repeat(40) {
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            assertTrue(
+                transport.pollCalls.size >= 2,
+                "expected at least 2 poll calls (410 + 200 follow-up); got ${transport.pollCalls.size}",
+            )
+            assertEquals(
+                emptyList(),
+                cursor.writes,
+                "the 410 dance MUST NOT write to the cursor repository. Got writes=${cursor.writes}.",
+            )
+            assertEquals(
+                42L,
+                cursor.stored,
+                "the pre-seeded cursor value MUST be preserved across the 410 dance",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun m14e_410_on_ack_deliver_does_NOT_trigger_handle410_reauth_dance() = runTest(timeout = 5.minutes) {
+        // M14(e): per Stage 1.x Lock-3, 410 on `/relay/ack-deliver`
+        // uses the existing self-healing fall-through, NOT the
+        // reauth dance. handle410 is wired to the POLL response
+        // branches only; the ack-deliver code path runs through
+        // `ackInboundAndAdvanceCursor` and classifies the ack
+        // outcome via the existing surface. Test pins the
+        // asymmetry: a 410 ack response must NOT pump the
+        // 410-storm timestamp list.
+        init()
+        val envelope = PollEnvelope(
+            id = "env-m14e",
+            fromHex = "ff".repeat(32),
+            payloadBase64 = "AA==",
+            sequenceTs = 1_000L,
+            seq = 1L,
+            seqMac = "",
+        )
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = listOf(envelope), more = false),
+                    rawBody = "{}", elapsedMs = 1L,
+                )
+            },
+            ackScript = { _, _ ->
+                // Ack-deliver returns 410.
+                RestFallbackResponse(
+                    statusCode = 410, bodyParsed = null,
+                    rawBody = "gone", elapsedMs = 1L,
+                )
+            },
+        )
+        val cursor = RecordingCursorRepo()
+        val orch = buildOrchestrator(transport, testScheduler, cursor = cursor)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            val received = mutableListOf<PollEnvelope>()
+            val collectJob = launch {
+                orch.inbound.collect {
+                    received += it
+                    // Simulate downstream consumer acknowledging.
+                    orch.ackInboundAndAdvanceCursor(it.id)
+                }
+            }
+            runCurrent()
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump until at least one ack-deliver call lands.
+            repeat(60) {
+                if (transport.ackCalls.isNotEmpty()) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            assertTrue(
+                transport.ackCalls.isNotEmpty(),
+                "ackInboundAndAdvanceCursor MUST call ack-deliver at least once. " +
+                    "Got ackCalls=${transport.ackCalls.size}.",
+            )
+            // The breaker state MUST NOT have transitioned to
+            // Status410Storm from the ack 410. The 410 dance is
+            // wired ONLY to the poll response branches.
+            val state = orch.peekBreakerStateForTest()
+            assertTrue(
+                state !is LongPollBreakerState.Open ||
+                    state.reason != BreakerOpenReason.Status410Storm,
+                "ack-deliver 410 MUST NOT trigger Status410Storm. Got state=$state.",
+            )
+            collectJob.cancel()
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    // ── M13(e) — cursor preserved across all breaker transitions ────────────
+
+    @Test
+    fun m13e_cursor_is_never_written_by_poll_loop_directly_across_all_transitions() = runTest(timeout = 5.minutes) {
+        // The cursor advances ONLY via
+        // ackInboundAndAdvanceCursor (called by the downstream
+        // consumer). The pollLoop's response handling never writes
+        // the cursor directly — including across breaker
+        // transitions Closed → Open → HalfOpen → Open → HalfOpen.
+        // Drive the full transition cycle via 5xx burst and assert
+        // the cursor is never written.
+        init()
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 500, bodyParsed = null,
+                    rawBody = "internal-server-error", elapsedMs = 1L,
+                )
+            },
+        )
+        val cursor = RecordingCursorRepo()
+        cursor.stored = 123L  // pre-seed; assert preservation.
+        val orch = buildOrchestrator(transport, testScheduler, cursor = cursor)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump through multiple breaker transitions.
+            repeat(200) {
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            assertEquals(
+                emptyList(),
+                cursor.writes,
+                "the pollLoop MUST NOT write the cursor across breaker transitions. " +
+                    "Got writes=${cursor.writes}.",
+            )
+            assertEquals(
+                123L,
+                cursor.stored,
+                "the pre-seeded cursor value MUST be preserved across all breaker transitions",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    // ── M-13e — stop() during Open cancels timer ────────────────────────────
+
+    @Test
+    fun m13e_stop_during_Open_cancels_breaker_timer_and_no_refire_on_next_start() = runTest(timeout = 5.minutes) {
+        // The fixed sequence pinned by this test (per Vladislav's
+        // lock):
+        //   1. Drive the breaker to Open via a 5xx burst.
+        //   2. Call stop() — the timer Job MUST be cancelled.
+        //   3. Flip the fake transport to 200 so the next start
+        //      cycle does not immediately re-trip Open.
+        //   4. Call start() — the breaker state resets to Closed.
+        //   5. Assert Closed AND the pre-seeded cursor preserved
+        //      AND polling resumes WITHOUT a fresh Open opening.
+        //
+        // Without step 3 the test would conflate "stop+start reset"
+        // with "the next 5xx burst immediately re-opens" — flipping
+        // the transport to 200 isolates the reset semantic from
+        // the re-trip semantic.
+        init()
+        var pollReturns500 = true
+        val transport = BreakerTestTransport(
+            pollScript = { _ ->
+                if (pollReturns500) {
+                    RestFallbackResponse(
+                        statusCode = 500, bodyParsed = null,
+                        rawBody = "", elapsedMs = 1L,
+                    )
+                } else {
+                    RestFallbackResponse(
+                        statusCode = 200,
+                        bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                        rawBody = "{}", elapsedMs = 1L,
+                    )
+                }
+            },
+        )
+        val cursor = RecordingCursorRepo()
+        cursor.stored = 99L  // pre-seed; assert preservation across stop+start.
+        val orch = buildOrchestrator(transport, testScheduler, cursor = cursor)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Pump until the breaker is Open.
+            var observedOpen = false
+            repeat(200) {
+                if (observedOpen) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+                if (orch.peekBreakerStateForTest() is LongPollBreakerState.Open) {
+                    observedOpen = true
+                }
+            }
+            check(observedOpen) {
+                "expected Open state before stop(); got ${orch.peekBreakerStateForTest()}. " +
+                    "pollCalls=${transport.pollCalls.size}."
+            }
+            check(orch.peekBreakerStateForTest() is LongPollBreakerState.Open) { "expected Open" }
+            // Step 2 — stop. Timer Job is cancelled by
+            // cancelAndJoinAll Phase 2.
+            orch.stop()
+            runCurrent()
+            // Demonstrate the timer was cancelled: advance past
+            // BREAKER_COOLDOWN_CEILING_MS without a start, no
+            // Open → HalfOpen transition fires. State stays Open
+            // until start() resets it.
+            advanceTimeBy(RestFallbackOrchestrator.BREAKER_COOLDOWN_CEILING_MS + 5_000L)
+            runCurrent()
+            assertTrue(
+                orch.peekBreakerStateForTest() is LongPollBreakerState.Open,
+                "after stop+advance, state MUST still be Open (the timer was cancelled, " +
+                    "so the Open → HalfOpen transition does NOT fire). " +
+                    "Got ${orch.peekBreakerStateForTest()}.",
+            )
+            // Step 3 — flip transport to 200 BEFORE start so we
+            // isolate the reset semantic from the re-trip semantic.
+            pollReturns500 = false
+            val pollsBeforeRestart = transport.pollCalls.size
+            // Step 4 — start. Resets state to Closed.
+            orch.start()
+            runCurrent()
+            // Step 5 — assertions: Closed, cursor preserved, no
+            // spurious transition, polling actually resumes.
+            assertEquals(
+                LongPollBreakerState.Closed,
+                orch.peekBreakerStateForTest(),
+                "after stop+start, breaker MUST be Closed (reset on start per scope §L9)",
+            )
+            assertEquals(
+                99L,
+                cursor.stored,
+                "the pre-seeded cursor MUST be preserved across the stop+start cycle",
+            )
+            assertEquals(
+                emptyList(),
+                cursor.writes,
+                "the pollLoop MUST NOT write the cursor during the breaker cycle. " +
+                    "Got writes=${cursor.writes}.",
+            )
+            // Advance over a window much larger than any possible
+            // stranded timer's cooldown. With 200 responses + a
+            // freshly-Closed state, the only valid trajectory is
+            // "stay Closed AND keep polling."
+            advanceTimeBy(RestFallbackOrchestrator.BREAKER_COOLDOWN_CEILING_MS + 5_000L)
+            runCurrent()
+            assertEquals(
+                LongPollBreakerState.Closed,
+                orch.peekBreakerStateForTest(),
+                "no stranded timer Job MUST fire after stop+start. " +
+                    "Got ${orch.peekBreakerStateForTest()}.",
+            )
+            assertTrue(
+                transport.pollCalls.size > pollsBeforeRestart,
+                "polling MUST resume after start. Got pollCalls before=${pollsBeforeRestart} " +
+                    "after=${transport.pollCalls.size}.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
     // ── Fixtures ────────────────────────────────────────────────────────────
 
     private val IDENTITY: String = "aa".repeat(32)
@@ -851,15 +1408,18 @@ class RestFallbackOrchestratorBreakerTest {
      */
     private class BreakerTestTransport(
         var pollScript: (callIndex: Int) -> RestFallbackResponse<PollResponse>,
+        var sessionScript: ((callIndex: Int) -> RestFallbackResponse<AuthSessionResponse>)? = null,
+        var ackScript: ((callIndex: Int, envelopeId: String) -> RestFallbackResponse<AckDeliverResponse>)? = null,
     ) : RestFallbackTransport {
         val pollCalls: MutableList<Long?> = mutableListOf()
         val authCalls: MutableList<Unit> = mutableListOf()
+        val ackCalls: MutableList<String> = mutableListOf()
         override suspend fun authSession(
             url: String,
             body: AuthSessionRequest,
         ): RestFallbackResponse<AuthSessionResponse> {
             authCalls += Unit
-            return RestFallbackResponse(
+            return sessionScript?.invoke(authCalls.size - 1) ?: RestFallbackResponse(
                 statusCode = 200,
                 bodyParsed = AuthSessionResponse(
                     token = "tok-${authCalls.size}",
@@ -886,18 +1446,22 @@ class RestFallbackOrchestratorBreakerTest {
         }
         override suspend fun ackDeliver(
             url: String, token: String, body: AckDeliverRequest,
-        ): RestFallbackResponse<AckDeliverResponse> = RestFallbackResponse(
-            statusCode = 200,
-            bodyParsed = AckDeliverResponse(ok = 1),
-            rawBody = "{}",
-            elapsedMs = 1L,
-        )
+        ): RestFallbackResponse<AckDeliverResponse> {
+            ackCalls += body.id
+            return ackScript?.invoke(ackCalls.size - 1, body.id) ?: RestFallbackResponse(
+                statusCode = 200,
+                bodyParsed = AckDeliverResponse(ok = 1),
+                rawBody = "{}",
+                elapsedMs = 1L,
+            )
+        }
     }
 
     private fun buildOrchestrator(
         transport: BreakerTestTransport,
         scheduler: TestCoroutineScheduler,
         longPollEnabled: Boolean = false,
+        cursor: LongPollCursorRepository = NoopCursor(),
         logSink: (String) -> Unit = {},
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
         baseUrl = "https://relay.test",
@@ -909,9 +1473,19 @@ class RestFallbackOrchestratorBreakerTest {
         now = { 0L },
         log = logSink,
         longPollEnabled = longPollEnabled,
-        cursorRepository = NoopCursor(),
+        cursorRepository = cursor,
         dispatcher = StandardTestDispatcher(scheduler),
     )
+
+    private class RecordingCursorRepo : LongPollCursorRepository {
+        val writes: MutableList<Pair<Long, Long>> = mutableListOf()
+        var stored: Long? = null
+        override suspend fun getLastSeenSeq(identityHex: String): Long? = stored
+        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
+            writes += seq to nowMs
+            stored = maxOf(stored ?: Long.MIN_VALUE, seq)
+        }
+    }
 
     private class RetryAfterTransport(
         var pollScript: (callIndex: Int) -> RestFallbackResponse<PollResponse>,

@@ -381,6 +381,33 @@ class RestFallbackOrchestrator(
      */
     private var _breakerTimerJob: Job? = null
 
+    /**
+     * Trek 2 Stage 2B-B (C5, L8) — current 410 reauth backoff
+     * value. Scope §L8: "Backoff is capped exponential with a
+     * 5-second floor and a 60-second ceiling. The first 410 backs
+     * off 5 s; each subsequent 410 doubles up to 60 s."
+     *
+     * Reset to [BREAKER_INITIAL_COOLDOWN_MS] (5 s floor) on every
+     * successful (200-OK) poll observation via [recordRestSuccess]
+     * AND on orchestrator restart. Doubled on each 410 (capped at
+     * [BREAKER_410_STORM_COOLDOWN_MS] = 60 s) inside [handle410].
+     */
+    private var _current410BackoffMs: Long = BREAKER_INITIAL_COOLDOWN_MS
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L8 + L9) — wall-clock timestamps of
+     * the recent `410 Gone` poll responses. Used by [handle410] to
+     * detect the L9 [BreakerOpenReason.Status410Storm] trigger:
+     * [BREAKER_410_STORM_THRESHOLD] = 3 consecutive 410s within
+     * [BREAKER_410_STORM_WINDOW_MS] = 30 s.
+     *
+     * Pruned to entries within the window on every 410 observation.
+     * Cleared on every successful poll via [recordRestSuccess] AND
+     * on orchestrator restart. Accessed only under
+     * [_inboundStateMutex].
+     */
+    private val _status410StormTimestamps: MutableList<Long> = mutableListOf()
+
     private var sessionToken: String? = null
     private var tokenExpiresAt: Long = 0L
 
@@ -562,6 +589,8 @@ class RestFallbackOrchestrator(
                     // alongside the C4 poison state.
                     _breakerFailCount = 0
                     _breakerCurrentCooldownMs = BREAKER_INITIAL_COOLDOWN_MS
+                    _current410BackoffMs = BREAKER_INITIAL_COOLDOWN_MS
+                    _status410StormTimestamps.clear()
                 }
                 log("REST_TRACE poison_state_reset_on_start")
                 stateObserverJob = scope.launch {
@@ -1464,12 +1493,30 @@ class RestFallbackOrchestrator(
                         )
                         delay(jitteredDelay)
                     }
+                    410 -> {
+                        // Trek 2 Stage 2B-B (C5, L8 + L9) — the 410
+                        // reauth dance. `handle410` performs the L8
+                        // capped exponential backoff (5 s floor /
+                        // 60 s ceiling / doubling) AND the L9 storm
+                        // detection (Kth 410 within W → Open with
+                        // Status410Storm reason); refreshes the
+                        // token; returns the millisecond delay to
+                        // apply. 410 is NOT a transport failure per
+                        // scope §L9 taxonomy: do NOT call
+                        // `recordRestFailure` (would falsely count
+                        // toward `ConsecutiveRestFailures`) and do
+                        // NOT call `recordRestSuccess` (would
+                        // inadvertently clear an Open state, incl.
+                        // the storm-triggered Open we just set).
+                        val nextDelayMs = handle410(token = token, loopTag = "pollLoop")
+                        delay(nextDelayMs)
+                    }
                     else -> {
                         // Trek 2 Stage 2B-B (C5, L9) — 4xx-other
-                        // (incl. 410 in C5-B; 410 gets its own dance
-                        // in C5-C via Status410Storm). The relay
-                        // answered, so the breaker records success
-                        // for the consecutive-fail dimension.
+                        // (NOT 410; 410 has its own dance above).
+                        // The relay answered, so the breaker
+                        // records success for the consecutive-fail
+                        // dimension.
                         recordRestSuccess()
                         // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
                         // backoff. Server-unexpected-status retries can herd
@@ -1704,12 +1751,21 @@ class RestFallbackOrchestrator(
                     delay(jitteredDelay)
                     continue
                 }
+                if (response.statusCode == 410) {
+                    // Trek 2 Stage 2B-B (C5, L8 + L9) — same shape
+                    // as the legacy `pollLoop`'s 410 branch. See
+                    // there for the rationale on NOT calling
+                    // `recordRestFailure` / `recordRestSuccess` on
+                    // 410.
+                    val nextDelayMs = handle410(token = token, loopTag = "wsActivePollLoop")
+                    delay(nextDelayMs)
+                    continue
+                }
                 if (response.statusCode !in 200..299 || response.bodyParsed == null) {
-                    // Trek 2 Stage 2B-B (C5, L9) — 4xx-other (incl.
-                    // 410 in C5-B; 410 gets its own dance in C5-C
-                    // via Status410Storm). The relay answered, so
-                    // the breaker records success for the
-                    // consecutive-fail dimension.
+                    // Trek 2 Stage 2B-B (C5, L9) — 4xx-other (NOT
+                    // 410; 410 has its own dance above). The relay
+                    // answered, so the breaker records success for
+                    // the consecutive-fail dimension.
                     recordRestSuccess()
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                     val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
@@ -2126,6 +2182,13 @@ class RestFallbackOrchestrator(
     private suspend fun recordRestSuccess() {
         val transitioned: Boolean = _inboundStateMutex.withLock {
             _breakerFailCount = 0
+            // Trek 2 Stage 2B-B (C5, L8) — a successful poll exits
+            // the 410 reauth backoff: reset the floor and clear the
+            // storm window. A future 410 will start the 5 s floor
+            // afresh and a new storm window will be measured from
+            // scratch.
+            _current410BackoffMs = BREAKER_INITIAL_COOLDOWN_MS
+            _status410StormTimestamps.clear()
             when (_breakerState) {
                 is LongPollBreakerState.Open, is LongPollBreakerState.HalfOpen -> {
                     _breakerState = LongPollBreakerState.Closed
@@ -2167,6 +2230,89 @@ class RestFallbackOrchestrator(
                 log("REST_TRACE breaker_probe_permit_released_on_cancel")
             }
         }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C5, L8 + L9) — `410 Gone` poll-response
+     * handler. Performs the L8 reauth dance (capped exponential
+     * backoff + token refresh) and the L9 storm detection
+     * (3 consecutive 410s within 30 s ⇒
+     * `Open(Status410Storm, BREAKER_410_STORM_COOLDOWN_MS)`).
+     *
+     * Mutex discipline:
+     *   * The state-update critical section runs under
+     *     [_inboundStateMutex] and either bumps
+     *     [_current410BackoffMs] (≤ [BREAKER_410_STORM_COOLDOWN_MS]
+     *     ceiling) OR fires the storm transition via
+     *     [transitionToOpenUnderMutex].
+     *   * The token refresh ([acquireOrRefreshToken]) runs OUTSIDE
+     *     [_inboundStateMutex] — it takes `tokenMutex` outer +
+     *     `_inboundStateMutex` inner per the L6 lock order, so we
+     *     never invert.
+     *
+     * Returns the milliseconds delay the caller should apply
+     * before the next iteration. Storm trips return the
+     * `BREAKER_410_STORM_COOLDOWN_MS` ceiling (60 s) immediately;
+     * non-storm 410s return the post-double-and-clamp
+     * `_current410BackoffMs`.
+     *
+     * Per scope §L8 + L9: the dance applies to `/relay/poll`
+     * responses ONLY. The `/relay/ack-deliver` 410 path uses the
+     * existing self-healing fall-through (Stage 1.x Lock-3
+     * "T1 ack after T2 → 401, burning a fresh token there is
+     * wrong"); M14 sub-cell (e) pins this asymmetry.
+     */
+    private suspend fun handle410(token: String, loopTag: String): Long {
+        val nowMs = now()
+        val openedStorm: Boolean
+        val effectiveDelayMs: Long
+        _inboundStateMutex.withLock {
+            // Drop timestamps that fell out of the storm window
+            // before we add the new one — both for correctness
+            // (only counts in-window 410s) and to keep the list
+            // bounded in size.
+            _status410StormTimestamps.removeAll { it < nowMs - BREAKER_410_STORM_WINDOW_MS }
+            _status410StormTimestamps.add(nowMs)
+            if (_status410StormTimestamps.size >= BREAKER_410_STORM_THRESHOLD) {
+                // L9 storm trigger. Both the L8 backoff AND the
+                // breaker fire on the same condition with the
+                // same exit timer per scope §L9.
+                _current410BackoffMs = BREAKER_410_STORM_COOLDOWN_MS
+                transitionToOpenUnderMutex(
+                    BreakerOpenReason.Status410Storm,
+                    BREAKER_410_STORM_COOLDOWN_MS,
+                )
+                openedStorm = true
+                effectiveDelayMs = BREAKER_410_STORM_COOLDOWN_MS
+            } else {
+                _current410BackoffMs = (_current410BackoffMs * 2).coerceAtMost(BREAKER_410_STORM_COOLDOWN_MS)
+                openedStorm = false
+                effectiveDelayMs = _current410BackoffMs
+            }
+        }
+        if (openedStorm) {
+            log(
+                "REST_TRACE breaker_open reason=${BreakerOpenReason.Status410Storm} " +
+                    "cooldown_ms=$BREAKER_410_STORM_COOLDOWN_MS loop=$loopTag",
+            )
+            stateMachine.onEvent(RestStateMachine.Event.RestPollDegraded(BreakerOpenReason.Status410Storm))
+        }
+        // Refresh the token OUTSIDE the mutex. Per scope §L8 step 1
+        // we set staleToken = the 410'd token and let
+        // `acquireOrRefreshToken` either refresh it or CAS-reuse
+        // what a concurrent caller already refreshed. A refresh
+        // failure publishes the L2 corollary
+        // (Failure → KeySuspended) via the existing classifier
+        // path inside `acquireOrRefreshToken`; M14 sub-cell (b)
+        // pins this.
+        acquireOrRefreshToken(reason = "poll_410", staleToken = token)
+        log(
+            "REST_TRACE poll_410 next_delay_ms=$effectiveDelayMs " +
+                "storm=${if (openedStorm) "true" else "false"} " +
+                "storm_count=${_inboundStateMutex.withLock { _status410StormTimestamps.size }} " +
+                "loop=$loopTag",
+        )
+        return effectiveDelayMs
     }
 
     private suspend fun processInboundEnvelopeWithVerify(
