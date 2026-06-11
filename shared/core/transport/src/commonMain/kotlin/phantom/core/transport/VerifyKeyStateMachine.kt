@@ -103,6 +103,17 @@ sealed class VerifyKeyState {
      * [transition] applied to a `Valid(hex)` outcome, which routes the
      * already-validated hex through.
      */
+    /**
+     * Companion holding the constant render string used by
+     * [KeyPresent.toString] (and by the matching [RefreshOutcome.Valid]
+     * override). Surfaced via a `const val` rather than inlining the
+     * literal so the test suite can read the expected value through
+     * the same public symbol the production code uses.
+     */
+    companion object {
+        const val KEY_PRESENT_REDACTED_RENDER: String = "KeyPresent(hex=[REDACTED])"
+    }
+
     data class KeyPresent(val hex: String) : VerifyKeyState() {
         init {
             require(isValidLowercaseHexVerifyKey(hex)) {
@@ -119,20 +130,26 @@ sealed class VerifyKeyState {
         }
 
         /**
-         * Redact the verify-key payload from string output. The default
-         * `data class` `toString()` would emit the full 64-char hex,
-         * leaking the per-identity session secret into any log line,
-         * assertion message, or exception surface that prints a
+         * Fully redact the verify-key payload from string output. The
+         * default `data class` `toString()` would emit the full 64-char
+         * hex, leaking the per-identity session secret into any log
+         * line, assertion message, or exception surface that prints a
          * `VerifyKeyState`. The verify key is a session-scoped MAC
          * verifier — an attacker with access to logs that contain it
          * can verify (and therefore forge in concert with the relay's
          * canonical-input encoding) any envelope MAC for the bound
-         * identity. The short 8-char prefix keeps logs disambiguatable
-         * across multiple sessions without disclosing the rest of the
-         * key.
+         * identity.
+         *
+         * The locked Stage 1.x threat model treats the derived
+         * `seq_mac_verify_key` as a secret whose appearance in logs is
+         * an explicit violation: a leading-prefix disclosure is enough
+         * for an offline correlator to link sessions of the same
+         * identity across logs even when the rest of the key is
+         * absent. The render therefore carries ZERO per-key bits —
+         * two different verify keys produce byte-identical
+         * `toString()` output.
          */
-        override fun toString(): String =
-            "KeyPresent(hex=${hex.take(VERIFY_KEY_HEX_LOG_PREFIX_LENGTH)}...REDACTED)"
+        override fun toString(): String = KEY_PRESENT_REDACTED_RENDER
     }
 
     /** Drop all envelopes; no emit, no cursor advance. Recovery is the
@@ -157,6 +174,14 @@ sealed class RefreshOutcome {
      * downstream consumers can route it into [VerifyKeyState.KeyPresent]
      * without re-validating.
      */
+    /**
+     * Companion holding the constant render string used by
+     * [Valid.toString].
+     */
+    companion object {
+        const val VALID_REDACTED_RENDER: String = "Valid(hex=[REDACTED])"
+    }
+
     data class Valid(val hex: String) : RefreshOutcome() {
         init {
             require(isValidLowercaseHexVerifyKey(hex)) {
@@ -168,15 +193,15 @@ sealed class RefreshOutcome {
         }
 
         /**
-         * Redact the verify-key payload from string output. The
-         * default `data class` `toString()` would emit the full
-         * 64-char hex, leaking the per-identity session secret into
-         * any log line, assertion message, or exception surface that
-         * prints a `RefreshOutcome`. See [VerifyKeyState.KeyPresent.toString]
-         * for the threat-model rationale.
+         * Fully redact the verify-key payload from string output. See
+         * [VerifyKeyState.KeyPresent.toString] for the threat-model
+         * rationale — the locked Stage 1.x model treats ANY prefix or
+         * suffix fragment of the derived `seq_mac_verify_key` as
+         * sensitive, because a leading-prefix disclosure is enough to
+         * link sessions of the same identity across logs. The render
+         * therefore carries ZERO per-key bits.
          */
-        override fun toString(): String =
-            "Valid(hex=${hex.take(VERIFY_KEY_HEX_LOG_PREFIX_LENGTH)}...REDACTED)"
+        override fun toString(): String = VALID_REDACTED_RENDER
     }
 
     /**
@@ -214,15 +239,6 @@ sealed class RefreshOutcome {
  * independently).
  */
 internal const val VERIFY_KEY_HEX_LENGTH: Int = 64
-
-/**
- * Number of leading hex characters preserved in the redacted
- * [VerifyKeyState.KeyPresent.toString] / [RefreshOutcome.Valid.toString]
- * output. Eight characters (32 bits) is enough to disambiguate
- * different verify keys across logs without disclosing enough material
- * to reconstruct the full key.
- */
-internal const val VERIFY_KEY_HEX_LOG_PREFIX_LENGTH: Int = 8
 
 /**
  * Classify a 2xx response's `seq_mac_verify_key` field value into one

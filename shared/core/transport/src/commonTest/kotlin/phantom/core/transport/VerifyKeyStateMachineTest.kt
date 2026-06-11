@@ -353,25 +353,42 @@ class VerifyKeyStateMachineTest {
 
     // ── Verify-key redaction in toString (P2 review fix) ────────────────────
 
+    /**
+     * Sweep prefix and suffix lengths (4 / 8 / 16 / 32 / 48 / 64) and
+     * confirm none of them appear inside [rendered]. The locked
+     * Stage 1.x threat model treats ANY fragment of the derived
+     * `seq_mac_verify_key` as sensitive, because a leading-prefix
+     * disclosure is enough to link sessions of the same identity
+     * across logs. Used by both the [VerifyKeyState.KeyPresent] and
+     * [RefreshOutcome.Valid] redaction tests below.
+     */
+    private fun assertNoHexFragmentLeaks(hex: String, rendered: String) {
+        for (n in listOf(4, 8, 16, 32, 48, 64)) {
+            val prefix = hex.take(n)
+            assertFalse(
+                prefix in rendered,
+                "leaked $n-char prefix \"$prefix\" through toString: \"$rendered\"",
+            )
+            val suffix = hex.takeLast(n)
+            assertFalse(
+                suffix in rendered,
+                "leaked $n-char suffix \"$suffix\" through toString: \"$rendered\"",
+            )
+        }
+    }
+
     @Test
-    fun KeyPresent_toString_does_not_leak_full_hex_payload() {
+    fun KeyPresent_toString_does_not_leak_any_fragment_of_hex() {
         // Default `data class` toString would emit the full 64-char
-        // hex. The override redacts to an 8-char prefix + "REDACTED"
-        // suffix so the verify-key cannot leak via logs, assertion
-        // messages, or any caller that prints the state.
-        val sensitiveHex = "deadbeef".repeat(8) // 64-char fixture
+        // hex. The override fully redacts so neither the full payload
+        // nor any prefix/suffix fragment surfaces in logs, assertion
+        // messages, or exception surfaces. The locked threat model
+        // forbids a prefix-only leak because a per-session
+        // leading-fragment disclosure is enough to correlate sessions
+        // of the same identity across separate log captures.
+        val sensitiveHex = "fedcba9876543210".repeat(4) // 64 chars, distinctive
         val rendered = VerifyKeyState.KeyPresent(sensitiveHex).toString()
-        assertFalse(
-            sensitiveHex in rendered,
-            "verify-key full hex leaked through toString: \"$rendered\"",
-        )
-        // 8-char prefix retained for diagnostic disambiguation.
-        assertTrue(
-            "deadbeef" in rendered,
-            "expected 8-char hex prefix in redacted toString: \"$rendered\"",
-        )
-        // Explicit redaction signal so a reviewer scanning logs sees
-        // the value was deliberately omitted.
+        assertNoHexFragmentLeaks(sensitiveHex, rendered)
         assertTrue(
             "REDACTED" in rendered,
             "expected REDACTED marker in toString: \"$rendered\"",
@@ -379,32 +396,44 @@ class VerifyKeyStateMachineTest {
     }
 
     @Test
-    fun KeyPresent_toString_with_different_hex_renders_with_different_prefix() {
-        // Make sure the redaction isn't so aggressive that two
-        // distinct keys collapse to the same string. The 8-char
-        // prefix is 32 bits — operationally unique across a session.
+    fun KeyPresent_toString_is_constant_regardless_of_input_hex() {
+        // Two different keys must produce byte-identical toString —
+        // proves the rendered form carries ZERO per-key bits. A
+        // regression that re-introduced a per-key prefix (e.g. for
+        // "diagnostic disambiguation") would surface here.
         val a = VerifyKeyState.KeyPresent("deadbeef".repeat(8)).toString()
         val b = VerifyKeyState.KeyPresent("cafebabe".repeat(8)).toString()
-        assertTrue(a != b, "redacted toString must preserve diagnostic prefix")
-        assertTrue("deadbeef" in a)
-        assertTrue("cafebabe" in b)
+        val c = VerifyKeyState.KeyPresent("0123456789abcdef".repeat(4)).toString()
+        assertEquals(a, b, "different keys must produce identical toString")
+        assertEquals(a, c, "different keys must produce identical toString")
+        // Tie to the production constant so a future rename of the
+        // literal surfaces immediately.
+        assertEquals(VerifyKeyState.KEY_PRESENT_REDACTED_RENDER, a)
     }
 
     @Test
-    fun Valid_outcome_toString_does_not_leak_full_hex_payload() {
+    fun Valid_outcome_toString_does_not_leak_any_fragment_of_hex() {
         // Same redaction contract on the RefreshOutcome side. The
         // outcome carries the same verify-key payload as
-        // VerifyKeyState.KeyPresent so any code path that prints
-        // a RefreshOutcome (logs, assertion messages, exception
-        // surfaces) must not leak the secret.
-        val sensitiveHex = "deadbeef".repeat(8)
+        // VerifyKeyState.KeyPresent so any code path that prints a
+        // RefreshOutcome must not leak ANY fragment of the secret.
+        val sensitiveHex = "fedcba9876543210".repeat(4)
         val rendered = RefreshOutcome.Valid(sensitiveHex).toString()
-        assertFalse(
-            sensitiveHex in rendered,
-            "verify-key full hex leaked through Valid.toString: \"$rendered\"",
+        assertNoHexFragmentLeaks(sensitiveHex, rendered)
+        assertTrue(
+            "REDACTED" in rendered,
+            "expected REDACTED marker in toString: \"$rendered\"",
         )
-        assertTrue("deadbeef" in rendered)
-        assertTrue("REDACTED" in rendered)
+    }
+
+    @Test
+    fun Valid_outcome_toString_is_constant_regardless_of_input_hex() {
+        val a = RefreshOutcome.Valid("deadbeef".repeat(8)).toString()
+        val b = RefreshOutcome.Valid("cafebabe".repeat(8)).toString()
+        val c = RefreshOutcome.Valid("0123456789abcdef".repeat(4)).toString()
+        assertEquals(a, b, "different keys must produce identical toString")
+        assertEquals(a, c, "different keys must produce identical toString")
+        assertEquals(RefreshOutcome.VALID_REDACTED_RENDER, a)
     }
 
     @Test
