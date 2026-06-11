@@ -1307,6 +1307,158 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
     }
 
     @Test
+    fun p16_cancelled_start_waiter_does_not_destroy_working_orchestrator() = runTest {
+        // Round 6 P1 regression pin: ASYMMETRIC `start()` vs
+        // `stop()`/`close()` cancellation semantics. `start()`
+        // re-arms a running orchestrator; a caller cancelled
+        // BEFORE the mutex is acquired must be a true no-op —
+        // the working orchestrator stays working.
+        //
+        // Under round 5 the start()'s mutex acquire ran inside
+        // `withContext(NonCancellable)`. A cancelled waiter would
+        // STILL acquire the mutex eventually, run
+        // `cancelAndJoinAll()` (destroying running jobs), reset
+        // state, and only then skip the spawn via the
+        // `callerJob.isCancelled` gate. Net effect on a healthy
+        // transport: the cancellation tore it down.
+        //
+        // Under round 6 the start()'s mutex acquire is
+        // CANCELLABLE. The cancelled waiter throws
+        // CancellationException out of the acquire phase; the
+        // body never runs; the running orchestrator is
+        // untouched. The NonCancellable transaction only kicks
+        // in AFTER successful acquire (to keep teardown+reset+
+        // spawn atomic if the call does land).
+        //
+        // Repro: hold the lifecycle mutex externally; launch a
+        // start() that suspends on the acquire; cancel its
+        // caller; release the mutex; assert the original workers
+        // are still polling AND no second `poison_state_reset_on_start`
+        // was logged.
+        init()
+        val transport = PollLoopCountingTransport(
+            sessionScript = { _ ->
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = "",
+                    ), "{}", 1L,
+                )
+            },
+        )
+        val logLines = mutableListOf<String>()
+        val orch = buildOrchestratorWithPollLoops(
+            transport = transport, cursor = RecordingCursorRepo(),
+            scheduler = testScheduler, longPollEnabled = true,
+            logSink = { logLines += it },
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                ),
+            )
+        }
+        orch.start()
+        runCurrent()
+        repeat(5) {
+            advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+            runCurrent()
+        }
+        val pollCountBeforeRace = transport.pollEnterCount
+        assertTrue(
+            pollCountBeforeRace >= 2,
+            "expected both loops alive + polling before the race; got pollEnterCount=$pollCountBeforeRace",
+        )
+        val resetLogsBeforeRace = logLines.count { it.contains("poison_state_reset_on_start") }
+        check(resetLogsBeforeRace == 1) {
+            "expected exactly one reset log from the first start; got $resetLogsBeforeRace"
+        }
+
+        // Hold the lifecycle mutex externally; the start() will
+        // suspend on the acquire.
+        val release = CompletableDeferred<Unit>()
+        val holder = launch {
+            orch.withLifecycleMutexHeldForTest { release.await() }
+        }
+        runCurrent()
+
+        // start() suspends on the cancellable acquire.
+        val startCompleted = CompletableDeferred<Boolean>()
+        val startCaller = launch {
+            try {
+                orch.start()
+                startCompleted.complete(true)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                startCompleted.complete(false)
+                throw ce
+            }
+        }
+        runCurrent()
+        assertFalse(
+            startCompleted.isCompleted,
+            "start() should still be suspended waiting for the externally-held lifecycle mutex",
+        )
+
+        // Cancel the start's caller WHILE IT WAITS on the
+        // (cancellable) mutex acquire.
+        startCaller.cancel()
+        startCaller.join()
+        runCurrent()
+        assertEquals(
+            false,
+            startCompleted.await(),
+            "start() must have exited via CancellationException — its body never ran. " +
+                "If this returns true, the acquire was NonCancellable and the body executed despite caller cancel.",
+        )
+
+        // Release the holder. Mutex is now free.
+        release.complete(Unit)
+        holder.join()
+        runCurrent()
+        advanceTimeBy(1_000L)
+        runCurrent()
+
+        // The working orchestrator must be untouched: pollEnterCount
+        // keeps growing, no second reset log emitted.
+        val pollCountAfterMutexRelease = transport.pollEnterCount
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS * 5L)
+        runCurrent()
+        assertTrue(
+            transport.pollEnterCount > pollCountAfterMutexRelease,
+            "cancelled-waiter start() must NOT destroy the running orchestrator. " +
+                "Old workers must keep polling. Got before=$pollCountAfterMutexRelease " +
+                "after=${transport.pollEnterCount}. A non-growing count means the cancelled " +
+                "start() tore down the workers — the round-5 NonCancellable-on-acquire bug.",
+        )
+        val resetLogsAfterRace = logLines.count { it.contains("poison_state_reset_on_start") }
+        assertEquals(
+            1,
+            resetLogsAfterRace,
+            "no second `poison_state_reset_on_start` log MUST be emitted — the cancelled " +
+                "start() never reached the reset block. Got $resetLogsAfterRace total " +
+                "reset logs (expected 1 from the first start). Any extra means the cancelled " +
+                "start()'s body ran past the acquire and reset state.",
+        )
+        // Also confirm: the post-teardown abort log from round 5
+        // MUST NOT be present (we never enter the body now).
+        assertFalse(
+            logLines.any { it.contains("orchestrator_start_aborted") },
+            "no `orchestrator_start_aborted` log MUST be emitted — under round 6 the body never runs " +
+                "for a cancelled pre-acquire waiter. The presence of this log would indicate the body " +
+                "ran past teardown and aborted at the post-teardown gate (round-5 leftover).",
+        )
+
+        // Clean up.
+        orch.stop()
+        runCurrent()
+    }
+
+    @Test
     fun p15_start_after_close_is_terminal_noop_no_new_jobs_spawned() = runTest {
         // Round 5 P1.2 regression pin: `close()` is terminal. A
         // subsequent `start()` MUST NOT spawn new jobs into the

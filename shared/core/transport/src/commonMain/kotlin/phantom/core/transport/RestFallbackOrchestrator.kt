@@ -10,7 +10,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -342,19 +341,30 @@ class RestFallbackOrchestrator(
 
     /**
      * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1, round 5 P1.1
-     * extended) — serialises the lifecycle methods [start] / [stop]
-     * / [close] / [shutdown] so a second `start()` cannot run its
-     * `cancelAndJoinAll()` while a prior `start()` is still
-     * resetting state under [_inboundStateMutex]. The lifecycle
-     * mutex is strictly OUTER to [_inboundStateMutex]; never
-     * acquired the other way round.
+     * extended, round 6 P1 split) — serialises the lifecycle
+     * methods [start] / [stop] / [close] so a second `start()`
+     * cannot run its `cancelAndJoinAll()` while a prior `start()`
+     * is still resetting state under [_inboundStateMutex]. The
+     * lifecycle mutex is strictly OUTER to [_inboundStateMutex];
+     * never acquired the other way round.
      *
-     * Round 5 P1.1: the mutex ACQUIRE itself runs under
-     * [NonCancellable] in each lifecycle entry point. Under round 4
-     * the acquire was cancellable — a caller cancelled while
-     * waiting for the mutex would never run [cancelAndJoinAll],
-     * leaving the orchestrator in an indeterminate state if the
-     * caller had intended to wind it down.
+     * Round 6 P1: ASYMMETRIC cancellation semantics across the
+     * three entry points.
+     *
+     *   * [stop] / [close] — the ENTIRE mutex hold (including the
+     *     acquire itself) runs under [NonCancellable]. A caller
+     *     cancelled while waiting for the mutex still gets the
+     *     cleanup once the mutex frees. Rationale: "ensure
+     *     cleanup even on caller cancel."
+     *
+     *   * [start] — the acquire is CANCELLABLE. A caller cancelled
+     *     BEFORE the mutex is acquired is a true no-op; a
+     *     working orchestrator is NOT torn down by a cancelled
+     *     re-arm. Once the mutex is held, the
+     *     teardown+reset+spawn sequence runs as ONE atomic
+     *     `withContext(NonCancellable)` transaction so partial
+     *     application is impossible. Rationale: "do not destroy a
+     *     working transport on a pre-acquire cancel."
      */
     private val _lifecycleMutex: Mutex = Mutex()
 
@@ -450,51 +460,53 @@ class RestFallbackOrchestrator(
      */
     suspend fun start() {
         // Trek 2 Stage 2B-B (C4 review-fix round 3 P1.1, extended in
-        // round 4 to cover stop/close, hardened in round 5 P1.1) —
-        // serialise the full lifecycle reset under [_lifecycleMutex].
-        // The mutex is strictly OUTER to [_inboundStateMutex]; the
-        // order is never inverted.
+        // round 4 to cover stop/close, round-5 hardening then split
+        // in round 6 P1) — serialise the lifecycle reset under
+        // [_lifecycleMutex]. The mutex is strictly OUTER to
+        // [_inboundStateMutex]; the order is never inverted.
         //
-        // Round 5 P1.1: `withContext(NonCancellable)` wraps the
-        // ENTIRE mutex hold — including the acquire itself. Under
-        // round 4 the acquire was cancellable; a caller cancellation
-        // during waiter time would abort the entire lifecycle call,
-        // skipping teardown. With NonCancellable around the acquire
-        // the cancellation is held off until [cancelAndJoinAll] and
-        // the state reset complete; the caller-cancellation is
-        // honoured AFTER teardown via the [Job.isCancelled] check
-        // below, BEFORE any new jobs are launched.
-        val callerJob = currentCoroutineContext()[Job]
-        withContext(NonCancellable) {
-            _lifecycleMutex.withLock {
-                // Round 5 P1.2: terminal-state guard. `start()`
-                // after `close()` must NOT spawn new jobs into the
-                // cancelled scope.
-                if (_closed) {
-                    log("REST_TRACE orchestrator_start_skipped reason=closed")
-                    return@withLock
-                }
-                if (!_capabilities.value.restFallback) {
-                    log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
-                    return@withLock
-                }
+        // Round 6 P1: ASYMMETRIC cancellation semantics between
+        // `start()` and `stop()`/`close()`. `start()` re-arms a
+        // running orchestrator; if the caller is cancelled BEFORE
+        // re-arm actually begins, the right outcome is "do nothing,
+        // leave the running orchestrator alone." Under round 5 the
+        // acquire ran inside `withContext(NonCancellable)` — a
+        // cancelled `start()` waiter would still acquire the mutex,
+        // run `cancelAndJoinAll`, reset state, and only THEN skip
+        // the spawn. Net effect: the cancellation destroyed a
+        // healthy transport.
+        //
+        // Round 6 resolution: keep the acquire CANCELLABLE for
+        // `start()` so a pre-acquire cancel is a true no-op. Once
+        // the mutex is held, the teardown+reset+spawn sequence
+        // runs under `withContext(NonCancellable)` as ONE atomic
+        // transaction — no half-state. After the NonCancellable
+        // block exits, the function returns; any pending caller
+        // cancellation manifests on the caller side at the next
+        // suspension. `stop()` and `close()` retain the round-5
+        // shape (full body under NonCancellable) because their
+        // contract is "ensure cleanup even on caller cancel."
+        _lifecycleMutex.withLock {
+            // Round 5 P1.2: terminal-state guard. `start()` after
+            // `close()` must NOT spawn new jobs into the cancelled
+            // scope.
+            if (_closed) {
+                log("REST_TRACE orchestrator_start_skipped reason=closed")
+                return@withLock
+            }
+            if (!_capabilities.value.restFallback) {
+                log("REST_TRACE orchestrator_start_skipped reason=capability_disabled")
+                return@withLock
+            }
+            // Atomic re-arm transaction. Once we enter this block
+            // the orchestrator's teardown+reset+spawn happens
+            // together; partial application is impossible.
+            withContext(NonCancellable) {
                 cancelAndJoinAll()
                 _inboundStateMutex.withLock {
                     _breakerState = LongPollBreakerState.Closed
                     _macFailCount.clear()
                     _macRefreshStatus.clear()
-                }
-                // Caller-cancellation gate: if the caller was
-                // cancelled while we held the mutex, honour the
-                // cancellation NOW rather than spawn new jobs that
-                // would outlive the caller's intent. We're inside
-                // `withContext(NonCancellable)` so reading the
-                // CURRENT context's `isActive` would always return
-                // true; instead inspect the CALLER's job state
-                // captured before the NonCancellable transition.
-                if (callerJob?.isCancelled == true) {
-                    log("REST_TRACE orchestrator_start_aborted reason=caller_cancelled_post_teardown")
-                    return@withLock
                 }
                 log("REST_TRACE poison_state_reset_on_start")
                 stateObserverJob = scope.launch {
