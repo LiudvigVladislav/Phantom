@@ -261,6 +261,60 @@ class RestFallbackOrchestrator(
      */
     private var _emitGenerationCounter: Long = 0L
 
+    /**
+     * Trek 2 Stage 2B-B (C4, L2) — verify-key state machine value.
+     * Published from inside [acquireOrRefreshToken]'s `tokenMutex`
+     * critical section under [_inboundStateMutex] (L6 lock order:
+     * `tokenMutex` outer, `_inboundStateMutex` inner). The poll
+     * loops snapshot this value under [_inboundStateMutex], release,
+     * and verify against the snapshot — so a refresh-vs-poll race
+     * cannot produce a verify call that uses half a stale key and
+     * half a fresh one (M-B25).
+     *
+     * Initial state is [VerifyKeyState.KeyAbsent]; bootstrap is
+     * just the first refresh observation, not a special pre-state.
+     */
+    private var _verifyKeyState: VerifyKeyState = VerifyKeyState.KeyAbsent
+
+    /**
+     * Trek 2 Stage 2B-B (C4, L7 step 1) — per-orchestrator-session,
+     * per-`envelope_id` MAC verify-fail counter. Increments on every
+     * verify-fail outcome (`mac_mismatch` or `no_mac_field` under
+     * `KeyPresent`). Resets only on orchestrator restart; the map
+     * is purely in-memory.
+     *
+     * Accessed only under [_inboundStateMutex]. Drives the L7
+     * threshold ([MAC_REPEAT_REFRESH_THRESHOLD] = 2) for the
+     * one-shot forced refresh AND the subsequent transition to
+     * [LongPollBreakerState.SuspendedOnPoison] on a second failure
+     * after refresh.
+     */
+    private val _macFailCount: MutableMap<String, Int> = mutableMapOf()
+
+    /**
+     * Trek 2 Stage 2B-B (C4, L7 step 3) — latch set recording each
+     * `envelope_id` for which the orchestrator has already attempted
+     * a forced session/key refresh under the L7 posture. Subsequent
+     * verify failures on the SAME envelope_id do NOT trigger
+     * another refresh — they instead transition the breaker to
+     * [LongPollBreakerState.SuspendedOnPoison] (step 4).
+     *
+     * Resets only on orchestrator restart. Accessed only under
+     * [_inboundStateMutex]. Shared by BOTH REST poll loops per L6.
+     */
+    private val _macRefreshAttemptedFor: MutableSet<String> = mutableSetOf()
+
+    /**
+     * Trek 2 Stage 2B-B (C4, L9) — current breaker state. Both REST
+     * poll loops snapshot this under [_inboundStateMutex] and gate
+     * ingestion accordingly. C4 only uses [LongPollBreakerState.Closed]
+     * and [LongPollBreakerState.SuspendedOnPoison]; C5 will add the
+     * full circuit-breaker `Open` + `HalfOpen` states.
+     *
+     * Initial state is [LongPollBreakerState.Closed].
+     */
+    private var _breakerState: LongPollBreakerState = LongPollBreakerState.Closed
+
     private var sessionToken: String? = null
     private var tokenExpiresAt: Long = 0L
 
@@ -1013,17 +1067,22 @@ class RestFallbackOrchestrator(
                             "REST_TRACE poll_received id=${env.id.take(8)} " +
                                 "from=${env.fromHex.take(8)} elapsedMs=$elapsed more=${parsed.more}",
                         )
-                        lastInboundOrSendAtMs = now()
-                        // L3 Step 1 — single insertion point via the
-                        // cancel-safe helper. Inserts the mapping
-                        // under `_inboundStateMutex` with a fresh
-                        // generation token, then emits; if cancel
-                        // hits during a buffer-full backpressure
-                        // suspension, only THIS attempt's mapping is
-                        // rolled back (a concurrent loop's mapping
-                        // for the same id is preserved by the
-                        // generation guard).
-                        emitWithCancellationSafeRollback(env)
+                        // Trek 2 Stage 2B-B (C4, L6 + L7) — verify
+                        // the envelope against the snapshotted
+                        // verify-key state and gate ingestion on the
+                        // outcome. The helper handles all L2 / L6 /
+                        // L7 cases including the bad-MAC posture;
+                        // `lastInboundOrSendAtMs` is bumped only on
+                        // a successful emit (verified path or
+                        // KeyAbsent unverified pass-through).
+                        val emitted = processInboundEnvelopeWithVerify(
+                            env = env,
+                            currentToken = token,
+                            loopTag = "pollLoop",
+                        )
+                        if (emitted) {
+                            lastInboundOrSendAtMs = now()
+                        }
                     }
                     // Drain immediately if server says there's more.
                     if (parsed.more) {
@@ -1209,18 +1268,19 @@ class RestFallbackOrchestrator(
             // emitting so the consumer can rely on
             // `ackInboundAndAdvanceCursor` finding the seq.
             //
-            // C3 review-fix (P1.1) — use the SUSPENDING
-            // `emitWithCancellationSafeRollback` instead of the
-            // earlier non-suspending `tryEmit(env)` + rollback. The
-            // helper inserts the pending-seq mapping under
-            // `_inboundStateMutex` with a fresh GENERATION TOKEN,
-            // then emits; on cancel-during-emit it rolls back ONLY
-            // its own attempt's mapping (the generation guard leaves
-            // a concurrent loop's mapping intact). C3 review-fix
-            // round 3 closed the emit-cancellation gap that the
-            // suspending-emit-without-rollback fix had left open.
+            // Trek 2 Stage 2B-B (C4, L6 + L7) — same verify-and-emit
+            // gate as the legacy `pollLoop` site above. Both REST
+            // poll loops enforce IDENTICAL `seq_mac` verify
+            // semantics; the bad-MAC posture's counter / latch /
+            // suspension state is shared via [_inboundStateMutex],
+            // so a fail observed on one loop drives both loops'
+            // ingestion decisions.
             for (env in envelopes) {
-                emitWithCancellationSafeRollback(env)
+                processInboundEnvelopeWithVerify(
+                    env = env,
+                    currentToken = token,
+                    loopTag = "wsActivePollLoop",
+                )
             }
             // L4: cursor advance happens inside
             // `ackInboundAndAdvanceCursor` after the relay 2xx's the
@@ -1316,6 +1376,19 @@ class RestFallbackOrchestrator(
             sessionToken = null
             tokenExpiresAt = 0L
             log("REST_TRACE token_invalidated_after_failed_refresh reason=$reason")
+            // Trek 2 Stage 2B-B (C4, L2 + L7 corollary) — publish
+            // `RefreshOutcome.Failure` onto the verify-key state
+            // machine. From `KeyPresent` this transitions to
+            // `KeySuspended` (the locked corollary: no REST
+            // ingestion under a stale-or-empty key after a failed
+            // refresh); from `KeyAbsent` it stays at `KeyAbsent`
+            // (bootstrap asymmetry — no relay observed yet); from
+            // `KeySuspended` it stays at `KeySuspended`. L6 lock
+            // order: we are INSIDE `tokenMutex`; `_inboundStateMutex`
+            // is inner.
+            _inboundStateMutex.withLock {
+                _verifyKeyState = transition(_verifyKeyState, RefreshOutcome.Failure)
+            }
             return@withLock null
         }
         sessionToken = response.token
@@ -1328,6 +1401,17 @@ class RestFallbackOrchestrator(
         // 1.x deployment without `RELAY_SEQ_MAC_KEY` provisioned).
         // The cache is overwritten on every token refresh.
         _seqMacVerifyKey = response.seqMacVerifyKey
+        // Trek 2 Stage 2B-B (C4, L2) — classify the relay-supplied
+        // `seq_mac_verify_key` and publish the transition-matrix
+        // outcome onto the verify-key state machine. The classifier
+        // (Empty / Valid(hex) / Malformed) runs at the publication
+        // site, NOT in the relay; the orchestrator never trusts the
+        // relay to label the outcome. Same `_inboundStateMutex`
+        // serialisation as the failure branch above.
+        _inboundStateMutex.withLock {
+            val outcome = classifyVerifyKeyResponse(response.seqMacVerifyKey)
+            _verifyKeyState = transition(_verifyKeyState, outcome)
+        }
         log(
             "REST_TRACE token_cached reason=$reason " +
                 "expiresInMs=${response.expiresAt - now()} " +
@@ -1384,6 +1468,197 @@ class RestFallbackOrchestrator(
             throw ce
         }
     }
+
+    /**
+     * Trek 2 Stage 2B-B (C4, L6) — per-envelope verify-and-emit
+     * decision for BOTH REST poll loops. Returns `true` when the
+     * envelope was emitted onto [_inbound] (caller should bump
+     * `lastInboundOrSendAtMs`), `false` when the envelope was
+     * dropped per the L2/L6/L7 posture.
+     *
+     * Decision tree (all snapshots taken under [_inboundStateMutex];
+     * verify runs against snapshots, NOT live state — closes M-B25):
+     *
+     *   1. **Breaker `SuspendedOnPoison`** → drop, no emit, no ack,
+     *      no cursor. Direct WSS stays operational (M-B15).
+     *   2. **Verify-key state `KeySuspended`** → drop, no emit, no
+     *      ack, no cursor.
+     *   3. **Verify-key state `KeyAbsent`** → legacy unverified
+     *      pass-through with structured log `reason=no_verify_key`
+     *      (M17). The cursor still advances normally on the
+     *      consumer's ack.
+     *   4. **Verify-key state `KeyPresent(hex)`** → run the verifier
+     *      with the SNAPSHOTTED hex. Outcomes:
+     *        * `Verified` → emit; cursor advances on consumer ack.
+     *        * `MacMismatch` → L7 bad-MAC posture with reason
+     *          `mac_mismatch`.
+     *        * `MalformedSeqMac` → L7 bad-MAC posture with reason
+     *          `no_mac_field` (covers empty + non-hex + wrong-length).
+     */
+    private suspend fun processInboundEnvelopeWithVerify(
+        env: PollEnvelope,
+        currentToken: String,
+        loopTag: String,
+    ): Boolean {
+        val (verifyKeyState, breakerState) = _inboundStateMutex.withLock {
+            Pair(_verifyKeyState, _breakerState)
+        }
+
+        if (breakerState is LongPollBreakerState.SuspendedOnPoison) {
+            log(
+                "REST_TRACE inbound_drop_breaker_suspended " +
+                    "id=${env.id.take(8)} loop=$loopTag",
+            )
+            return false
+        }
+
+        if (verifyKeyState is VerifyKeyState.KeySuspended) {
+            log(
+                "REST_TRACE inbound_drop_key_suspended " +
+                    "id=${env.id.take(8)} loop=$loopTag",
+            )
+            return false
+        }
+
+        if (verifyKeyState is VerifyKeyState.KeyAbsent) {
+            log(
+                "REST_TRACE inbound_unverified id=${env.id.take(8)} " +
+                    "reason=no_verify_key loop=$loopTag",
+            )
+            emitWithCancellationSafeRollback(env)
+            return true
+        }
+
+        // KeyPresent — verify against the snapshotted hex. Per L6,
+        // the hex is the value held at the moment of snapshot; a
+        // refresh-vs-poll race that flips the state to a different
+        // key mid-verify cannot torn-read because the snapshot is
+        // immutable. M-B25 pins this.
+        val verifyKeyHex = (verifyKeyState as VerifyKeyState.KeyPresent).hex
+        val outcome = SeqMacVerifier.verify(
+            identityHex = identityHex,
+            seq = env.seq,
+            envelopeId = env.id,
+            sequenceTs = env.sequenceTs,
+            seqMacHex = env.seqMac,
+            verifyKeyHex = verifyKeyHex,
+        )
+
+        return when (outcome) {
+            SeqMacVerifier.Outcome.Verified -> {
+                log(
+                    "REST_TRACE seq_mac_verified id=${env.id.take(8)} " +
+                        "seq=${env.seq} loop=$loopTag",
+                )
+                emitWithCancellationSafeRollback(env)
+                true
+            }
+            SeqMacVerifier.Outcome.MacMismatch -> {
+                handleBadMacEnvelope(env, "mac_mismatch", currentToken, loopTag)
+                false
+            }
+            SeqMacVerifier.Outcome.MalformedSeqMac -> {
+                handleBadMacEnvelope(env, "no_mac_field", currentToken, loopTag)
+                false
+            }
+        }
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C4, L7) — bad-MAC posture handler. Four
+     * locked steps per the scope-doc:
+     *
+     *   1. **Telemetry** — increment [_macFailCount] (under
+     *      [_inboundStateMutex]); log
+     *      `event=poll_mac_verify_repeat`.
+     *   2. **Drop and continue** — caller returns false; no emit,
+     *      no ack, no cursor advance.
+     *   3. **One forced refresh, latched per envelope_id** — when
+     *      the per-id counter reaches
+     *      [MAC_REPEAT_REFRESH_THRESHOLD] and the latch
+     *      [_macRefreshAttemptedFor] does not already record this
+     *      envelope_id, set the latch and call
+     *      [acquireOrRefreshToken] with the current token as
+     *      `staleToken`. If the refresh itself fails, the L2
+     *      corollary (KeyPresent + Failure → KeySuspended)
+     *      automatically suspends subsequent ingestion via the
+     *      classifier publication path inside
+     *      [acquireOrRefreshToken].
+     *   4. **Suspend BOTH REST poll loops on repeat-after-refresh**
+     *      — if the latch already records this envelope_id, the
+     *      current call IS the load-bearing "second failure after
+     *      refresh" event: transition the breaker to
+     *      [LongPollBreakerState.SuspendedOnPoison] (under the
+     *      same `_inboundStateMutex` critical section as the count
+     *      increment, so the state is observable atomically by
+     *      both loops on their next snapshot).
+     */
+    private suspend fun handleBadMacEnvelope(
+        env: PollEnvelope,
+        reason: String,
+        currentToken: String,
+        loopTag: String,
+    ) {
+        // Step 1 + Step 4 under a single mutex critical section so
+        // concurrent failures on the same envelope_id from both
+        // loops cannot race past the latch check.
+        val decision: BadMacDecision = _inboundStateMutex.withLock {
+            val newCount = (_macFailCount[env.id] ?: 0) + 1
+            _macFailCount[env.id] = newCount
+            val alreadyLatched = env.id in _macRefreshAttemptedFor
+            when {
+                alreadyLatched -> {
+                    // Step 4: repeat-after-refresh → suspension.
+                    _breakerState = LongPollBreakerState.SuspendedOnPoison
+                    BadMacDecision(newCount = newCount, action = BadMacAction.Suspend)
+                }
+                newCount >= MAC_REPEAT_REFRESH_THRESHOLD -> {
+                    // Step 3: threshold reached, latch was empty —
+                    // set the latch and signal the caller to
+                    // trigger the refresh (outside the mutex; the
+                    // refresh path takes `tokenMutex` outer).
+                    _macRefreshAttemptedFor += env.id
+                    BadMacDecision(newCount = newCount, action = BadMacAction.TriggerRefresh)
+                }
+                else -> {
+                    BadMacDecision(newCount = newCount, action = BadMacAction.JustLog)
+                }
+            }
+        }
+
+        // Step 1: telemetry.
+        log(
+            "REST_TRACE poll_mac_verify_repeat id=${env.id.take(8)} " +
+                "count=${decision.newCount} seq=${env.seq} " +
+                "reason=$reason loop=$loopTag",
+        )
+
+        when (decision.action) {
+            BadMacAction.JustLog -> { /* no additional action */ }
+            BadMacAction.TriggerRefresh -> {
+                // Step 3: forced refresh outside `_inboundStateMutex`
+                // because `acquireOrRefreshToken` takes
+                // `tokenMutex` outer + `_inboundStateMutex` inner.
+                // The refresh response classifier transitions the
+                // verify-key state machine onto the published
+                // outcome (Valid / Empty / Malformed / Failure).
+                acquireOrRefreshToken(
+                    reason = "poll_mac_repeat",
+                    staleToken = currentToken,
+                )
+            }
+            BadMacAction.Suspend -> {
+                log(
+                    "REST_TRACE poll_mac_repeat_suspend " +
+                        "reason=verify_fail_after_refresh source=$loopTag " +
+                        "id=${env.id.take(8)}",
+                )
+            }
+        }
+    }
+
+    private data class BadMacDecision(val newCount: Int, val action: BadMacAction)
+    private enum class BadMacAction { JustLog, TriggerRefresh, Suspend }
 
     /**
      * Trek 2 Stage 2B-B (C3 review-fix) — defensive read of
@@ -1495,6 +1770,64 @@ class RestFallbackOrchestrator(
      */
     internal suspend fun emitWithCancellationSafeRollbackForTest(env: PollEnvelope) {
         emitWithCancellationSafeRollback(env)
+    }
+
+    /**
+     * Trek 2 Stage 2B-B (C4) — peek the verify-key state machine
+     * value under [_inboundStateMutex]. Used by tests to assert
+     * publication-site outcomes at acquireOrRefreshToken success +
+     * failure branches.
+     */
+    internal suspend fun peekVerifyKeyStateForTest(): VerifyKeyState =
+        _inboundStateMutex.withLock { _verifyKeyState }
+
+    /** Peek breaker state. */
+    internal suspend fun peekBreakerStateForTest(): LongPollBreakerState =
+        _inboundStateMutex.withLock { _breakerState }
+
+    /** Peek per-envelope MAC verify-fail counter. Returns 0 if absent. */
+    internal suspend fun peekMacFailCountForTest(envelopeId: String): Int =
+        _inboundStateMutex.withLock { _macFailCount[envelopeId] ?: 0 }
+
+    /** Peek refresh-attempted latch membership. */
+    internal suspend fun peekMacRefreshAttemptedForTest(envelopeId: String): Boolean =
+        _inboundStateMutex.withLock { envelopeId in _macRefreshAttemptedFor }
+
+    /**
+     * Test-only seam that drives the per-envelope verify-and-emit
+     * decision directly without standing up a poll loop. Same
+     * semantics as `processInboundEnvelopeWithVerify` (the
+     * production callers from both REST poll loops).
+     */
+    internal suspend fun processInboundEnvelopeWithVerifyForTest(
+        env: PollEnvelope,
+        currentToken: String,
+        loopTag: String,
+    ): Boolean = processInboundEnvelopeWithVerify(env, currentToken, loopTag)
+
+    /**
+     * Test-only seam that publishes the verify-key state machine
+     * directly. Mirrors what `acquireOrRefreshToken` does on its
+     * publication branches; used by tests to drive the state into
+     * `KeyPresent(hex)` / `KeySuspended` / etc. without standing up
+     * a session lifecycle.
+     */
+    internal suspend fun setVerifyKeyStateForTest(state: VerifyKeyState) {
+        _inboundStateMutex.withLock {
+            _verifyKeyState = state
+        }
+    }
+
+    /**
+     * Test-only seam that publishes the breaker state directly.
+     * Used by tests that exercise the `SuspendedOnPoison` gate
+     * without driving the bad-MAC posture through the production
+     * path.
+     */
+    internal suspend fun setBreakerStateForTest(state: LongPollBreakerState) {
+        _inboundStateMutex.withLock {
+            _breakerState = state
+        }
     }
 
     /**
@@ -1776,6 +2109,25 @@ class RestFallbackOrchestrator(
          * attempts.
          */
         val CURSOR_WRITE_RETRY_BACKOFF_MS: LongArray = longArrayOf(100L, 500L)
+
+        /**
+         * Trek 2 Stage 2B-B (C4, L7 step 3) — repeat-count threshold
+         * that triggers the orchestrator's one-shot forced session/
+         * key refresh under the bad-MAC posture. When the per-
+         * `envelope_id` MAC verify-fail counter reaches this value,
+         * the orchestrator calls `acquireOrRefreshToken(reason =
+         * "poll_mac_repeat", staleToken = currentToken)` exactly
+         * once per envelope_id per orchestrator-session lifetime
+         * (latched via `_macRefreshAttemptedFor`). A subsequent
+         * verify failure on the same envelope_id transitions the
+         * breaker to [LongPollBreakerState.SuspendedOnPoison].
+         *
+         * Locked value `2`: one initial failure is data noise; the
+         * second is the signal to refresh. Lower (1) would refresh
+         * on every transient; higher (3+) lets a stale verify-key
+         * leak more bad-MAC outcomes before recovery.
+         */
+        const val MAC_REPEAT_REFRESH_THRESHOLD: Int = 2
 
         private fun defaultNowMs(): Long =
             kotlinx.datetime.Clock.System.now().toEpochMilliseconds()

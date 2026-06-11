@@ -49,6 +49,17 @@ class RestFallbackOrchestratorPollLoopTest {
 
     private val IDENTITY: String = "aa".repeat(32)
 
+    /**
+     * Trek 2 Stage 2B-B (C4) — the session response here returns
+     * an EMPTY `seq_mac_verify_key` so the orchestrator's
+     * verify-key state machine stays at `KeyAbsent` (legacy
+     * unverified pass-through). The poll-loop tests in this file
+     * exercise concurrency / cursor-failure / barrier mechanics
+     * INDEPENDENT of the verify path; the C4 verify wiring is
+     * tested in [RestFallbackOrchestratorVerifyAndPostureTest]
+     * with a separate setup that drives the state machine into
+     * `KeyPresent`.
+     */
     private val SESSION_RESPONSE_OK: RestFallbackResponse<AuthSessionResponse> =
         RestFallbackResponse(
             statusCode = 200,
@@ -59,7 +70,7 @@ class RestFallbackOrchestratorPollLoopTest {
                 maxSendBodyBytes = 4096,
                 pollMaxEnvelopes = 1,
                 pollHoldSecs = 30,
-                seqMacVerifyKey = "f".repeat(64),
+                seqMacVerifyKey = "", // KeyAbsent state → unverified pass-through.
             ),
             rawBody = "{}",
             elapsedMs = 1L,

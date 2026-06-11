@@ -54,7 +54,10 @@ class WsActivePollJobLifecycleTest {
                     maxSendBodyBytes = 4096,
                     pollMaxEnvelopes = 1,
                     pollHoldSecs = 30,
-                    seqMacVerifyKey = "f".repeat(64),
+                    // C4: empty key keeps state at KeyAbsent →
+                    // unverified pass-through; lifecycle tests
+                    // assert delivery without verify gate.
+                    seqMacVerifyKey = "",
                 ),
                 rawBody = "{}",
                 elapsedMs = 1L,
