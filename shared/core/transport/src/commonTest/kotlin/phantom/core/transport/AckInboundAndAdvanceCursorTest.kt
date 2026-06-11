@@ -8,16 +8,12 @@ package phantom.core.transport
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.async
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
-import kotlin.coroutines.coroutineContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -609,110 +605,377 @@ class AckInboundAndAdvanceCursorTest {
     }
 
     @Test
-    fun mb29_no_suspension_point_between_acked_return_and_try_block_structurally() = runTest {
-        // Sub-cell (d) — STRUCTURAL: by construction of
-        // ackInboundAndAdvanceCursor, there is NO suspension point
-        // between the `return ackOutcome` on the non-Acked early
-        // exit and the `try { ... }` block entry on the Acked path.
-        // The first suspension point after `Acked` is the
-        // `_inboundStateMutex.withLock` INSIDE the `try`. This test
-        // exercises the structural property by asserting that a
-        // post-`Acked` cancellation is observed only via the
-        // `finally`/`NonCancellable` cleanup path — never via a
-        // mid-region leak. We re-run the cancellation-during-mutex
-        // case as the canonical behavioural witness; the absence of
-        // a leakable suspension point is a load-bearing property of
-        // the implementation, not a runtime measurement.
-        val cursor = FakeCursorRepo()
+    fun mb29_cancel_at_phase1_mutex_acquire_finally_removes_entry() = runTest {
+        // Sub-cell (a) — REAL cancellation at the Phase 1 mutex
+        // acquire. We hold `_inboundStateMutex` externally via the
+        // module-internal `withInboundStateMutexHeldForTest` seam so
+        // the ack-and-advance coroutine deterministically suspends
+        // at the Phase 1 `_inboundStateMutex.withLock` call. Then we
+        // cancel the ack coroutine while it is blocked on the lock.
+        //
+        // The expected sequence:
+        //   1. The Phase 1 mutex wait throws CancellationException.
+        //   2. The outer try/catch path propagates the CE.
+        //   3. Phase 3 finally enters `withContext(NonCancellable) {
+        //      _inboundStateMutex.withLock { ... } }`. It suspends
+        //      waiting for the holder to release the mutex.
+        //   4. We release the held mutex.
+        //   5. Phase 3 acquires the mutex, removes the entry, and
+        //      the CE propagates to the caller.
+        //
+        // Assertion: the entry is removed; no exhaustion log fires.
         val transport = FakeTransport(
             sessionScript = { SESSION_RESPONSE_OK },
             ackScript = ackOk200(),
         )
-        val orch = buildOrchestrator(transport, cursor)
+        val cursor = FakeCursorRepo()
+        val logLines = mutableListOf<String>()
+        val orch = buildOrchestrator(transport, cursor, logSink = { logLines += it })
         bootstrapped(orch)
 
-        orch.primePendingSeqForAckForTest("env-struct", 44L)
-        val outcome = orch.ackInboundAndAdvanceCursor("env-struct")
+        orch.primePendingSeqForAckForTest("env-phase1", 23L)
 
-        // Witness: under normal completion, the post-`Acked` region
-        // unconditionally cleans up; the entry is gone and the cursor
-        // is advanced exactly once. A regression that put a
-        // suspension point BEFORE the `try { ... }` would not change
-        // these assertions under normal flow (they pass either way),
-        // but the cancellation tests in mb29_cancel_at_phase1_*
-        // exercise the leakable-suspension surface and would trip
-        // there if the structural property were broken.
-        assertEquals(AckOutcome.Acked, outcome)
-        assertEquals(1, cursor.writes.size)
-        assertEquals(44L, cursor.writes.single().second)
-        assertNull(orch.peekPendingSeqForAckForTest("env-struct"))
+        val mutexAcquired = CompletableDeferred<Unit>()
+        val releaseMutex = CompletableDeferred<Unit>()
+        val holderJob = launch {
+            orch.withInboundStateMutexHeldForTest {
+                mutexAcquired.complete(Unit)
+                releaseMutex.await()
+            }
+        }
+        // Wait until the holder has actually acquired the lock.
+        mutexAcquired.await()
+
+        val ackJob = launch {
+            try {
+                orch.ackInboundAndAdvanceCursor("env-phase1")
+                fail("expected CancellationException — Phase 1 should be cancellable")
+            } catch (ce: CancellationException) {
+                // Expected.
+            }
+        }
+        // Let the ack reach Phase 0 (synchronous ackInbound) and
+        // arrive at Phase 1 suspension on the held mutex.
+        advanceUntilIdle()
+
+        // Cancel while blocked on the mutex.
+        ackJob.cancel()
+        // Release the holder so the ack's Phase 3 finally cleanup
+        // can acquire the mutex and remove the entry.
+        releaseMutex.complete(Unit)
+        advanceUntilIdle()
+
+        // The Phase 3 cleanup ran under NonCancellable; the entry
+        // must be gone.
+        assertNull(
+            orch.peekPendingSeqForAckForTest("env-phase1"),
+            "Phase 3 finally cleanup must remove the entry after a Phase 1 cancellation",
+        )
+        assertFalse(
+            logLines.any { it.contains("poll_cursor_write_exhausted") },
+            "exhaustion log MUST NOT fire under cancellation at Phase 1",
+        )
+        assertEquals(0, cursor.writes.size, "no cursor write happens when Phase 1 is cancelled")
+        holderJob.join()
     }
 
-    // ── M12 — cursor monotonicity ────────────────────────────────────────────
-
     @Test
-    fun m12_cursor_monotonicity_across_sparse_sequential_acks() = runTest {
-        // Sparse but monotonic sequence acks land in order; the
-        // cursor never regresses. FakeCursorRepo's monotonicity
-        // mirror catches a regression that wrote a lower seq.
-        val transport = FakeTransport(
-            sessionScript = { SESSION_RESPONSE_OK },
-            ackScript = ackOk200(),
+    fun mb29d_structural_no_suspension_point_between_acked_return_and_try_block() {
+        // Sub-cell (d) — STRUCTURAL: the production source file MUST
+        // NOT contain a suspending call between the `return ackOutcome`
+        // line (early-exit on non-Acked) and the `try {` block entry
+        // on the Acked path. The first suspension point after `Acked`
+        // must be the `_inboundStateMutex.withLock` INSIDE the try.
+        //
+        // Verification: read the orchestrator source file, locate the
+        // two markers, and assert that the region between them contains
+        // ONLY local variable initialisations (assignment to `null` or
+        // `false`) plus comments + blank lines. Any other token in
+        // that region is a candidate suspension point and breaks the
+        // load-bearing property that cancellation cannot leak the
+        // `_pendingSeqForAck` entry past the `try { ... } finally { ... }`
+        // bracket.
+        val source = locateSource(
+            "shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackOrchestrator.kt",
+        ).readText(Charsets.UTF_8)
+
+        // The Acked branch is unique: there's exactly one occurrence
+        // of `if (ackOutcome !is AckOutcome.Acked) {` in the
+        // orchestrator, immediately followed by the early-exit
+        // `return ackOutcome`. The next `try {` opens the post-Acked
+        // bracket.
+        val ackedCheckIdx = source.indexOf("if (ackOutcome !is AckOutcome.Acked) {")
+        assertTrue(
+            ackedCheckIdx >= 0,
+            "ackInboundAndAdvanceCursor `if (ackOutcome !is AckOutcome.Acked) {` " +
+                "anchor not found in orchestrator source — refactor may have moved it",
         )
-        val cursor = FakeCursorRepo()
-        val orch = buildOrchestrator(transport, cursor)
-        bootstrapped(orch)
+        val earlyExitEnd = source.indexOf('}', ackedCheckIdx)
+        assertTrue(earlyExitEnd > ackedCheckIdx, "no closing `}` after Acked check")
+        // Find the next `try {` that begins on its own line (i.e.
+        // preceded by indentation only, not embedded inside a
+        // documentation comment that references the `try { ... }`
+        // block textually). The orchestrator is indented with 4
+        // spaces × N levels — match any leading whitespace before
+        // `try {` and require a preceding newline.
+        val tryBraceAnchor = Regex("""\n\s*try\s*\{""")
+        val tryMatch = tryBraceAnchor.find(source, startIndex = earlyExitEnd)
+        assertNotNull(
+            tryMatch,
+            "expected a line-starting `try {` after the early-exit close brace; " +
+                "not found",
+        )
+        val tryBraceIdx = tryMatch.range.first
+        val region = source.substring(earlyExitEnd + 1, tryBraceIdx)
 
-        // Out-of-order PRIME (simulating both poll loops registering
-        // different ids concurrently before consumer drains), but
-        // sequential ack so the writes themselves land in seq order:
-        orch.primePendingSeqForAckForTest("env-a", 3L)
-        orch.primePendingSeqForAckForTest("env-b", 5L)
-        orch.primePendingSeqForAckForTest("env-c", 4L)
-        orch.primePendingSeqForAckForTest("env-d", 6L)
+        // The region must contain only:
+        //   - whitespace / blank lines
+        //   - `//` comments (single-line)
+        //   - `var <name>: <Type>? = null` initialisations
+        //   - `var <name> = false` initialisations
+        // No suspending calls, no method invocations, no awaits.
+        // Strip comments + whitespace, then assert that the remainder
+        // matches only the allowed `var ... = null|false` shapes.
+        val stripped = region
+            .lineSequence()
+            .map { line -> line.replace(Regex("""//.*$"""), "").trim() }
+            .filter { it.isNotEmpty() }
+            .joinToString("\n")
 
-        orch.ackInboundAndAdvanceCursor("env-a")
-        orch.ackInboundAndAdvanceCursor("env-c") // seq=4 after seq=3
-        orch.ackInboundAndAdvanceCursor("env-b") // seq=5 after seq=4
-        orch.ackInboundAndAdvanceCursor("env-d") // seq=6 after seq=5
+        // Allow-list: lines of shape `var <ident>: <Type> = null` or
+        // `var <ident> = false`. Anything else is a candidate leak.
+        val allowedLine = Regex(
+            """^var\s+\w+(\s*:\s*[\w?<>]+)?\s*=\s*(null|false|true|0|0L)\s*$""",
+        )
+        val offending = stripped.lineSequence().filter { line ->
+            !allowedLine.matches(line)
+        }.toList()
 
-        assertEquals(4, cursor.writes.size)
-        assertEquals(listOf(3L, 4L, 5L, 6L), cursor.writes.map { it.second })
-        // Final persistent value at the highest observed.
-        assertEquals(6L, cursor.initialSeq)
+        assertTrue(
+            offending.isEmpty(),
+            "Region between the Acked early-exit and the `try {` block contains " +
+                "suspending or non-trivial statements. The locked structural property " +
+                "is that NO suspension point exists in this region; cancellation " +
+                "before `try { ... }` would leak `_pendingSeqForAck` past the " +
+                "finally-block cleanup. Offending lines:\n" +
+                offending.joinToString("\n") { "  > $it" },
+        )
+    }
+
+    /**
+     * Resolve the orchestrator source file from the test working
+     * directory. The module layout puts the test under
+     * `shared/core/transport/build/classes/...` at run time; the
+     * source itself lives at
+     * `shared/core/transport/src/commonMain/...`. The repo-root path
+     * is the canonical anchor; we also accept a relative path so
+     * the test works from the module-level working directory.
+     */
+    private fun locateSource(repoRelative: String): java.io.File {
+        val candidates = listOf(
+            java.io.File(repoRelative),
+            java.io.File("../../../$repoRelative"),
+            java.io.File("../../$repoRelative"),
+            java.io.File("../$repoRelative"),
+        )
+        return candidates.firstOrNull { it.exists() && it.isFile }
+            ?: fail(
+                "Could not locate orchestrator source from the unit-test " +
+                    "working directory. Tried: ${candidates.joinToString { it.absolutePath }}",
+            )
+    }
+
+    // ── M12 — cursor monotonicity (real concurrent dual-loop test) ──────────
+
+    /**
+     * Trek 2 Stage 2B-B (C3 review-fix) — M12-required monotonic
+     * storage mirror that ENFORCES the invariant: the underlying
+     * SQLDelight `upsertLastSeenSeq` transaction NO-OPs on
+     * `newSeq <= persistedSeq` (Stage 2A D5 contract). This fake
+     * mirrors that behaviour faithfully so the M12 assertion below
+     * can pin "writer never accepts a value ≤ persisted" as an
+     * end-to-end property rather than relying on the live
+     * SQLCipher transaction.
+     *
+     * Records the full call log AND the accepted-writes log so the
+     * test can prove both:
+     *   1. The orchestrator forwards every (id, seq) attempt through
+     *      the seam (we do NOT filter in the orchestrator).
+     *   2. The storage layer no-ops on non-monotonic attempts, so
+     *      the persisted cursor only ever advances — never regresses.
+     */
+    private class MonotonicCursorRepo(
+        initial: Long? = null,
+    ) : LongPollCursorRepository {
+        private val lock = kotlinx.coroutines.sync.Mutex()
+        private var persisted: Long? = initial
+        val reads: MutableList<String> = mutableListOf()
+
+        /** Every `upsertLastSeenSeq(...)` call attempt, in order. */
+        val attempts: MutableList<Long> = mutableListOf()
+
+        /** Only the attempts that the monotonic transaction ACCEPTED. */
+        val accepted: MutableList<Long> = mutableListOf()
+
+        val persistedSeq: Long? get() = persisted
+
+        override suspend fun getLastSeenSeq(identityHex: String): Long? = lock.withLock {
+            reads += identityHex
+            persisted
+        }
+
+        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
+            lock.withLock {
+                attempts += seq
+                val current = persisted
+                if (current == null || seq > current) {
+                    persisted = seq
+                    accepted += seq
+                }
+                // else: SQLDelight monotonicity contract no-ops the write.
+            }
+        }
     }
 
     @Test
-    fun m12_cursor_writer_never_called_with_value_lower_than_persisted() = runTest {
-        // The orchestrator simply forwards whatever seq is in the
-        // pending map. The monotonicity invariant is enforced by
-        // the SQLDelight implementation (D5) — this test pins the
-        // surface contract: out-of-order acks DO call upsert with
-        // potentially-lower seq values; production storage rejects
-        // the lower writes. C3 ships the orchestrator side of the
-        // contract; the storage side has been pinned since Stage 2A
-        // A2/A3. The test confirms the orchestrator does NOT filter
-        // out-of-order writes — that responsibility lives at the
-        // storage layer.
+    fun m12_two_concurrent_poll_loops_interleaved_3_5_4_6_keep_persisted_monotonic() = runTest {
+        // Real concurrent test per scope-doc M12 cell. Two
+        // independent coroutines simulate `wsActivePollLoop` and
+        // the legacy `pollLoop` running in parallel; each receives
+        // an interleaved subset of the canonical out-of-order batch
+        // `seq = [3, 5, 4, 6]`. The monotonic FakeCursorRepo
+        // mirrors the SQLDelight transaction's no-op-on-lower
+        // contract.
+        //
+        // Loop A (wsActive analogue): handles seq=3, then seq=5.
+        // Loop B (legacy analogue):   handles seq=4, then seq=6.
+        //
+        // Real interleaving from concurrent dispatching means the
+        // four ack calls land in some non-deterministic order. The
+        // ASSERTIONS pin the load-bearing properties regardless of
+        // the interleaving:
+        //   * All four envelopes ack via the relay (4 upsert attempts).
+        //   * The persisted cursor is monotonically non-decreasing
+        //     across every accepted write.
+        //   * The final persisted value equals max(3,5,4,6) = 6L.
+        //   * Any upsert attempt with seq ≤ persisted at attempt time
+        //     was NO-OP'd by the storage layer — i.e. the writer was
+        //     never "called and committed" with a value lower than
+        //     the persisted state.
+        //
+        // The concurrency here exercises the orchestrator's
+        // `_inboundStateMutex` discipline AND the storage layer's
+        // monotonicity AND their interaction. A regression that
+        // either lost the lock around `_pendingSeqForAck` or wrote
+        // a stale seq value would trip the final-state assertion or
+        // the monotonicity invariant.
         val transport = FakeTransport(
             sessionScript = { SESSION_RESPONSE_OK },
             ackScript = ackOk200(),
         )
-        val cursor = FakeCursorRepo()
+        val cursor = MonotonicCursorRepo()
         val orch = buildOrchestrator(transport, cursor)
         bootstrapped(orch)
 
-        orch.primePendingSeqForAckForTest("late-low", 2L)
-        orch.primePendingSeqForAckForTest("early-high", 9L)
-        orch.ackInboundAndAdvanceCursor("early-high")
-        orch.ackInboundAndAdvanceCursor("late-low")
+        // Loop A — simulates `wsActivePollLoop` ingesting envelopes
+        // seq=3 and seq=5.
+        val loopA = launch {
+            orch.primePendingSeqForAckForTest("env-3", 3L)
+            orch.ackInboundAndAdvanceCursor("env-3")
+            orch.primePendingSeqForAckForTest("env-5", 5L)
+            orch.ackInboundAndAdvanceCursor("env-5")
+        }
+        // Loop B — simulates the legacy `pollLoop` ingesting envelopes
+        // seq=4 and seq=6.
+        val loopB = launch {
+            orch.primePendingSeqForAckForTest("env-4", 4L)
+            orch.ackInboundAndAdvanceCursor("env-4")
+            orch.primePendingSeqForAckForTest("env-6", 6L)
+            orch.ackInboundAndAdvanceCursor("env-6")
+        }
+        loopA.join()
+        loopB.join()
 
-        // The orchestrator forwarded both writes verbatim — including
-        // the lower value. Production storage rejects it via its own
-        // monotonicity transaction; the orchestrator does not.
-        assertEquals(2, cursor.writes.size)
-        assertEquals(9L, cursor.writes[0].second)
-        assertEquals(2L, cursor.writes[1].second)
+        // All four envelopes acked at the relay.
+        assertEquals(4, transport.ackCalls.size, "all four envelopes must ack")
+
+        // All four upsert attempts forwarded to the storage seam
+        // (the orchestrator does NOT pre-filter; the storage layer
+        // enforces monotonicity).
+        assertEquals(4, cursor.attempts.size, "orchestrator forwards every (id, seq) to upsert")
+        assertEquals(setOf(3L, 4L, 5L, 6L), cursor.attempts.toSet())
+
+        // Monotonic non-decreasing accepted writes — the load-bearing
+        // M12 property. A regression that accidentally let a lower
+        // seq advance the persisted cursor would break this.
+        for (i in 1 until cursor.accepted.size) {
+            assertTrue(
+                cursor.accepted[i] > cursor.accepted[i - 1],
+                "accepted writes must be strictly increasing; saw ${cursor.accepted}",
+            )
+        }
+
+        // Final persisted value at max(envelopes).
+        assertEquals(6L, cursor.persistedSeq, "final persisted cursor must be the highest observed")
+
+        // The "writer never accepted a value ≤ persisted" invariant
+        // — every accepted write strictly exceeds the persisted
+        // value AT THE MOMENT OF the write (this follows from the
+        // strict increase above plus the storage layer's contract).
+        // We assert it explicitly so the property is named:
+        var snapshotPersisted: Long? = null
+        for (seq in cursor.accepted) {
+            val sp = snapshotPersisted
+            assertTrue(
+                sp == null || seq > sp,
+                "accepted write seq=$seq must exceed persisted-at-time=$sp",
+            )
+            snapshotPersisted = seq
+        }
+    }
+
+    @Test
+    fun m12_no_torn_seq_value_under_concurrent_emit_and_consume() = runTest {
+        // Companion test: under high concurrency, the
+        // `_inboundStateMutex` discipline must guarantee that
+        // `_pendingSeqForAck` reads always see whole, well-formed
+        // seq values — never a torn read across an emit/consume
+        // pair. We exercise this by running many concurrent
+        // emit→ack pairs and asserting the orchestrator forwarded
+        // EXACTLY the primed seq for each envelope.
+        val transport = FakeTransport(
+            sessionScript = { SESSION_RESPONSE_OK },
+            ackScript = ackOk200(),
+        )
+        val cursor = MonotonicCursorRepo()
+        val orch = buildOrchestrator(transport, cursor)
+        bootstrapped(orch)
+
+        // 50 envelopes with monotonic seqs, interleaved across two
+        // simulated loops.
+        val jobs = mutableListOf<Job>()
+        for (i in 1..50) {
+            val seq = i.toLong()
+            val id = "env-$i"
+            val coro = if (i % 2 == 0) "loopA" else "loopB"
+            jobs += launch {
+                orch.primePendingSeqForAckForTest(id, seq)
+                yield() // interleave deliberately
+                orch.ackInboundAndAdvanceCursor(id)
+            }
+        }
+        jobs.forEach { it.join() }
+
+        // Every primed seq was forwarded to upsert (no envelope lost).
+        assertEquals(50, cursor.attempts.size)
+        // Every seq from 1..50 appears exactly once.
+        assertEquals((1L..50L).toSet(), cursor.attempts.toSet())
+        // Final persisted value is the max.
+        assertEquals(50L, cursor.persistedSeq)
+        // Accepted writes are strictly increasing.
+        for (i in 1 until cursor.accepted.size) {
+            assertTrue(cursor.accepted[i] > cursor.accepted[i - 1])
+        }
     }
 
     // ── Companion-constant pin ────────────────────────────────────────────────

@@ -889,7 +889,15 @@ class RestFallbackOrchestrator(
             // of every iteration. Both poll loops share this single
             // source of truth; the legacy in-memory `lastSeenSeq`
             // variable is gone.
-            val lastSeenSeq = cursorRepository?.getLastSeenSeq(identityHex)
+            //
+            // C3 review-fix — wrap the storage read so a transient
+            // SQLCipher / repository exception does NOT terminate the
+            // poll-loop coroutine. CancellationException always
+            // rethrows; other throwables degrade to `null` (server
+            // treats null as `since_seq=0`, a slight over-fetch on
+            // the next legitimate iteration but no envelope loss).
+            // The next iteration retries the read.
+            val lastSeenSeq = readCursorSafely(loopTag = "pollLoop")
             log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
             val startMs = now()
             val outcome = runCatching {
@@ -1074,7 +1082,11 @@ class RestFallbackOrchestrator(
             // through `ackInboundAndAdvanceCursor` after the relay
             // 2xx's the ack; this loop NEVER writes back from the
             // poll response directly.
-            val sinceSeq = cursorRepository?.getLastSeenSeq(identityHex)
+            //
+            // C3 review-fix — wrap the storage read so a transient
+            // repository exception does not terminate the parallel
+            // poll-loop coroutine (CancellationException rethrows).
+            val sinceSeq = readCursorSafely(loopTag = "wsActivePollLoop")
 
             val intervalMs = pollIntervalMs()
             log(
@@ -1147,11 +1159,31 @@ class RestFallbackOrchestrator(
             // mapping, mirrored on this loop. Populated BEFORE
             // emitting so the consumer can rely on
             // `ackInboundAndAdvanceCursor` finding the seq.
+            //
+            // C3 review-fix — `tryEmit` returns `false` when the
+            // SharedFlow buffer is full (slow consumer + parallel
+            // loop running ahead of decrypt/persist). In that case
+            // the consumer NEVER sees the envelope, and a leaked
+            // `_pendingSeqForAck` entry would persist until
+            // orchestrator restart. Roll back the map insertion so
+            // the relay queue + dedup ledger are the only
+            // authoritative state for this envelope; the next poll
+            // re-delivers it and the emit retries.
             for (env in envelopes) {
                 _inboundStateMutex.withLock {
                     _pendingSeqForAck[env.id] = env.seq
                 }
-                _inbound.tryEmit(env)
+                val emitted = _inbound.tryEmit(env)
+                if (!emitted) {
+                    _inboundStateMutex.withLock {
+                        _pendingSeqForAck.remove(env.id)
+                    }
+                    log(
+                        "REST_TRACE ws_active_poll_emit_dropped " +
+                            "id=${env.id.take(8)} reason=buffer_full " +
+                            "pending_seq_rolled_back=true",
+                    )
+                }
             }
             // L4: cursor advance happens inside
             // `ackInboundAndAdvanceCursor` after the relay 2xx's the
@@ -1267,6 +1299,42 @@ class RestFallbackOrchestrator(
         response.token
     }
 
+    /**
+     * Trek 2 Stage 2B-B (C3 review-fix) — defensive read of
+     * [cursorRepository] used by both poll loops at iteration start.
+     *
+     * Returns `null` when the repository is unwired OR when the read
+     * throws a non-cancellation exception (transient SQLCipher I/O,
+     * file lock contention, transaction abort). The poll loop
+     * proceeds with `since_seq = null`, which the server treats as
+     * `since_seq = 0` — a slight over-fetch on this iteration, but
+     * envelope-id dedup at both layers (relay queue + storage layer)
+     * absorbs the duplicate without lost or double-delivered
+     * messages. The next iteration retries the read; recurrent
+     * storage failure surfaces in repeated
+     * `poll_cursor_read_fail` log lines without crashing the loop.
+     *
+     * `CancellationException` rethrows so structured-concurrency
+     * shutdown still tears the loop down cleanly. The compiler can
+     * inline this helper into both poll-loop sites; the explicit
+     * function exists so the discipline is in one place and any
+     * future hardening lands once.
+     */
+    private suspend fun readCursorSafely(loopTag: String): Long? {
+        if (cursorRepository == null) return null
+        return try {
+            cursorRepository.getLastSeenSeq(identityHex)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            log(
+                "REST_TRACE poll_cursor_read_fail loop=$loopTag " +
+                    "reason=${t::class.simpleName} continuing_with_null",
+            )
+            null
+        }
+    }
+
     // ── Test seams (Trek 2 Stage 2B-B C3) ─────────────────────────────────────
 
     /**
@@ -1304,6 +1372,21 @@ class RestFallbackOrchestrator(
         _inboundStateMutex.withLock {
             _pendingSeqForAck[envelopeId]
         }
+
+    /**
+     * Trek 2 Stage 2B-B (C3 review-fix) — test-only seam that holds
+     * [_inboundStateMutex] for the duration of [block] so commonTest
+     * can deterministically trigger [ackInboundAndAdvanceCursor]
+     * suspending at its Phase 1 mutex acquire. Used by M-B29 sub-cell
+     * (a) to verify the cancellation-safety property at that
+     * suspension point.
+     *
+     * Visibility: `internal` — only the `:shared:core:transport`
+     * module's tests can call it. No production caller has a
+     * legitimate use.
+     */
+    internal suspend fun <T> withInboundStateMutexHeldForTest(block: suspend () -> T): T =
+        _inboundStateMutex.withLock { block() }
 
     /**
      * Public CAS facade for media token acquisition (PR-M1w).
