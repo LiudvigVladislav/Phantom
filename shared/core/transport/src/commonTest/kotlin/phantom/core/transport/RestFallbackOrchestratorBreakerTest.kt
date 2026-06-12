@@ -1265,8 +1265,7 @@ class RestFallbackOrchestratorBreakerTest {
 
     @Test
     fun m13e_stop_during_Open_cancels_breaker_timer_and_no_refire_on_next_start() = runTest(timeout = 5.minutes) {
-        // The fixed sequence pinned by this test (per Vladislav's
-        // lock):
+        // The fixed sequence pinned by this test:
         //   1. Drive the breaker to Open via a 5xx burst.
         //   2. Call stop() — the timer Job MUST be cancelled.
         //   3. Flip the fake transport to 200 so the next start
@@ -2788,11 +2787,10 @@ class RestFallbackOrchestratorBreakerTest {
         // Round-5 P2: both poll loops now route through
         // [RestFallbackOrchestrator.classifyPollResponse], so a
         // future status-code drift requires changing the
-        // production enum + auditing both loops. Round-6 cleanup
-        // (Vladislav 2026-06-12): calls the PRODUCTION classifier
-        // directly via `internal` visibility — round-5's
-        // test-side mirror would have silently passed through any
-        // production drift.
+        // production enum + auditing both loops. Round-6 cleanup:
+        // calls the PRODUCTION classifier directly via `internal`
+        // visibility — round-5's test-side mirror would have
+        // silently passed through any production drift.
         init()
         val transport = BreakerTestTransport(pollScript = { _ ->
             fail("classifier-only test: poll not used")
