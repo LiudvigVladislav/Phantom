@@ -307,7 +307,7 @@ android {
             //     refuted; Arm G (WS-over-Reality) is primary next test
             //
             // The T2 client uses a SEPARATE OkHttp profile from the
-            // WebSocket arms (Vladislav hard gate 1 2026-06-06): connect=5s,
+            // WebSocket arms (hard gate 1, locked 2026-06-06): connect=5s,
             // write=30s, read=60s, callTimeout=180s. The WebSocket arms'
             // `callTimeout(10s)` would kill the slow POST mid-test and
             // produce garbage data.
@@ -399,8 +399,8 @@ android {
             // opt-in header, raised OkHttp callTimeout/readTimeout, jittered
             // hold consumption, persisted `lastSeenSeq` use, periodic
             // re-auth ceiling). Values follow the existing
-            // `DEBUG_RC_DIRECT_ARM` String "1"/"0" idiom locked by Vladislav
-            // OQ7 2026-06-09. Debug builds default to "1" (long-poll on so
+            // `DEBUG_RC_DIRECT_ARM` String "1"/"0" idiom (locked
+            // 2026-06-09). Debug builds default to "1" (long-poll on so
             // beta phones exercise the path); release builds pin to "0"
             // (defence in depth — Stage 2B promotion to production is a
             // separate named PR + a deliberate buildConfigField flip in this
@@ -429,8 +429,7 @@ android {
             // `local.properties` (or `S6_DEBUG_TRIGGER_ENABLED=1`
             // env). Default `"1"` on debug builds; release pins to
             // `"0"`. Mirrors the existing `LONGPOLL_V2_ENABLED`
-            // String "1"/"0" idiom locked by Vladislav OQ7
-            // 2026-06-09.
+            // String "1"/"0" idiom (locked 2026-06-09).
             val s6DebugTriggerEnabled = localOrEnv(
                 "s6DebugTriggerEnabled",
                 "S6_DEBUG_TRIGGER_ENABLED",
@@ -535,8 +534,8 @@ android {
             // can never engage any Stage 2B runtime path even if a debug-only
             // wire-up site forgot its `BuildConfig.DEBUG` guard. Stage 2B
             // promotion to release is a separate named PR that flips this
-            // single line; defence-in-depth backstop per Vladislav OQ7 +
-            // OQ11 split locks 2026-06-09.
+            // single line; defence-in-depth backstop per the
+            // OQ7 + OQ11 split locks (locked 2026-06-09).
             buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"0\"")
             // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) —
             // release builds ALWAYS pin the S6 debug trigger flag
@@ -546,7 +545,7 @@ android {
             // `BuildConfig.DEBUG`). A release APK can never reach
             // the trigger path even if the receiver were
             // dispatched. Defence-in-depth backstop per the same
-            // Vladislav OQ7 idiom as `LONGPOLL_V2_ENABLED`.
+            // OQ7 idiom as `LONGPOLL_V2_ENABLED`.
             buildConfigField("String", "S6_DEBUG_TRIGGER_ENABLED", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
