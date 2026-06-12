@@ -121,7 +121,7 @@ adb shell am broadcast \
 Logcat should then show:
 
 ```
-Phantom/S6Debug  Registered S6BreakerTriggerReceiver for action phantom.android.dev.S6_BREAKER_TRIGGER (S6 trigger flag enabled, permission=phantom.android.dev.permission.TRIGGER_S6)
+Phantom/S6Debug  Registered S6BreakerTriggerReceiver for action phantom.android.dev.S6_BREAKER_TRIGGER (S6 trigger flag enabled, permission=android.permission.DUMP)
 ... <wait until the natural Mode-2 window expires> ...
 Phantom/S6Debug  S6 breaker trigger broadcast received; dispatching on AppContainer.appScope
 PhantomRelay     REST_TRACE breaker_test_trigger_fired reason=ConsecutiveRestFailures threshold=5
