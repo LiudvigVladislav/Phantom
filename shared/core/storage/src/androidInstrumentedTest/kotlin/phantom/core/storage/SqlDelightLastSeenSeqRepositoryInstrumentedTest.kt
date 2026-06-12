@@ -132,34 +132,70 @@ class SqlDelightLastSeenSeqRepositoryInstrumentedTest {
     }
 
     @Test
-    fun descending_concurrent_writers_yield_exactly_one_advanced() = runTest {
-        // C6 review-fix round 5 (tester P1) — strong race-coverage pin
-        // against the real SQLDelight `transactionWithResult` block.
-        // See the JVM contract test's commentary for the rationale:
-        // descending input against a cold cursor is the
-        // discriminating shape because every loser sees `current`
-        // strictly greater than its requested seq and MUST return a
-        // NoChange witness equal to the persisted winning seq.
+    fun seeded_high_then_concurrent_lower_writers_yield_zero_advanced() = runTest {
+        // C6 review-fix round 6 — corrected race-coverage pin
+        // against the real SQLDelight `transactionWithResult`. See
+        // the JVM contract test's commentary for the rationale: a
+        // cold-descending shape admits up-to-50 legitimate Advanced
+        // events (each commit could observe `current < requested`
+        // and honestly advance), so the round-5 "exactly one
+        // Advanced" claim was structurally wrong.
+        //
+        // Deterministic shape A: seed at 50, fire (49 downTo 1)
+        // concurrent. The atomicity contract pins zero Advanced
+        // because every writer observes `current=50 >= requested`.
+        val seedOutcome = repo.upsertLastSeenSeq(idA, seq = 50L, nowMs = 1L)
+        assertEquals(null, seedOutcome, "seed must commit Advanced on a cold cursor")
         val outcomes: List<Long?> = coroutineScope {
-            (50 downTo 1).map { seq ->
+            (49 downTo 1).map { seq ->
                 async {
                     repo.upsertLastSeenSeq(idA, seq = seq.toLong(), nowMs = seq * 1_000L)
                 }
             }.awaitAll()
         }
-        val advancedCount = outcomes.count { it == null }
         assertEquals(
-            1, advancedCount,
-            "descending shape MUST yield exactly one Advanced outcome; got $advancedCount",
+            0, outcomes.count { it == null },
+            "with cursor seeded at 50, EVERY one of the 49 lower-seq writers MUST return " +
+                "NoChange. Any Advanced here is a false-Advanced bug.",
         )
-        val winningSeq = repo.getLastSeenSeq(idA) ?: error("repo must hold the winner's seq")
         val witnesses = outcomes.filterNotNull()
         assertEquals(49, witnesses.size, "expected 49 NoChange outcomes")
         assertTrue(
-            witnesses.all { witness -> witness == winningSeq },
-            "every NoChange witness MUST equal the persisted winning seq ($winningSeq); " +
-                "out-of-range: ${witnesses.filter { it != winningSeq }}",
+            witnesses.all { it == 50L },
+            "every NoChange witness MUST equal the seeded value (50). " +
+                "Out-of-range: ${witnesses.filter { it != 50L }}",
         )
+        assertEquals(50L, repo.getLastSeenSeq(idA))
+    }
+
+    @Test
+    fun seeded_just_below_then_concurrent_equal_writers_yield_exactly_one_advanced() = runTest {
+        // Deterministic shape B: seed at 49, fire 50 concurrent
+        // writers ALL requesting seq=50. The atomicity contract
+        // pins exactly one Advanced (the single 49 → 50 transition)
+        // independent of execution order.
+        val seedOutcome = repo.upsertLastSeenSeq(idA, seq = 49L, nowMs = 1L)
+        assertEquals(null, seedOutcome, "seed must commit Advanced on a cold cursor")
+        val outcomes: List<Long?> = coroutineScope {
+            (1..50).map { _ ->
+                async {
+                    repo.upsertLastSeenSeq(idA, seq = 50L, nowMs = 2L)
+                }
+            }.awaitAll()
+        }
+        assertEquals(
+            1, outcomes.count { it == null },
+            "all-equal seq=50 against cursor seeded at 49 MUST yield exactly ONE Advanced; " +
+                "a higher count is a false-Advanced bridge race.",
+        )
+        val witnesses = outcomes.filterNotNull()
+        assertEquals(49, witnesses.size, "expected 49 NoChange outcomes")
+        assertTrue(
+            witnesses.all { it == 50L },
+            "every NoChange witness MUST equal the post-commit value (50). " +
+                "Out-of-range: ${witnesses.filter { it != 50L }}",
+        )
+        assertEquals(50L, repo.getLastSeenSeq(idA))
     }
 
     @Test

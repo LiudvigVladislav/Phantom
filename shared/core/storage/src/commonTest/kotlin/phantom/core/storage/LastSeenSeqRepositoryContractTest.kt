@@ -231,60 +231,85 @@ class LastSeenSeqRepositoryContractTest {
     }
 
     @Test
-    fun descending_concurrent_writers_yield_exactly_one_advanced() = runTest {
-        // C6 review-fix round 5 (tester P1) — strong race-coverage
-        // pin. The strictly-increasing (1..50) case in the previous
-        // test admits vacuously-true witnesses because every
-        // witness <= 50L is satisfied by the input shape. A bug
-        // where the bridge returns false `Advanced(N)` for seq=N
-        // when current was already >= N (the round-2 race shape)
-        // would NOT trip the increasing case because input seq <=
-        // 50 by construction.
+    fun seeded_high_then_concurrent_lower_writers_yield_zero_advanced() = runTest {
+        // C6 review-fix round 6 — corrected race-coverage pin
+        // (replaces the round-5 cold-descending shape which
+        // admitted up-to-50 legitimate Advanced events as long as
+        // each commit observed `current < requested`).
         //
-        // Descending input (50 downTo 1) against a cold cursor is
-        // the discriminating shape. Under the atomicity contract:
-        //
-        //   * The FIRST writer to land has nothing persisted ⇒
-        //     returns null (Advanced) AND its seq becomes the
-        //     stored value.
-        //   * EVERY subsequent writer sees a persisted value strictly
-        //     greater than its requested seq (because the first
-        //     writer chose from {50, 49, ..., 1} and all losers
-        //     requested smaller) ⇒ returns the existing seq
-        //     (NoChange witness).
-        //
-        // The serialised winner picks ANY of the 50 values; the
-        // remaining 49 ALL no-op regardless of order. The contract
-        // is: EXACTLY ONE Advanced, EXACTLY 49 NoChange, and EVERY
-        // NoChange witness equals the winning seq (= finalSeq).
+        // **Deterministic shape A** — seed the cursor at 50, then
+        // fire 49 concurrent writers requesting (49 downTo 1). The
+        // atomicity contract says: EVERY one of them MUST observe
+        // `current >= requested` and return `NoChange(50)`. Zero
+        // Advanced. Any Advanced fired here is a false-Advanced
+        // bug — exactly the regression Vladislav flagged as the
+        // round-2 race shape: a bridge-style read-before-write
+        // could let an outdated `current` reach the "advance"
+        // branch.
         val repo: LastSeenSeqRepository = FakeLastSeenSeqRepository()
+        // Seed the high value.
+        val seedOutcome = repo.upsertLastSeenSeq(idA, seq = 50L, nowMs = 1L)
+        assertEquals(null, seedOutcome, "seed must commit Advanced on a cold cursor")
         val outcomes: List<Long?> = coroutineScope {
-            (50 downTo 1).map { seq ->
+            (49 downTo 1).map { seq ->
                 async {
                     repo.upsertLastSeenSeq(idA, seq = seq.toLong(), nowMs = seq * 1_000L)
                 }
             }.awaitAll()
         }
-        val advancedCount = outcomes.count { it == null }
-        val noChangeWitnesses: List<Long> = outcomes.filterNotNull()
         assertEquals(
-            1, advancedCount,
-            "descending shape MUST yield exactly ONE Advanced outcome (the cold-start " +
-                "winner). A higher count signals a bridge-style read-before-write race " +
-                "is back: multiple writers each saw a stale `current` and each was " +
-                "reported as Advanced even though only the first transaction landed.",
+            0, outcomes.count { it == null },
+            "with cursor seeded at 50, EVERY one of the 49 lower-seq writers MUST return " +
+                "NoChange. Any Advanced here is a false-Advanced from a bridge race.",
         )
-        assertEquals(
-            49, noChangeWitnesses.size,
-            "descending shape MUST yield exactly 49 NoChange outcomes (one per loser).",
-        )
-        val winningSeq = repo.getLastSeenSeq(idA) ?: error("repo must hold the winner's seq")
+        val witnesses = outcomes.filterNotNull()
+        assertEquals(49, witnesses.size, "expected 49 NoChange outcomes")
         assertTrue(
-            noChangeWitnesses.all { witness -> witness == winningSeq },
-            "every NoChange witness MUST equal the persisted winning seq ($winningSeq) — " +
-                "the in-transaction outcome is derived from the SAME `current` value the " +
-                "monotonicity guard observes. Witnesses out of range: " +
-                "${noChangeWitnesses.filter { it != winningSeq }}",
+            witnesses.all { it == 50L },
+            "every NoChange witness MUST equal the seeded value (50). " +
+                "Out-of-range: ${witnesses.filter { it != 50L }}",
         )
+        assertEquals(50L, repo.getLastSeenSeq(idA), "persisted cursor unchanged")
+    }
+
+    @Test
+    fun seeded_just_below_then_concurrent_equal_writers_yield_exactly_one_advanced() = runTest {
+        // **Deterministic shape B** — seed the cursor at 49, then
+        // fire 50 concurrent writers ALL requesting seq=50. The
+        // atomicity contract says: EXACTLY ONE writer transitions
+        // 49 → 50 (returns null / Advanced); the other 49 see
+        // `current == 50 >= requested` and return `NoChange(50)`.
+        // Order of execution doesn't matter — only one transaction
+        // can be the strict-greater-than winner.
+        //
+        // A false-Advanced bug surfaces directly: if two writers
+        // each observed `current=49` and each branched into the
+        // write, the bridge would report two Advanced outcomes
+        // even though only one transaction actually committed the
+        // 49 → 50 transition.
+        val repo: LastSeenSeqRepository = FakeLastSeenSeqRepository()
+        val seedOutcome = repo.upsertLastSeenSeq(idA, seq = 49L, nowMs = 1L)
+        assertEquals(null, seedOutcome, "seed must commit Advanced on a cold cursor")
+        val outcomes: List<Long?> = coroutineScope {
+            (1..50).map { _ ->
+                async {
+                    repo.upsertLastSeenSeq(idA, seq = 50L, nowMs = 2L)
+                }
+            }.awaitAll()
+        }
+        assertEquals(
+            1, outcomes.count { it == null },
+            "all-equal seq=50 against cursor seeded at 49 MUST yield exactly ONE Advanced. " +
+                "A higher count is a false-Advanced from a bridge race: multiple writers " +
+                "each saw stale `current=49` and each was reported as Advanced.",
+        )
+        val witnesses = outcomes.filterNotNull()
+        assertEquals(49, witnesses.size, "expected 49 NoChange outcomes")
+        assertTrue(
+            witnesses.all { it == 50L },
+            "every NoChange witness MUST equal the post-commit value (50). " +
+                "Out-of-range: ${witnesses.filter { it != 50L }}",
+        )
+        assertEquals(50L, repo.getLastSeenSeq(idA))
     }
 }

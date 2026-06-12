@@ -121,13 +121,15 @@ adb shell am broadcast \
 Logcat should then show:
 
 ```
-Phantom/S6Debug  Registered S6BreakerTriggerReceiver for action phantom.android.dev.S6_BREAKER_TRIGGER (RECEIVER_EXPORTED on API 33+; debug build only)
+Phantom/S6Debug  Registered S6BreakerTriggerReceiver for action phantom.android.dev.S6_BREAKER_TRIGGER (S6 trigger flag enabled, permission=phantom.android.dev.permission.TRIGGER_S6)
 ... <wait until the natural Mode-2 window expires> ...
 Phantom/S6Debug  S6 breaker trigger broadcast received; dispatching on AppContainer.appScope
 PhantomRelay     REST_TRACE breaker_test_trigger_fired reason=ConsecutiveRestFailures threshold=5
 PhantomRelay     REST_TRACE breaker_open reason=ConsecutiveRestFailures cooldown_ms=5000
 Phantom/S6Debug  triggerS6BreakerForDebug() returned dispatched=true
 ```
+
+The operator's grep should anchor on the stable tokens (`Registered S6BreakerTriggerReceiver`, `S6 trigger flag enabled`, `permission=`) rather than the full literal — the parenthesised suffix may carry additional diagnostic fields in future builds.
 
 **Mandatory smoke verification step (one-shot per APK build).** Before relying on the controllable trigger for S6 evidence, the operator MUST verify the broadcast delivery path is wired correctly on THIS specific APK:
 
