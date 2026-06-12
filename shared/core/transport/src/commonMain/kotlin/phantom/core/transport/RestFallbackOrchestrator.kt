@@ -1469,7 +1469,7 @@ class RestFallbackOrchestrator(
                         // answered; the breaker treats this as a
                         // successful observation (resets counters /
                         // exits Open or HalfOpen).
-                        recordRestSuccess(isProbe = isProbe)
+                        recordRestSuccess(isProbe = isProbe, isOkResponse = false)
                         staleToken = token
                         // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
                         // backoff. Token-stale on a burst can herd if multiple
@@ -1485,7 +1485,7 @@ class RestFallbackOrchestrator(
                         continue
                     }
                     in 200..299 -> {
-                        recordRestSuccess(isProbe = isProbe)
+                        recordRestSuccess(isProbe = isProbe, isOkResponse = true)
                         val parsed = response.bodyParsed
                         if (parsed == null || parsed.envelopes.isEmpty()) {
                             log("REST_TRACE poll_empty elapsedMs=$elapsed")
@@ -1531,7 +1531,7 @@ class RestFallbackOrchestrator(
                         // malformed. 429 is rate-limit, not transport
                         // failure: the relay answered; record as
                         // success for the breaker.
-                        recordRestSuccess(isProbe = isProbe)
+                        recordRestSuccess(isProbe = isProbe, isOkResponse = false)
                         val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
                         val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
                             // No jitter — the relay's scheduling
@@ -1589,7 +1589,7 @@ class RestFallbackOrchestrator(
                         // The relay answered, so the breaker
                         // records success for the consecutive-fail
                         // dimension.
-                        recordRestSuccess(isProbe = isProbe)
+                        recordRestSuccess(isProbe = isProbe, isOkResponse = false)
                         // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
                         // backoff. Server-unexpected-status retries can herd
                         // when a transient relay condition rejects many polls.
@@ -1783,7 +1783,7 @@ class RestFallbackOrchestrator(
 
                 val response = outcome.getOrThrow()
                 if (response.statusCode == 401) {
-                    recordRestSuccess(isProbe = isProbe)
+                    recordRestSuccess(isProbe = isProbe, isOkResponse = false)
                     staleToken = token
                     log(
                         "REST_TRACE ws_active_poll_unauthorised status=401 " +
@@ -1799,7 +1799,7 @@ class RestFallbackOrchestrator(
                     // jittered backoff when the header is absent or
                     // malformed. Same shape as the legacy `pollLoop`'s
                     // 429 branch.
-                    recordRestSuccess(isProbe = isProbe)
+                    recordRestSuccess(isProbe = isProbe, isOkResponse = false)
                     val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
                     val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
                         clampedRetryAfterMs to clampedRetryAfterMs
@@ -1845,7 +1845,7 @@ class RestFallbackOrchestrator(
                     // 410; 410 has its own dance above). The relay
                     // answered, so the breaker records success for
                     // the consecutive-fail dimension.
-                    recordRestSuccess(isProbe = isProbe)
+                    recordRestSuccess(isProbe = isProbe, isOkResponse = false)
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                     val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
@@ -1857,7 +1857,7 @@ class RestFallbackOrchestrator(
                     delay(jitteredDelay)
                     continue
                 }
-                recordRestSuccess(isProbe = isProbe)
+                recordRestSuccess(isProbe = isProbe, isOkResponse = true)
                 val envelopes = response.bodyParsed.envelopes
                 log(
                     "REST_TRACE ws_active_poll_ok " +
@@ -2202,18 +2202,22 @@ class RestFallbackOrchestrator(
      */
     private suspend fun recordRestFailure(isProbe: Boolean) {
         val openedReason: BreakerOpenReason? = _inboundStateMutex.withLock {
-            // Trek 2 Stage 2B-B (C5-C review-fix P1.3) — scope §L9
-            // pins the storm trigger as "K consecutive 410 Gone
-            // responses within W wall-clock seconds." A non-410
-            // response (5xx, IOException, read timeout — anything
-            // that lands here in `recordRestFailure`) breaks the
-            // consecutive sequence and resets the storm window.
-            // The L8 410-backoff exponent (`_current410BackoffMs`)
-            // is NOT reset here — only a successful 200 OK
-            // (`recordRestSuccess`) returns to the 5 s floor.
-            _status410StormTimestamps.clear()
+            // Trek 2 Stage 2B-B (C5 round-3 review-fix P1) — every
+            // mutation (storm timestamps, counter, cooldown,
+            // state) lives INSIDE the authoritative branch. A
+            // stale non-probe response in Open / HalfOpen /
+            // SuspendedOnPoison is a FULL no-op — its data does
+            // not reflect current state and must not pollute
+            // bookkeeping. Round-2 implemented the state-transition
+            // gating but still cleared `_status410StormTimestamps`
+            // unconditionally; round-3 moves that mutation into
+            // the authoritative branches alongside the rest.
             when (val current = _breakerState) {
                 is LongPollBreakerState.Closed -> {
+                    // Authoritative — normal operating mode.
+                    // Scope §L9: a non-410 response breaks the
+                    // consecutive 410 sequence.
+                    _status410StormTimestamps.clear()
                     _breakerFailCount += 1
                     if (_breakerFailCount >= BREAKER_CONSECUTIVE_FAIL_THRESHOLD) {
                         transitionToOpenUnderMutex(
@@ -2224,15 +2228,11 @@ class RestFallbackOrchestrator(
                     } else null
                 }
                 is LongPollBreakerState.HalfOpen -> {
-                    // Round-2 review-fix P1.1: only the probe owner
-                    // can resolve HalfOpen. A stale non-probe loop
-                    // that finished AFTER another loop tripped the
-                    // breaker into HalfOpen via its own probe MUST
-                    // NOT also reopen — that would short-circuit
-                    // the cooldown timer and effectively double the
-                    // open cycle. The non-probe failure is dropped
-                    // silently here; the cooldown timer continues.
                     if (isProbe && current.probeInFlight) {
+                        // Authoritative — the probe owner's failure
+                        // resolves HalfOpen to Open with the
+                        // doubled cooldown.
+                        _status410StormTimestamps.clear()
                         val nextCooldown = (_breakerCurrentCooldownMs.toDouble() * BREAKER_COOLDOWN_GROWTH_FACTOR)
                             .toLong()
                             .coerceAtMost(BREAKER_COOLDOWN_CEILING_MS)
@@ -2242,12 +2242,19 @@ class RestFallbackOrchestrator(
                             nextCooldown,
                         )
                         BreakerOpenReason.ConsecutiveRestFailures
-                    } else null
+                    } else {
+                        // Stale non-probe failure in HalfOpen:
+                        // full no-op. The cooldown timer / probe
+                        // owner manage HalfOpen exit; a stale
+                        // response's data does not apply.
+                        null
+                    }
                 }
-                // Round-2 review-fix P1.1: Open and SuspendedOnPoison
-                // are owned by their own recovery paths (the breaker
-                // timer / orchestrator restart respectively). A late
-                // failure from a stale loop does not transition them.
+                // Stale failure in Open / SuspendedOnPoison: full
+                // no-op. Round-3 fix: do NOT clear storm
+                // timestamps — that bookkeeping was set by an
+                // authoritative observation; a stale response must
+                // not erase it.
                 is LongPollBreakerState.Open, is LongPollBreakerState.SuspendedOnPoison -> null
             }
         }
@@ -2322,44 +2329,56 @@ class RestFallbackOrchestrator(
      * loop saw the relay answer at this moment" — which a
      * non-probe loop's response also evidences.
      */
-    private suspend fun recordRestSuccess(isProbe: Boolean) {
+    private suspend fun recordRestSuccess(isProbe: Boolean, isOkResponse: Boolean) {
         val transitioned: Boolean = _inboundStateMutex.withLock {
-            // Trek 2 Stage 2B-B (C5, L8) — a successful poll exits
-            // the 410 reauth backoff: reset the floor and clear the
-            // storm window. A future 410 will start the 5 s floor
-            // afresh and a new storm window will be measured from
-            // scratch. These resets apply regardless of [isProbe] —
-            // a non-probe success also evidences that the relay
-            // answered.
-            _current410BackoffMs = BREAKER_INITIAL_COOLDOWN_MS
-            _status410StormTimestamps.clear()
-            when (_breakerState) {
+            // Trek 2 Stage 2B-B (C5 round-3 review-fix P1) — every
+            // mutation lives INSIDE the authoritative branch. A
+            // stale non-probe response in Open / HalfOpen /
+            // SuspendedOnPoison is a FULL no-op.
+            //
+            // The [isOkResponse] flag discriminates a real
+            // `200 OK` response (which per scope §L8 is the ONLY
+            // signal that resets [_current410BackoffMs] to the
+            // 5 s floor) from `401` / `429` / `4xx-other`
+            // responses (which prove the transport works but do
+            // NOT entitle the 410 dance to reset).
+            when (val current = _breakerState) {
                 is LongPollBreakerState.Closed -> {
-                    // Reset the consecutive-fail counter on any
-                    // non-failure observation in the normal
-                    // operating state.
+                    // Authoritative — normal operating mode.
+                    // Scope §L9: a non-410 response breaks the
+                    // consecutive 410 sequence.
+                    _status410StormTimestamps.clear()
                     _breakerFailCount = 0
+                    if (isOkResponse) {
+                        _current410BackoffMs = BREAKER_INITIAL_COOLDOWN_MS
+                    }
                     false
                 }
                 is LongPollBreakerState.HalfOpen -> {
-                    // Round-2 review-fix P1.1: only the probe
-                    // owner resolves HalfOpen → Closed. A late
-                    // non-probe success during the probe window
-                    // does not close the breaker.
-                    if (isProbe && (_breakerState as LongPollBreakerState.HalfOpen).probeInFlight) {
+                    if (isProbe && current.probeInFlight) {
+                        // Authoritative — the probe owner's success
+                        // closes the breaker and resets all bookkeeping
+                        // tied to a successful recovery cycle.
                         _breakerState = LongPollBreakerState.Closed
                         _breakerFailCount = 0
+                        _status410StormTimestamps.clear()
                         _breakerCurrentCooldownMs = BREAKER_INITIAL_COOLDOWN_MS
+                        if (isOkResponse) {
+                            _current410BackoffMs = BREAKER_INITIAL_COOLDOWN_MS
+                        }
                         _breakerTimerJob?.cancel()
                         _breakerTimerJob = null
                         true
-                    } else false
+                    } else {
+                        // Stale non-probe success in HalfOpen:
+                        // full no-op.
+                        false
+                    }
                 }
-                // Round-2 review-fix P1.1: Open is owned by the
-                // cooldown timer. A late non-probe success MUST
-                // NOT bypass the cooldown by force-closing the
-                // breaker. SuspendedOnPoison is owned by its own
-                // recovery path; same rule.
+                // Stale success in Open / SuspendedOnPoison: full
+                // no-op. The cooldown timer / poison recovery path
+                // owns these states; a stale response cannot
+                // resolve them.
                 is LongPollBreakerState.Open, is LongPollBreakerState.SuspendedOnPoison -> false
             }
         }
@@ -2945,14 +2964,32 @@ class RestFallbackOrchestrator(
     }
 
     /**
-     * Trek 2 Stage 2B-B (C5 round-2 review-fix P1.1) — direct
-     * entry to [recordRestSuccess] so commonTest can pin the
-     * probe-owner gating contract (non-probe success on Open /
-     * HalfOpen is a no-op; probe owner closes HalfOpen).
+     * Trek 2 Stage 2B-B (C5 round-2 review-fix P1.1; round-3
+     * gained [isOkResponse]) — direct entry to [recordRestSuccess]
+     * so commonTest can pin the probe-owner gating contract AND
+     * the 200-OK-only backoff-reset contract.
      */
-    internal suspend fun recordRestSuccessForTest(isProbe: Boolean) {
-        recordRestSuccess(isProbe = isProbe)
+    internal suspend fun recordRestSuccessForTest(isProbe: Boolean, isOkResponse: Boolean) {
+        recordRestSuccess(isProbe = isProbe, isOkResponse = isOkResponse)
     }
+
+    /**
+     * Trek 2 Stage 2B-B (C5 round-3 review-fix P1) — read-only
+     * peek for [_current410BackoffMs] so commonTest can pin the
+     * scope §L8 "only 200 OK resets the 5 s floor" semantic
+     * across the recordRestSuccess paths.
+     */
+    internal suspend fun peekCurrent410BackoffMsForTest(): Long =
+        _inboundStateMutex.withLock { _current410BackoffMs }
+
+    /**
+     * Trek 2 Stage 2B-B (C5 round-3 review-fix P1) — read-only
+     * peek for the snapshot of [_status410StormTimestamps] so
+     * commonTest can pin the "stale non-probe response in Open
+     * MUST NOT pollute the storm window" semantic.
+     */
+    internal suspend fun peekStatus410StormTimestampsForTest(): List<Long> =
+        _inboundStateMutex.withLock { _status410StormTimestamps.toList() }
 
     /**
      * Trek 2 Stage 2B-B (C5 round-2 review-fix P1.1) — direct
