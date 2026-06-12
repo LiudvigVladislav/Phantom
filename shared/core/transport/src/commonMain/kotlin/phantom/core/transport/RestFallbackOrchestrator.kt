@@ -23,7 +23,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.CoroutineContext
-import kotlin.random.Random
+import phantom.core.crypto.Csprng
+import phantom.core.crypto.LibsodiumCsprng
 
 /**
  * High-level lifecycle owner for the REST short-poll fallback transport — PR-D1.
@@ -147,7 +148,40 @@ class RestFallbackOrchestrator(
      */
     private val cursorRepository: LongPollCursorRepository? = null,
     dispatcher: CoroutineContext = Dispatchers.Default,
+    /**
+     * Trek 2 Stage 2B-B (C6, L10, M15) — single CSPRNG source for
+     * every jitter draw in the orchestrator. Replaces the
+     * pre-C6 `kotlin.random` jitter sites with a uniformly-
+     * sampled draw from [Csprng.uniformLong].
+     *
+     * Defaults to [LibsodiumCsprng] (libsodium-backed `getrandom(2)`
+     * on Linux/Android, BCryptGenRandom on Windows desktop). Tests
+     * inject a deterministic recording fake so M15 can assert the
+     * exact draw count + bucket against a known scenario.
+     *
+     * Pinned by the M15 grep gate: no legacy RNG reference
+     * may remain in this file after Stage 2B-B.
+     */
+    private val csprng: Csprng = LibsodiumCsprng,
 ) {
+
+    /**
+     * Trek 2 Stage 2B-B (C6, L10) — draw a single jitter factor
+     * from [Csprng.uniformLong] mapped onto the existing
+     * `[0.8, 1.2)` band. Replacement for the pre-C6 jitter
+     * idiom that appeared at every backoff site.
+     *
+     * Discretisation: [JITTER_RESOLUTION] = 10_000 buckets give
+     * a step of ~0.00004 (~0.004 % of the multiplier band). That
+     * is finer than the ms-resolution `delay(...)` consumer would
+     * ever resolve, so the discrete output is operationally
+     * indistinguishable from the prior continuous double draw.
+     *
+     * Pure call (no other side-effect) so the test recording
+     * fake can pin every draw site by drawing-call count.
+     */
+    private fun nextJitterFactor(): Double =
+        jitterFactorFor(csprng.uniformLong(JITTER_RESOLUTION.toLong()))
 
     init {
         // Trek 2 Stage 2B-B (C3, L3) — backoff-array contract: there
@@ -942,7 +976,7 @@ class RestFallbackOrchestrator(
                     // `SEND_RETRY_DELAYS_MS` doc claim that `delayForRetry(5)`
                     // is never called.
                     val nominalDelay = delayForRetry(attempt)
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitterFactor = nextJitterFactor()
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                     log(
                         "REST_TRACE send_retry id=${envelopeId.take(8)} reason=$lastReason " +
@@ -1022,7 +1056,7 @@ class RestFallbackOrchestrator(
                             // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30):
                             // jittered backoff per the design note shape.
                             val nominal = delayForRetry(attempt)
-                            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                            val jitterFactor = nextJitterFactor()
                             nominal to (nominal * jitterFactor).toLong()
                         }
                         log(
@@ -1043,7 +1077,7 @@ class RestFallbackOrchestrator(
                         // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30):
                         // jittered backoff per the design note shape.
                         val nominalDelay = delayForRetry(attempt)
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitterFactor = nextJitterFactor()
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                         log(
                             "REST_TRACE send_retry id=${envelopeId.take(8)} " +
@@ -1356,7 +1390,7 @@ class RestFallbackOrchestrator(
                 // backoff. This site can herd in recovery when multiple
                 // poll iterations all skip-no-token simultaneously.
                 val nominalDelay = POLL_BACKOFF_NO_TOKEN_MS
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitterFactor = nextJitterFactor()
                 val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                 log(
                     "REST_TRACE poll_call_skipped reason=no_token " +
@@ -1381,7 +1415,7 @@ class RestFallbackOrchestrator(
             val breakerDecision = gateBreakerForIteration()
             if (breakerDecision is BreakerIterationDecision.Skip) {
                 val nominalDelay = POLL_FAIL_BACKOFF_MS
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitterFactor = nextJitterFactor()
                 val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                 log(
                     "REST_TRACE poll_call_skipped reason=${breakerDecision.reason} " +
@@ -1415,7 +1449,7 @@ class RestFallbackOrchestrator(
                 CursorReadOutcome.NoCursor -> null
                 CursorReadOutcome.ReadFailure -> {
                     val nominalDelay = POLL_FAIL_BACKOFF_MS
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitterFactor = nextJitterFactor()
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                     log(
                         "REST_TRACE poll_call_skipped reason=cursor_read_fail " +
@@ -1500,7 +1534,7 @@ class RestFallbackOrchestrator(
                     // backoff. `next_delay_ms` is the actual wait;
                     // `nominal_delay_ms` is the un-jittered source.
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitterFactor = nextJitterFactor()
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                     log(
                         "REST_TRACE poll_fail reason=${ex::class.simpleName} elapsedMs=$elapsed " +
@@ -1523,7 +1557,7 @@ class RestFallbackOrchestrator(
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
                         staleToken = token
                         val nominalDelay = POLL_FAIL_BACKOFF_MS
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitterFactor = nextJitterFactor()
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                         log(
                             "REST_TRACE poll_401_token_stale elapsedMs=$elapsed " +
@@ -1568,7 +1602,7 @@ class RestFallbackOrchestrator(
                             clampedRetryAfterMs to clampedRetryAfterMs
                         } else {
                             val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                            val jitterFactor = nextJitterFactor()
                             nominal to (nominal * jitterFactor).toLong()
                         }
                         log(
@@ -1583,7 +1617,7 @@ class RestFallbackOrchestrator(
                         // 5xx — transport failure.
                         recordRestFailure(iterationEpoch = iterationEpoch, isProbe = isProbe)
                         val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitterFactor = nextJitterFactor()
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                         log(
                             "REST_TRACE poll_5xx status=${response.statusCode} " +
@@ -1601,7 +1635,7 @@ class RestFallbackOrchestrator(
                         // 4xx-other — drop + log.
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
                         val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitterFactor = nextJitterFactor()
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                         log(
                             "REST_TRACE poll_unexpected_status status=${response.statusCode} " +
@@ -1676,7 +1710,7 @@ class RestFallbackOrchestrator(
             )
             if (token == null) {
                 val nominalDelay = POLL_BACKOFF_NO_TOKEN_MS
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitterFactor = nextJitterFactor()
                 val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                 log(
                     "REST_TRACE ws_active_poll_call_skipped reason=no_token " +
@@ -1699,7 +1733,7 @@ class RestFallbackOrchestrator(
             val breakerDecision = gateBreakerForIteration()
             if (breakerDecision is BreakerIterationDecision.Skip) {
                 val nominalDelay = POLL_FAIL_BACKOFF_MS
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitterFactor = nextJitterFactor()
                 val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                 log(
                     "REST_TRACE ws_active_poll_call_skipped reason=${breakerDecision.reason} " +
@@ -1732,7 +1766,7 @@ class RestFallbackOrchestrator(
                 CursorReadOutcome.NoCursor -> null
                 CursorReadOutcome.ReadFailure -> {
                     val nominalDelay = POLL_FAIL_BACKOFF_MS
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitterFactor = nextJitterFactor()
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                     log(
                         "REST_TRACE ws_active_poll_call_skipped reason=cursor_read_fail " +
@@ -1784,7 +1818,7 @@ class RestFallbackOrchestrator(
                     }
                     recordRestFailure(iterationEpoch = iterationEpoch, isProbe = isProbe)
                     val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                    val jitterFactor = nextJitterFactor()
                     val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                     log(
                         "REST_TRACE ws_active_poll_fail reason=${ex::class.simpleName} " +
@@ -1815,7 +1849,7 @@ class RestFallbackOrchestrator(
                             clampedRetryAfterMs to clampedRetryAfterMs
                         } else {
                             val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                            val jitterFactor = nextJitterFactor()
                             nominal to (nominal * jitterFactor).toLong()
                         }
                         log(
@@ -1829,7 +1863,7 @@ class RestFallbackOrchestrator(
                     PollResponseClass.ServerError -> {
                         recordRestFailure(iterationEpoch = iterationEpoch, isProbe = isProbe)
                         val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitterFactor = nextJitterFactor()
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                         log(
                             "REST_TRACE ws_active_poll_5xx status=${response.statusCode} " +
@@ -1846,7 +1880,7 @@ class RestFallbackOrchestrator(
                     PollResponseClass.Other -> {
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
                         val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitterFactor = nextJitterFactor()
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                         log(
                             "REST_TRACE ws_active_poll_unexpected_status " +
@@ -1908,7 +1942,7 @@ class RestFallbackOrchestrator(
                 // L4: cursor advance happens inside
                 // `ackInboundAndAdvanceCursor` after the relay 2xx's the
                 // ack. NOT here from the poll response directly.
-                val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                val jitterFactor = nextJitterFactor()
                 val jitteredDelay = (intervalMs * jitterFactor).toLong()
                 delay(jitteredDelay)
             } finally {
@@ -3571,6 +3605,27 @@ class RestFallbackOrchestrator(
 
         private fun defaultNowMs(): Long =
             kotlinx.datetime.Clock.System.now().toEpochMilliseconds()
+
+        /**
+         * Trek 2 Stage 2B-B (C6, L10) — discretisation resolution
+         * for the CSPRNG-backed jitter draw. 10_000 buckets give
+         * step ≈ 0.00004 (~0.004 % of the multiplier band),
+         * finer than ms-resolution `delay(...)` would resolve.
+         */
+        internal const val JITTER_RESOLUTION: Int = 10_000
+
+        /**
+         * Trek 2 Stage 2B-B (C6, L10) — map a [Csprng.uniformLong]
+         * draw in `[0, JITTER_RESOLUTION)` onto the jitter band
+         * `[0.8, 1.2)`. Pure function so M15 can pin the mapping
+         * without standing up an orchestrator.
+         */
+        internal fun jitterFactorFor(value: Long): Double {
+            require(value in 0L until JITTER_RESOLUTION.toLong()) {
+                "jitter draw out of range [0, $JITTER_RESOLUTION): $value"
+            }
+            return 0.8 + (value.toDouble() / JITTER_RESOLUTION) * 0.4
+        }
 
         private val HEX_CHARS = "0123456789abcdef".toCharArray()
 
