@@ -23,6 +23,32 @@ import phantom.core.storage.db.PhantomDatabase
  * race past the guard check and silently regress the cursor. In
  * practice the long-poll loop is single-coroutine per identity so
  * the contention is rare; the transaction is defence-in-depth.
+ *
+ * C6 REVIEW-FIX ROUND 3 — ATOMIC OUTCOME
+ *
+ * The discriminator (`null` for advance, `Long(existingSeq)` for the
+ * monotonicity no-op) is derived INSIDE the same
+ * `transactionWithResult` block that decides the conditional write.
+ * A bridge-level read-before-write was the round-2 race that this
+ * landing closes.
+ *
+ * TEST COVERAGE (round-4 P2.2)
+ *
+ * Tested in two layers:
+ *
+ *   1. **JVM cross-module contract.** `LastSeenSeqRepositoryContractTest`
+ *      exercises the same atomicity contract on the in-memory
+ *      `FakeLastSeenSeqRepository` (the `mutex.withLock` analogue
+ *      of `transactionWithResult`).
+ *   2. **Android-runtime SQLDelight contract.**
+ *      `SqlDelightLastSeenSeqRepositoryInstrumentedTest` in
+ *      `androidInstrumentedTest` exercises THIS class against an
+ *      in-memory `AndroidSqliteDriver`, pinning the cold-start
+ *      advance / forward advance / equal-seq no-op / lower-seq
+ *      no-op / identity-isolation / concurrent-writers cases on
+ *      the real SQLDelight path. Invoke with
+ *      `./gradlew :shared:core:storage:connectedDebugAndroidTest`
+ *      against a connected device or emulator.
  */
 class SqlDelightLastSeenSeqRepository(
     private val db: PhantomDatabase,

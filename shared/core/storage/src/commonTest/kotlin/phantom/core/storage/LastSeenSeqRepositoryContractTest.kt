@@ -121,10 +121,10 @@ class LastSeenSeqRepositoryContractTest {
     }
 
     @Test
-    fun concurrent_writers_get_exactly_one_advanced_outcome_and_others_get_NoChange() = runTest {
-        // C6 review-fix round 3 — regression test for the round-2
-        // AppContainer bridge race. The bridge previously did a
-        // `getLastSeenSeq` read followed by a SEPARATE
+    fun concurrent_writers_share_atomic_outcome_no_false_Advanced_witness() = runTest {
+        // C6 review-fix round 4 P2.2 — regression test for the
+        // round-2 AppContainer bridge race. The bridge previously
+        // did a `getLastSeenSeq` read followed by a SEPARATE
         // `upsertLastSeenSeq` write. Two writers that both observed
         // the same `current` could each go through the "advance"
         // branch, but only the storage transaction enforced
@@ -136,19 +136,36 @@ class LastSeenSeqRepositoryContractTest {
         // section that decides the write, this race cannot produce
         // a false `Advanced`. The test fires 50 concurrent writers
         // each requesting `seq=N` (1..50) against a cold-start
-        // repository and asserts that EXACTLY ONE write returned
-        // `null` (Advanced); the other 49 must report a NoChange
-        // witness equal to the FINAL persisted seq (which is the
-        // max value the winning writer chose, but the assertion
-        // is on the discriminator shape, not on who wins).
+        // repository.
         //
-        // Note: the in-memory fake uses a single `Mutex` so each
-        // call is fully serialised, but the same race the bridge
-        // had was structural — read-then-write across two suspending
-        // calls. The fake's outcome derivation now lives inside one
-        // `withLock` critical section, mirroring the SQLDelight
-        // transactional guarantee. This test pins that contract on
-        // the Fake; the SQLDelight impl is verified by `androidInstrumentedTest`.
+        // The contract asserted is NOT "exactly one Advanced" — that
+        // shape was wrong in round 3's first iteration of this
+        // test. With 50 strictly-increasing seqs and arbitrary
+        // serialisation order, the number of Advanced outcomes
+        // depends on the order: if writers serialise in
+        // strictly-increasing order, every call advances (50
+        // Advanced); if they serialise in strictly-decreasing
+        // order, only one call advances (1 Advanced). The
+        // load-bearing claim is:
+        //
+        //   (a) the final persisted seq is exactly the maximum
+        //       requested (50L), proving the highest writer's
+        //       transaction landed;
+        //   (b) every NoChange witness is `<=` the final persisted
+        //       seq (a witness greater than the final stored value
+        //       would mean the repo at some point reported a value
+        //       it never actually held — impossible under
+        //       monotonicity);
+        //   (c) at least one Advanced fires (the cold-start
+        //       advance always commits).
+        //
+        // **Coverage split.** This test exercises
+        // [FakeLastSeenSeqRepository] only. The SQLDelight-backed
+        // production impl is exercised by
+        // `SqlDelightLastSeenSeqRepositoryInstrumentedTest` in
+        // `androidInstrumentedTest` against a real
+        // `AndroidSqliteDriver`. Run with
+        // `./gradlew :shared:core:storage:connectedDebugAndroidTest`.
         val repo: LastSeenSeqRepository = FakeLastSeenSeqRepository()
         val outcomes: List<Long?> = coroutineScope {
             (1..50).map { seq ->

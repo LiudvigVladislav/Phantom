@@ -93,11 +93,11 @@ class AppContainer(private val context: Context) {
         private set
 
     /**
-     * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — REST
+     * Trek 2 Stage 2B-B (C6 review-fix round 3 P1.1) — REST
      * orchestrator reference, set inside [initMessaging] after the
-     * orchestrator is constructed. Held so the debug-only S6
-     * breaker trigger surface ([triggerS6BreakerForDebug] +
-     * [S6BreakerTriggerReceiver]) can route to
+     * orchestrator is constructed. Held so the S6 breaker trigger
+     * surface ([triggerS6BreakerForDebug] +
+     * [phantom.android.dev.S6BreakerTriggerReceiver]) can route to
      * `forceBreakerTripForS6TestTrigger()` without re-entering
      * the wiring path. Null until [initMessaging] runs.
      */
@@ -105,8 +105,9 @@ class AppContainer(private val context: Context) {
         phantom.core.transport.RestFallbackOrchestrator? = null
 
     /**
-     * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — debug/beta
-     * entry point for the Tele2 LTE smoke S6 controllable trigger.
+     * Trek 2 Stage 2B-B (C6 review-fix round 3 P2) — entry point for
+     * the Tele2 LTE smoke S6 controllable trigger. Reachable iff
+     * `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`.
      *
      * The Tele2 runbook (`docs/tracks/trek2-stage2b-b-tele2-smoke.md`,
      * scenario S6) accepts this helper iff natural Mode-2 does not
@@ -116,8 +117,9 @@ class AppContainer(private val context: Context) {
      *   1. **ADB broadcast intent** —
      *      `adb shell am broadcast -a
      *      phantom.android.dev.S6_BREAKER_TRIGGER` invokes the
-     *      [S6BreakerTriggerReceiver] (dynamically registered in
-     *      [initMessaging]) which calls this function on
+     *      [phantom.android.dev.S6BreakerTriggerReceiver]
+     *      (dynamically registered in [initMessaging] iff the
+     *      trigger flag is enabled) which calls this function on
      *      [appScope]. The Tecno operator can fire the trigger
      *      from a connected laptop without compiling a debug menu
      *      UI.
@@ -126,14 +128,14 @@ class AppContainer(private val context: Context) {
      *
      * Two-layer defence-in-depth:
      *
-     *   * This function returns `false` (no-op) if
-     *     `phantom.android.BuildConfig.DEBUG` is `false` (release
-     *     build). The release APK BuildConfig is generated from
-     *     the Gradle release variant — a release APK can never
-     *     observe `DEBUG=true`.
+     *   * This function returns `false` (no-op) when
+     *     `BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1"`. Release
+     *     builds pin the field to `"0"` unconditionally; a future
+     *     beta variant opts in via the dedicated gradle property
+     *     independent of `isDebuggable`.
      *   * The orchestrator constructor receives
-     *     `s6DebugTriggerEnabled = BuildConfig.DEBUG`; even if a
-     *     caller reached past the AppContainer gate, the
+     *     `s6DebugTriggerEnabled = BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`;
+     *     even if a caller reached past the AppContainer gate, the
      *     orchestrator-side gate refuses and logs
      *     `REST_TRACE breaker_test_trigger_refused
      *     reason=disabled_in_release`.
@@ -1141,38 +1143,36 @@ class AppContainer(private val context: Context) {
                 },
                 s6DebugTriggerEnabled = s6DebugEnabled,
             )
-            // Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — wire
+            // Trek 2 Stage 2B-B (C6 review-fix round 3 P1.1) — wire
             // the freshly-constructed orchestrator into the
-            // class-level reference so the debug-only S6 breaker
-            // trigger surface ([triggerS6BreakerForDebug] +
-            // [S6BreakerTriggerReceiver]) can reach it. The
-            // assignment happens AFTER the orchestrator is fully
-            // constructed so observers cannot see a partially-
-            // initialised instance.
+            // class-level reference so the S6 breaker trigger
+            // surface ([triggerS6BreakerForDebug] +
+            // [phantom.android.dev.S6BreakerTriggerReceiver]) can
+            // reach it. The assignment happens AFTER the
+            // orchestrator is fully constructed so observers cannot
+            // see a partially-initialised instance.
             restOrchestratorRef = restOrchestrator
-            // Register the debug-only ADB-broadcast receiver iff
-            // this is a DEBUG build. Dynamic registration (vs
-            // manifest declaration) lets the receiver live for the
-            // process lifetime without expanding the production
-            // manifest surface. The receiver itself also gates on
-            // BuildConfig.DEBUG defensively so even a manual
-            // intent dispatch with the right action string is a
-            // no-op in release.
+            // Register the ADB-broadcast receiver iff
+            // `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`.
+            // Dynamic registration (vs manifest declaration) lets
+            // the receiver live for the process lifetime without
+            // expanding the production manifest surface. The
+            // receiver's `onReceive` also re-checks the trigger
+            // flag defensively, and the orchestrator's
+            // constructor-time gate is the load-bearing third
+            // layer. All three independent gates must allow the
+            // dispatch before the breaker mutates.
             if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1") {
-                // C6 review-fix round 3 P1.2 — `RECEIVER_EXPORTED` is
-                // load-bearing on API 33+. `adb shell am broadcast`
-                // dispatches as the system shell user, which is NOT
-                // the registering app — `RECEIVER_NOT_EXPORTED`
-                // (round 2) silently dropped the intent on API 33+.
-                // We accept the export only on debug builds; release
-                // builds never reach this branch and the manifest
-                // never declares the action. Defence-in-depth gates:
-                //   * BuildConfig.DEBUG (this `if` block).
-                //   * Receiver's own `BuildConfig.DEBUG` check in
-                //     `onReceive` (belt-and-braces).
-                //   * Orchestrator constructor flag
-                //     `s6DebugTriggerEnabled = BuildConfig.DEBUG`.
-                // A release APK fails ALL three independently.
+                // C6 review-fix round 3 P1.2 — the registration
+                // uses `RECEIVER_EXPORTED` on API 33+ so an
+                // externally-dispatched intent (`adb shell am
+                // broadcast`, which runs as the system shell user
+                // rather than the registering app) is delivered.
+                // The runtime safety story does NOT rely on the
+                // export classification: the trigger-flag gates
+                // (this block + the receiver's onReceive + the
+                // orchestrator constructor) hold the production
+                // safety contract independently.
                 val s6Receiver = phantom.android.dev.S6BreakerTriggerReceiver(this@AppContainer)
                 val filter = android.content.IntentFilter(
                     phantom.android.dev.S6BreakerTriggerReceiver.ACTION,
@@ -1191,7 +1191,7 @@ class AppContainer(private val context: Context) {
                     "Phantom/S6Debug",
                     "Registered S6BreakerTriggerReceiver for action ${
                         phantom.android.dev.S6BreakerTriggerReceiver.ACTION
-                    } (RECEIVER_EXPORTED on API 33+; debug build only)",
+                    } (S6 trigger flag enabled)",
                 )
             }
 
