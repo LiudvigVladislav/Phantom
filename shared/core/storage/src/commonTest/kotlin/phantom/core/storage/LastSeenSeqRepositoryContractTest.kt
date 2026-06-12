@@ -229,4 +229,62 @@ class LastSeenSeqRepositoryContractTest {
                 "${noChangeWitnesses.filter { witness -> witness > finalSeqValue }}",
         )
     }
+
+    @Test
+    fun descending_concurrent_writers_yield_exactly_one_advanced() = runTest {
+        // C6 review-fix round 5 (tester P1) — strong race-coverage
+        // pin. The strictly-increasing (1..50) case in the previous
+        // test admits vacuously-true witnesses because every
+        // witness <= 50L is satisfied by the input shape. A bug
+        // where the bridge returns false `Advanced(N)` for seq=N
+        // when current was already >= N (the round-2 race shape)
+        // would NOT trip the increasing case because input seq <=
+        // 50 by construction.
+        //
+        // Descending input (50 downTo 1) against a cold cursor is
+        // the discriminating shape. Under the atomicity contract:
+        //
+        //   * The FIRST writer to land has nothing persisted ⇒
+        //     returns null (Advanced) AND its seq becomes the
+        //     stored value.
+        //   * EVERY subsequent writer sees a persisted value strictly
+        //     greater than its requested seq (because the first
+        //     writer chose from {50, 49, ..., 1} and all losers
+        //     requested smaller) ⇒ returns the existing seq
+        //     (NoChange witness).
+        //
+        // The serialised winner picks ANY of the 50 values; the
+        // remaining 49 ALL no-op regardless of order. The contract
+        // is: EXACTLY ONE Advanced, EXACTLY 49 NoChange, and EVERY
+        // NoChange witness equals the winning seq (= finalSeq).
+        val repo: LastSeenSeqRepository = FakeLastSeenSeqRepository()
+        val outcomes: List<Long?> = coroutineScope {
+            (50 downTo 1).map { seq ->
+                async {
+                    repo.upsertLastSeenSeq(idA, seq = seq.toLong(), nowMs = seq * 1_000L)
+                }
+            }.awaitAll()
+        }
+        val advancedCount = outcomes.count { it == null }
+        val noChangeWitnesses: List<Long> = outcomes.filterNotNull()
+        assertEquals(
+            1, advancedCount,
+            "descending shape MUST yield exactly ONE Advanced outcome (the cold-start " +
+                "winner). A higher count signals a bridge-style read-before-write race " +
+                "is back: multiple writers each saw a stale `current` and each was " +
+                "reported as Advanced even though only the first transaction landed.",
+        )
+        assertEquals(
+            49, noChangeWitnesses.size,
+            "descending shape MUST yield exactly 49 NoChange outcomes (one per loser).",
+        )
+        val winningSeq = repo.getLastSeenSeq(idA) ?: error("repo must hold the winner's seq")
+        assertTrue(
+            noChangeWitnesses.all { witness -> witness == winningSeq },
+            "every NoChange witness MUST equal the persisted winning seq ($winningSeq) — " +
+                "the in-transaction outcome is derived from the SAME `current` value the " +
+                "monotonicity guard observes. Witnesses out of range: " +
+                "${noChangeWitnesses.filter { it != winningSeq }}",
+        )
+    }
 }

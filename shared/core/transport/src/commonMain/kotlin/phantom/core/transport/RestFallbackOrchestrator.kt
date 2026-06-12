@@ -126,7 +126,7 @@ class RestFallbackOrchestrator(
      */
     private val longPollEnabled: Boolean = false,
     /**
-     * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — debug-mode
+     * Trek 2 Stage 2B-B (C6 review-fix round 5 P2) — debug-mode
      * gate for [forceBreakerTripForS6TestTrigger]. Defence-in-depth:
      * the helper itself is public so the Android `AppContainer` can
      * route an ADB-broadcast intent to it without depending on the
@@ -134,9 +134,9 @@ class RestFallbackOrchestrator(
      * boundaries), but a release-mode binary that accidentally
      * carried a call site would still no-op because this flag
      * defaults to `false`. The Android wire-up sets it to
-     * `phantom.android.BuildConfig.DEBUG`; release-mode APKs
-     * therefore have a hard `false` from BOTH the BuildConfig pin
-     * AND the orchestrator-side gate.
+     * `phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`;
+     * release-mode APKs therefore have a hard `false` from BOTH the
+     * BuildConfig pin AND the orchestrator-side gate.
      */
     private val s6DebugTriggerEnabled: Boolean = false,
     /**
@@ -3326,8 +3326,9 @@ class RestFallbackOrchestrator(
      *     reason=disabled_in_release` and returns WITHOUT touching
      *     any breaker state. A release APK that accidentally
      *     carried a call site is therefore a no-op.
-     *   * Debug-mode wire-up passes `true` (from
-     *     `BuildConfig.DEBUG`); the helper executes normally.
+     *   * Trigger-enabled wire-up passes `true` (from
+     *     `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`); the helper
+     *     executes normally.
      *
      * **Effect (when enabled).** Bumps `_breakerFailCount` to the
      * threshold and routes through the regular

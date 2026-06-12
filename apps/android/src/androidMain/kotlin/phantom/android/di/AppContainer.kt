@@ -1163,16 +1163,22 @@ class AppContainer(private val context: Context) {
             // layer. All three independent gates must allow the
             // dispatch before the breaker mutates.
             if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1") {
-                // C6 review-fix round 3 P1.2 — the registration
-                // uses `RECEIVER_EXPORTED` on API 33+ so an
-                // externally-dispatched intent (`adb shell am
+                // C6 review-fix round 5 P1.security/tester — the
+                // registration uses `RECEIVER_EXPORTED` on API 33+
+                // so an externally-dispatched intent (`adb shell am
                 // broadcast`, which runs as the system shell user
                 // rather than the registering app) is delivered.
-                // The runtime safety story does NOT rely on the
-                // export classification: the trigger-flag gates
-                // (this block + the receiver's onReceive + the
-                // orchestrator constructor) hold the production
-                // safety contract independently.
+                // The `broadcastPermission` argument requires the
+                // sender to hold the signature-scoped
+                // `phantom.android.dev.permission.TRIGGER_S6`
+                // permission declared in AndroidManifest.xml. A
+                // co-installed third-party app cannot hold the
+                // permission because it is signature-only. The
+                // shell user delivers the broadcast via
+                // `adb shell am broadcast --receiver-permission
+                // phantom.android.dev.permission.TRIGGER_S6 -a ...`
+                // — the system shell satisfies signature-scoped
+                // permissions on a debug-keyed APK.
                 val s6Receiver = phantom.android.dev.S6BreakerTriggerReceiver(this@AppContainer)
                 val filter = android.content.IntentFilter(
                     phantom.android.dev.S6BreakerTriggerReceiver.ACTION,
@@ -1181,17 +1187,25 @@ class AppContainer(private val context: Context) {
                     context.registerReceiver(
                         s6Receiver,
                         filter,
+                        phantom.android.dev.S6BreakerTriggerReceiver.PERMISSION,
+                        /* scheduler = */ null,
                         android.content.Context.RECEIVER_EXPORTED,
                     )
                 } else {
-                    @Suppress("UnspecifiedRegisterReceiverFlag")
-                    context.registerReceiver(s6Receiver, filter)
+                    context.registerReceiver(
+                        s6Receiver,
+                        filter,
+                        phantom.android.dev.S6BreakerTriggerReceiver.PERMISSION,
+                        /* scheduler = */ null,
+                    )
                 }
                 android.util.Log.i(
                     "Phantom/S6Debug",
                     "Registered S6BreakerTriggerReceiver for action ${
                         phantom.android.dev.S6BreakerTriggerReceiver.ACTION
-                    } (S6 trigger flag enabled)",
+                    } (S6 trigger flag enabled, permission=${
+                        phantom.android.dev.S6BreakerTriggerReceiver.PERMISSION
+                    })",
                 )
             }
 

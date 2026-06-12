@@ -111,8 +111,12 @@ A log block missing any of the five proofs is NOT a pass regardless of subjectiv
 **Trigger recipe.** The Tecno operator, with the device attached over USB, fires from the connected laptop:
 
 ```bash
-adb shell am broadcast -a phantom.android.dev.S6_BREAKER_TRIGGER
+adb shell am broadcast \
+  --receiver-permission phantom.android.dev.permission.TRIGGER_S6 \
+  -a phantom.android.dev.S6_BREAKER_TRIGGER
 ```
+
+(The `--receiver-permission` flag is REQUIRED on round-5 wiring: the receiver is registered with a signature-level sender permission so co-installed third-party apps on a debug/beta device cannot broadcast the trigger. The system shell satisfies signature-scoped permissions on a debug-keyed APK; omitting the flag causes Android to drop the broadcast at delivery time without invoking `onReceive`.)
 
 Logcat should then show:
 

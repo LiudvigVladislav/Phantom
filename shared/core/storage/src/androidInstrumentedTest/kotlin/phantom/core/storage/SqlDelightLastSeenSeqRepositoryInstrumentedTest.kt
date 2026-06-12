@@ -132,6 +132,37 @@ class SqlDelightLastSeenSeqRepositoryInstrumentedTest {
     }
 
     @Test
+    fun descending_concurrent_writers_yield_exactly_one_advanced() = runTest {
+        // C6 review-fix round 5 (tester P1) — strong race-coverage pin
+        // against the real SQLDelight `transactionWithResult` block.
+        // See the JVM contract test's commentary for the rationale:
+        // descending input against a cold cursor is the
+        // discriminating shape because every loser sees `current`
+        // strictly greater than its requested seq and MUST return a
+        // NoChange witness equal to the persisted winning seq.
+        val outcomes: List<Long?> = coroutineScope {
+            (50 downTo 1).map { seq ->
+                async {
+                    repo.upsertLastSeenSeq(idA, seq = seq.toLong(), nowMs = seq * 1_000L)
+                }
+            }.awaitAll()
+        }
+        val advancedCount = outcomes.count { it == null }
+        assertEquals(
+            1, advancedCount,
+            "descending shape MUST yield exactly one Advanced outcome; got $advancedCount",
+        )
+        val winningSeq = repo.getLastSeenSeq(idA) ?: error("repo must hold the winner's seq")
+        val witnesses = outcomes.filterNotNull()
+        assertEquals(49, witnesses.size, "expected 49 NoChange outcomes")
+        assertTrue(
+            witnesses.all { witness -> witness == winningSeq },
+            "every NoChange witness MUST equal the persisted winning seq ($winningSeq); " +
+                "out-of-range: ${witnesses.filter { it != winningSeq }}",
+        )
+    }
+
+    @Test
     fun concurrent_writers_no_false_Advanced_witness() = runTest {
         // 50 concurrent writers each request seq=N (1..50) against a
         // cold-start cursor. The SQLDelight `transactionWithResult`

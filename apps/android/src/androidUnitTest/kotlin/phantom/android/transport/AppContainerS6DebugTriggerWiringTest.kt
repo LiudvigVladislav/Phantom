@@ -138,6 +138,21 @@ class AppContainerS6DebugTriggerWiringTest {
                 "(round 2) was load-bearing for the production safety story but silently " +
                 "dropped debug broadcasts dispatched from outside the app.",
         )
+        // Round-5 P1.security/tester — the registration must also
+        // pass a signature-level sender permission so a co-installed
+        // third-party app on a debug/beta device cannot broadcast
+        // the trigger. The PERMISSION constant on
+        // S6BreakerTriggerReceiver is the documented source; the
+        // AppContainer wire-up must reference it.
+        assertTrue(
+            text.contains("S6BreakerTriggerReceiver.PERMISSION"),
+            "AppContainer must pass `S6BreakerTriggerReceiver.PERMISSION` as the " +
+                "broadcast-permission argument to `registerReceiver`. Without it, any " +
+                "app installed on the same device could broadcast the trigger and " +
+                "open the breaker; the signature-level permission scopes the gate to " +
+                "the app's own signing certificate (and the system shell on a debug " +
+                "build).",
+        )
     }
 
     @Test

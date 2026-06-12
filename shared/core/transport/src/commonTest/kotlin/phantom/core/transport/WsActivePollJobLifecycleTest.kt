@@ -131,16 +131,29 @@ class WsActivePollJobLifecycleTest {
     ) : LongPollCursorRepository {
         val reads: MutableList<String> = mutableListOf()
         val writes: MutableList<Triple<String, Long, Long>> = mutableListOf()
+        private var stored: Long? = backing
         override suspend fun getLastSeenSeq(identityHex: String): Long? {
             reads += identityHex
-            return backing
+            return stored
         }
+        // C6 review-fix round 5 (kmp-builder P2) — bring this fake in
+        // line with the SQLDelight + Fake monotonicity contract. The
+        // round-2/3/4 wiring assumed every test fake either records
+        // monotonically OR honestly returns NoChange; an
+        // always-Advanced fake here was a consistency nit that a
+        // future copy-paste would extend into a test where the
+        // discrimination matters.
         override suspend fun upsertLastSeenSeq(
             identityHex: String,
             seq: Long,
             nowMs: Long,
         ): CursorUpsertOutcome {
+            val previous = stored
+            if (previous != null && previous >= seq) {
+                return CursorUpsertOutcome.NoChange(previous)
+            }
             writes += Triple(identityHex, seq, nowMs)
+            stored = maxOf(previous ?: Long.MIN_VALUE, seq)
             return CursorUpsertOutcome.Advanced(seq)
         }
     }

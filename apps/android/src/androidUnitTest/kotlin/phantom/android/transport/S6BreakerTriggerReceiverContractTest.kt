@@ -62,6 +62,36 @@ class S6BreakerTriggerReceiverContractTest {
     private fun source(): String = receiverSource.readText(Charsets.UTF_8)
 
     @Test
+    fun permission_constant_matches_manifest_signature_scoped_declaration() {
+        // C6 review-fix round 5 P1.security/tester — receiver
+        // declares a signature-level sender permission so a co-
+        // installed third-party app on a debug/beta device cannot
+        // broadcast the trigger. The constant must match the
+        // permission declared in AndroidManifest.xml exactly; a
+        // drift breaks the registerReceiver call site and either
+        // crashes at registration OR silently registers without
+        // a permission gate (the latter is the load-bearing
+        // regression this test prevents).
+        val text = source()
+        val permissionRegex = Regex(
+            """const\s+val\s+PERMISSION\s*:\s*String\s*=\s*"([^"]+)""""
+        )
+        val match = permissionRegex.find(text)
+        assertNotNull(
+            match,
+            "S6BreakerTriggerReceiver must declare `const val PERMISSION: String = \"...\"` " +
+                "for the signature-level sender permission.",
+        )
+        assertEquals(
+            "phantom.android.dev.permission.TRIGGER_S6",
+            match.groupValues[1],
+            "PERMISSION must equal `phantom.android.dev.permission.TRIGGER_S6` exactly. " +
+                "Any other value desynchronises from the manifest declaration and either " +
+                "crashes registerReceiver OR drops the sender gate silently.",
+        )
+    }
+
+    @Test
     fun action_constant_matches_runbook_recipe_exactly() {
         val text = source()
         val actionRegex = Regex(

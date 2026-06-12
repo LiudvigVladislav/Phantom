@@ -54,11 +54,12 @@ import phantom.android.di.AppContainer
  * **Receiver export classification (API 33+).** Registered with
  * `RECEIVER_EXPORTED` so `adb shell am broadcast` — which dispatches
  * as the system shell user, NOT the registering app — can deliver the
- * intent. The runtime safety story does NOT rely on the export
- * classification; the three independent flag gates above are what hold
- * the production safety contract. Pre-Tiramisu the receiver flag is
- * omitted; the action namespace (`phantom.android.dev.*`) is
- * sufficient hardening combined with the trigger-flag gates.
+ * intent. The export classification is paired with a signature-level
+ * sender permission ([PERMISSION]) so a co-installed third-party app
+ * on a debug/beta device CANNOT broadcast the trigger: the permission
+ * is signature-scoped and only the APK's own signing certificate
+ * satisfies it. The system shell (debug-keyed APK) is allowed to
+ * deliver via `adb shell am broadcast --receiver-permission ...`.
  */
 class S6BreakerTriggerReceiver(
     private val container: AppContainer,
@@ -88,6 +89,20 @@ class S6BreakerTriggerReceiver(
     companion object {
 
         const val ACTION: String = "phantom.android.dev.S6_BREAKER_TRIGGER"
+
+        /**
+         * Trek 2 Stage 2B-B (C6 review-fix round 5 P1.security/tester)
+         * — signature-level permission gating broadcast delivery into
+         * the receiver. Declared in `AndroidManifest.xml` with
+         * `protectionLevel=signature` so a co-installed third-party
+         * app on a debug/beta device cannot hold the permission and
+         * therefore cannot broadcast the trigger intent. The system
+         * shell (used by `adb shell am broadcast`) satisfies
+         * signature-scoped permissions on a debug-keyed APK; the
+         * runbook recipe sets `--receiver-permission` explicitly to
+         * make the contract observable on the wire.
+         */
+        const val PERMISSION: String = "phantom.android.dev.permission.TRIGGER_S6"
 
         private const val TAG: String = "Phantom/S6Debug"
     }

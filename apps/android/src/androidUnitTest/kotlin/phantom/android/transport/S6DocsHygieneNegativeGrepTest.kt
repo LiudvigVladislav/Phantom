@@ -141,10 +141,23 @@ class S6DocsHygieneNegativeGrepTest {
         }
         if (depth != 0) fail("Unbalanced braces in S6 receiver registration block")
         val s6SurfaceB = text.substring(registrationStart, i)
-        // Also grab a short context block around the registration
-        // (a few lines above) to catch a stale comment above the
-        // `if`.
-        val contextStart = (text.lastIndexOf("// ", registrationStart) - 400).coerceAtLeast(0)
+        // C6 review-fix round 5 P2.tester — anchor the context
+        // window on the structural element that DIRECTLY precedes
+        // the registration: the `restOrchestratorRef = restOrchestrator`
+        // assignment that runs immediately before the trigger flag
+        // check. A future refactor that adds a long comment block
+        // between the assignment and the `if` would push stale tokens
+        // OUT of a fixed 400-char window; anchoring on the structural
+        // boundary keeps the grep scope correct under any comment
+        // expansion.
+        val contextAnchorRegex = Regex("""restOrchestratorRef\s*=\s*restOrchestrator""")
+        val contextAnchorMatch = contextAnchorRegex.find(text, startIndex = refStart)
+        assertTrue(
+            contextAnchorMatch != null && contextAnchorMatch.range.first < registrationStart,
+            "S6 surface anchor `restOrchestratorRef = restOrchestrator` not found between " +
+                "the field declaration and the receiver registration block.",
+        )
+        val contextStart = contextAnchorMatch!!.range.first
         val s6SurfaceContext = text.substring(contextStart, registrationStart)
         val combinedS6Surface = s6SurfaceA + "\n" + s6SurfaceContext + "\n" + s6SurfaceB
 
