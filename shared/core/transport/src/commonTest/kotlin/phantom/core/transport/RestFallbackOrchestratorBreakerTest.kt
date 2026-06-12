@@ -2907,9 +2907,18 @@ class RestFallbackOrchestratorBreakerTest {
         val writes: MutableList<Pair<Long, Long>> = mutableListOf()
         var stored: Long? = null
         override suspend fun getLastSeenSeq(identityHex: String): Long? = stored
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome {
+            val previous = stored
+            if (previous != null && previous >= seq) {
+                return CursorUpsertOutcome.NoChange(previous)
+            }
             writes += seq to nowMs
-            stored = maxOf(stored ?: Long.MIN_VALUE, seq)
+            stored = maxOf(previous ?: Long.MIN_VALUE, seq)
+            return CursorUpsertOutcome.Advanced(seq)
         }
     }
 
@@ -2978,7 +2987,11 @@ class RestFallbackOrchestratorBreakerTest {
 
     private class NoopCursor : LongPollCursorRepository {
         override suspend fun getLastSeenSeq(identityHex: String): Long? = null
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {}
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome = CursorUpsertOutcome.Advanced(seq)
     }
 
     private fun buildOrchestrator(

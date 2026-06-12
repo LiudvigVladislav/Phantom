@@ -237,9 +237,18 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
             reads += identityHex
             return stored
         }
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome {
+            val previous = stored
+            if (previous != null && previous >= seq) {
+                return CursorUpsertOutcome.NoChange(previous)
+            }
             writes += Triple(identityHex, seq, nowMs)
-            stored = maxOf(stored ?: Long.MIN_VALUE, seq)
+            stored = maxOf(previous ?: Long.MIN_VALUE, seq)
+            return CursorUpsertOutcome.Advanced(seq)
         }
     }
 

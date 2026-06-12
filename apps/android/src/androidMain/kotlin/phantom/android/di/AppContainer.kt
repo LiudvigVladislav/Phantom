@@ -93,6 +93,78 @@ class AppContainer(private val context: Context) {
         private set
 
     /**
+     * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — REST
+     * orchestrator reference, set inside [initMessaging] after the
+     * orchestrator is constructed. Held so the debug-only S6
+     * breaker trigger surface ([triggerS6BreakerForDebug] +
+     * [S6BreakerTriggerReceiver]) can route to
+     * `forceBreakerTripForS6TestTrigger()` without re-entering
+     * the wiring path. Null until [initMessaging] runs.
+     */
+    @Volatile private var restOrchestratorRef:
+        phantom.core.transport.RestFallbackOrchestrator? = null
+
+    /**
+     * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — debug/beta
+     * entry point for the Tele2 LTE smoke S6 controllable trigger.
+     *
+     * The Tele2 runbook (`docs/tracks/trek2-stage2b-b-tele2-smoke.md`,
+     * scenario S6) accepts this helper iff natural Mode-2 does not
+     * reproduce inside the 30-minute Tecno+Tele2 LTE time-box. This
+     * surface is reachable two ways:
+     *
+     *   1. **ADB broadcast intent** —
+     *      `adb shell am broadcast -a
+     *      phantom.android.dev.S6_BREAKER_TRIGGER` invokes the
+     *      [S6BreakerTriggerReceiver] (dynamically registered in
+     *      [initMessaging]) which calls this function on
+     *      [appScope]. The Tecno operator can fire the trigger
+     *      from a connected laptop without compiling a debug menu
+     *      UI.
+     *   2. **Direct test call** — commonTest / androidUnitTest
+     *      cells call this directly to assert the gate logic.
+     *
+     * Two-layer defence-in-depth:
+     *
+     *   * This function returns `false` (no-op) if
+     *     `phantom.android.BuildConfig.DEBUG` is `false` (release
+     *     build). The release APK BuildConfig is generated from
+     *     the Gradle release variant — a release APK can never
+     *     observe `DEBUG=true`.
+     *   * The orchestrator constructor receives
+     *     `s6DebugTriggerEnabled = BuildConfig.DEBUG`; even if a
+     *     caller reached past the AppContainer gate, the
+     *     orchestrator-side gate refuses and logs
+     *     `REST_TRACE breaker_test_trigger_refused
+     *     reason=disabled_in_release`.
+     *
+     * Return value indicates whether the trigger was DISPATCHED
+     * (orchestrator helper called), not whether the breaker
+     * actually flipped. The orchestrator-side gate may still
+     * refuse and the caller observes the refusal log instead of
+     * the trigger log.
+     */
+    suspend fun triggerS6BreakerForDebug(): Boolean {
+        if (!phantom.android.BuildConfig.DEBUG) {
+            android.util.Log.w(
+                "Phantom/S6Debug",
+                "triggerS6BreakerForDebug() refused: not a DEBUG build",
+            )
+            return false
+        }
+        val orch = restOrchestratorRef
+        if (orch == null) {
+            android.util.Log.w(
+                "Phantom/S6Debug",
+                "triggerS6BreakerForDebug() refused: initMessaging has not run yet",
+            )
+            return false
+        }
+        orch.forceBreakerTripForS6TestTrigger()
+        return true
+    }
+
+    /**
      * Steady-state prekey lifecycle service: onboarding bootstrap,
      * OPK pool refill, weekly SPK rotation. The 24-hour ticker is
      * launched in [initMessaging]; UI surfaces (e.g. MigrationScreen)
@@ -942,6 +1014,12 @@ class AppContainer(private val context: Context) {
             // collectors only start later, after bootstrapAndStart).
             var degradationDetectorRef: phantom.core.transport.WsDegradationDetector? = null
 
+            // Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — pass
+            // `BuildConfig.DEBUG` through to the orchestrator's
+            // [s6DebugTriggerEnabled] constructor gate. Release APKs
+            // get `false`; the trigger helper short-circuits with
+            // the `breaker_test_trigger_refused` log.
+            val s6DebugEnabled = phantom.android.BuildConfig.DEBUG
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
@@ -1029,11 +1107,77 @@ class AppContainer(private val context: Context) {
                         identityHex: String,
                         seq: Long,
                         nowMs: Long,
-                    ) {
+                    ): phantom.core.transport.CursorUpsertOutcome {
+                        // C6 review-fix round 2 P1.2 — read-before-
+                        // write so the bridge surfaces a typed
+                        // outcome to the orchestrator's smoke-pin
+                        // log site. Storage-side `upsertLastSeenSeq`
+                        // is already monotonic (it silent-no-ops
+                        // when `seq <= existing` inside its own
+                        // transaction), but exposes that as `Unit`.
+                        // Bridging up to a discriminated outcome
+                        // costs one extra read on the ack path; the
+                        // ack path is per-envelope, not per-poll,
+                        // so the extra read is bounded by the
+                        // envelope arrival rate. Race window: a
+                        // concurrent writer could land between the
+                        // read and the conditional upsert; the
+                        // storage layer's own transactional guard
+                        // catches the cursor-regress case so the
+                        // worst outcome is a spurious `cursor_noop`
+                        // log when the bridge raced past a
+                        // legitimate advance. Field smoke proofs
+                        // tolerate that asymmetry — false NoChange
+                        // is preferable to false Advanced.
+                        val existing = lastSeenSeqRepo.getLastSeenSeq(identityHex)
+                        if (existing != null && existing >= seq) {
+                            return phantom.core.transport.CursorUpsertOutcome.NoChange(existing)
+                        }
                         lastSeenSeqRepo.upsertLastSeenSeq(identityHex, seq, nowMs)
+                        return phantom.core.transport.CursorUpsertOutcome.Advanced(seq)
                     }
                 },
+                s6DebugTriggerEnabled = s6DebugEnabled,
             )
+            // Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — wire
+            // the freshly-constructed orchestrator into the
+            // class-level reference so the debug-only S6 breaker
+            // trigger surface ([triggerS6BreakerForDebug] +
+            // [S6BreakerTriggerReceiver]) can reach it. The
+            // assignment happens AFTER the orchestrator is fully
+            // constructed so observers cannot see a partially-
+            // initialised instance.
+            restOrchestratorRef = restOrchestrator
+            // Register the debug-only ADB-broadcast receiver iff
+            // this is a DEBUG build. Dynamic registration (vs
+            // manifest declaration) lets the receiver live for the
+            // process lifetime without expanding the production
+            // manifest surface. The receiver itself also gates on
+            // BuildConfig.DEBUG defensively so even a manual
+            // intent dispatch with the right action string is a
+            // no-op in release.
+            if (phantom.android.BuildConfig.DEBUG) {
+                val s6Receiver = phantom.android.dev.S6BreakerTriggerReceiver(this@AppContainer)
+                val filter = android.content.IntentFilter(
+                    phantom.android.dev.S6BreakerTriggerReceiver.ACTION,
+                )
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    context.registerReceiver(
+                        s6Receiver,
+                        filter,
+                        android.content.Context.RECEIVER_NOT_EXPORTED,
+                    )
+                } else {
+                    @Suppress("UnspecifiedRegisterReceiverFlag")
+                    context.registerReceiver(s6Receiver, filter)
+                }
+                android.util.Log.i(
+                    "Phantom/S6Debug",
+                    "Registered S6BreakerTriggerReceiver for action ${
+                        phantom.android.dev.S6BreakerTriggerReceiver.ACTION
+                    }",
+                )
+            }
 
             // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.
             // MediaCrypto wraps libsodium AEAD (already initialized at app start).

@@ -135,8 +135,13 @@ class WsActivePollJobLifecycleTest {
             reads += identityHex
             return backing
         }
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome {
             writes += Triple(identityHex, seq, nowMs)
+            return CursorUpsertOutcome.Advanced(seq)
         }
     }
 

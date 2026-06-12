@@ -170,15 +170,24 @@ class AckInboundAndAdvanceCursorTest {
             return initialSeq
         }
 
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome {
             upsertHook?.invoke(identityHex, seq, nowMs)
+            // C6 review-fix round 2 — discriminate the silent-no-op
+            // (caller seq <= persisted) from the genuine advance.
+            // The `writes` list still records every CALL so existing
+            // tests counting attempts continue to pass; the new
+            // outcome value mirrors the production semantics.
+            val previous = initialSeq
+            if (previous != null && previous >= seq) {
+                return CursorUpsertOutcome.NoChange(previous)
+            }
             writes += Triple(identityHex, seq, nowMs)
-            // Monotonicity invariant mirroring SqlDelightLastSeenSeqRepository:
-            // a `seq` less than or equal to the currently-stored value would
-            // be a no-op in production. For these tests we treat the highest
-            // observed write as the canonical value and assert monotonicity
-            // explicitly in M-B26.
-            initialSeq = maxOf(initialSeq ?: Long.MIN_VALUE, seq)
+            initialSeq = maxOf(previous ?: Long.MIN_VALUE, seq)
+            return CursorUpsertOutcome.Advanced(seq)
         }
     }
 
@@ -828,15 +837,21 @@ class AckInboundAndAdvanceCursorTest {
             persisted
         }
 
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
-            lock.withLock {
-                attempts += seq
-                val current = persisted
-                if (current == null || seq > current) {
-                    persisted = seq
-                    accepted += seq
-                }
-                // else: SQLDelight monotonicity contract no-ops the write.
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome = lock.withLock {
+            attempts += seq
+            val current = persisted
+            if (current == null || seq > current) {
+                persisted = seq
+                accepted += seq
+                CursorUpsertOutcome.Advanced(seq)
+            } else {
+                // SQLDelight monotonicity contract no-ops the write
+                // and now surfaces it as a typed NoChange.
+                CursorUpsertOutcome.NoChange(current)
             }
         }
     }

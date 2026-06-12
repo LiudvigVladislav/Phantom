@@ -213,14 +213,19 @@ class RestFallbackOrchestratorPollLoopTest {
             }
         }
 
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
-            lock.withLock {
-                attempts += seq
-                val current = persisted
-                if (current == null || seq > current) {
-                    persisted = seq
-                    accepted += seq
-                }
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome = lock.withLock {
+            attempts += seq
+            val current = persisted
+            if (current == null || seq > current) {
+                persisted = seq
+                accepted += seq
+                CursorUpsertOutcome.Advanced(seq)
+            } else {
+                CursorUpsertOutcome.NoChange(current)
             }
         }
     }

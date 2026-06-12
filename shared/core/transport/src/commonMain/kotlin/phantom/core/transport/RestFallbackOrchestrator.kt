@@ -126,6 +126,20 @@ class RestFallbackOrchestrator(
      */
     private val longPollEnabled: Boolean = false,
     /**
+     * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — debug-mode
+     * gate for [forceBreakerTripForS6TestTrigger]. Defence-in-depth:
+     * the helper itself is public so the Android `AppContainer` can
+     * route an ADB-broadcast intent to it without depending on the
+     * `internal` visibility (which does not cross Gradle module
+     * boundaries), but a release-mode binary that accidentally
+     * carried a call site would still no-op because this flag
+     * defaults to `false`. The Android wire-up sets it to
+     * `phantom.android.BuildConfig.DEBUG`; release-mode APKs
+     * therefore have a hard `false` from BOTH the BuildConfig pin
+     * AND the orchestrator-side gate.
+     */
+    private val s6DebugTriggerEnabled: Boolean = false,
+    /**
      * Trek 2 Stage 2B-B (C3, L4) — full read/write cursor seam used
      * by BOTH REST poll loops as the single source of truth for
      * `since_seq`. Replaces the Stage 2B-A read-only
@@ -1277,24 +1291,36 @@ class RestFallbackOrchestrator(
                         break
                     }
                     try {
-                        cursorRepository.upsertLastSeenSeq(
+                        val outcome = cursorRepository.upsertLastSeenSeq(
                             identityHex = identityHex,
                             seq = pendingSeq!!,
                             nowMs = now(),
                         )
                         upsertOk = true
-                        // Trek 2 Stage 2B-B (C6 review-fix round 1
-                        // P1.1) — Tele2 smoke pin: `cursor_advanced
-                        // seq=<n>` with strictly-monotonic `seq`. The
-                        // upsert just succeeded; the cursor table
-                        // holds at least `pendingSeq` for this
-                        // identity. The runbook greps this line to
-                        // prove persistence happened on the device
-                        // under field conditions.
-                        log(
-                            "REST_TRACE cursor_advanced seq=$pendingSeq " +
-                                "id=${envelopeId.take(8)} attempt=${attemptIdx + 1}",
-                        )
+                        // Trek 2 Stage 2B-B (C6 review-fix round 2
+                        // P1.2) — discriminate `Advanced` from
+                        // `NoChange`. The Tele2 smoke runbook treats
+                        // `REST_TRACE cursor_advanced seq=<n>` as
+                        // PROOF that the persisted row changed —
+                        // round-1 emitted it on every successful
+                        // return, including the silent-no-op branch
+                        // (relay redelivery past the cursor), which
+                        // made the smoke evidence unfalsifiable.
+                        // After this commit, `cursor_advanced` fires
+                        // ONLY on a genuine forward write; the
+                        // monotonicity-noop branch emits a distinct
+                        // `cursor_noop` line.
+                        when (outcome) {
+                            is CursorUpsertOutcome.Advanced -> log(
+                                "REST_TRACE cursor_advanced seq=${outcome.storedSeq} " +
+                                    "id=${envelopeId.take(8)} attempt=${attemptIdx + 1}",
+                            )
+                            is CursorUpsertOutcome.NoChange -> log(
+                                "REST_TRACE cursor_noop existing_seq=${outcome.existingSeq} " +
+                                    "rejected_seq=$pendingSeq id=${envelopeId.take(8)} " +
+                                    "attempt=${attemptIdx + 1}",
+                            )
+                        }
                     } catch (ce: CancellationException) {
                         // Cancellation MUST propagate. `runCatching`
                         // would have silently caught it and turned
@@ -3273,37 +3299,58 @@ class RestFallbackOrchestrator(
         _breakerTimerJob != null
 
     /**
-     * Trek 2 Stage 2B-B (C6 review-fix round 1 P1.2) — S6
-     * controllable trigger. Simulates [BREAKER_CONSECUTIVE_FAIL_THRESHOLD]
-     * consecutive REST poll failures by forcing the breaker into
+     * Trek 2 Stage 2B-B (C6 review-fix round 1 P1.2, hardened in
+     * round 2) — S6 controllable trigger. Simulates
+     * [BREAKER_CONSECUTIVE_FAIL_THRESHOLD] consecutive REST poll
+     * failures by forcing the breaker into
      * [LongPollBreakerState.Open] under the inbound-state mutex and
      * emitting the `breaker_test_trigger_fired` log the Tele2 LTE
      * smoke runbook greps for.
      *
      * The runbook (`docs/tracks/trek2-stage2b-b-tele2-smoke.md`,
-     * scenario S6 line 101 / 114) accepts this helper iff natural
-     * Mode-2 does not reproduce inside the 30-minute Tele2 LTE
-     * time-box. The PR description must quote the helper invocation
-     * line AND the natural-trigger absence note.
+     * scenario S6) accepts this helper iff natural Mode-2 does not
+     * reproduce inside the 30-minute Tele2 LTE time-box. The PR
+     * description must quote the helper invocation line AND the
+     * natural-trigger absence note.
      *
-     * **Production safety.** The Android AppContainer wires this
-     * helper through a debug-menu surface gated on
-     * `BuildConfig.DEBUG` so a release APK has no reachable code
-     * path that could call it. The `internal` visibility prevents
-     * production callers in other Gradle modules from grabbing a
-     * reference outside the test seam.
+     * **Visibility and production safety.** Public so the Android
+     * `AppContainer` can route an ADB-broadcast intent receiver
+     * call into it (the round-1 `internal` modifier blocked cross-
+     * module access — `AppContainer` lives in `phantom.android.di`,
+     * the orchestrator in `phantom.core.transport`, both in
+     * separate Gradle modules). The defence-in-depth gate now lives
+     * in the constructor parameter [s6DebugTriggerEnabled]:
      *
-     * **Effect.** Bumps `_breakerFailCount` to the threshold and
-     * routes through the regular [transitionToOpenUnderMutex] so
-     * the resulting state — `Open(ConsecutiveRestFailures, cooldownMs)`
-     * with a fresh timer Job, epoch bumped, fail counter reset —
-     * is byte-identical to what a natural 5-failure trip produces.
-     * Subsequent pollLoop iterations skip with
-     * `breaker_open_ConsecutiveRestFailures`; the existing
-     * cooldown / HalfOpen / probe / re-Open / re-Close machinery
-     * exercises exactly as in production.
+     *   * Release-mode wire-up passes `false`; the helper logs
+     *     `REST_TRACE breaker_test_trigger_refused
+     *     reason=disabled_in_release` and returns WITHOUT touching
+     *     any breaker state. A release APK that accidentally
+     *     carried a call site is therefore a no-op.
+     *   * Debug-mode wire-up passes `true` (from
+     *     `BuildConfig.DEBUG`); the helper executes normally.
+     *
+     * **Effect (when enabled).** Bumps `_breakerFailCount` to the
+     * threshold and routes through the regular
+     * [transitionToOpenUnderMutex] so the resulting state —
+     * `Open(ConsecutiveRestFailures, cooldownMs)` with a fresh timer
+     * Job, epoch bumped, fail counter reset — is byte-identical to
+     * what a natural 5-failure trip produces. Subsequent pollLoop
+     * iterations skip with `breaker_open_ConsecutiveRestFailures`;
+     * the existing cooldown / HalfOpen / probe / re-Open / re-Close
+     * machinery exercises exactly as in production.
      */
-    internal suspend fun forceBreakerTripForS6TestTrigger() {
+    suspend fun forceBreakerTripForS6TestTrigger() {
+        if (!s6DebugTriggerEnabled) {
+            // Refusal log fires on EVERY call attempt regardless of
+            // build mode so an operator with logcat access can verify
+            // the gate held. The release pin is the load-bearing
+            // safety; this line is observability.
+            log(
+                "REST_TRACE breaker_test_trigger_refused " +
+                    "reason=disabled_in_release",
+            )
+            return
+        }
         // Emit the trigger log BEFORE acquiring the mutex so the
         // line appears in logcat even if the transition itself
         // contends momentarily — the runbook needs the line

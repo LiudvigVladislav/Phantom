@@ -55,11 +55,67 @@ interface LongPollCursorRepository {
      * persisted value is a no-op (the underlying repository enforces
      * monotonicity per Stage 2A D5).
      *
+     * **C6 review-fix round 2 — typed outcome.** The call returns a
+     * [CursorUpsertOutcome] so the orchestrator can discriminate
+     *
+     *   * [CursorUpsertOutcome.Advanced] — the persisted value
+     *     genuinely changed; the underlying storage now holds [seq].
+     *   * [CursorUpsertOutcome.NoChange] — the monotonicity guard
+     *     short-circuited the write because the persisted value was
+     *     already `>= seq`. The Tele2 smoke runbook treats this
+     *     case as NOT proof of cursor advance — the
+     *     `REST_TRACE cursor_advanced seq=<n>` log MUST NOT fire
+     *     on this branch or the field evidence becomes unfalsifiable.
+     *
      * Called only by the orchestrator's `ackInboundAndAdvanceCursor`
      * after the relay's `/relay/ack-deliver` has returned 2xx. The
      * call site bounds retry via the orchestrator's
      * `CURSOR_WRITE_MAX_ATTEMPTS` / `CURSOR_WRITE_RETRY_BACKOFF_MS`
      * companion constants; this interface does not retry internally.
+     *
+     * Implementations MAY throw on unrelated I/O errors (database
+     * locked, disk full, etc.). The caller's retry loop catches
+     * those and routes them through the `poll_cursor_write_attempt_fail`
+     * telemetry path; they are NOT [CursorUpsertOutcome] cases.
      */
-    suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long)
+    suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long): CursorUpsertOutcome
+}
+
+/**
+ * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.2) — outcome of a
+ * [LongPollCursorRepository.upsertLastSeenSeq] call. Discriminates a
+ * genuine cursor advance from the silent no-op a monotonicity guard
+ * produces when the caller tries to write a `seq` less than or equal
+ * to the persisted value.
+ *
+ * The Tele2 LTE smoke runbook (`docs/tracks/trek2-stage2b-b-tele2-
+ * smoke.md`) requires the `REST_TRACE cursor_advanced seq=<n>` log
+ * line as a proof point that envelopes are being persistently
+ * dequeued in the field. Before this outcome existed, the
+ * orchestrator emitted the line on every successful return from
+ * `upsertLastSeenSeq` — including the silent-no-op branch — which
+ * meant the smoke proof was a lie any time a relay redelivered an
+ * envelope already past the cursor (the legitimate dedup path).
+ *
+ * With this discriminated outcome, the smoke proof "cursor is
+ * persisted with strictly-monotonic seq" is genuine: a
+ * `cursor_advanced` line in logcat means the underlying row in
+ * `transport_seq_state` actually changed.
+ */
+sealed class CursorUpsertOutcome {
+
+    /**
+     * The repository stored [storedSeq] as the new persisted cursor
+     * value; the previous value was strictly less than [storedSeq]
+     * (or absent for a cold-start identity).
+     */
+    data class Advanced(val storedSeq: Long) : CursorUpsertOutcome()
+
+    /**
+     * The repository observed a persisted value of [existingSeq]
+     * that was `>=` the caller's requested seq, and short-circuited
+     * the write per the monotonicity contract. The persisted row
+     * is unchanged.
+     */
+    data class NoChange(val existingSeq: Long) : CursorUpsertOutcome()
 }

@@ -98,7 +98,32 @@ A log block missing any of the five proofs is NOT a pass regardless of subjectiv
 
 **Setup.** Sustain Tele2 LTE upload pressure to provoke Mode-2 cutoff (5-14 KB upload then silence per the byte-threshold finding from the Direct-stability tracks). The breaker does NOT "select" a transport — it controls the REST poll cadence.
 
-**Time-box.** ≥ 30 minutes of Tecno+Tele2 LTE elapsed wall-clock. A **controllable trigger** is acceptable iff natural Mode-2 does not reproduce in the 30-min window. The orchestrator ships an internal seam, `forceBreakerTripForS6TestTrigger()`, that synthesises the threshold-fail-count + transitions the breaker through the production `transitionToOpenUnderMutex` path — byte-identical to a natural 5-failure trip. The seam emits the helper-only log line `REST_TRACE breaker_test_trigger_fired reason=ConsecutiveRestFailures threshold=5` before the regular `breaker_open` line. Production Android builds expose this through a debug-menu surface gated on `BuildConfig.DEBUG`; release APKs have no reachable call path. If the controllable trigger is used, the PR description quotes the trigger log line explicitly.
+**Time-box.** ≥ 30 minutes of Tecno+Tele2 LTE elapsed wall-clock. A **controllable trigger** is acceptable iff natural Mode-2 does not reproduce in the 30-min window. The orchestrator ships a public helper, `forceBreakerTripForS6TestTrigger()`, that synthesises the threshold-fail-count + transitions the breaker through the production `transitionToOpenUnderMutex` path — byte-identical to a natural 5-failure trip. The helper emits the trigger log line `REST_TRACE breaker_test_trigger_fired reason=ConsecutiveRestFailures threshold=5` before the regular `breaker_open` line.
+
+**Three-layer defence-in-depth for production safety.**
+
+1. The orchestrator constructor parameter `s6DebugTriggerEnabled` defaults to `false`; the helper short-circuits with `REST_TRACE breaker_test_trigger_refused reason=disabled_in_release` when the flag is `false`.
+2. `AppContainer` passes `s6DebugTriggerEnabled = phantom.android.BuildConfig.DEBUG` so release-mode APKs hand the orchestrator a hard `false`.
+3. `AppContainer` registers `phantom.android.dev.S6BreakerTriggerReceiver` dynamically iff `BuildConfig.DEBUG`; release APKs never register the receiver and the broadcast intent is a no-op on the device side.
+
+**Trigger recipe.** The Tecno operator, with the device attached over USB, fires from the connected laptop:
+
+```bash
+adb shell am broadcast -a phantom.android.dev.S6_BREAKER_TRIGGER
+```
+
+Logcat should then show:
+
+```
+Phantom/S6Debug  Registered S6BreakerTriggerReceiver for action phantom.android.dev.S6_BREAKER_TRIGGER
+... <wait until the natural Mode-2 window expires> ...
+Phantom/S6Debug  S6 breaker trigger broadcast received; dispatching on AppContainer.appScope
+PhantomRelay     REST_TRACE breaker_test_trigger_fired reason=ConsecutiveRestFailures threshold=5
+PhantomRelay     REST_TRACE breaker_open reason=ConsecutiveRestFailures cooldown_ms=5000
+Phantom/S6Debug  triggerS6BreakerForDebug() returned dispatched=true
+```
+
+A release APK on the same device would show NO `Registered S6BreakerTriggerReceiver` line at app startup and the broadcast would be silently dropped. If the operator sees a `breaker_test_trigger_refused reason=disabled_in_release` line instead of `breaker_test_trigger_fired`, the build is a release variant and the smoke is INVALID per the APK-build requirement above. If the controllable trigger is used, the PR description quotes the trigger log line explicitly AND the receiver-registered line from app startup as proof the build was debug/beta.
 
 **Pass criteria (all six required).**
 

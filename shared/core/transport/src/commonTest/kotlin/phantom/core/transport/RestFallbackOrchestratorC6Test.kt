@@ -5,6 +5,7 @@
 
 package phantom.core.transport
 
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.advanceTimeBy
@@ -429,6 +430,76 @@ class RestFallbackOrchestratorC6Test {
     }
 
     @Test
+    fun p1_1_cursor_advanced_log_NOT_emitted_when_upsert_is_NoChange_monotonicity_noop() = runTest(timeout = 5.minutes) {
+        // C6 review-fix round 2 P1.2 — the monotonicity no-op path
+        // MUST NOT emit `cursor_advanced`. The Tele2 LTE smoke runbook
+        // greps `cursor_advanced seq=<n>` as PROOF that the persisted
+        // cursor row changed; round-1 emitted it unconditionally on
+        // every successful return from `upsertLastSeenSeq`, which
+        // meant a relay redelivering an envelope past the cursor
+        // (the legitimate dedup path) generated a false positive.
+        //
+        // Setup: seed the cursor at seq=100 BEFORE the ack-and-advance
+        // call, then ack an envelope with seq=42. The repository's
+        // monotonicity guard short-circuits the write and the bridge
+        // returns `NoChange(100)`. The orchestrator MUST emit
+        // `cursor_noop existing_seq=100 rejected_seq=42` and MUST NOT
+        // emit any `cursor_advanced` line.
+        init()
+        val captured = mutableListOf<String>()
+        val transport = C6TestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                    rawBody = "{}", elapsedMs = 1L,
+                )
+            },
+        )
+        val cursor = RecordingCursor().apply { initialSeq = 100L }
+        val orch = buildOrchestrator(
+            transport, testScheduler,
+            cursor = cursor,
+            logSink = { captured += it },
+        )
+        try {
+            orch.bootstrap()
+            orch.primePendingSeqForAckForTest("env-noop", 42L)
+            val outcome = orch.ackInboundAndAdvanceCursor("env-noop")
+            assertEquals(AckOutcome.Acked, outcome)
+            assertEquals(
+                0, cursor.writes.size,
+                "the monotonicity-noop path MUST NOT record a write — the persisted row " +
+                    "is unchanged",
+            )
+            assertTrue(
+                captured.none { it.startsWith("REST_TRACE cursor_advanced ") },
+                "`cursor_advanced` line MUST NOT fire on the monotonicity-noop branch; " +
+                    "captured:\n${captured.joinToString("\n")}",
+            )
+            val noopLine = captured.singleOrNull {
+                it.startsWith("REST_TRACE cursor_noop ")
+            }
+            assertNotNull(
+                noopLine,
+                "expected exactly one `cursor_noop` line on the monotonicity-noop branch; " +
+                    "captured ${captured.size} REST_TRACE lines.",
+            )
+            assertTrue(
+                "existing_seq=100" in noopLine,
+                "noop existing-seq pin failed: `$noopLine`",
+            )
+            assertTrue(
+                "rejected_seq=42" in noopLine,
+                "noop rejected-seq pin failed: `$noopLine`",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
     fun p1_1_poll_call_log_carries_headers_and_probe_flag() = runTest(timeout = 5.minutes) {
         init()
         val captured = mutableListOf<String>()
@@ -500,7 +571,11 @@ class RestFallbackOrchestratorC6Test {
                 )
             },
         )
-        val orch = buildOrchestrator(transport, testScheduler, logSink = { captured += it })
+        val orch = buildOrchestrator(
+            transport, testScheduler,
+            s6DebugTriggerEnabled = true,
+            logSink = { captured += it },
+        )
         try {
             orch.bootstrap()
             // Pre-state: breaker MUST be Closed under the C5 invariants
@@ -533,6 +608,59 @@ class RestFallbackOrchestratorC6Test {
                 state is LongPollBreakerState.Open &&
                     state.reason == BreakerOpenReason.ConsecutiveRestFailures,
                 "expected breaker state Open(ConsecutiveRestFailures); got $state",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun p1_2_force_breaker_trip_refused_when_s6DebugTriggerEnabled_is_false() = runTest(timeout = 5.minutes) {
+        // C6 review-fix round 2 P1.1 — release-mode safety pin. The
+        // orchestrator-side gate is the load-bearing defence: even
+        // if a release APK somehow reached `forceBreakerTripForS6
+        // TestTrigger()`, the constructor flag (false by default,
+        // false in release per `BuildConfig.DEBUG`) must short-
+        // circuit the trigger. The refusal log MUST fire so an
+        // operator with logcat access can verify the gate held.
+        init()
+        val captured = mutableListOf<String>()
+        val transport = C6TestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                    rawBody = "{}", elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(
+            transport, testScheduler,
+            s6DebugTriggerEnabled = false,
+            logSink = { captured += it },
+        )
+        try {
+            orch.bootstrap()
+            val preState = orch.peekBreakerStateForTest()
+            orch.forceBreakerTripForS6TestTrigger()
+            val postState = orch.peekBreakerStateForTest()
+            assertEquals(
+                preState, postState,
+                "release-mode trigger MUST NOT mutate breaker state; pre=$preState post=$postState",
+            )
+            assertTrue(
+                captured.none { it.startsWith("REST_TRACE breaker_test_trigger_fired") },
+                "`breaker_test_trigger_fired` MUST NOT appear when s6DebugTriggerEnabled=false; " +
+                    "captured:\n${captured.joinToString("\n")}",
+            )
+            assertTrue(
+                captured.any {
+                    it.startsWith("REST_TRACE breaker_test_trigger_refused ") &&
+                        "reason=disabled_in_release" in it
+                },
+                "expected a `breaker_test_trigger_refused reason=disabled_in_release` log " +
+                    "as observability for the release-mode gate; captured:\n${captured.joinToString("\n")}",
             )
         } finally {
             orch.stop()
@@ -586,6 +714,203 @@ class RestFallbackOrchestratorC6Test {
             malformedSeqMac = "0".repeat(128),
             caseLabel = "128-char (double-length)",
         )
+    }
+
+    /**
+     * C6 review-fix round 2 P1.3 — end-to-end M-B19 integration
+     * through the REAL `wsActivePollLoop`. The unit-level tests
+     * above (mb19_d/e/f via `processInboundEnvelopeWithVerifyForTest`)
+     * pin the helper's behaviour, but NOT the assertion "the poll
+     * loop continues polling and ack-and-advance happens for the
+     * recovery envelope only". A regression that broke the loop
+     * tear-down on a bad envelope, or that wrote the cursor for
+     * the dropped envelope, would NOT trip the unit pins because
+     * the loop machinery is not exercised.
+     *
+     * Setup: transport.poll returns
+     *   * Call 0 — one envelope with a malformed `seqMac` (drop path).
+     *   * Call 1+ — one envelope with a correctly-computed `seqMac`
+     *     (verify-pass path), then empty thereafter so the loop
+     *     keeps idling without flooding the consumer.
+     *
+     * The orchestrator runs both poll loops; the test collects from
+     * `orch.inbound` and acks each envelope via
+     * `ackInboundAndAdvanceCursor`. Assertions:
+     *
+     *   1. The malformed envelope is NEVER emitted to `orch.inbound`
+     *      (verify failed; the drop path returns early before
+     *      `emitWithCancellationSafeRollback`).
+     *   2. Exactly ONE valid envelope is emitted and consumed.
+     *   3. `transport.ackCalls` contains only the VALID envelope's
+     *      id (the dropped envelope's id never reaches the relay).
+     *   4. `cursor.writes` contains only ONE entry with the valid
+     *      envelope's seq.
+     *   5. The poll loop made AT LEAST 2 successful `poll` calls
+     *      (proving it survived the drop and went around again).
+     *   6. A `REST_TRACE cursor_advanced seq=<validSeq>` line is
+     *      present; NO `cursor_advanced` line for the dropped seq.
+     */
+    @Test
+    fun mb19_real_poll_loop_drops_malformed_then_advances_on_recovery() = runTest(timeout = 5.minutes) {
+        init()
+        val captured = mutableListOf<String>()
+        val verifyKeyBytes = ByteArray(32) { (it + 2).toByte() }
+        val verifyKeyHex = verifyKeyBytes.joinToString("") {
+            ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+        }
+        val malformedId = "env-mb19-loop-malformed"
+        val recoveryId = "env-mb19-loop-recovery"
+        val recoverySeq = 7L
+        val recoveryMacHex = SeqMacVerifier.computeMac(
+            identityHex = IDENTITY,
+            seq = recoverySeq,
+            envelopeId = recoveryId,
+            sequenceTs = 0L,
+            verifyKeyBytes = verifyKeyBytes,
+        ).joinToString("") {
+            ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+        }
+        val malformedEnv = PollEnvelope(
+            id = malformedId,
+            fromHex = "ff".repeat(32),
+            payloadBase64 = "",
+            sequenceTs = 0L,
+            seq = 5L,
+            seqMac = "0123456789abcdef".repeat(4).replaceRange(0, 1, "g"), // non-hex
+        )
+        val recoveryEnv = PollEnvelope(
+            id = recoveryId,
+            fromHex = "ff".repeat(32),
+            payloadBase64 = "",
+            sequenceTs = 0L,
+            seq = recoverySeq,
+            seqMac = recoveryMacHex,
+        )
+        val transport = C6TestTransport(
+            pollScript = { callIdx ->
+                val envs = when (callIdx) {
+                    0 -> listOf(malformedEnv)
+                    1 -> listOf(recoveryEnv)
+                    else -> emptyList()
+                }
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = envs, more = false),
+                    rawBody = "{}", elapsedMs = 1L,
+                )
+            },
+            sessionScript = {
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = AuthSessionResponse(
+                        token = "tok-mb19-loop",
+                        expiresAt = Long.MAX_VALUE,
+                        restFallback = true,
+                        maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1,
+                        pollHoldSecs = 30,
+                        seqMacVerifyKey = verifyKeyHex,
+                    ),
+                    rawBody = "{}", elapsedMs = 1L,
+                )
+            },
+        )
+        val cursor = RecordingCursor()
+        val orch = buildOrchestrator(
+            transport, testScheduler,
+            longPollEnabled = true,
+            cursor = cursor,
+            logSink = { captured += it },
+        )
+        // Subscribe BEFORE start() so we don't miss the recovery
+        // envelope's emission. `MutableSharedFlow` with `replay=0`
+        // is exactly what `_inbound` is; an unsubscribed flow has
+        // no subscribers and `emit(...)` will suspend on the
+        // back-pressure path (we'd see a hang).
+        val emitted = mutableListOf<PollEnvelope>()
+        val collectorJob = launch {
+            orch.inbound.collect { env ->
+                emitted += env
+                // Ack each emitted envelope so the cursor-advance
+                // path actually runs — that's the production
+                // contract (`HybridRelayTransport.handleRestInbound`
+                // ack chains here).
+                orch.ackInboundAndAdvanceCursor(env.id)
+            }
+        }
+        try {
+            orch.bootstrap()
+            assertEquals(
+                VerifyKeyState.KeyPresent(verifyKeyHex),
+                orch.peekVerifyKeyStateForTest(),
+                "bootstrap must publish KeyPresent before exercising the real poll loop",
+            )
+            orch.start()
+            // Pump the wsActivePollLoop through a couple of poll
+            // calls so the malformed envelope drops, the second
+            // poll lands the valid one, the ack pipeline runs, and
+            // the cursor advances. The loop's idle delay is
+            // `pollIntervalMs` (active = 2_000 ms); advancing 4×
+            // gives the loop time for ≥ 2 iterations + the ack
+            // round-trip + cursor write.
+            repeat(8) {
+                advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS)
+                runCurrent()
+            }
+
+            assertTrue(
+                transport.pollCalls.size >= 2,
+                "poll loop MUST have made ≥ 2 polls (one for malformed drop, one for recovery); " +
+                    "got ${transport.pollCalls.size}",
+            )
+            assertEquals(
+                listOf(recoveryId),
+                emitted.map { it.id },
+                "ONLY the recovery envelope is emitted; the malformed one is dropped " +
+                    "before reaching `_inbound`",
+            )
+            assertEquals(
+                listOf(recoveryId),
+                transport.ackCalls.toList(),
+                "ackDeliver called for the recovery envelope ONLY; the malformed envelope's " +
+                    "id never reaches the relay",
+            )
+            assertEquals(
+                1, cursor.writes.size,
+                "cursor write happens ONCE for the recovery envelope only",
+            )
+            assertEquals(
+                recoverySeq, cursor.writes.single().second,
+                "cursor stores the recovery envelope's seq, not the malformed envelope's seq",
+            )
+            assertTrue(
+                captured.any {
+                    it.startsWith("REST_TRACE cursor_advanced ") && "seq=$recoverySeq" in it
+                },
+                "cursor_advanced log fires for the recovery envelope's seq; " +
+                    "captured:\n${captured.joinToString("\n")}",
+            )
+            assertTrue(
+                captured.none {
+                    it.startsWith("REST_TRACE cursor_advanced ") && "seq=5" in it
+                },
+                "NO cursor_advanced log for the malformed envelope's seq (5); " +
+                    "captured:\n${captured.joinToString("\n")}",
+            )
+            // Bad-MAC posture telemetry for the drop:
+            assertTrue(
+                captured.any {
+                    it.startsWith("REST_TRACE poll_mac_verify_repeat") &&
+                        "reason=no_mac_field" in it
+                },
+                "expected a `poll_mac_verify_repeat reason=no_mac_field` line for the " +
+                    "malformed envelope; got:\n${captured.joinToString("\n")}",
+            )
+        } finally {
+            collectorJob.cancel()
+            orch.stop()
+            runCurrent()
+        }
     }
 
     /**
@@ -769,6 +1094,7 @@ class RestFallbackOrchestratorC6Test {
     ) : RestFallbackTransport {
         val pollCalls: MutableList<Long?> = mutableListOf()
         val authCalls: MutableList<Unit> = mutableListOf()
+        val ackCalls: MutableList<String> = mutableListOf()
         override suspend fun authSession(
             url: String,
             body: AuthSessionRequest,
@@ -800,11 +1126,14 @@ class RestFallbackOrchestratorC6Test {
         }
         override suspend fun ackDeliver(
             url: String, token: String, body: AckDeliverRequest,
-        ): RestFallbackResponse<AckDeliverResponse> = RestFallbackResponse(
-            statusCode = 200,
-            bodyParsed = AckDeliverResponse(ok = 1),
-            rawBody = "{}", elapsedMs = 1L,
-        )
+        ): RestFallbackResponse<AckDeliverResponse> {
+            ackCalls += body.id
+            return RestFallbackResponse(
+                statusCode = 200,
+                bodyParsed = AckDeliverResponse(ok = 1),
+                rawBody = "{}", elapsedMs = 1L,
+            )
+        }
     }
 
     /**
@@ -833,21 +1162,35 @@ class RestFallbackOrchestratorC6Test {
 
     private class NoopCursor : LongPollCursorRepository {
         override suspend fun getLastSeenSeq(identityHex: String): Long? = null
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {}
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome = CursorUpsertOutcome.Advanced(seq)
     }
 
     /**
      * Recording cursor for the C6 review-fix log-shape pins. Captures
      * every successful upsert so a test can assert both the write
      * landed AND the `cursor_advanced` log line carrying the same seq.
+     * C6 review-fix round 2 — discriminate Advanced from NoChange.
      */
     private class RecordingCursor : LongPollCursorRepository {
         var initialSeq: Long? = null
         val writes: MutableList<Triple<String, Long, Long>> = mutableListOf()
         override suspend fun getLastSeenSeq(identityHex: String): Long? = initialSeq
-        override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long) {
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome {
+            val previous = initialSeq
+            if (previous != null && previous >= seq) {
+                return CursorUpsertOutcome.NoChange(previous)
+            }
             writes += Triple(identityHex, seq, nowMs)
-            initialSeq = maxOf(initialSeq ?: Long.MIN_VALUE, seq)
+            initialSeq = maxOf(previous ?: Long.MIN_VALUE, seq)
+            return CursorUpsertOutcome.Advanced(seq)
         }
     }
 
@@ -857,6 +1200,7 @@ class RestFallbackOrchestratorC6Test {
         csprng: Csprng = phantom.core.crypto.LibsodiumCsprng,
         longPollEnabled: Boolean = false,
         cursor: LongPollCursorRepository = NoopCursor(),
+        s6DebugTriggerEnabled: Boolean = false,
         logSink: (String) -> Unit = {},
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
         baseUrl = "https://relay.test",
@@ -871,5 +1215,6 @@ class RestFallbackOrchestratorC6Test {
         cursorRepository = cursor,
         dispatcher = StandardTestDispatcher(scheduler),
         csprng = csprng,
+        s6DebugTriggerEnabled = s6DebugTriggerEnabled,
     )
 }
