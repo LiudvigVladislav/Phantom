@@ -702,7 +702,20 @@ class RestFallbackOrchestrator(
                 } else {
                     log("REST_TRACE ws_active_poll_skipped long_poll_enabled=false")
                 }
-                log("REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled")
+                // Trek 2 Stage 2B-B (C6 review-fix round 1 P1.1) —
+                // the Tele2 LTE smoke runbook (`trek2-stage2b-b-
+                // tele2-smoke.md`) requires the literal substring
+                // `LONGPOLL_V2_ENABLED=<0|1>` at orchestrator
+                // construction so a logcat grep can prove the
+                // BuildConfig flag value the runtime was built with.
+                // The Boolean `long_poll_enabled=` field is kept for
+                // back-compatible parsers; the literal string form
+                // is the smoke-pin shape.
+                val longPollV2EnabledFlagValue = if (longPollEnabled) "1" else "0"
+                log(
+                    "REST_TRACE orchestrator_started long_poll_enabled=$longPollEnabled " +
+                        "LONGPOLL_V2_ENABLED=$longPollV2EnabledFlagValue",
+                )
             }
         }
     }
@@ -1270,6 +1283,18 @@ class RestFallbackOrchestrator(
                             nowMs = now(),
                         )
                         upsertOk = true
+                        // Trek 2 Stage 2B-B (C6 review-fix round 1
+                        // P1.1) — Tele2 smoke pin: `cursor_advanced
+                        // seq=<n>` with strictly-monotonic `seq`. The
+                        // upsert just succeeded; the cursor table
+                        // holds at least `pendingSeq` for this
+                        // identity. The runbook greps this line to
+                        // prove persistence happened on the device
+                        // under field conditions.
+                        log(
+                            "REST_TRACE cursor_advanced seq=$pendingSeq " +
+                                "id=${envelopeId.take(8)} attempt=${attemptIdx + 1}",
+                        )
                     } catch (ce: CancellationException) {
                         // Cancellation MUST propagate. `runCatching`
                         // would have silently caught it and turned
@@ -1466,7 +1491,23 @@ class RestFallbackOrchestrator(
             // `withContext(NonCancellable)`. Non-probe iterations
             // pay no cost beyond the empty finally branch.
             try {
-                log("REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode")
+                // Trek 2 Stage 2B-B (C6 review-fix round 1 P1.1
+                // headers + P1.2 probe) — Tele2 smoke pin. The
+                // `X-Phantom-Long-Poll=...` and `X-Phantom-Padded-
+                // Poll=...` literals expose the headers actually
+                // emitted on this call so the runbook's grep finds
+                // them inside `REST_TRACE` without re-running the
+                // request through a packet capture. The `probe=`
+                // flag distinguishes the HalfOpen single-probe
+                // iteration from regular ones — S6 pass criterion
+                // 4 needs to greppably identify the probe.
+                val lpHeaderValue = if (longPollEnabled) "1" else "absent"
+                val ppHeaderValue = if (longPollEnabled) "1" else "absent"
+                log(
+                    "REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode " +
+                        "probe=$isProbe " +
+                        "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue",
+                )
                 val startMs = now()
                 val outcome = runCatching {
                     // Trek 2 Stage 2B-A (B1) — gate the long-poll opt-in pair
@@ -1785,9 +1826,20 @@ class RestFallbackOrchestrator(
             // `withContext(NonCancellable)`. Non-probe iterations
             // pay no cost beyond the empty finally branch.
             try {
+                // Trek 2 Stage 2B-B (C6 review-fix round 1 P1.1
+                // headers + P1.2 probe) — see the matching block in
+                // [pollLoop] above for the smoke-pin rationale.
+                // `long_poll_enabled=true` is preserved (the parallel
+                // loop only spawns when the flag is on, so the
+                // literal is constant here) so back-compat parsers
+                // see no shape change; the new fields are appended.
+                val lpHeaderValue = if (longPollEnabled) "1" else "absent"
+                val ppHeaderValue = if (longPollEnabled) "1" else "absent"
                 log(
                     "REST_TRACE ws_active_poll_call since_seq=${sinceSeq ?: -1L} " +
-                        "long_poll_enabled=true",
+                        "long_poll_enabled=true " +
+                        "probe=$isProbe " +
+                        "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue",
                 )
                 val startMs = now()
                 val outcome = runCatching {
@@ -2051,7 +2103,19 @@ class RestFallbackOrchestrator(
             // order: we are INSIDE `tokenMutex`; `_inboundStateMutex`
             // is inner.
             _inboundStateMutex.withLock {
+                val priorState = _verifyKeyState
                 _verifyKeyState = transition(_verifyKeyState, RefreshOutcome.Failure)
+                // Trek 2 Stage 2B-B (C6 review-fix round 1 P1.1) —
+                // Tele2 smoke pin: `seq_mac_verify_key_state=<name>`
+                // ≥ 1× before envelope ingest. `from=` captures the
+                // pre-transition state for diagnostic triage. The
+                // key payload is NOT logged: VerifyKeyState.toString
+                // already redacts; `logName()` is a literal class
+                // identifier with zero per-key bits.
+                log(
+                    "REST_TRACE seq_mac_verify_key_state=${verifyKeyStateLogName(_verifyKeyState)} " +
+                        "from=${verifyKeyStateLogName(priorState)} outcome=Failure",
+                )
             }
             return@withLock null
         }
@@ -2074,7 +2138,20 @@ class RestFallbackOrchestrator(
         // serialisation as the failure branch above.
         _inboundStateMutex.withLock {
             val outcome = classifyVerifyKeyResponse(response.seqMacVerifyKey)
+            val priorState = _verifyKeyState
             _verifyKeyState = transition(_verifyKeyState, outcome)
+            // Trek 2 Stage 2B-B (C6 review-fix round 1 P1.1) — Tele2
+            // smoke pin: see the matching block on the Failure path
+            // above. `outcome::class.simpleName` resolves to
+            // `Empty`/`Valid`/`Malformed`; `Valid` redacts the hex
+            // via its companion-locked `toString` so a future log-
+            // line tweak printing `outcome=$outcome` would also be
+            // safe — we keep the literal class name here for the
+            // smoke grep.
+            log(
+                "REST_TRACE seq_mac_verify_key_state=${verifyKeyStateLogName(_verifyKeyState)} " +
+                    "from=${verifyKeyStateLogName(priorState)} outcome=${outcome::class.simpleName}",
+            )
         }
         log(
             "REST_TRACE token_cached reason=$reason " +
@@ -2654,6 +2731,21 @@ class RestFallbackOrchestrator(
         return effectiveDelayMs
     }
 
+    /**
+     * Trek 2 Stage 2B-B (C6 review-fix round 1 P1.1) — literal
+     * class identifier used by the `seq_mac_verify_key_state=...`
+     * smoke pin log. The verify key payload is intentionally NOT
+     * surfaced: even a leading-prefix disclosure on the 64-char hex
+     * is enough for an offline correlator to link sessions of the
+     * same identity across logs. The class name carries zero
+     * per-key bits.
+     */
+    private fun verifyKeyStateLogName(state: VerifyKeyState): String = when (state) {
+        VerifyKeyState.KeyAbsent -> "KeyAbsent"
+        is VerifyKeyState.KeyPresent -> "KeyPresent"
+        VerifyKeyState.KeySuspended -> "KeySuspended"
+    }
+
     private suspend fun processInboundEnvelopeWithVerify(
         env: PollEnvelope,
         currentToken: String,
@@ -3179,6 +3271,72 @@ class RestFallbackOrchestrator(
      */
     internal fun peekHasBreakerTimerForTest(): Boolean =
         _breakerTimerJob != null
+
+    /**
+     * Trek 2 Stage 2B-B (C6 review-fix round 1 P1.2) — S6
+     * controllable trigger. Simulates [BREAKER_CONSECUTIVE_FAIL_THRESHOLD]
+     * consecutive REST poll failures by forcing the breaker into
+     * [LongPollBreakerState.Open] under the inbound-state mutex and
+     * emitting the `breaker_test_trigger_fired` log the Tele2 LTE
+     * smoke runbook greps for.
+     *
+     * The runbook (`docs/tracks/trek2-stage2b-b-tele2-smoke.md`,
+     * scenario S6 line 101 / 114) accepts this helper iff natural
+     * Mode-2 does not reproduce inside the 30-minute Tele2 LTE
+     * time-box. The PR description must quote the helper invocation
+     * line AND the natural-trigger absence note.
+     *
+     * **Production safety.** The Android AppContainer wires this
+     * helper through a debug-menu surface gated on
+     * `BuildConfig.DEBUG` so a release APK has no reachable code
+     * path that could call it. The `internal` visibility prevents
+     * production callers in other Gradle modules from grabbing a
+     * reference outside the test seam.
+     *
+     * **Effect.** Bumps `_breakerFailCount` to the threshold and
+     * routes through the regular [transitionToOpenUnderMutex] so
+     * the resulting state — `Open(ConsecutiveRestFailures, cooldownMs)`
+     * with a fresh timer Job, epoch bumped, fail counter reset —
+     * is byte-identical to what a natural 5-failure trip produces.
+     * Subsequent pollLoop iterations skip with
+     * `breaker_open_ConsecutiveRestFailures`; the existing
+     * cooldown / HalfOpen / probe / re-Open / re-Close machinery
+     * exercises exactly as in production.
+     */
+    internal suspend fun forceBreakerTripForS6TestTrigger() {
+        // Emit the trigger log BEFORE acquiring the mutex so the
+        // line appears in logcat even if the transition itself
+        // contends momentarily — the runbook needs the line
+        // grep-discoverable regardless of contention timing.
+        log(
+            "REST_TRACE breaker_test_trigger_fired " +
+                "reason=${BreakerOpenReason.ConsecutiveRestFailures} " +
+                "threshold=$BREAKER_CONSECUTIVE_FAIL_THRESHOLD",
+        )
+        _inboundStateMutex.withLock {
+            // Synthesize the threshold-1 fail count then bump the
+            // last one through `transitionToOpenUnderMutex` so the
+            // log shape matches the natural-trip path's
+            // `REST_TRACE breaker_open reason=... cooldown_ms=...`
+            // line. Resetting `_breakerFailCount` to 0 (which
+            // `transitionToOpenUnderMutex` does) maintains the
+            // same invariant the production trip ends with.
+            _breakerFailCount = BREAKER_CONSECUTIVE_FAIL_THRESHOLD
+            _status410StormTimestamps.clear()
+            transitionToOpenUnderMutex(
+                BreakerOpenReason.ConsecutiveRestFailures,
+                _breakerCurrentCooldownMs,
+            )
+        }
+        log(
+            "REST_TRACE breaker_open " +
+                "reason=${BreakerOpenReason.ConsecutiveRestFailures} " +
+                "cooldown_ms=${_inboundStateMutex.withLock { _breakerCurrentCooldownMs }}",
+        )
+        stateMachine.onEvent(
+            RestStateMachine.Event.RestPollDegraded(BreakerOpenReason.ConsecutiveRestFailures),
+        )
+    }
 
     /**
      * Public CAS facade for media token acquisition (PR-M1w).

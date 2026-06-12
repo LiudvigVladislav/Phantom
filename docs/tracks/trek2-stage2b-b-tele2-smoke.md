@@ -18,7 +18,7 @@ The PR description MUST quote, verbatim:
 
 1. **APK SHA-256.** Captured via `sha256sum app-debug.apk` (or beta equivalent) at the exact APK that ran the field session. The SHA pins the binary that produced the log evidence so a different build cannot be substituted post-hoc.
 2. **Build variant.** `debug` or `beta`.
-3. **Runtime flag proof.** A logcat excerpt showing `LONGPOLL_V2_ENABLED=1` at orchestrator construction. The flag is computed from the Gradle-generated `BuildConfig.LONGPOLL_V2_ENABLED` and surfaced in the orchestrator start log line. Without this line the runtime value is unknown.
+3. **Runtime flag proof.** A logcat excerpt of the orchestrator construction line, literal shape: `REST_TRACE orchestrator_started long_poll_enabled=true LONGPOLL_V2_ENABLED=1`. The `LONGPOLL_V2_ENABLED=<0|1>` suffix is computed from the Gradle-generated `BuildConfig.LONGPOLL_V2_ENABLED` BuildConfig field; the Boolean `long_poll_enabled=` precursor is kept for back-compatible parsers. Without this line the runtime value is unknown.
 
 ## Per-scenario log-line evidence (load-bearing)
 
@@ -26,11 +26,11 @@ Each scenario's pass criterion requires ALL of the following log signals during 
 
 | Proof | Log signal |
 |---|---|
-| Feature flag is on | `LONGPOLL_V2_ENABLED=1` at orchestrator construction |
-| Verify-key state is `KeyPresent` | `seq_mac_verify_key_state=KeyPresent` ≥ 1× before first envelope ingest |
-| At least one envelope passes verify | ≥ 1 × `seq_mac_verified` (or equivalent verify-pass log shape) |
-| Cursor is persisted | ≥ 1 × `cursor_advanced seq=<n>` with strictly-monotonic `seq` |
-| Long-poll headers emitted | `X-Phantom-Long-Poll: 1` AND `X-Phantom-Padded-Poll: 1` visible in `REST_TRACE` |
+| Feature flag is on | `REST_TRACE orchestrator_started ... LONGPOLL_V2_ENABLED=1` at orchestrator construction |
+| Verify-key state is `KeyPresent` | `REST_TRACE seq_mac_verify_key_state=KeyPresent` ≥ 1× before first envelope ingest |
+| At least one envelope passes verify | ≥ 1 × `REST_TRACE seq_mac_verified id=<hex> seq=<n>` |
+| Cursor is persisted | ≥ 1 × `REST_TRACE cursor_advanced seq=<n>` with strictly-monotonic `seq` |
+| Long-poll headers emitted | `REST_TRACE poll_call ... X-Phantom-Long-Poll=1 X-Phantom-Padded-Poll=1` (key=value form, value `1` ⇔ flag on, value `absent` ⇔ flag off) |
 
 A log block missing any of the five proofs is NOT a pass regardless of subjective verdict (envelope delivered, chat appears responsive, etc.). The PR description quotes the matching lines verbatim per scenario.
 
@@ -98,20 +98,20 @@ A log block missing any of the five proofs is NOT a pass regardless of subjectiv
 
 **Setup.** Sustain Tele2 LTE upload pressure to provoke Mode-2 cutoff (5-14 KB upload then silence per the byte-threshold finding from the Direct-stability tracks). The breaker does NOT "select" a transport — it controls the REST poll cadence.
 
-**Time-box.** ≥ 30 minutes of Tecno+Tele2 LTE elapsed wall-clock. A **controllable trigger** (debug-mode helper that simulates `BREAKER_CONSECUTIVE_FAIL_THRESHOLD = 5` consecutive REST poll failures by force-returning IOException from the transport) is acceptable iff natural Mode-2 does not reproduce in the 30-min window. If the controllable trigger is used, the PR description names it explicitly and quotes the helper's invocation line.
+**Time-box.** ≥ 30 minutes of Tecno+Tele2 LTE elapsed wall-clock. A **controllable trigger** is acceptable iff natural Mode-2 does not reproduce in the 30-min window. The orchestrator ships an internal seam, `forceBreakerTripForS6TestTrigger()`, that synthesises the threshold-fail-count + transitions the breaker through the production `transitionToOpenUnderMutex` path — byte-identical to a natural 5-failure trip. The seam emits the helper-only log line `REST_TRACE breaker_test_trigger_fired reason=ConsecutiveRestFailures threshold=5` before the regular `breaker_open` line. Production Android builds expose this through a debug-menu surface gated on `BuildConfig.DEBUG`; release APKs have no reachable call path. If the controllable trigger is used, the PR description quotes the trigger log line explicitly.
 
 **Pass criteria (all six required).**
 
-1. **Open trigger.** `breaker_open reason=ConsecutiveRestFailures cooldown_ms=<n>` logs within the threshold (5 consecutive failures).
-2. **Cooldown skip.** REST poll enters the cooldown — `REST_TRACE poll_call_skipped reason=breaker_open_*` lines fire for at least `BREAKER_INITIAL_COOLDOWN_MS = 5_000` ms.
+1. **Open trigger.** `REST_TRACE breaker_open reason=ConsecutiveRestFailures cooldown_ms=<n>` logs within the threshold (5 consecutive failures). When the controllable trigger is used, the `breaker_test_trigger_fired` line precedes it.
+2. **Cooldown skip.** REST poll enters the cooldown — `REST_TRACE poll_call_skipped reason=breaker_open_ConsecutiveRestFailures` lines fire for at least `BREAKER_INITIAL_COOLDOWN_MS = 5_000` ms.
 3. **Direct WSS continuity.** Direct WSS continues delivering messages during the REST cooldown (at least one `WS Deliver` log inside the cooldown window). Per scope: "Direct WSS, Reality, and Tor transports stay operational — the messenger remains usable over those paths." A breaker-open MUST NOT silence the messenger.
-4. **HalfOpen transition.** At cooldown expiry the breaker transitions to `HalfOpen` and issues **exactly one** probe poll: `breaker_half_open` followed by `poll_call ... probe=true` (or equivalent probe-flag shape — the implementation logs the half-open probe distinctly enough to grep).
+4. **HalfOpen transition.** At cooldown expiry the breaker transitions to `HalfOpen` and issues **exactly one** probe poll. The transition emits `REST_TRACE breaker_half_open`; the probe iteration emits `REST_TRACE poll_call ... probe=true X-Phantom-Long-Poll=1 X-Phantom-Padded-Poll=1`. Regular (non-probe) iterations show `probe=false`.
 5. **Probe outcome.** The probe outcome transitions the breaker correctly:
-   - **Probe success** → `breaker_closed`. Polling resumes.
-   - **Probe failure** → `breaker_open reason=ConsecutiveRestFailures cooldown_ms=<doubled>` capped at `BREAKER_COOLDOWN_CEILING_MS = 120_000`.
-6. **Cursor invariance.** Cursor is preserved across all transitions (M-B16 applies in the field) — the persisted `last_seen_seq` does not regress at any point during the cooldown / HalfOpen / re-close cycle.
+   - **Probe success** → `REST_TRACE breaker_closed`. Polling resumes.
+   - **Probe failure** → `REST_TRACE breaker_open reason=ConsecutiveRestFailures cooldown_ms=<doubled>` capped at `BREAKER_COOLDOWN_CEILING_MS = 120_000`.
+6. **Cursor invariance.** Cursor is preserved across all transitions (M-B16 applies in the field) — the persisted `last_seen_seq` does not regress at any point during the cooldown / HalfOpen / re-close cycle. Grep `REST_TRACE cursor_advanced seq=` lines and assert strict monotonicity across the window.
 
-If the controllable trigger is used, the trigger emits `breaker_test_trigger_fired` (or equivalent helper-only log) and the PR description includes both that line AND the natural-trigger absence note (e.g., "30 min Tele2 LTE upload did not provoke Mode-2 in the observation window; controllable trigger invoked at 21 m 47 s mark per breaker_test_trigger_fired log").
+If the controllable trigger is used, the PR description includes both the trigger log line AND the natural-trigger absence note (e.g., "30 min Tele2 LTE upload did not provoke Mode-2 in the observation window; controllable trigger invoked at 21 m 47 s mark per `REST_TRACE breaker_test_trigger_fired` log").
 
 ## Smoke evidence block (PR description)
 
@@ -132,7 +132,7 @@ Carrier: Tele2 LTE
 APK SHA-256: <sha256sum output>
 APK variant: debug | beta
 Runtime flag proof:
-  <logcat line showing LONGPOLL_V2_ENABLED=1>
+  <logcat line: `REST_TRACE orchestrator_started long_poll_enabled=true LONGPOLL_V2_ENABLED=1`>
 Elapsed wall-clock: <hh:mm:ss>
 ```
 
