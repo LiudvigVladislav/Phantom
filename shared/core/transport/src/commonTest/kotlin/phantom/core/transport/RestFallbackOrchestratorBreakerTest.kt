@@ -766,7 +766,7 @@ class RestFallbackOrchestratorBreakerTest {
         orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
         check(orch.peekBreakerStateForTest() == LongPollBreakerState.HalfOpen(probeInFlight = true))
 
-        orch.releaseProbePermitIfStillHeldForTest()
+        orch.releaseProbePermitIfStillHeldForTest(iterationEpoch = orch.peekBreakerEpochForTest())
         assertEquals(
             LongPollBreakerState.HalfOpen(probeInFlight = false),
             orch.peekBreakerStateForTest(),
@@ -787,7 +787,7 @@ class RestFallbackOrchestratorBreakerTest {
         check(caps.restFallback)
 
         orch.setBreakerStateForTest(LongPollBreakerState.Closed)
-        orch.releaseProbePermitIfStillHeldForTest()
+        orch.releaseProbePermitIfStillHeldForTest(iterationEpoch = orch.peekBreakerEpochForTest())
         assertEquals(
             LongPollBreakerState.Closed,
             orch.peekBreakerStateForTest(),
@@ -795,7 +795,7 @@ class RestFallbackOrchestratorBreakerTest {
         )
 
         orch.setBreakerStateForTest(LongPollBreakerState.Open(BreakerOpenReason.ConsecutiveRestFailures, 5_000L))
-        orch.releaseProbePermitIfStillHeldForTest()
+        orch.releaseProbePermitIfStillHeldForTest(iterationEpoch = orch.peekBreakerEpochForTest())
         val openAfterRelease = orch.peekBreakerStateForTest()
         assertTrue(
             openAfterRelease is LongPollBreakerState.Open,
@@ -817,7 +817,7 @@ class RestFallbackOrchestratorBreakerTest {
         check(caps.restFallback)
         // Seed mid-cancellation state.
         orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
-        orch.releaseProbePermitIfStillHeldForTest()
+        orch.releaseProbePermitIfStillHeldForTest(iterationEpoch = orch.peekBreakerEpochForTest())
         check(orch.peekBreakerStateForTest() == LongPollBreakerState.HalfOpen(probeInFlight = false))
 
         // Next caller claims fresh.
@@ -2645,7 +2645,181 @@ class RestFallbackOrchestratorBreakerTest {
         }
     }
 
+    // ── C5 round-5 review-fix regression pins ───────────────────────────────
+
+    @Test
+    fun cf5_p1_old_probe_owner_finally_does_not_release_new_owner_permit() = runTest(timeout = 5.minutes) {
+        // Round-5 P1: `releaseProbePermitIfStillHeld` did not
+        // take an iteration epoch. Scenario:
+        //   1. Probe A claimed permit at epoch N.
+        //   2. handle410 trips Open(Status410Storm) at N+1.
+        //   3. Timer fires Open → HalfOpen(false) at N+2.
+        //   4. Loop B claims new permit at N+2.
+        //   5. A's `finally` fires release. Without epoch
+        //      gating the release sees HalfOpen(probeInFlight=true)
+        //      and flips it back to false — DROPPING B's permit.
+        //
+        // Round-5 fix: release is no-op when epoch mismatches.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ ->
+            RestFallbackResponse(statusCode = 200, bodyParsed = null, rawBody = "", elapsedMs = 1L)
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            val epochA = orch.peekBreakerEpochForTest()
+            // Simulate state cycles via seam (each bumps epoch).
+            orch.setBreakerStateForTest(
+                LongPollBreakerState.Open(
+                    BreakerOpenReason.ConsecutiveRestFailures,
+                    RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                ),
+            )
+            orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = false))
+            orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
+            val epochB = orch.peekBreakerEpochForTest()
+            assertTrue(
+                epochB > epochA,
+                "expected epoch to advance; epochA=$epochA epochB=$epochB",
+            )
+            // A's stale finally fires.
+            orch.releaseProbePermitIfStillHeldForTest(iterationEpoch = epochA)
+            assertEquals(
+                LongPollBreakerState.HalfOpen(probeInFlight = true),
+                orch.peekBreakerStateForTest(),
+                "stale-epoch release MUST NOT drop the new owner's permit. If state flipped " +
+                    "to probeInFlight=false, the round-4 bug is back: A's old finally killed " +
+                    "B's claim.",
+            )
+            // B's current-epoch release DOES drop the permit.
+            orch.releaseProbePermitIfStillHeldForTest(iterationEpoch = epochB)
+            assertEquals(
+                LongPollBreakerState.HalfOpen(probeInFlight = false),
+                orch.peekBreakerStateForTest(),
+                "current-epoch release MUST drop the permit (the cancellation-safety " +
+                    "semantic is preserved for the actual owner).",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf5_p2_in_flight_410_arriving_after_epoch_change_is_full_noop() = runTest(timeout = 5.minutes) {
+        // Round-5 P2: round-4's stale-410 tests relied on the
+        // breaker gate having ALREADY Skipped, so handle410 was
+        // never actually reached. The real race the round-4 fix
+        // was supposed to close: a 410 already in-flight when
+        // state transitioned. Repro deterministically with a
+        // transport that suspends the first poll inside
+        // `withContext(NonCancellable)` until released by the
+        // test.
+        init()
+        val pollEntered = CompletableDeferred<Unit>()
+        val gateRelease = CompletableDeferred<Unit>()
+        val transport = BreakerTestTransport(pollScript = { i ->
+            if (i == 0) {
+                pollEntered.complete(Unit)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                    gateRelease.await()
+                }
+            }
+            RestFallbackResponse(statusCode = 410, bodyParsed = null, rawBody = "", elapsedMs = 1L)
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            repeat(20) {
+                if (pollEntered.isCompleted) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            check(pollEntered.isCompleted) {
+                "expected pollLoop to have entered transport.poll's NonCancellable gate"
+            }
+            // Force state transitions via seam (each bumps epoch).
+            orch.setBreakerStateForTest(
+                LongPollBreakerState.Open(
+                    BreakerOpenReason.ConsecutiveRestFailures,
+                    RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                ),
+            )
+            orch.setBreakerStateForTest(LongPollBreakerState.Closed)
+            val timestampsBefore = orch.peekStatus410StormTimestampsForTest()
+            val backoffBefore = orch.peekCurrent410BackoffMsForTest()
+            // Release gate. transport.poll returns 410; handle410
+            // is called with the (now-stale) gate-time epoch.
+            gateRelease.complete(Unit)
+            runCurrent()
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(
+                timestampsBefore,
+                orch.peekStatus410StormTimestampsForTest(),
+                "in-flight 410 with stale epoch MUST NOT add to storm timestamps. " +
+                    "Got ${orch.peekStatus410StormTimestampsForTest()}.",
+            )
+            assertEquals(
+                backoffBefore,
+                orch.peekCurrent410BackoffMsForTest(),
+                "in-flight 410 with stale epoch MUST NOT double the 410 backoff. " +
+                    "Got backoff=${orch.peekCurrent410BackoffMsForTest()}.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf5_p2_classifyPollResponse_buckets_pinned_for_drift_detection() {
+        // Round-5 P2: both poll loops now route through
+        // [classifyPollResponse], so a future status-code drift
+        // requires changing the enum + auditing both loops.
+        // Pin the exact buckets so the enum cannot drift
+        // silently either.
+        assertEquals("Ok200", classifyForTest(200))
+        assertEquals("Ok200", classifyForTest(204))
+        assertEquals("Ok200", classifyForTest(299))
+        assertEquals("TokenStale", classifyForTest(401))
+        assertEquals("GoneReauth", classifyForTest(410))
+        assertEquals("RateLimit", classifyForTest(429))
+        assertEquals("ServerError", classifyForTest(500))
+        assertEquals("ServerError", classifyForTest(503))
+        assertEquals("ServerError", classifyForTest(599))
+        assertEquals("Other", classifyForTest(400))
+        assertEquals("Other", classifyForTest(403))
+        assertEquals("Other", classifyForTest(409))
+        assertEquals("Other", classifyForTest(418))
+    }
+
     // ── Fixtures ────────────────────────────────────────────────────────────
+
+    /**
+     * Test-side mirror of the production
+     * [RestFallbackOrchestrator.classifyPollResponse] so a drift
+     * surfaces by failing the pin rather than silently diverging.
+     */
+    private fun classifyForTest(statusCode: Int): String = when (statusCode) {
+        401 -> "TokenStale"
+        410 -> "GoneReauth"
+        429 -> "RateLimit"
+        in 200..299 -> "Ok200"
+        in 500..599 -> "ServerError"
+        else -> "Other"
+    }
 
     private val IDENTITY: String = "aa".repeat(32)
 

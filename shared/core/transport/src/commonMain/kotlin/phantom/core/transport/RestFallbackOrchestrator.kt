@@ -1511,18 +1511,17 @@ class RestFallbackOrchestrator(
                 }
 
                 val response = outcome.getOrThrow()
-                when (response.statusCode) {
-                    401 -> {
-                        // Trek 2 Stage 2B-B (C5, L9) — 401 is a token
-                        // issue, not a transport failure. The relay
-                        // answered; the breaker treats this as a
-                        // successful observation (resets counters /
-                        // exits Open or HalfOpen).
+                // Trek 2 Stage 2B-B (C5 round-5 review-fix P2) —
+                // route through [classifyPollResponse] so both poll
+                // loops dispatch on the same enumerated set and a
+                // future drift requires an enum edit + audit of
+                // both loops.
+                when (classifyPollResponse(response.statusCode)) {
+                    PollResponseClass.TokenStale -> {
+                        // 401 is a token issue, not a transport
+                        // failure. The relay answered.
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
                         staleToken = token
-                        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
-                        // backoff. Token-stale on a burst can herd if multiple
-                        // poll iterations all 401 at the same moment.
                         val nominalDelay = POLL_FAIL_BACKOFF_MS
                         val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
@@ -1533,7 +1532,7 @@ class RestFallbackOrchestrator(
                         delay(jitteredDelay)
                         continue
                     }
-                    in 200..299 -> {
+                    PollResponseClass.Ok200 -> {
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = true)
                         val parsed = response.bodyParsed
                         if (parsed == null || parsed.envelopes.isEmpty()) {
@@ -1546,14 +1545,6 @@ class RestFallbackOrchestrator(
                                 "REST_TRACE poll_received id=${env.id.take(8)} " +
                                     "from=${env.fromHex.take(8)} elapsedMs=$elapsed more=${parsed.more}",
                             )
-                            // Trek 2 Stage 2B-B (C4, L6 + L7) — verify
-                            // the envelope against the snapshotted
-                            // verify-key state and gate ingestion on the
-                            // outcome. The helper handles all L2 / L6 /
-                            // L7 cases including the bad-MAC posture;
-                            // `lastInboundOrSendAtMs` is bumped only on
-                            // a successful emit (verified path or
-                            // KeyAbsent unverified pass-through).
                             val emitted = processInboundEnvelopeWithVerify(
                                 env = env,
                                 currentToken = token,
@@ -1563,28 +1554,17 @@ class RestFallbackOrchestrator(
                                 lastInboundOrSendAtMs = now()
                             }
                         }
-                        // Drain immediately if server says there's more.
                         if (parsed.more) {
                             delay(POLL_DRAIN_IMMEDIATE_MS)
                             continue
                         }
                         delay(intervalMs)
                     }
-                    429 -> {
-                        // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour
-                        // the relay's `Retry-After` header, clamped to
-                        // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
-                        // multiplying by 1_000L. Falls back to the
-                        // existing intervalMs/POLL_FAIL_BACKOFF_MS
-                        // jittered backoff when the header is absent or
-                        // malformed. 429 is rate-limit, not transport
-                        // failure: the relay answered; record as
-                        // success for the breaker.
+                    PollResponseClass.RateLimit -> {
+                        // 429 — Retry-After dance.
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
                         val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
                         val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
-                            // No jitter — the relay's scheduling
-                            // suggestion is its own discipline.
                             clampedRetryAfterMs to clampedRetryAfterMs
                         } else {
                             val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
@@ -1599,10 +1579,8 @@ class RestFallbackOrchestrator(
                         )
                         delay(effectiveDelay)
                     }
-                    in 500..599 -> {
-                        // Trek 2 Stage 2B-B (C5, L9) — 5xx is a
-                        // transport-class failure per scope §L9
-                        // taxonomy. Counts toward the breaker.
+                    PollResponseClass.ServerError -> {
+                        // 5xx — transport failure.
                         recordRestFailure(iterationEpoch = iterationEpoch, isProbe = isProbe)
                         val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                         val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
@@ -1614,34 +1592,14 @@ class RestFallbackOrchestrator(
                         )
                         delay(jitteredDelay)
                     }
-                    410 -> {
-                        // Trek 2 Stage 2B-B (C5, L8 + L9) — the 410
-                        // reauth dance. `handle410` performs the L8
-                        // capped exponential backoff (5 s floor /
-                        // 60 s ceiling / doubling) AND the L9 storm
-                        // detection (Kth 410 within W → Open with
-                        // Status410Storm reason); refreshes the
-                        // token; returns the millisecond delay to
-                        // apply. 410 is NOT a transport failure per
-                        // scope §L9 taxonomy: do NOT call
-                        // `recordRestFailure` (would falsely count
-                        // toward `ConsecutiveRestFailures`) and do
-                        // NOT call `recordRestSuccess` (would
-                        // inadvertently clear an Open state, incl.
-                        // the storm-triggered Open we just set).
+                    PollResponseClass.GoneReauth -> {
+                        // 410 — L8 reauth dance + L9 storm detection.
                         val nextDelayMs = handle410(token = token, iterationEpoch = iterationEpoch, isProbe = isProbe, loopTag = "pollLoop")
                         delay(nextDelayMs)
                     }
-                    else -> {
-                        // Trek 2 Stage 2B-B (C5, L9) — 4xx-other
-                        // (NOT 410; 410 has its own dance above).
-                        // The relay answered, so the breaker
-                        // records success for the consecutive-fail
-                        // dimension.
+                    PollResponseClass.Other -> {
+                        // 4xx-other — drop + log.
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
-                        // PR-WS-HEALTH-STATE1 Commit 2 (2026-05-30): jittered
-                        // backoff. Server-unexpected-status retries can herd
-                        // when a transient relay condition rejects many polls.
                         val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
                         val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
                         val jitteredDelay = (nominalDelay * jitterFactor).toLong()
@@ -1663,7 +1621,7 @@ class RestFallbackOrchestrator(
                     // guarantees the reset itself cannot be cancelled
                     // inside its own critical section.
                     withContext(NonCancellable) {
-                        releaseProbePermitIfStillHeld()
+                        releaseProbePermitIfStillHeld(iterationEpoch = iterationEpoch)
                     }
                 }
             }
@@ -1837,91 +1795,71 @@ class RestFallbackOrchestrator(
                 }
 
                 val response = outcome.getOrThrow()
-                if (response.statusCode == 401) {
-                    recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
-                    staleToken = token
-                    log(
-                        "REST_TRACE ws_active_poll_unauthorised status=401 " +
-                            "elapsedMs=$elapsed — will refresh token",
-                    )
-                    continue
-                }
-                if (response.statusCode == 429) {
-                    // Trek 2 Stage 2B-B (C5, L8 + M-B24) — honour the
-                    // relay's `Retry-After` header, clamped to
-                    // `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE
-                    // multiplying by 1_000L. Falls back to the existing
-                    // jittered backoff when the header is absent or
-                    // malformed. Same shape as the legacy `pollLoop`'s
-                    // 429 branch.
-                    recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
-                    val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
-                    val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
-                        clampedRetryAfterMs to clampedRetryAfterMs
-                    } else {
-                        val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                        nominal to (nominal * jitterFactor).toLong()
+                // Trek 2 Stage 2B-B (C5 round-5 review-fix P2) —
+                // unified dispatch on [classifyPollResponse]. Same
+                // enum as the legacy pollLoop's `when`.
+                when (classifyPollResponse(response.statusCode)) {
+                    PollResponseClass.TokenStale -> {
+                        recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
+                        staleToken = token
+                        log(
+                            "REST_TRACE ws_active_poll_unauthorised status=401 " +
+                                "elapsedMs=$elapsed — will refresh token",
+                        )
+                        continue
                     }
-                    log(
-                        "REST_TRACE ws_active_poll_429 elapsedMs=$elapsed " +
-                            "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
-                            "retry_after_secs=${response.retryAfterSeconds ?: -1L}",
-                    )
-                    delay(effectiveDelay)
-                    continue
-                }
-                if (response.statusCode in 500..599) {
-                    // Trek 2 Stage 2B-B (C5, L9) — 5xx counts toward
-                    // the breaker per scope §L9 taxonomy.
-                    recordRestFailure(iterationEpoch = iterationEpoch, isProbe = isProbe)
-                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
-                    log(
-                        "REST_TRACE ws_active_poll_5xx status=${response.statusCode} " +
-                            "elapsedMs=$elapsed next_delay_ms=$jitteredDelay",
-                    )
-                    delay(jitteredDelay)
-                    continue
-                }
-                if (response.statusCode == 410) {
-                    // Trek 2 Stage 2B-B (C5, L8 + L9) — same shape
-                    // as the legacy `pollLoop`'s 410 branch. See
-                    // there for the rationale on NOT calling
-                    // `recordRestFailure` / `recordRestSuccess` on
-                    // 410.
-                    val nextDelayMs = handle410(token = token, iterationEpoch = iterationEpoch, isProbe = isProbe, loopTag = "wsActivePollLoop")
-                    delay(nextDelayMs)
-                    continue
-                }
-                if (response.statusCode !in 200..299) {
-                    // Trek 2 Stage 2B-B (C5, L9; round-4 P2)
-                    // — 4xx-other (NOT 410; 410 has its own
-                    // dance above). The relay answered, so the
-                    // breaker records success for the
-                    // consecutive-fail dimension.
-                    //
-                    // Round-4 P2: this branch used to also
-                    // capture `bodyParsed == null`, which
-                    // shoved 2xx-with-bad-body into the
-                    // isOkResponse=false bucket — DIVERGED
-                    // from the legacy pollLoop's 200..299
-                    // arm, which treats body parsing as
-                    // unrelated to status-code classification.
-                    // Round-4 unifies on status-code-only
-                    // classification.
-                    recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
-                    val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
-                    val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
-                    val jitteredDelay = (nominalDelay * jitterFactor).toLong()
-                    log(
-                        "REST_TRACE ws_active_poll_unexpected_status " +
-                            "status=${response.statusCode} elapsedMs=$elapsed " +
-                            "next_delay_ms=$jitteredDelay",
-                    )
-                    delay(jitteredDelay)
-                    continue
+                    PollResponseClass.RateLimit -> {
+                        recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
+                        val clampedRetryAfterMs = clampRetryAfterMs(response.retryAfterSeconds)
+                        val (nominalDelay, effectiveDelay) = if (clampedRetryAfterMs != null) {
+                            clampedRetryAfterMs to clampedRetryAfterMs
+                        } else {
+                            val nominal = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                            val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                            nominal to (nominal * jitterFactor).toLong()
+                        }
+                        log(
+                            "REST_TRACE ws_active_poll_429 elapsedMs=$elapsed " +
+                                "next_delay_ms=$effectiveDelay nominal_delay_ms=$nominalDelay " +
+                                "retry_after_secs=${response.retryAfterSeconds ?: -1L}",
+                        )
+                        delay(effectiveDelay)
+                        continue
+                    }
+                    PollResponseClass.ServerError -> {
+                        recordRestFailure(iterationEpoch = iterationEpoch, isProbe = isProbe)
+                        val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        log(
+                            "REST_TRACE ws_active_poll_5xx status=${response.statusCode} " +
+                                "elapsedMs=$elapsed next_delay_ms=$jitteredDelay",
+                        )
+                        delay(jitteredDelay)
+                        continue
+                    }
+                    PollResponseClass.GoneReauth -> {
+                        val nextDelayMs = handle410(token = token, iterationEpoch = iterationEpoch, isProbe = isProbe, loopTag = "wsActivePollLoop")
+                        delay(nextDelayMs)
+                        continue
+                    }
+                    PollResponseClass.Other -> {
+                        recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
+                        val nominalDelay = intervalMs.coerceAtLeast(POLL_FAIL_BACKOFF_MS)
+                        val jitterFactor = 0.8 + Random.Default.nextDouble() * 0.4
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
+                        log(
+                            "REST_TRACE ws_active_poll_unexpected_status " +
+                                "status=${response.statusCode} elapsedMs=$elapsed " +
+                                "next_delay_ms=$jitteredDelay",
+                        )
+                        delay(jitteredDelay)
+                        continue
+                    }
+                    PollResponseClass.Ok200 -> {
+                        // Fall through to the 200..299 envelope-
+                        // processing block below.
+                    }
                 }
                 // 200..299 branch — round-4 P2 symmetric with
                 // legacy pollLoop. isOkResponse = true regardless
@@ -1976,7 +1914,7 @@ class RestFallbackOrchestrator(
             } finally {
                 if (isProbe) {
                     withContext(NonCancellable) {
-                        releaseProbePermitIfStillHeld()
+                        releaseProbePermitIfStillHeld(iterationEpoch = iterationEpoch)
                     }
                 }
             }
@@ -2528,8 +2466,37 @@ class RestFallbackOrchestrator(
      * MUST be called inside `withContext(NonCancellable)` so the
      * reset itself cannot be cancelled inside its critical section.
      */
-    private suspend fun releaseProbePermitIfStillHeld() {
+    private suspend fun releaseProbePermitIfStillHeld(iterationEpoch: Long) {
         _inboundStateMutex.withLock {
+            // Trek 2 Stage 2B-B (C5 round-5 review-fix P1) —
+            // epoch-gate the permit release. Round-4 caught
+            // recordRest* / handle410 ABA but the probe-permit
+            // finally was not threaded through. Scenario:
+            //   1. Probe A's iteration captured epoch N.
+            //   2. A's transport.poll receives the 3rd 410.
+            //   3. handle410 trips Open(Status410Storm) → epoch N+1.
+            //   4. A's finally runs the legacy 60 s delay then
+            //      exits the try; the next iteration would be
+            //      gated by the new state.
+            //   5. Meanwhile the storm cooldown timer fires:
+            //      Open → HalfOpen(probeInFlight=false) at epoch N+2.
+            //   6. Loop B claims the new probe permit at
+            //      epoch N+2 — flips to
+            //      HalfOpen(probeInFlight=true).
+            //   7. A's finally fires `releaseProbePermitIfStillHeld`.
+            //      Without epoch gating, the release sees
+            //      HalfOpen(probeInFlight=true) and flips it
+            //      back to false — DROPPING B's permit. Either
+            //      another loop now double-claims (parallel
+            //      probes against the relay) or B's probe
+            //      proceeds without permit (state torn).
+            //
+            // Fix: release ONLY if the iteration's epoch matches
+            // current. The release is a no-op for any prior
+            // generation's owner.
+            if (iterationEpoch != _breakerEpoch) {
+                return@withLock
+            }
             val current = _breakerState
             if (current is LongPollBreakerState.HalfOpen && current.probeInFlight) {
                 _breakerState = LongPollBreakerState.HalfOpen(probeInFlight = false)
@@ -3118,8 +3085,8 @@ class RestFallbackOrchestrator(
      * pin the cancellation-safe permit release without standing up
      * a controllable suspending transport for the claimant loop.
      */
-    internal suspend fun releaseProbePermitIfStillHeldForTest() {
-        releaseProbePermitIfStillHeld()
+    internal suspend fun releaseProbePermitIfStillHeldForTest(iterationEpoch: Long) {
+        releaseProbePermitIfStillHeld(iterationEpoch = iterationEpoch)
     }
 
     /**
