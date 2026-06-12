@@ -39,21 +39,29 @@ class SqlDelightLastSeenSeqRepository(
         identityHex: String,
         seq: Long,
         nowMs: Long,
-    ): Unit = withContext(Dispatchers.IO) {
-        db.transactionWithResult {
+    ): Long? = withContext(Dispatchers.IO) {
+        // C6 review-fix round 3 — atomic outcome derived INSIDE the
+        // transaction. A concurrent writer that races between the
+        // `getLastSeenSeq` read and the `upsertLastSeenSeq` write
+        // still produces the correct discriminator at the call site
+        // because both the read and the conditional write live in
+        // one transactional unit.
+        db.transactionWithResult<Long?> {
             val current = db.transportSeqStateQueries
                 .getLastSeenSeq(identityHex)
                 .executeAsOneOrNull()
             if (current != null && current >= seq) {
                 // Monotonicity guard — silent no-op when the caller
-                // tries to regress the cursor. See interface KDoc.
-                return@transactionWithResult
+                // tries to regress (or no-op) the cursor. Returns the
+                // currently-persisted value as the NoChange witness.
+                return@transactionWithResult current
             }
             db.transportSeqStateQueries.upsertLastSeenSeq(
                 identity_hex = identityHex,
                 last_seen_seq = seq,
                 updated_at_ms = nowMs,
             )
+            null
         }
     }
 

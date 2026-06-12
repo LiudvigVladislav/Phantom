@@ -51,11 +51,12 @@ class S6BreakerTriggerReceiver(
 ) : BroadcastReceiver() {
 
     override fun onReceive(context: Context?, intent: Intent?) {
-        if (!phantom.android.BuildConfig.DEBUG) {
+        if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1") {
             Log.w(
                 TAG,
-                "onReceive() refused: not a DEBUG build (the receiver should never have been " +
-                    "registered in this build mode)",
+                "onReceive() refused: BuildConfig.S6_DEBUG_TRIGGER_ENABLED=" +
+                    "${phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED} (the receiver " +
+                    "should never have been registered in this build mode)",
             )
             return
         }

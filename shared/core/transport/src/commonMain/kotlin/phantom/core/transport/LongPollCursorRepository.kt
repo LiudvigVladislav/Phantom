@@ -82,11 +82,11 @@ interface LongPollCursorRepository {
 }
 
 /**
- * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.2) — outcome of a
- * [LongPollCursorRepository.upsertLastSeenSeq] call. Discriminates a
- * genuine cursor advance from the silent no-op a monotonicity guard
- * produces when the caller tries to write a `seq` less than or equal
- * to the persisted value.
+ * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.2; atomic in round 3)
+ * — outcome of a [LongPollCursorRepository.upsertLastSeenSeq] call.
+ * Discriminates a genuine cursor advance from the silent no-op a
+ * monotonicity guard produces when the caller tries to write a `seq`
+ * less than or equal to the persisted value.
  *
  * The Tele2 LTE smoke runbook (`docs/tracks/trek2-stage2b-b-tele2-
  * smoke.md`) requires the `REST_TRACE cursor_advanced seq=<n>` log
@@ -97,10 +97,15 @@ interface LongPollCursorRepository {
  * meant the smoke proof was a lie any time a relay redelivered an
  * envelope already past the cursor (the legitimate dedup path).
  *
- * With this discriminated outcome, the smoke proof "cursor is
- * persisted with strictly-monotonic seq" is genuine: a
+ * **Atomicity (round 3).** The discriminator is derived INSIDE the
+ * storage layer's transactional critical section (SQLDelight
+ * `transactionWithResult` / Fake `mutex.withLock`). A concurrent-
+ * writer race cannot produce a false `Advanced` because the same
+ * critical section that decides the conditional write returns the
+ * outcome value. With this discriminated outcome, the smoke proof
+ * "cursor is persisted with strictly-monotonic seq" is genuine: a
  * `cursor_advanced` line in logcat means the underlying row in
- * `transport_seq_state` actually changed.
+ * `transport_seq_state` actually changed in this transaction.
  */
 sealed class CursorUpsertOutcome {
 

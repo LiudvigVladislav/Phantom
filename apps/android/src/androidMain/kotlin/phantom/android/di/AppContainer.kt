@@ -145,10 +145,12 @@ class AppContainer(private val context: Context) {
      * the trigger log.
      */
     suspend fun triggerS6BreakerForDebug(): Boolean {
-        if (!phantom.android.BuildConfig.DEBUG) {
+        if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1") {
             android.util.Log.w(
                 "Phantom/S6Debug",
-                "triggerS6BreakerForDebug() refused: not a DEBUG build",
+                "triggerS6BreakerForDebug() refused: " +
+                    "BuildConfig.S6_DEBUG_TRIGGER_ENABLED=" +
+                    "${phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED}",
             )
             return false
         }
@@ -1014,12 +1016,16 @@ class AppContainer(private val context: Context) {
             // collectors only start later, after bootstrapAndStart).
             var degradationDetectorRef: phantom.core.transport.WsDegradationDetector? = null
 
-            // Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — pass
-            // `BuildConfig.DEBUG` through to the orchestrator's
-            // [s6DebugTriggerEnabled] constructor gate. Release APKs
-            // get `false`; the trigger helper short-circuits with
-            // the `breaker_test_trigger_refused` log.
-            val s6DebugEnabled = phantom.android.BuildConfig.DEBUG
+            // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) — pass
+            // `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`
+            // through to the orchestrator's [s6DebugTriggerEnabled]
+            // constructor gate. Decoupled from `BuildConfig.DEBUG`
+            // so a future beta variant with `isDebuggable=false`
+            // can still opt into the trigger via the gradle
+            // property `s6DebugTriggerEnabled=1`. Release pins to
+            // `"0"`; the trigger helper short-circuits with the
+            // `breaker_test_trigger_refused` log.
+            val s6DebugEnabled = phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
@@ -1108,33 +1114,29 @@ class AppContainer(private val context: Context) {
                         seq: Long,
                         nowMs: Long,
                     ): phantom.core.transport.CursorUpsertOutcome {
-                        // C6 review-fix round 2 P1.2 — read-before-
-                        // write so the bridge surfaces a typed
-                        // outcome to the orchestrator's smoke-pin
-                        // log site. Storage-side `upsertLastSeenSeq`
-                        // is already monotonic (it silent-no-ops
-                        // when `seq <= existing` inside its own
-                        // transaction), but exposes that as `Unit`.
-                        // Bridging up to a discriminated outcome
-                        // costs one extra read on the ack path; the
-                        // ack path is per-envelope, not per-poll,
-                        // so the extra read is bounded by the
-                        // envelope arrival rate. Race window: a
-                        // concurrent writer could land between the
-                        // read and the conditional upsert; the
-                        // storage layer's own transactional guard
-                        // catches the cursor-regress case so the
-                        // worst outcome is a spurious `cursor_noop`
-                        // log when the bridge raced past a
-                        // legitimate advance. Field smoke proofs
-                        // tolerate that asymmetry — false NoChange
-                        // is preferable to false Advanced.
-                        val existing = lastSeenSeqRepo.getLastSeenSeq(identityHex)
-                        if (existing != null && existing >= seq) {
-                            return phantom.core.transport.CursorUpsertOutcome.NoChange(existing)
+                        // C6 review-fix round 3 — outcome is now
+                        // derived INSIDE the SQLDelight transaction
+                        // (the `LastSeenSeqRepository.upsertLast
+                        // SeenSeq` contract returns `Long?` —
+                        // `null` when the write committed,
+                        // `Long(existingSeq)` when the monotonicity
+                        // guard short-circuited). The previous
+                        // round-2 read-before-write bridge had a
+                        // genuine race: two coroutines could each
+                        // read the same `current`, both decide to
+                        // advance, but only the first INSERT-OR-
+                        // REPLACE land — the second silently no-
+                        // opped at the storage layer while the
+                        // bridge still returned Advanced(seq). With
+                        // the outcome derived in-transaction the
+                        // bridge becomes a one-call mapping.
+                        return when (
+                            val existingSeqOrNullIfAdvanced =
+                                lastSeenSeqRepo.upsertLastSeenSeq(identityHex, seq, nowMs)
+                        ) {
+                            null -> phantom.core.transport.CursorUpsertOutcome.Advanced(seq)
+                            else -> phantom.core.transport.CursorUpsertOutcome.NoChange(existingSeqOrNullIfAdvanced)
                         }
-                        lastSeenSeqRepo.upsertLastSeenSeq(identityHex, seq, nowMs)
-                        return phantom.core.transport.CursorUpsertOutcome.Advanced(seq)
                     }
                 },
                 s6DebugTriggerEnabled = s6DebugEnabled,
@@ -1156,7 +1158,21 @@ class AppContainer(private val context: Context) {
             // BuildConfig.DEBUG defensively so even a manual
             // intent dispatch with the right action string is a
             // no-op in release.
-            if (phantom.android.BuildConfig.DEBUG) {
+            if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1") {
+                // C6 review-fix round 3 P1.2 — `RECEIVER_EXPORTED` is
+                // load-bearing on API 33+. `adb shell am broadcast`
+                // dispatches as the system shell user, which is NOT
+                // the registering app — `RECEIVER_NOT_EXPORTED`
+                // (round 2) silently dropped the intent on API 33+.
+                // We accept the export only on debug builds; release
+                // builds never reach this branch and the manifest
+                // never declares the action. Defence-in-depth gates:
+                //   * BuildConfig.DEBUG (this `if` block).
+                //   * Receiver's own `BuildConfig.DEBUG` check in
+                //     `onReceive` (belt-and-braces).
+                //   * Orchestrator constructor flag
+                //     `s6DebugTriggerEnabled = BuildConfig.DEBUG`.
+                // A release APK fails ALL three independently.
                 val s6Receiver = phantom.android.dev.S6BreakerTriggerReceiver(this@AppContainer)
                 val filter = android.content.IntentFilter(
                     phantom.android.dev.S6BreakerTriggerReceiver.ACTION,
@@ -1165,7 +1181,7 @@ class AppContainer(private val context: Context) {
                     context.registerReceiver(
                         s6Receiver,
                         filter,
-                        android.content.Context.RECEIVER_NOT_EXPORTED,
+                        android.content.Context.RECEIVER_EXPORTED,
                     )
                 } else {
                     @Suppress("UnspecifiedRegisterReceiverFlag")
@@ -1175,7 +1191,7 @@ class AppContainer(private val context: Context) {
                     "Phantom/S6Debug",
                     "Registered S6BreakerTriggerReceiver for action ${
                         phantom.android.dev.S6BreakerTriggerReceiver.ACTION
-                    }",
+                    } (RECEIVER_EXPORTED on API 33+; debug build only)",
                 )
             }
 

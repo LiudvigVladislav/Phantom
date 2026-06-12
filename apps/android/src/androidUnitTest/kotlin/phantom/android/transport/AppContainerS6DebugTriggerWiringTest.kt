@@ -10,29 +10,28 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1) — contract test
- * that pins the Android-side wire-up for the S6 controllable breaker
- * trigger.
+ * Trek 2 Stage 2B-B (C6 review-fix round 2 P1.1; hardened round 3) —
+ * contract test that pins the Android-side wire-up for the S6
+ * controllable breaker trigger.
  *
- * The Tele2 LTE smoke runbook (`docs/tracks/trek2-stage2b-b-tele2-
- * smoke.md`) accepts the helper iff natural Mode-2 does not reproduce
- * inside the 30-minute Tecno+Tele2 LTE time-box. Round 1's first
- * landing claimed in a code comment that the helper was already wired
- * through a debug surface — that was false. Round 2 makes it real,
- * and this test asserts that the wiring actually exists in
- * `AppContainer.kt` so a future refactor cannot quietly unwire it.
+ * Round 2 wired the helper through `BuildConfig.DEBUG`. Round 3
+ * decouples the trigger gate from the DEBUG flag onto a dedicated
+ * `BuildConfig.S6_DEBUG_TRIGGER_ENABLED` String "1"/"0" pin so a
+ * future beta variant (which may run with `isDebuggable=false`) can
+ * still opt into the trigger by flipping the gradle property. The
+ * Tele2 runbook ("debug or beta APK") is now honoured regardless of
+ * how the future beta variant is configured.
  *
- * Three required surfaces:
+ * Required surfaces:
  *
  *   1. The orchestrator construction passes
- *      `s6DebugTriggerEnabled = phantom.android.BuildConfig.DEBUG`
- *      (or an equivalent reference) so release builds get `false`.
+ *      `s6DebugTriggerEnabled = ...S6_DEBUG_TRIGGER_ENABLED == "1"`.
  *   2. The `restOrchestratorRef` field is assigned to the freshly-
- *      constructed orchestrator so the AppContainer-level
- *      `triggerS6BreakerForDebug()` can reach it.
+ *      constructed orchestrator.
  *   3. The dynamic `BroadcastReceiver` registration block is present
- *      and gated on `phantom.android.BuildConfig.DEBUG` so a release
- *      APK never registers the receiver.
+ *      and gated on `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`.
+ *   4. `triggerS6BreakerForDebug()` body short-circuits on the same
+ *      `S6_DEBUG_TRIGGER_ENABLED != "1"` gate.
  */
 class AppContainerS6DebugTriggerWiringTest {
 
@@ -80,20 +79,17 @@ class AppContainerS6DebugTriggerWiringTest {
         assertTrue(
             args.contains("s6DebugTriggerEnabled = "),
             "AppContainer's RestFallbackOrchestrator construction MUST pass " +
-                "`s6DebugTriggerEnabled = <expr>` explicitly. The constructor default is " +
-                "`false`; relying on the default in production is acceptable BUT " +
-                "AppContainer is the documented wire-up — a missing assignment is a " +
-                "signal that the round-2 wire-up was reverted. Argument list:\n$args",
+                "`s6DebugTriggerEnabled = <expr>` explicitly. Argument list:\n$args",
         )
-        // The expression must reference BuildConfig.DEBUG (directly or
-        // through a local variable named `s6DebugEnabled` that we
-        // already verify earlier in the AppContainer source).
+        // The expression must derive from the dedicated
+        // S6_DEBUG_TRIGGER_ENABLED BuildConfig pin (NOT
+        // BuildConfig.DEBUG — that round-2 gate is decommissioned).
         assertTrue(
-            text.contains("phantom.android.BuildConfig.DEBUG") ||
-                text.contains("BuildConfig.DEBUG"),
-            "AppContainer must reference `BuildConfig.DEBUG` so the orchestrator-side gate " +
-                "is fed by the BuildConfig pin. A literal `true` here would leak the trigger " +
-                "into release builds and is a CI gate violation.",
+            text.contains("BuildConfig.S6_DEBUG_TRIGGER_ENABLED"),
+            "AppContainer must reference `BuildConfig.S6_DEBUG_TRIGGER_ENABLED` so the " +
+                "trigger gate is independent of `BuildConfig.DEBUG`. A future beta variant " +
+                "with `isDebuggable=false` would otherwise lose the trigger surface despite " +
+                "the runbook allowing `debug OR beta` APKs.",
         )
     }
 
@@ -103,18 +99,13 @@ class AppContainerS6DebugTriggerWiringTest {
         assertTrue(
             text.contains("restOrchestratorRef = restOrchestrator"),
             "AppContainer must assign `restOrchestratorRef = restOrchestrator` after the " +
-                "orchestrator is constructed so `triggerS6BreakerForDebug()` can reach it. " +
-                "Without this assignment the debug surface is unreachable even when the " +
-                "BuildConfig gate would allow it.",
+                "orchestrator is constructed so `triggerS6BreakerForDebug()` can reach it.",
         )
     }
 
     @Test
-    fun s6_broadcast_receiver_registration_is_present_and_gated_on_buildconfig_debug() {
+    fun s6_broadcast_receiver_registration_is_present_and_gated_on_dedicated_flag() {
         val text = source()
-        // The receiver class must be referenced, the action constant
-        // referenced, AND the registration must live inside an
-        // `if (...BuildConfig.DEBUG)` block (or syntactic equivalent).
         assertTrue(
             text.contains("S6BreakerTriggerReceiver"),
             "AppContainer must reference `S6BreakerTriggerReceiver` so the ADB-broadcast " +
@@ -123,40 +114,40 @@ class AppContainerS6DebugTriggerWiringTest {
         )
         assertTrue(
             text.contains("registerReceiver("),
-            "AppContainer must call `registerReceiver(...)` dynamically so the receiver lives " +
-                "for the process lifetime without expanding the production manifest. The Tele2 " +
-                "smoke S6 scenario relies on the `phantom.android.dev.S6_BREAKER_TRIGGER` " +
+            "AppContainer must call `registerReceiver(...)` dynamically. The Tele2 smoke " +
+                "S6 scenario relies on the `phantom.android.dev.S6_BREAKER_TRIGGER` " +
                 "broadcast being deliverable from `adb shell am broadcast`.",
         )
-        // The registration block must be guarded by BuildConfig.DEBUG
-        // — even though the receiver itself also gates, an
-        // unconditional registration in release would expand the
-        // attack surface (release APKs would respond to the broadcast
-        // by entering the receiver's onReceive, which then refuses
-        // — but the refusal log itself is a tell). Defence in depth:
-        // never register the receiver in release.
-        val gateRegex = Regex("""if\s*\(\s*phantom\.android\.BuildConfig\.DEBUG\s*\)""")
+        val gateRegex = Regex(
+            """if\s*\(\s*phantom\.android\.BuildConfig\.S6_DEBUG_TRIGGER_ENABLED\s*==\s*"1"\s*\)"""
+        )
         assertTrue(
             gateRegex.containsMatchIn(text),
             "AppContainer must gate the `S6BreakerTriggerReceiver` registration on " +
-                "`phantom.android.BuildConfig.DEBUG`. Found no such guard.",
+                "`BuildConfig.S6_DEBUG_TRIGGER_ENABLED == \"1\"`. Found no such guard.",
+        )
+        // The registration must also use RECEIVER_EXPORTED on API
+        // 33+ so `adb shell am broadcast` (system shell user, NOT
+        // the registering app) can deliver the intent. The
+        // NOT_EXPORTED round-2 wiring silently dropped the
+        // broadcast on API 33+ devices like the Tecno.
+        assertTrue(
+            text.contains("RECEIVER_EXPORTED"),
+            "AppContainer must register the receiver with `RECEIVER_EXPORTED` on API 33+ so " +
+                "`adb shell am broadcast` can deliver the intent. `RECEIVER_NOT_EXPORTED` " +
+                "(round 2) was load-bearing for the production safety story but silently " +
+                "dropped debug broadcasts dispatched from outside the app.",
         )
     }
 
     @Test
-    fun trigger_method_returns_false_in_release_via_buildconfig_check() {
+    fun trigger_method_short_circuits_on_dedicated_flag_when_not_one() {
         val text = source()
-        // `triggerS6BreakerForDebug()` must short-circuit on
-        // `!BuildConfig.DEBUG`. Pin the method body's exit-early
-        // structure so a refactor cannot silently drop the gate.
         val triggerStart = text.indexOf("suspend fun triggerS6BreakerForDebug(): Boolean {")
         assertNotNull(
             triggerStart.takeIf { it >= 0 },
-            "AppContainer must declare `suspend fun triggerS6BreakerForDebug(): Boolean`. " +
-                "A missing declaration removes the AppContainer-level debug surface that the " +
-                "S6 trigger receiver routes to.",
+            "AppContainer must declare `suspend fun triggerS6BreakerForDebug(): Boolean`.",
         )
-        // Walk forward to the matching `}` to extract the method body.
         val openIdx = text.indexOf('{', startIndex = triggerStart)
         var depth = 1
         var i = openIdx + 1
@@ -169,10 +160,13 @@ class AppContainerS6DebugTriggerWiringTest {
         }
         if (depth != 0) fail("Unbalanced braces in triggerS6BreakerForDebug body.")
         val body = text.substring(openIdx + 1, i - 1)
+        val gateRegex = Regex(
+            """if\s*\(\s*phantom\.android\.BuildConfig\.S6_DEBUG_TRIGGER_ENABLED\s*!=\s*"1"\s*\)"""
+        )
         assertTrue(
-            Regex("""if\s*\(\s*!\s*phantom\.android\.BuildConfig\.DEBUG\s*\)""").containsMatchIn(body),
+            gateRegex.containsMatchIn(body),
             "triggerS6BreakerForDebug() body must contain the early-exit gate " +
-                "`if (!phantom.android.BuildConfig.DEBUG) { ... return false }`. " +
+                "`if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED != \"1\") { return false }`. " +
                 "Found body:\n$body",
         )
         assertTrue(

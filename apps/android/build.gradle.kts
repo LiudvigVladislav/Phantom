@@ -414,6 +414,33 @@ android {
             // Stage 2B wires every consumer.
             val longPollV2Enabled = localOrEnv("longPollV2Enabled", "LONGPOLL_V2_ENABLED", "1")
             buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"$longPollV2Enabled\"")
+
+            // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) — debug
+            // override gate for the Tele2 LTE smoke S6 controllable
+            // breaker trigger. The previous `BuildConfig.DEBUG`
+            // gate was load-bearing for ALL three defence-in-depth
+            // layers; if a future beta variant runs with
+            // `isDebuggable = false`, the smoke runbook ("debug or
+            // beta APK") would be silently invalidated because the
+            // trigger surface would be unreachable. This dedicated
+            // flag decouples the gate from `BuildConfig.DEBUG` so
+            // a beta variant can opt into the trigger explicitly
+            // by setting `s6DebugTriggerEnabled=1` in
+            // `local.properties` (or `S6_DEBUG_TRIGGER_ENABLED=1`
+            // env). Default `"1"` on debug builds; release pins to
+            // `"0"`. Mirrors the existing `LONGPOLL_V2_ENABLED`
+            // String "1"/"0" idiom locked by Vladislav OQ7
+            // 2026-06-09.
+            val s6DebugTriggerEnabled = localOrEnv(
+                "s6DebugTriggerEnabled",
+                "S6_DEBUG_TRIGGER_ENABLED",
+                "1",
+            )
+            buildConfigField(
+                "String",
+                "S6_DEBUG_TRIGGER_ENABLED",
+                "\"$s6DebugTriggerEnabled\"",
+            )
         }
         release {
             isMinifyEnabled = true
@@ -511,6 +538,16 @@ android {
             // single line; defence-in-depth backstop per Vladislav OQ7 +
             // OQ11 split locks 2026-06-09.
             buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"0\"")
+            // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) —
+            // release builds ALWAYS pin the S6 debug trigger flag
+            // to `"0"`. The AppContainer wire-up reads this value
+            // and gates the receiver registration + the
+            // orchestrator constructor flag on it (independent of
+            // `BuildConfig.DEBUG`). A release APK can never reach
+            // the trigger path even if the receiver were
+            // dispatched. Defence-in-depth backstop per the same
+            // Vladislav OQ7 idiom as `LONGPOLL_V2_ENABLED`.
+            buildConfigField("String", "S6_DEBUG_TRIGGER_ENABLED", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.
