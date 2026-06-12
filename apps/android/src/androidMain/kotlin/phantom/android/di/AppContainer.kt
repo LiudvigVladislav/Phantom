@@ -1163,22 +1163,26 @@ class AppContainer(private val context: Context) {
             // layer. All three independent gates must allow the
             // dispatch before the breaker mutates.
             if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1") {
-                // C6 review-fix round 5 P1.security/tester — the
+                // C6 review-fix round 7 P1.evidence — the
                 // registration uses `RECEIVER_EXPORTED` on API 33+
                 // so an externally-dispatched intent (`adb shell am
                 // broadcast`, which runs as the system shell user
                 // rather than the registering app) is delivered.
                 // The `broadcastPermission` argument requires the
-                // sender to hold the signature-scoped
-                // `phantom.android.dev.permission.TRIGGER_S6`
-                // permission declared in AndroidManifest.xml. A
-                // co-installed third-party app cannot hold the
-                // permission because it is signature-only. The
-                // shell user delivers the broadcast via
-                // `adb shell am broadcast --receiver-permission
-                // phantom.android.dev.permission.TRIGGER_S6 -a ...`
-                // — the system shell satisfies signature-scoped
-                // permissions on a debug-keyed APK.
+                // sender to hold `android.permission.DUMP`:
+                //   * The system shell uid reliably holds DUMP by
+                //     default; the runbook recipe sets
+                //     `--receiver-permission android.permission.DUMP`
+                //     explicitly so a future shell permission
+                //     change produces a clearly-attributable
+                //     delivery failure.
+                //   * A co-installed third-party app cannot hold
+                //     DUMP because the platform scopes it to the
+                //     system signing certificate.
+                // Round-5 used a custom signature permission scoped
+                // to THIS APK's cert; the shell did not satisfy
+                // that scope and the broadcast would have silently
+                // dropped on the Tecno.
                 val s6Receiver = phantom.android.dev.S6BreakerTriggerReceiver(this@AppContainer)
                 val filter = android.content.IntentFilter(
                     phantom.android.dev.S6BreakerTriggerReceiver.ACTION,

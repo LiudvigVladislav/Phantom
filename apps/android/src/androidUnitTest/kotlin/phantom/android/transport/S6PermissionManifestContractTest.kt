@@ -9,31 +9,29 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Trek 2 Stage 2B-B (C6 review-fix round 5 P1.security/tester) —
- * contract test that pins the `phantom.android.dev.permission.TRIGGER_S6`
- * permission declaration in `AndroidManifest.xml`.
+ * Trek 2 Stage 2B-B (C6 review-fix round 7 P1.evidence) — contract
+ * test that pins the `android.permission.DUMP` declaration in
+ * `AndroidManifest.xml` and ASSERTS that no leftover custom round-5
+ * permission declaration remains.
  *
  * The S6 controllable trigger receiver registration in `AppContainer`
  * passes this permission name as the `broadcastPermission` argument
- * to `registerReceiver`. Manifest-side, the permission MUST be:
+ * to `registerReceiver`. The manifest must:
  *
- *   * Declared with the literal name
- *     `phantom.android.dev.permission.TRIGGER_S6`.
- *   * Protection level `signature` (NOT `normal`, NOT `dangerous`,
- *     NOT `signatureOrSystem` — only `signature` correctly prevents
- *     a co-installed third-party app from holding it without
- *     compromising the app's own signing certificate).
- *   * Paired with a corresponding `<uses-permission>` so the
- *     app's own components can satisfy the gate when needed (the
- *     receiver registration is the load-bearing consumer; the
- *     `<uses-permission>` keeps Android's permission framework
- *     consistent even though the receiver itself does NOT need to
- *     hold the permission to register).
- *
- * A future refactor that flips the level to `normal` silently
- * undoes the round-5 P1 security fix: any installed app could then
- * hold the permission with a manifest declaration and broadcast
- * the trigger. This test fences that regression.
+ *   * Declare `<uses-permission android:name="android.permission.DUMP" />`
+ *     so the platform permission framework treats the app as
+ *     intending to consume the platform permission. (The receiver
+ *     registration itself does NOT need the app to HOLD the
+ *     permission; the `<uses-permission>` is for framework-side
+ *     consistency.)
+ *   * NOT declare a custom
+ *     `<permission android:name="phantom.android.dev.permission.TRIGGER_S6" />`
+ *     element. Round-5 used a custom signature permission scoped to
+ *     the APK's own signing certificate — the shell uid cannot
+ *     satisfy that scope and the broadcast would silently drop. Round
+ *     7 switched to the platform `DUMP` permission instead; any
+ *     leftover custom-permission declaration silently re-introduces
+ *     the round-5 delivery failure on the Tecno.
  */
 class S6PermissionManifestContractTest {
 
@@ -51,60 +49,38 @@ class S6PermissionManifestContractTest {
     }
 
     @Test
-    fun permission_declared_with_signature_protection_level() {
-        val text = manifest.readText(Charsets.UTF_8)
-        // The `<permission>` element must include BOTH the literal
-        // permission name AND `android:protectionLevel="signature"`.
-        // We match a single <permission ... /> element containing
-        // both attributes in any order via two independent regex
-        // checks against the element's text.
-        val elementRegex = Regex(
-            """<permission\b[^>]*?android:name="phantom\.android\.dev\.permission\.TRIGGER_S6"[^>]*?/>""",
-            RegexOption.DOT_MATCHES_ALL,
-        )
-        val match = elementRegex.find(text)
-        if (match == null) {
-            // Try the alternate attribute order — the permission
-            // name might appear AFTER protectionLevel in the source.
-            val swapRegex = Regex(
-                """<permission\b[^>]*?android:name="phantom\.android\.dev\.permission\.TRIGGER_S6"[^>]*?>""",
-                RegexOption.DOT_MATCHES_ALL,
-            )
-            if (swapRegex.find(text) == null) {
-                fail(
-                    "AndroidManifest.xml MUST declare a `<permission>` element with " +
-                        "`android:name=\"phantom.android.dev.permission.TRIGGER_S6\"`. The " +
-                        "S6 controllable trigger receiver registration relies on this " +
-                        "permission to gate broadcast senders.",
-                )
-            }
-        }
-        val element = match?.value ?: fail("permission element not located")
-        assertTrue(
-            element.contains("""android:protectionLevel="signature""""),
-            "The TRIGGER_S6 permission MUST use `android:protectionLevel=\"signature\"`. " +
-                "Any other level (normal, dangerous, signatureOrSystem) would let a " +
-                "co-installed third-party app hold the permission and broadcast the " +
-                "trigger. Element body: $element",
-        )
-    }
-
-    @Test
-    fun uses_permission_paired_with_declared_permission() {
+    fun uses_permission_dump_is_declared() {
         val text = manifest.readText(Charsets.UTF_8)
         val usesRegex = Regex(
-            """<uses-permission\b[^>]*?android:name="phantom\.android\.dev\.permission\.TRIGGER_S6"[^>]*?/>""",
+            """<uses-permission\b[^>]*?android:name="android\.permission\.DUMP"[^>]*?/>""",
             RegexOption.DOT_MATCHES_ALL,
         )
         assertTrue(
             usesRegex.containsMatchIn(text),
             "AndroidManifest.xml MUST contain a `<uses-permission " +
-                "android:name=\"phantom.android.dev.permission.TRIGGER_S6\" />` element " +
-                "paired with the `<permission>` declaration. Without the " +
-                "`<uses-permission>`, Android's permission framework treats the app as " +
-                "not having declared intent to consume the permission, which is " +
-                "internally inconsistent even when the receiver registration does not " +
-                "need the app itself to HOLD the permission.",
+                "android:name=\"android.permission.DUMP\" />` element. The S6 controllable " +
+                "trigger receiver registration passes `android.permission.DUMP` as the " +
+                "broadcast-permission argument so the shell uid can deliver the trigger " +
+                "and co-installed third-party apps cannot.",
+        )
+    }
+
+    @Test
+    fun no_round5_custom_permission_declared() {
+        val text = manifest.readText(Charsets.UTF_8)
+        // The round-5 custom permission was an APK-cert-scoped
+        // signature permission that the shell uid could not satisfy.
+        // Its presence anywhere in the manifest (a `<permission>`
+        // declaration OR a `<uses-permission>` reference) would
+        // either silently revive the round-5 delivery failure or
+        // confuse future operators reading the manifest.
+        val customNameRegex = Regex("""phantom\.android\.dev\.permission\.TRIGGER_S6""")
+        assertTrue(
+            !customNameRegex.containsMatchIn(text),
+            "AndroidManifest.xml MUST NOT contain any reference to the round-5 custom " +
+                "permission `phantom.android.dev.permission.TRIGGER_S6`. Round 7 replaced " +
+                "it with `android.permission.DUMP` because the custom-signature scope was " +
+                "not satisfiable by the shell uid.",
         )
     }
 }

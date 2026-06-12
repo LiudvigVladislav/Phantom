@@ -62,16 +62,15 @@ class S6BreakerTriggerReceiverContractTest {
     private fun source(): String = receiverSource.readText(Charsets.UTF_8)
 
     @Test
-    fun permission_constant_matches_manifest_signature_scoped_declaration() {
-        // C6 review-fix round 5 P1.security/tester — receiver
-        // declares a signature-level sender permission so a co-
-        // installed third-party app on a debug/beta device cannot
-        // broadcast the trigger. The constant must match the
-        // permission declared in AndroidManifest.xml exactly; a
-        // drift breaks the registerReceiver call site and either
-        // crashes at registration OR silently registers without
-        // a permission gate (the latter is the load-bearing
-        // regression this test prevents).
+    fun permission_constant_is_platform_DUMP() {
+        // C6 review-fix round 7 P1.evidence — receiver gates
+        // delivery on the platform `android.permission.DUMP`. Round
+        // 5 used a custom APK-cert-scoped signature permission that
+        // the shell uid could not satisfy; round 7 switched to the
+        // standard adb-broadcast-secured-intent pattern. Any drift
+        // off `android.permission.DUMP` either reintroduces the
+        // round-5 delivery failure OR weakens the third-party-app
+        // gate.
         val text = source()
         val permissionRegex = Regex(
             """const\s+val\s+PERMISSION\s*:\s*String\s*=\s*"([^"]+)""""
@@ -80,14 +79,16 @@ class S6BreakerTriggerReceiverContractTest {
         assertNotNull(
             match,
             "S6BreakerTriggerReceiver must declare `const val PERMISSION: String = \"...\"` " +
-                "for the signature-level sender permission.",
+                "for the sender permission.",
         )
         assertEquals(
-            "phantom.android.dev.permission.TRIGGER_S6",
+            "android.permission.DUMP",
             match.groupValues[1],
-            "PERMISSION must equal `phantom.android.dev.permission.TRIGGER_S6` exactly. " +
-                "Any other value desynchronises from the manifest declaration and either " +
-                "crashes registerReceiver OR drops the sender gate silently.",
+            "PERMISSION must equal `android.permission.DUMP` exactly. Round 5 used a " +
+                "custom signature permission scoped to the APK cert — the shell uid could " +
+                "not satisfy that scope and the broadcast would silently drop on the Tecno. " +
+                "Round 7 uses the platform DUMP permission, which the shell holds by " +
+                "default and which co-installed third-party apps cannot satisfy.",
         )
     }
 

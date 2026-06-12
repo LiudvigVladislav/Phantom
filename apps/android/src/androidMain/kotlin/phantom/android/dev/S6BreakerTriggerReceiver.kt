@@ -54,12 +54,15 @@ import phantom.android.di.AppContainer
  * **Receiver export classification (API 33+).** Registered with
  * `RECEIVER_EXPORTED` so `adb shell am broadcast` — which dispatches
  * as the system shell user, NOT the registering app — can deliver the
- * intent. The export classification is paired with a signature-level
- * sender permission ([PERMISSION]) so a co-installed third-party app
- * on a debug/beta device CANNOT broadcast the trigger: the permission
- * is signature-scoped and only the APK's own signing certificate
- * satisfies it. The system shell (debug-keyed APK) is allowed to
- * deliver via `adb shell am broadcast --receiver-permission ...`.
+ * intent. The export classification is paired with the platform-defined
+ * `android.permission.DUMP` sender permission ([PERMISSION]):
+ *
+ *   * The shell uid reliably holds `DUMP` by default, so the runbook
+ *     recipe `adb shell am broadcast --receiver-permission
+ *     android.permission.DUMP -a ...` is deliverable.
+ *   * `DUMP` is signature-scoped to the system signing certificate, so
+ *     a co-installed third-party app CANNOT satisfy it and CANNOT
+ *     broadcast the trigger.
  */
 class S6BreakerTriggerReceiver(
     private val container: AppContainer,
@@ -91,18 +94,34 @@ class S6BreakerTriggerReceiver(
         const val ACTION: String = "phantom.android.dev.S6_BREAKER_TRIGGER"
 
         /**
-         * Trek 2 Stage 2B-B (C6 review-fix round 5 P1.security/tester)
-         * — signature-level permission gating broadcast delivery into
-         * the receiver. Declared in `AndroidManifest.xml` with
-         * `protectionLevel=signature` so a co-installed third-party
-         * app on a debug/beta device cannot hold the permission and
-         * therefore cannot broadcast the trigger intent. The system
-         * shell (used by `adb shell am broadcast`) satisfies
-         * signature-scoped permissions on a debug-keyed APK; the
-         * runbook recipe sets `--receiver-permission` explicitly to
-         * make the contract observable on the wire.
+         * Trek 2 Stage 2B-B (C6 review-fix round 7 P1.evidence) —
+         * sender permission gating broadcast delivery into the
+         * receiver. Set to the platform-defined
+         * `android.permission.DUMP` so:
+         *
+         *   * The system shell user (which is what `adb shell am
+         *     broadcast` runs as) reliably holds the permission by
+         *     default. The runbook recipe sets the
+         *     `--receiver-permission` flag explicitly so the
+         *     contract is observable on the wire and a future
+         *     downgrade of the shell's default permission set still
+         *     produces a clearly-attributable delivery failure.
+         *   * A co-installed third-party app CANNOT hold `DUMP` —
+         *     the platform declares it signature-scoped to the
+         *     SYSTEM signing certificate (not the app's). Only
+         *     platform code or shell-uid processes can satisfy it.
+         *
+         * Round-5 used a custom signature permission
+         * (`phantom.android.dev.permission.TRIGGER_S6`) scoped to
+         * THIS APK's signing certificate — the shell cannot satisfy
+         * that scope and the broadcast would have silently dropped
+         * at delivery time when the smoke recipe ran on the Tecno.
          */
-        const val PERMISSION: String = "phantom.android.dev.permission.TRIGGER_S6"
+        // Literal kept in this file (not `android.Manifest.permission.DUMP`
+        // reference) so the constant remains compile-time `const val` —
+        // the Android framework value is `public static final String` in
+        // Java but not eligible for Kotlin `const` propagation.
+        const val PERMISSION: String = "android.permission.DUMP"
 
         private const val TAG: String = "Phantom/S6Debug"
     }

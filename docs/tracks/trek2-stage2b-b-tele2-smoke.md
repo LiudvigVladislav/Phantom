@@ -112,11 +112,11 @@ A log block missing any of the five proofs is NOT a pass regardless of subjectiv
 
 ```bash
 adb shell am broadcast \
-  --receiver-permission phantom.android.dev.permission.TRIGGER_S6 \
+  --receiver-permission android.permission.DUMP \
   -a phantom.android.dev.S6_BREAKER_TRIGGER
 ```
 
-(The `--receiver-permission` flag is REQUIRED on round-5 wiring: the receiver is registered with a signature-level sender permission so co-installed third-party apps on a debug/beta device cannot broadcast the trigger. The system shell satisfies signature-scoped permissions on a debug-keyed APK; omitting the flag causes Android to drop the broadcast at delivery time without invoking `onReceive`.)
+(The `--receiver-permission` flag is REQUIRED. The receiver is registered with `android.permission.DUMP` as the sender permission. `DUMP` is signature-scoped to the system signing certificate: the shell uid reliably holds it by default, and a co-installed third-party app CANNOT satisfy it. Round-5 used a custom APK-scoped signature permission that the shell could not satisfy — the broadcast would have silently dropped on the Tecno; round-7 switches to the standard `adb`-broadcast-secured-intent pattern.)
 
 Logcat should then show:
 
