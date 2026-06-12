@@ -2169,7 +2169,7 @@ class RestFallbackOrchestrator(
      * non-200 fall-through and passed `isOkResponse = false`.
      * Round-4 P2 unifies on status-code-only semantics.
      */
-    private enum class PollResponseClass {
+    internal enum class PollResponseClass {
         Ok200,        // 200..299 — successful response (isOkResponse = true)
         TokenStale,   // 401 — token refresh required (isOkResponse = false)
         RateLimit,    // 429 — Retry-After dance (isOkResponse = false)
@@ -2178,7 +2178,7 @@ class RestFallbackOrchestrator(
         Other,        // 4xx-other — drop + log (isOkResponse = false)
     }
 
-    private fun classifyPollResponse(statusCode: Int): PollResponseClass = when (statusCode) {
+    internal fun classifyPollResponse(statusCode: Int): PollResponseClass = when (statusCode) {
         401 -> PollResponseClass.TokenStale
         410 -> PollResponseClass.GoneReauth
         429 -> PollResponseClass.RateLimit

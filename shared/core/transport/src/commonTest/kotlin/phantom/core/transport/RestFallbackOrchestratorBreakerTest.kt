@@ -2784,42 +2784,41 @@ class RestFallbackOrchestratorBreakerTest {
     }
 
     @Test
-    fun cf5_p2_classifyPollResponse_buckets_pinned_for_drift_detection() {
+    fun cf5_p2_classifyPollResponse_buckets_pinned_for_drift_detection() = runTest {
         // Round-5 P2: both poll loops now route through
-        // [classifyPollResponse], so a future status-code drift
-        // requires changing the enum + auditing both loops.
-        // Pin the exact buckets so the enum cannot drift
-        // silently either.
-        assertEquals("Ok200", classifyForTest(200))
-        assertEquals("Ok200", classifyForTest(204))
-        assertEquals("Ok200", classifyForTest(299))
-        assertEquals("TokenStale", classifyForTest(401))
-        assertEquals("GoneReauth", classifyForTest(410))
-        assertEquals("RateLimit", classifyForTest(429))
-        assertEquals("ServerError", classifyForTest(500))
-        assertEquals("ServerError", classifyForTest(503))
-        assertEquals("ServerError", classifyForTest(599))
-        assertEquals("Other", classifyForTest(400))
-        assertEquals("Other", classifyForTest(403))
-        assertEquals("Other", classifyForTest(409))
-        assertEquals("Other", classifyForTest(418))
+        // [RestFallbackOrchestrator.classifyPollResponse], so a
+        // future status-code drift requires changing the
+        // production enum + auditing both loops. Round-6 cleanup
+        // (Vladislav 2026-06-12): calls the PRODUCTION classifier
+        // directly via `internal` visibility — round-5's
+        // test-side mirror would have silently passed through any
+        // production drift.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ ->
+            fail("classifier-only test: poll not used")
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.Ok200, orch.classifyPollResponse(200))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.Ok200, orch.classifyPollResponse(204))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.Ok200, orch.classifyPollResponse(299))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.TokenStale, orch.classifyPollResponse(401))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.GoneReauth, orch.classifyPollResponse(410))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.RateLimit, orch.classifyPollResponse(429))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.ServerError, orch.classifyPollResponse(500))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.ServerError, orch.classifyPollResponse(503))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.ServerError, orch.classifyPollResponse(599))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.Other, orch.classifyPollResponse(400))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.Other, orch.classifyPollResponse(403))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.Other, orch.classifyPollResponse(409))
+            assertEquals(RestFallbackOrchestrator.PollResponseClass.Other, orch.classifyPollResponse(418))
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
     }
 
     // ── Fixtures ────────────────────────────────────────────────────────────
-
-    /**
-     * Test-side mirror of the production
-     * [RestFallbackOrchestrator.classifyPollResponse] so a drift
-     * surfaces by failing the pin rather than silently diverging.
-     */
-    private fun classifyForTest(statusCode: Int): String = when (statusCode) {
-        401 -> "TokenStale"
-        410 -> "GoneReauth"
-        429 -> "RateLimit"
-        in 200..299 -> "Ok200"
-        in 500..599 -> "ServerError"
-        else -> "Other"
-    }
 
     private val IDENTITY: String = "aa".repeat(32)
 
