@@ -1879,7 +1879,7 @@ class RestFallbackOrchestratorBreakerTest {
             // via the seam: setBreakerStateForTest already proves
             // state isolation; here we call recordRestSuccess(isProbe = false)
             // via reflection-free seam (added below).
-            orch.recordRestSuccessForTest(isProbe = false, isOkResponse = true)
+            orch.recordRestSuccessForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = false, isOkResponse = true)
             assertEquals(
                 openBeforeLateSuccess,
                 orch.peekBreakerStateForTest(),
@@ -1889,7 +1889,7 @@ class RestFallbackOrchestratorBreakerTest {
             // A probe owner's success SHOULD close — pin the
             // contrast so the gate semantic is observable.
             orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
-            orch.recordRestSuccessForTest(isProbe = true, isOkResponse = true)
+            orch.recordRestSuccessForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = true, isOkResponse = true)
             assertEquals(
                 LongPollBreakerState.Closed,
                 orch.peekBreakerStateForTest(),
@@ -1926,7 +1926,7 @@ class RestFallbackOrchestratorBreakerTest {
             orch.setBreakerStateForTest(LongPollBreakerState.HalfOpen(probeInFlight = true))
             val cooldownBefore = orch.peekBreakerCooldownMsForTest()
             // Call the non-probe failure path. Should be a no-op.
-            orch.recordRestFailureForTest(isProbe = false)
+            orch.recordRestFailureForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = false)
             assertEquals(
                 LongPollBreakerState.HalfOpen(probeInFlight = true),
                 orch.peekBreakerStateForTest(),
@@ -1938,7 +1938,7 @@ class RestFallbackOrchestratorBreakerTest {
                 "non-probe failure during HalfOpen MUST NOT double the cooldown — that is the probe owner's job",
             )
             // Probe owner failure DOES reopen with doubled cooldown.
-            orch.recordRestFailureForTest(isProbe = true)
+            orch.recordRestFailureForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = true)
             val state = orch.peekBreakerStateForTest()
             assertTrue(
                 state is LongPollBreakerState.Open,
@@ -2133,7 +2133,7 @@ class RestFallbackOrchestratorBreakerTest {
             // Call recordRestSuccessForTest(isProbe=false,
             // isOkResponse=true) — represents a stale non-probe
             // 200 response arriving after the breaker tripped.
-            orch.recordRestSuccessForTest(isProbe = false, isOkResponse = true)
+            orch.recordRestSuccessForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = false, isOkResponse = true)
             // ASSERTIONS — all preserved.
             assertEquals(
                 timestampsBefore,
@@ -2202,14 +2202,14 @@ class RestFallbackOrchestratorBreakerTest {
             check(orch.peekBreakerStateForTest() is LongPollBreakerState.Closed) {
                 "expected Closed state for the test pin; got ${orch.peekBreakerStateForTest()}"
             }
-            orch.recordRestSuccessForTest(isProbe = false, isOkResponse = false)
+            orch.recordRestSuccessForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = false, isOkResponse = false)
             assertEquals(
                 backoffAfter410,
                 orch.peekCurrent410BackoffMsForTest(),
                 "non-200 success (401/429/4xx-other) MUST NOT reset the 410 backoff per scope §L8",
             )
             // Now the 200 OK case — backoff should reset.
-            orch.recordRestSuccessForTest(isProbe = false, isOkResponse = true)
+            orch.recordRestSuccessForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = false, isOkResponse = true)
             assertEquals(
                 RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
                 orch.peekCurrent410BackoffMsForTest(),
@@ -2261,7 +2261,7 @@ class RestFallbackOrchestratorBreakerTest {
                 ),
             )
             // Stale non-probe failure.
-            orch.recordRestFailureForTest(isProbe = false)
+            orch.recordRestFailureForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = false)
             assertEquals(
                 timestampsBefore,
                 orch.peekStatus410StormTimestampsForTest(),
@@ -2347,7 +2347,7 @@ class RestFallbackOrchestratorBreakerTest {
             // threshold so the FIRST 5xx response after the gate
             // releases trips the breaker.
             repeat(RestFallbackOrchestrator.BREAKER_CONSECUTIVE_FAIL_THRESHOLD - 1) {
-                orch.recordRestFailureForTest(isProbe = false)
+                orch.recordRestFailureForTest(iterationEpoch = orch.peekBreakerEpochForTest(), isProbe = false)
             }
             // Sanity: no timer yet, state Closed.
             check(!orch.peekHasBreakerTimerForTest()) {
@@ -2386,6 +2386,258 @@ class RestFallbackOrchestratorBreakerTest {
                 "after stop, _breakerTimerJob MUST be null — the timer spawned during the " +
                     "poll producer's unwind MUST be captured by Phase 3's re-read of the field. " +
                     "If non-null, the round-2 three-phase teardown is not actually catching this race.",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    // ── C5 round-4 review-fix regression pins ───────────────────────────────
+
+    @Test
+    fun cf4_p12_stale_epoch_response_in_Closed_is_full_noop_aba_protection() = runTest(timeout = 5.minutes) {
+        // Round-4 P1.2: ABA — a response carrying an old
+        // iteration epoch must NOT mutate current bookkeeping
+        // even when state at write-time matches state at the
+        // (long-gone) gate read. Boolean isProbe alone could not
+        // close this race.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ ->
+            RestFallbackResponse(statusCode = 410, bodyParsed = null, rawBody = "", elapsedMs = 1L)
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            repeat(20) {
+                if (transport.pollCalls.size >= 1) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            check(transport.pollCalls.isNotEmpty())
+            val timestampsBefore = orch.peekStatus410StormTimestampsForTest()
+            val backoffBefore = orch.peekCurrent410BackoffMsForTest()
+            assertTrue(timestampsBefore.isNotEmpty())
+            val staleEpoch = orch.peekBreakerEpochForTest()
+            // Force two state-class transitions via the seam.
+            // Each bumps the epoch.
+            orch.setBreakerStateForTest(
+                LongPollBreakerState.Open(
+                    BreakerOpenReason.ConsecutiveRestFailures,
+                    RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                ),
+            )
+            orch.setBreakerStateForTest(LongPollBreakerState.Closed)
+            val currentEpoch = orch.peekBreakerEpochForTest()
+            assertTrue(
+                currentEpoch > staleEpoch,
+                "expected epoch bumps from seam transitions; stale=$staleEpoch current=$currentEpoch",
+            )
+            // Call with STALE epoch. State is now Closed, but
+            // the iteration's epoch is outdated.
+            orch.recordRestSuccessForTest(
+                iterationEpoch = staleEpoch,
+                isProbe = false,
+                isOkResponse = true,
+            )
+            assertEquals(
+                timestampsBefore,
+                orch.peekStatus410StormTimestampsForTest(),
+                "stale-epoch recordRestSuccess MUST NOT clear storm timestamps — that's the ABA bug",
+            )
+            assertEquals(
+                backoffBefore,
+                orch.peekCurrent410BackoffMsForTest(),
+                "stale-epoch recordRestSuccess MUST NOT reset 410 backoff floor",
+            )
+            orch.recordRestFailureForTest(
+                iterationEpoch = staleEpoch,
+                isProbe = false,
+            )
+            assertEquals(
+                timestampsBefore,
+                orch.peekStatus410StormTimestampsForTest(),
+                "stale-epoch recordRestFailure MUST NOT clear storm timestamps",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf4_p11_stale_410_in_SuspendedOnPoison_does_not_overwrite_state_via_storm_trigger() = runTest(timeout = 5.minutes) {
+        // Round-4 P1.1: the round-3 handle410 was NOT gated on
+        // ownership/epoch. So in SuspendedOnPoison (set by L7
+        // bad-MAC posture), three late 410s would still trip
+        // transitionToOpenUnderMutex(Status410Storm, 60s) →
+        // overwriting SuspendedOnPoison with Open and spawning
+        // a cooldown timer that would re-arm REST polling after
+        // 60 s — breaking L7's qualitative-different-recovery
+        // contract.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ ->
+            RestFallbackResponse(statusCode = 410, bodyParsed = null, rawBody = "", elapsedMs = 1L)
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            orch.setBreakerStateForTest(LongPollBreakerState.SuspendedOnPoison)
+            check(orch.peekBreakerStateForTest() == LongPollBreakerState.SuspendedOnPoison)
+            // Pump significant virtual time. The pollLoop's gate
+            // Skips every iteration; even if a stale 410 reached
+            // handle410, the round-4 epoch+state gate would
+            // no-op it. Storm trigger MUST NOT fire.
+            advanceTimeBy(RestFallbackOrchestrator.BREAKER_410_STORM_COOLDOWN_MS * 3L)
+            runCurrent()
+            advanceTimeBy(60_000L)
+            runCurrent()
+            assertEquals(
+                LongPollBreakerState.SuspendedOnPoison,
+                orch.peekBreakerStateForTest(),
+                "state MUST stay SuspendedOnPoison — 410s in this state are not authoritative " +
+                    "and cannot overwrite via storm trigger",
+            )
+            assertEquals(
+                false,
+                orch.peekHasBreakerTimerForTest(),
+                "no breaker timer MUST be alive while in SuspendedOnPoison",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf4_p11_handle410_in_Open_state_via_seam_is_full_noop() = runTest(timeout = 5.minutes) {
+        // Round-4 P1.1: a 410 dance arriving while the breaker
+        // is Open (because the gate would have Skipped) must
+        // be a full no-op for storm timestamps and backoff.
+        init()
+        val transport = BreakerTestTransport(pollScript = { _ ->
+            RestFallbackResponse(statusCode = 410, bodyParsed = null, rawBody = "", elapsedMs = 1L)
+        })
+        val orch = buildOrchestrator(transport, testScheduler)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+                orch.submitEvent(
+                    RestStateMachine.Event.WsSessionEnded(
+                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    ),
+                )
+            }
+            orch.start()
+            runCurrent()
+            // Drive one 410 → populates storm bookkeeping.
+            repeat(20) {
+                if (transport.pollCalls.size >= 1) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            val timestampsBefore = orch.peekStatus410StormTimestampsForTest()
+            val backoffBefore = orch.peekCurrent410BackoffMsForTest()
+            check(timestampsBefore.isNotEmpty())
+            // Flip to Open via seam (bumps epoch).
+            orch.setBreakerStateForTest(
+                LongPollBreakerState.Open(
+                    BreakerOpenReason.ConsecutiveRestFailures,
+                    RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                ),
+            )
+            // pollLoop iterates with gate Skip; no handle410 fires.
+            advanceTimeBy(RestFallbackOrchestrator.BREAKER_410_STORM_COOLDOWN_MS)
+            runCurrent()
+            assertEquals(
+                timestampsBefore,
+                orch.peekStatus410StormTimestampsForTest(),
+                "in Open state, no handle410 mutations should happen — storm timestamps unchanged",
+            )
+            assertEquals(
+                backoffBefore,
+                orch.peekCurrent410BackoffMsForTest(),
+                "in Open state, 410 backoff stays unchanged",
+            )
+        } finally {
+            orch.stop()
+            runCurrent()
+        }
+    }
+
+    @Test
+    fun cf4_p2_wsActivePollLoop_treats_200_with_null_body_as_OK_response() = runTest(timeout = 5.minutes) {
+        // Round-4 P2: round-3's wsActivePollLoop bundled
+        // `bodyParsed == null` with the !200..299 check, so a
+        // 200 with an unparseable body fell into the 4xx-other
+        // branch with isOkResponse = false. The legacy pollLoop
+        // treated the same response as isOkResponse = true. The
+        // asymmetry meant the same response reset the 410
+        // backoff floor through one loop but not the other.
+        init()
+        val transport = BreakerTestTransport(pollScript = { i ->
+            when (i) {
+                0 -> RestFallbackResponse(
+                    statusCode = 410, bodyParsed = null, rawBody = "", elapsedMs = 1L,
+                )
+                else -> RestFallbackResponse(
+                    statusCode = 200, bodyParsed = null,
+                    rawBody = "garbage-body", elapsedMs = 1L,
+                )
+            }
+        })
+        val orch = buildOrchestrator(transport, testScheduler, longPollEnabled = true)
+        try {
+            val caps = orch.bootstrap()
+            check(caps.restFallback)
+            orch.start()
+            runCurrent()
+            // Wait for the first poll (410) → backoff bumps to 10_000.
+            repeat(20) {
+                if (transport.pollCalls.size >= 1) return@repeat
+                advanceTimeBy(500L)
+                runCurrent()
+            }
+            val backoffAfter410 = orch.peekCurrent410BackoffMsForTest()
+            assertTrue(
+                backoffAfter410 > RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                "expected backoff > 5 s after 410; got $backoffAfter410",
+            )
+            // Advance through the 410 backoff so the next poll
+            // (the 200 with null body) fires.
+            advanceTimeBy(backoffAfter410 + 1_000L)
+            runCurrent()
+            assertTrue(
+                transport.pollCalls.size >= 2,
+                "expected 2nd poll (200) to have landed; got pollCalls.size=${transport.pollCalls.size}",
+            )
+            assertEquals(
+                RestFallbackOrchestrator.BREAKER_INITIAL_COOLDOWN_MS,
+                orch.peekCurrent410BackoffMsForTest(),
+                "the parallel wsActivePollLoop MUST treat 200 with null body as an OK response " +
+                    "(scope §L8: 200 OK resets the 410 floor); the legacy pollLoop's behaviour " +
+                    "MUST be matched symmetrically per round-4 P2.",
             )
         } finally {
             orch.stop()
