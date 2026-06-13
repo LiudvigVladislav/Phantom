@@ -568,3 +568,7 @@ After Stage 2B-B merges, the long-poll backbone is **semantically wired but NOT 
 3. **Direct WSS hardening track opens.** The backbone is "active" only after Stage 2B-D promotion is green in production. Direct WSS hardening is the next track per the locked strategic order, but it starts only after Stage 2B-D, not after Stage 2B-C.
 
 This sequencing is explicit so the strategic frame's "backbone first" framing does not silently degrade into "backbone shipped but never validated; we have moved on to Direct WSS." The backbone is the un-killable-messenger guarantee at the product level; validating it under production load is the load-bearing step that justifies that guarantee.
+
+## Post-d395f682 council deltas (2026-06-13)
+
+A two-layer council on the Tele2 LTE smoke at branch HEAD `d395f682` produced two binding decisions on top of the original scope: (A) a deployment-rollout-gate disclosure governing what PR descriptions and release notes may and may not claim about Stage 2B-B's production-active state, and (B) a written client contract for the REST poll body-timeout-after-headers failure shape. Both decisions live at `docs/tracks/trek2-stage2b-b-deployment-gate-and-body-timeout-contract.md` and are binding on this branch and on all subsequent Stage 2B-* PRs. Council synthesis: `docs/tracks/trek2-stage2b-b-s6-council-d395f682/synthesis.md`.
