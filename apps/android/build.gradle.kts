@@ -31,7 +31,13 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 fun localOrEnv(propKey: String, envKey: String, default: String): String =
-    localProps.getProperty(propKey) ?: System.getenv(envKey) ?: default
+    // Lookup priority: Gradle -P project property > local.properties > env var > default.
+    // The -P branch was added in Round 12 step 4 so the operator can build the
+    // diagnostic APK variants without editing local.properties — the canonical
+    // command line is `./gradlew :apps:android:assembleDebug -PpollSkipLpAndPp=1`.
+    // Backwards compatible: existing local.properties / env-var workflows are
+    // unchanged.
+    (project.findProperty(propKey) as? String) ?: localProps.getProperty(propKey) ?: System.getenv(envKey) ?: default
 
 kotlin {
     androidTarget {
@@ -307,7 +313,7 @@ android {
             //     refuted; Arm G (WS-over-Reality) is primary next test
             //
             // The T2 client uses a SEPARATE OkHttp profile from the
-            // WebSocket arms (Vladislav hard gate 1 2026-06-06): connect=5s,
+            // WebSocket arms (hard gate 1, locked 2026-06-06): connect=5s,
             // write=30s, read=60s, callTimeout=180s. The WebSocket arms'
             // `callTimeout(10s)` would kill the slow POST mid-test and
             // produce garbage data.
@@ -399,8 +405,8 @@ android {
             // opt-in header, raised OkHttp callTimeout/readTimeout, jittered
             // hold consumption, persisted `lastSeenSeq` use, periodic
             // re-auth ceiling). Values follow the existing
-            // `DEBUG_RC_DIRECT_ARM` String "1"/"0" idiom locked by Vladislav
-            // OQ7 2026-06-09. Debug builds default to "1" (long-poll on so
+            // `DEBUG_RC_DIRECT_ARM` String "1"/"0" idiom (locked
+            // 2026-06-09). Debug builds default to "1" (long-poll on so
             // beta phones exercise the path); release builds pin to "0"
             // (defence in depth — Stage 2B promotion to production is a
             // separate named PR + a deliberate buildConfigField flip in this
@@ -414,6 +420,78 @@ android {
             // Stage 2B wires every consumer.
             val longPollV2Enabled = localOrEnv("longPollV2Enabled", "LONGPOLL_V2_ENABLED", "1")
             buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"$longPollV2Enabled\"")
+
+            // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) — debug
+            // override gate for the Tele2 LTE smoke S6 controllable
+            // breaker trigger. The previous `BuildConfig.DEBUG`
+            // gate was load-bearing for ALL three defence-in-depth
+            // layers; if a future beta variant runs with
+            // `isDebuggable = false`, the smoke runbook ("debug or
+            // beta APK") would be silently invalidated because the
+            // trigger surface would be unreachable. This dedicated
+            // flag decouples the gate from `BuildConfig.DEBUG` so
+            // a beta variant can opt into the trigger explicitly
+            // by setting `s6DebugTriggerEnabled=1` in
+            // `local.properties` (or `S6_DEBUG_TRIGGER_ENABLED=1`
+            // env). Default `"1"` on debug builds; release pins to
+            // `"0"`. Mirrors the existing `LONGPOLL_V2_ENABLED`
+            // String "1"/"0" idiom (locked 2026-06-09).
+            val s6DebugTriggerEnabled = localOrEnv(
+                "s6DebugTriggerEnabled",
+                "S6_DEBUG_TRIGGER_ENABLED",
+                "1",
+            )
+            buildConfigField(
+                "String",
+                "S6_DEBUG_TRIGGER_ENABLED",
+                "\"$s6DebugTriggerEnabled\"",
+            )
+
+            // Trek 2 Stage 2B-B Round 12 step 3 — diagnostic toggle
+            // that drops BOTH `X-Phantom-Long-Poll` AND
+            // `X-Phantom-Padded-Poll` opt-in headers from the
+            // `/relay/poll` request atomically when set to "1". The
+            // strip is gated at the AppContainer wiring layer on
+            // (a) `BuildConfig.DEBUG == true` AND (b) the active
+            // PrivacyMode equalling `Standard`; flipping this field to
+            // "1" alone is necessary but not sufficient to enable the
+            // strip on a Privacy or Ghost session, by design (the
+            // Vladislav-locked uniform-functionality rule disallows
+            // silently degrading those tiers' wire shape).
+            //
+            // Debug builds default to "0" (no behavioural change vs
+            // production wire shape). Operator opts in for a
+            // body-size discriminator diagnostic run via
+            // `local.properties` `pollSkipLpAndPp=1` or env
+            // `POLL_SKIP_LP_AND_PP=1` before `assembleDebug`. Release
+            // builds pin to "0" — this is a release-pin invariant
+            // independent of the LONGPOLL_V2_ENABLED L6 pin, since
+            // the council's security cross-check flagged any
+            // diagnostic strip in release as a guardrail-C violation
+            // and a privacy-mode metadata regression vector.
+            //
+            // PARTIAL-STRIP IS BANNED. The original Round 12 patch
+            // proposal called this `POLL_SKIP_PADDED_BODY` and would
+            // have stripped only `X-Phantom-Padded-Poll` while
+            // retaining `X-Phantom-Long-Poll`. The council
+            // (Layer 2 kmp + security + test) blocked it because
+            // partial-strip violates the L1 LP+PP coupling lock
+            // (scope-doc lock 1: "both or neither") and produces a
+            // new wire-shape fingerprint distinguishable from the
+            // padded production shape. The current name carries
+            // BOTH letters so a future reader sees both surfaces are
+            // touched together; a negative-grep test fences against
+            // the rejected name reappearing.
+            val pollSkipLpAndPp = localOrEnv(
+                "pollSkipLpAndPp",
+                "POLL_SKIP_LP_AND_PP",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "POLL_SKIP_LP_AND_PP",
+                "\"$pollSkipLpAndPp\"",
+            )
         }
         release {
             isMinifyEnabled = true
@@ -508,9 +586,31 @@ android {
             // can never engage any Stage 2B runtime path even if a debug-only
             // wire-up site forgot its `BuildConfig.DEBUG` guard. Stage 2B
             // promotion to release is a separate named PR that flips this
-            // single line; defence-in-depth backstop per Vladislav OQ7 +
-            // OQ11 split locks 2026-06-09.
+            // single line; defence-in-depth backstop per the
+            // OQ7 + OQ11 split locks (locked 2026-06-09).
             buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"0\"")
+            // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) —
+            // release builds ALWAYS pin the S6 debug trigger flag
+            // to `"0"`. The AppContainer wire-up reads this value
+            // and gates the receiver registration + the
+            // orchestrator constructor flag on it (independent of
+            // `BuildConfig.DEBUG`). A release APK can never reach
+            // the trigger path even if the receiver were
+            // dispatched. Defence-in-depth backstop per the same
+            // OQ7 idiom as `LONGPOLL_V2_ENABLED`.
+            buildConfigField("String", "S6_DEBUG_TRIGGER_ENABLED", "\"0\"")
+
+            // Trek 2 Stage 2B-B Round 12 step 3 — release pin. The
+            // diagnostic LP+PP-strip toggle MUST be off in release
+            // regardless of any -PpollSkipLpAndPp Gradle property,
+            // local.properties entry, or env variable that an
+            // operator could pass at build time. The council security
+            // cross-check identified the toggle as a privacy-mode
+            // metadata regression vector if ever active in a release
+            // shipped to users; pinning here on top of the
+            // debug-only `BuildConfig.DEBUG` runtime gate is
+            // belt-and-braces.
+            buildConfigField("String", "POLL_SKIP_LP_AND_PP", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

@@ -48,6 +48,8 @@ actual fun forceShutdownActiveEngine() {
 // commonMain `expect` signature, but ignored — the stub throws regardless.
 actual fun createRestFallbackTransport(
     @Suppress("UNUSED_PARAMETER") socksProxyPort: Int?,
+    @Suppress("UNUSED_PARAMETER") debugBodyLogging: Boolean,
+    @Suppress("UNUSED_PARAMETER") pollSkipLpAndPpProvider: () -> Boolean,
 ): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is Android-only. " +

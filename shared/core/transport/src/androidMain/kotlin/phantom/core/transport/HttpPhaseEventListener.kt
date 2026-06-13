@@ -82,6 +82,7 @@ internal class HttpPhaseEventListener(
     private var connectStartMs: Long = 0L
     private var secureConnectStartMs: Long = 0L
     private var responseHeadersStartMs: Long = 0L
+    private var responseBodyStartMs: Long = 0L
 
     private fun elapsed(): Long = System.currentTimeMillis() - callStartMs
 
@@ -163,6 +164,46 @@ internal class HttpPhaseEventListener(
     override fun responseHeadersEnd(call: Call, response: Response) {
         val elapsedMs = System.currentTimeMillis() - responseHeadersStartMs
         log("event=responseHeadersEnd status=${response.code} elapsedMs=$elapsedMs")
+    }
+
+    // Round 12 step 2 — body-read phase events. The S6 council on
+    // d395f682 identified that the gap between `responseHeadersEnd`
+    // and `callFailed` (~9.3 s in the captured incident) is where
+    // body bytes either arrive, partially arrive, or never arrive,
+    // and that the absence of dedicated body-phase events made the
+    // four competing failure-mode hypotheses (Tele2 byte-budget,
+    // client timeout too tight, server defers body, Caddy/TLS
+    // intermediate) undiscriminatable in field evidence.
+    //
+    // OkHttp's `responseBodyStart` fires when the response body
+    // begins to be consumed (the source becomes readable);
+    // `responseBodyEnd` fires only on a SUCCESSFUL full read.
+    // The combination forms a partial discriminator on its own:
+    //
+    //   * neither fires + callFailed       — body read never began
+    //                                        (server-side hold, TLS
+    //                                        stall before body chunk
+    //                                        emission, etc.)
+    //   * responseBodyStart fires + callFailed
+    //                                      — body read began but did
+    //                                        not complete (a real
+    //                                        per-byte stall mid-read,
+    //                                        the byte-budget cutoff
+    //                                        class).
+    //   * both fire + callEnd              — body read completed
+    //                                        within budget.
+    //
+    // The per-chunk byte accounting that distinguishes "stalled at
+    // 0 bytes" from "stalled at N bytes" is delivered by the
+    // separate `DebugBodyByteLoggingInterceptor` (debug-only).
+    override fun responseBodyStart(call: Call) {
+        responseBodyStartMs = System.currentTimeMillis()
+        log("event=responseBodyStart elapsedMs=${elapsed()}")
+    }
+
+    override fun responseBodyEnd(call: Call, byteCount: Long) {
+        val elapsedMs = System.currentTimeMillis() - responseBodyStartMs
+        log("event=responseBodyEnd byteCount=$byteCount elapsedMs=$elapsedMs")
     }
 
     override fun callEnd(call: Call) {

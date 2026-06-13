@@ -149,6 +149,32 @@ data class RestFallbackResponse<T>(
     val rawBody: String,
     /** Wall-clock elapsed time for this single HTTP round-trip, in ms. */
     val elapsedMs: Long,
+    /**
+     * Trek 2 Stage 2B-B (C5, L8 + L9, M-B24) — parsed
+     * `Retry-After` header value, in seconds.
+     *
+     * Populated only when:
+     *   * The transport observed a `Retry-After` header on the
+     *     response.
+     *   * The header parsed as a non-negative numeric
+     *     `Long` (HTTP-date form, non-numeric junk, empty, zero,
+     *     and negative values are normalised to `null`).
+     *
+     * The orchestrator clamps the value to
+     * `RETRY_AFTER_HARD_CAP_SECONDS = 120` BEFORE multiplying by
+     * `1_000L` so a malicious or misconfigured relay sending
+     * `Retry-After: 86400` (one day) cannot lock the client out
+     * for a day, AND so the multiplication can NEVER overflow
+     * `Long` regardless of advertised value. The clamp pattern
+     * is `secs.coerceAtMost(RETRY_AFTER_HARD_CAP_SECONDS) * 1000L`
+     * — applied in both REST poll loops and the send-path retry
+     * that consumes the header.
+     *
+     * Default `null` keeps the wire shape backwards-compatible
+     * with the Stage 2B-A transport surface and with every test
+     * fake that does not exercise 429.
+     */
+    val retryAfterSeconds: Long? = null,
 )
 
 // ── Trek 2 Stage 2B-A (B1) — long-poll opt-in header constants ───────────────

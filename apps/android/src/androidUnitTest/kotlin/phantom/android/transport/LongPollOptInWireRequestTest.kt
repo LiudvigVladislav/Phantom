@@ -47,36 +47,49 @@ class LongPollOptInWireRequestTest {
     @Test
     fun build_poll_request_has_exactly_one_long_poll_opt_in_branch() {
         val source = transportSource.readText(Charsets.UTF_8)
-        // Match the actual code form `if (longPollOptIn) {` — excludes
-        // kdoc mentions of the pattern (which don't end with `) {`).
-        val branchCount = Regex("""if \(longPollOptIn\) \{""").findAll(source).count()
+        // Match the actual code form. Round 12 step 3 extended the
+        // condition from `if (longPollOptIn)` to
+        // `if (longPollOptIn && !pollSkipLpAndPp)` to support the
+        // diagnostic atomic-strip toggle. The L1 invariant ("exactly
+        // one branch that emits BOTH headers OR NEITHER") is
+        // preserved: there is still exactly one if-block, and the
+        // diagnostic toggle either lets BOTH headers emit (when
+        // `!pollSkipLpAndPp`) or drops BOTH together (when
+        // `pollSkipLpAndPp`). The partial-strip the council rejected
+        // would require a SECOND if-branch on PADDED_POLL alone; the
+        // single-branch invariant structurally forbids it.
+        val branchCount = Regex(
+            """if \(longPollOptIn && !pollSkipLpAndPp\) \{""",
+        ).findAll(source).count()
         assertEquals(
             1,
             branchCount,
             "AndroidNativeOkHttpRestFallbackTransport must contain EXACTLY ONE " +
-                "`if (longPollOptIn) {` block. Found $branchCount — a second branch " +
-                "would let one path emit headers without the other.",
+                "`if (longPollOptIn && !pollSkipLpAndPp) {` block. Found $branchCount — a " +
+                "second branch would let one path emit headers without the other.",
         )
     }
 
     @Test
     fun the_one_branch_emits_both_long_poll_and_padded_poll_headers() {
         val source = transportSource.readText(Charsets.UTF_8)
-        // Use the actual code form to skip the kdoc mention.
-        val branchStart = source.indexOf("if (longPollOptIn) {")
+        // Use the actual Round-12-updated code form.
+        val branchStart = source.indexOf("if (longPollOptIn && !pollSkipLpAndPp) {")
         assertNotNull(
             branchStart.takeIf { it >= 0 },
-            "Expected `if (longPollOptIn) {` block in transport source.",
+            "Expected `if (longPollOptIn && !pollSkipLpAndPp) {` block in transport source.",
         )
         val branchBlock = extractBalancedBraceBlock(source, branchStart)
             ?: fail("Could not extract balanced braces for the if-branch.")
         assertTrue(
             branchBlock.contains("LONG_POLL_OPT_IN_HEADER"),
-            "The `if (longPollOptIn)` block must emit LONG_POLL_OPT_IN_HEADER. Block was:\n$branchBlock",
+            "The `if (longPollOptIn && !pollSkipLpAndPp)` block must emit LONG_POLL_OPT_IN_HEADER. " +
+                "Block was:\n$branchBlock",
         )
         assertTrue(
             branchBlock.contains("PADDED_POLL_OPT_IN_HEADER"),
-            "The `if (longPollOptIn)` block must emit PADDED_POLL_OPT_IN_HEADER. Block was:\n$branchBlock",
+            "The `if (longPollOptIn && !pollSkipLpAndPp)` block must emit PADDED_POLL_OPT_IN_HEADER. " +
+                "Block was:\n$branchBlock",
         )
         // Both must be set via `builder.header(...)` calls, not some other API.
         val headerCalls = Regex("""builder\.header\(""").findAll(branchBlock).count()

@@ -28,13 +28,16 @@ class FakeLastSeenSeqRepository : LastSeenSeqRepository {
         identityHex: String,
         seq: Long,
         @Suppress("UNUSED_PARAMETER") nowMs: Long,
-    ): Unit = mutex.withLock {
+    ): Long? = mutex.withLock {
+        // C6 review-fix round 3 — atomic outcome derived INSIDE the
+        // same `mutex.withLock` that decides the write. Matches the
+        // SQLDelight transaction's atomicity guarantee.
         val current = cursors[identityHex]
-        if (current == null || current < seq) {
-            cursors[identityHex] = seq
+        if (current != null && current >= seq) {
+            return@withLock current
         }
-        // Monotonicity guard — silent no-op when caller tries to
-        // regress the cursor. Matches SQLDelight impl semantics.
+        cursors[identityHex] = seq
+        null
     }
 
     override suspend fun count(): Long =

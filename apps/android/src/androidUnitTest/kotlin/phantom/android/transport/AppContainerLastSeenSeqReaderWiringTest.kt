@@ -5,33 +5,44 @@ package phantom.android.transport
 
 import java.io.File
 import kotlin.test.Test
-import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Trek 2 Stage 2B-A (B3, L4) — review-fix contract test.
+ * Trek 2 Stage 2B-B (C3, L4 + OQ-6 LOCK) — review-fix contract test.
  *
  * Pins that `AppContainer.kt` actually passes a non-null
- * `lastSeenSeqReader` into `RestFallbackOrchestrator(...)`. Without
- * this wiring, the parallel `wsActivePollJob` would always poll with
- * `since_seq = null` regardless of any persisted cursor — defeating
- * the L4 cursor-read invariant in production even though the unit
- * tests still see it (they wire a fake reader directly into the
- * constructor).
+ * `cursorRepository` into `RestFallbackOrchestrator(...)` and that
+ * the bridge implements BOTH `getLastSeenSeq` AND `upsertLastSeenSeq`
+ * by delegating to the SQLDelight-backed repository field. Without
+ * this wiring, the orchestrator's `ackInboundAndAdvanceCursor` would
+ * silently no-op the persistent write half of the L4 contract and
+ * the cursor would stay at `null` in production even after a
+ * successful ack.
+ *
+ * **Why a textual contract test on the AppContainer source.** The
+ * orchestrator constructor parameter has a default of `null`, so a
+ * refactor that drops the wiring (or flips it to `null` during a
+ * back-out attempt) compiles cleanly but breaks the production L4
+ * write path. Unit tests pass their own `cursorRepository` directly
+ * into the constructor so they never see the production bridge. The
+ * textual assertion below trips at PR-test time on any such
+ * regression.
  *
  * The test parses the AppContainer source: locates the SOLE
  * `phantom.core.transport.RestFallbackOrchestrator(...)` construction
  * inside the file, extracts its balanced-paren argument list, and
- * asserts the argument list contains `lastSeenSeqReader = ` followed
- * by an expression that references a non-null SQLDelight-backed
- * repository.
+ * asserts the argument list contains `cursorRepository = ` followed
+ * by an expression that (a) is NOT `null` and (b) references the
+ * SQLDelight-backed `lastSeenSeqRepo` field for BOTH read and write
+ * methods.
  *
- * A future refactor that deletes the wiring or replaces it with
- * `null` trips this test deliberately at PR-test time.
+ * Filename retained as `AppContainerLastSeenSeqReaderWiringTest.kt`
+ * for git history continuity — the class name moved to reflect the
+ * Stage 2B-B contract.
  */
-class AppContainerLastSeenSeqReaderWiringTest {
+class AppContainerCursorRepositoryWiringTest {
 
     private val appContainerSource: File by lazy {
         val candidates = listOf(
@@ -72,48 +83,48 @@ class AppContainerLastSeenSeqReaderWiringTest {
     }
 
     @Test
-    fun app_container_passes_non_null_last_seen_seq_reader_to_orchestrator() {
+    fun app_container_passes_non_null_cursor_repository_to_orchestrator() {
         val args = orchestratorConstructionArguments()
         assertTrue(
-            args.contains("lastSeenSeqReader = "),
+            args.contains("cursorRepository = "),
             "AppContainer's RestFallbackOrchestrator construction must pass " +
-                "`lastSeenSeqReader = <expr>` explicitly. The orchestrator " +
+                "`cursorRepository = <expr>` explicitly. The orchestrator " +
                 "constructor has a default of `null` for this parameter; " +
-                "letting the default win means the production parallel " +
-                "`wsActivePollJob` polls with `since_seq=null` always, which " +
-                "exercises the L4 read path in tests but never in production. " +
+                "letting the default win means the production " +
+                "`ackInboundAndAdvanceCursor` no-ops the persistent write " +
+                "and the cursor stays at `null` after a successful ack. " +
                 "Argument list was:\n$args",
         )
         // The wired expression must NOT be the literal `null`. A future
         // refactor that flips the bridge to `null` (e.g. during a
         // back-out attempt) would silently restore the broken
         // production behaviour without breaking unit tests, since unit
-        // tests pass their own reader directly.
-        val readerArgStart = args.indexOf("lastSeenSeqReader = ") +
-            "lastSeenSeqReader = ".length
-        // Extract a small window — until the next comma at the top
-        // bracket level — and assert it does NOT begin with `null`.
-        val windowEnd = findTopLevelComma(args, readerArgStart).let {
+        // tests pass their own repository directly.
+        val argStart = args.indexOf("cursorRepository = ") +
+            "cursorRepository = ".length
+        // Extract a window until the next top-bracket-level comma and
+        // assert the expression does NOT begin with `null`.
+        val windowEnd = findTopLevelComma(args, argStart).let {
             if (it < 0) args.length else it
         }
-        val readerArgExpr = args.substring(readerArgStart, windowEnd).trim()
+        val argExpr = args.substring(argStart, windowEnd).trim()
         assertTrue(
-            !readerArgExpr.startsWith("null"),
-            "AppContainer must not pass `lastSeenSeqReader = null`. The " +
+            !argExpr.startsWith("null"),
+            "AppContainer must not pass `cursorRepository = null`. The " +
                 "wired value must reference a non-null SQLDelight-backed " +
                 "repository so the production path actually exercises L4's " +
-                "read-only cursor seam. Found expression:\n  $readerArgExpr",
+                "read AND write cursor seam. Found expression:\n  $argExpr",
         )
         // Sanity: the wired expression should mention the repository
         // field by name. This catches a refactor that wires a stub
         // returning a constant (which would also break the
-        // production L4 read path even if non-null).
+        // production L4 read/write path even if non-null).
         assertTrue(
-            readerArgExpr.contains("lastSeenSeqRepo"),
-            "Expected the lastSeenSeqReader expression to bridge through " +
+            argExpr.contains("lastSeenSeqRepo"),
+            "Expected the cursorRepository expression to bridge through " +
                 "`lastSeenSeqRepo` (the SQLDelight-backed " +
                 "LastSeenSeqRepository field on AppContainer). Found:\n  " +
-                "$readerArgExpr",
+                "$argExpr",
         )
     }
 
@@ -131,7 +142,7 @@ class AppContainerLastSeenSeqReaderWiringTest {
             "AppContainer must construct `SqlDelightLastSeenSeqRepository(" +
                 "dbHolder.database)` so the production path has a real " +
                 "SQLDelight-backed repository to bridge through to the " +
-                "orchestrator's `lastSeenSeqReader`. The declaration was " +
+                "orchestrator's `cursorRepository`. The declaration was " +
                 "not found in AppContainer.kt.",
         )
     }
@@ -156,31 +167,35 @@ class AppContainerLastSeenSeqReaderWiringTest {
     }
 
     @Test
-    fun reader_lambda_only_calls_get_last_seen_seq() {
-        // Lock L4 belt-and-braces: even though the
-        // `LongPollCursorReader` interface has no write method, this
-        // test pins that the bridge lambda inside AppContainer
-        // references only the `getLastSeenSeq` method on the
-        // repository. A bridge that grew an `upsertLastSeenSeq` call
-        // (e.g. as part of a misguided "advance cursor on poll"
-        // refactor) would trip this test deliberately — long before
-        // the resulting production behaviour could ship.
+    fun cursor_repository_bridge_implements_both_read_and_write_methods() {
+        // L4 + OQ-6 LOCK belt-and-braces: a Stage 2B-B bridge MUST
+        // implement BOTH `getLastSeenSeq` AND `upsertLastSeenSeq` so
+        // the orchestrator's `ackInboundAndAdvanceCursor` has a real
+        // persistent write target. A bridge that only implements
+        // read (e.g. accidentally rebuilt as a SAM for the legacy
+        // `LongPollCursorReader` interface) would compile cleanly
+        // because the orchestrator parameter type accepts any
+        // `LongPollCursorRepository?` — but the resulting object
+        // could not be constructed against the two-method interface
+        // anyway. This test catches a regression at PR-test time
+        // BEFORE the orchestrator-side write path becomes a no-op.
         val args = orchestratorConstructionArguments()
-        val readerArgStart = args.indexOf("lastSeenSeqReader = ")
-        if (readerArgStart < 0) fail("Test prerequisite: lastSeenSeqReader assignment must be present.")
-        val readerWindowEnd = findTopLevelComma(args, readerArgStart).let {
+        val argStart = args.indexOf("cursorRepository = ")
+        if (argStart < 0) fail("Test prerequisite: cursorRepository assignment must be present.")
+        val windowEnd = findTopLevelComma(args, argStart).let {
             if (it < 0) args.length else it
         }
-        val readerExpr = args.substring(readerArgStart, readerWindowEnd)
+        val argExpr = args.substring(argStart, windowEnd)
         assertTrue(
-            readerExpr.contains("getLastSeenSeq"),
-            "Bridge lambda must call `getLastSeenSeq`. Found:\n  $readerExpr",
+            argExpr.contains("getLastSeenSeq"),
+            "Bridge must implement `getLastSeenSeq`. Found:\n  $argExpr",
         )
-        assertEquals(
-            0,
-            Regex("""upsertLastSeenSeq""").findAll(readerExpr).count(),
-            "Bridge lambda must NOT call `upsertLastSeenSeq` — Stage 2B-A " +
-                "is read-only on the cursor (lock L4). Found:\n  $readerExpr",
+        assertTrue(
+            argExpr.contains("upsertLastSeenSeq"),
+            "Bridge MUST implement `upsertLastSeenSeq` so the L4 + OQ-6 " +
+                "LOCK write half is actually wired. A bridge missing this " +
+                "method would silently leave production cursors unpersisted " +
+                "after a successful ack. Found:\n  $argExpr",
         )
     }
 }

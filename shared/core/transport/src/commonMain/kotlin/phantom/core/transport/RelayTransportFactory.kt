@@ -140,6 +140,40 @@ expect fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport
  */
 expect fun createRestFallbackTransport(
     socksProxyPort: Int? = null,
+    /**
+     * Round 12 step 2 — debug-only diagnostic toggle for per-chunk
+     * response-body byte accounting on the REST `/relay/poll` path.
+     * Wired by the application module (Android) from
+     * `BuildConfig.DEBUG`. Defaults to `false` so every existing call
+     * site preserves byte-identical behaviour. iOS / JVM actuals
+     * accept the parameter but ignore it — they throw
+     * [NotImplementedError] regardless, identical to the existing
+     * `socksProxyPort` posture.
+     */
+    debugBodyLogging: Boolean = false,
+    /**
+     * Round 12 step 3 — diagnostic provider that, when it returns
+     * `true`, causes the `/relay/poll` request to drop BOTH the
+     * `X-Phantom-Long-Poll` AND the `X-Phantom-Padded-Poll` opt-in
+     * headers atomically (per the L1 coupling lock: both or neither).
+     * The provider is invoked at request-build time on each poll
+     * iteration so a runtime PrivacyMode change is observed
+     * promptly — Standard → Ghost mid-session promptly turns the
+     * strip off again.
+     *
+     * Wiring contract (Android): the provider is `{ BuildConfig.DEBUG
+     * && BuildConfig.POLL_SKIP_LP_AND_PP == "1" && PrivacyMode ==
+     * Standard }`. All three conjuncts MUST hold for the strip to
+     * fire; release builds (where `BuildConfig.DEBUG` is `false` AND
+     * `BuildConfig.POLL_SKIP_LP_AND_PP` is pinned to `"0"`) cannot
+     * activate the strip under any circumstances. Privacy and Ghost
+     * sessions also cannot activate the strip, by design.
+     *
+     * Defaults to `{ false }` so every existing call site preserves
+     * byte-identical wire behaviour. iOS / JVM actuals accept the
+     * parameter but ignore it.
+     */
+    pollSkipLpAndPpProvider: () -> Boolean = { false },
 ): RestFallbackTransport
 
 /**

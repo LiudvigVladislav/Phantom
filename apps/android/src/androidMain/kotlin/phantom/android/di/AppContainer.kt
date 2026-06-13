@@ -93,6 +93,118 @@ class AppContainer(private val context: Context) {
         private set
 
     /**
+     * Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence) — REST
+     * orchestrator reference, set inside [initMessaging] after the
+     * orchestrator is constructed. Held so the S6 breaker trigger
+     * surface ([triggerS6BreakerForDebug] +
+     * [phantom.android.dev.S6BreakerTriggerActivity]) can route to
+     * `forceBreakerTripForS6TestTrigger()` without re-entering
+     * the wiring path. Null until [initMessaging] runs.
+     *
+     * Round 11 (council follow-up) — partial-initialization window
+     * + reflection caveat:
+     *
+     * The field is assigned synchronously immediately after the
+     * orchestrator's constructor returns inside [initMessaging] and
+     * BEFORE the orchestrator's `start()` method is called. There is
+     * a window — bounded by the time it takes [initMessaging] to
+     * progress from the post-construction assignment to the `start()`
+     * call — during which `restOrchestratorRef` references a
+     * constructed-but-not-yet-armed orchestrator. The trigger
+     * helper [triggerS6BreakerForDebug] handles this case (logging
+     * "not initialised yet" when `restOrchestratorRef` is null), but
+     * the field becoming NON-null is not itself a guarantee that
+     * `orchestrator.start()` has completed.
+     *
+     * Kotlin `private` is enforced by the compiler, but not by the
+     * JVM at runtime: any in-process code with access to
+     * `java.lang.reflect.Field` (a compromised JNI library, a
+     * malicious plugin loaded into the process, a dependency-chain
+     * compromise) can read the reference irrespective of the
+     * `private` modifier. The defence here is layered: even if such
+     * code reaches the orchestrator reflectively, every breaker-
+     * trigger entry point re-checks
+     * `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"` independently,
+     * and the orchestrator constructor flag `s6DebugTriggerEnabled`
+     * is the load-bearing inner gate. Reflection cannot bypass that
+     * gate without also rewriting BuildConfig, at which point the
+     * build is already compromised at a different layer.
+     *
+     * A `started`-asserting accessor wrapper is intentionally NOT
+     * added in this round to keep the cleanup minimal; the
+     * production-side risk is bounded by the four-layer trigger
+     * defence-in-depth described on
+     * [phantom.android.dev.S6BreakerTriggerActivity]. A wrapper is
+     * a reasonable follow-up if the surface ever grows beyond the
+     * single debug-only S6 trigger.
+     */
+    @Volatile private var restOrchestratorRef:
+        phantom.core.transport.RestFallbackOrchestrator? = null
+
+    /**
+     * Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence) — entry
+     * point for the Tele2 LTE smoke S6 controllable trigger.
+     * Reachable iff `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`.
+     *
+     * The Tele2 runbook (`docs/tracks/trek2-stage2b-b-tele2-smoke.md`,
+     * scenario S6) accepts this helper iff natural Mode-2 does not
+     * reproduce inside the 30-minute Tecno+Tele2 LTE time-box. This
+     * surface is reachable two ways:
+     *
+     *   1. **ADB activity launch** —
+     *      `adb shell am start -n
+     *      phantom.android/phantom.android.dev.S6BreakerTriggerActivity`
+     *      invokes the no-display
+     *      [phantom.android.dev.S6BreakerTriggerActivity] which
+     *      calls this function on [appScope]. The Tecno operator
+     *      fires the trigger from a connected laptop without
+     *      compiling a debug menu UI.
+     *   2. **Direct test call** — commonTest / androidUnitTest
+     *      cells call this directly to assert the gate logic.
+     *
+     * Two-layer defence-in-depth:
+     *
+     *   * This function returns `false` (no-op) when
+     *     `BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1"`. Release
+     *     builds pin the field to `"0"` unconditionally; a future
+     *     beta variant opts in via the dedicated gradle property
+     *     independent of `isDebuggable`.
+     *   * The orchestrator constructor receives
+     *     `s6DebugTriggerEnabled = BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`;
+     *     even if a caller reached past the AppContainer gate, the
+     *     orchestrator-side gate refuses and logs
+     *     `REST_TRACE breaker_test_trigger_refused
+     *     reason=disabled_in_release`.
+     *
+     * Return value indicates whether the trigger was DISPATCHED
+     * (orchestrator helper called), not whether the breaker
+     * actually flipped. The orchestrator-side gate may still
+     * refuse and the caller observes the refusal log instead of
+     * the trigger log.
+     */
+    suspend fun triggerS6BreakerForDebug(): Boolean {
+        if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1") {
+            android.util.Log.w(
+                "Phantom/S6Debug",
+                "triggerS6BreakerForDebug() refused: " +
+                    "BuildConfig.S6_DEBUG_TRIGGER_ENABLED=" +
+                    "${phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED}",
+            )
+            return false
+        }
+        val orch = restOrchestratorRef
+        if (orch == null) {
+            android.util.Log.w(
+                "Phantom/S6Debug",
+                "triggerS6BreakerForDebug() refused: initMessaging has not run yet",
+            )
+            return false
+        }
+        orch.forceBreakerTripForS6TestTrigger()
+        return true
+    }
+
+    /**
      * Steady-state prekey lifecycle service: onboarding bootstrap,
      * OPK pool refill, weekly SPK rotation. The 24-hour ticker is
      * launched in [initMessaging]; UI surfaces (e.g. MigrationScreen)
@@ -942,6 +1054,16 @@ class AppContainer(private val context: Context) {
             // collectors only start later, after bootstrapAndStart).
             var degradationDetectorRef: phantom.core.transport.WsDegradationDetector? = null
 
+            // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) — pass
+            // `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`
+            // through to the orchestrator's [s6DebugTriggerEnabled]
+            // constructor gate. Decoupled from `BuildConfig.DEBUG`
+            // so a future beta variant with `isDebuggable=false`
+            // can still opt into the trigger via the gradle
+            // property `s6DebugTriggerEnabled=1`. Release pins to
+            // `"0"`; the trigger helper short-circuits with the
+            // `breaker_test_trigger_refused` log.
+            val s6DebugEnabled = phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
@@ -971,7 +1093,43 @@ class AppContainer(private val context: Context) {
                     identityManager.signRelayChallenge(nonceBytes)
                         ?: error("signing key not provisioned")
                 },
-                transport = phantom.core.transport.createRestFallbackTransport(),
+                transport = phantom.core.transport.createRestFallbackTransport(
+                    // Round 12 step 2 — debug-only per-chunk body
+                    // byte accounting on the /relay/poll path. Wired
+                    // from BuildConfig.DEBUG so the release variant
+                    // (where BuildConfig.DEBUG is always false)
+                    // receives `debugBodyLogging = false` and the
+                    // diagnostic interceptor is never constructed.
+                    debugBodyLogging = phantom.android.BuildConfig.DEBUG,
+                    // Round 12 step 3 — diagnostic provider that
+                    // strips BOTH X-Phantom-Long-Poll AND
+                    // X-Phantom-Padded-Poll headers atomically.
+                    // Gated on THREE conjuncts that ALL must hold:
+                    //   (1) BuildConfig.DEBUG — the release variant
+                    //       has this `false`, killing the diagnostic
+                    //       at compile-time-effective resolution.
+                    //   (2) BuildConfig.POLL_SKIP_LP_AND_PP == "1" —
+                    //       release-pinned to "0" in build.gradle.kts,
+                    //       defence-in-depth on top of (1).
+                    //   (3) PrivacyMode == Standard — Privacy and
+                    //       Ghost sessions MUST NOT carry the strip
+                    //       per the Vladislav-locked uniform-
+                    //       functionality rule (2026-06-06). The
+                    //       check reads the SharedPreferences-backed
+                    //       value at request-build time on each poll
+                    //       iteration so a runtime mode switch
+                    //       (Standard → Ghost) deactivates the strip
+                    //       on the very next poll, atomically.
+                    // A partial-strip diagnostic (PP only, LP kept)
+                    // was REJECTED by the council; the `&&
+                    // !pollSkipLpAndPp` block in `buildPollRequest`
+                    // keeps the emission decision a single boolean.
+                    pollSkipLpAndPpProvider = {
+                        phantom.android.BuildConfig.DEBUG &&
+                            phantom.android.BuildConfig.POLL_SKIP_LP_AND_PP == "1" &&
+                            transportPreferences.privacyMode == phantom.core.transport.PrivacyMode.Standard
+                    },
+                ),
                 log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
                 onModeSwitched = { _, _, reason ->
                     // Mirror the REST_TRACE mode_switched reason into the
@@ -981,6 +1139,20 @@ class AppContainer(private val context: Context) {
                     // is a pure log pass-through with no detector state
                     // mutation; safe to call from any context, no mutex.
                     degradationDetectorRef?.emitStateTransitionSeen(reason)
+                },
+                onRestPollDegraded = { reason ->
+                    // Trek 2 Stage 2B-B (C5, L9; round-2 review-fix P2):
+                    // mirror the typed BreakerOpenReason (e.g.
+                    // ConsecutiveRestFailures vs Status410Storm) into the
+                    // WS_DEGRADED_TELEMETRY stream so calibration can
+                    // discriminate without parsing the `REST_TRACE
+                    // breaker_open` log substring. Uses the same var-trick
+                    // as onModeSwitched: the detector is constructed
+                    // immediately after this orchestrator and assigned to
+                    // `degradationDetectorRef` synchronously on this
+                    // thread BEFORE any state-machine event can fire (the
+                    // WS collectors only start after bootstrapAndStart).
+                    degradationDetectorRef?.emitRestPollDegradedSeen(reason)
                 },
                 // Trek 2 Stage 2A (A6) — pass the Stage 2B long-poll
                 // runtime gate through to the orchestrator. The value
@@ -995,21 +1167,67 @@ class AppContainer(private val context: Context) {
                 // production release builds always see `false` here,
                 // independent of `BuildConfig.DEBUG`.
                 longPollEnabled = phantom.android.BuildConfig.LONGPOLL_V2_ENABLED == "1",
-                // Trek 2 Stage 2B-A (B3, L4) — bridge the SQLDelight-backed
-                // `LastSeenSeqRepository` into the orchestrator's read-only
-                // cursor seam. The lambda is a SAM constructor for
-                // `LongPollCursorReader`; the interface has no write method
-                // so this bridge cannot become a write path even by
-                // accident. Stage 2B-B will replace the read-only seam
-                // with a full read/write contract gated on `seq_mac`
-                // verify + storage accept-or-dedup; the bridge
-                // construction site stays here and the lambda body
-                // evolves to call both read + write methods at that
-                // point.
-                lastSeenSeqReader = phantom.core.transport.LongPollCursorReader { identityHex ->
-                    lastSeenSeqRepo.getLastSeenSeq(identityHex)
+                // Trek 2 Stage 2B-B (C3, L4 + OQ-6 LOCK) — bridge
+                // the SQLDelight-backed `LastSeenSeqRepository` into
+                // the orchestrator's full read/write cursor seam.
+                // Both REST poll loops share this single source of
+                // truth for `since_seq`; writes happen ONLY through
+                // `orchestrator.ackInboundAndAdvanceCursor` after the
+                // relay 2xx's the ack. The interface has two methods
+                // (`getLastSeenSeq` + `upsertLastSeenSeq`) so the
+                // bridge is an object literal — the SAM-constructor
+                // form is reserved for the legacy
+                // `LongPollCursorReader` read-only contract that
+                // remains in the codebase for diagnostic callers.
+                cursorRepository = object : phantom.core.transport.LongPollCursorRepository {
+                    override suspend fun getLastSeenSeq(identityHex: String): Long? =
+                        lastSeenSeqRepo.getLastSeenSeq(identityHex)
+
+                    override suspend fun upsertLastSeenSeq(
+                        identityHex: String,
+                        seq: Long,
+                        nowMs: Long,
+                    ): phantom.core.transport.CursorUpsertOutcome {
+                        // C6 review-fix round 3 — outcome is now
+                        // derived INSIDE the SQLDelight transaction
+                        // (the `LastSeenSeqRepository.upsertLast
+                        // SeenSeq` contract returns `Long?` —
+                        // `null` when the write committed,
+                        // `Long(existingSeq)` when the monotonicity
+                        // guard short-circuited). The previous
+                        // round-2 read-before-write bridge had a
+                        // genuine race: two coroutines could each
+                        // read the same `current`, both decide to
+                        // advance, but only the first INSERT-OR-
+                        // REPLACE land — the second silently no-
+                        // opped at the storage layer while the
+                        // bridge still returned Advanced(seq). With
+                        // the outcome derived in-transaction the
+                        // bridge becomes a one-call mapping.
+                        return when (
+                            val existingSeqOrNullIfAdvanced =
+                                lastSeenSeqRepo.upsertLastSeenSeq(identityHex, seq, nowMs)
+                        ) {
+                            null -> phantom.core.transport.CursorUpsertOutcome.Advanced(seq)
+                            else -> phantom.core.transport.CursorUpsertOutcome.NoChange(existingSeqOrNullIfAdvanced)
+                        }
+                    }
                 },
+                s6DebugTriggerEnabled = s6DebugEnabled,
             )
+            // Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence)
+            // — wire the freshly-constructed orchestrator into the
+            // class-level reference so the S6 breaker trigger
+            // surface ([triggerS6BreakerForDebug] +
+            // [phantom.android.dev.S6BreakerTriggerActivity]) can
+            // reach it. The assignment happens AFTER the
+            // orchestrator is fully constructed so observers cannot
+            // see a partially-initialised instance. The activity
+            // entry point is declared in AndroidManifest.xml with
+            // android:exported="true" and Theme.NoDisplay; the
+            // defence-in-depth chain is described in the activity's
+            // KDoc and on [triggerS6BreakerForDebug].
+            restOrchestratorRef = restOrchestrator
 
             // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.
             // MediaCrypto wraps libsodium AEAD (already initialized at app start).

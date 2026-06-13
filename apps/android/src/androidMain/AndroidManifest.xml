@@ -118,6 +118,21 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"/>
         </provider>
+
+        <!--
+            Trek 2 Stage 2B-B (C6 review-fix round 10 P1.arch+sec):
+            the S6 controllable breaker trigger Activity is now
+            declared in the debug-variant manifest overlay at
+            `apps/android/src/debug/AndroidManifest.xml`. Release
+            APKs therefore do NOT carry the declaration at all —
+            the component is invisible to `pm list packages -f` and
+            `dumpsys package` on release.
+
+            Runtime BuildConfig gates (in onCreate, AppContainer,
+            and the orchestrator constructor) remain as defence-in-
+            depth; the manifest-side absence is the load-bearing
+            release safety surface.
+        -->
     </application>
 
 </manifest>

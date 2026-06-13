@@ -54,7 +54,10 @@ class WsActivePollJobLifecycleTest {
                     maxSendBodyBytes = 4096,
                     pollMaxEnvelopes = 1,
                     pollHoldSecs = 30,
-                    seqMacVerifyKey = "f".repeat(64),
+                    // C4: empty key keeps state at KeyAbsent →
+                    // unverified pass-through; lifecycle tests
+                    // assert delivery without verify gate.
+                    seqMacVerifyKey = "",
                 ),
                 rawBody = "{}",
                 elapsedMs = 1L,
@@ -111,19 +114,47 @@ class WsActivePollJobLifecycleTest {
     }
 
     /**
-     * Recording fake cursor reader. The only seam method is
-     * [getLastSeenSeq]; there is no write API to mock because there
-     * is no write API on [LongPollCursorReader]. The fake exposes a
-     * [reads] list so M5 can assert read activity without giving the
-     * orchestrator any opportunity to advance the cursor.
+     * Recording fake cursor repository. Trek 2 Stage 2B-B (C3, L4)
+     * migrated this from the read-only `LongPollCursorReader` SAM to
+     * the read/write [LongPollCursorRepository] interface so the new
+     * orchestrator parameter shape is what the test wires. Stage
+     * 2B-A's M5 contract (read activity is recorded without giving
+     * the orchestrator an opportunity to advance the cursor) still
+     * holds in C3 lifecycle tests because the lifecycle harness does
+     * NOT drive the ack path — `upsertLastSeenSeq` simply records
+     * any write that occurs so a regression that incorrectly
+     * advances the cursor from a poll response (instead of from
+     * `ackInboundAndAdvanceCursor`) trips the test.
      */
-    private class RecordingCursorReader(
+    private class RecordingCursorRepository(
         private val backing: Long? = 7L,
-    ) : LongPollCursorReader {
+    ) : LongPollCursorRepository {
         val reads: MutableList<String> = mutableListOf()
+        val writes: MutableList<Triple<String, Long, Long>> = mutableListOf()
+        private var stored: Long? = backing
         override suspend fun getLastSeenSeq(identityHex: String): Long? {
             reads += identityHex
-            return backing
+            return stored
+        }
+        // C6 review-fix round 5 — bring this fake in
+        // line with the SQLDelight + Fake monotonicity contract. The
+        // round-2/3/4 wiring assumed every test fake either records
+        // monotonically OR honestly returns NoChange; an
+        // always-Advanced fake here was a consistency nit that a
+        // future copy-paste would extend into a test where the
+        // discrimination matters.
+        override suspend fun upsertLastSeenSeq(
+            identityHex: String,
+            seq: Long,
+            nowMs: Long,
+        ): CursorUpsertOutcome {
+            val previous = stored
+            if (previous != null && previous >= seq) {
+                return CursorUpsertOutcome.NoChange(previous)
+            }
+            writes += Triple(identityHex, seq, nowMs)
+            stored = maxOf(previous ?: Long.MIN_VALUE, seq)
+            return CursorUpsertOutcome.Advanced(seq)
         }
     }
 
@@ -131,13 +162,13 @@ class WsActivePollJobLifecycleTest {
 
     /**
      * Build an orchestrator wired with [transport]. [longPollEnabled]
-     * gates whether B3 spawns the parallel job at [start]; [reader] is
+     * gates whether B3 spawns the parallel job at [start]; [cursor] is
      * the (optional) cursor source for the parallel job.
      */
     private fun orchestrator(
         transport: FakeTransport,
         longPollEnabled: Boolean = true,
-        reader: LongPollCursorReader? = null,
+        cursor: LongPollCursorRepository? = null,
         dispatcher: CoroutineContext = UnconfinedTestDispatcher(),
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
         baseUrl = "https://relay.test",
@@ -148,7 +179,7 @@ class WsActivePollJobLifecycleTest {
         transport = transport,
         now = { 0L },
         longPollEnabled = longPollEnabled,
-        lastSeenSeqReader = reader,
+        cursorRepository = cursor,
         dispatcher = dispatcher,
     )
 
@@ -166,8 +197,8 @@ class WsActivePollJobLifecycleTest {
     @Test
     fun m3_parallel_job_is_not_spawned_when_flag_is_off() = runTest {
         val transport = FakeTransport()
-        val reader = RecordingCursorReader(backing = 5L)
-        val orch = orchestrator(transport, longPollEnabled = false, reader = reader)
+        val cursor = RecordingCursorRepository(backing = 5L)
+        val orch = orchestrator(transport, longPollEnabled = false, cursor = cursor)
 
         orch.bootstrap()
         orch.start()
@@ -178,8 +209,8 @@ class WsActivePollJobLifecycleTest {
 
         assertEquals(
             emptyList<String>(),
-            reader.reads,
-            "Cursor reader must NOT be touched when LONGPOLL_V2_ENABLED is off.",
+            cursor.reads,
+            "Cursor repository must NOT be touched when LONGPOLL_V2_ENABLED is off.",
         )
         val pollsAttributableToParallelJob = transport.pollMutex.withLock {
             transport.pollLongPollOptIns.count { it }
@@ -211,8 +242,8 @@ class WsActivePollJobLifecycleTest {
                 )
             }
         }
-        val reader = RecordingCursorReader(backing = 5L)
-        val orch = orchestrator(transport, longPollEnabled = true, reader = reader)
+        val cursor = RecordingCursorRepository(backing = 5L)
+        val orch = orchestrator(transport, longPollEnabled = true, cursor = cursor)
 
         orch.bootstrap()
         // Capability disabled → start() returns immediately without
@@ -223,8 +254,8 @@ class WsActivePollJobLifecycleTest {
 
         assertEquals(
             emptyList<String>(),
-            reader.reads,
-            "Cursor reader must NOT be touched when capabilities advertise " +
+            cursor.reads,
+            "Cursor repository must NOT be touched when capabilities advertise " +
                 "rest_fallback=false, even if the long-poll flag is on.",
         )
     }
@@ -234,8 +265,8 @@ class WsActivePollJobLifecycleTest {
     @Test
     fun m5_parallel_job_reads_cursor_and_forwards_to_transport_poll() = runTest {
         val transport = FakeTransport()
-        val reader = RecordingCursorReader(backing = 42L)
-        val orch = orchestrator(transport, longPollEnabled = true, reader = reader)
+        val cursor = RecordingCursorRepository(backing = 42L)
+        val orch = orchestrator(transport, longPollEnabled = true, cursor = cursor)
 
         orch.bootstrap()
         orch.start()
@@ -244,7 +275,7 @@ class WsActivePollJobLifecycleTest {
 
         assertTrue(landed, "Parallel job did not produce a poll call within the pump window.")
         assertTrue(
-            reader.reads.isNotEmpty(),
+            cursor.reads.isNotEmpty(),
             "Parallel job must call `LongPollCursorReader.getLastSeenSeq(...)` at " +
                 "least once when it runs.",
         )
@@ -278,7 +309,7 @@ class WsActivePollJobLifecycleTest {
     @Test
     fun m5_null_reader_means_no_since_seq_on_wire() = runTest {
         val transport = FakeTransport()
-        val orch = orchestrator(transport, longPollEnabled = true, reader = null)
+        val orch = orchestrator(transport, longPollEnabled = true, cursor = null)
 
         orch.bootstrap()
         orch.start()
@@ -289,7 +320,7 @@ class WsActivePollJobLifecycleTest {
         val firstSinceSeq = transport.pollMutex.withLock { transport.pollSinceSeqs.first() }
         assertNull(
             firstSinceSeq,
-            "With no cursor reader, the parallel job must pass `sinceSeq = null` " +
+            "With no cursor repository, the parallel job must pass `sinceSeq = null` " +
                 "to the transport — server treats null as since_seq=0.",
         )
     }
@@ -330,7 +361,7 @@ class WsActivePollJobLifecycleTest {
         val orch = orchestrator(
             transport,
             longPollEnabled = true,
-            reader = RecordingCursorReader(0L),
+            cursor = RecordingCursorRepository(0L),
             dispatcher = dispatcher,
         )
 
@@ -408,7 +439,7 @@ class WsActivePollJobLifecycleTest {
                 )
             }
         }
-        val orch = orchestrator(transport, longPollEnabled = true, reader = null)
+        val orch = orchestrator(transport, longPollEnabled = true, cursor = null)
         assertEquals(
             "",
             orch.seqMacVerifyKey,
@@ -433,7 +464,7 @@ class WsActivePollJobLifecycleTest {
         val orch = orchestrator(
             transport,
             longPollEnabled = true,
-            reader = RecordingCursorReader(1L),
+            cursor = RecordingCursorRepository(1L),
             dispatcher = dispatcher,
         )
 
@@ -479,7 +510,7 @@ class WsActivePollJobLifecycleTest {
     @Test
     fun m7_parallel_job_only_uses_long_poll_opt_in_when_flag_enabled() = runTest {
         val transport = FakeTransport()
-        val orch = orchestrator(transport, longPollEnabled = true, reader = null)
+        val orch = orchestrator(transport, longPollEnabled = true, cursor = null)
 
         orch.bootstrap()
         orch.start()
@@ -500,7 +531,7 @@ class WsActivePollJobLifecycleTest {
     @Test
     fun m7_stop_cancels_parallel_job_and_pump_quiesces() = runTest {
         val transport = FakeTransport()
-        val orch = orchestrator(transport, longPollEnabled = true, reader = null)
+        val orch = orchestrator(transport, longPollEnabled = true, cursor = null)
 
         orch.bootstrap()
         orch.start()

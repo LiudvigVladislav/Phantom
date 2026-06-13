@@ -299,6 +299,24 @@ class WsDegradationDetector(
         log("WS_DEGRADED_TELEMETRY state_transition_seen reason=$reason")
     }
 
+    /**
+     * Trek 2 Stage 2B-B (C5, L9; round-2 review-fix P2) — mirror
+     * the typed [BreakerOpenReason] from
+     * [RestStateMachine.Event.RestPollDegraded] into the
+     * `WS_DEGRADED_TELEMETRY` stream. Lets calibration discriminate
+     * sustained network failure
+     * ([BreakerOpenReason.ConsecutiveRestFailures]) from a `410 Gone`
+     * rotation loop ([BreakerOpenReason.Status410Storm]) without
+     * parsing the `REST_TRACE breaker_open` log substring.
+     *
+     * Action-less per design note §6 — only emits a structured log
+     * line; no detector state mutation. Safe to call from any
+     * context.
+     */
+    fun emitRestPollDegradedSeen(reason: BreakerOpenReason) {
+        log("WS_DEGRADED_TELEMETRY rest_poll_degraded_seen reason=$reason")
+    }
+
     private fun pruneOldest(nowMs: Long) {
         val cutoff = nowMs - windowMs
         while (window.isNotEmpty() && window.first().tsMs < cutoff) {
