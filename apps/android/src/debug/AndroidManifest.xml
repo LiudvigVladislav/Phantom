@@ -7,11 +7,10 @@
     `dumpsys package` on release APKs even though the runtime gates
     would refuse to dispatch.
 
-    Layer-2 architecture + security reviewers flagged this as a P1
-    manifest-surface regression vs the round 3-8 dynamic-receiver
-    approach (which never existed in release manifests). This overlay
-    restores the round 3-8 invariant: the activity exists ONLY in
-    debug-variant APKs.
+    Round 10 manifest-surface review flagged this as a regression
+    vs the round 3-8 dynamic-receiver approach (which never existed
+    in release manifests). This overlay restores the round 3-8
+    invariant: the activity exists ONLY in debug-variant APKs.
 
     Release builds still pin BuildConfig.S6_DEBUG_TRIGGER_ENABLED to
     "0" as a defence-in-depth backstop; the orchestrator constructor

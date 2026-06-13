@@ -136,7 +136,7 @@ class WsActivePollJobLifecycleTest {
             reads += identityHex
             return stored
         }
-        // C6 review-fix round 5 (kmp-builder P2) — bring this fake in
+        // C6 review-fix round 5 — bring this fake in
         // line with the SQLDelight + Fake monotonicity contract. The
         // round-2/3/4 wiring assumed every test fake either records
         // monotonically OR honestly returns NoChange; an

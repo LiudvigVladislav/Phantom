@@ -89,7 +89,7 @@ class S6ActivityManifestContractTest {
         )
         assertTrue(
             element.contains("""android:permission="android.permission.INTERACT_ACROSS_USERS_FULL""""),
-            "Round 10 P2.security — Activity MUST declare `android:permission=\"android." +
+            "Round 10 sender-permission lock — Activity MUST declare `android:permission=\"android." +
                 "permission.INTERACT_ACROSS_USERS_FULL\"` so co-installed third-party apps " +
                 "cannot launch it. The shell uid (which is what `adb shell am start` runs " +
                 "as) satisfies this permission; verified on TECNO BF7-12 round 10. Found " +

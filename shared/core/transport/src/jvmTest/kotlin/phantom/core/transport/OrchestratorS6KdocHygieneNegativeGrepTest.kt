@@ -9,7 +9,7 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Trek 2 Stage 2B-B (C6 review-fix round 5 P2.architect) — negative
+ * Trek 2 Stage 2B-B (C6 review-fix round 5) — negative
  * grep over the S6-trigger KDoc surface inside
  * `RestFallbackOrchestrator.kt`. Complements
  * `S6DocsHygieneNegativeGrepTest` in the `:apps:android` module by

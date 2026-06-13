@@ -108,7 +108,7 @@ class S6BreakerTriggerActivity : Activity() {
             return
         }
         Log.i(TAG, "S6 breaker trigger activity invoked; dispatching on AppContainer.appScope")
-        // Round-10 P1.architect — finish() is now scheduled INSIDE
+        // Round-10 lifecycle-safety fix — finish() is now scheduled INSIDE
         // the launch's finally block (on the main thread via
         // runOnUiThread), so the activity stays alive until the
         // dispatch completes (or fails). Without this, the OS could
@@ -117,7 +117,7 @@ class S6BreakerTriggerActivity : Activity() {
         // PHANTOM's foreground service kept the process alive in
         // every observed run.
         //
-        // Round-10 P2.implementation-risk — guard against a
+        // Round-10 cancellation-safety guard — guard against a
         // cancelled appScope. `launch { ... }` on a cancelled scope
         // returns a cancelled Job and the body never runs; without
         // the `isCancelled` check below the activity would hang

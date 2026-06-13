@@ -199,4 +199,51 @@ class S6DocsHygieneNegativeGrepTest {
                 "has legitimate `BuildConfig.DEBUG` uses elsewhere, but not in the S6 block.",
         )
     }
+
+    @Test
+    fun s6_surface_files_do_not_carry_reviewer_role_attribution_phrases() {
+        // Round-10d (neutral-voice cleanup): the S6 surface files
+        // must not document fixes by attributing them to specific
+        // reviewer-role labels (e.g. "P1.architect",
+        // "P2.implementation-risk", "kmp-builder P2", "Layer-2
+        // reviewers flagged...", etc). The fixes are the load-
+        // bearing artifacts; the review-process labels are not.
+        // Stale attribution leaks internal review-process plumbing
+        // into the persistent code surface and dates the comments
+        // unnecessarily.
+        val targets = listOf(
+            "src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt",
+            "src/androidUnitTest/kotlin/phantom/android/transport/S6BreakerTriggerActivityContractTest.kt",
+            "src/androidUnitTest/kotlin/phantom/android/transport/S6ActivityManifestContractTest.kt",
+            "src/debug/AndroidManifest.xml",
+        )
+        val forbiddenPhrases = listOf(
+            "P1.architect",
+            "P2.architect",
+            "P1.implementation-risk",
+            "P2.implementation-risk",
+            "P1.security",
+            "P2.security",
+            "P1.tester",
+            "P2.tester",
+            "P1.kmp-builder",
+            "P2.kmp-builder",
+            "kmp-builder P",
+            "Layer-1",
+            "Layer-2",
+            "reviewers flagged",
+        )
+        for (relative in targets) {
+            val file = locate(relative)
+            val source = file.readText(Charsets.UTF_8)
+            for (phrase in forbiddenPhrases) {
+                assertTrue(
+                    !source.contains(phrase),
+                    "${file.absolutePath} MUST NOT contain the reviewer-role attribution " +
+                        "phrase `$phrase`. Round 10d neutral-voice policy: describe the fix, " +
+                        "not the review process that surfaced it.",
+                )
+            }
+        }
+    }
 }

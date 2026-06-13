@@ -106,7 +106,7 @@ class S6BreakerTriggerActivityContractTest {
     @Test
     fun activity_finish_after_dispatch_inside_try_finally_on_appScope() {
         val text = source()
-        // Round-10 P1.architect — `finish()` MUST be scheduled
+        // Round-10 lifecycle-safety pin — `finish()` MUST be scheduled
         // inside the launch's `finally` block (via runOnUiThread)
         // so the activity stays alive until the suspending
         // `triggerS6BreakerForDebug()` actually returns. The
@@ -134,7 +134,7 @@ class S6BreakerTriggerActivityContractTest {
     @Test
     fun activity_checks_isCancelled_on_launch_to_avoid_silent_drop() {
         val text = source()
-        // Round-10 P2.implementation-risk — if appScope is already
+        // Round-10 cancellation-safety guard — if appScope is already
         // cancelled when launch is called, the coroutine body never
         // runs and the activity would hang without the explicit
         // check below.
