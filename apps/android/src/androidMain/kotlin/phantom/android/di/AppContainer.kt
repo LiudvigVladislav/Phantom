@@ -1101,6 +1101,34 @@ class AppContainer(private val context: Context) {
                     // receives `debugBodyLogging = false` and the
                     // diagnostic interceptor is never constructed.
                     debugBodyLogging = phantom.android.BuildConfig.DEBUG,
+                    // Round 12 step 3 — diagnostic provider that
+                    // strips BOTH X-Phantom-Long-Poll AND
+                    // X-Phantom-Padded-Poll headers atomically.
+                    // Gated on THREE conjuncts that ALL must hold:
+                    //   (1) BuildConfig.DEBUG — the release variant
+                    //       has this `false`, killing the diagnostic
+                    //       at compile-time-effective resolution.
+                    //   (2) BuildConfig.POLL_SKIP_LP_AND_PP == "1" —
+                    //       release-pinned to "0" in build.gradle.kts,
+                    //       defence-in-depth on top of (1).
+                    //   (3) PrivacyMode == Standard — Privacy and
+                    //       Ghost sessions MUST NOT carry the strip
+                    //       per the Vladislav-locked uniform-
+                    //       functionality rule (2026-06-06). The
+                    //       check reads the SharedPreferences-backed
+                    //       value at request-build time on each poll
+                    //       iteration so a runtime mode switch
+                    //       (Standard → Ghost) deactivates the strip
+                    //       on the very next poll, atomically.
+                    // A partial-strip diagnostic (PP only, LP kept)
+                    // was REJECTED by the council; the `&&
+                    // !pollSkipLpAndPp` block in `buildPollRequest`
+                    // keeps the emission decision a single boolean.
+                    pollSkipLpAndPpProvider = {
+                        phantom.android.BuildConfig.DEBUG &&
+                            phantom.android.BuildConfig.POLL_SKIP_LP_AND_PP == "1" &&
+                            transportPreferences.privacyMode == phantom.core.transport.PrivacyMode.Standard
+                    },
                 ),
                 log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
                 onModeSwitched = { _, _, reason ->

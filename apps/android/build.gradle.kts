@@ -440,6 +440,52 @@ android {
                 "S6_DEBUG_TRIGGER_ENABLED",
                 "\"$s6DebugTriggerEnabled\"",
             )
+
+            // Trek 2 Stage 2B-B Round 12 step 3 — diagnostic toggle
+            // that drops BOTH `X-Phantom-Long-Poll` AND
+            // `X-Phantom-Padded-Poll` opt-in headers from the
+            // `/relay/poll` request atomically when set to "1". The
+            // strip is gated at the AppContainer wiring layer on
+            // (a) `BuildConfig.DEBUG == true` AND (b) the active
+            // PrivacyMode equalling `Standard`; flipping this field to
+            // "1" alone is necessary but not sufficient to enable the
+            // strip on a Privacy or Ghost session, by design (the
+            // Vladislav-locked uniform-functionality rule disallows
+            // silently degrading those tiers' wire shape).
+            //
+            // Debug builds default to "0" (no behavioural change vs
+            // production wire shape). Operator opts in for a
+            // body-size discriminator diagnostic run via
+            // `local.properties` `pollSkipLpAndPp=1` or env
+            // `POLL_SKIP_LP_AND_PP=1` before `assembleDebug`. Release
+            // builds pin to "0" — this is a release-pin invariant
+            // independent of the LONGPOLL_V2_ENABLED L6 pin, since
+            // the council's security cross-check flagged any
+            // diagnostic strip in release as a guardrail-C violation
+            // and a privacy-mode metadata regression vector.
+            //
+            // PARTIAL-STRIP IS BANNED. The original Round 12 patch
+            // proposal called this `POLL_SKIP_PADDED_BODY` and would
+            // have stripped only `X-Phantom-Padded-Poll` while
+            // retaining `X-Phantom-Long-Poll`. The council
+            // (Layer 2 kmp + security + test) blocked it because
+            // partial-strip violates the L1 LP+PP coupling lock
+            // (scope-doc lock 1: "both or neither") and produces a
+            // new wire-shape fingerprint distinguishable from the
+            // padded production shape. The current name carries
+            // BOTH letters so a future reader sees both surfaces are
+            // touched together; a negative-grep test fences against
+            // the rejected name reappearing.
+            val pollSkipLpAndPp = localOrEnv(
+                "pollSkipLpAndPp",
+                "POLL_SKIP_LP_AND_PP",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "POLL_SKIP_LP_AND_PP",
+                "\"$pollSkipLpAndPp\"",
+            )
         }
         release {
             isMinifyEnabled = true
@@ -547,6 +593,18 @@ android {
             // dispatched. Defence-in-depth backstop per the same
             // OQ7 idiom as `LONGPOLL_V2_ENABLED`.
             buildConfigField("String", "S6_DEBUG_TRIGGER_ENABLED", "\"0\"")
+
+            // Trek 2 Stage 2B-B Round 12 step 3 — release pin. The
+            // diagnostic LP+PP-strip toggle MUST be off in release
+            // regardless of any -PpollSkipLpAndPp Gradle property,
+            // local.properties entry, or env variable that an
+            // operator could pass at build time. The council security
+            // cross-check identified the toggle as a privacy-mode
+            // metadata regression vector if ever active in a release
+            // shipped to users; pinning here on top of the
+            // debug-only `BuildConfig.DEBUG` runtime gate is
+            // belt-and-braces.
+            buildConfigField("String", "POLL_SKIP_LP_AND_PP", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

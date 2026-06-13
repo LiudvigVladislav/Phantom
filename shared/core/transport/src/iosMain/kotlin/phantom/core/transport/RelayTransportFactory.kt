@@ -49,6 +49,7 @@ actual fun forceShutdownActiveEngine() {
 actual fun createRestFallbackTransport(
     @Suppress("UNUSED_PARAMETER") socksProxyPort: Int?,
     @Suppress("UNUSED_PARAMETER") debugBodyLogging: Boolean,
+    @Suppress("UNUSED_PARAMETER") pollSkipLpAndPpProvider: () -> Boolean,
 ): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is not implemented for iOS. " +
