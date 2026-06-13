@@ -275,6 +275,127 @@ class BodyTimeoutContractTest {
         runCurrent()
     }
 
+    // ── Round 12 step 2 — hold_secs structured field on poll_call ──────────
+
+    @Test
+    fun r12_poll_call_log_includes_hold_secs_field() = runTest(timeout = 5.minutes) {
+        // Per Round 12 step 2 instrumentation: the legacy `pollLoop`
+        // poll_call log line carries the server-advertised
+        // `pollHoldSecs` as a structured field. The S6 council on
+        // d395f682 identified that the absence of this single field
+        // caused a 30-minute field run to be ambiguous on the
+        // kill-switch precondition. The test pins the field's
+        // presence so a future refactor that strips it surfaces
+        // here, not after a wasted re-test.
+        init()
+        val logLines = mutableListOf<String>()
+        val transport = BodyTimeoutTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                    rawBody = "{}",
+                    elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(
+            transport = transport,
+            scheduler = testScheduler,
+            logSink = { logLines += it },
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                ),
+            )
+        }
+        check(orch.stateMachine.state.value == RestMode.RestActive)
+        orch.start()
+        runCurrent()
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+        runCurrent()
+        val pollCallLine = logLines.firstOrNull { it.contains("REST_TRACE poll_call ") }
+        assertTrue(
+            pollCallLine != null,
+            "expected at least one `REST_TRACE poll_call ` line during a single poll iteration; " +
+                "got logLines.size=${logLines.size}",
+        )
+        assertTrue(
+            pollCallLine!!.contains("hold_secs="),
+            "Round 12 step 2: poll_call log line MUST carry the structured field `hold_secs=<n>`. " +
+                "Got: $pollCallLine",
+        )
+        // The test transport session response advertised `pollHoldSecs = 30`
+        // — assert the value flowed through the capabilities snapshot to
+        // the log line. A drift here proves the field is decoupled from
+        // the actual server-advertised value, which would defeat the
+        // purpose of the field (operator could not tell from logs what
+        // the server said).
+        assertTrue(
+            pollCallLine.contains("hold_secs=30"),
+            "Round 12 step 2: poll_call log MUST emit the server-advertised `pollHoldSecs` value. " +
+                "Test transport advertised pollHoldSecs=30; got: $pollCallLine",
+        )
+        orch.stop()
+        runCurrent()
+    }
+
+    @Test
+    fun r12_ws_active_poll_call_log_includes_hold_secs_field() = runTest(timeout = 5.minutes) {
+        // Mirror of the legacy-loop test for the parallel
+        // `wsActivePollLoop` poll_call site. Both poll origins MUST
+        // carry the same `hold_secs` field so a single grep covers
+        // both. Without this pin, a future refactor that adds the
+        // field to one site and not the other would create an
+        // observability gap.
+        init()
+        val logLines = mutableListOf<String>()
+        val transport = BodyTimeoutTestTransport(
+            pollScript = { _ ->
+                RestFallbackResponse(
+                    statusCode = 200,
+                    bodyParsed = PollResponse(envelopes = emptyList(), more = false),
+                    rawBody = "{}",
+                    elapsedMs = 1L,
+                )
+            },
+        )
+        val orch = buildOrchestrator(
+            transport = transport,
+            scheduler = testScheduler,
+            logSink = { logLines += it },
+            longPollEnabled = true,
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        orch.start()
+        runCurrent()
+        advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+        runCurrent()
+        val wsPollCallLine = logLines.firstOrNull { it.contains("REST_TRACE ws_active_poll_call ") }
+        assertTrue(
+            wsPollCallLine != null,
+            "expected at least one `REST_TRACE ws_active_poll_call ` line during a single iteration; " +
+                "got logLines.size=${logLines.size}",
+        )
+        assertTrue(
+            wsPollCallLine!!.contains("hold_secs="),
+            "Round 12 step 2: ws_active_poll_call log line MUST carry the structured field " +
+                "`hold_secs=<n>`. Got: $wsPollCallLine",
+        )
+        assertTrue(
+            wsPollCallLine.contains("hold_secs=30"),
+            "Round 12 step 2: ws_active_poll_call log MUST emit the server-advertised value. " +
+                "Test transport advertised pollHoldSecs=30; got: $wsPollCallLine",
+        )
+        orch.stop()
+        runCurrent()
+    }
+
     // ── Test infrastructure (inline, single-file scope) ─────────────────────
 
     /**
@@ -368,6 +489,8 @@ class BodyTimeoutContractTest {
         transport: BodyTimeoutTestTransport,
         scheduler: TestCoroutineScheduler,
         cursor: LongPollCursorRepository = RecordingCursorRepo(),
+        logSink: (String) -> Unit = {},
+        longPollEnabled: Boolean = false,
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
         baseUrl = "https://relay.test",
         identityHex = IDENTITY,
@@ -376,8 +499,8 @@ class BodyTimeoutContractTest {
         signChallenge = { _ -> ByteArray(64) { 0xDD.toByte() } },
         transport = transport,
         now = { 0L },
-        log = {},
-        longPollEnabled = false,
+        log = logSink,
+        longPollEnabled = longPollEnabled,
         cursorRepository = cursor,
         dispatcher = StandardTestDispatcher(scheduler),
     )

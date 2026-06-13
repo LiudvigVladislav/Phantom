@@ -140,6 +140,17 @@ expect fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport
  */
 expect fun createRestFallbackTransport(
     socksProxyPort: Int? = null,
+    /**
+     * Round 12 step 2 — debug-only diagnostic toggle for per-chunk
+     * response-body byte accounting on the REST `/relay/poll` path.
+     * Wired by the application module (Android) from
+     * `BuildConfig.DEBUG`. Defaults to `false` so every existing call
+     * site preserves byte-identical behaviour. iOS / JVM actuals
+     * accept the parameter but ignore it — they throw
+     * [NotImplementedError] regardless, identical to the existing
+     * `socksProxyPort` posture.
+     */
+    debugBodyLogging: Boolean = false,
 ): RestFallbackTransport
 
 /**

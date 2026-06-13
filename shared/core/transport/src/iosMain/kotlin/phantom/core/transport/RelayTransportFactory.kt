@@ -48,6 +48,7 @@ actual fun forceShutdownActiveEngine() {
 // SOCKS proxy the same way the Android actual gates an OkHttp proxy().
 actual fun createRestFallbackTransport(
     @Suppress("UNUSED_PARAMETER") socksProxyPort: Int?,
+    @Suppress("UNUSED_PARAMETER") debugBodyLogging: Boolean,
 ): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is not implemented for iOS. " +

@@ -1544,10 +1544,19 @@ class RestFallbackOrchestrator(
                 // 4 needs to greppably identify the probe.
                 val lpHeaderValue = if (longPollEnabled) "1" else "absent"
                 val ppHeaderValue = if (longPollEnabled) "1" else "absent"
+                // Round 12 step 2 — emit the server-advertised
+                // `pollHoldSecs` as a structured field so a logcat
+                // grep can answer "was the kill switch on?" without
+                // walking back to the `session_request` line. The
+                // S6 council on d395f682 found that the observability
+                // gap of this single field caused a 30-minute field
+                // run to be invalidated post-hoc.
+                val holdSecsField = _capabilities.value.pollHoldSecs
                 log(
                     "REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode " +
                         "probe=$isProbe " +
-                        "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue",
+                        "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue " +
+                        "hold_secs=$holdSecsField",
                 )
                 val startMs = now()
                 val outcome = runCatching {
@@ -1876,11 +1885,16 @@ class RestFallbackOrchestrator(
                 // see no shape change; the new fields are appended.
                 val lpHeaderValue = if (longPollEnabled) "1" else "absent"
                 val ppHeaderValue = if (longPollEnabled) "1" else "absent"
+                // Round 12 step 2 — emit `hold_secs` on the parallel
+                // loop site too. Both poll_call origins carry the same
+                // field so a single grep covers both.
+                val holdSecsField = _capabilities.value.pollHoldSecs
                 log(
                     "REST_TRACE ws_active_poll_call since_seq=${sinceSeq ?: -1L} " +
                         "long_poll_enabled=true " +
                         "probe=$isProbe " +
-                        "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue",
+                        "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue " +
+                        "hold_secs=$holdSecsField",
                 )
                 val startMs = now()
                 val outcome = runCatching {

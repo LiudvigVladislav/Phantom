@@ -343,5 +343,9 @@ actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
  */
 actual fun createRestFallbackTransport(
     socksProxyPort: Int?,
+    debugBodyLogging: Boolean,
 ): RestFallbackTransport =
-    AndroidNativeOkHttpRestFallbackTransport(socksProxyPort = socksProxyPort)
+    AndroidNativeOkHttpRestFallbackTransport(
+        socksProxyPort = socksProxyPort,
+        debugBodyLogging = debugBodyLogging,
+    )

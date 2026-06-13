@@ -65,6 +65,26 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
      * lifetime; the orchestrator caches one transport per app run.
      */
     private val socksProxyPort: Int? = null,
+    /**
+     * Round 12 step 2 — debug-only diagnostic toggle for the per-chunk
+     * response-body byte accounting interceptor
+     * ([DebugBodyByteLoggingInterceptor]). When `false` (the release
+     * default and the production default), the interceptor is never
+     * constructed and the OkHttp pipeline runs identically to its
+     * pre-Round-12 shape. When `true`, the interceptor is added to
+     * the OkHttp client for `op == "poll"` calls only — auth/session,
+     * send, and ack/deliver paths are not instrumented because the
+     * S6 incident pinpointed the poll body-read as the discriminator
+     * surface, and instrumenting auth/send would pollute the
+     * diagnostic signal with shapes the council did not request.
+     *
+     * Wired by [phantom.android.di.AppContainer] from
+     * `BuildConfig.DEBUG`. The release-variant `BuildConfig.DEBUG`
+     * is always `false`, so the production constructor receives
+     * `debugBodyLogging = false` at the application-module
+     * boundary.
+     */
+    private val debugBodyLogging: Boolean = false,
 ) : RestFallbackTransport {
 
     private val jsonCodec = Json {
@@ -295,6 +315,28 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
                     correlationKey = correlationKey,
                 ),
             )
+            .also { builder ->
+                // Round 12 step 2 — per-chunk response-body byte
+                // accounting for the REST poll path. Gated on
+                // `debugBodyLogging` (debug-build only) AND `op == "poll"`
+                // (auth/send/ack are out of scope per the S6 council
+                // narrow finding). The interceptor wraps the response
+                // body's Source with a logging ForwardingSource;
+                // `responseBodyStart` / `responseBodyEnd` events from
+                // the EventListener still fire normally, and the new
+                // `body_chunk` / `body_eof` lines compose with them to
+                // discriminate the four failure-mode hypotheses.
+                if (debugBodyLogging && op == "poll") {
+                    builder.addInterceptor(
+                        DebugBodyByteLoggingInterceptor(
+                            tag = "PhantomHybrid",
+                            keyword = "REST_TRACE",
+                            op = op,
+                            correlationKey = correlationKey,
+                        ),
+                    )
+                }
+            }
             .build()
     }
 

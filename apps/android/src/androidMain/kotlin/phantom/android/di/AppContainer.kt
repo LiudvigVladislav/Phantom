@@ -1093,7 +1093,15 @@ class AppContainer(private val context: Context) {
                     identityManager.signRelayChallenge(nonceBytes)
                         ?: error("signing key not provisioned")
                 },
-                transport = phantom.core.transport.createRestFallbackTransport(),
+                transport = phantom.core.transport.createRestFallbackTransport(
+                    // Round 12 step 2 — debug-only per-chunk body
+                    // byte accounting on the /relay/poll path. Wired
+                    // from BuildConfig.DEBUG so the release variant
+                    // (where BuildConfig.DEBUG is always false)
+                    // receives `debugBodyLogging = false` and the
+                    // diagnostic interceptor is never constructed.
+                    debugBodyLogging = phantom.android.BuildConfig.DEBUG,
+                ),
                 log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
                 onModeSwitched = { _, _, reason ->
                     // Mirror the REST_TRACE mode_switched reason into the
