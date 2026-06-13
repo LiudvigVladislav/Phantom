@@ -71,11 +71,32 @@ class S6DocsHygieneNegativeGrepTest {
         val source = locate("src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt")
             .readText(Charsets.UTF_8)
         val stalePhrases = listOf(
-            "before returning",
+            // Round-9 timing model: finish() was called BEFORE the
+            // suspending dispatch returned. The phrase "before
+            // returning to the caller" is the load-bearing wording
+            // that misled future maintainers. Narrower than round-10b's
+            // "before returning" to reduce false positives on innocent
+            // English in unrelated KDoc additions.
+            "before returning to the caller",
+            // Round-9 threat-model wording on co-installed third-party
+            // apps. Round 10 closed the vector with
+            // INTERACT_ACROSS_USERS_FULL; the KDoc must not re-introduce
+            // the round-9 risk description.
             "co-installed third-party app",
             "co-installed-app risk",
             "any `exported=\"true\"` activity is launchable cross-process",
             "transient, non-silencing",
+            // Round-10c (security L2 P2): the activity is a single-
+            // purpose debug operator trigger. It MUST NOT be described
+            // as a cross-user or privileged capability — those are
+            // collateral side effects of the chosen permission proxy,
+            // not the intent. Stale phrasing that romanticises the
+            // capability would over-describe the threat surface in
+            // published docs and could mislead a future maintainer
+            // into broadening the trigger.
+            "across users",
+            "cross-user",
+            "privileged",
         )
         for (phrase in stalePhrases) {
             assertTrue(

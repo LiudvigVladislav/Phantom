@@ -127,10 +127,18 @@ class S6BreakerTriggerActivity : Activity() {
             try {
                 val dispatched = container.triggerS6BreakerForDebug()
                 Log.i(TAG, "triggerS6BreakerForDebug() returned dispatched=$dispatched")
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                // Round-10c (implementation L2 P2): re-throw structured
+                // cancellation explicitly so the coroutine machinery
+                // observes it as a clean cancel, not a swallowed
+                // exception. A single `catch (Throwable)` with an
+                // `is CancellationException` guard could swallow a
+                // wrapped `CancellationException` (e.g., one delivered
+                // through a `CompletionHandlerException`) and mask a
+                // structural cancel failure on the parent scope.
+                throw cancelled
             } catch (t: Throwable) {
-                if (t !is kotlinx.coroutines.CancellationException) {
-                    Log.w(TAG, "S6 dispatch threw before completion", t)
-                }
+                Log.w(TAG, "S6 dispatch threw before completion", t)
             } finally {
                 runOnUiThread { finish() }
             }
