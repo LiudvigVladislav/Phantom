@@ -9,7 +9,7 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Trek 2 Stage 2B-B (C6 review-fix round 10 P1.arch+sec) — manifest
+ * Trek 2 Stage 2B-B (C6 review-fix round 10) — manifest
  * contract test for the activity-based S6 trigger surface.
  *
  * Round 10 moved the activity declaration from

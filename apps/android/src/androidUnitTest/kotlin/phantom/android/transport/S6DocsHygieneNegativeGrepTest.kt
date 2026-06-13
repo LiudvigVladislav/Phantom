@@ -86,7 +86,7 @@ class S6DocsHygieneNegativeGrepTest {
             "co-installed-app risk",
             "any `exported=\"true\"` activity is launchable cross-process",
             "transient, non-silencing",
-            // Round-10c (security L2 P2): the activity is a single-
+            // Round-10c capability-scoping cleanup: the activity is a single-
             // purpose debug operator trigger. It MUST NOT be described
             // as a cross-user or privileged capability — those are
             // collateral side effects of the chosen permission proxy,
@@ -218,6 +218,7 @@ class S6DocsHygieneNegativeGrepTest {
             "src/debug/AndroidManifest.xml",
         )
         val forbiddenPhrases = listOf(
+            // Full role names.
             "P1.architect",
             "P2.architect",
             "P1.implementation-risk",
@@ -232,6 +233,19 @@ class S6DocsHygieneNegativeGrepTest {
             "Layer-1",
             "Layer-2",
             "reviewers flagged",
+            // Round-10e: compressed / cross-role variants.
+            // Past patterns observed: `P1.arch+sec`, `implementation L2 P2`,
+            // `security L2 P2`, `architecture L2`, `test L2 P1`.
+            "arch+sec",
+            "architecture L2",
+            "implementation L2",
+            "security L2",
+            "test L2",
+            "tester L2",
+            "L1 P1",
+            "L1 P2",
+            "L2 P1",
+            "L2 P2",
         )
         for (relative in targets) {
             val file = locate(relative)

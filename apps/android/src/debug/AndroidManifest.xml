@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Trek 2 Stage 2B-B (C6 review-fix round 10 P1.arch+sec): debug-only
+    Trek 2 Stage 2B-B (C6 review-fix round 10): debug-only
     manifest overlay declaring the S6 controllable breaker trigger
     Activity. Round-9 declared it in `androidMain/AndroidManifest.xml`
     which left the component enumerable via `pm list packages -f` and
