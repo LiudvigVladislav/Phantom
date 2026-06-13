@@ -102,11 +102,12 @@ A log block missing any of the five proofs is NOT a pass regardless of subjectiv
 
 **Build-time gate.** A dedicated `BuildConfig.S6_DEBUG_TRIGGER_ENABLED` String "1"/"0" pin, independent of `BuildConfig.DEBUG`. Debug builds default to `"1"`; release builds pin to `"0"`. A future beta variant (`isDebuggable=false`) opts in via `s6DebugTriggerEnabled=1` in `local.properties` (or `S6_DEBUG_TRIGGER_ENABLED=1` env). The runbook's "debug OR beta APK" allowance is now honoured regardless of how the future beta variant is configured.
 
-**Three-layer defence-in-depth for production safety.**
+**Four-layer defence-in-depth for production safety.**
 
-1. **Orchestrator constructor flag.** `s6DebugTriggerEnabled` defaults to `false`; the helper short-circuits with `REST_TRACE breaker_test_trigger_refused reason=disabled_in_release` when `false`.
-2. **AppContainer-level gate.** `AppContainer.triggerS6BreakerForDebug()` checks `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`. Release APKs see `"0"` and return `false` before reaching the orchestrator helper.
-3. **Activity onCreate gate.** `S6BreakerTriggerActivity.onCreate()` re-checks the same `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"` flag and `finish()`'es without dispatch when the flag is `"0"`. The activity is declared in the manifest unconditionally with `android:exported="true"` (required for `adb shell am start`) and `android:theme="@android:style/Theme.NoDisplay"`; the release-mode behavioural no-op is the runtime gate, not a manifest-level disable.
+1. **Manifest-side debug-only declaration (round 10).** `S6BreakerTriggerActivity` is declared in `apps/android/src/debug/AndroidManifest.xml` ONLY. Release APKs do NOT carry the declaration — the component is invisible to `pm list packages -f` and `dumpsys package` on release. This restores the round 3-8 manifest-cleanliness invariant that round 9 inadvertently regressed.
+2. **Sender permission `INTERACT_ACROSS_USERS_FULL` (round 10).** The debug-only activity declaration carries `android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"`. Co-installed third-party apps on a debug/beta device cannot satisfy this permission (it is signature-scoped to the system signing certificate). The shell uid (which is what `adb shell am start` runs as) does satisfy it on TECNO BF7-12 — verified at the wire on round 10.
+3. **Orchestrator + AppContainer + Activity onCreate flag gates.** Three independent runtime checks of `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`. Release APKs pin the field to `"0"`; the chain short-circuits at every layer.
+4. **`finish()` after dispatch (round 10).** The activity calls `finish()` from inside the launch's `finally` block via `runOnUiThread`, so the suspending `triggerS6BreakerForDebug()` completes before the activity terminates. Without this, the OS could sweep the process between `finish()` and the dispatch landing on devices without an active foreground service (round-9 wiring only worked because PHANTOM's foreground service kept the process alive on every observed run).
 
 **Trigger recipe.** The Tecno operator, with the device attached over USB, fires from the connected laptop:
 
@@ -114,7 +115,7 @@ A log block missing any of the five proofs is NOT a pass regardless of subjectiv
 adb shell am start -n phantom.android/phantom.android.dev.S6BreakerTriggerActivity
 ```
 
-(PowerShell users: prepend `& "C:\Users\<you>\AppData\Local\Android\Sdk\platform-tools\adb.exe"` if `adb` is not on `$env:PATH`. Activity launch via `am start` does not require the shell uid to hold any specific permission; this is the standard cross-process invocation path through ActivityManager for activities declared `android:exported="true"`.)
+(PowerShell users: prepend `& "C:\Users\<you>\AppData\Local\Android\Sdk\platform-tools\adb.exe"` if `adb` is not on `$env:PATH`. The recipe requires the activity declared in the debug-variant manifest with `android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"`. The shell uid satisfies this permission on TECNO BF7-12; verified at the wire on round 10. If a future target OEM build rejects the launch with `Permission Denial`, the permission attribute must be reviewed against that build's shell permission set.)
 
 Logcat should then show:
 

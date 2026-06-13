@@ -59,9 +59,10 @@ class S6BreakerTriggerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Defence-in-depth layer 2: re-check the BuildConfig flag
-        // even though the manifest declaration is gated. A future
-        // refactor that flipped the manifest gate without removing
-        // this activity from the codebase still no-ops here.
+        // even though the manifest declaration is debug-only. A
+        // future variant that flipped the manifest gate without
+        // removing this activity from the codebase still no-ops
+        // here.
         if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1") {
             Log.w(
                 TAG,
@@ -94,11 +95,40 @@ class S6BreakerTriggerActivity : Activity() {
             return
         }
         Log.i(TAG, "S6 breaker trigger activity invoked; dispatching on AppContainer.appScope")
-        container.appScope.launch {
-            val dispatched = container.triggerS6BreakerForDebug()
-            Log.i(TAG, "triggerS6BreakerForDebug() returned dispatched=$dispatched")
+        // Round-10 P1.architect — finish() is now scheduled INSIDE
+        // the launch's finally block (on the main thread via
+        // runOnUiThread), so the activity stays alive until the
+        // dispatch completes (or fails). Without this, the OS could
+        // sweep the process between finish() and the suspending
+        // call resuming — the round-9 wiring only worked because
+        // PHANTOM's foreground service kept the process alive in
+        // every observed run.
+        //
+        // Round-10 P2.implementation-risk — guard against a
+        // cancelled appScope. `launch { ... }` on a cancelled scope
+        // returns a cancelled Job and the body never runs; without
+        // the `isCancelled` check below the activity would hang
+        // forever (no finish() ever fires). We log loudly and
+        // finish() from the main thread.
+        val job = container.appScope.launch {
+            try {
+                val dispatched = container.triggerS6BreakerForDebug()
+                Log.i(TAG, "triggerS6BreakerForDebug() returned dispatched=$dispatched")
+            } catch (t: Throwable) {
+                if (t !is kotlinx.coroutines.CancellationException) {
+                    Log.w(TAG, "S6 dispatch threw before completion", t)
+                }
+            } finally {
+                runOnUiThread { finish() }
+            }
         }
-        finish()
+        if (job.isCancelled) {
+            Log.w(
+                TAG,
+                "appScope was already cancelled at launch time — finishing without dispatch",
+            )
+            finish()
+        }
     }
 
     companion object {

@@ -69,9 +69,9 @@ class S6DocsHygieneNegativeGrepTest {
             assertTrue(
                 !source.contains(token),
                 "S6BreakerTriggerActivity.kt MUST NOT reference `$token` " +
-                    "(receiver-era token from rounds 3-8). Round 9 is activity-based " +
-                    "with no sender-permission gate; carrying the old token in the " +
-                    "code or doc misleads a future refactor.",
+                    "(receiver-era token from rounds 3-8). Round 10 uses a debug-only " +
+                    "manifest-declared Activity with INTERACT_ACROSS_USERS_FULL permission; " +
+                    "carrying the old token in the code or doc misleads a future refactor.",
             )
         }
         // `BuildConfig.DEBUG` was the round-2 gate. The round-3+

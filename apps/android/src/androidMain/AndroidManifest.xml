@@ -120,35 +120,19 @@
         </provider>
 
         <!--
-            Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence):
-            no-display Activity that routes an adb shell am start
-            invocation into the orchestrator S6 controllable breaker
-            trigger. Defence-in-depth chain (independent layers):
+            Trek 2 Stage 2B-B (C6 review-fix round 10 P1.arch+sec):
+            the S6 controllable breaker trigger Activity is now
+            declared in the debug-variant manifest overlay at
+            `apps/android/src/debug/AndroidManifest.xml`. Release
+            APKs therefore do NOT carry the declaration at all —
+            the component is invisible to `pm list packages -f` and
+            `dumpsys package` on release.
 
-              1. BuildConfig.S6_DEBUG_TRIGGER_ENABLED is "0" in the
-                 release variant (pinned in apps/android/build.gradle.kts);
-                 the activity onCreate refuses on that flag and
-                 finishes without dispatching.
-              2. AppContainer.triggerS6BreakerForDebug() re-checks
-                 the same flag.
-              3. The orchestrator constructor flag
-                 s6DebugTriggerEnabled is the load-bearing third
-                 gate inside the transport module.
-
-            Activity declaration is unconditional on Android variant
-            but harmless in release: the runtime gate in onCreate
-            makes the activity a no-op when the BuildConfig flag
-            is "0". The replacement for round 7s BroadcastReceiver
-            approach, which failed on TECNO BF7-RU because the
-            shell uid does not hold DUMP in broadcast permission
-            scope on that OEM build.
+            Runtime BuildConfig gates (in onCreate, AppContainer,
+            and the orchestrator constructor) remain as defence-in-
+            depth; the manifest-side absence is the load-bearing
+            release safety surface.
         -->
-        <activity
-            android:name="phantom.android.dev.S6BreakerTriggerActivity"
-            android:exported="true"
-            android:noHistory="true"
-            android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.NoDisplay" />
     </application>
 
 </manifest>

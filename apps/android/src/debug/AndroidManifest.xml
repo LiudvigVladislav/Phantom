@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Trek 2 Stage 2B-B (C6 review-fix round 10 P1.arch+sec): debug-only
+    manifest overlay declaring the S6 controllable breaker trigger
+    Activity. Round-9 declared it in `androidMain/AndroidManifest.xml`
+    which left the component enumerable via `pm list packages -f` and
+    `dumpsys package` on release APKs even though the runtime gates
+    would refuse to dispatch.
+
+    Layer-2 architecture + security reviewers flagged this as a P1
+    manifest-surface regression vs the round 3-8 dynamic-receiver
+    approach (which never existed in release manifests). This overlay
+    restores the round 3-8 invariant: the activity exists ONLY in
+    debug-variant APKs.
+
+    Release builds still pin BuildConfig.S6_DEBUG_TRIGGER_ENABLED to
+    "0" as a defence-in-depth backstop; the orchestrator constructor
+    gate (s6DebugTriggerEnabled = false in release) is the load-
+    bearing third layer.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+            Round 10 P2.security trial: gate the activity on
+            android.permission.INTERACT_ACROSS_USERS_FULL. This
+            permission is held by the shell uid (which is what
+            `adb shell am start` runs as) and is signature-scoped
+            to the system signing certificate — co-installed
+            third-party apps cannot satisfy it. If TECNO BF7 (or
+            another target OEM) rejects the launch with
+            "Permission Denial", this attribute must be removed
+            and the risk re-documented in the runbook.
+        -->
+        <activity
+            android:name="phantom.android.dev.S6BreakerTriggerActivity"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
+    </application>
+
+</manifest>

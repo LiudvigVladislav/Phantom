@@ -104,6 +104,50 @@ class S6BreakerTriggerActivityContractTest {
     }
 
     @Test
+    fun activity_finish_after_dispatch_inside_try_finally_on_appScope() {
+        val text = source()
+        // Round-10 P1.architect — `finish()` MUST be scheduled
+        // inside the launch's `finally` block (via runOnUiThread)
+        // so the activity stays alive until the suspending
+        // `triggerS6BreakerForDebug()` actually returns. The
+        // round-9 wiring called `finish()` synchronously after the
+        // `launch` returned, which let the OS sweep the process
+        // before the dispatch landed on devices without an active
+        // foreground service.
+        assertTrue(
+            text.contains("runOnUiThread { finish() }"),
+            "S6BreakerTriggerActivity must schedule `finish()` via `runOnUiThread { " +
+                "finish() }` inside the coroutine `finally` block so the dispatch completes " +
+                "before the activity finishes. Found activity source:\n$text",
+        )
+        // The `try { ... } finally { ... }` shape must wrap the
+        // dispatch + log line. Pin the structural anchor.
+        assertTrue(
+            Regex("""try\s*\{[\s\S]*?triggerS6BreakerForDebug\(\)[\s\S]*?\}\s*catch[\s\S]*?\}\s*finally\s*\{""")
+                .containsMatchIn(text),
+            "S6BreakerTriggerActivity dispatch must be wrapped in " +
+                "`try { triggerS6BreakerForDebug() ... } catch (...) { ... } finally { ... }` " +
+                "so unhandled exceptions still finish the activity.",
+        )
+    }
+
+    @Test
+    fun activity_checks_isCancelled_on_launch_to_avoid_silent_drop() {
+        val text = source()
+        // Round-10 P2.implementation-risk — if appScope is already
+        // cancelled when launch is called, the coroutine body never
+        // runs and the activity would hang without the explicit
+        // check below.
+        assertTrue(
+            text.contains("job.isCancelled"),
+            "S6BreakerTriggerActivity must check `job.isCancelled` after `appScope.launch` " +
+                "and call `finish()` from the main thread if the scope was already " +
+                "cancelled. Without this guard the activity hangs silently when AppContainer " +
+                "is mid-shutdown.",
+        )
+    }
+
+    @Test
     fun receiver_source_no_longer_exists_in_dev_package() {
         val receiverFile = File(devPackageDir, "S6BreakerTriggerReceiver.kt")
         assertTrue(
