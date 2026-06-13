@@ -31,7 +31,13 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 fun localOrEnv(propKey: String, envKey: String, default: String): String =
-    localProps.getProperty(propKey) ?: System.getenv(envKey) ?: default
+    // Lookup priority: Gradle -P project property > local.properties > env var > default.
+    // The -P branch was added in Round 12 step 4 so the operator can build the
+    // diagnostic APK variants without editing local.properties — the canonical
+    // command line is `./gradlew :apps:android:assembleDebug -PpollSkipLpAndPp=1`.
+    // Backwards compatible: existing local.properties / env-var workflows are
+    // unchanged.
+    (project.findProperty(propKey) as? String) ?: localProps.getProperty(propKey) ?: System.getenv(envKey) ?: default
 
 kotlin {
     androidTarget {
