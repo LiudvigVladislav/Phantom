@@ -93,11 +93,11 @@ class AppContainer(private val context: Context) {
         private set
 
     /**
-     * Trek 2 Stage 2B-B (C6 review-fix round 3 P1.1) — REST
+     * Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence) — REST
      * orchestrator reference, set inside [initMessaging] after the
      * orchestrator is constructed. Held so the S6 breaker trigger
      * surface ([triggerS6BreakerForDebug] +
-     * [phantom.android.dev.S6BreakerTriggerReceiver]) can route to
+     * [phantom.android.dev.S6BreakerTriggerActivity]) can route to
      * `forceBreakerTripForS6TestTrigger()` without re-entering
      * the wiring path. Null until [initMessaging] runs.
      */
@@ -105,24 +105,23 @@ class AppContainer(private val context: Context) {
         phantom.core.transport.RestFallbackOrchestrator? = null
 
     /**
-     * Trek 2 Stage 2B-B (C6 review-fix round 3 P2) — entry point for
-     * the Tele2 LTE smoke S6 controllable trigger. Reachable iff
-     * `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`.
+     * Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence) — entry
+     * point for the Tele2 LTE smoke S6 controllable trigger.
+     * Reachable iff `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`.
      *
      * The Tele2 runbook (`docs/tracks/trek2-stage2b-b-tele2-smoke.md`,
      * scenario S6) accepts this helper iff natural Mode-2 does not
      * reproduce inside the 30-minute Tecno+Tele2 LTE time-box. This
      * surface is reachable two ways:
      *
-     *   1. **ADB broadcast intent** —
-     *      `adb shell am broadcast -a
-     *      phantom.android.dev.S6_BREAKER_TRIGGER` invokes the
-     *      [phantom.android.dev.S6BreakerTriggerReceiver]
-     *      (dynamically registered in [initMessaging] iff the
-     *      trigger flag is enabled) which calls this function on
-     *      [appScope]. The Tecno operator can fire the trigger
-     *      from a connected laptop without compiling a debug menu
-     *      UI.
+     *   1. **ADB activity launch** —
+     *      `adb shell am start -n
+     *      phantom.android/phantom.android.dev.S6BreakerTriggerActivity`
+     *      invokes the no-display
+     *      [phantom.android.dev.S6BreakerTriggerActivity] which
+     *      calls this function on [appScope]. The Tecno operator
+     *      fires the trigger from a connected laptop without
+     *      compiling a debug menu UI.
      *   2. **Direct test call** — commonTest / androidUnitTest
      *      cells call this directly to assert the gate logic.
      *
@@ -1143,75 +1142,19 @@ class AppContainer(private val context: Context) {
                 },
                 s6DebugTriggerEnabled = s6DebugEnabled,
             )
-            // Trek 2 Stage 2B-B (C6 review-fix round 3 P1.1) — wire
-            // the freshly-constructed orchestrator into the
+            // Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence)
+            // — wire the freshly-constructed orchestrator into the
             // class-level reference so the S6 breaker trigger
             // surface ([triggerS6BreakerForDebug] +
-            // [phantom.android.dev.S6BreakerTriggerReceiver]) can
+            // [phantom.android.dev.S6BreakerTriggerActivity]) can
             // reach it. The assignment happens AFTER the
             // orchestrator is fully constructed so observers cannot
-            // see a partially-initialised instance.
+            // see a partially-initialised instance. The activity
+            // entry point is declared in AndroidManifest.xml with
+            // android:exported="true" and Theme.NoDisplay; the
+            // defence-in-depth chain is described in the activity's
+            // KDoc and on [triggerS6BreakerForDebug].
             restOrchestratorRef = restOrchestrator
-            // Register the ADB-broadcast receiver iff
-            // `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`.
-            // Dynamic registration (vs manifest declaration) lets
-            // the receiver live for the process lifetime without
-            // expanding the production manifest surface. The
-            // receiver's `onReceive` also re-checks the trigger
-            // flag defensively, and the orchestrator's
-            // constructor-time gate is the load-bearing third
-            // layer. All three independent gates must allow the
-            // dispatch before the breaker mutates.
-            if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1") {
-                // C6 review-fix round 7 P1.evidence — the
-                // registration uses `RECEIVER_EXPORTED` on API 33+
-                // so an externally-dispatched intent (`adb shell am
-                // broadcast`, which runs as the system shell user
-                // rather than the registering app) is delivered.
-                // The `broadcastPermission` argument requires the
-                // sender to hold `android.permission.DUMP`:
-                //   * The system shell uid reliably holds DUMP by
-                //     default; the runbook recipe sets
-                //     `--receiver-permission android.permission.DUMP`
-                //     explicitly so a future shell permission
-                //     change produces a clearly-attributable
-                //     delivery failure.
-                //   * A co-installed third-party app cannot hold
-                //     DUMP because the platform scopes it to the
-                //     system signing certificate.
-                // Round-5 used a custom signature permission scoped
-                // to THIS APK's cert; the shell did not satisfy
-                // that scope and the broadcast would have silently
-                // dropped on the Tecno.
-                val s6Receiver = phantom.android.dev.S6BreakerTriggerReceiver(this@AppContainer)
-                val filter = android.content.IntentFilter(
-                    phantom.android.dev.S6BreakerTriggerReceiver.ACTION,
-                )
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    context.registerReceiver(
-                        s6Receiver,
-                        filter,
-                        phantom.android.dev.S6BreakerTriggerReceiver.PERMISSION,
-                        /* scheduler = */ null,
-                        android.content.Context.RECEIVER_EXPORTED,
-                    )
-                } else {
-                    context.registerReceiver(
-                        s6Receiver,
-                        filter,
-                        phantom.android.dev.S6BreakerTriggerReceiver.PERMISSION,
-                        /* scheduler = */ null,
-                    )
-                }
-                android.util.Log.i(
-                    "Phantom/S6Debug",
-                    "Registered S6BreakerTriggerReceiver for action ${
-                        phantom.android.dev.S6BreakerTriggerReceiver.ACTION
-                    } (S6 trigger flag enabled, permission=${
-                        phantom.android.dev.S6BreakerTriggerReceiver.PERMISSION
-                    })",
-                )
-            }
 
             // PR-M1w wire-up (2026-05-18) — encrypted media upload for 1:1 voice.
             // MediaCrypto wraps libsodium AEAD (already initialized at app start).

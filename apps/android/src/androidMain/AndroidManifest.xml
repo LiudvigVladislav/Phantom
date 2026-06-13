@@ -1,26 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!--
-        Trek 2 Stage 2B-B (C6 review-fix round 7 P1.evidence):
-        sender-permission that guards the dynamically-registered S6
-        controllable breaker trigger receiver (debug/beta builds only,
-        gated by BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"). The
-        registration passes android.permission.DUMP as the
-        broadcastPermission argument so:
-          (1) the system shell user (adb shell) reliably holds the
-              permission by default and can deliver the broadcast
-              with the receiver-permission flag on am broadcast;
-          (2) a co-installed third-party app CANNOT hold DUMP because
-              the platform declares it signature-scoped to the
-              system signing certificate; only platform code or
-              shell-uid processes can satisfy it.
-        DUMP is the standard adb-broadcast-secured-intent pattern.
-        See docs/tracks/trek2-stage2b-b-tele2-smoke.md for the recipe
-        and the prior-round rationale.
-    -->
-    <uses-permission android:name="android.permission.DUMP" />
-
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
     <uses-permission android:name="android.permission.INTERNET" />
@@ -138,6 +118,37 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"/>
         </provider>
+
+        <!--
+            Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence):
+            no-display Activity that routes an adb shell am start
+            invocation into the orchestrator S6 controllable breaker
+            trigger. Defence-in-depth chain (independent layers):
+
+              1. BuildConfig.S6_DEBUG_TRIGGER_ENABLED is "0" in the
+                 release variant (pinned in apps/android/build.gradle.kts);
+                 the activity onCreate refuses on that flag and
+                 finishes without dispatching.
+              2. AppContainer.triggerS6BreakerForDebug() re-checks
+                 the same flag.
+              3. The orchestrator constructor flag
+                 s6DebugTriggerEnabled is the load-bearing third
+                 gate inside the transport module.
+
+            Activity declaration is unconditional on Android variant
+            but harmless in release: the runtime gate in onCreate
+            makes the activity a no-op when the BuildConfig flag
+            is "0". The replacement for round 7s BroadcastReceiver
+            approach, which failed on TECNO BF7-RU because the
+            shell uid does not hold DUMP in broadcast permission
+            scope on that OEM build.
+        -->
+        <activity
+            android:name="phantom.android.dev.S6BreakerTriggerActivity"
+            android:exported="true"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
     </application>
 
 </manifest>

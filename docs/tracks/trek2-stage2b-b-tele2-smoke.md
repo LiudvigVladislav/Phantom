@@ -106,40 +106,36 @@ A log block missing any of the five proofs is NOT a pass regardless of subjectiv
 
 1. **Orchestrator constructor flag.** `s6DebugTriggerEnabled` defaults to `false`; the helper short-circuits with `REST_TRACE breaker_test_trigger_refused reason=disabled_in_release` when `false`.
 2. **AppContainer-level gate.** `AppContainer.triggerS6BreakerForDebug()` checks `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`. Release APKs see `"0"` and return `false` before reaching the orchestrator helper.
-3. **Receiver registration gate.** `AppContainer` registers `phantom.android.dev.S6BreakerTriggerReceiver` dynamically iff `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"`. Release APKs never register the receiver; the broadcast intent is dropped at the framework level. On API 33+ the receiver registers with `RECEIVER_EXPORTED` so `adb shell am broadcast` (system shell user) can deliver — round-2's `RECEIVER_NOT_EXPORTED` silently dropped the intent on API 33+ devices.
+3. **Activity onCreate gate.** `S6BreakerTriggerActivity.onCreate()` re-checks the same `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"` flag and `finish()`'es without dispatch when the flag is `"0"`. The activity is declared in the manifest unconditionally with `android:exported="true"` (required for `adb shell am start`) and `android:theme="@android:style/Theme.NoDisplay"`; the release-mode behavioural no-op is the runtime gate, not a manifest-level disable.
 
 **Trigger recipe.** The Tecno operator, with the device attached over USB, fires from the connected laptop:
 
-```bash
-adb shell am broadcast \
-  --receiver-permission android.permission.DUMP \
-  -a phantom.android.dev.S6_BREAKER_TRIGGER
+```
+adb shell am start -n phantom.android/phantom.android.dev.S6BreakerTriggerActivity
 ```
 
-(The `--receiver-permission` flag is REQUIRED. The receiver is registered with `android.permission.DUMP` as the sender permission. `DUMP` is signature-scoped to the system signing certificate: the shell uid reliably holds it by default, and a co-installed third-party app CANNOT satisfy it. Round-5 used a custom APK-scoped signature permission that the shell could not satisfy — the broadcast would have silently dropped on the Tecno; round-7 switches to the standard `adb`-broadcast-secured-intent pattern.)
+(PowerShell users: prepend `& "C:\Users\<you>\AppData\Local\Android\Sdk\platform-tools\adb.exe"` if `adb` is not on `$env:PATH`. Activity launch via `am start` does not require the shell uid to hold any specific permission; this is the standard cross-process invocation path through ActivityManager for activities declared `android:exported="true"`.)
 
 Logcat should then show:
 
 ```
-Phantom/S6Debug  Registered S6BreakerTriggerReceiver for action phantom.android.dev.S6_BREAKER_TRIGGER (S6 trigger flag enabled, permission=android.permission.DUMP)
-... <wait until the natural Mode-2 window expires> ...
-Phantom/S6Debug  S6 breaker trigger broadcast received; dispatching on AppContainer.appScope
+Phantom/S6Debug  S6 breaker trigger activity invoked; dispatching on AppContainer.appScope
 PhantomRelay     REST_TRACE breaker_test_trigger_fired reason=ConsecutiveRestFailures threshold=5
 PhantomRelay     REST_TRACE breaker_open reason=ConsecutiveRestFailures cooldown_ms=5000
 Phantom/S6Debug  triggerS6BreakerForDebug() returned dispatched=true
 ```
 
-The operator's grep should anchor on the stable tokens (`Registered S6BreakerTriggerReceiver`, `S6 trigger flag enabled`, `permission=`) rather than the full literal — the parenthesised suffix may carry additional diagnostic fields in future builds.
+The operator's grep should anchor on the stable tokens (`S6 breaker trigger activity invoked`, `REST_TRACE breaker_test_trigger_fired`, `REST_TRACE breaker_open`) rather than any specific tail — the parenthesised suffix may carry additional diagnostic fields in future builds.
 
-**Mandatory smoke verification step (one-shot per APK build).** Before relying on the controllable trigger for S6 evidence, the operator MUST verify the broadcast delivery path is wired correctly on THIS specific APK:
+**Mandatory smoke verification step (one-shot per APK build).** Before relying on the controllable trigger for S6 evidence, the operator MUST verify the activity-dispatch path is wired correctly on THIS specific APK:
 
-1. Launch the APK on Tecno; verify the `Phantom/S6Debug  Registered S6BreakerTriggerReceiver ...` line appears at startup (proves the receiver registered with the right gate).
-2. Without waiting for natural Mode-2, fire the broadcast immediately and observe BOTH `S6 breaker trigger broadcast received` AND `breaker_test_trigger_fired` in logcat within 1-2 seconds.
+1. Launch the PHANTOM app on Tecno; wait until the home screen renders. The AppContainer must reach `initMessaging` (verified by any `REST_TRACE orchestrator_started` line in logcat) before the activity dispatch is meaningful — earlier launches log `AppContainer not initialised yet — launch the PHANTOM app first` and `finish()` without dispatch.
+2. Fire the trigger immediately (recipe above). Observe BOTH `Phantom/S6Debug  S6 breaker trigger activity invoked ...` AND `PhantomRelay  REST_TRACE breaker_test_trigger_fired ...` in logcat within 1-2 seconds.
 3. Reset the breaker (force-stop + relaunch the app, or let the cooldown expire to `Closed`).
 
-If either log line is missing on this verification, the APK is misconfigured (likely a release variant or a debug build with `s6DebugTriggerEnabled=0` flipped). DO NOT count S6 evidence under such an APK; rebuild and re-verify.
+If either log line is missing on this verification, the APK is misconfigured (likely a release variant or a debug build with `S6_DEBUG_TRIGGER_ENABLED=0` flipped). DO NOT count S6 evidence under such an APK; rebuild and re-verify.
 
-A release APK on the same device would show NO `Registered S6BreakerTriggerReceiver` line at app startup and the broadcast would be silently dropped. If the operator sees a `breaker_test_trigger_refused reason=disabled_in_release` line instead of `breaker_test_trigger_fired`, the build is a release variant and the smoke is INVALID per the APK-build requirement above. If the controllable trigger is used, the PR description quotes the trigger log line explicitly AND the receiver-registered line from app startup as proof the build was debug/beta.
+A release APK fires the activity but `onCreate` short-circuits on the BuildConfig gate and emits only the refusal log; the orchestrator-side gate also refuses. If the operator sees a `breaker_test_trigger_refused reason=disabled_in_release` line instead of `breaker_test_trigger_fired`, the build is a release variant and the smoke is INVALID per the APK-build requirement above. If the controllable trigger is used, the PR description quotes the trigger log line explicitly AND the `S6 breaker trigger activity invoked` line as proof the build was debug/beta.
 
 **Pass criteria (all six required).**
 
