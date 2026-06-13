@@ -11,7 +11,7 @@ This is NOT a re-run of the original S1-S6 smoke. It is a narrow three-condition
 
 ## APK identity
 
-Round 12 branch HEAD `c6c17055` produced two diagnostic APKs:
+Round 12 branch HEAD `c2a77d17` produced two diagnostic APKs:
 
 | APK | Variant | `BuildConfig.POLL_SKIP_LP_AND_PP` | SHA-256 |
 |---|---|---|---|
@@ -47,9 +47,11 @@ In every condition below the Tecno serial is `103603734A004351` and the laptop r
 
 Before EACH condition: re-verify the Tecno's PrivacyMode is `Standard`. The diagnostic strip in C2 only fires in Standard.
 
-## Condition C0 — baseline (does long-poll recovery work at all?)
+## Condition C0 — healthy long-poll delivery baseline
 
-**Goal:** confirm that with a real long-poll hold and a working network, Stage 2B-B's REST recovery path actually closes the breaker and advances the cursor. If C0 fails, every other diagnostic below is moot — the recovery path itself is broken.
+**Goal:** confirm that with `RELAY_POLL_HOLD_SECS=30` the long-poll path can deliver envelopes and advance the cursor under a healthy radio window. This is a **baseline delivery check** — it proves that the headers / hold / verify / cursor pipeline is working at all, NOT that the breaker-recovery path closes under degraded-WS conditions. The recovery proof lives in C1/C2 below.
+
+A `breaker_closed` line MAY appear in C0 if breaker happened to be Open from a prior session and Standard polling closed it; if it does, that is a bonus signal worth recording but it is NOT required for C0 to pass. C0 does NOT explicitly suspend WS, so envelopes may legitimately arrive via the WS path; the load-bearing observation is that the REST observability surface (`hold_secs=30`, `seq_mac_verified`, `cursor_advanced`, body-phase events) is healthy.
 
 **Setup:**
 
@@ -88,20 +90,22 @@ $log = "C:\temp\c0-baseline.log"
 "=== hold_secs ==="; Select-String -Path $log -Pattern "REST_TRACE poll_call " | Where-Object { $_.Line -match "hold_secs=30" } | Select-Object -First 3
 "=== seq_mac_verified ==="; Select-String -Path $log -Pattern "REST_TRACE seq_mac_verified " | Select-Object -First 3
 "=== cursor_advanced ==="; Select-String -Path $log -Pattern "REST_TRACE cursor_advanced seq=" | Select-Object -First 3
-"=== breaker_closed (recovery proof, if it fired) ==="; Select-String -Path $log -Pattern "REST_TRACE breaker_closed"
+"=== breaker_closed (optional bonus signal, if it fires) ==="; Select-String -Path $log -Pattern "REST_TRACE breaker_closed"
 "=== body_chunk (Step 2 instrumentation, debug-only) ==="; Select-String -Path $log -Pattern "phase_event op=poll event=body_chunk" | Select-Object -First 5
 ```
 
-**Pass criteria:**
+**Pass criteria (baseline delivery check):**
 
 - `hold_secs=30` appears on `poll_call` lines (proves the server kill switch is off, contrary to d395f682).
 - At least one `seq_mac_verified` line per delivered envelope.
 - `cursor_advanced` advances monotonically across the 5 envelopes.
 - `body_chunk` per-chunk lines fire (confirms the Step 2 instrumentation is observable; not a pass requirement on its own).
 
+`breaker_closed` is NOT a C0 pass requirement. If it appears, record it as a bonus signal. If it does not, C0 still passes as long as the four bullets above hold; the recovery-closure proof is the job of C1/C2.
+
 **Interpretation:**
 
-- All pass → recovery path works under healthy network. Proceed to C1.
+- All pass → baseline delivery is healthy. Proceed to C1, which is where the breaker-recovery cycle gets exercised.
 - `hold_secs=30` missing → the `.env` change did not propagate (likely needs `docker compose down/up` instead of `restart`). Fix and retry.
 - `seq_mac_verified` empty + `inbound_unverified ... no_verify_key` present → the `RELAY_SEQ_MAC_KEY` flow is broken on the relay; investigate before continuing.
 - `cursor_advanced` does not fire → broader REST delivery bug; stop, file separately.
@@ -215,7 +219,7 @@ Select-String -Path $log -Pattern "REST_TRACE cursor_advanced seq="
 Once C0/C1/C2 complete:
 
 ```
-Round 12 field re-test — branch HEAD c6c17055 — <date>
+Round 12 field re-test — branch HEAD c2a77d17 — <date>
 
 APK-A SHA-256: e47d9f7a45ba9ef06637234ac7d1648a94a9f0ca1b5749975eb506c538df5881
 APK-B SHA-256: 7985e40e0b6ec469a05a232b3a345214b32c0ec0ae03678f2311e201f4459357
