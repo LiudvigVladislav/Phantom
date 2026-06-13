@@ -31,7 +31,20 @@ import kotlin.test.fail
 class S6BreakerTriggerActivityContractTest {
 
     private val activitySource: File by lazy {
+        // Round 11 (council follow-up): the Activity was moved from
+        // `src/androidMain/kotlin/...` to `src/debug/kotlin/...`
+        // so the class is excluded from release Kotlin compilation
+        // entirely (removes the `release-bytecode-shipping` hygiene
+        // surface flagged by the architecture cross-check). The
+        // candidate list searches the debug location first; the
+        // `androidMain` legacy paths are kept as a fallback so a
+        // future maintainer who accidentally moves the file back
+        // sees a passing source-parse test rather than a misleading
+        // "could not locate" failure.
         val candidates = listOf(
+            File("src/debug/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt"),
+            File("apps/android/src/debug/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt"),
+            File("../apps/android/src/debug/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt"),
             File("src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt"),
             File("apps/android/src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt"),
             File("../apps/android/src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt"),
@@ -45,6 +58,9 @@ class S6BreakerTriggerActivityContractTest {
 
     private val devPackageDir: File by lazy {
         val candidates = listOf(
+            File("src/debug/kotlin/phantom/android/dev"),
+            File("apps/android/src/debug/kotlin/phantom/android/dev"),
+            File("../apps/android/src/debug/kotlin/phantom/android/dev"),
             File("src/androidMain/kotlin/phantom/android/dev"),
             File("apps/android/src/androidMain/kotlin/phantom/android/dev"),
             File("../apps/android/src/androidMain/kotlin/phantom/android/dev"),

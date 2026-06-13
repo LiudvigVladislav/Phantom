@@ -353,8 +353,23 @@ class RestFallbackOrchestrator(
      * one-shot forced refresh AND the subsequent transition to
      * [LongPollBreakerState.SuspendedOnPoison] on a second failure
      * after refresh.
+     *
+     * Round 11 (council follow-up) — defence-in-depth against an
+     * unbounded-map growth path. Even with the server-side
+     * `POLL_MAX_ENVELOPES = 1` contract from Stage 1.x, a malicious
+     * relay can drive ~1 fabricated envelope_id per poll. Without a
+     * client-side cap, the map grows linearly over the orchestrator
+     * lifetime. The map is now bounded at
+     * [BAD_MAC_TRACKED_ENVELOPE_CAP] entries with insertion-order
+     * eviction of the oldest first-seen envelope_id. The companion
+     * [_macRefreshStatus] map is evicted on the same key
+     * synchronously so the two maps never disagree about whether an
+     * envelope_id is tracked. Eviction never re-arms a suspended
+     * breaker — the [LongPollBreakerState.SuspendedOnPoison]
+     * transition has already been published by the time eviction
+     * matters.
      */
-    private val _macFailCount: MutableMap<String, Int> = mutableMapOf()
+    private val _macFailCount: MutableMap<String, Int> = LinkedHashMap()
 
     /**
      * Trek 2 Stage 2B-B (C4, L7 step 3 + C4 review-fix) — per-
@@ -384,7 +399,7 @@ class RestFallbackOrchestrator(
         /** Refresh has completed; the next fail suspends both REST loops. */
         Completed,
     }
-    private val _macRefreshStatus: MutableMap<String, MacRefreshStatus> = mutableMapOf()
+    private val _macRefreshStatus: MutableMap<String, MacRefreshStatus> = LinkedHashMap()
 
     /**
      * Trek 2 Stage 2B-B (C4, L9; extended in C5) — current breaker
@@ -2020,6 +2035,24 @@ class RestFallbackOrchestrator(
                 // L4: cursor advance happens inside
                 // `ackInboundAndAdvanceCursor` after the relay 2xx's the
                 // ack. NOT here from the poll response directly.
+                //
+                // Round 11 (council follow-up) — drain-immediate
+                // symmetry with `pollLoop`. When the relay sets
+                // `more=true` on the response, both poll loops MUST
+                // short-cycle through `POLL_DRAIN_IMMEDIATE_MS`
+                // (~100 ms) rather than the jittered `intervalMs`
+                // (~2 s active). Without this branch the parallel
+                // loop falls back to the regular jittered delay,
+                // which leaves backlog draining ~20× slower than the
+                // legacy loop. The symmetry break also leaves the
+                // parallel loop holding the CPU/dispatcher slot
+                // longer than necessary when a burst is in
+                // progress — a latent battery / wakelock cost on
+                // Android Doze-eligible devices.
+                if (parsedBody.more) {
+                    delay(POLL_DRAIN_IMMEDIATE_MS)
+                    continue
+                }
                 val jitterFactor = nextJitterFactor()
                 val jitteredDelay = (intervalMs * jitterFactor).toLong()
                 delay(jitteredDelay)
@@ -2882,6 +2915,23 @@ class RestFallbackOrchestrator(
         val decision: BadMacDecision = _inboundStateMutex.withLock {
             val newCount = (_macFailCount[env.id] ?: 0) + 1
             _macFailCount[env.id] = newCount
+            // Round 11 (council follow-up) — bounded-map eviction.
+            // After the insert, if the count map exceeds the cap,
+            // drop the oldest first-seen envelope_id from both the
+            // count and status maps to keep them consistent. The
+            // current envelope_id was just inserted and is now the
+            // most recently added, so it is never evicted by its
+            // own arrival. The decision returned to the caller still
+            // reflects the just-updated state for [env.id]; eviction
+            // affects a different (older) id only.
+            val evictedId: String? = if (_macFailCount.size > BAD_MAC_TRACKED_ENVELOPE_CAP) {
+                val eldest = _macFailCount.keys.first()
+                _macFailCount.remove(eldest)
+                _macRefreshStatus.remove(eldest)
+                eldest
+            } else {
+                null
+            }
             val currentStatus = _macRefreshStatus[env.id] ?: MacRefreshStatus.NotAttempted
             when (currentStatus) {
                 MacRefreshStatus.Completed -> {
@@ -2892,7 +2942,7 @@ class RestFallbackOrchestrator(
                     _breakerState = LongPollBreakerState.SuspendedOnPoison
                     // Round-4 P1.2: state-class change bumps epoch.
                     _breakerEpoch += 1
-                    BadMacDecision(newCount = newCount, action = BadMacAction.Suspend)
+                    BadMacDecision(newCount = newCount, action = BadMacAction.Suspend, evictedId = evictedId)
                 }
                 MacRefreshStatus.InFlight -> {
                     // C4 review-fix (P1.1): refresh is still in
@@ -2901,7 +2951,7 @@ class RestFallbackOrchestrator(
                     // and drop. When the in-flight refresh lands
                     // it will mark status=Completed; subsequent
                     // failures from that point onward suspend.
-                    BadMacDecision(newCount = newCount, action = BadMacAction.JustLog)
+                    BadMacDecision(newCount = newCount, action = BadMacAction.JustLog, evictedId = evictedId)
                 }
                 MacRefreshStatus.NotAttempted -> {
                     if (newCount >= MAC_REPEAT_REFRESH_THRESHOLD) {
@@ -2910,9 +2960,9 @@ class RestFallbackOrchestrator(
                         // section so a concurrent loop racing past
                         // here observes InFlight and JustLogs.
                         _macRefreshStatus[env.id] = MacRefreshStatus.InFlight
-                        BadMacDecision(newCount = newCount, action = BadMacAction.TriggerRefresh)
+                        BadMacDecision(newCount = newCount, action = BadMacAction.TriggerRefresh, evictedId = evictedId)
                     } else {
-                        BadMacDecision(newCount = newCount, action = BadMacAction.JustLog)
+                        BadMacDecision(newCount = newCount, action = BadMacAction.JustLog, evictedId = evictedId)
                     }
                 }
             }
@@ -2924,6 +2974,12 @@ class RestFallbackOrchestrator(
                 "count=${decision.newCount} seq=${env.seq} " +
                 "reason=$reason loop=$loopTag",
         )
+        // Round 11 — eviction telemetry. Emitted outside the mutex
+        // critical section. The 8-char id prefix keeps the log free
+        // of full-id PII consistent with other REST_TRACE lines.
+        decision.evictedId?.let { id ->
+            log("REST_TRACE mac_state_evicted id=${id.take(8)} reason=lru_cap")
+        }
 
         when (decision.action) {
             BadMacAction.JustLog -> { /* no additional action */ }
@@ -2989,7 +3045,15 @@ class RestFallbackOrchestrator(
         }
     }
 
-    private data class BadMacDecision(val newCount: Int, val action: BadMacAction)
+    private data class BadMacDecision(
+        val newCount: Int,
+        val action: BadMacAction,
+        // Round 11 (council follow-up) — id evicted by the
+        // bounded-map LRU pass on this insert, if any. Used by the
+        // caller to emit a `mac_state_evicted` log line outside the
+        // mutex critical section. Null when no eviction fired.
+        val evictedId: String? = null,
+    )
     private enum class BadMacAction { JustLog, TriggerRefresh, Suspend }
 
     /**
@@ -3679,6 +3743,30 @@ class RestFallbackOrchestrator(
          * leak more bad-MAC outcomes before recovery.
          */
         const val MAC_REPEAT_REFRESH_THRESHOLD: Int = 2
+
+        /**
+         * Round 11 (council follow-up) — upper bound on the number of
+         * distinct `envelope_id` entries tracked by [_macFailCount]
+         * and [_macRefreshStatus] across the orchestrator session
+         * lifetime. The server-side `POLL_MAX_ENVELOPES = 1` cap
+         * (Stage 1.x lock) limits a non-malicious relay to ~1 entry
+         * per poll, but a malicious relay can still drive ~1
+         * fabricated envelope_id per poll for the entire orchestrator
+         * lifetime; without a client-side cap, the maps grow linearly
+         * over time. A bounded value here is defence-in-depth.
+         *
+         * The cap of 256 is comfortably above the longest realistic
+         * window of in-flight envelope_ids the L7 four-step posture
+         * tracks at once (the threshold is 2 failures per id, plus a
+         * one-shot forced refresh, and the relay tears down
+         * everything older as the sliding window of unacked envelopes
+         * advances), and small enough that worst-case heap cost stays
+         * negligible: 256 String keys + 256 Int counters + 256
+         * MacRefreshStatus enums ≈ ~30 KB across both maps. Eviction
+         * is insertion-order (oldest first-seen evicted first) — see
+         * [handleBadMacEnvelope] for the eviction site.
+         */
+        const val BAD_MAC_TRACKED_ENVELOPE_CAP: Int = 256
 
         // ── Trek 2 Stage 2B-B (C5, L8 + L9 + D11) — breaker constants ────
 

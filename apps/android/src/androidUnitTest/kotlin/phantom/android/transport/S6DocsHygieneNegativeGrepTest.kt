@@ -41,11 +41,25 @@ import kotlin.test.fail
 class S6DocsHygieneNegativeGrepTest {
 
     private fun locate(relative: String): File {
-        val candidates = listOf(
-            File(relative),
-            File("apps/android/$relative"),
-            File("../apps/android/$relative"),
-        )
+        // Round 11 (council follow-up): when the caller asks for
+        // `src/debug/kotlin/...` (where the S6 activity now lives
+        // after the source-set move) and the file is not yet at
+        // that location, fall back to the legacy `androidMain`
+        // location so a future maintainer who accidentally moves
+        // the file back is told the test still passes rather than
+        // hitting a misleading "could not locate" assertion.
+        val legacyAliases = if (relative.startsWith("src/debug/kotlin/")) {
+            listOf(relative.replaceFirst("src/debug/kotlin/", "src/androidMain/kotlin/"))
+        } else {
+            emptyList()
+        }
+        val candidates = (listOf(relative) + legacyAliases).flatMap { rel ->
+            listOf(
+                File(rel),
+                File("apps/android/$rel"),
+                File("../apps/android/$rel"),
+            )
+        }
         return candidates.firstOrNull { it.exists() && it.isFile }
             ?: fail(
                 "Could not locate `$relative` from the unit-test working directory. " +
@@ -68,7 +82,7 @@ class S6DocsHygieneNegativeGrepTest {
         //
         // A stale phrase in the KDoc misleads the next reader
         // about both the lifecycle and the threat model.
-        val source = locate("src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt")
+        val source = locate("src/debug/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt")
             .readText(Charsets.UTF_8)
         val stalePhrases = listOf(
             // Round-9 timing model: finish() was called BEFORE the
@@ -112,7 +126,7 @@ class S6DocsHygieneNegativeGrepTest {
 
     @Test
     fun activity_source_does_not_reference_stale_receiver_or_permission_models() {
-        val source = locate("src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt")
+        val source = locate("src/debug/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt")
             .readText(Charsets.UTF_8)
         val staleTokens = listOf(
             "RECEIVER_NOT_EXPORTED",
@@ -201,6 +215,68 @@ class S6DocsHygieneNegativeGrepTest {
     }
 
     @Test
+    fun rest_orchestrator_ref_kdoc_documents_partial_init_window_and_reflection_caveat() {
+        // Round 11 (council follow-up) — `restOrchestratorRef`
+        // carries an extended KDoc that documents two contract
+        // points discovered during the two-layer council:
+        //
+        //   1. The field is assigned BEFORE
+        //      `orchestrator.start()` completes, so the field
+        //      becoming non-null does NOT prove the orchestrator
+        //      is fully armed.
+        //   2. Kotlin `private` is compiler-enforced, not JVM-
+        //      enforced; reflection (compromised JNI, malicious
+        //      plugin, dependency-chain compromise) can still read
+        //      the reference, so the load-bearing defence is the
+        //      orchestrator constructor flag
+        //      `s6DebugTriggerEnabled`, NOT the visibility
+        //      modifier.
+        //
+        // A future maintainer trimming this KDoc as "verbose" would
+        // erase the security-contract reasoning. The fence below
+        // pins specific phrases so the deletion fails the build
+        // loudly rather than landing as a silent hygiene
+        // regression.
+        val text = locate("src/androidMain/kotlin/phantom/android/di/AppContainer.kt")
+            .readText(Charsets.UTF_8)
+        // Locate the KDoc block immediately preceding the
+        // `restOrchestratorRef` field declaration.
+        val declIdx = text.indexOf("@Volatile private var restOrchestratorRef")
+        assertTrue(
+            declIdx >= 0,
+            "AppContainer.kt MUST declare `@Volatile private var restOrchestratorRef`. The S6 " +
+                "wiring path depends on this field; a rename without updating this test is itself " +
+                "a contract change that must be reviewed.",
+        )
+        // Scan backward from the field declaration to find the
+        // KDoc opening `/**` that precedes it. The KDoc is the
+        // closest `/**` before the declaration.
+        val kdocStart = text.lastIndexOf("/**", startIndex = declIdx)
+        assertTrue(
+            kdocStart >= 0,
+            "No KDoc block found preceding `restOrchestratorRef`. Round 11 council follow-up " +
+                "requires a documented partial-initialization window + reflection caveat.",
+        )
+        val kdoc = text.substring(kdocStart, declIdx)
+        val requiredPhrases = listOf(
+            "partial-initialization window",
+            "reflection caveat",
+            "BEFORE the orchestrator's `start()` method is called",
+            "Kotlin `private` is enforced by the compiler",
+            "java.lang.reflect.Field",
+            "s6DebugTriggerEnabled",
+        )
+        for (phrase in requiredPhrases) {
+            assertTrue(
+                kdoc.contains(phrase),
+                "restOrchestratorRef KDoc MUST contain the load-bearing phrase `$phrase`. The " +
+                    "phrase pins a security contract surfaced by the two-layer council; a trim " +
+                    "that removes it erases the reasoning, so the fence prevents silent drift.",
+            )
+        }
+    }
+
+    @Test
     fun s6_surface_files_do_not_carry_reviewer_role_attribution_phrases() {
         // Round-10d (neutral-voice cleanup): the S6 surface files
         // must not document fixes by attributing them to specific
@@ -212,7 +288,7 @@ class S6DocsHygieneNegativeGrepTest {
         // into the persistent code surface and dates the comments
         // unnecessarily.
         val targets = listOf(
-            "src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt",
+            "src/debug/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt",
             "src/androidUnitTest/kotlin/phantom/android/transport/S6BreakerTriggerActivityContractTest.kt",
             "src/androidUnitTest/kotlin/phantom/android/transport/S6ActivityManifestContractTest.kt",
             "src/debug/AndroidManifest.xml",

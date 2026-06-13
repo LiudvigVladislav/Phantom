@@ -780,6 +780,268 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         assertEquals(LongPollBreakerState.SuspendedOnPoison, orch.peekBreakerStateForTest())
     }
 
+    // ── Round 11 (council follow-up) — bounded bad-MAC map LRU ──────────────
+
+    @Test
+    fun r11_bad_mac_maps_evict_oldest_envelope_id_when_cap_exceeded() = runTest {
+        // Defence-in-depth against a malicious relay that fabricates
+        // unique envelope_ids on every poll. Even with server-side
+        // `pollMaxEnvelopes = 1`, ~1 fabricated id per poll over the
+        // orchestrator lifetime would grow `_macFailCount` and
+        // `_macRefreshStatus` unboundedly without a client cap.
+        //
+        // The cap is asserted as a behavioural invariant: after
+        // `cap + N` distinct bad-MAC ids each failing once, the
+        // first N ids (oldest first-seen) must be EVICTED from the
+        // tracker and the most recent `cap` ids must remain.
+        // Eviction is keyed on insertion order (the eldest entry in
+        // [_macFailCount]); both maps are evicted on the same key
+        // synchronously so they never disagree about which ids are
+        // tracked.
+        //
+        // No individual id reaches the L7 refresh threshold
+        // (`MAC_REPEAT_REFRESH_THRESHOLD = 2`) — each id fails
+        // exactly once — so the breaker stays Closed and the verify
+        // gate is not short-circuited by SuspendedOnPoison.
+        init()
+        val rootKey = ByteArray(32)
+        val derivedKey = deriveVerifyKey(rootKey, IDENTITY)
+        val keyHex = derivedKey.toLowerHex()
+        val transport = VerifyTransport(sessionScript = {
+            RestFallbackResponse(
+                200, AuthSessionResponse(
+                    token = "tok", expiresAt = Long.MAX_VALUE,
+                    restFallback = true, maxSendBodyBytes = 4096,
+                    pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                    seqMacVerifyKey = keyHex,
+                ), "{}", 1L,
+            )
+        })
+        val orch = buildOrchestrator(transport, RecordingCursorRepo(), testScheduler)
+        bootstrapped(orch)
+
+        val cap = RestFallbackOrchestrator.BAD_MAC_TRACKED_ENVELOPE_CAP
+        val excess = 44 // arbitrary > 0, chosen to bracket realistic burst pressure
+        val total = cap + excess
+
+        for (n in 0 until total) {
+            val env = makeEnvelopeWithSeqMac(
+                seq = (n + 1).toLong(),
+                envelopeId = "evict-$n",
+                sequenceTs = 60_000L,
+                seqMac = "0".repeat(64), // always-bad MAC
+            )
+            val emitted = orch.processInboundEnvelopeWithVerifyForTest(env, "tok", "test")
+            assertFalse(emitted, "bad-MAC envelope evict-$n must NOT emit downstream")
+        }
+
+        // Breaker invariant: with `cap + excess` distinct ids each
+        // failing once, no id ever reaches `MAC_REPEAT_REFRESH_THRESHOLD`,
+        // so the breaker must remain Closed.
+        assertEquals(
+            LongPollBreakerState.Closed, orch.peekBreakerStateForTest(),
+            "no id reaches MAC_REPEAT_REFRESH_THRESHOLD; breaker must stay Closed under LRU eviction",
+        )
+
+        // Oldest `excess` envelope_ids must have been LRU-evicted.
+        // `peekMacFailCountForTest` returns 0 for absent ids, which
+        // is indistinguishable from "never seen" for the purpose of
+        // future bad-MAC accounting — eviction safely re-arms the
+        // L7 posture for that id (worst case: a relay can re-attack
+        // the same evicted id but the counter starts from zero,
+        // staying below threshold for at least one more cycle).
+        for (n in 0 until excess) {
+            assertEquals(
+                0, orch.peekMacFailCountForTest("evict-$n"),
+                "envelope evict-$n is older than cap=$cap and must be LRU-evicted",
+            )
+            assertEquals(
+                RestFallbackOrchestrator.MacRefreshStatus.NotAttempted,
+                orch.peekMacRefreshStatusForTest("evict-$n"),
+                "evicted id must also be removed from _macRefreshStatus to keep the two maps consistent",
+            )
+        }
+
+        // The most recent `cap` envelope_ids must still be tracked
+        // with count=1 (each saw exactly one failure and was not yet
+        // evicted by subsequent inserts).
+        for (n in excess until total) {
+            assertEquals(
+                1, orch.peekMacFailCountForTest("evict-$n"),
+                "envelope evict-$n is among the most recent $cap inserts and must still be tracked",
+            )
+        }
+    }
+
+    // ── Round 11 (council follow-up) — wsActivePollLoop drain-immediate symmetry ──
+
+    @Test
+    fun r11_ws_active_poll_loop_drains_with_immediate_delay_when_relay_signals_more() = runTest {
+        // Behavioural fence for the wsActivePollLoop's `more=true`
+        // short-cycle path. The legacy `pollLoop` (line ~1658)
+        // delays only [POLL_DRAIN_IMMEDIATE_MS] (~100 ms) between
+        // iterations when the relay sets `more=true` on the poll
+        // response, draining backlog ~20× faster than the regular
+        // jittered `intervalMs` cadence. Before Round 11, the
+        // parallel `wsActivePollLoop` lacked this symmetry — it
+        // always fell back to the jittered delay even when the
+        // relay said "more pending".
+        //
+        // Without a behavioural assertion this regression could land
+        // silently. The test scripts an inline transport that
+        // returns 5 distinct envelopes + `more=true` on calls 0..4
+        // and then an empty response on call 5+. With the symmetry
+        // fix, all 5 short-cycle polls fit comfortably inside
+        // 1500 ms of virtual time (5 × 100 ms drain + processing
+        // overhead). Without the fix, the loop would issue at most
+        // ~1 poll in that window because each iteration would
+        // delay `intervalMs * jitterFactor` ≈ 2000-2400 ms.
+        //
+        // The test isolates `wsActivePollLoop` by keeping the state
+        // machine in its initial mode (NOT `RestActive`), so the
+        // legacy `pollLoop` does NOT spawn. Only the parallel loop
+        // runs, and its polls are counted directly via the inline
+        // transport.
+        init()
+        val rootKey = ByteArray(32)
+        val derivedKey = deriveVerifyKey(rootKey, IDENTITY)
+        val keyHex = derivedKey.toLowerHex()
+        val transport = MorePollScriptingTransport(
+            sessionScript = {
+                RestFallbackResponse(
+                    200, AuthSessionResponse(
+                        token = "tok", expiresAt = Long.MAX_VALUE,
+                        restFallback = true, maxSendBodyBytes = 4096,
+                        pollMaxEnvelopes = 1, pollHoldSecs = 30,
+                        seqMacVerifyKey = keyHex,
+                    ), "{}", 1L,
+                )
+            },
+            scheduler = testScheduler,
+            shortCycleCount = 5,
+        )
+        val orch = buildOrchestratorWithPollLoops(
+            transport = transport,
+            cursor = RecordingCursorRepo(),
+            scheduler = testScheduler,
+            longPollEnabled = true,
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback)
+        orch.start()
+        runCurrent()
+        // Advance virtual time enough for 5 short-cycle polls to
+        // complete plus a small slack for orchestrator bookkeeping.
+        // Budget: 5 × POLL_DRAIN_IMMEDIATE_MS + 1000ms slack = 1500ms.
+        advanceTimeBy(1500L)
+        runCurrent()
+
+        // Behavioural invariant 1: at least 5 polls must have fired
+        // within the 1500ms window. Without the more=true symmetry,
+        // each iteration would delay ~2000ms (POLL_ACTIVE_MS × jitter)
+        // and at most 1 poll would land in this window.
+        assertTrue(
+            transport.pollTimestamps.size >= 5,
+            "wsActivePollLoop must short-cycle through POLL_DRAIN_IMMEDIATE_MS when " +
+                "the relay sets `more=true`. After 1500ms of virtual time, expected ≥5 polls " +
+                "(5 × 100ms drain delay + slack); got ${transport.pollTimestamps.size}. " +
+                "Without the more=true symmetry, the loop falls back to intervalMs " +
+                "(POLL_ACTIVE_MS=2000ms × jitter), so the test would observe at most ~1 poll.",
+        )
+
+        // Behavioural invariant 2: inter-poll virtual-time gaps for
+        // the more=true polls must be ≤ POLL_DRAIN_IMMEDIATE_MS plus
+        // a small slack for the orchestrator's per-iteration work
+        // (envelope processing, log emission). The slack accommodates
+        // verify-fail bookkeeping plus the inline transport's own
+        // bookkeeping; both are well under 20ms in virtual time.
+        val timestamps = transport.pollTimestamps.take(5)
+        val gapCap = RestFallbackOrchestrator.POLL_DRAIN_IMMEDIATE_MS + 20L
+        for (i in 1 until timestamps.size) {
+            val gap = timestamps[i] - timestamps[i - 1]
+            assertTrue(
+                gap <= gapCap,
+                "wsActivePollLoop poll #$i fired ${gap}ms after poll #${i - 1}; " +
+                    "expected ≤ ${gapCap}ms (POLL_DRAIN_IMMEDIATE_MS=" +
+                    "${RestFallbackOrchestrator.POLL_DRAIN_IMMEDIATE_MS}ms + 20ms slack). " +
+                    "If this gap matches POLL_ACTIVE_MS × jitter (~2000-2400ms), the " +
+                    "drain-immediate symmetry has regressed.",
+            )
+        }
+
+        // Tear down so runTest's child-coroutine scope can complete.
+        // Without stop(), the parallel wsActivePollLoop sits in
+        // `while (scope.isActive) { ... }` forever and runTest
+        // never returns.
+        orch.stop()
+        runCurrent()
+    }
+
+    /**
+     * Inline transport that scripts poll responses to exercise the
+     * `more=true` branch of `wsActivePollLoop`. The first
+     * [shortCycleCount] polls return one unique envelope each with
+     * `more=true`; subsequent polls return empty + `more=false`.
+     *
+     * The envelopes carry a bad MAC (`seqMac = "0".repeat(64)`)
+     * with DISTINCT envelope_ids so no individual id reaches
+     * `MAC_REPEAT_REFRESH_THRESHOLD` — the breaker stays Closed and
+     * the poll loops keep running through the test window.
+     *
+     * `pollTimestamps` records the virtual-time instant of each
+     * poll's entry, taken from [scheduler]. The test asserts the
+     * inter-poll gap on this list.
+     */
+    private class MorePollScriptingTransport(
+        var sessionScript: suspend (callIndex: Int) -> RestFallbackResponse<AuthSessionResponse>,
+        val scheduler: TestCoroutineScheduler,
+        val shortCycleCount: Int,
+    ) : RestFallbackTransport {
+        val pollTimestamps: MutableList<Long> = mutableListOf()
+        val authCalls: MutableList<Unit> = mutableListOf()
+        private val mutex = Mutex()
+        override suspend fun authSession(url: String, body: AuthSessionRequest): RestFallbackResponse<AuthSessionResponse> {
+            authCalls += Unit
+            return sessionScript(authCalls.size - 1)
+        }
+        override suspend fun send(url: String, token: String, idempotencyKey: String, body: SendRequest): RestFallbackResponse<SendResponse> =
+            fail("send unexpected in r11 wsActivePoll drain test")
+        override suspend fun poll(url: String, token: String, sinceSeq: Long?, longPollOptIn: Boolean, readTimeoutMs: Long?): RestFallbackResponse<PollResponse> {
+            val callIdx = mutex.withLock {
+                val idx = pollTimestamps.size
+                pollTimestamps += scheduler.currentTime
+                idx
+            }
+            return if (callIdx < shortCycleCount) {
+                RestFallbackResponse(
+                    200,
+                    PollResponse(
+                        envelopes = listOf(
+                            PollEnvelope(
+                                id = "evict-drain-$callIdx",
+                                fromHex = "ff".repeat(32),
+                                payloadBase64 = "",
+                                sequenceTs = 60_000L + callIdx.toLong(),
+                                seq = (callIdx + 1).toLong(),
+                                seqMac = "0".repeat(64), // bad MAC keeps it in bad-MAC posture, no emit
+                            ),
+                        ),
+                        more = true,
+                    ),
+                    "{}", 1L,
+                )
+            } else {
+                RestFallbackResponse(
+                    200,
+                    PollResponse(envelopes = emptyList(), more = false),
+                    "{}", 1L,
+                )
+            }
+        }
+        override suspend fun ackDeliver(url: String, token: String, body: AckDeliverRequest): RestFallbackResponse<AckDeliverResponse> =
+            RestFallbackResponse(200, AckDeliverResponse(ok = 1), "{}", 1L)
+    }
+
     // ── M-B15 / M-B16 — Direct WSS and cursor invariants under suspension ──
 
     @Test
@@ -1581,7 +1843,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
     }
 
     private fun buildOrchestratorWithPollLoops(
-        transport: PollLoopCountingTransport,
+        transport: RestFallbackTransport,
         cursor: LongPollCursorRepository?,
         scheduler: TestCoroutineScheduler,
         longPollEnabled: Boolean = true,

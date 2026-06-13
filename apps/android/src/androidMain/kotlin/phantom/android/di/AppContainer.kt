@@ -100,6 +100,43 @@ class AppContainer(private val context: Context) {
      * [phantom.android.dev.S6BreakerTriggerActivity]) can route to
      * `forceBreakerTripForS6TestTrigger()` without re-entering
      * the wiring path. Null until [initMessaging] runs.
+     *
+     * Round 11 (council follow-up) — partial-initialization window
+     * + reflection caveat:
+     *
+     * The field is assigned synchronously immediately after the
+     * orchestrator's constructor returns inside [initMessaging] and
+     * BEFORE the orchestrator's `start()` method is called. There is
+     * a window — bounded by the time it takes [initMessaging] to
+     * progress from the post-construction assignment to the `start()`
+     * call — during which `restOrchestratorRef` references a
+     * constructed-but-not-yet-armed orchestrator. The trigger
+     * helper [triggerS6BreakerForDebug] handles this case (logging
+     * "not initialised yet" when `restOrchestratorRef` is null), but
+     * the field becoming NON-null is not itself a guarantee that
+     * `orchestrator.start()` has completed.
+     *
+     * Kotlin `private` is enforced by the compiler, but not by the
+     * JVM at runtime: any in-process code with access to
+     * `java.lang.reflect.Field` (a compromised JNI library, a
+     * malicious plugin loaded into the process, a dependency-chain
+     * compromise) can read the reference irrespective of the
+     * `private` modifier. The defence here is layered: even if such
+     * code reaches the orchestrator reflectively, every breaker-
+     * trigger entry point re-checks
+     * `BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"` independently,
+     * and the orchestrator constructor flag `s6DebugTriggerEnabled`
+     * is the load-bearing inner gate. Reflection cannot bypass that
+     * gate without also rewriting BuildConfig, at which point the
+     * build is already compromised at a different layer.
+     *
+     * A `started`-asserting accessor wrapper is intentionally NOT
+     * added in this round to keep the cleanup minimal; the
+     * production-side risk is bounded by the four-layer trigger
+     * defence-in-depth described on
+     * [phantom.android.dev.S6BreakerTriggerActivity]. A wrapper is
+     * a reasonable follow-up if the surface ever grows beyond the
+     * single debug-only S6 trigger.
      */
     @Volatile private var restOrchestratorRef:
         phantom.core.transport.RestFallbackOrchestrator? = null
