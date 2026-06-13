@@ -54,6 +54,42 @@ class S6DocsHygieneNegativeGrepTest {
     }
 
     @Test
+    fun activity_source_does_not_reference_stale_round9_model_phrases() {
+        // Round-10 KDoc-hygiene fence. Round 9's KDoc described
+        // the activity as calling `finish()` "before returning"
+        // and bounded the co-installed-app risk with prose
+        // assuming the activity was exported with no sender
+        // permission. Round 10 changed both: `finish()` runs
+        // inside the launch's `finally` block (after the
+        // suspending dispatch returns), and the debug-only
+        // activity carries `android:permission="...
+        // INTERACT_ACROSS_USERS_FULL"` so a third-party app
+        // cannot launch it at all.
+        //
+        // A stale phrase in the KDoc misleads the next reader
+        // about both the lifecycle and the threat model.
+        val source = locate("src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt")
+            .readText(Charsets.UTF_8)
+        val stalePhrases = listOf(
+            "before returning",
+            "co-installed third-party app",
+            "co-installed-app risk",
+            "any `exported=\"true\"` activity is launchable cross-process",
+            "transient, non-silencing",
+        )
+        for (phrase in stalePhrases) {
+            assertTrue(
+                !source.contains(phrase),
+                "S6BreakerTriggerActivity.kt MUST NOT contain the round-9 KDoc phrase " +
+                    "`$phrase`. Round 10 invalidates it (finish() now runs in the " +
+                    "launch's finally block; the activity carries " +
+                    "INTERACT_ACROSS_USERS_FULL so third-party callers cannot launch it). " +
+                    "Rewrite the KDoc to describe the round-10 model.",
+            )
+        }
+    }
+
+    @Test
     fun activity_source_does_not_reference_stale_receiver_or_permission_models() {
         val source = locate("src/androidMain/kotlin/phantom/android/dev/S6BreakerTriggerActivity.kt")
             .readText(Charsets.UTF_8)

@@ -10,8 +10,8 @@ import kotlinx.coroutines.launch
 import phantom.android.PhantomApplication
 
 /**
- * Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence) — no-display
- * Activity that routes an `adb shell am start` invocation into the
+ * Trek 2 Stage 2B-B (C6 review-fix round 10) — no-display Activity
+ * that routes an `adb shell am start` invocation into the
  * orchestrator's S6 controllable breaker trigger.
  *
  * **Trigger recipe.** Tecno operator from connected laptop:
@@ -23,36 +23,49 @@ import phantom.android.PhantomApplication
  * The activity opens with `Theme.NoDisplay` so the user sees no
  * window flash; `noHistory="true"` keeps it off the back stack;
  * `excludeFromRecents="true"` keeps it out of the recents UI. The
- * dispatch happens in `onCreate` and the activity calls `finish()`
- * before returning.
+ * dispatch runs on `AppContainer.appScope`; the activity calls
+ * `finish()` from inside the launch's `finally` block (via
+ * `runOnUiThread`) so the activity stays alive until the suspending
+ * `triggerS6BreakerForDebug()` actually returns. A `job.isCancelled`
+ * check immediately after the launch finishes the activity from the
+ * main thread when the `appScope` was already cancelled, so the
+ * activity never hangs.
  *
- * **Defence-in-depth.**
+ * **Four-layer defence-in-depth.**
  *
- *   1. The activity onCreate short-circuits when
+ *   1. **Manifest-side debug-only declaration.** The activity is
+ *      declared in `apps/android/src/debug/AndroidManifest.xml`
+ *      ONLY. Release APKs do NOT carry the declaration —
+ *      the component is invisible to `pm list packages -f` and
+ *      `dumpsys package` on release.
+ *   2. **Sender permission `INTERACT_ACROSS_USERS_FULL`.** The
+ *      debug-only declaration carries
+ *      `android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"`.
+ *      The shell uid (which is what `adb shell am start` runs as)
+ *      satisfies this permission; verified at the wire on
+ *      TECNO BF7-12 (round 10). A third-party app installed
+ *      alongside PHANTOM on a debug device CANNOT satisfy the
+ *      permission — it is
+ *      signature-scoped to the system signing certificate, so
+ *      neither the implicit nor the explicit-component path is
+ *      available to a third-party caller.
+ *   3. **Activity onCreate flag gate.** Short-circuits when
  *      `BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1"`. The release
- *      variant pins the BuildConfig field to "0"; the activity
- *      is a runtime no-op in release.
- *   2. The AppContainer-level method
+ *      variant pins the BuildConfig field to "0"; the activity is
+ *      a runtime no-op in release.
+ *   4. **AppContainer + orchestrator constructor gate.**
  *      [phantom.android.di.AppContainer.triggerS6BreakerForDebug]
- *      re-checks the same flag.
- *   3. The orchestrator constructor flag `s6DebugTriggerEnabled`
- *      (set from the same BuildConfig field) is the load-bearing
- *      third gate inside `:shared:core:transport`. Even if a
- *      caller reached past the AppContainer gate, the
- *      orchestrator-side gate refuses and emits
- *      `REST_TRACE breaker_test_trigger_refused
+ *      re-checks the same flag, and the orchestrator constructor
+ *      flag `s6DebugTriggerEnabled` is the load-bearing inner gate
+ *      inside `:shared:core:transport`. Even if a caller reached
+ *      past both Android-side gates, the orchestrator-side gate
+ *      refuses and emits `REST_TRACE breaker_test_trigger_refused
  *      reason=disabled_in_release`.
  *
- * **`exported="true"` and co-installed-app risk.** A co-installed
- * third-party app on a debug device CAN launch this activity (any
- * `exported="true"` activity is launchable cross-process). The
- * impact is bounded: opening the REST poll breaker for
- * `BREAKER_INITIAL_COOLDOWN_MS = 5_000` ms. Per the scope-doc, WS
- * delivery is NOT silenced during the cooldown — the messenger
- * remains usable. The risk is therefore "transient, non-silencing,
- * confined to REST cadence". Distributable builds with
- * `S6_DEBUG_TRIGGER_ENABLED=1` are reserved to operator devices;
- * the runbook restates this explicitly.
+ * The first two layers prevent cross-process invocation entirely
+ * in release / by third-party callers; the inner two are the
+ * runtime safety net for debug builds that legitimately receive
+ * the `am start` call.
  */
 class S6BreakerTriggerActivity : Activity() {
 

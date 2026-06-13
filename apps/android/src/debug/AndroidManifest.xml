@@ -22,15 +22,19 @@
 
     <application>
         <!--
-            Round 10 P2.security trial: gate the activity on
-            android.permission.INTERACT_ACROSS_USERS_FULL. This
+            Trek 2 Stage 2B-B (C6 review-fix round 10): the
+            activity is gated on
+            android.permission.INTERACT_ACROSS_USERS_FULL. The
             permission is held by the shell uid (which is what
             `adb shell am start` runs as) and is signature-scoped
-            to the system signing certificate — co-installed
-            third-party apps cannot satisfy it. If TECNO BF7 (or
-            another target OEM) rejects the launch with
-            "Permission Denial", this attribute must be removed
-            and the risk re-documented in the runbook.
+            to the system signing certificate, so co-installed
+            third-party apps cannot satisfy it. Verified at the
+            wire on TECNO BF7-12 (round 10): `am start` from the
+            shell uid 2000 launches the activity cleanly; all four
+            expected logcat lines (S6 invocation, trigger fired,
+            breaker open, dispatched=true) emit within ~15 ms.
+            See docs/tracks/trek2-stage2b-b-tele2-smoke.md for the
+            full smoke recipe and field-evidence requirements.
         -->
         <activity
             android:name="phantom.android.dev.S6BreakerTriggerActivity"
