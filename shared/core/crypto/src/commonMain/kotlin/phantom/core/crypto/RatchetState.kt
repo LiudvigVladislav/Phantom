@@ -6,6 +6,42 @@ package phantom.core.crypto
 import kotlinx.serialization.Serializable
 
 /**
+ * Role of a session record relative to the X3DH handshake that created
+ * it. Diagnostic-only tag in this iteration; downstream callers may
+ * use it to distinguish an INITIATOR-bootstrapped session (created on
+ * the device that first ran `initiatorBootstrap`) from a RESPONDER-
+ * bootstrapped session (created when an inbound `x3dhInit` was
+ * processed via `recipientBootstrap` or `recipientBootstrapInMemory`).
+ *
+ * The Double Ratchet's sending and receiving chains are oriented
+ * opposite ways for the two roles: an INITIATOR's sending chain
+ * corresponds to a RESPONDER's receiving chain and vice versa. A
+ * RESPONDER session is therefore not safe to use as an outbound
+ * existing-session — the remote side will see a ciphertext from the
+ * wrong chain and fail MAC verification. Marking the role at bootstrap
+ * time lets a future outbound guard distinguish the two cases without
+ * inspecting the ratchet keys themselves.
+ *
+ * Default for unmarked / legacy serialized records is [INITIATOR] so
+ * blobs that were persisted before this field existed deserialize with
+ * the historical pre-marking behaviour (no guard, treated as a normal
+ * outbound-capable session). New records created via
+ * [phantom.core.messaging.SessionManager] carry an explicit role.
+ */
+@Serializable
+enum class SessionRole {
+    /** Session was created by this device running `initiatorBootstrap`. */
+    INITIATOR,
+
+    /**
+     * Session was created by this device running `recipientBootstrap`
+     * or `recipientBootstrapInMemory` in response to an inbound
+     * `x3dhInit` from a peer that initiated the X3DH exchange.
+     */
+    RESPONDER,
+}
+
+/**
  * Full serializable state of a Double Ratchet session for one party.
  *
  * Alpha-0 constraints:
@@ -41,6 +77,25 @@ data class RatchetState(
 
     /** Number of messages received on the current receiving chain. */
     val receiveCount: Int = 0,
+
+    /**
+     * Role of this session relative to its originating X3DH handshake.
+     *
+     * Default [SessionRole.INITIATOR] preserves backwards-compatible
+     * behaviour for legacy serialized blobs (`rs1:` encoding) that
+     * were written before this field existed — they deserialize with
+     * the historical pre-marking semantics. New sessions created via
+     * [phantom.core.messaging.SessionManager] tag the role explicitly
+     * at bootstrap time. See [SessionRole] KDoc for the protocol
+     * background.
+     *
+     * **Diagnostic-only in this iteration.** No outbound or inbound
+     * code path consumes this field yet — adding the field is the
+     * minimal state-model change required before a behavioural guard
+     * can be added in a subsequent iteration without that guard
+     * having to inspect chain orientation directly.
+     */
+    val role: SessionRole = SessionRole.INITIATOR,
 ) {
     // ByteArray equals/hashCode must be structural for data class correctness.
     override fun equals(other: Any?): Boolean {
@@ -53,7 +108,8 @@ data class RatchetState(
             sendingRatchetPrivateKey.contentEquals(other.sendingRatchetPrivateKey) &&
             receivingRatchetPublicKey.contentEqualsNullable(other.receivingRatchetPublicKey) &&
             sendCount == other.sendCount &&
-            receiveCount == other.receiveCount
+            receiveCount == other.receiveCount &&
+            role == other.role
     }
 
     override fun hashCode(): Int {
@@ -65,6 +121,7 @@ data class RatchetState(
         result = 31 * result + (receivingRatchetPublicKey?.contentHashCode() ?: 0)
         result = 31 * result + sendCount
         result = 31 * result + receiveCount
+        result = 31 * result + role.hashCode()
         return result
     }
 }
