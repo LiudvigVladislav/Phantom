@@ -7,11 +7,12 @@ import kotlinx.serialization.Serializable
 
 /**
  * Role of a session record relative to the X3DH handshake that created
- * it. Diagnostic-only tag in this iteration; downstream callers may
- * use it to distinguish an INITIATOR-bootstrapped session (created on
- * the device that first ran `initiatorBootstrap`) from a RESPONDER-
- * bootstrapped session (created when an inbound `x3dhInit` was
- * processed via `recipientBootstrap` or `recipientBootstrapInMemory`).
+ * it. Consumed by the Sprint 2a outbound role guard in
+ * `DefaultMessagingService.encryptUnderLock` to distinguish an
+ * INITIATOR-bootstrapped session (created on the device that first
+ * ran `initiatorBootstrap`) from a RESPONDER-bootstrapped session
+ * (created when an inbound `x3dhInit` was processed via
+ * `recipientBootstrap` or `recipientBootstrapInMemory`).
  *
  * The Double Ratchet's sending and receiving chains are oriented
  * opposite ways for the two roles: an INITIATOR's sending chain
