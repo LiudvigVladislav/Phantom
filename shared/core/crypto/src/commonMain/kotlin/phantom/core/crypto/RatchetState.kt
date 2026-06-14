@@ -89,11 +89,18 @@ data class RatchetState(
      * at bootstrap time. See [SessionRole] KDoc for the protocol
      * background.
      *
-     * **Diagnostic-only in this iteration.** No outbound or inbound
-     * code path consumes this field yet — adding the field is the
-     * minimal state-model change required before a behavioural guard
-     * can be added in a subsequent iteration without that guard
-     * having to inspect chain orientation directly.
+     * Consumed by the Sprint 2a outbound role guard in
+     * `DefaultMessagingService.encryptUnderLock` — the existing-
+     * session branch fires only when the loaded state's role is
+     * [SessionRole.INITIATOR] and `sessionSuspect` is false. A
+     * [SessionRole.RESPONDER]-tagged session is redirected into the
+     * bootstrap branch (fresh X3DH 4-DH + outbound `x3dhInit`) so
+     * the peer's inbound X3DH repair path can re-key their ratchet
+     * to match. Legacy `rs1:` blobs without the role field
+     * deserialize as [SessionRole.INITIATOR] by the default below,
+     * so the guard is a no-op for any session row written before
+     * the tag existed — pre-Sprint-1 broken RESPONDER pairs are
+     * NOT auto-healed and require user-driven reset or re-pair.
      */
     val role: SessionRole = SessionRole.INITIATOR,
 ) {

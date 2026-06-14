@@ -460,10 +460,17 @@ class DefaultMessagingService(
             // Backwards-compat: untagged legacy `rs1:` blobs deserialize
             // with default `SessionRole.INITIATOR` (Sprint 1) so the
             // guard is a no-op for any session row written before the
-            // tag existed. Existing-but-broken pairs in the field stay
-            // broken until the next user-initiated send on the affected
-            // peer-side device triggers the bootstrap path — accepted
-            // Option A trade-off from synthesis-track-A-amended-2.
+            // tag existed. A legacy RESPONDER session persisted before
+            // Sprint 1 therefore satisfies `role == INITIATOR &&
+            // !sessionSuspect` and continues to encrypt under its
+            // (actually RESPONDER) sending chain — Sprint 2a does NOT
+            // auto-heal these pairs. Recovery requires user-driven
+            // reset or re-pair of the affected conversation. Accepted
+            // Option A trade-off from synthesis-track-A-amended-2: no
+            // migration risk / no OPK storm at upgrade time, at the
+            // cost of manual remediation for pre-Sprint-1 broken pairs.
+            // New sessions created after Sprint 1 carry an explicit
+            // role and are fully covered by the guard below.
             //
             // Known limitation (race window, Sprint 2b scope): the
             // bootstrap path's `saveSession` REPLACES the RESPONDER
