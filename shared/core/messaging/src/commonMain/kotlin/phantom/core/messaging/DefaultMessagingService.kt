@@ -500,10 +500,16 @@ class DefaultMessagingService(
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
                 wireFrame
             } else {
-                // Bootstrap path: peer has no session here yet.
+                // Bootstrap path: peer has no usable initiator session here.
                 // Fetch their bundle, run 4-DH, ship the bootstrap
                 // header with the first message.
-                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_path conv=$convTag — no existing session")
+                val bootstrapReason = when {
+                    existingState == null -> "no_session_row"
+                    existingState.role == SessionRole.RESPONDER -> "responder_role_redirected"
+                    sessionSuspect -> "session_suspect"
+                    else -> "unknown"
+                }
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_path conv=$convTag reason=$bootstrapReason")
                 val recipientTag = recipientPublicKeyHex.take(16)
                 val endpointPath =
                     "/prekeys/bundle/$recipientPublicKeyHex?requester=${identity.publicKeyHex}"
