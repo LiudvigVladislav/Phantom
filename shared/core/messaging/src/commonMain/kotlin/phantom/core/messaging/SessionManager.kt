@@ -10,6 +10,7 @@ import phantom.core.crypto.DhKeyPair
 import phantom.core.crypto.DhPrivateKey
 import phantom.core.crypto.DhPublicKey
 import phantom.core.crypto.RatchetState
+import phantom.core.crypto.SessionRole
 import phantom.core.crypto.SignedPreKeySigner
 import phantom.core.crypto.X3DHProtocol
 import phantom.core.identity.IdentityCrypto
@@ -144,13 +145,21 @@ class SessionManager(
         // sending-ratchet seed is a separate fresh keypair generated
         // INSIDE LibsodiumX3DH (per F15); SessionManager never touches it.
         val ephemeral = x3dh.generateDhKeyPair()
-        val state = x3dh.initiatorHandshake4DHWithEphemeral(
+        val rawState = x3dh.initiatorHandshake4DHWithEphemeral(
             initiatorIdentityKeyPair = localIdentityKeyPair,
             recipientIdentityPublicKey = recipientIdentity,
             recipientSignedPreKey = recipientSpkPub,
             recipientOPK = recipientOpkPub,
             ephemeralKeyPair = ephemeral,
         )
+
+        // RC-CRYPTO-PAIR-X3DH-INIT Sprint 1 (2026-06-15) — tag the
+        // session record with [SessionRole.INITIATOR] explicitly. The
+        // crypto layer ([LibsodiumX3DH]) returns a [RatchetState] with
+        // the field's default value; the bootstrap call site is where
+        // role is semantically known and therefore the right place to
+        // record it. See [SessionRole] KDoc for the protocol background.
+        val state = rawState.copy(role = SessionRole.INITIATOR)
 
         // F15: the ratchet seed must NEVER be the identity keypair.
         // LibsodiumX3DH mints a fresh ephemeral so this should always
@@ -362,13 +371,28 @@ class SessionManager(
 
         // Run the recipient-side 4-DH handshake. F12 closure: this is
         // the only call into the X3DH layer; no computeSharedSecret bypass.
-        val state = x3dh.recipientHandshake4DH(
+        val rawState = x3dh.recipientHandshake4DH(
             recipientIdentityKeyPair = localIdentityKeyPair,
             recipientSignedPreKeyPair = spkKeyPair,
             recipientOPKPair = opkKeyPair,
             initiatorIdentityPublicKey = initiatorIdentityPub,
             initiatorEphemeralPublicKey = initiatorEphemeralPub,
         )
+
+        // RC-CRYPTO-PAIR-X3DH-INIT Sprint 1 (2026-06-15) — tag this
+        // session record with [SessionRole.RESPONDER]. This is the
+        // load-bearing tag for the asymmetric-pair lacuna: an inbound
+        // X3DH bootstrap produces a session whose sending chain
+        // corresponds to the initiator's receiving chain, NOT a
+        // generic bidirectional session. Without the tag, a later
+        // outbound send call would find this record via
+        // [tryLoadSession] and use it as if it were a normal existing
+        // session — encrypting on the RESPONDER's sending chain while
+        // the remote peer's INITIATOR ratchet expects messages from
+        // the INITIATOR's sending chain. The diagnostic tag here is a
+        // prerequisite for the outbound guard added in a subsequent
+        // iteration; this iteration adds the tag only.
+        val state = rawState.copy(role = SessionRole.RESPONDER)
 
         // F15 invariant — for the recipient side the ratchet seed is the
         // SPK keypair (per Signal X3DH spec, matched by LibsodiumX3DH).

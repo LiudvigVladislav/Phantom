@@ -34,6 +34,7 @@ import phantom.core.crypto.DhKeyPair
 import phantom.core.crypto.MessagePadding
 import phantom.core.crypto.RatchetState
 import phantom.core.crypto.SealedSender
+import phantom.core.crypto.SessionRole
 import phantom.core.identity.IdentityRecord
 import phantom.core.identity.IdentitySigningKeyPair
 import phantom.core.storage.ConversationEntity
@@ -428,10 +429,71 @@ class DefaultMessagingService(
                 "SEND_TRACE session_lookup conv=$convTag suspect=$sessionSuspect",
             )
             val existingState = sessionManager.tryLoadSession(conversationId)
-            // Existing-session branch runs ONLY when a session exists
-            // AND the conversation is NOT flagged suspect. Suspect flows
-            // into the bootstrap branch below regardless of existingState.
-            if (existingState != null && !sessionSuspect) {
+            // ═════════════════════════════════════════════════════════
+            // RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a (2026-06-15) — outbound
+            // role guard.
+            //
+            // The existing-session branch must run ONLY when the loaded
+            // session is the INITIATOR side of the X3DH handshake (i.e.,
+            // its sending chain is the one the remote peer's receiving
+            // chain expects). A RESPONDER-bootstrapped session — created
+            // by `recipientBootstrap` / `recipientBootstrapInMemory` in
+            // response to an inbound `x3dhInit` from the peer — has its
+            // sending chain oriented opposite: the remote peer's
+            // INITIATOR ratchet is keyed to expect messages from the
+            // INITIATOR's sending chain, not the RESPONDER's. Encrypting
+            // an outbound message under a RESPONDER session produces a
+            // ciphertext the remote peer cannot decrypt (`fail_mac` with
+            // `sessionExists=true, x3dhInitPresent=false` on the receive
+            // side — the recurring asymmetric-pair lacuna documented in
+            // three field tests: 2026-05-30 sealed read receipts,
+            // 2026-06-14 WiFi, 2026-06-14 Tele2 LTE).
+            //
+            // The guard routes a RESPONDER-tagged session into the
+            // bootstrap branch below. That branch runs a fresh X3DH 4-DH
+            // exchange in the local→peer direction, attaches the
+            // resulting `x3dhInit` header to the outbound WireFrame, and
+            // saves a new INITIATOR-tagged session record. The remote
+            // peer processes the `x3dhInit` via PR #249's inbound repair
+            // path and re-keys their own ratchet to match.
+            //
+            // Backwards-compat: untagged legacy `rs1:` blobs deserialize
+            // with default `SessionRole.INITIATOR` (Sprint 1) so the
+            // guard is a no-op for any session row written before the
+            // tag existed. A legacy RESPONDER session persisted before
+            // Sprint 1 therefore satisfies `role == INITIATOR &&
+            // !sessionSuspect` and continues to encrypt under its
+            // (actually RESPONDER) sending chain — Sprint 2a does NOT
+            // auto-heal these pairs. Recovery requires user-driven
+            // reset or re-pair of the affected conversation. Accepted
+            // Option A trade-off from synthesis-track-A-amended-2: no
+            // migration risk / no OPK storm at upgrade time, at the
+            // cost of manual remediation for pre-Sprint-1 broken pairs.
+            // New sessions created after Sprint 1 carry an explicit
+            // role and are fully covered by the guard below.
+            //
+            // Known limitation (race window, Sprint 2b scope): the
+            // bootstrap path's `saveSession` REPLACES the RESPONDER
+            // session row with the new INITIATOR session row in the same
+            // storage slot — there is no pending/active separation in
+            // this iteration. If the remote peer sends another message
+            // under their old INITIATOR ratchet AFTER our local
+            // RESPONDER row was replaced but BEFORE the remote peer has
+            // processed our `x3dhInit` and rebuilt their own ratchet,
+            // that message arrives at us encrypted under a chain our
+            // new INITIATOR session does not know about and fails MAC.
+            // The window is bounded by the peer's bootstrap-processing
+            // latency (seconds to minutes on Tele2 LTE) and the user
+            // retry path. Sprint 2b's pending/active state machine
+            // eliminates the window by keeping the RESPONDER session in
+            // a primary slot for inbound decryption while the new
+            // INITIATOR session sits in a pending slot until the first
+            // successful reply.
+            // ═════════════════════════════════════════════════════════
+            val canTakeExistingSessionPath = existingState != null &&
+                existingState.role == SessionRole.INITIATOR &&
+                !sessionSuspect
+            if (canTakeExistingSessionPath) {
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_existing conv=$convTag")
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE ratchet_encrypt_start conv=$convTag plaintextBytes=${plaintext.size}")
                 val (newState, encrypted) = ratchet.encrypt(existingState, plaintext)
@@ -445,10 +507,16 @@ class DefaultMessagingService(
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
                 wireFrame
             } else {
-                // Bootstrap path: peer has no session here yet.
+                // Bootstrap path: peer has no usable initiator session here.
                 // Fetch their bundle, run 4-DH, ship the bootstrap
                 // header with the first message.
-                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_path conv=$convTag — no existing session")
+                val bootstrapReason = when {
+                    existingState == null -> "no_session_row"
+                    existingState.role == SessionRole.RESPONDER -> "responder_role_redirected"
+                    sessionSuspect -> "session_suspect"
+                    else -> "unknown"
+                }
+                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_path conv=$convTag reason=$bootstrapReason")
                 val recipientTag = recipientPublicKeyHex.take(16)
                 val endpointPath =
                     "/prekeys/bundle/$recipientPublicKeyHex?requester=${identity.publicKeyHex}"
