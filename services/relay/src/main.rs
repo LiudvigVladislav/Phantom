@@ -91,6 +91,7 @@ async fn main() {
     tracing::info!(
         heartbeat_echo_enabled = cfg.heartbeat_echo_enabled,
         slow_post_diag_enabled = cfg.slow_post_diag_enabled,
+        poll_chunked_flush = cfg.poll_chunked_flush,
         "relay feature flags"
     );
 

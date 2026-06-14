@@ -36,9 +36,10 @@ use std::{
 };
 
 use axum::{
+    body::{Body, Bytes},
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use lru::LruCache;
@@ -89,6 +90,134 @@ const POLL_MAX_ENVELOPES: usize = 1;
 /// Guardrail C — padding can be tuned later but NEVER reduced silently;
 /// any change requires tcpdump-based size-distribution proof first.
 pub const POLL_RESPONSE_CANONICAL_BYTES: usize = 4_608;
+
+/// Round 14 L-GATING-1 — number of chunks the paced poll response is
+/// emitted in when the `poll_chunked_flush` server flag is on AND the
+/// request carries BOTH `X-Phantom-Long-Poll: 1` and
+/// `X-Phantom-Padded-Poll: 1` headers.
+///
+/// With 4 chunks the per-chunk size is
+/// `POLL_RESPONSE_CANONICAL_BYTES / 4 = 1152` bytes — well below typical
+/// IPv4 MSS so each chunk fits in a single TCP segment without IP
+/// fragmentation. Matches the M2-B 2026-06-14 field evidence
+/// configuration (chunked-100 / chunked-200 / chunked-500 all used 4
+/// chunks of 1152 bytes).
+pub const POLL_CHUNKED_FLUSH_CHUNK_COUNT: usize = 4;
+
+/// Round 14 L-CARRIER-1 — inter-chunk pause in milliseconds for the
+/// paced poll response. 300 ms is the M2-B 2026-06-14 proven floor
+/// (chunked-200ms PASS 3/3; chunked-100ms PASS 2/3 with 1 outlier
+/// inferring the carrier's reset window is around 100-200 ms) plus a
+/// 50 % safety margin. M12 startup-validation test pins this value as
+/// ≥ 100 ms; lowering it below the M2-B proven minimum without new
+/// carrier evidence is a contract violation.
+pub const POLL_CHUNKED_FLUSH_PAUSE_MS: u64 = 300;
+
+// Round 14 M12 (compile-time variant) — `POLL_CHUNKED_FLUSH_PAUSE_MS`
+// MUST be ≥ 100 ms (M2-B proven floor). A future change that lowers
+// this constant below the floor fails to compile. The runtime variant
+// of M12 lives in `tests/poll_chunked_flush.rs`.
+const _: () = assert!(
+    POLL_CHUNKED_FLUSH_PAUSE_MS >= 100,
+    "Round 14 M12 — POLL_CHUNKED_FLUSH_PAUSE_MS must be at least 100 ms (M2-B proven floor)",
+);
+
+// Round 14 — `POLL_RESPONSE_CANONICAL_BYTES` MUST divide evenly by
+// `POLL_CHUNKED_FLUSH_CHUNK_COUNT` so each chunk carries the same number
+// of bytes. A future change to either constant that produces a
+// fractional chunk count fails to compile, preventing accidental
+// off-by-one bugs in the chunk-emit loop.
+const _: () = assert!(
+    POLL_RESPONSE_CANONICAL_BYTES % POLL_CHUNKED_FLUSH_CHUNK_COUNT == 0,
+    "POLL_RESPONSE_CANONICAL_BYTES must divide evenly by POLL_CHUNKED_FLUSH_CHUNK_COUNT",
+);
+
+/// Round 14 — build a paced chunked HTTP body stream from the padded
+/// poll response. Emits `POLL_CHUNKED_FLUSH_CHUNK_COUNT` chunks of
+/// equal size with `POLL_CHUNKED_FLUSH_PAUSE_MS` millisecond
+/// `tokio::time::sleep` pauses between yields.
+///
+/// The first chunk is yielded immediately (no pre-pause); subsequent
+/// chunks are yielded after the configured pause. Total chunk count is
+/// fixed at compile time; total bytes equals the input Vec length
+/// (caller's responsibility to pass a Vec of exactly
+/// `POLL_RESPONSE_CANONICAL_BYTES` bytes — `build_poll_response`
+/// `debug_assert!`s this).
+///
+/// Wire-behavior caveat: this function REQUESTS the tokio runtime to
+/// emit chunks with `tokio::time::sleep` pauses. Whether those pauses
+/// survive Caddy / TLS / the kernel TCP stack onto the wire is what
+/// L-CADDY-1 verifies (Caddyfile `flush_interval -1` confirmed
+/// 2026-06-14) and what the F1/F2 field test gates ultimately prove.
+fn build_chunked_poll_body_stream(
+    padded_body: Vec<u8>,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    let body = Arc::new(padded_body);
+    let chunk_size = body.len() / POLL_CHUNKED_FLUSH_CHUNK_COUNT;
+    let pause = Duration::from_millis(POLL_CHUNKED_FLUSH_PAUSE_MS);
+
+    futures_util::stream::unfold(0usize, move |idx| {
+        let body = body.clone();
+        async move {
+            if idx >= POLL_CHUNKED_FLUSH_CHUNK_COUNT {
+                return None;
+            }
+            if idx > 0 {
+                tokio::time::sleep(pause).await;
+            }
+            let start = idx * chunk_size;
+            let end = if idx == POLL_CHUNKED_FLUSH_CHUNK_COUNT - 1 {
+                body.len()
+            } else {
+                start + chunk_size
+            };
+            let chunk = Bytes::copy_from_slice(&body[start..end]);
+            Some((Ok::<_, std::io::Error>(chunk), idx + 1))
+        }
+    })
+}
+
+/// Round 14 — build the `/relay/poll` 200 OK response from the
+/// already-padded body. When `emit_chunked` is true, the response uses
+/// `Body::from_stream(...)` over the chunked emitter (4 × 1152 with
+/// 300 ms pauses). When false (default / flag-off path / non-padded
+/// short-body path), the response uses `Body::from(Vec<u8>)` for a
+/// single buffered emit.
+///
+/// BOTH branches set `Content-Length` explicitly. This is L-CL-1: axum
+/// `Body::from_stream` defaults to `Transfer-Encoding: chunked` when
+/// the stream length is unknown to the framing layer. We override that
+/// default so the wire shape is preserved as a known-length response,
+/// matching the legacy mono framing seen by Caddy and the client (M5
+/// contract test asserts this header pair).
+///
+/// The byte-EXACT 4608 invariant (D15) is enforced upstream by
+/// `pad_poll_response`; this function `debug_assert!`s the precondition
+/// at the chunked-path boundary so an unrelated future refactor that
+/// passes a wrong-size body fails fast in debug builds.
+fn build_poll_response(body: Vec<u8>, emit_chunked: bool) -> Response {
+    debug_assert!(
+        !emit_chunked || body.len() == POLL_RESPONSE_CANONICAL_BYTES,
+        "Round 14 build_poll_response: emit_chunked requires byte-EXACT {} \
+         body (D15 invariant), got {}",
+        POLL_RESPONSE_CANONICAL_BYTES,
+        body.len(),
+    );
+
+    let content_length = body.len();
+    let response_body = if emit_chunked {
+        Body::from_stream(build_chunked_poll_body_stream(body))
+    } else {
+        Body::from(body)
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::CONTENT_LENGTH, content_length.to_string())
+        .body(response_body)
+        .expect("Round 14 poll response builds — Content-Length and Content-Type are static safe values")
+}
 
 /// Max distinct identities tracked in `AppState.notifiers` before the
 /// long-poll path degrades to immediate-return for new identities
@@ -2020,6 +2149,25 @@ pub async fn rest_poll(
         };
 
     let envelope_id_log = envelopes.first().map(|e| e.id.as_str()).unwrap_or("");
+    // Round 14 L-GATING-1 — chunked emission gate is STRICTLY narrower
+    // than `padded_opt_in`. We require BOTH opt-in headers AND the
+    // `poll_chunked_flush` server flag. The legacy `padded_opt_in`
+    // OR-gate at line 1982 stays unchanged to preserve the Stage 1 /
+    // 2A / 2B-A wire contract; do NOT collapse this AND-gate to
+    // `padded_opt_in && poll_chunked_flush`. A client that opted into
+    // only ONE of LP/PP must continue to receive the legacy mono
+    // padded response (or unpadded if `padded_opt_in == false`),
+    // NEVER the new chunked shape — emitting chunked to a partial-
+    // opt-in client would create a new client-distinguishable wire
+    // shape (R5 padding invariant violation per privacy reviewer
+    // 2026-06-14). Tests `lp_only_no_chunked` (M1) and
+    // `pp_only_no_chunked` (M2) in `tests/poll_chunked_flush.rs` pin
+    // this conjunction; a future refactor that simplifies the gate
+    // breaks both tests.
+    let chunked_flush_opt_in = state.config.poll_chunked_flush
+        && long_poll_opt_in
+        && padded_poll_opt_in;
+
     tracing::info!(
         event              = "rest_poll_returned",
         identity           = %&recipient_identity[..8.min(recipient_identity.len())],
@@ -2028,6 +2176,7 @@ pub async fn rest_poll(
         hold_secs          = effective_hold_secs,
         long_poll_opt_in   = long_poll_opt_in,
         padded_poll_opt_in = padded_poll_opt_in,
+        chunked_flush      = chunked_flush_opt_in,
     );
 
     // Trek 2 Stage 1.x Lock-2 — response shape is gated by
@@ -2055,12 +2204,16 @@ pub async fn rest_poll(
         })
         .expect("PollResponse serialises")
     };
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response()
+
+    // Round 14 — chunked emission applies ONLY when `chunked_flush_opt_in`
+    // (strict AND of LP=1, PP=1, flag=ON per L-GATING-1) AND the body
+    // is the padded 4608-byte shape. `chunked_flush_opt_in` already
+    // implies `padded_opt_in` (LP AND PP implies LP OR PP), but we
+    // check explicitly so the chunked path is structurally impossible
+    // on the non-padded short-body code path even if a future change
+    // alters one of the gates without updating the other.
+    let emit_chunked = chunked_flush_opt_in && padded_opt_in;
+    build_poll_response(body, emit_chunked)
 }
 
 /// POST /relay/ack-deliver
