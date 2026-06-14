@@ -151,6 +151,27 @@ pub fn router(state: Arc<AppState>) -> Router {
         http_routes
     };
 
+    // ── M2-B diag-shape diagnostic (Trek 2 Round 12 follow-up) ──────────────
+    //
+    // Conditional route registration mirroring the slow-post pattern: when
+    // `diag_shape_enabled = false` (production default), the route is NOT
+    // registered and any GET to `/diag-shape/*` returns 404. Activated by
+    // `RELAY_ENABLE_DIAG_SHAPE=1` in the VPS `.env`.
+    //
+    // The diagnostic answers whether deliberately pacing the response body
+    // emission across multiple chunks survives a hostile carrier path that
+    // silently drops bytes past a documented threshold in a single-burst
+    // response. Total body is held constant at 4608 bytes across all
+    // modes — the diagnostic isolates the time-spreading axis only.
+    let http_routes = if state.config.diag_shape_enabled {
+        http_routes.route(
+            "/diag-shape/{mode}",
+            get(crate::diag_shape::diag_shape_handler),
+        )
+    } else {
+        http_routes
+    };
+
     // Trek 2 Stage 1 Q3 — `/relay/poll` carved out of the 30 s
     // `TimeoutLayer` that wraps `http_routes`. Mounted on its own
     // sub-router with a 60 s timeout so the server-side long-poll hold

@@ -91,6 +91,7 @@ async fn main() {
     tracing::info!(
         heartbeat_echo_enabled = cfg.heartbeat_echo_enabled,
         slow_post_diag_enabled = cfg.slow_post_diag_enabled,
+        diag_shape_enabled = cfg.diag_shape_enabled,
         "relay feature flags"
     );
 

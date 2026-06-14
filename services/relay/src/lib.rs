@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod diag_shape;
 pub mod envelope;
 pub mod error;
 pub mod media;

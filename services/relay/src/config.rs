@@ -89,6 +89,26 @@ pub struct RelayConfig {
     /// Locked design in `docs/tracks/rc-direct-stability1.md` §10 T2.
     pub slow_post_diag_enabled: bool,
 
+    // ── M2-B diag-shape (Trek 2 Round 12 follow-up) ───────────────────────────
+
+    /// When `true`, the relay exposes `GET /diag-shape/{mode}` for the M2-B
+    /// chunked-vs-monolithic carrier-path diagnostic. Default `false`. Set
+    /// by env var `RELAY_ENABLE_DIAG_SHAPE=1` exactly; any other value
+    /// (including `"true"` or `"yes"`) fails closed. When `false`, the
+    /// route is NOT registered — any GET to `/diag-shape/*` returns 404.
+    ///
+    /// The endpoint streams a fixed 4608-byte body either monolithically
+    /// (`mode = mono`) or as four 1152-byte chunks with 100 / 200 / 500
+    /// millisecond `tokio::time::sleep` pauses between yields (`mode =
+    /// chunked-100|chunked-200|chunked-500`). Total response size is
+    /// held constant across modes so the diagnostic isolates the
+    /// time-spreading axis.
+    ///
+    /// Wire-level behaviour (whether the requested pauses survive Caddy
+    /// / TLS / the kernel TCP stack onto the wire) is verified by pcap
+    /// on the VPS side, NOT inferred from the handler code.
+    pub diag_shape_enabled: bool,
+
     // ── Trek 2 Stage 1 long-poll (SHORT-CYCLE-LONGPOLL1) ──────────────────────
 
     /// Server-side hold-time (seconds) for `/relay/poll`. When > 0, an empty
@@ -155,6 +175,9 @@ impl RelayConfig {
             // exercise the handler construct a config with this flipped to
             // `true` rather than relying on the surrounding env.
             slow_post_diag_enabled: false,
+            // M2-B diag-shape is off in tests by default; tests that exercise
+            // the handler construct a config with this flipped to `true`.
+            diag_shape_enabled: false,
             // Trek 2 Stage 1: long-poll hold disabled in tests by default;
             // tests that exercise the hold loop construct a config with
             // this set to a non-zero value (typically 1 s, with
@@ -229,6 +252,13 @@ impl RelayConfig {
             slow_post_diag_enabled: std::env::var("RELAY_ENABLE_SLOW_POST_DIAG")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            // M2-B diag-shape: strict `"1"` parse, fails closed on any other
+            // value. Mirrors slow_post_diag_enabled gate pattern. When
+            // `false`, the `/diag-shape/{mode}` route is NOT registered
+            // (returns 404 to any GET) — defence-in-depth, route off → 404.
+            diag_shape_enabled: std::env::var("RELAY_ENABLE_DIAG_SHAPE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
             // Trek 2 Stage 1: long-poll hold-time. Default 0 = short-poll
             // (existing behaviour). Operator opts-in by setting
             // `RELAY_POLL_HOLD_SECS=20` (or similar) in `.env` and restarting
@@ -294,6 +324,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("media_ttl_secs", &self.media_ttl_secs)
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
             .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)
+            .field("diag_shape_enabled", &self.diag_shape_enabled)
             .field("poll_hold_secs", &self.poll_hold_secs)
             // `seq_mac_key` carries its own `[REDACTED]` Debug impl from
             // `SeqMacRootKey`, but we still elide the wrapping `Arc` here
