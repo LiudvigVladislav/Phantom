@@ -19,8 +19,8 @@ import kotlinx.serialization.Serializable
  * RESPONDER session is therefore not safe to use as an outbound
  * existing-session — the remote side will see a ciphertext from the
  * wrong chain and fail MAC verification. Marking the role at bootstrap
- * time lets a future outbound guard distinguish the two cases without
- * inspecting the ratchet keys themselves.
+ * time lets the Sprint 2a outbound role guard distinguish the two
+ * cases without inspecting the ratchet keys themselves.
  *
  * Default for unmarked / legacy serialized records is [INITIATOR] so
  * blobs that were persisted before this field existed deserialize with
@@ -89,18 +89,23 @@ data class RatchetState(
      * at bootstrap time. See [SessionRole] KDoc for the protocol
      * background.
      *
-     * Consumed by the Sprint 2a outbound role guard in
+     * Introduced as the Sprint 1 state-model foundation and consumed
+     * by the Sprint 2a outbound role guard in
      * `DefaultMessagingService.encryptUnderLock` — the existing-
      * session branch fires only when the loaded state's role is
      * [SessionRole.INITIATOR] and `sessionSuspect` is false. A
      * [SessionRole.RESPONDER]-tagged session is redirected into the
      * bootstrap branch (fresh X3DH 4-DH + outbound `x3dhInit`) so
      * the peer's inbound X3DH repair path can re-key their ratchet
-     * to match. Legacy `rs1:` blobs without the role field
-     * deserialize as [SessionRole.INITIATOR] by the default below,
-     * so the guard is a no-op for any session row written before
-     * the tag existed — pre-Sprint-1 broken RESPONDER pairs are
-     * NOT auto-healed and require user-driven reset or re-pair.
+     * to match. A future Sprint 2b pending/active state machine
+     * will likely also read this field to decide which slot a
+     * loaded record belongs in. Legacy `rs1:` blobs without the
+     * role field deserialize as [SessionRole.INITIATOR] by the
+     * default below, so the guard is a no-op for any session row
+     * written before the tag existed — pre-Sprint-1 broken
+     * RESPONDER pairs are NOT auto-healed and require user-driven
+     * reset / re-pair / manual repair (or a future migration that
+     * is explicitly out of scope for Sprint 2a).
      */
     val role: SessionRole = SessionRole.INITIATOR,
 ) {
