@@ -86,6 +86,23 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
      */
     private val debugBodyLogging: Boolean = false,
     /**
+     * Round 13 — debug-only gate for the OkHttp
+     * [HttpPhaseEventListener] attached to every REST call. The
+     * listener emits `dnsEnd addresses=[...]` and
+     * `connectStart host=...` lines to Android logcat under the
+     * `PhantomHybrid` tag; on a release build those lines expose
+     * the resolved relay IP address on every poll/send/auth/ack
+     * call, which violates the Ghost privacy-mode contract that
+     * keeps the relay endpoint off-device.
+     *
+     * Wired by [phantom.android.di.AppContainer] from
+     * `BuildConfig.DEBUG`. The release-variant `BuildConfig.DEBUG`
+     * is always `false`, so the production constructor receives
+     * `httpPhaseLogging = false` and the listener is never attached.
+     * Mirrors the gating discipline of [debugBodyLogging].
+     */
+    private val httpPhaseLogging: Boolean = false,
+    /**
      * Round 12 step 3 — diagnostic provider that, when it returns
      * `true`, causes [buildPollRequest] to drop BOTH the
      * `X-Phantom-Long-Poll` and the `X-Phantom-Padded-Poll` opt-in
@@ -335,14 +352,25 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
             // `PhantomHybrid` tag so the new lines sort with the existing
             // REST_TRACE send/poll/auth bodies. NO behaviour change; the
             // listener does string concatenation and Log.i only.
-            .eventListener(
-                HttpPhaseEventListener(
-                    tag = "PhantomHybrid",
-                    keyword = "REST_TRACE",
-                    op = op,
-                    correlationKey = correlationKey,
-                ),
-            )
+            //
+            // Round 13 — gated on `httpPhaseLogging` (debug-build only;
+            // wired by AppContainer from `BuildConfig.DEBUG`). The
+            // `dnsEnd addresses=[...]` and `connectStart host=...` lines
+            // emit the resolved relay IP, which on a release build would
+            // expose the relay endpoint on every REST call and violate
+            // the Ghost privacy-mode contract.
+            .also { builder ->
+                if (httpPhaseLogging) {
+                    builder.eventListener(
+                        HttpPhaseEventListener(
+                            tag = "PhantomHybrid",
+                            keyword = "REST_TRACE",
+                            op = op,
+                            correlationKey = correlationKey,
+                        ),
+                    )
+                }
+            }
             .also { builder ->
                 // Round 12 step 2 — per-chunk response-body byte
                 // accounting for the REST poll path. Gated on

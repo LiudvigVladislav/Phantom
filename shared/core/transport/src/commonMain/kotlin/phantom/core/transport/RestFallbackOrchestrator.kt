@@ -604,11 +604,21 @@ class RestFallbackOrchestrator(
 
     /**
      * Trek 2 Stage 2B-A (B3, L5) — read-only access to the cached
-     * session verify key. Visible for Stage 2B-B and for behaviour
-     * tests; the value is empty until [bootstrap] succeeds against a
-     * Stage 1.x-deployed relay.
+     * session verify key for in-module tests only. The value is empty
+     * until [bootstrap] succeeds against a Stage 1.x-deployed relay.
+     *
+     * Round 13 (Stage 2B-B post-review) — restricted from `public val`
+     * to `internal val`. Production Stage 2B-B verification reads the
+     * key off [_verifyKeyState] under [_inboundStateMutex] (the C4
+     * state-machine path); no production caller needs the bare hex
+     * string. Keeping the getter `public` exposed 64 chars of raw
+     * per-identity verify-key material to any caller / crash reporter
+     * / exception path that incidentally read it, even though no
+     * production caller actually did so. `internal` keeps the seam
+     * available to `commonTest` (`WsActivePollJobLifecycleTest`)
+     * without making it part of the module's public surface.
      */
-    val seqMacVerifyKey: String get() = _seqMacVerifyKey
+    internal val seqMacVerifyKey: String get() = _seqMacVerifyKey
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -2446,6 +2456,14 @@ class RestFallbackOrchestrator(
      *     failure (the cooldown doubles).
      */
     private suspend fun recordRestFailure(iterationEpoch: Long, isProbe: Boolean) {
+        // Round 13 — capture both the transition reason AND the
+        // cooldown value inside the single critical section so the
+        // log line below reads consistent state without re-acquiring
+        // [_inboundStateMutex]. The earlier double-acquire pattern
+        // raced a concurrent breaker transition and violated the L6
+        // discipline ("mutex held only across in-memory operations,
+        // never re-entered for log interpolation").
+        var capturedCooldownMs = 0L
         val openedReason: BreakerOpenReason? = _inboundStateMutex.withLock {
             // Trek 2 Stage 2B-B (C5 round-4 review-fix P1.2) —
             // epoch gate. If the breaker has transitioned since
@@ -2468,6 +2486,7 @@ class RestFallbackOrchestrator(
                             BreakerOpenReason.ConsecutiveRestFailures,
                             _breakerCurrentCooldownMs,
                         )
+                        capturedCooldownMs = _breakerCurrentCooldownMs
                         BreakerOpenReason.ConsecutiveRestFailures
                     } else null
                 }
@@ -2487,6 +2506,7 @@ class RestFallbackOrchestrator(
                             BreakerOpenReason.ConsecutiveRestFailures,
                             nextCooldown,
                         )
+                        capturedCooldownMs = nextCooldown
                         BreakerOpenReason.ConsecutiveRestFailures
                     } else {
                         // Inconsistency (epoch matches HalfOpen
@@ -2504,7 +2524,7 @@ class RestFallbackOrchestrator(
             }
         }
         if (openedReason != null) {
-            log("REST_TRACE breaker_open reason=$openedReason cooldown_ms=${_inboundStateMutex.withLock { _breakerCurrentCooldownMs }}")
+            log("REST_TRACE breaker_open reason=$openedReason cooldown_ms=$capturedCooldownMs")
             stateMachine.onEvent(RestStateMachine.Event.RestPollDegraded(openedReason))
         }
     }
@@ -2724,6 +2744,12 @@ class RestFallbackOrchestrator(
         var openedStorm = false
         var effectiveDelayMs: Long = POLL_FAIL_BACKOFF_MS
         var authoritative = false
+        // Round 13 — capture storm count inside the single critical
+        // section so the log line below reads consistent state
+        // without re-acquiring [_inboundStateMutex]. The earlier
+        // double-acquire pattern raced a concurrent `recordRestSuccess`
+        // /`recordRestFailure` and violated the L6 discipline.
+        var capturedStormCount = 0
         _inboundStateMutex.withLock {
             // Trek 2 Stage 2B-B (C5 round-4 review-fix P1.1) —
             // epoch gate + state-class gate. handle410 now
@@ -2779,6 +2805,7 @@ class RestFallbackOrchestrator(
                 effectiveDelayMs = _current410BackoffMs
                 _current410BackoffMs = (_current410BackoffMs * 2).coerceAtMost(BREAKER_410_STORM_COOLDOWN_MS)
             }
+            capturedStormCount = _status410StormTimestamps.size
         }
         if (openedStorm) {
             log(
@@ -2798,7 +2825,7 @@ class RestFallbackOrchestrator(
             "REST_TRACE poll_410 next_delay_ms=$effectiveDelayMs " +
                 "authoritative=${if (authoritative) "true" else "false"} " +
                 "storm=${if (openedStorm) "true" else "false"} " +
-                "storm_count=${_inboundStateMutex.withLock { _status410StormTimestamps.size }} " +
+                "storm_count=$capturedStormCount " +
                 "loop=$loopTag",
         )
         return effectiveDelayMs
@@ -3439,6 +3466,11 @@ class RestFallbackOrchestrator(
                 "reason=${BreakerOpenReason.ConsecutiveRestFailures} " +
                 "threshold=$BREAKER_CONSECUTIVE_FAIL_THRESHOLD",
         )
+        // Round 13 — capture the cooldown inside the single critical
+        // section so the log line below reads consistent state without
+        // re-acquiring [_inboundStateMutex]. The earlier double-acquire
+        // pattern raced a concurrent breaker transition.
+        var capturedCooldownMs = 0L
         _inboundStateMutex.withLock {
             // Synthesize the threshold-1 fail count then bump the
             // last one through `transitionToOpenUnderMutex` so the
@@ -3453,11 +3485,12 @@ class RestFallbackOrchestrator(
                 BreakerOpenReason.ConsecutiveRestFailures,
                 _breakerCurrentCooldownMs,
             )
+            capturedCooldownMs = _breakerCurrentCooldownMs
         }
         log(
             "REST_TRACE breaker_open " +
                 "reason=${BreakerOpenReason.ConsecutiveRestFailures} " +
-                "cooldown_ms=${_inboundStateMutex.withLock { _breakerCurrentCooldownMs }}",
+                "cooldown_ms=$capturedCooldownMs",
         )
         stateMachine.onEvent(
             RestStateMachine.Event.RestPollDegraded(BreakerOpenReason.ConsecutiveRestFailures),

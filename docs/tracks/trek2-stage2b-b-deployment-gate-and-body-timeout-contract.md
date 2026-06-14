@@ -2,7 +2,7 @@
 
 Two binding decisions taken at branch HEAD `d395f682` on 2026-06-13 after a two-layer council (4 Claude Code subagents + 4 Ruflo MCP sonnet cross-check agents) on the S6 incident from the Tele2 LTE smoke captured the same day.
 
-Council artifacts: `docs/tracks/trek2-stage2b-b-s6-council-d395f682/` (9 files: 4 Layer 1 + 4 Layer 2 + synthesis).
+Council log evidence is captured in `docs/tracks/trek2-stage2b-b-tele2-smoke-d395f682-2026-06-13/` (8 .log files: `s1.log`, `s2.log`, `s6.log`, `s6-before.log`, `s6-relay-window.log`, `variant-check.log`, `verify-check.log`, `verify-check-3.log`). The two binding council decisions themselves (A and B below) are the synthesis — there is no separate `synthesis.md` file; the contract this document encodes is the synthesis, and the upstream Layer 1 / Layer 2 review threads were captured ephemerally in the council session.
 
 Both decisions are binding on this branch (`feat/pr-trek2-stage2b-b-impl`, PR #309) and on all subsequent Stage 2B-* PRs and release/operator communications.
 
@@ -19,7 +19,7 @@ Until this server-side gate is open in production:
 3. Stage 2B-B field evidence captured against an environment where `RELAY_POLL_HOLD_SECS=0` does not validate the long-poll recovery path. Such runs may validate breaker mechanics (open/half-open cycling, cursor preservation, both-loop gating) but do NOT validate recovery.
 4. PR descriptions, commit messages, release notes, and operator-facing communications must NOT claim that the REST backbone is protecting delivery in production until BOTH (a) the deployment rollout gate is open AND (b) a re-validation field run with `RELAY_POLL_HOLD_SECS > 0` has produced affirmative recovery evidence (at least one `breaker_closed` + `cursor_advanced` cycle under degraded-WS conditions).
 
-The Tele2 LTE smoke captured at branch HEAD `d395f682` on 2026-06-13 observed the breaker mechanics correctly but did not exercise the recovery path because the kill switch was active throughout the capture window. Council artifacts: `docs/tracks/trek2-stage2b-b-tele2-smoke-d395f682-2026-06-13/` and `docs/tracks/trek2-stage2b-b-s6-council-d395f682/synthesis.md`.
+The Tele2 LTE smoke captured at branch HEAD `d395f682` on 2026-06-13 observed the breaker mechanics correctly but did not exercise the recovery path because the kill switch was active throughout the capture window. The log evidence is at `docs/tracks/trek2-stage2b-b-tele2-smoke-d395f682-2026-06-13/`; the binding decisions distilled from the surrounding council are A and B captured in this document.
 
 ---
 

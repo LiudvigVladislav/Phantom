@@ -62,6 +62,17 @@ class BodyTimeoutContractTest {
 
     private val IDENTITY: String = "aa".repeat(32)
 
+    // Round 13 follow-up — the previous version of this fence read the
+    // KDoc literally ("no libsodium primitive is invoked along this path")
+    // and short-circuited `init()` to a no-op. That broke the test
+    // because the orchestrator's jitter helper still pulls `Csprng`
+    // bytes, and `Csprng` lives behind libsodium. Matches the established
+    // pattern across ~10 commonTest files in transport+messaging+crypto:
+    // libsodium-via-`ionspin/kotlin-cryptography` is the project's
+    // convention for KMP test setup. iOS portability of the test
+    // initializer is a separate KMP migration concern tracked in
+    // `docs/tech_debt.md` Bug H and addressed by a future blanket move,
+    // not by this one test.
     private suspend fun init() {
         if (!com.ionspin.kotlin.crypto.LibsodiumInitializer.isInitialized()) {
             com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()

@@ -10,27 +10,41 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Trek 2 Stage 2B-B Round 12 step 3 — AppContainer wiring contract
- * for the `POLL_SKIP_LP_AND_PP` diagnostic toggle's three-conjunct
- * runtime gate.
+ * Trek 2 Stage 2B-B Round 12 step 3 + Round 13 hardening — AppContainer
+ * wiring contract for the `POLL_SKIP_LP_AND_PP` diagnostic toggle's
+ * four-conjunct runtime gate.
  *
  * The runtime gate that decides whether to strip BOTH LP and PP
- * headers on each poll iteration MUST combine all three of:
+ * headers on each poll iteration MUST combine all four of:
  *
  *   (1) `BuildConfig.DEBUG`               — debug variant only.
  *   (2) `BuildConfig.POLL_SKIP_LP_AND_PP == "1"` — explicit operator opt-in.
- *   (3) `transportPreferences.privacyMode == PrivacyMode.Standard`
+ *   (3) `BuildConfig.LONGPOLL_V2_ENABLED == "1"` — Round 13 hardening; the
+ *                                           strip only makes sense when the
+ *                                           long-poll backbone itself is
+ *                                           wired in. A beta build with
+ *                                           `LONGPOLL_V2_ENABLED == "0"`
+ *                                           does not send LP/PP headers in
+ *                                           the first place; stripping them
+ *                                           when they are not emitted still
+ *                                           produces a Standard-mode wire
+ *                                           fingerprint distinguishable from
+ *                                           both the production padded shape
+ *                                           and the legacy unpadded shape.
+ *   (4) `transportPreferences.privacyMode == PrivacyMode.Standard`
  *                                         — Privacy/Ghost are protected
- *                                           by the Vladislav-locked
- *                                           uniform-functionality rule
- *                                           (2026-06-06).
+ *                                           by the uniform-functionality
+ *                                           rule (2026-06-06).
  *
  * Missing ANY conjunct turns the strip off. The council security
- * cross-check (BS-6) identified the absence of the third conjunct
- * (PrivacyMode gate) as a HIGH-severity Privacy/Ghost exposure
- * vector — a debug build with the second conjunct flipped on but
- * the user in Ghost mode would silently degrade the wire shape
- * without warning.
+ * cross-check (BS-6) identified the absence of the PrivacyMode gate
+ * as a HIGH-severity Privacy/Ghost exposure vector — a debug build
+ * with the operator opt-in flipped on but the user in Ghost mode
+ * would silently degrade the wire shape without warning. The Round 13
+ * Layer 2 cross-check added the `LONGPOLL_V2_ENABLED` conjunct: the
+ * three-conjunct gate would survive future refactors because the
+ * unit test below previously only enforced three conjuncts; the
+ * fourth conjunct closes that "tested-in" exposure gap.
  *
  * This contract test is a source-parse fence: parse
  * `AppContainer.kt`, locate the `pollSkipLpAndPpProvider = { ... }`
@@ -114,6 +128,29 @@ class AppContainerPollSkipLpAndPpGateTest {
     }
 
     @Test
+    fun gate_lambda_contains_LONGPOLL_V2_ENABLED_eq_one_conjunct() {
+        // Round 13 hardening — the strip only makes sense when the
+        // long-poll backbone itself is wired in. A beta build with
+        // `LONGPOLL_V2_ENABLED == "0"` does not send LP/PP headers
+        // in the first place; stripping them when they are not
+        // emitted still produces a Standard-mode wire fingerprint
+        // distinguishable from both the production padded shape and
+        // the legacy unpadded shape.
+        val source = loadAppContainer()
+        val lambda = extractPollSkipProviderLambda(source)
+            ?: fail("Could not locate `pollSkipLpAndPpProvider = { ... }` lambda in AppContainer.kt.")
+        assertTrue(
+            lambda.contains("BuildConfig.LONGPOLL_V2_ENABLED") &&
+                lambda.contains("== \"1\""),
+            "pollSkipLpAndPpProvider lambda MUST require `BuildConfig.LONGPOLL_V2_ENABLED == \"1\"`. " +
+                "Without this conjunct, a beta debug build with `LONGPOLL_V2_ENABLED == \"0\"` AND " +
+                "`POLL_SKIP_LP_AND_PP == \"1\"` would strip LP/PP headers from a request that does " +
+                "not emit them in the first place — a tested-in Standard-mode wire fingerprint. " +
+                "Lambda body:\n$lambda",
+        )
+    }
+
+    @Test
     fun gate_lambda_contains_PrivacyMode_Standard_conjunct() {
         val source = loadAppContainer()
         val lambda = extractPollSkipProviderLambda(source)
@@ -131,24 +168,24 @@ class AppContainerPollSkipLpAndPpGateTest {
     }
 
     @Test
-    fun gate_lambda_uses_logical_AND_conjunction_for_all_three_conditions() {
-        // Pin that the gate is `A && B && C`, not `A || B || C`. A
-        // future refactor that accidentally flips one `&&` to `||`
-        // would silently enable the strip on ANY of the three
-        // conditions instead of ALL of them — catastrophic privacy
-        // regression. We count the `&&` occurrences inside the
-        // lambda; the structural form is two ANDs joining three
-        // operands.
+    fun gate_lambda_uses_logical_AND_conjunction_for_all_four_conditions() {
+        // Round 13 — pin that the gate is `A && B && C && D`, not any
+        // `||` join. A future refactor that accidentally flips one
+        // `&&` to `||` would silently enable the strip on ANY of the
+        // four conditions instead of ALL of them — catastrophic
+        // privacy / wire-fingerprint regression. We count the `&&`
+        // occurrences inside the lambda; the structural form is
+        // three ANDs joining four operands.
         val source = loadAppContainer()
         val lambda = extractPollSkipProviderLambda(source)
             ?: fail("Could not locate `pollSkipLpAndPpProvider = { ... }` lambda in AppContainer.kt.")
         val andCount = Regex("""&&""").findAll(lambda).count()
         assertTrue(
-            andCount >= 2,
-            "pollSkipLpAndPpProvider lambda MUST conjoin its three required conditions with `&&`. " +
-                "Expected at least 2 `&&` operators in the lambda body; found $andCount. " +
+            andCount >= 3,
+            "pollSkipLpAndPpProvider lambda MUST conjoin its four required conditions with `&&`. " +
+                "Expected at least 3 `&&` operators in the lambda body; found $andCount. " +
                 "A `||` joining the conditions would activate the strip on ANY single condition " +
-                "instead of ALL three, defeating the privacy-gate. Lambda body:\n$lambda",
+                "instead of ALL four, defeating the privacy-gate. Lambda body:\n$lambda",
         )
         // Pin that the lambda does NOT contain `||` between the
         // three relevant conditions. Plain text scan is enough — a

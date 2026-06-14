@@ -1,6 +1,6 @@
 # Trek 2 Stage 2B-B Round 12 — field re-test C0/C1/C2 operator scenario
 
-Companion to the council synthesis at `docs/tracks/trek2-stage2b-b-s6-council-d395f682/synthesis.md` and the binding decisions doc at `docs/tracks/trek2-stage2b-b-deployment-gate-and-body-timeout-contract.md`.
+Companion to the binding decisions doc at `docs/tracks/trek2-stage2b-b-deployment-gate-and-body-timeout-contract.md` (which itself encodes the council synthesis — the upstream Layer 1 / Layer 2 review threads were captured ephemerally during the council session) and the underlying log evidence at `docs/tracks/trek2-stage2b-b-tele2-smoke-d395f682-2026-06-13/`.
 
 This is NOT a re-run of the original S1-S6 smoke. It is a narrow three-condition matrix designed to discriminate the four competing failure-mode hypotheses surfaced by the S6 council on `d395f682`:
 
@@ -41,7 +41,7 @@ The `-PpollSkipLpAndPp=1` Gradle property flows into the existing `localOrEnv("p
 
 ## Pre-flight (one-time, before any condition)
 
-Per the existing operator-scenario doc at `docs/tracks/trek2-stage2b-b-tele2-smoke-operator-scenario.md`, replace the APK path with the relevant Round 12 APK. Pre-flight steps (SHA check, install, variant flag, S6 trigger sanity, WiFi off) are unchanged.
+Per the existing Tele2 smoke runbook at `docs/tracks/trek2-stage2b-b-tele2-smoke.md`, replace the APK path with the relevant Round 12 APK. Pre-flight steps (SHA check, install, variant flag, S6 trigger sanity, WiFi off) are unchanged.
 
 In every condition below the Tecno serial is `103603734A004351` and the laptop runs Windows / PowerShell. `adb` is at `$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe`.
 

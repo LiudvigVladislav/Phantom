@@ -174,6 +174,20 @@ expect fun createRestFallbackTransport(
      * parameter but ignore it.
      */
     pollSkipLpAndPpProvider: () -> Boolean = { false },
+    /**
+     * Round 13 — debug-only gate for the OkHttp [HttpPhaseEventListener]
+     * attached to every REST call. The listener emits `dnsEnd
+     * addresses=[...]` and `connectStart host=...` lines under the
+     * `PhantomHybrid` tag; on a release build those lines would expose
+     * the resolved relay IP on every REST call and violate the Ghost
+     * privacy-mode contract that keeps the relay endpoint off-device.
+     *
+     * Wired by the application module (Android) from
+     * `BuildConfig.DEBUG`. Defaults to `false` so every existing call
+     * site preserves byte-identical behaviour. iOS / JVM actuals accept
+     * the parameter but ignore it.
+     */
+    httpPhaseLogging: Boolean = false,
 ): RestFallbackTransport
 
 /**

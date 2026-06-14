@@ -660,6 +660,19 @@ class AppContainer(private val context: Context) {
     // getter returns this directly (callers see a regular WS transport, just
     // like before). After initMessaging it returns a [HybridRelayTransport]
     // wrapper that adds the REST fallback path on top of the same WS transport.
+    //
+    // Round 13 — set the WS-side HttpPhaseEventListener gate BEFORE the
+    // first call to [createHttpClientFactory] so the lambda returned by
+    // the factory sees the correct flag on its first invocation. The
+    // flag default is `false`; release builds (where `BuildConfig.DEBUG`
+    // is `false`) keep it `false`, ensuring the listener is never
+    // attached and the resolved relay IP cannot leak via the
+    // `dnsEnd addresses=[...]` / `connectStart host=...` lines.
+    init {
+        phantom.core.transport.wsHttpPhaseLoggingEnabled =
+            phantom.android.BuildConfig.DEBUG
+    }
+
     private val wsTransport = KtorRelayTransport(createHttpClientFactory())
 
     /**
@@ -1104,19 +1117,32 @@ class AppContainer(private val context: Context) {
                     // Round 12 step 3 — diagnostic provider that
                     // strips BOTH X-Phantom-Long-Poll AND
                     // X-Phantom-Padded-Poll headers atomically.
-                    // Gated on THREE conjuncts that ALL must hold:
+                    // Round 13 — gated on FOUR conjuncts that ALL must hold:
                     //   (1) BuildConfig.DEBUG — the release variant
                     //       has this `false`, killing the diagnostic
                     //       at compile-time-effective resolution.
                     //   (2) BuildConfig.POLL_SKIP_LP_AND_PP == "1" —
                     //       release-pinned to "0" in build.gradle.kts,
                     //       defence-in-depth on top of (1).
-                    //   (3) PrivacyMode == Standard — Privacy and
+                    //   (3) BuildConfig.LONGPOLL_V2_ENABLED == "1" —
+                    //       Round 13 added. The diagnostic strip only
+                    //       makes sense when the long-poll backbone
+                    //       itself is wired in. A debug build with
+                    //       `LONGPOLL_V2_ENABLED == "0"` (the legacy
+                    //       short-poll shape) does not send LP/PP
+                    //       headers in the first place — stripping
+                    //       "off" headers would still produce a
+                    //       Standard-mode wire fingerprint
+                    //       distinguishable from both the production
+                    //       padded shape and the legacy unpadded
+                    //       shape. The fourth conjunct closes that
+                    //       beta-build-tested-in fingerprint gap.
+                    //   (4) PrivacyMode == Standard — Privacy and
                     //       Ghost sessions MUST NOT carry the strip
-                    //       per the Vladislav-locked uniform-
-                    //       functionality rule (2026-06-06). The
-                    //       check reads the SharedPreferences-backed
-                    //       value at request-build time on each poll
+                    //       per the uniform-functionality rule
+                    //       (2026-06-06). The check reads the
+                    //       SharedPreferences-backed value at
+                    //       request-build time on each poll
                     //       iteration so a runtime mode switch
                     //       (Standard → Ghost) deactivates the strip
                     //       on the very next poll, atomically.
@@ -1127,8 +1153,18 @@ class AppContainer(private val context: Context) {
                     pollSkipLpAndPpProvider = {
                         phantom.android.BuildConfig.DEBUG &&
                             phantom.android.BuildConfig.POLL_SKIP_LP_AND_PP == "1" &&
+                            phantom.android.BuildConfig.LONGPOLL_V2_ENABLED == "1" &&
                             transportPreferences.privacyMode == phantom.core.transport.PrivacyMode.Standard
                     },
+                    // Round 13 — debug-only gate for the OkHttp
+                    // HttpPhaseEventListener. The release variant has
+                    // BuildConfig.DEBUG = false, so the listener is
+                    // never attached and the `dnsEnd addresses=[...]`
+                    // and `connectStart host=...` lines that would
+                    // expose the resolved relay IP on every REST call
+                    // never fire. Mirrors the discipline of
+                    // debugBodyLogging above.
+                    httpPhaseLogging = phantom.android.BuildConfig.DEBUG,
                 ),
                 log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
                 onModeSwitched = { _, _, reason ->
