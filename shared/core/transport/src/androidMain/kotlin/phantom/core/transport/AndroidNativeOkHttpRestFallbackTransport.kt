@@ -114,8 +114,14 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
      * every existing call site. Production wiring (Android,
      * `AppContainer`) injects
      * `{ BuildConfig.DEBUG && BuildConfig.POLL_SKIP_LP_AND_PP == "1"
-     * && PrivacyMode == Standard }`; all three conjuncts MUST hold
-     * for the strip to fire.
+     * && BuildConfig.LONGPOLL_V2_ENABLED == "1" && PrivacyMode ==
+     * Standard }`; all four conjuncts MUST hold for the strip to
+     * fire. Round 13 added the `LONGPOLL_V2_ENABLED` conjunct: a
+     * beta build with `LONGPOLL_V2_ENABLED == "0"` does not emit
+     * LP/PP headers in the first place, so stripping "off" headers
+     * would produce a Standard-mode wire fingerprint distinguishable
+     * from both the production padded shape and the legacy unpadded
+     * shape.
      */
     private val pollSkipLpAndPpProvider: () -> Boolean = { false },
 ) : RestFallbackTransport {

@@ -162,12 +162,20 @@ expect fun createRestFallbackTransport(
      * strip off again.
      *
      * Wiring contract (Android): the provider is `{ BuildConfig.DEBUG
-     * && BuildConfig.POLL_SKIP_LP_AND_PP == "1" && PrivacyMode ==
-     * Standard }`. All three conjuncts MUST hold for the strip to
+     * && BuildConfig.POLL_SKIP_LP_AND_PP == "1" &&
+     * BuildConfig.LONGPOLL_V2_ENABLED == "1" && PrivacyMode ==
+     * Standard }`. All four conjuncts MUST hold for the strip to
      * fire; release builds (where `BuildConfig.DEBUG` is `false` AND
-     * `BuildConfig.POLL_SKIP_LP_AND_PP` is pinned to `"0"`) cannot
+     * `BuildConfig.POLL_SKIP_LP_AND_PP` is pinned to `"0"` AND
+     * `BuildConfig.LONGPOLL_V2_ENABLED` is pinned to `"0"`) cannot
      * activate the strip under any circumstances. Privacy and Ghost
-     * sessions also cannot activate the strip, by design.
+     * sessions also cannot activate the strip, by design. A beta
+     * debug build with `LONGPOLL_V2_ENABLED == "0"` cannot activate
+     * it either: the client does not emit LP/PP headers in that
+     * shape, and stripping headers that are never emitted would
+     * still produce a Standard-mode wire fingerprint distinguishable
+     * from both the production padded shape and the legacy unpadded
+     * shape (the Round 13 conjunct addition).
      *
      * Defaults to `{ false }` so every existing call site preserves
      * byte-identical wire behaviour. iOS / JVM actuals accept the

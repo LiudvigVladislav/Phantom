@@ -193,7 +193,7 @@ class AppContainerPollSkipLpAndPpGateTest {
         // the gate.
         assertTrue(
             !lambda.contains("||"),
-            "pollSkipLpAndPpProvider lambda MUST NOT contain `||` — all three conditions must " +
+            "pollSkipLpAndPpProvider lambda MUST NOT contain `||` — all four conditions must " +
                 "be conjoined by `&&`. A `||` would silently activate the strip on any single " +
                 "condition, defeating the privacy-gate. Lambda body:\n$lambda",
         )
