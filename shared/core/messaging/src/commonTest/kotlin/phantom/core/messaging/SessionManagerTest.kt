@@ -991,4 +991,228 @@ class SessionManagerTest {
             "recipientBootstrap MUST still consume OPK after refactor (regression check)",
         )
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // RC-CRYPTO-PAIR-X3DH-INIT Sprint 1 (2026-06-15)
+    //
+    // Coverage for the new `role` field on RatchetState. Sprint 1 is the
+    // diagnostic-tagging foundation: the role marks which side of the
+    // X3DH handshake produced a session record so a later iteration can
+    // add an outbound guard without inspecting chain orientation.
+    //
+    // Sprint 1 in this file:
+    //  - initiatorBootstrap saves an INITIATOR-tagged state
+    //  - recipientBootstrap saves a RESPONDER-tagged state
+    //  - recipientBootstrapInMemory returns a RESPONDER-tagged candidate
+    //
+    // Sprint 1 does NOT add an outbound guard. Tests for guard behaviour
+    // live in a subsequent iteration.
+    // ═══════════════════════════════════════════════════════════════════
+
+    @Test
+    fun initiatorBootstrap_tagsPersistedStateAsInitiator() = runTest {
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val aliceIdentity = real.generateDhKeyPair()
+        val bobIdentity = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobOpk = real.generateDhKeyPair()
+        val bobOpkIdHex = "aaaa11112222333344445555666677ff"
+        val bobSigning = Signature.keypair()
+
+        val ratchetRepo = InMemoryRatchetRepo()
+        val mgr = makeManager(real, ratchetRepo)
+        val bundle = buildBundleFromBob(
+            bobX25519IdentityHex = bobIdentity.publicKey.bytes.toHexString(),
+            bobEd25519SigningPub = bobSigning.publicKey.toByteArray(),
+            bobEd25519SigningSecret = bobSigning.secretKey.toByteArray(),
+            bobSpkPair = bobSpk,
+            bobSpkKeyId = 100L,
+            bobSpkCreatedAtMs = 1_000L,
+            bobOpkPair = bobOpk,
+            bobOpkIdHex = bobOpkIdHex,
+        )
+        val result = mgr.initiatorBootstrap(
+            conversationId = "alice-bob-role",
+            localIdentityKeyPair = aliceIdentity,
+            bundle = bundle,
+        )
+
+        assertEquals(
+            phantom.core.crypto.SessionRole.INITIATOR,
+            result.ratchetState.role,
+            "initiatorBootstrap must tag the returned state as SessionRole.INITIATOR. " +
+                "The bootstrap call site is where role is semantically known; the " +
+                "crypto layer returns a default-tagged RatchetState.",
+        )
+
+        // Persisted blob must round-trip the tag.
+        val persisted = mgr.tryLoadSession("alice-bob-role")
+        assertNotNull(persisted, "initiatorBootstrap must persist via saveSession")
+        assertEquals(
+            phantom.core.crypto.SessionRole.INITIATOR,
+            persisted.role,
+            "Persisted RatchetState blob must round-trip the INITIATOR role tag.",
+        )
+    }
+
+    @Test
+    fun recipientBootstrap_tagsPersistedStateAsResponder() = runTest {
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val aliceIdentity = real.generateDhKeyPair()
+        val bobIdentity = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobOpk = real.generateDhKeyPair()
+        val bobOpkIdHex = "bbbb11112222333344445555666677ee"
+        val bobSigning = Signature.keypair()
+
+        // Alice's initiator side produces a real x3dhInit header.
+        val aliceMgr = makeManager(real, InMemoryRatchetRepo())
+        val bundle = buildBundleFromBob(
+            bobX25519IdentityHex = bobIdentity.publicKey.bytes.toHexString(),
+            bobEd25519SigningPub = bobSigning.publicKey.toByteArray(),
+            bobEd25519SigningSecret = bobSigning.secretKey.toByteArray(),
+            bobSpkPair = bobSpk,
+            bobSpkKeyId = 101L,
+            bobSpkCreatedAtMs = 1_000L,
+            bobOpkPair = bobOpk,
+            bobOpkIdHex = bobOpkIdHex,
+        )
+        val initiatorResult = aliceMgr.initiatorBootstrap(
+            conversationId = "alice-bob-role",
+            localIdentityKeyPair = aliceIdentity,
+            bundle = bundle,
+        )
+
+        // Bob's recipient side runs the bootstrap that this Sprint targets.
+        val bobSpkRepo = InMemorySignedPreKeyRepo().also {
+            it.upsert(
+                LocalSignedPreKeyEntity(
+                    keyId = 101L,
+                    publicKeyHex = bobSpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobSpk.privateKey.bytes.toHexString(),
+                    createdAtMs = 1_000L,
+                    signatureHex = "00".repeat(64),
+                ),
+            )
+        }
+        val bobOpkRepo = InMemoryOneTimePreKeyRepo().also {
+            it.insert(
+                LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkIdHex,
+                    publicKeyHex = bobOpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobOpk.privateKey.bytes.toHexString(),
+                    uploadedAtMs = 500L,
+                ),
+            )
+        }
+        val bobRatchetRepo = InMemoryRatchetRepo()
+        val bobMgr = makeManager(
+            x3dh = real,
+            ratchetRepo = bobRatchetRepo,
+            spkRepo = bobSpkRepo,
+            opkRepo = bobOpkRepo,
+        )
+
+        val bobState = bobMgr.recipientBootstrap(
+            conversationId = "alice-bob-role",
+            localIdentityKeyPair = bobIdentity,
+            senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
+            x3dhInit = initiatorResult.x3dhInit,
+        )
+
+        assertEquals(
+            phantom.core.crypto.SessionRole.RESPONDER,
+            bobState.role,
+            "recipientBootstrap must tag the returned state as SessionRole.RESPONDER. " +
+                "This is the load-bearing tag for the asymmetric-pair lacuna: the " +
+                "sending chain on a RESPONDER state corresponds to the initiator's " +
+                "receiving chain, so a future outbound guard needs the marker to " +
+                "distinguish this from a normal existing-session.",
+        )
+
+        val persisted = bobMgr.tryLoadSession("alice-bob-role")
+        assertNotNull(persisted, "recipientBootstrap must persist via saveSession")
+        assertEquals(
+            phantom.core.crypto.SessionRole.RESPONDER,
+            persisted.role,
+            "Persisted RatchetState blob must round-trip the RESPONDER role tag.",
+        )
+    }
+
+    @Test
+    fun recipientBootstrapInMemory_tagsCandidateAsResponder() = runTest {
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val aliceIdentity = real.generateDhKeyPair()
+        val bobIdentity = real.generateDhKeyPair()
+        val bobSpk = real.generateDhKeyPair()
+        val bobOpk = real.generateDhKeyPair()
+        val bobOpkIdHex = "cccc11112222333344445555666677dd"
+        val bobSigning = Signature.keypair()
+
+        val aliceMgr = makeManager(real, InMemoryRatchetRepo())
+        val bundle = buildBundleFromBob(
+            bobX25519IdentityHex = bobIdentity.publicKey.bytes.toHexString(),
+            bobEd25519SigningPub = bobSigning.publicKey.toByteArray(),
+            bobEd25519SigningSecret = bobSigning.secretKey.toByteArray(),
+            bobSpkPair = bobSpk,
+            bobSpkKeyId = 102L,
+            bobSpkCreatedAtMs = 1_000L,
+            bobOpkPair = bobOpk,
+            bobOpkIdHex = bobOpkIdHex,
+        )
+        val initiatorResult = aliceMgr.initiatorBootstrap(
+            conversationId = "alice-bob-role",
+            localIdentityKeyPair = aliceIdentity,
+            bundle = bundle,
+        )
+
+        val bobSpkRepo = InMemorySignedPreKeyRepo().also {
+            it.upsert(
+                LocalSignedPreKeyEntity(
+                    keyId = 102L,
+                    publicKeyHex = bobSpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobSpk.privateKey.bytes.toHexString(),
+                    createdAtMs = 1_000L,
+                    signatureHex = "00".repeat(64),
+                ),
+            )
+        }
+        val bobOpkRepo = InMemoryOneTimePreKeyRepo().also {
+            it.insert(
+                LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkIdHex,
+                    publicKeyHex = bobOpk.publicKey.bytes.toHexString(),
+                    privateKeyHex = bobOpk.privateKey.bytes.toHexString(),
+                    uploadedAtMs = 500L,
+                ),
+            )
+        }
+        val bobMgr = makeManager(
+            x3dh = real,
+            ratchetRepo = InMemoryRatchetRepo(),
+            spkRepo = bobSpkRepo,
+            opkRepo = bobOpkRepo,
+        )
+
+        val candidate = bobMgr.recipientBootstrapInMemory(
+            conversationId = "alice-bob-role",
+            localIdentityKeyPair = bobIdentity,
+            senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
+            x3dhInit = initiatorResult.x3dhInit,
+        )
+
+        assertEquals(
+            phantom.core.crypto.SessionRole.RESPONDER,
+            candidate.role,
+            "recipientBootstrapInMemory must tag the returned candidate as " +
+                "SessionRole.RESPONDER even though it does not persist. The role " +
+                "tag travels with the candidate state so the PR #249 repair " +
+                "branch's downstream saveSession (line 2531 of " +
+                "DefaultMessagingService) writes a correctly-tagged blob without " +
+                "any additional plumbing.",
+        )
+    }
 }
