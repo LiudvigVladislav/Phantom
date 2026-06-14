@@ -7,6 +7,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -15,6 +16,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import phantom.core.storage.ProcessedEnvelopeRepository
 import phantom.core.transport.AckOutcome
 import phantom.core.transport.KtorRelayTransport
@@ -239,6 +241,17 @@ class HybridRelayTransport(
      * Guards [maybeRetryBootstrap] so only one retry runs at a time.
      */
     private val bootstrapRetryLock = Mutex()
+
+    /**
+     * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.2) — serialises
+     * [activateRestCollectors] so a concurrent call from
+     * [bootstrapAndStart] and [maybeRetryBootstrap] cannot both pass
+     * the `restCapabilityActive` check, launch two inbound
+     * collectors, and call `orchestrator.start()` twice. The check
+     * is now re-evaluated UNDER the mutex; rollback of a partial
+     * launch is also serialised here.
+     */
+    private val restActivationMutex = Mutex()
 
     /**
      * Wall-clock ms of the last bootstrap attempt (success or fail). Used by
@@ -543,19 +556,76 @@ class HybridRelayTransport(
     /**
      * Switch the wrapper into REST-fallback-aware mode. Idempotent — safe
      * to call from a retry path.
+     *
+     * Trek 2 Stage 2B-B (C4 review-fix round 3 P1.2) — the body runs
+     * under [restActivationMutex] so a concurrent call from
+     * [bootstrapAndStart] and [maybeRetryBootstrap] cannot interleave
+     * the `restCapabilityActive` check with the actual launch.
+     * Without the mutex both callers passed the check, both launched
+     * a `restInboundJob`, both called `orchestrator.start()` — two
+     * sets of `stateObserverJob` + `wsActivePollJob` were spawned,
+     * and the first set was orphaned when the second overwrote
+     * the field references.
+     *
+     * If anything between collector launch and the `restCapabilityActive`
+     * flip throws (including `CancellationException`), the launched
+     * collector is rolled back under [NonCancellable] so a cancelled
+     * caller does not leak a half-activated state.
      */
-    private fun activateRestCollectors() {
-        if (restCapabilityActive) {
-            return
+    private suspend fun activateRestCollectors() {
+        restActivationMutex.withLock {
+            if (restCapabilityActive) {
+                return@withLock
+            }
+            // Trek 2 Stage 2B-B (C3 review-fix) — register the inbound
+            // collector BEFORE starting the orchestrator. `SharedFlow`
+            // with `replay=0` does NOT buffer envelopes for retroactive
+            // subscribers; a poll-loop emit that lands before the
+            // collector is registered is lost. `CoroutineStart.UNDISPATCHED`
+            // runs the launched body eagerly on the current thread up to
+            // the first suspension point (the `collect` call), so by
+            // the time `launch` returns the collector is registered on
+            // `inbound` and ready to receive emits.
+            val launched: Job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                orchestrator.inbound.collect { handleRestInbound(it) }
+            }
+            restInboundJob = launched
+            try {
+                // Now safe to start the orchestrator — its poll loops
+                // can begin emitting and the collector is guaranteed
+                // to be listening. Trek 2 Stage 2B-B (C4 review-fix
+                // round 2 P1.1) — start() is now suspending so it can
+                // `cancelAndJoinAll` prior jobs before resetting state.
+                orchestrator.start()
+                // Flip flag AFTER the inbound collector is registered
+                // so any event already in flight is processed correctly.
+                restCapabilityActive = true
+            } catch (t: Throwable) {
+                // Rollback the half-launched collector under
+                // `NonCancellable` so even a `CancellationException` on
+                // the caller does not skip the cleanup. Re-throw after
+                // rollback (CE included) so the caller observes the
+                // original failure.
+                withContext(NonCancellable) {
+                    launched.cancel()
+                    try {
+                        launched.join()
+                    } catch (_: Throwable) {
+                        // Diagnostic; join() is to ensure the body has
+                        // fully unwound regardless of completion outcome.
+                    }
+                    if (restInboundJob === launched) {
+                        restInboundJob = null
+                    }
+                    // Defensive: in case `orchestrator.start()` had
+                    // partially armed itself before throwing.
+                    orchestrator.stop()
+                }
+                // Re-throw (CE included) so the caller observes the
+                // original failure after rollback completes.
+                throw t
+            }
         }
-        orchestrator.start()
-        // REST poll inbound → dedup → translate → merged inbound.
-        restInboundJob = scope.launch {
-            orchestrator.inbound.collect { handleRestInbound(it) }
-        }
-        // Flip flag AFTER the inbound collector is registered so any event
-        // already in flight is processed correctly.
-        restCapabilityActive = true
     }
 
     /**
@@ -963,7 +1033,24 @@ class HybridRelayTransport(
                 TAG,
                 "REST_TRACE inbound_skip_already_processed id=${env.id.take(8)}",
             )
-            runCatching { orchestrator.ackInbound(env.id) }
+            // Trek 2 Stage 2B-B (C3 review-fix) — explicit try/catch
+            // with CancellationException rethrow so the orchestrator's
+            // three-phase cancellation safety is NOT undermined by a
+            // wrapper that catches everything. `runCatching` would
+            // silently swallow a CE and turn an in-flight shutdown
+            // into a successful return; the catch (Throwable) preserves
+            // the non-cancellation defensive behaviour.
+            try {
+                orchestrator.ackInboundAndAdvanceCursor(env.id)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "REST_TRACE inbound_skip_already_processed_ack_threw " +
+                        "id=${env.id.take(8)} reason=${t::class.simpleName}",
+                )
+            }
             return
         }
 
@@ -1004,7 +1091,26 @@ class HybridRelayTransport(
                     TAG,
                     "REST_TRACE inbound_reack_after_ack id=${env.id.take(8)}",
                 )
-                runCatching { orchestrator.ackInbound(env.id) }
+                // Trek 2 Stage 2B-B (C3, L3 Step 3) — ReAck path uses
+                // the combined method so a successful retry not only
+                // clears the relay queue but also advances the
+                // persisted cursor that the FIRST ack attempt
+                // missed. M-B20 pins the success-after-retry path.
+                //
+                // C3 review-fix — explicit try/catch with CE rethrow
+                // (the orchestrator's three-phase cancellation safety
+                // is undermined by `runCatching`).
+                try {
+                    orchestrator.ackInboundAndAdvanceCursor(env.id)
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    Log.w(
+                        TAG,
+                        "REST_TRACE inbound_reack_ack_threw " +
+                            "id=${env.id.take(8)} reason=${t::class.simpleName}",
+                    )
+                }
             }
         }
     }
@@ -1023,9 +1129,25 @@ class HybridRelayTransport(
         // DMS only calls sendDeliveryAck AFTER markProcessed + insertMessage,
         // so by the time we get here the envelope is durably stored locally.
         // This is the load-bearing ACK-after-persistence invariant.
+        //
+        // Trek 2 Stage 2B-B (C3, L3 Step 4) — the combined method
+        // wraps `ackInbound` + the persistent cursor advance into a
+        // single cancellation-safe call. The outcome classification
+        // below is unchanged; on `Failed` the entry stays in
+        // `_pendingSeqForAck` for the ReAck path's retry. On `Acked`
+        // the cursor is already persisted by the time this returns.
         Log.i(TAG, "REST_TRACE ack_after_save id=${messageId.take(8)}")
-        val outcome = runCatching { orchestrator.ackInbound(messageId) }
-            .getOrElse { AckOutcome.Failed(statusCode = null, reason = it::class.simpleName ?: "Throwable") }
+        // Trek 2 Stage 2B-B (C3 review-fix) — explicit try/catch so a
+        // shutdown-time CancellationException propagates to the
+        // caller (and the rest of the structured-concurrency tree)
+        // instead of being silently turned into `AckOutcome.Failed`.
+        val outcome = try {
+            orchestrator.ackInboundAndAdvanceCursor(messageId)
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            AckOutcome.Failed(statusCode = null, reason = t::class.simpleName ?: "Throwable")
+        }
         // Mark acknowledged regardless of network outcome — DMS has
         // persisted the envelope. If the relay re-delivers because our ack
         // never reached it, the tracker correctly returns ReAck on the

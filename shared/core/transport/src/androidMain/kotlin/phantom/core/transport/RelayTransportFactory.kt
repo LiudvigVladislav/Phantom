@@ -31,6 +31,26 @@ import okhttp3.RequestBody.Companion.toRequestBody
 // which is why APK 13 still hung 4 minutes on Tecno HiOS.
 @Volatile private var activeOkHttp: OkHttpClient? = null
 
+/**
+ * Round 13 — debug-only gate for the OkHttp [HttpPhaseEventListener]
+ * attached to the WS reconnect HTTPS auth/challenge GET and the
+ * subsequent WebSocket upgrade. The listener emits `dnsEnd
+ * addresses=[...]` and `connectStart host=...` lines under the
+ * `PhantomRelay` tag; on a release build those lines would expose
+ * the resolved relay IP on every WS reconnect and violate the Ghost
+ * privacy-mode contract.
+ *
+ * Set by [phantom.android.di.AppContainer] from `BuildConfig.DEBUG`
+ * BEFORE the first WS connection is established. Default `false`
+ * means the listener is never attached on a release build even if
+ * the AppContainer initialiser is skipped (defence-in-depth). The
+ * volatile read in [createHttpClientFactory]'s returned lambda
+ * happens at WS reconnect time, so a runtime flip would take effect
+ * on the next reconnect — although in practice the flag is set once
+ * at startup and never toggled.
+ */
+@Volatile var wsHttpPhaseLoggingEnabled: Boolean = false
+
 actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { socksProxyPort ->
     val builder = OkHttpClient.Builder()
         // PR-H1c (2026-05-13) / PR-H1e (2026-05-14): WebSocket-protocol
@@ -117,16 +137,29 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // Generation/session correlation is by timestamp against the
         // existing `[gen=N s=M]` lines in KtorRelayTransport; not
         // injected here to avoid cross-module shared mutable plumbing
-        // that the Commit 1 scope guard rules out. NO behaviour change.
+        // that the Commit 1 scope guard rules out.
+        //
+        // Round 13 — the factory itself is unconditionally registered,
+        // but it returns the no-op [okhttp3.EventListener.NONE] when
+        // [wsHttpPhaseLoggingEnabled] is `false`. On a release build
+        // the AppContainer initialiser leaves the flag at its default
+        // `false`, so the `HttpPhaseEventListener` (which would emit
+        // `dnsEnd addresses=[...]` / `connectStart host=...` lines
+        // disclosing the resolved relay IP on every WS reconnect) is
+        // never constructed and never invoked.
         .eventListenerFactory { call ->
-            val path = call.request().url.encodedPath
-            val op = if (path.contains("/auth/challenge")) "ws_auth" else "ws_upgrade"
-            HttpPhaseEventListener(
-                tag = "PhantomRelay",
-                keyword = "RELAY_TRACE",
-                op = op,
-                correlationKey = System.identityHashCode(call).toString(16),
-            )
+            if (wsHttpPhaseLoggingEnabled) {
+                val path = call.request().url.encodedPath
+                val op = if (path.contains("/auth/challenge")) "ws_auth" else "ws_upgrade"
+                HttpPhaseEventListener(
+                    tag = "PhantomRelay",
+                    keyword = "RELAY_TRACE",
+                    op = op,
+                    correlationKey = System.identityHashCode(call).toString(16),
+                )
+            } else {
+                okhttp3.EventListener.NONE
+            }
         }
 
     // ADR-016 Stage 2C: route this generation's TCP connection through
@@ -343,5 +376,13 @@ actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
  */
 actual fun createRestFallbackTransport(
     socksProxyPort: Int?,
+    debugBodyLogging: Boolean,
+    pollSkipLpAndPpProvider: () -> Boolean,
+    httpPhaseLogging: Boolean,
 ): RestFallbackTransport =
-    AndroidNativeOkHttpRestFallbackTransport(socksProxyPort = socksProxyPort)
+    AndroidNativeOkHttpRestFallbackTransport(
+        socksProxyPort = socksProxyPort,
+        debugBodyLogging = debugBodyLogging,
+        pollSkipLpAndPpProvider = pollSkipLpAndPpProvider,
+        httpPhaseLogging = httpPhaseLogging,
+    )

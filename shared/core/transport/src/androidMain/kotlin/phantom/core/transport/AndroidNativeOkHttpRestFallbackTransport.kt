@@ -65,6 +65,65 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
      * lifetime; the orchestrator caches one transport per app run.
      */
     private val socksProxyPort: Int? = null,
+    /**
+     * Round 12 step 2 — debug-only diagnostic toggle for the per-chunk
+     * response-body byte accounting interceptor
+     * ([DebugBodyByteLoggingInterceptor]). When `false` (the release
+     * default and the production default), the interceptor is never
+     * constructed and the OkHttp pipeline runs identically to its
+     * pre-Round-12 shape. When `true`, the interceptor is added to
+     * the OkHttp client for `op == "poll"` calls only — auth/session,
+     * send, and ack/deliver paths are not instrumented because the
+     * S6 incident pinpointed the poll body-read as the discriminator
+     * surface, and instrumenting auth/send would pollute the
+     * diagnostic signal with shapes the council did not request.
+     *
+     * Wired by [phantom.android.di.AppContainer] from
+     * `BuildConfig.DEBUG`. The release-variant `BuildConfig.DEBUG`
+     * is always `false`, so the production constructor receives
+     * `debugBodyLogging = false` at the application-module
+     * boundary.
+     */
+    private val debugBodyLogging: Boolean = false,
+    /**
+     * Round 13 — debug-only gate for the OkHttp
+     * [HttpPhaseEventListener] attached to every REST call. The
+     * listener emits `dnsEnd addresses=[...]` and
+     * `connectStart host=...` lines to Android logcat under the
+     * `PhantomHybrid` tag; on a release build those lines expose
+     * the resolved relay IP address on every poll/send/auth/ack
+     * call, which violates the Ghost privacy-mode contract that
+     * keeps the relay endpoint off-device.
+     *
+     * Wired by [phantom.android.di.AppContainer] from
+     * `BuildConfig.DEBUG`. The release-variant `BuildConfig.DEBUG`
+     * is always `false`, so the production constructor receives
+     * `httpPhaseLogging = false` and the listener is never attached.
+     * Mirrors the gating discipline of [debugBodyLogging].
+     */
+    private val httpPhaseLogging: Boolean = false,
+    /**
+     * Round 12 step 3 — diagnostic provider that, when it returns
+     * `true`, causes [buildPollRequest] to drop BOTH the
+     * `X-Phantom-Long-Poll` and the `X-Phantom-Padded-Poll` opt-in
+     * headers atomically. Read at request-build time on each
+     * `poll(...)` call so a PrivacyMode switch mid-session is
+     * observed promptly.
+     *
+     * Default `{ false }` preserves byte-identical wire shape for
+     * every existing call site. Production wiring (Android,
+     * `AppContainer`) injects
+     * `{ BuildConfig.DEBUG && BuildConfig.POLL_SKIP_LP_AND_PP == "1"
+     * && BuildConfig.LONGPOLL_V2_ENABLED == "1" && PrivacyMode ==
+     * Standard }`; all four conjuncts MUST hold for the strip to
+     * fire. Round 13 added the `LONGPOLL_V2_ENABLED` conjunct: a
+     * beta build with `LONGPOLL_V2_ENABLED == "0"` does not emit
+     * LP/PP headers in the first place, so stripping "off" headers
+     * would produce a Standard-mode wire fingerprint distinguishable
+     * from both the production padded shape and the legacy unpadded
+     * shape.
+     */
+    private val pollSkipLpAndPpProvider: () -> Boolean = { false },
 ) : RestFallbackTransport {
 
     private val jsonCodec = Json {
@@ -112,11 +171,17 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         readTimeoutMs: Long?,
     ): RestFallbackResponse<PollResponse> = withContext(Dispatchers.IO) {
         val fullUrl = if (sinceSeq != null) "$url?since_seq=$sinceSeq" else url
+        // Round 12 step 3 — evaluate the provider once per poll
+        // iteration so a runtime PrivacyMode change is reflected on
+        // the very next request (Standard → Ghost atomically turns
+        // the diagnostic strip off again).
+        val skipLpAndPp = pollSkipLpAndPpProvider()
         val response = get(
             url = fullUrl,
             token = token,
             op = "poll",
             longPollOptIn = longPollOptIn,
+            pollSkipLpAndPp = skipLpAndPp,
             readTimeoutOverrideMs = readTimeoutMs,
         )
         decode(response, PollResponse.serializer())
@@ -145,6 +210,17 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         val statusCode: Int,
         val rawBody: String,
         val elapsedMs: Long,
+        /**
+         * Trek 2 Stage 2B-B (C5, L8 + M-B24) — parsed `Retry-After`
+         * header value in seconds. `null` when absent / malformed
+         * (HTTP-date form, non-numeric, empty, zero, negative — all
+         * normalised to `null` by
+         * [RestFallbackOrchestrator.parseRetryAfterHeader]). The
+         * orchestrator clamps to `RETRY_AFTER_HARD_CAP_SECONDS = 120`
+         * before multiplying by 1_000L (see
+         * [RestFallbackOrchestrator.clampRetryAfterMs]).
+         */
+        val retryAfterSeconds: Long? = null,
     )
 
     private fun post(
@@ -169,6 +245,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         token: String,
         op: String,
         longPollOptIn: Boolean = false,
+        pollSkipLpAndPp: Boolean = false,
         readTimeoutOverrideMs: Long? = null,
     ): RawResponse {
         val client = buildClient(
@@ -176,7 +253,12 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
             correlationKey = url,
             readTimeoutOverrideMs = readTimeoutOverrideMs,
         )
-        val request = buildPollRequest(url = url, token = token, longPollOptIn = longPollOptIn)
+        val request = buildPollRequest(
+            url = url,
+            token = token,
+            longPollOptIn = longPollOptIn,
+            pollSkipLpAndPp = pollSkipLpAndPp,
+        )
         return execute(client, request)
     }
 
@@ -185,11 +267,24 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         client.newCall(request).execute().use { response: Response ->
             val raw = response.body?.string() ?: ""
             val elapsedMs = System.currentTimeMillis() - startMs
+            // Trek 2 Stage 2B-B (C5, L8) — parse `Retry-After` INSIDE
+            // the `.use { }` block. OkHttp's `Response.header(name)`
+            // returns the value verbatim; the parse normalises
+            // malformed inputs to `null`. The orchestrator clamps
+            // the typed value to `RETRY_AFTER_HARD_CAP_SECONDS = 120`
+            // before multiplying by 1_000L (see
+            // `RestFallbackOrchestrator.clampRetryAfterMs`). Reading
+            // the header here is cheap and avoids surfacing the raw
+            // OkHttp Response object outside the `.use { }` boundary.
+            val retryAfterSeconds = RestFallbackOrchestrator.parseRetryAfterHeader(
+                response.header("Retry-After"),
+            )
             // Status log INSIDE use{} per PR-R0.3 guardrail.
             return RawResponse(
                 statusCode = response.code,
                 rawBody = raw,
                 elapsedMs = elapsedMs,
+                retryAfterSeconds = retryAfterSeconds,
             )
         }
     }
@@ -214,6 +309,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
             bodyParsed = parsed,
             rawBody = raw.rawBody,
             elapsedMs = raw.elapsedMs,
+            retryAfterSeconds = raw.retryAfterSeconds,
         )
     }
 
@@ -262,14 +358,47 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
             // `PhantomHybrid` tag so the new lines sort with the existing
             // REST_TRACE send/poll/auth bodies. NO behaviour change; the
             // listener does string concatenation and Log.i only.
-            .eventListener(
-                HttpPhaseEventListener(
-                    tag = "PhantomHybrid",
-                    keyword = "REST_TRACE",
-                    op = op,
-                    correlationKey = correlationKey,
-                ),
-            )
+            //
+            // Round 13 — gated on `httpPhaseLogging` (debug-build only;
+            // wired by AppContainer from `BuildConfig.DEBUG`). The
+            // `dnsEnd addresses=[...]` and `connectStart host=...` lines
+            // emit the resolved relay IP, which on a release build would
+            // expose the relay endpoint on every REST call and violate
+            // the Ghost privacy-mode contract.
+            .also { builder ->
+                if (httpPhaseLogging) {
+                    builder.eventListener(
+                        HttpPhaseEventListener(
+                            tag = "PhantomHybrid",
+                            keyword = "REST_TRACE",
+                            op = op,
+                            correlationKey = correlationKey,
+                        ),
+                    )
+                }
+            }
+            .also { builder ->
+                // Round 12 step 2 — per-chunk response-body byte
+                // accounting for the REST poll path. Gated on
+                // `debugBodyLogging` (debug-build only) AND `op == "poll"`
+                // (auth/send/ack are out of scope per the S6 council
+                // narrow finding). The interceptor wraps the response
+                // body's Source with a logging ForwardingSource;
+                // `responseBodyStart` / `responseBodyEnd` events from
+                // the EventListener still fire normally, and the new
+                // `body_chunk` / `body_eof` lines compose with them to
+                // discriminate the four failure-mode hypotheses.
+                if (debugBodyLogging && op == "poll") {
+                    builder.addInterceptor(
+                        DebugBodyByteLoggingInterceptor(
+                            tag = "PhantomHybrid",
+                            keyword = "REST_TRACE",
+                            op = op,
+                            correlationKey = correlationKey,
+                        ),
+                    )
+                }
+            }
             .build()
     }
 
@@ -318,17 +447,29 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
          * inside a single `if (longPollOptIn)` block is the structural
          * enforcement of scope lock L1: a future caller cannot accidentally
          * emit one header without the other.
+         *
+         * Round 12 step 3 — the [pollSkipLpAndPp] diagnostic toggle
+         * skips BOTH headers atomically when `true`, preserving the
+         * L1 coupling by structural form. A partial strip (PP only)
+         * was explicitly rejected by the d395f682 council; the
+         * `&& !pollSkipLpAndPp` gate keeps the emission decision a
+         * single boolean — both headers go out together or neither
+         * does. The diagnostic toggle's gating chain (BuildConfig +
+         * PrivacyMode == Standard) lives at the AppContainer wiring
+         * layer, not here; this function trusts its caller to have
+         * already applied those checks.
          */
         internal fun buildPollRequest(
             url: String,
             token: String,
             longPollOptIn: Boolean,
+            pollSkipLpAndPp: Boolean = false,
         ): Request {
             val builder = Request.Builder()
                 .url(url)
                 .header("Connection", "close")
                 .header("Authorization", "Bearer $token")
-            if (longPollOptIn) {
+            if (longPollOptIn && !pollSkipLpAndPp) {
                 builder.header(LONG_POLL_OPT_IN_HEADER, "1")
                 builder.header(PADDED_POLL_OPT_IN_HEADER, "1")
             }

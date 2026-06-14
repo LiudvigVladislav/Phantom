@@ -568,3 +568,19 @@ After Stage 2B-B merges, the long-poll backbone is **semantically wired but NOT 
 3. **Direct WSS hardening track opens.** The backbone is "active" only after Stage 2B-D promotion is green in production. Direct WSS hardening is the next track per the locked strategic order, but it starts only after Stage 2B-D, not after Stage 2B-C.
 
 This sequencing is explicit so the strategic frame's "backbone first" framing does not silently degrade into "backbone shipped but never validated; we have moved on to Direct WSS." The backbone is the un-killable-messenger guarantee at the product level; validating it under production load is the load-bearing step that justifies that guarantee.
+
+## Post-d395f682 council deltas (2026-06-13)
+
+A two-layer council on the Tele2 LTE smoke at branch HEAD `d395f682` produced two binding decisions on top of the original scope: (A) a deployment-rollout-gate disclosure governing what PR descriptions and release notes may and may not claim about Stage 2B-B's production-active state, and (B) a written client contract for the REST poll body-timeout-after-headers failure shape. Both decisions live at `docs/tracks/trek2-stage2b-b-deployment-gate-and-body-timeout-contract.md` and are binding on this branch and on all subsequent Stage 2B-* PRs.
+
+## Round 13 path-B re-cut (2026-06-15)
+
+A two-pass preflight on branch HEAD `d934e7e2` (Round 12 step 4) — four parallel domain reviews followed by an independent cross-check — returned ten unique blockers: five code-level findings (3 security, 2 KMP discipline), two documentation / branch-hygiene findings, and three field-validation / measurement findings. The code and doc findings were addressed in Round 13 (see PR description for the per-blocker mapping). The field-validation findings — Tele2 LTE S1-S6 with `RELAY_POLL_HOLD_SECS > 0`, the C0/C1/C2 APK-A/B discriminator matrix, and the M1 Caddy tcpdump / M2 carrier-ceiling instrumentation — are explicitly deferred to a single integration smoke that runs once three independent moving parts are co-deployed:
+
+1. Stage 2B-B client implementation (this PR) merged to master.
+2. The Round 14 paced-padded-poll relay binary (PR #310, branch `feat/round14-poll-chunked-flush`) deployed to the production relay with `RELAY_POLL_CHUNKED_FLUSH=1` set in the VPS environment.
+3. The release pin promoted to `LONGPOLL_V2_ENABLED == "1"` for the smoke APK so the client actually emits the LP+PP headers that gate the chunked-flush path.
+
+Assembling all three on a throwaway diagnostic branch was rejected as a 4-6 hour integration program with too many independent failure modes to attribute cleanly. The integration smoke is therefore staged as part of the Stage 2B-D rollout gate (the Tele2 LTE smoke S1-S6 reproduction is already one of the four Stage 2B-D promotion criteria — Round 13 only sharpens that criterion to include the additional measurement gates above and to require `RELAY_POLL_HOLD_SECS > 0` rather than the kill-switch-active capture window the d395f682 smoke ran with). The integration smoke remains non-waivable per WORKING_RULES rule 8; the deferral concerns *when* the smoke runs and *with which combined deployment shape*, not *whether* it runs.
+
+This Round 13 deferral does not relax Decision A's deployment-rollout-gate disclosure: the long-poll backbone is "wired but not yet active in production" through Stage 2B-C, then becomes "active" only after the Stage 2B-D integration smoke passes.
