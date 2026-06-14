@@ -589,6 +589,31 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-15 · RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a outbound role guard SHIPPED LOCAL + field smoke PASS on Vladislav setup
+
+**Goal:** ship the smallest behavioural fix that closes H1 from the Sprint 1 foundation (`88e472af`), validate on Vladislav's real two-device pair under Wi-Fi, and decide push/draft-PR timing — without expanding scope into the Sprint 2b pending/active state machine that would require schema work.
+
+**What landed (LOCAL only, branch `feat/rc-crypto-pair-x3dh-init-root-cause`):**
+
+1. **Sprint 2a outbound role guard — commit `14b8033c feat(crypto): outbound role guard at encryptUnderLock — Sprint 2a`.** The existing-session branch at `DefaultMessagingService.kt:434` now requires the loaded state to be `INITIATOR`-tagged AND `!sessionSuspect`. A `RESPONDER`-bootstrapped session (created by `recipientBootstrap` / `recipientBootstrapInMemory` when the peer received an `x3dhInit` from Tecno first) is redirected into the bootstrap branch — runs a fresh X3DH 4-DH exchange in the local→peer direction, attaches `x3dhInit` to the outbound `WireFrame`, and writes a new INITIATOR row. Three new tests added to `DefaultMessagingServiceTest.kt`: U1 (RESPONDER seed → bootstrap path + `x3dhInit` emitted), U2 (INITIATOR seed → existing-session path no `x3dhInit`, regression vs OPK storm), U3 (INITIATOR + `sessionSuspect=true` → bootstrap path). Storage inspection during scope-lock confirmed `RatchetStateRepository` is single-slot per `conversation_id` (PRIMARY KEY), so the new INITIATOR row REPLACES the RESPONDER row on `saveSession`. Sprint 2a accepts this race window explicitly and pushes pending/active into Sprint 2b. Backwards-compat: untagged legacy `rs1:` blobs deserialize as `INITIATOR` (Sprint 1 default), so the guard is a no-op for any session row written before the role field existed.
+
+2. **Field smoke PASS on Vladislav's setup.** Tecno `103603734A004351` + emulator `emulator-5554`, both running the same `14b8033c` build, Wi-Fi only, `pm clear phantom.android` on both, fresh QR pair. Two-message smoke: Tecno→emulator "alpha" (creates the RESPONDER session on emulator), emulator→Tecno "beta" (THE Sprint 2a guard test). Results: emulator outbound event #3 (the "beta" reply) took the `bootstrap_path` branch and attached `bootstrap=true`. Tecno received envelope id `21350350` with `sessionExists=true x3dhInitPresent=true`, triggered PR #249's `inbound_repair_armed reason=fail_mac_existing_session`, and `inbound_repair_ok bootstrap=true plaintextBytes=126 elapsedMs=77`. Zero `action=hold` across the entire log. Four successful Tecno decrypts in the run (2× `inbound_repair_ok` for bootstrap envelopes carrying `x3dhInit`, 2× plain `DECRYPT_TRACE ok` for follow-up envelopes on the freshly-rekeyed session). User confirmation verbatim: "все сообщения теперь пришли, и быстро даже приходят". Architect independent review converged on the same verdict. Durable evidence at `C:\temp\sprint-2a-field-smoke-2026-06-15\` (findings.md + tecno.log + emulator.log).
+
+3. **Minor log text fix in the same commit window.** The pre-Sprint-2a bootstrap_path log read `— no existing session` even when `existingState != null` but `role=RESPONDER` (mechanism correct, text misleading). Tightened to `SEND_TRACE bootstrap_path conv=$convTag reason=$bootstrapReason` where reason ∈ {`no_session_row`, `responder_role_redirected`, `session_suspect`, `unknown`}. `:shared:core:messaging:jvmTest` BUILD SUCCESSFUL after the amend.
+
+**What Sprint 2a does NOT claim:**
+
+- Sprint 2b pending/active state machine still open. Single-slot REPLACE semantic means a peer-side concurrent send within the bootstrap-processing window (seconds to minutes on Tele2 LTE) can still race.
+- A1–A4 security mitigations not in scope.
+- LTE not validated in this smoke — Wi-Fi only.
+- Round 14 / PR #310 / PR #309 not touched.
+
+**Why ship Sprint 2a as its own PR (Vladislav decision 2026-06-15):** Sprint 2a already delivers real user-visible value — the recurring asymmetric `fail_mac action=hold` after fresh clean-state pair (bitten three field tests: 2026-05-30 sealed read receipts + 2026-06-14 WiFi + 2026-06-14 Tele2 LTE) no longer needs a reset button to recover. Waiting for Sprint 2b's pending/active state machine to absorb the race window risks re-bloating into multi-day schema/DAL work and delaying the proven fix. The PR body must be honest about scope: primary fresh-pair asymmetric path fixed, race window explicitly documented as Sprint 2b follow-up, no claim that all crypto desync cases are solved.
+
+**Key commits (LOCAL):** `88e472af` Sprint 1 foundation, `14b8033c` Sprint 2a outbound role guard + smoke PASS.
+
+**Follow-ups:** Sprint 2b pending/active state machine on top of Sprint 2a once Sprint 2a's PR is open / reviewed / merged → Sprint 3 (Fix 2 + A3) → Sprint 4 (Fix 3 + A4) → A5 (separate ticket). PR #310 Round 14 transport stays draft pending the field-evidence LTE retry after Sprint 2a lands on master.
+
 ### 2026-06-14 → 2026-06-15 · RC-CRYPTO-PAIR-X3DH-INIT Track A Council CLOSED + Sprint 1 foundation SHIPPED LOCAL (NOT pushed)
 
 **Goal:** root-cause the recurring asymmetric `fail_mac action=hold` with `sessionExists=true, x3dhInitPresent=false` on peer→Tecno after fresh clean-state pair — bitten three field tests now (2026-05-30 sealed read receipts + 2026-06-14 WiFi attempt + 2026-06-14 Tele2 LTE retry). The crypto-track precedes any move on PR #310 Round 14 transport (which itself ships correctly on real LTE but cannot be validated end-to-end while delivery is silently broken).
