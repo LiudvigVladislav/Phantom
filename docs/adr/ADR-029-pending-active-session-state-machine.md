@@ -193,7 +193,7 @@ Considered at Round 1 + Round 2. Rejected (Round 2 verdict 3:1 against). Sprint 
 
 ## Amendment — Sprint 2b-C runtime wiring (2026-06-15)
 
-Sprint 2b-B landed the storage half of the L3 / L4 / L5 / L6 / L7 contracts above + the in-place dual-write scaffolding that kept the inbound-repair flow functional while the runtime promotion path was not yet wired. Sprint 2b-C wires the runtime: outbound bootstraps land in pending only, outbound within `PENDING_TTL_MS` reuses pending, and inbound active MAC failure tries pending before falling through to inbound repair. This amendment supersedes the Sprint 2b-B "dual-write" half of §L4 success and §L4 P1-1 conflict variant — the wording above remains accurate for the merged 2b-B intermediate, but the runtime now follows the model below.
+Sprint 2b-B landed the storage half of the L3 / L4 / L5 / L6 / L7 contracts above + the in-place dual-write scaffolding that kept the inbound-repair flow functional while the runtime promotion path was not yet wired. Sprint 2b-C wires the runtime: outbound bootstraps land in pending only, outbound within `PENDING_TTL_MS` reuses pending, and inbound active MAC failure tries pending before falling through to inbound repair. The historical 2b-B intermediate is documented in the §L4 "Note on the Sprint 2b-B intermediate dual-write" above; the binding runtime model is the no-dual-write model described below.
 
 ### Outbound — bootstrap writes pending, not active
 
