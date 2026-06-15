@@ -89,6 +89,47 @@ pub struct RelayConfig {
     /// Locked design in `docs/tracks/rc-direct-stability1.md` §10 T2.
     pub slow_post_diag_enabled: bool,
 
+    // ── Round 14 paced padded poll (Trek 2 Round 14) ──────────────────────────
+
+    /// When `true`, the relay emits the padded `/relay/poll` response body
+    /// as 4 chunks of 1152 bytes with 300 ms `tokio::time::sleep` pauses
+    /// between yields, instead of buffering the full 4608-byte response
+    /// and emitting it in one go. Total body shape is preserved
+    /// byte-EXACT 4608 (D15 invariant); only wire-level emission timing
+    /// changes. Default `false`. Set by env var
+    /// `RELAY_POLL_CHUNKED_FLUSH=1` exactly; any other value (including
+    /// `"true"` / `"yes"` / unset) fails closed.
+    ///
+    /// L-GATING-1 — chunked emission fires if and only if ALL THREE
+    /// conditions hold at request time:
+    ///   1. `X-Phantom-Long-Poll: 1` header present
+    ///   2. `X-Phantom-Padded-Poll: 1` header present
+    ///   3. `poll_chunked_flush == true` (this flag)
+    ///
+    /// IMPORTANT: this is STRICTLY narrower than the existing
+    /// `padded_opt_in = long_poll_opt_in || padded_poll_opt_in` OR-gate
+    /// at `rest_fallback.rs`. The legacy OR-gate stays as-is to preserve
+    /// the Stage 1 / 2A / 2B-A wire contract. The new chunked path
+    /// requires the strict AND because emitting a 4608-byte chunked
+    /// body to a client that opted into only ONE of LP/PP would create
+    /// a new client-distinguishable shape (R5 padding invariant
+    /// violation per privacy reviewer 2026-06-14). The two gates serve
+    /// different contracts and MUST NOT be collapsed by a future
+    /// "simplification".
+    ///
+    /// MUTUAL EXCLUSION: `RELAY_POLL_CHUNKED_FLUSH=1` and
+    /// `RELAY_ENABLE_DIAG_SHAPE=1` (the diagnostic octet-stream endpoint
+    /// flag, if introduced) are mutually exclusive in production — the
+    /// relay refuses to start with `std::process::exit(2)` when both are
+    /// set simultaneously. Mixing a paced padded JSON response with the
+    /// diagnostic octet-stream endpoint produces a bi-modal traffic
+    /// fingerprint stronger than either alone. The mutex check happens
+    /// in `RelayConfig::from_env` at startup.
+    ///
+    /// Locked design in `round14-poll-chunked-flush` scope doc
+    /// 2026-06-14 (filed under M2-B field measurement working notes).
+    pub poll_chunked_flush: bool,
+
     // ── Trek 2 Stage 1 long-poll (SHORT-CYCLE-LONGPOLL1) ──────────────────────
 
     /// Server-side hold-time (seconds) for `/relay/poll`. When > 0, an empty
@@ -155,6 +196,10 @@ impl RelayConfig {
             // exercise the handler construct a config with this flipped to
             // `true` rather than relying on the surrounding env.
             slow_post_diag_enabled: false,
+            // Round 14 paced padded poll is off in tests by default; tests that
+            // exercise the chunked path construct a config with this set to
+            // `true`.
+            poll_chunked_flush: false,
             // Trek 2 Stage 1: long-poll hold disabled in tests by default;
             // tests that exercise the hold loop construct a config with
             // this set to a non-zero value (typically 1 s, with
@@ -229,6 +274,11 @@ impl RelayConfig {
             slow_post_diag_enabled: std::env::var("RELAY_ENABLE_SLOW_POST_DIAG")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            // Round 14 paced padded poll: strict `"1"` parse, fails closed
+            // on any other value. Mirrors slow_post_diag gate pattern.
+            // Also enforces M13 mutex against `RELAY_ENABLE_DIAG_SHAPE` at
+            // startup (see `load_round14_poll_chunked_flush_from_env`).
+            poll_chunked_flush: load_round14_poll_chunked_flush_from_env(),
             // Trek 2 Stage 1: long-poll hold-time. Default 0 = short-poll
             // (existing behaviour). Operator opts-in by setting
             // `RELAY_POLL_HOLD_SECS=20` (or similar) in `.env` and restarting
@@ -258,6 +308,46 @@ impl RelayConfig {
             seq_mac_key: Arc::new(load_seq_mac_root_key_from_env()),
         }
     }
+}
+
+/// Round 14 — parse `RELAY_POLL_CHUNKED_FLUSH` env var with strict
+/// `"1"` semantics AND enforce mutual exclusion (M13) against the
+/// `RELAY_ENABLE_DIAG_SHAPE` diagnostic flag.
+///
+/// Strict `"1"` parse: any value other than the literal string `"1"`
+/// (including `"true"` / `"yes"` / empty / unset) evaluates to `false`.
+/// Mirrors `RELAY_ENABLE_SLOW_POST_DIAG` and `RELAY_ENABLE_HEARTBEAT_ECHO`
+/// patterns established at lines 217–231 of this file.
+///
+/// Mutual exclusion: if BOTH `RELAY_POLL_CHUNKED_FLUSH=1` and
+/// `RELAY_ENABLE_DIAG_SHAPE=1` are set in env at startup, the relay
+/// exits with `std::process::exit(2)` and a clear FATAL message.
+/// Rationale: mixing a paced padded JSON response (Round 14) with the
+/// diagnostic octet-stream endpoint produces a bi-modal traffic
+/// fingerprint stronger than either alone (privacy reviewer 2026-06-14
+/// Layer 2 finding). Operators MUST set only one of the two flags.
+///
+/// This implements M13 from the Round 14 scope doc test list as a
+/// startup-validation contract.
+fn load_round14_poll_chunked_flush_from_env() -> bool {
+    let chunked_flush = std::env::var("RELAY_POLL_CHUNKED_FLUSH")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let diag_shape = std::env::var("RELAY_ENABLE_DIAG_SHAPE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if chunked_flush && diag_shape {
+        eprintln!(
+            "FATAL: RELAY_POLL_CHUNKED_FLUSH=1 and RELAY_ENABLE_DIAG_SHAPE=1 \
+             are mutually exclusive in production. Mixing a paced padded \
+             JSON poll response with the diagnostic octet-stream endpoint \
+             produces a bi-modal traffic fingerprint stronger than either \
+             alone. Unset one of these env vars and restart. \
+             (Round 14 M13 startup-validation contract.)"
+        );
+        std::process::exit(2);
+    }
+    chunked_flush
 }
 
 /// Parse and validate the `RELAY_SEQ_MAC_KEY` env var, or panic with a
@@ -294,6 +384,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("media_ttl_secs", &self.media_ttl_secs)
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
             .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)
+            .field("poll_chunked_flush", &self.poll_chunked_flush)
             .field("poll_hold_secs", &self.poll_hold_secs)
             // `seq_mac_key` carries its own `[REDACTED]` Debug impl from
             // `SeqMacRootKey`, but we still elide the wrapping `Arc` here

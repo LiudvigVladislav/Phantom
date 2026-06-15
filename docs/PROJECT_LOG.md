@@ -644,6 +644,26 @@ The gate as designed needs two things to happen concurrently: (a) `publishWithRe
 
 **Durable evidence:** `C:\temp\trek2-stage2b-b-d-integration-smoke-2026-06-15\` carries `findings.md`, `runbook.md`, and the three raw captures (`logs/tecno-lte-C0.log`, `logs/emu.log`, `logs/relay.log`).
 
+### 2026-06-15 · Round 14 paced-padded-poll relay patch rebased onto master post-#309 + integration LTE smoke scoped as Stage 2B-D pre-promotion gate
+
+**Goal:** refresh the Round 14 relay patch (PR #310) on top of the post-#309 master baseline (`2ddb922a` Stage 2B-B client backbone + `38ccc69b` pivot docs + `df34222d` Sprint 2a crypto fix) so the integration smoke can run against the actual three-part bundle that Stage 2B-D promotion gates on.
+
+**What landed:**
+
+1. **Round 14 relay patch (`6780fa6d` Sun 2026-06-14) re-applied as `917d5e98` on top of master `2ddb922a`.** Identical Rust diff (`services/relay/src/{config,main,rest_fallback}.rs` + `services/relay/tests/poll_chunked_flush.rs`); only the parent SHA changed because the branch had to leave its `94ba8d7a` fork point to land on a post-Stage-2B-B base. `cargo test --manifest-path services/relay/Cargo.toml --release --test poll_chunked_flush` produced 11/11 PASS on the rebased state. The unrelated `prekey_endpoints` test isolation flakes that surface in this branch's `cargo test` output are pre-existing on master and out of scope for this rebase.
+2. **Stale durable-trail commit (`3a3909f9` Sun 2026-06-14) dropped.** Its content (the Round 14 LTE field evidence captured 2026-06-14 12:30-12:44 UTC on Tecno BF7-12 + Tele2 LTE) is preserved here in this fresh entry; the original commit conflicted on `docs/PROJECT_LOG.md` and `docs/project/MASTER_TIMELINE_2026.md` against the post-#311 / #312 / #309 layout and could not be replayed without restructuring three unrelated session-journal entries. Re-writing here keeps the LTE evidence accessible without forcing a contrived merge across the four downstream tracks.
+3. **PR #310 branch force-pushed.** `feat/round14-poll-chunked-flush` moves from `6780fa6d` → `917d5e98`; original baseline was `+1` doc commit ahead of `origin` and now is `+1` (the same Round 14 code) on top of current master. The PR #310 body still records the field-validation evidence; this rebase only refreshes the diff so the next field session can run against a build that contains the Stage 2B-B client backbone, the Sprint 2a crypto fix, and the Round 14 chunked-flush patch in one place.
+
+**Round 14 LTE field evidence (preserved from the dropped commit):**
+
+Tele2 LTE on Tecno BF7-12, 2026-06-14 12:30-12:44 UTC. The Round 14 paced-padded-poll patch produced 100+ polls each delivered as 4 × 1152-byte chunks with ~300 ms inter-chunk pauses, totalling the byte-EXACT 4608 D15 contract, followed by `body_eof`. Earlier baseline diagnostics on this carrier class reproduced the byte-budget stall around ~3978 / 4608 bytes; in this run the paced response completed at the full 4608 bytes repeatedly. F2 wire shape closed via M5 unit test + logcat body confirmation. M13 mutex caught a stale `RELAY_ENABLE_DIAG_SHAPE=1` leftover at pre-flight. Rollback verified clean at 12:44:45 UTC. Field findings at `C:\temp\round12-field-measurement-2026-06-14\F1-F2-findings.md`. The PR #310 comment at https://github.com/LiudvigVladislav/Phantom/pull/310#issuecomment-4701800603 carries the same evidence with two hedges (earlier-baseline diagnostics not same-session A/B; M5 covers server-side L-CL-1, logcat confirms 4608 received — not logcat=wire).
+
+**Integration smoke scoped, NOT executed.** The integration LTE smoke that gates PR #310 ready-for-review is the three-part bundle Stage 2B-D promotes against: (i) post-#309 master client APK built with `LONGPOLL_V2_ENABLED == "1"`, (ii) Round 14 relay binary deployed to the production relay with `RELAY_POLL_CHUNKED_FLUSH=1` set in the VPS env, (iii) the Sprint 2a crypto outbound role guard already on master so the `fail_mac action=hold` desync class that contaminated earlier baselines is closed. The integration smoke runbook lives at `C:\temp\trek2-stage2b-b-d-integration-smoke-2026-06-15\runbook.md` (durable trail outside the repo until the smoke runs against real VPS deployment).
+
+**Key commits:** `917d5e98` Round 14 relay patch on rebased Round 14 branch (PR #310 force-pushed).
+
+**Follow-ups:** integration LTE smoke per the runbook → if PASS, PR #310 ready-for-review + Stage 2B-D promotion proceeds → if FAIL, root-cause per the runbook's three-part attribution matrix.
+
 ### 2026-06-15 · RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a outbound role guard SHIPPED on branch (PR #311) + field smoke PASS on Vladislav setup
 
 **Goal:** ship the smallest behavioural fix that closes H1 from the Sprint 1 foundation (`88e472af`), validate on Vladislav's real two-device pair under Wi-Fi, and open a draft PR — without expanding scope into the Sprint 2b pending/active state machine that would require schema work.
