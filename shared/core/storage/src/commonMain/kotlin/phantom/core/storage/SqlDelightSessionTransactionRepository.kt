@@ -42,11 +42,27 @@ class SqlDelightSessionTransactionRepository(
                 .executeAsOneOrNull()
             if (reservation == null) {
                 // The reservation we set in L4 phase 1 has been
-                // released between then and now. Drop the candidate
-                // state; the caller treats this as a soft failure
-                // and falls through to the existing hold path. The
-                // active ratchet_state row is byte-identical to its
-                // pre-call content.
+                // released between then and now (e.g. an L7 cap
+                // eviction or L6 sweep raced with this callback).
+                // Drop the candidate from the pending slot; return
+                // false to the caller.
+                //
+                // PR #316 review P2-1 (2026-06-15): we do NOT touch
+                // `ratchet_state` at all on either branch of this
+                // transaction. Under the current Sprint 2b-B DMS:2569
+                // wiring the caller has ALREADY written the advanced
+                // state to `ratchet_state` via `saveSession` BEFORE
+                // invoking `commitBootstrap`, so a false return here
+                // leaves the active row holding whatever `saveSession`
+                // wrote — typically the advanced state. The DMS
+                // caller logs `inbound_repair_commit_skip` and still
+                // emits `inbound_repair_ok`; the decrypted plaintext
+                // is returned to the user. The only observable effect
+                // of false is that Sprint 2b-C will not find a
+                // pending row for this conversation until the next
+                // inbound envelope re-derives. See
+                // [SessionTransactionRepository.commitBootstrap] KDoc
+                // for the binding contract.
                 return@transactionWithResult false
             }
             // L4 reserves and pending UPSERT share the same

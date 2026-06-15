@@ -34,11 +34,9 @@ data class OpkReservation(
  * Outcome of [OpkReservationRepository.reserve].
  *
  * `INSERT OR IGNORE` semantics: an existing reservation for the same
- * `opk_key_id_hex` (e.g. a crash-recovered mid-derive carcass that
- * the L6 startup sweep happened to leave in place because the
- * threshold had not yet elapsed) causes the insert to no-op. The
- * caller distinguishes the two outcomes for diagnostics — both
- * outcomes mean "the reservation is now in place; safe to derive."
+ * `opk_key_id_hex` causes the insert to no-op. The two outcomes
+ * carry DIFFERENT obligations for the caller — see
+ * [AlreadyReserved] below.
  */
 sealed class ReservationOutcome {
     /** A fresh reservation row was created. The common case. */
@@ -46,8 +44,45 @@ sealed class ReservationOutcome {
 
     /**
      * A reservation already existed for this `opk_key_id_hex`. The
-     * insert was a no-op; the existing row is returned for log
-     * correlation.
+     * insert was a no-op; the existing row is returned so the caller
+     * can inspect the OWNER.
+     *
+     * **Owner-check obligation (PR #316 review P1-1 — 2026-06-15).**
+     * Receiving [AlreadyReserved] is NOT a generic "safe to derive"
+     * signal. The caller MUST compare [existing]'s
+     * `(conversationId, envelopeId)` against its own intended
+     * derivation's `(conversationId, envelopeId)`:
+     *
+     *  - **Match** — this is an idempotent retry of the caller's own
+     *    prior derivation that crashed after L4 phase 1 but before
+     *    L4 phase 3 (commit / release). Safe to proceed; the caller
+     *    will eventually commit / release for the eventual outcome
+     *    of THIS attempt.
+     *
+     *  - **Mismatch** — some OTHER in-flight inbound bootstrap
+     *    derivation owns this reservation. Proceeding would let the
+     *    caller upsert a `pending_ratchet_state` row pointing at a
+     *    reservation that belongs to a different conversation; the
+     *    L6 join + L7 cap LRU accounting would then both silently
+     *    corrupt. The caller MUST throw
+     *    [phantom.core.messaging.SessionBootstrapException.OpkReservationConflict]
+     *    (or its layer's equivalent) and MUST NOT call [release] in
+     *    the resulting failure branch — releasing would delete a
+     *    reservation that belongs to the other derivation.
+     *
+     * Production callers of this contract:
+     *  - `phantom.core.messaging.SessionManager.recipientBootstrapInMemory`
+     *    implements the owner-check + conflict throw; cell
+     *    `recipientBootstrapInMemory_onConflictingReservation_throwsAndPreservesExistingOwner`
+     *    in `Sprint2bBMessagingTest` pins it.
+     *  - `phantom.core.messaging.DefaultMessagingService.handleDeliver`
+     *    at the L4 phase 3 failure branch matches on
+     *    `OpkReservationConflict` and SKIPS the release.
+     *
+     * Crash-recovered mid-derive carcasses left behind the L6 sweep
+     * threshold are also covered by the match case: they were
+     * written by the same `(conversation_id, envelope_id)` retry
+     * that is now firing.
      */
     data class AlreadyReserved(val existing: OpkReservation) : ReservationOutcome()
 }
