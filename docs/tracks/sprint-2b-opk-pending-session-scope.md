@@ -125,15 +125,32 @@ The `opk_reservation` table schema:
 CREATE TABLE opk_reservation (
     opk_key_id_hex  TEXT NOT NULL PRIMARY KEY,
     envelope_id     TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
     reserved_at_ms  INTEGER NOT NULL
 );
 ```
 
-A new `OpkReservationRepository` interface in `shared/core/storage` exposes `reserve(opk_key_id_hex, envelope_id, now_ms): ReservationOutcome` (returns `Created` or `AlreadyReserved`), `release(opk_key_id_hex)`, `getAll(): List<OpkReservation>`, and `deleteStaleOlderThan(threshold_ms)`. The `recipientBootstrapInMemory` flow calls `reserve` first; the commit path calls neither `release` nor `deleteByKeyId` — the cross-table transaction in L4 deletes both rows atomically.
+`conversation_id` is added (relative to the Round 2 sketch) to give L6's startup sweep a deterministic join to `pending_ratchet_state.conversation_id` — see L6 for why this is needed under the amended deferred-consume L4.
 
-### L6 — Reservation TTL + startup recovery sweep
+A new `OpkReservationRepository` interface in `shared/core/storage` exposes:
+- `reserve(opk_key_id_hex, envelope_id, conversation_id, now_ms): ReservationOutcome` (returns `Created` or `AlreadyReserved`)
+- `release(opk_key_id_hex)`
+- `getAll(): List<OpkReservation>`
+- `sweepOrphanReservations(thresholdMs): Int` (the L6 sweep operation — replaces the Round 2 `deleteStaleOlderThan`; see L6 for the precise semantics)
 
-Reservations have a 5-minute TTL. On process startup, `AppContainer` calls `OpkReservationRepository.deleteStaleOlderThan(now_ms - 5 * 60 * 1000)` BEFORE any inbound handler can fire. Stale reservations are silently swept; their OPK rows remain available (they were never deleted in the failure path; if the process crashed mid-derive after reserve but before commit, the reservation is stale by definition). 5 minutes is well above the expected derivation latency (<1s) and well below any reasonable user-facing reconnect cadence.
+The `recipientBootstrapInMemory` flow calls `reserve` first. The L4 success path leaves the reservation in place (per amended L4 — OPK consumption is deferred to pending→active promotion in Sprint 2b-C). The L4 failure path calls `release(opk_key_id_hex)`; the `local_one_time_pre_key` row is preserved. The L7 cap-8 eviction path calls `release(opk_key_id_hex)` for the evicted candidate and deletes the corresponding `pending_ratchet_state` row in the same transaction; the OPK row is preserved. The Sprint 2b-C promotion transaction is the SOLE site that DELETES the `local_one_time_pre_key` row and the `opk_reservation` row atomically — see M-2bC-4.
+
+### L6 — Reservation TTL + pending-coordinated startup recovery sweep
+
+Reservations have a 5-minute TTL. On process startup, `AppContainer` calls `OpkReservationRepository.sweepOrphanReservations(thresholdMs = now_ms - 5 * 60 * 1000)` BEFORE any inbound handler can fire. Under the amended L4 deferred-consume model, a reservation can be in one of two live states: (a) **mid-derive** — reservation row exists, no corresponding `pending_ratchet_state` row yet (the derivation hasn't completed); (b) **pending-awaiting-promotion** — reservation row exists AND a `pending_ratchet_state` row exists for the same `conversation_id`. Only state (a), if it persists past 5 minutes, is a crash carcass; state (b) is a legitimate pending candidate that should not be touched by the sweep.
+
+`sweepOrphanReservations` MUST therefore implement the join-based semantics:
+
+> For each `opk_reservation` row where `reserved_at_ms < thresholdMs`, check whether a `pending_ratchet_state` row exists with the same `conversation_id`. If NO matching pending row exists, the reservation is an orphan (state (a) mid-derive crash carcass); DELETE the reservation row only. The corresponding `local_one_time_pre_key` row is preserved (the OPK was never consumed). If a matching pending row exists, the reservation is part of a live pending candidate (state (b)) and MUST be skipped — eviction of stale pending candidates is the cap-8 LRU's responsibility (L7), not the startup sweep's.
+
+The pre-amendment L6 used a blunt `deleteStaleOlderThan(now_ms - 5 * 60 * 1000)` that did not distinguish between the two states. Under the old L4 (which deleted reservations at success), every alive reservation was guaranteed mid-derive, so the blunt sweep was safe. Under the amended L4, the blunt sweep would orphan pending rows (whose reservations got swept) and could leave the local OPK pool out of sync with what the in-memory pending state expects. The join-based semantics close this gap.
+
+5 minutes is well above the expected derivation latency (<1s) and well below any reasonable user-facing reconnect cadence. The pending TTL is a separate concept handled by the Sprint 2b-C runtime path (LRU cap-8 eviction in L7); it does NOT inherit the 5-minute reservation TTL. Cell M-2bB-8 pins the join-based sweep contract (added in this amendment — asserts the sweep skips reservations whose conversation_id has a matching pending row, regardless of reservation age).
 
 ### L7 — `PENDING_SESSION_CANDIDATE_CAP = 8` with LRU eviction (defense-in-depth)
 
@@ -172,7 +189,7 @@ Three PRs, each individually green at the local sweep level, each independently 
 
 **Code surface:**
 - `shared/core/transport/src/commonMain/kotlin/phantom/core/transport/PreKeyApiClient.kt` — `publishBundle` signature change to factory-lambda; `publishWithRetry` invokes the factory on each attempt; logging at `prekey_publish_start` shows attempt-specific `opks=N` reflecting the fresh snapshot.
-- `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/PreKeyLifecycleService.kt` — `publishBundle` helper takes `opksProvider: suspend () -> List<LocalOneTimePreKeyEntity>`; all four call sites (`bootstrapForNewIdentity`, `maybeReplenishOneTimePreKeys`, `verifyBundleOnRelay`, `maybeRotateSignedPreKey`) pass `{ oneTimePreKeyRepository.getAll() }` (or `{ generated_opks }` for the bootstrap case where the snapshot is point-in-time-of-call by definition).
+- `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/PreKeyLifecycleService.kt` — `publishBundle` helper takes `opksProvider: suspend () -> List<LocalOneTimePreKeyEntity>`; all four call sites (`bootstrapForNewIdentity`, `maybeReplenishOneTimePreKeys`, `verifyBundleOnRelay`, `maybeRotateSignedPreKey`) pass `{ oneTimePreKeyRepository.getAll() }`. No bootstrap-path exception is allowed (per L1).
 - `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt:2569` — decrypt-existing-first early-return: attempt `ratchet.decrypt(existingState, encrypted)` first; on success, save advanced state + mark envelope processed + return without entering `recipientBootstrapInMemory`; on failure, fall through to the existing PR #249 inbound X3DH repair path unchanged.
 
 **Tests (commonTest):**
@@ -199,7 +216,7 @@ Three PRs, each individually green at the local sweep level, each independently 
 - `shared/core/storage/src/commonMain/kotlin/phantom/core/storage/PendingRatchetStateRepository.kt` (new interface) + `SqlDelightPendingRatchetStateRepository.kt` (new impl) — reuses `PrivateKeyStorageCodec` + `IdentityCipher` (Keystore alias `phantom_ratchet_wrap_v1`)
 - `shared/core/storage/src/commonMain/kotlin/phantom/core/storage/SessionTransactionRepository.kt` (new interface) — exposes `commitBootstrap(opkKeyIdHex, conversationId, stateBlob): Boolean` which runs the L4 phase-3 cross-table transaction atomically
 - `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/SessionManager.kt:317-419` — `recipientBootstrapInMemory` rewires to L4's three-phase protocol; the eager delete at line 357 is replaced with `opkReservationRepository.reserve(opkId, envelopeId, now())`; the caller in `DefaultMessagingService:2569` now calls `sessionTransactionRepository.commitBootstrap` on success and `opkReservationRepository.release` on failure
-- `apps/android/src/androidMain/kotlin/phantom/android/di/AppContainer.kt` — wires the three new repositories; the startup recovery sweep (per L6) runs `opkReservationRepository.deleteStaleOlderThan(now - 5 * 60 * 1000)` in `init { ... }` before messaging starts
+- `apps/android/src/androidMain/kotlin/phantom/android/di/AppContainer.kt` — wires the three new repositories; the startup recovery sweep (per L6) runs `opkReservationRepository.sweepOrphanReservations(thresholdMs = now - 5 * 60 * 1000)` in `init { ... }` before messaging starts. The sweep implementation joins on `pending_ratchet_state.conversation_id` and only deletes reservations whose conversation has NO matching pending row
 - `AppContainer` also wires the L7 cap-8 eviction: a `PendingSessionCapEnforcer` (new class in `shared/core/messaging`) checks the cap on each successful `commitBootstrap`; on overflow, the oldest pending row + its reservation are transactionally rolled back
 
 **Tests (commonTest):**
@@ -210,6 +227,7 @@ Three PRs, each individually green at the local sweep level, each independently 
 - **M-2bB-5** `commitBootstrap_atomicallyUpsertsPendingAndPreservesOpkAndReservation` — successful candidate-decrypt + UPSERT of `pending_ratchet_state` row land in a single transaction; `opk_reservation` row is PRESERVED (not deleted at decrypt success per amended L4); `local_one_time_pre_key` row is PRESERVED.
 - **M-2bB-6** `pendingSessionCapEnforcer_evictsOldestOnOverflow_releasesReservationPreservesOpk` — after 9 reserves, the oldest pending row + its reservation are evicted; the associated `local_one_time_pre_key` row is preserved (OPK returns to pool because L4 never consumed it). The amended L7 invariant.
 - **M-2bB-7** `pendingSessionCapEnforcer_evictionRollsBackReservationOnly` — `opkReservationRepo.has(evictedOpkId) == false` AND `opkRepo.has(evictedOpkId) == true` post-eviction (asserts the reservation is released but the OPK survives because it was never consumed).
+- **M-2bB-8** `sweepOrphanReservations_skipsReservationsWithMatchingPendingRow` — given two reservations both with `reserved_at_ms < threshold`, where one has a matching `pending_ratchet_state` row (state (b) live pending) and the other does NOT (state (a) mid-derive orphan), the sweep deletes ONLY the orphan. The matching-pending reservation is preserved regardless of its age. The amended L6 join contract.
 
 **Instrumented tests (androidInstrumentedTest):**
 - Schema migration test asserting fresh installs + upgrade installs land at the same schema version.
