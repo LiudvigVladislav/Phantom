@@ -432,13 +432,43 @@ class SessionManager(
                 conversationId = conversationId,
                 nowMs = nowMsProvider(),
             )
-            // ReservationOutcome.AlreadyReserved is treated as a no-op
-            // success here — the existing reservation came from this
-            // same caller on a previous derivation attempt (idempotent
-            // retry). The caller will still issue its own commit /
-            // release for the eventual outcome.
-            @Suppress("UNUSED_VARIABLE")
-            val reservationOutcome = outcome
+            // PR #316 review P1-1 (2026-06-15): owner-check the
+            // ReservationOutcome.AlreadyReserved branch. INSERT OR
+            // IGNORE returns AlreadyReserved both for our own retry
+            // (same opkId + same conversationId + same envelopeId —
+            // idempotent) AND for the rare race where some OTHER
+            // inbound bootstrap derivation reserved the same
+            // opk_key_id_hex first. Proceeding into the X3DH derive in
+            // the second case would let this caller upsert a pending
+            // row pointing to a reservation that belongs to a
+            // different conversation; the L6 join + L7 cap LRU
+            // accounting would then both be silently corrupted (one
+            // pending without a matching reservation; one reservation
+            // pointing at the wrong conversation_id). Reject the
+            // mismatch by throwing
+            // [SessionBootstrapException.OpkReservationConflict]; the
+            // caller MUST NOT release in the failure branch — that
+            // reservation belongs to the other derivation.
+            if (outcome is ReservationOutcome.AlreadyReserved) {
+                val existing = outcome.existing
+                if (existing.conversationId != conversationId ||
+                    existing.envelopeId != envelopeId
+                ) {
+                    throw SessionBootstrapException.OpkReservationConflict(
+                        opkKeyIdHex = opkId,
+                        attemptedConversationId = conversationId,
+                        attemptedEnvelopeId = envelopeId,
+                        ownerConversationId = existing.conversationId,
+                        ownerEnvelopeId = existing.envelopeId,
+                    )
+                }
+                // Same owner + same envelope -> idempotent retry of
+                // our own prior derivation that crashed after the
+                // L4 phase 1 reserve but before the caller's commit /
+                // release. Safe to proceed; the caller will eventually
+                // commit / release for the eventual outcome of THIS
+                // attempt.
+            }
             DhKeyPair(
                 publicKey = DhPublicKey(opk.publicKeyHex.hexToByteArray()),
                 privateKey = DhPrivateKey(opk.privateKeyHex.hexToByteArray()),
@@ -674,4 +704,37 @@ sealed class SessionBootstrapException(message: String) : Exception(message) {
      */
     class MalformedBundle(detail: String) :
         SessionBootstrapException("malformed bundle: $detail")
+
+    /**
+     * Sprint 2b-B L4: the OPK id the peer referenced is already
+     * reserved by a DIFFERENT conversation / envelope. The reservation
+     * row in `opk_reservation` was created by some other in-flight
+     * inbound bootstrap derivation; consuming this OPK now would
+     * compromise both reservations + corrupt the L6 join semantics +
+     * the L7 cap LRU accounting.
+     *
+     * Diagnostic semantics: this is a tiny window — the reservation
+     * needs to land between this caller's bundle fetch and the local
+     * `recipientBootstrapInMemory` derivation, AND the peer needs to
+     * reference an OPK that some other peer has just bootstrapped
+     * against. Realistically only happens under deliberate attack
+     * (an attacker fetched our bundle, derived a session, then a
+     * relay-delivery race put a forged `x3dhInit` with the same OPK
+     * id in our queue ahead of the legitimate one) or extreme
+     * concurrency. The caller MUST NOT release the reservation in
+     * the failure branch — the reservation belongs to the other
+     * derivation, releasing it would compromise that flow.
+     */
+    class OpkReservationConflict(
+        val opkKeyIdHex: String,
+        val attemptedConversationId: String,
+        val attemptedEnvelopeId: String,
+        val ownerConversationId: String,
+        val ownerEnvelopeId: String,
+    ) : SessionBootstrapException(
+        "OPK reservation conflict on opk_key_id_hex=${opkKeyIdHex.take(16)}...: " +
+            "attempted by conv=${attemptedConversationId.take(8)}/" +
+            "env=${attemptedEnvelopeId.take(8)} but owned by " +
+            "conv=${ownerConversationId.take(8)}/env=${ownerEnvelopeId.take(8)}",
+    )
 }

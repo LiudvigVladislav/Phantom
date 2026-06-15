@@ -174,6 +174,87 @@ class Sprint2bBMessagingTest {
                 "deferred to Sprint 2b-C promotion under the amended L4 contract.")
     }
 
+    // ── M-2bB-3 conflict branch (PR #316 review P1-1) ────────────────────────
+    //
+    // INSERT OR IGNORE on a reservation row that already exists with a
+    // DIFFERENT (conversationId, envelopeId) owner is REJECTED at L4
+    // phase 1 with SessionBootstrapException.OpkReservationConflict.
+    // The caller MUST NOT release the reservation in the failure
+    // branch — the reservation belongs to the other in-flight
+    // derivation. This test pins both the throw and the no-release
+    // invariant; the DMS:2569 failure-branch skip-release wiring is
+    // covered separately by the manual code review of the `if (err
+    // !is OpkReservationConflict)` guard.
+
+    @Test
+    fun recipientBootstrapInMemory_onConflictingReservation_throwsAndPreservesExistingOwner() = runTest {
+        LibsodiumInitializer.initialize()
+        val real = LibsodiumX3DH()
+        val (opkResRepo, _) = newSprint2bBFakePair()
+        val opkIdHex = "11".repeat(16)
+        val opkRepo = InMemoryOneTimePreKeyRepoForTest()
+
+        // Pre-seed a reservation owned by conv-OTHER / env-OTHER.
+        opkResRepo.reserve(
+            opkKeyIdHex = opkIdHex,
+            envelopeId = "env-OTHER",
+            conversationId = "conv-OTHER",
+            nowMs = 500L,
+        )
+        val ownerReservation = opkResRepo.get(opkIdHex)
+        assertNotNull(ownerReservation)
+        assertEquals("conv-OTHER", ownerReservation!!.conversationId)
+        assertEquals("env-OTHER", ownerReservation.envelopeId)
+
+        // Build a rig where the THIS caller will reserve under conv /
+        // env attribution that mismatches the pre-seeded reservation.
+        val (bobMgr, _, bobX25519, aliceX25519, initResult) = buildBootstrapRig(
+            real = real,
+            opkResRepo = opkResRepo,
+            opkRepo = opkRepo,
+            bobOpkIdHex = opkIdHex,
+            reservedAtMs = 1_000L,
+        )
+
+        // L4 phase 1 detects the mismatched owner and throws.
+        var thrown: SessionBootstrapException.OpkReservationConflict? = null
+        try {
+            bobMgr.recipientBootstrapInMemory(
+                conversationId = "conv-THIS",
+                envelopeId = "env-THIS",
+                localIdentityKeyPair = bobX25519,
+                senderIdentityPublicKeyHex = aliceX25519.publicKey.bytes.toHexStringLower(),
+                x3dhInit = initResult.x3dhInit,
+            )
+        } catch (e: SessionBootstrapException.OpkReservationConflict) {
+            thrown = e
+        }
+        assertNotNull(thrown,
+            "M-2bB-3 conflict: recipientBootstrapInMemory MUST throw " +
+                "OpkReservationConflict when AlreadyReserved owner mismatches.")
+        assertEquals(opkIdHex, thrown!!.opkKeyIdHex)
+        assertEquals("conv-OTHER", thrown.ownerConversationId)
+        assertEquals("env-OTHER", thrown.ownerEnvelopeId)
+        assertEquals("conv-THIS", thrown.attemptedConversationId)
+        assertEquals("env-THIS", thrown.attemptedEnvelopeId)
+
+        // The pre-existing reservation is UNCHANGED — INSERT OR IGNORE
+        // semantics + the throw before any further work.
+        val afterReservation = opkResRepo.get(opkIdHex)
+        assertNotNull(afterReservation,
+            "M-2bB-3 conflict: the existing reservation MUST be preserved.")
+        assertEquals(
+            "conv-OTHER", afterReservation!!.conversationId,
+            "M-2bB-3 conflict: the existing reservation owner MUST be preserved.",
+        )
+        assertEquals("env-OTHER", afterReservation.envelopeId)
+        assertEquals(500L, afterReservation.reservedAtMs)
+
+        // OPK row preserved.
+        assertTrue(opkRepo.has(opkIdHex),
+            "M-2bB-3 conflict: local OPK row preserved (no eager delete + no release).")
+    }
+
     // ── M-2bB-4 ───────────────────────────────────────────────────────────────
     //
     // Mid-derive process crash: reservation written, then "crash" (we
@@ -241,7 +322,7 @@ class Sprint2bBMessagingTest {
         val sessionTx = FakeSessionTransactionRepository(opkResRepo, pendingRepo)
         val enforcer = PendingSessionCapEnforcer(
             pendingRatchetStateRepository = pendingRepo,
-            opkReservationRepository = opkResRepo,
+            sessionTransactionRepository = sessionTx,
         )
 
         // Fill 9 conversations: each reserves its own OPK + commits a
@@ -290,7 +371,7 @@ class Sprint2bBMessagingTest {
         val sessionTx = FakeSessionTransactionRepository(opkResRepo, pendingRepo)
         val enforcer = PendingSessionCapEnforcer(
             pendingRatchetStateRepository = pendingRepo,
-            opkReservationRepository = opkResRepo,
+            sessionTransactionRepository = sessionTx,
         )
         val opkRepo = InMemoryOneTimePreKeyRepoForTest()
 
@@ -555,6 +636,18 @@ class Sprint2bBMessagingTest {
                 bootstrapArtifactsBlob = bootstrapArtifactsBlob,
             )
             return true
+        }
+
+        override suspend fun evictPendingCandidate(conversationId: String) {
+            // Production runs both operations in a single SQLDelight
+            // transaction. The fake serialises them — sufficient for
+            // contract testing because nothing else races the in-memory
+            // store inside the test coroutine.
+            val reservation = opkResRepo.getByConversationId(conversationId)
+            if (reservation != null) {
+                opkResRepo.release(reservation.opkKeyIdHex)
+            }
+            pendingRepo.delete(conversationId)
         }
     }
 

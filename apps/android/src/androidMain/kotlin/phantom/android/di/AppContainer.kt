@@ -1058,7 +1058,7 @@ class AppContainer(private val context: Context) {
         // L4 protocol uses, so eviction is observable through them.
         val pendingSessionCapEnforcer = PendingSessionCapEnforcer(
             pendingRatchetStateRepository = pendingRatchetStateRepo,
-            opkReservationRepository = opkReservationRepo,
+            sessionTransactionRepository = sessionTransactionRepo,
         )
         // PR C commit 11: DMS gains the prekey REST client (for the
         // first-message bundle-fetch path) plus a signing-key provider

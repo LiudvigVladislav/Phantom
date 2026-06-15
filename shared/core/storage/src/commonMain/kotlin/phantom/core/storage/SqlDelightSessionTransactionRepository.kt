@@ -63,4 +63,21 @@ class SqlDelightSessionTransactionRepository(
             true
         }
     }
+
+    override suspend fun evictPendingCandidate(conversationId: String): Unit =
+        withContext(Dispatchers.IO) {
+            // Single SQLDelight transaction so a crash between the
+            // reservation release and the pending row delete cannot
+            // leave a pending row without its companion reservation.
+            // PR #316 review P1-2 (2026-06-15).
+            db.transaction {
+                val reservation = db.opkReservationQueries
+                    .getByConversationId(conversationId)
+                    .executeAsOneOrNull()
+                if (reservation != null) {
+                    db.opkReservationQueries.release(reservation.opk_key_id_hex)
+                }
+                db.pendingRatchetStateQueries.deleteByConversationId(conversationId)
+            }
+        }
 }

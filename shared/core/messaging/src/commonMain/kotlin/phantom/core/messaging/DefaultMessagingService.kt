@@ -2557,10 +2557,34 @@ class DefaultMessagingService(
                             //       handleDeliver routes it through the same payload
                             //       handlers and the eventual ack happens via that
                             //       normal flow.
-                            //   (5) OPK is eagerly consumed inside
-                            //       recipientBootstrapInMemory (explicit commit-1
-                            //       decision matching recipientBootstrap behaviour;
-                            //       see SessionManager KDoc).
+                            //   (5) OPK lifecycle (Sprint 2b-B L4 amendment,
+                            //       2026-06-15): the OPK is RESERVED inside
+                            //       recipientBootstrapInMemory via
+                            //       OpkReservationRepository.reserve, NOT
+                            //       deleted. The local_one_time_pre_key row
+                            //       is preserved through this whole inbound-
+                            //       repair flow; OPK consumption is deferred
+                            //       to Sprint 2b-C pending->active promotion
+                            //       (the SOLE atomic cross-table site where
+                            //       local_one_time_pre_key + opk_reservation
+                            //       + pending_ratchet_state rows are deleted
+                            //       alongside the active ratchet_state
+                            //       replace). The Sprint 2b-B success path
+                            //       below dual-writes: saveSession to active
+                            //       (decrypt continuity until 2b-C lands) +
+                            //       SessionTransactionRepository.commitBootstrap
+                            //       to pending (the seed 2b-C will promote).
+                            //       The failure path calls
+                            //       OpkReservationRepository.release UNLESS
+                            //       the failure was an
+                            //       OpkReservationConflict (the reservation
+                            //       belongs to a different in-flight
+                            //       derivation). The pre-Sprint-2b-B
+                            //       implementation note "OPK is eagerly
+                            //       consumed inside recipientBootstrapInMemory
+                            //       (matching recipientBootstrap behaviour)"
+                            //       is now wrong on both halves and has been
+                            //       removed.
                             //   (6) NOT gated on holdMacFailures. This is successful
                             //       crypto recovery — not a destructive-ack-vs-hold
                             //       choice — so it fires in BOTH debug AND release
@@ -2758,8 +2782,20 @@ class DefaultMessagingService(
                                     // BEFORE reaching the reserve call (e.g.
                                     // `SpkNotFound`), so the catch-all
                                     // failure path here is safe.
-                                    inboundX3dhInit.opkKeyIdHex?.let { opkId ->
-                                        opkReservationRepository.release(opkId)
+                                    //
+                                    // PR #316 review P1-1 (2026-06-15):
+                                    // CRITICAL — on
+                                    // [SessionBootstrapException.OpkReservationConflict]
+                                    // the reservation we tried to make
+                                    // BELONGS TO A DIFFERENT
+                                    // conversation/envelope; releasing it
+                                    // here would compromise the other
+                                    // in-flight derivation. Skip release
+                                    // in that case.
+                                    if (err !is phantom.core.messaging.SessionBootstrapException.OpkReservationConflict) {
+                                        inboundX3dhInit.opkKeyIdHex?.let { opkId ->
+                                            opkReservationRepository.release(opkId)
+                                        }
                                     }
                                     // INTENTIONAL fall-through to the existing
                                     // hold branch below. The candidate state

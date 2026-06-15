@@ -372,4 +372,16 @@ internal class FakeSessionTransactionRepository(
         )
         return true
     }
+
+    override suspend fun evictPendingCandidate(conversationId: String) {
+        // Production runs both operations in a single SQLDelight
+        // transaction. The fake serialises them — sufficient for
+        // contract testing because nothing else races the in-memory
+        // store inside the test coroutine.
+        val reservation = opkResRepo.getByConversationId(conversationId)
+        if (reservation != null) {
+            opkResRepo.release(reservation.opkKeyIdHex)
+        }
+        pendingRepo.delete(conversationId)
+    }
 }

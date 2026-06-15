@@ -3,8 +3,8 @@
 
 package phantom.core.messaging
 
-import phantom.core.storage.OpkReservationRepository
 import phantom.core.storage.PendingRatchetStateRepository
+import phantom.core.storage.SessionTransactionRepository
 
 /**
  * Sprint 2b-B L7 — caps the number of in-flight pending session
@@ -37,7 +37,7 @@ import phantom.core.storage.PendingRatchetStateRepository
  */
 class PendingSessionCapEnforcer(
     private val pendingRatchetStateRepository: PendingRatchetStateRepository,
-    private val opkReservationRepository: OpkReservationRepository,
+    private val sessionTransactionRepository: SessionTransactionRepository,
 ) {
 
     /**
@@ -47,33 +47,30 @@ class PendingSessionCapEnforcer(
      *  - Counts pending rows; if `count <= PENDING_SESSION_CANDIDATE_CAP`
      *    returns 0 (the common case).
      *  - On overflow, walks the LRU until the count is at or under the
-     *    cap, evicting one pending row per iteration. Each eviction:
-     *      - Resolves the `opk_reservation` row that backs the evicted
-     *        pending candidate via [OpkReservationRepository.getByConversationId].
-     *      - Releases the reservation. The `local_one_time_pre_key`
-     *        row is preserved (the OPK was never consumed because L4
-     *        defers consumption to promotion).
-     *      - Deletes the pending row via
-     *        [PendingRatchetStateRepository.delete].
+     *    cap, evicting one pending row per iteration via
+     *    [SessionTransactionRepository.evictPendingCandidate] — a
+     *    single SQLDelight cross-table transaction that releases the
+     *    `opk_reservation` row + deletes the `pending_ratchet_state`
+     *    row atomically. The `local_one_time_pre_key` row is preserved
+     *    in the same transaction (the OPK returns to the pool because
+     *    L4 defers consumption to Sprint 2b-C promotion).
      *
      * Returns the number of pending rows evicted in this call.
+     *
+     * PR #316 review P1-2 (2026-06-15): the pre-fix shape made two
+     * independent repository calls (release reservation, then delete
+     * pending). A crash between them could leave a pending row
+     * whose reservation had already been released — silently
+     * orphaned because the L6 sweep's join semantics treat the
+     * pending row as live. The atomic
+     * [SessionTransactionRepository.evictPendingCandidate] closes
+     * this gap.
      */
     suspend fun enforce(): Int {
         var evicted = 0
         while (pendingRatchetStateRepository.count() > PENDING_SESSION_CANDIDATE_CAP) {
             val oldest = pendingRatchetStateRepository.getOldestConversationId() ?: break
-            // Resolve and release the matching reservation BEFORE
-            // deleting the pending row. Order is intentional: a
-            // concurrent L6 sweep would skip this reservation while
-            // the pending row still exists (the L6 join semantics);
-            // releasing first widens the no-op window for that sweep
-            // by an immeasurable amount. Either order is correct under
-            // the L4 deferred-consume contract.
-            val reservation = opkReservationRepository.getByConversationId(oldest.conversationId)
-            if (reservation != null) {
-                opkReservationRepository.release(reservation.opkKeyIdHex)
-            }
-            pendingRatchetStateRepository.delete(oldest.conversationId)
+            sessionTransactionRepository.evictPendingCandidate(oldest.conversationId)
             evicted++
         }
         return evicted
