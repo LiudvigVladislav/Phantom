@@ -96,8 +96,15 @@ class PreKeyLifecycleService(
             "PREKEY_TRACE bootstrap_start identity=$identityTag…",
         )
         val spkEntity = generateAndPersistSpk(signing)
-        val opks = generateAndPersistOpks(REFILL_BATCH_SIZE, replaceExisting = true)
-        publishBundle(identity.publicKeyHex, signing, spkEntity, opks)
+        generateAndPersistOpks(REFILL_BATCH_SIZE, replaceExisting = true)
+        // Sprint 2b L1: even on the bootstrap path, the publish helper
+        // re-snapshots the OPK pool from the DB on every retry attempt —
+        // no closure over the freshly-generated `opks` list. If a
+        // concurrent inbound bootstrap consumes one of these OPKs locally
+        // between publish attempts, the retry sends the up-to-date pool,
+        // never the stale 40-OPK snapshot. The scope-lock rejects a
+        // bootstrap-path exception (see L1 + M-2bA-5).
+        publishBundle(identity.publicKeyHex, signing, spkEntity) { oneTimePreKeyRepository.getAll() }
         messagingLog(
             MessagingLogLevel.INFO,
             "PREKEY_TRACE bootstrap_done identity=$identityTag…",
@@ -176,8 +183,12 @@ class PreKeyLifecycleService(
             MessagingLogLevel.WARN,
             "PREKEY_TRACE verify_republish_triggered identity=$identityTag… — relay has no record",
         )
-        val allOpks = oneTimePreKeyRepository.getAll()
-        publishBundle(identity.publicKeyHex, signing, spkEntity, allOpks)
+        // Sprint 2b L1: factory lambda — every retry re-reads the OPK
+        // pool from the DB. This second call site (Round 2 security
+        // Blocker 1 / D-R2-2) shares the same publish-snapshot
+        // consistency contract as the bootstrap / replenish / rotate
+        // sites.
+        publishBundle(identity.publicKeyHex, signing, spkEntity) { oneTimePreKeyRepository.getAll() }
         true
     }
 
@@ -207,8 +218,10 @@ class PreKeyLifecycleService(
         // Republish the FULL pool. The relay's POST /prekeys/publish
         // replaces its OPK list wholesale, so we have to ship every
         // local OPK we still hold (after the new ones were added).
-        val allLocal = oneTimePreKeyRepository.getAll()
-        publishBundle(identity.publicKeyHex, signing, spkEntity, allLocal)
+        // Sprint 2b L1: factory lambda — retry re-reads the post-refill
+        // pool from the DB, picking up any concurrent local consume
+        // between attempts.
+        publishBundle(identity.publicKeyHex, signing, spkEntity) { oneTimePreKeyRepository.getAll() }
         true
     }
 
@@ -264,8 +277,9 @@ class PreKeyLifecycleService(
         signedPreKeyRepository.upsert(newEntity)
 
         // Republish bundle with the rotated SPK + the existing OPK pool.
-        val allOpks = oneTimePreKeyRepository.getAll()
-        publishBundle(identity.publicKeyHex, signing, newEntity, allOpks)
+        // Sprint 2b L1: factory lambda — retry re-reads the OPK pool from
+        // the DB on every attempt.
+        publishBundle(identity.publicKeyHex, signing, newEntity) { oneTimePreKeyRepository.getAll() }
         true
     }
 
@@ -314,11 +328,25 @@ class PreKeyLifecycleService(
         return newEntities
     }
 
+    /**
+     * Build + publish the bundle, retrying transient failures inside
+     * [preKeyApi]. The OPK pool is supplied via [opksProvider] (Sprint 2b
+     * L1): each retry attempt re-snapshots the pool from the repository,
+     * so a local consume between attempts is reflected in the next
+     * attempt's wire body. The pre-Sprint-2b shape passed a fixed
+     * `List<LocalOneTimePreKeyEntity>` that the retry loop replayed
+     * identically — the 2026-06-15 integration smoke root cause.
+     *
+     * The upload_start log shows an OPK count, sampled from one extra
+     * [opksProvider] call before the publish so operator-readable grep
+     * shape (`opks=N`) is preserved; the authoritative per-attempt
+     * count is in the transport-layer `prekey_publish_start` log lines.
+     */
     private suspend fun publishBundle(
         identityX25519Hex: String,
         signing: IdentitySigningKeyPair,
         spk: LocalSignedPreKeyEntity,
-        opks: List<LocalOneTimePreKeyEntity>,
+        opksProvider: suspend () -> List<LocalOneTimePreKeyEntity>,
     ) {
         // For onboarding the SPK was just generated in this call; persist
         // it now so a publish failure leaves us with a known-good local
@@ -326,31 +354,45 @@ class PreKeyLifecycleService(
         signedPreKeyRepository.upsert(spk)
 
         val identityTag = identityX25519Hex.take(16)
-        val opkCount = opks.size
+        // Pre-publish snapshot count for the operator-readable upload_start
+        // log only. Authoritative per-attempt counts come from
+        // PreKeyApiClient.publishWithRetry's prekey_publish_start lines,
+        // each reflecting the L1 re-snapshot at the start of that attempt.
+        val preflightOpkCount = opksProvider().size
         messagingLog(
             MessagingLogLevel.INFO,
-            "PREKEY_TRACE upload_start identity=$identityTag… opks=$opkCount spk_key_id=${spk.keyId}",
+            "PREKEY_TRACE upload_start identity=$identityTag… opks=$preflightOpkCount spk_key_id=${spk.keyId}",
         )
 
-        val request = PublishRequest(
-            identity_pubkey_hex = identityX25519Hex,
-            signing_pubkey_hex = signing.publicKey.bytes.toHex(),
-            signed_pre_key = WireSignedPreKey(
-                key_id = spk.keyId,
-                public_key_hex = spk.publicKeyHex,
-                created_at_ms = spk.createdAtMs,
-                signature_hex = spk.signatureHex,
-            ),
-            one_time_pre_keys = opks.map { e ->
-                WireOneTimePreKey(
-                    key_id_hex = e.keyIdHex,
-                    public_key_hex = e.publicKeyHex,
-                )
-            },
+        val signingPubHex = signing.publicKey.bytes.toHex()
+        val wireSpk = WireSignedPreKey(
+            key_id = spk.keyId,
+            public_key_hex = spk.publicKeyHex,
+            created_at_ms = spk.createdAtMs,
+            signature_hex = spk.signatureHex,
         )
         val startMs = nowMsProvider()
         val result = try {
-            preKeyApi.publishBundle(request)
+            // Sprint 2b L1: factory lambda — preKeyApi.publishBundle
+            // invokes this on every retry attempt. opksProvider() is
+            // re-called each time so the wire body reflects the
+            // current local pool, not a pre-loop snapshot. SPK +
+            // signing key + identity hex are stable across retries
+            // and are captured by closure once.
+            preKeyApi.publishBundle {
+                val freshOpks = opksProvider()
+                PublishRequest(
+                    identity_pubkey_hex = identityX25519Hex,
+                    signing_pubkey_hex = signingPubHex,
+                    signed_pre_key = wireSpk,
+                    one_time_pre_keys = freshOpks.map { e ->
+                        WireOneTimePreKey(
+                            key_id_hex = e.keyIdHex,
+                            public_key_hex = e.publicKeyHex,
+                        )
+                    },
+                )
+            }
         } catch (t: Throwable) {
             val elapsed = nowMsProvider() - startMs
             messagingLog(

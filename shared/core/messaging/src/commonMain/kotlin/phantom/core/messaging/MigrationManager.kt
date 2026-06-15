@@ -185,7 +185,15 @@ class MigrationManager(
                 )
             },
         )
-        when (val result = preKeyApi.publishBundle(publishRequest)) {
+        // Sprint 2b L1 (PreKeyApi factory-lambda signature): the migration
+        // path is single-shot and runs before any session exists, so no
+        // concurrent inbound bootstrap can race the OPK pool. Capturing
+        // the pre-built request by closure here satisfies the interface
+        // and is operationally safe — retries replay the same body, which
+        // matches pre-Sprint-2b behaviour for this isolated path. The
+        // load-bearing re-snapshot contract is enforced for the steady-
+        // state PreKeyLifecycleService publishes (L1 + M-2bA-1..5).
+        when (val result = preKeyApi.publishBundle { publishRequest }) {
             is PublishResult.Stored -> { /* expected */ }
             is PublishResult.Failure -> {
                 val reason = result.reason

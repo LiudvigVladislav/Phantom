@@ -180,9 +180,13 @@ class MigrationManagerTest {
     ) : PreKeyApi {
         var publishCount = 0
         var lastRequest: PublishRequest? = null
-        override suspend fun publishBundle(request: PublishRequest): PublishResult {
+        // Sprint 2b L1: PreKeyApi.publishBundle takes a factory lambda
+        // invoked once per retry attempt. The migration path is single-
+        // shot in production, and this fake invokes the lambda exactly
+        // once and records the resulting request — same shape as before.
+        override suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult {
             publishCount++
-            lastRequest = request
+            lastRequest = requestProvider()
             return publishResult
         }
         override suspend fun fetchBundle(

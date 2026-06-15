@@ -49,7 +49,27 @@ import kotlinx.serialization.json.Json
  * wires a single instance via AppContainer.
  */
 interface PreKeyApi {
-    suspend fun publishBundle(request: PublishRequest): PublishResult
+    /**
+     * Publish a freshly-built [PublishRequest] to the relay, retrying
+     * transient transport / 408 / 5xx failures up to
+     * [PreKeyApiClient.PUBLISH_MAX_ATTEMPTS] times.
+     *
+     * Sprint 2b L1 (publish-snapshot consistency): the request is
+     * supplied as a factory lambda rather than a pre-built value. The
+     * implementation invokes [requestProvider] **once per retry attempt**
+     * so the OPK list serialized on attempt N reflects the local pool
+     * state at the start of attempt N — including any OPK that was
+     * locally consumed by an inbound bootstrap path between attempt N-1
+     * and attempt N. Pre-Sprint-2b the request body was captured ONCE
+     * before the retry loop and replayed identically; that allowed a
+     * later retry to succeed server-side after a local consume, restoring
+     * the relay-side pool to a stale snapshot that included the already-
+     * consumed OPK — the root cause of the 2026-06-15 integration smoke
+     * `errorClass=OpkNotFound action=fall_through_to_hold` shape (see
+     * `docs/tracks/sprint-2b-opk-pending-session-scope.md` L1 + the
+     * ADR-009 publish protocol amendment).
+     */
+    suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult
     suspend fun fetchBundle(
         identityPubkeyHex: String,
         requesterPubkeyHex: String? = null,
@@ -122,20 +142,27 @@ class PreKeyApiClient(
      *    Retried: SocketTimeoutException, IOException (connection reset /
      *    broken pipe), HTTP 408, HTTP 5xx. NOT retried: HTTP 400/401/403/422.
      *
+     * Sprint 2b L1 (publish-snapshot consistency): [requestProvider] is
+     * invoked ONCE PER RETRY ATTEMPT inside [publishWithRetry]; the body
+     * is no longer captured-once-before-the-loop. See [PreKeyApi.publishBundle]
+     * KDoc + scope-doc L1 for the rationale.
+     *
      * @return [PublishResult.Stored] with the count of OPKs the relay
      *         retained (after dedup + cap), or [PublishResult.Failure]
      *         describing why the relay rejected the bundle.
      */
-    override suspend fun publishBundle(request: PublishRequest): PublishResult {
-        val identityTag = request.identity_pubkey_hex.take(16)
-
+    override suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult {
         // Debounce: if another publish is already running for this identity,
         // skip silently rather than queue. The in-flight publish will leave
         // the relay in the correct state.
+        //
+        // PreKeyApiClient is wired per-identity by AppContainer (see comment
+        // above publishMutex), so the debounce log omits the identity tag —
+        // operator can correlate via the instance / process boundary.
         if (!publishMutex.tryLock()) {
             relayLog(
                 RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_debounced identity=$identityTag…",
+                "PREKEY_TRACE prekey_publish_debounced",
             )
             // Another publish is already in-flight for this identity. Skip
             // rather than queue — the in-flight call will leave the relay in
@@ -150,31 +177,46 @@ class PreKeyApiClient(
         // in the finally block — Mutex.tryLock() does NOT use the owner token
         // mechanism, so we must call unlock() directly (not withLock{}).
         return try {
-            publishWithRetry(request, identityTag)
+            publishWithRetry(requestProvider)
         } finally {
             publishMutex.unlock()
         }
     }
 
     private suspend fun publishWithRetry(
-        request: PublishRequest,
-        identityTag: String,
+        requestProvider: suspend () -> PublishRequest,
     ): PublishResult {
-        val bodyJson = json.encodeToString(PublishRequest.serializer(), request)
-        // Pre-build the byte array so OkHttp can write it in one shot.
-        // This is the PR-R0.1 fix: Ktor streams the body through a ByteWriteChannel
-        // that stalls at 8192 bytes on Android; native OkHttp writes the full
-        // ByteArray via okio.Buffer.writeAll() without any streaming.
-        val bodyBytes = bodyJson.encodeToByteArray()
         val url = "$relayBaseUrl/prekeys/publish"
         val totalStartMs = Clock.System.now().toEpochMilliseconds()
         var lastException: Throwable? = null
+        // identity is stable across retries (same identity hex from the
+        // lifecycle service); we capture the tag from the first attempt's
+        // body for the give-up log. Initialised on attempt 1.
+        var identityTag = ""
 
         val transport = publishTransport
             ?: error("PreKeyApiClient requires a publishTransport (PR-R0.1). " +
                 "Pass createPreKeyPublishHttpTransport() from AppContainer.")
 
         for (attempt in 1..PUBLISH_MAX_ATTEMPTS) {
+            // Sprint 2b L1: re-snapshot the PublishRequest on EVERY attempt.
+            // Calling requestProvider() rebuilds the OPK list from the
+            // backing repository (in PreKeyLifecycleService:
+            // { oneTimePreKeyRepository.getAll() }), so attempt N's body
+            // reflects any local OPK consumption that happened since
+            // attempt N-1. Pre-Sprint-2b the body was captured once before
+            // the loop and replayed identically — the 2026-06-15 smoke
+            // root cause. See ADR-009 publish protocol amendment.
+            val request = requestProvider()
+            if (identityTag.isEmpty()) {
+                identityTag = request.identity_pubkey_hex.take(16)
+            }
+            val bodyJson = json.encodeToString(PublishRequest.serializer(), request)
+            // Pre-build the byte array so OkHttp can write it in one shot.
+            // This is the PR-R0.1 fix: Ktor streams the body through a ByteWriteChannel
+            // that stalls at 8192 bytes on Android; native OkHttp writes the full
+            // ByteArray via okio.Buffer.writeAll() without any streaming.
+            val bodyBytes = bodyJson.encodeToByteArray()
             if (bodyBytes.size >= 7800) {
                 relayLog(
                     RelayLogLevel.WARN,

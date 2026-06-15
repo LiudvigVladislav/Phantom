@@ -100,7 +100,7 @@ class PreKeyApiClientTest {
             publishTransport = StaticFakePublishTransport(201, """{"stored_opks":2}"""),
         )
 
-        val result = api.publishBundle(samplePublishRequest())
+        val result = api.publishBundle { samplePublishRequest() }
         when (result) {
             is PublishResult.Stored -> assertEquals(2, result.storedOpks)
             else -> fail("expected Stored, got $result")
@@ -115,7 +115,7 @@ class PreKeyApiClientTest {
             publishTransport = StaticFakePublishTransport(409, """{"error":"signing_pubkey_hex does not match"}"""),
         )
 
-        val result = api.publishBundle(samplePublishRequest())
+        val result = api.publishBundle { samplePublishRequest() }
         assertTrue(result is PublishResult.Failure)
         assertEquals(PublishResult.Reason.SigningKeyMismatch, result.reason)
     }
@@ -128,7 +128,7 @@ class PreKeyApiClientTest {
             publishTransport = StaticFakePublishTransport(429, """{"error":"publish rate limit exceeded"}"""),
         )
 
-        val result = api.publishBundle(samplePublishRequest())
+        val result = api.publishBundle { samplePublishRequest() }
         assertTrue(result is PublishResult.Failure)
         assertEquals(PublishResult.Reason.RateLimited, result.reason)
     }
@@ -141,7 +141,7 @@ class PreKeyApiClientTest {
             publishTransport = StaticFakePublishTransport(400, """{"error":"signing_pubkey_hex must be 64 hex chars"}"""),
         )
 
-        val result = api.publishBundle(samplePublishRequest())
+        val result = api.publishBundle { samplePublishRequest() }
         assertTrue(result is PublishResult.Failure)
         assertEquals(PublishResult.Reason.BadRequest, result.reason)
     }

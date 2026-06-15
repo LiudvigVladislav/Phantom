@@ -1357,6 +1357,308 @@ class DefaultMessagingServiceTest {
         assertEquals(false, bobOpkRepo.has(bobOpkIdHex), "OPK consumed on bootstrap")
     }
 
+    // ── Sprint 2b M-2bA-3 ───────────────────────────────────────────────────
+    //
+    // Regression lock on the decrypt-existing-first ordering (scope-doc
+    // L1 + L2): when DMS receives an envelope with `sessionExists=true
+    // AND x3dhInitPresent=true`, the implementation MUST attempt
+    // `ratchet.decrypt(existingState, encrypted)` BEFORE entering
+    // `recipientBootstrapInMemory`. On success, the envelope is treated
+    // as a stale relay re-delivery / a "suspect outbound" attaching a
+    // repair hint to a frame the receiver could already decrypt
+    // (PR #243 commit 4 contract preserved): the advanced ratchet state
+    // is saved; the `x3dhInit` header is ignored; NO OPK is consumed.
+    //
+    // The behaviour ALREADY exists today at `DefaultMessagingService.kt`
+    // around line 2411 (the existing-state `try { ratchet.decrypt(state,
+    // encrypted) }` block returns the decrypted plaintext directly; the
+    // PR-249 inbound-repair branch is reached ONLY through the catch
+    // arm on MAC failure). M-2bA-3 is the load-bearing assertion that
+    // this ordering does NOT regress under Sprint 2b's surrounding
+    // changes — specifically the OPK lifecycle rewires landing in
+    // Sprint 2b-B/C.
+    //
+    // Mechanism: a [SpyOneTimePreKeyRepository] records every
+    // `deleteByKeyId` call so the test can pin both quantitatively
+    // (total delete count) and qualitatively (which keyId hex) the
+    // OPK lifecycle behaviour across the two envelopes.
+
+    @Test
+    fun handleDeliver_existingSessionDecryptsCleanly_doesNotInvokeInboundRepair() = runTest {
+        LibsodiumInitializer.initialize()
+        // Bob is the local user receiving Alice's messages. Alice runs
+        // a parallel SessionManager so we capture the resulting
+        // WireFrames + advance her own ratchet between envelopes.
+        val real = phantom.core.crypto.LibsodiumX3DH()
+
+        val aliceX25519 = real.generateDhKeyPair()
+        val bobX25519 = real.generateDhKeyPair()
+        val bobSpkPair = real.generateDhKeyPair()
+        val bobOpkConsumedPair = real.generateDhKeyPair()
+        val bobOpkConsumedIdHex = "00112233445566778899aabbccddeeff"
+        val bobOpkSurvivorPair = real.generateDhKeyPair()
+        // Distinct id so the spy can disambiguate the two OPKs.
+        val bobOpkSurvivorIdHex = "ffeeddccbbaa99887766554433221100"
+
+        val bobSpkRepo = object : phantom.core.storage.LocalSignedPreKeyRepository {
+            private var stored: phantom.core.storage.LocalSignedPreKeyEntity? =
+                phantom.core.storage.LocalSignedPreKeyEntity(
+                    keyId = 99L,
+                    publicKeyHex = bobSpkPair.publicKey.bytes.toHexStringLower(),
+                    privateKeyHex = bobSpkPair.privateKey.bytes.toHexStringLower(),
+                    createdAtMs = 0L,
+                    signatureHex = "00".repeat(64),
+                )
+            override suspend fun get() = stored
+            override suspend fun upsert(entity: phantom.core.storage.LocalSignedPreKeyEntity) {
+                stored = entity
+            }
+            override suspend fun clear() { stored = null }
+        }
+
+        // Spy on every deleteByKeyId call — the load-bearing assertion
+        // source. Pool seeded with BOTH the consume target AND the
+        // survivor so envelope #2's synthetic x3dhInit has a valid id
+        // to reference (the kind of "buggy peer" pattern PR #243
+        // commit 4 anticipates) without short-circuiting through the
+        // OpkNotFound path.
+        val opkDeleteCalls = mutableListOf<String>()
+        val bobOpkRepo = object : phantom.core.storage.LocalOneTimePreKeyRepository {
+            private val store = mutableMapOf(
+                bobOpkConsumedIdHex to phantom.core.storage.LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkConsumedIdHex,
+                    publicKeyHex = bobOpkConsumedPair.publicKey.bytes.toHexStringLower(),
+                    privateKeyHex = bobOpkConsumedPair.privateKey.bytes.toHexStringLower(),
+                    uploadedAtMs = 0L,
+                ),
+                bobOpkSurvivorIdHex to phantom.core.storage.LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkSurvivorIdHex,
+                    publicKeyHex = bobOpkSurvivorPair.publicKey.bytes.toHexStringLower(),
+                    privateKeyHex = bobOpkSurvivorPair.privateKey.bytes.toHexStringLower(),
+                    uploadedAtMs = 0L,
+                ),
+            )
+            override suspend fun get(keyIdHex: String) = store[keyIdHex]
+            override suspend fun getAll() = store.values.toList()
+            override suspend fun count() = store.size
+            override suspend fun insert(entity: phantom.core.storage.LocalOneTimePreKeyEntity) {
+                store[entity.keyIdHex] = entity
+            }
+            override suspend fun insertAll(entities: List<phantom.core.storage.LocalOneTimePreKeyEntity>) {
+                entities.forEach { insert(it) }
+            }
+            override suspend fun deleteByKeyId(keyIdHex: String) {
+                opkDeleteCalls.add(keyIdHex)
+                store.remove(keyIdHex)
+            }
+            override suspend fun clear() { store.clear() }
+            fun has(keyIdHex: String): Boolean = store.containsKey(keyIdHex)
+        }
+
+        // Alice's parallel SessionManager — used to derive aliceBootstrap
+        // and advance her sending ratchet between envelopes.
+        val aliceSessionMgr = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = FakeRatchetStateRepository(),
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+        val bobSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val aliceBundleForBob = PreKeyBundle(
+            identityPubkeyHex = bobX25519.publicKey.bytes.toHexStringLower(),
+            signingPubkeyHex = bobSigning.publicKey.toByteArray().toHexStringLower(),
+            signedPreKeyId = 99L,
+            signedPreKeyPublicHex = bobSpkPair.publicKey.bytes.toHexStringLower(),
+            signedPreKeyCreatedAtMs = 1_000L,
+            signedPreKeySignatureHex = phantom.core.crypto.SignedPreKeySigner.sign(
+                bobSpkPair.publicKey,
+                1_000L,
+                bobSigning.secretKey.toByteArray(),
+            ).toHexStringLower(),
+            oneTimePreKeyIdHex = bobOpkConsumedIdHex,
+            oneTimePreKeyPublicHex = bobOpkConsumedPair.publicKey.bytes.toHexStringLower(),
+        )
+        val aliceBootstrap = aliceSessionMgr.initiatorBootstrap(
+            conversationId = "alice-side-M-2bA-3",
+            localIdentityKeyPair = aliceX25519,
+            bundle = aliceBundleForBob,
+        )
+
+        val bobIdentity = phantom.core.identity.IdentityRecord(
+            id = "bob-id-M-2bA-3",
+            username = "bob",
+            publicKeyHex = bobX25519.publicKey.bytes.toHexStringLower(),
+            dhPrivateKeyHex = bobX25519.privateKey.bytes.toHexStringLower(),
+            createdAt = 0L,
+        )
+        val ratchetRepo = FakeRatchetStateRepository()
+        val bobSessionMgr = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = bobSpkRepo,
+            oneTimePreKeyRepository = bobOpkRepo,
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+        val bobIncomingTransport = ManualIncomingTransport()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        val service = DefaultMessagingService(
+            identity = bobIdentity,
+            localKeyPair = bobX25519,
+            ratchet = phantom.core.crypto.LibsodiumDoubleRatchet(),
+            sessionManager = bobSessionMgr,
+            transport = bobIncomingTransport,
+            messageRepository = msgRepo,
+            conversationRepository = convRepo,
+            scope = backgroundScope,
+            json = json,
+            preKeyApi = ThrowingPreKeyApi,
+            signingKeyProvider = { ThrowingSigningKey },
+        )
+        service.startReceiving()
+
+        val collected = mutableListOf<IncomingMessage>()
+        val collectJob = launch { service.incomingMessages.collect { collected.add(it) } }
+        testScheduler.runCurrent()
+
+        // ── Envelope #1 — bootstrap path ────────────────────────────────────
+        // Alice's first message. WireFrame carries her real bootstrap
+        // x3dhInit. Bob's flow: no existing session → enters bootstrap
+        // → consumes `bobOpkConsumedIdHex`.
+        val realRatchet = phantom.core.crypto.LibsodiumDoubleRatchet()
+        val payload1Bytes = json.encodeToString(
+            MessagePayload.serializer(),
+            MessagePayload(
+                text = "hello, bob",
+                sentAt = 1_700_000_000_000L,
+                senderUsername = "alice",
+            ),
+        ).encodeToByteArray()
+        val (aliceStateAfter1, encrypted1) = realRatchet.encrypt(aliceBootstrap.ratchetState, payload1Bytes)
+        val wireFrame1 = WireFrame(
+            encryptedMessage = encrypted1,
+            x3dhInit = aliceBootstrap.x3dhInit,
+            senderSigningPublicKeyHex = "ee".repeat(32),
+        )
+        val wireFrame1Bytes = json.encodeToString(WireFrame.serializer(), wireFrame1).encodeToByteArray()
+        val padded1 = phantom.core.crypto.MessagePadding.pad(wireFrame1Bytes)
+
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val sealedSenderHex = phantom.core.crypto.SealedSender.seal(
+            fromPubKeyHex = aliceX25519.publicKey.bytes.toHexStringLower(),
+            toPublicKeyBytes = bobX25519.publicKey.bytes,
+        )
+
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        bobIncomingTransport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "",
+                sealedSender = kotlin.io.encoding.Base64.encode(sealedSenderHex),
+                payload = kotlin.io.encoding.Base64.encode(padded1),
+                messageId = "msg-M-2bA-3-bootstrap",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // Snapshot the delete-spy AFTER envelope #1 — this is the
+        // baseline that envelope #2 must NOT extend.
+        val deleteCallsAfterEnvelope1 = opkDeleteCalls.toList()
+        assertEquals(
+            1, collected.size,
+            "envelope #1 must decrypt via bootstrap path",
+        )
+        assertEquals(
+            "hello, bob", collected[0].text,
+            "envelope #1 plaintext recovered",
+        )
+        assertEquals(
+            listOf(bobOpkConsumedIdHex), deleteCallsAfterEnvelope1,
+            "envelope #1 consumes exactly the bootstrap OPK",
+        )
+        assertEquals(
+            false, bobOpkRepo.has(bobOpkConsumedIdHex),
+            "consumed OPK gone from pool after envelope #1",
+        )
+        assertEquals(
+            true, bobOpkRepo.has(bobOpkSurvivorIdHex),
+            "survivor OPK still in pool after envelope #1",
+        )
+
+        // ── Envelope #2 — existing-session decrypt + suspect x3dhInit ──────
+        // Alice's SECOND message: encrypted under her now-advanced
+        // ratchet (aliceStateAfter1). The WireFrame attaches a
+        // synthetic x3dhInit referencing the SURVIVOR OPK — mimicking
+        // a "suspect outbound" peer that attaches a repair hint to a
+        // frame the receiver could already decrypt (the very case the
+        // L2 decrypt-existing-first ordering must absorb without
+        // consuming an OPK).
+        val payload2Bytes = json.encodeToString(
+            MessagePayload.serializer(),
+            MessagePayload(
+                text = "hello again, bob",
+                sentAt = 1_700_000_001_000L,
+                senderUsername = "alice",
+            ),
+        ).encodeToByteArray()
+        val (_, encrypted2) = realRatchet.encrypt(aliceStateAfter1, payload2Bytes)
+        val syntheticX3dhInit = X3dhInitHeader(
+            spkKeyId = aliceBootstrap.x3dhInit.spkKeyId,
+            ephemeralPubKeyHex = aliceBootstrap.x3dhInit.ephemeralPubKeyHex,
+            opkKeyIdHex = bobOpkSurvivorIdHex,
+        )
+        val wireFrame2 = WireFrame(
+            encryptedMessage = encrypted2,
+            x3dhInit = syntheticX3dhInit,
+            senderSigningPublicKeyHex = "ee".repeat(32),
+        )
+        val wireFrame2Bytes = json.encodeToString(WireFrame.serializer(), wireFrame2).encodeToByteArray()
+        val padded2 = phantom.core.crypto.MessagePadding.pad(wireFrame2Bytes)
+
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        bobIncomingTransport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "",
+                sealedSender = kotlin.io.encoding.Base64.encode(sealedSenderHex),
+                payload = kotlin.io.encoding.Base64.encode(padded2),
+                messageId = "msg-M-2bA-3-existing-session",
+            ),
+        )
+        testScheduler.runCurrent()
+        collectJob.cancel()
+
+        // ── Load-bearing assertions ─────────────────────────────────────────
+        // L2 invariant: envelope #2 decrypted via the existing-session
+        // path (NOT the inbound repair branch). The synthetic
+        // x3dhInit was ignored; the survivor OPK was NEITHER read NOR
+        // deleted; the on-disk delete-spy log has NOT grown.
+        assertEquals(
+            2, collected.size,
+            "envelope #2 must produce a second decoded incoming message",
+        )
+        assertEquals(
+            "hello again, bob", collected[1].text,
+            "envelope #2 plaintext recovered via existing-session decrypt",
+        )
+        assertEquals(
+            deleteCallsAfterEnvelope1, opkDeleteCalls.toList(),
+            "L2 decrypt-existing-first: envelope #2 MUST NOT trigger any " +
+                "additional deleteByKeyId call — its x3dhInit is ignored " +
+                "because the existing session decrypted cleanly",
+        )
+        assertEquals(
+            true, bobOpkRepo.has(bobOpkSurvivorIdHex),
+            "L2 decrypt-existing-first: survivor OPK MUST stay in the pool " +
+                "after envelope #2 (the x3dhInit hint was ignored)",
+        )
+        assertEquals(
+            false, bobOpkRepo.has(bobOpkConsumedIdHex),
+            "consumed OPK remains gone — envelope #2 did NOT restore it",
+        )
+    }
+
     // ── PR 3 / F-05: voice chunking tests ─────────────────────────────────────
 
     @Test
@@ -4910,8 +5212,11 @@ private fun ByteArray.toHexStringLower(): String =
 private class StubPreKeyApi(
     private val bundle: phantom.core.transport.PreKeyBundle,
 ) : phantom.core.transport.PreKeyApi {
+    // Sprint 2b L1: PreKeyApi.publishBundle takes a factory lambda
+    // (re-snapshot per retry). The stub returns Stored(0) without
+    // examining the request, so the lambda is not invoked.
     override suspend fun publishBundle(
-        request: phantom.core.transport.PublishRequest,
+        requestProvider: suspend () -> phantom.core.transport.PublishRequest,
     ): phantom.core.transport.PublishResult =
         phantom.core.transport.PublishResult.Stored(0)
 
@@ -4970,8 +5275,9 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
 //    the missing seed entry, not stub these out. ─────────────────────
 
 private object ThrowingPreKeyApi : phantom.core.transport.PreKeyApi {
+    // Sprint 2b L1: factory-lambda signature.
     override suspend fun publishBundle(
-        request: phantom.core.transport.PublishRequest,
+        requestProvider: suspend () -> phantom.core.transport.PublishRequest,
     ): phantom.core.transport.PublishResult =
         error("ThrowingPreKeyApi: wire-flow tests must pre-seed ratchet state, not call publishBundle")
 
