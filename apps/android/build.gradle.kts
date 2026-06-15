@@ -579,16 +579,36 @@ android {
             // diagnostic class. Defence-in-depth backstop per §14 hard
             // gate 1 + WORKING_RULES rule 8 narrow carve-out.
             buildConfigField("String", "DEBUG_RC_DIRECT_ARM_G_VIA_REALITY", "\"\"")
-            // Trek 2 Stage 2A (A6): release builds ALWAYS pin the long-poll
-            // V2 gate to "0". The AppContainer wire-up reads this value and
-            // computes the Boolean passed to
-            // `RestFallbackOrchestrator.longPollEnabled`, so a release build
-            // can never engage any Stage 2B runtime path even if a debug-only
-            // wire-up site forgot its `BuildConfig.DEBUG` guard. Stage 2B
-            // promotion to release is a separate named PR that flips this
-            // single line; defence-in-depth backstop per the
-            // OQ7 + OQ11 split locks (locked 2026-06-09).
-            buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"0\"")
+            // Trek 2 Stage 2B-D rollout (2026-06-16): release builds NOW
+            // pin the long-poll V2 gate to "1". The AppContainer wire-up
+            // reads this value and computes the Boolean passed to
+            // `RestFallbackOrchestrator.longPollEnabled`, so release builds
+            // emit `X-Phantom-Long-Poll: 1` + `X-Phantom-Padded-Poll: 1`
+            // opt-in headers on every `/relay/poll` request — and the
+            // production relay (Round 14 deployed via PR #310 squash
+            // `345d9761`, `RELAY_POLL_CHUNKED_FLUSH=1` set in the VPS
+            // .env on 2026-06-16) responds with the paced chunked-flush
+            // 4 × 1152-byte body that closes the Tele2 LTE byte-budget
+            // stall observed pre-Round-14.
+            //
+            // Stage 2B-D entry criteria met: Sprint 2b-A + 2b-B + 2b-C
+            // merged + Stage 2B-D Tele2 LTE integration smoke 2026-06-16
+            // PASS (all three layers — Round 14 wire, Sprint 2a guard,
+            // Sprint 2b-C inbound-repair + promotion). See the
+            // `docs/PROJECT_LOG.md` 2026-06-16 entry "Stage 2B-D Tele2
+            // LTE integration smoke PASS + PR #310 MERGED + Round 14
+            // LIVE on production" and the amended L10 in
+            // `docs/tracks/sprint-2b-opk-pending-session-scope.md`.
+            //
+            // Rollback contract: reverting this line to `"\"0\""`
+            // returns release builds to the pre-Stage-2B-D wire shape
+            // (no LP/PP opt-in, legacy mono padded poll). Production
+            // relay can keep `RELAY_POLL_CHUNKED_FLUSH=1` set
+            // independently — without the LP/PP opt-in headers the
+            // server falls back to mono padded poll for those clients,
+            // so the relay-side flag is a safe no-op for any non-opted-
+            // in client. This decoupling is the rollback safety contract.
+            buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"1\"")
             // Trek 2 Stage 2B-B (C6 review-fix round 3 P2) —
             // release builds ALWAYS pin the S6 debug trigger flag
             // to `"0"`. The AppContainer wire-up reads this value

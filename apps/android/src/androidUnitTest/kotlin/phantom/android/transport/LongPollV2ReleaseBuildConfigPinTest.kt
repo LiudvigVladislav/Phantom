@@ -10,24 +10,40 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Trek 2 Stage 2B-A — M4 contract test.
+ * Trek 2 Stage 2B-D rollout — M4 contract test (pin-direction flipped
+ * 2026-06-16 from `"0"` to `"1"` in the dedicated Stage 2B-D rollout PR).
  *
  * Pins the release variant of the `apps/android/build.gradle.kts` file
- * so that `LONGPOLL_V2_ENABLED` cannot be promoted to `"1"` in the
+ * so that `LONGPOLL_V2_ENABLED` cannot drift away from `"1"` in the
  * release block by accident. The release pin is the load-bearing safety
- * invariant of Stage 2B-A (scope lock L6): a release-mode APK with the
- * flag at `"0"` is byte-for-byte runtime-equivalent to a pre-2B-A build
- * regardless of what new wiring this stage adds.
+ * invariant of Stage 2B-D rollout: a release-mode APK with the flag at
+ * `"1"` emits `X-Phantom-Long-Poll: 1` + `X-Phantom-Padded-Poll: 1`
+ * opt-in headers on every `/relay/poll` request, activating the Round
+ * 14 paced chunked-flush path on the production relay (deployed via
+ * PR #310 squash `345d9761` with `RELAY_POLL_CHUNKED_FLUSH=1` set on
+ * the VPS).
  *
- * Stage 2B-B promotion to release is a separate, explicitly named PR
- * that flips this single line — at which point this test will be
- * updated (or moved) deliberately as part of that promotion's diff.
- * Tripping this test as a side-effect of an unrelated edit signals
- * that the pin has been broken without the explicit promotion ceremony.
+ * Pre-Stage-2B-D history (for context). Stage 2B-A originally pinned
+ * the release block to `"0"` so a release APK was byte-for-byte
+ * runtime-equivalent to a pre-2B-A build regardless of the new wiring
+ * — defence-in-depth on top of `BuildConfig.DEBUG`. The pin survived
+ * Stage 2B-A (PR #306), Stage 2B-B (PR #309), Sprint 2a (PR #311),
+ * Sprint 2b-A/B/C (PRs #315/#316/#317), and Round 14 (PR #310). The
+ * 2026-06-16 Stage 2B-D rollout PR is the deliberate "single named
+ * PR" that the prior comment promised would flip this pin.
+ *
+ * Rollback contract. Reverting the build.gradle.kts pin and this
+ * test's expected literal back to `"0"` returns release builds to the
+ * pre-Stage-2B-D wire shape (no LP/PP opt-in, legacy mono padded
+ * poll). The relay-side `RELAY_POLL_CHUNKED_FLUSH=1` flag can stay on
+ * the VPS independently — without the LP/PP opt-in headers from the
+ * client, the relay falls back to the mono padded poll for those
+ * clients, so the server flag is a safe no-op for any non-opted-in
+ * client. The decoupling is intentional.
  *
  * Test strategy: parse `apps/android/build.gradle.kts` as text, find
  * the `release { ... }` block under `buildTypes`, and grep for the
- * exact `buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"0\"")`
+ * exact `buildConfigField("String", "LONGPOLL_V2_ENABLED", "\"1\"")`
  * declaration. Text parsing is the right tool here because the
  * BuildConfig value is a Gradle-generated `String` constant that is
  * only meaningful when the release variant is actually built, and
@@ -42,24 +58,24 @@ class LongPollV2ReleaseBuildConfigPinTest {
      * test deliberately — the pin's value is in not drifting at all.
      */
     private val expectedPinLine: String =
-        "buildConfigField(\"String\", \"LONGPOLL_V2_ENABLED\", \"\\\"0\\\"\")"
+        "buildConfigField(\"String\", \"LONGPOLL_V2_ENABLED\", \"\\\"1\\\"\")"
 
     /** The header literal we look for to locate the release block. */
     private val releaseBlockHeader: String = "release {"
 
     @Test
-    fun release_block_pins_longpoll_v2_enabled_to_zero() {
+    fun release_block_pins_longpoll_v2_enabled_to_one() {
         val source = loadBuildGradle()
         val releaseBlock = extractReleaseBlock(source)
             ?: fail("Could not locate `release { ... }` block inside `apps/android/build.gradle.kts`.")
         assertTrue(
             releaseBlock.contains(expectedPinLine),
-            "Release variant must pin `LONGPOLL_V2_ENABLED` to `\"0\"` for the " +
-                "Stage 2B-A L6 release-pin invariant. Expected to find the literal\n" +
+            "Release variant must pin `LONGPOLL_V2_ENABLED` to `\"1\"` for the " +
+                "Stage 2B-D rollout invariant. Expected to find the literal\n" +
                 "  $expectedPinLine\n" +
                 "inside the `release { ... }` block of `apps/android/build.gradle.kts`. " +
-                "Flipping this pin to `\"1\"` is the dedicated Stage 2B-B release " +
-                "promotion ceremony and must NOT happen as a side-effect.",
+                "Reverting this pin to `\"0\"` is the dedicated Stage 2B-D rollback " +
+                "ceremony and must NOT happen as a side-effect of an unrelated edit.",
         )
     }
 
@@ -69,10 +85,17 @@ class LongPollV2ReleaseBuildConfigPinTest {
      * would pass even if the release block were deleted, because
      * `extractReleaseBlock` would find the wrong block. The debug block
      * uses a runtime-computed `localOrEnv(...)` value, not a literal
-     * `"0"`, so the same literal MUST NOT appear there.
+     * `"1"`, so the same literal MUST NOT appear there.
+     *
+     * (Note: even after the Stage 2B-D rollout flipped the release pin
+     * from `"0"` to `"1"`, this sanity test still applies — the debug
+     * block's value comes from `localOrEnv("longPollV2Enabled",
+     * "LONGPOLL_V2_ENABLED", "1")` which expands to
+     * `buildConfigField("String", "LONGPOLL_V2_ENABLED",
+     * "\"$longPollV2Enabled\"")`, NOT the literal release-pin shape.)
      */
     @Test
-    fun debug_block_does_not_carry_the_literal_zero_pin() {
+    fun debug_block_does_not_carry_the_literal_one_pin() {
         val source = loadBuildGradle()
         val debugBlock = extractDebugBlock(source)
             ?: fail("Could not locate `debug { ... }` block inside `apps/android/build.gradle.kts`.")
