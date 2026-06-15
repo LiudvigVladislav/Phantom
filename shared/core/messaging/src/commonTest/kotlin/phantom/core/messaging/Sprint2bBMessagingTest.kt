@@ -649,6 +649,27 @@ class Sprint2bBMessagingTest {
             }
             pendingRepo.delete(conversationId)
         }
+
+        override suspend fun promotePendingToActive(conversationId: String): Boolean =
+            // Sprint 2b-B messaging tests do not exercise promotion
+            // (added in Sprint 2b-C). Promotion-aware fakes live in
+            // Sprint2bCMessagingTest. Fail loudly on accidental call.
+            error(
+                "FakeSessionTransactionRepository (Sprint 2b-B variant) does not " +
+                    "support promotePendingToActive. Use the Sprint 2b-C variant " +
+                    "in Sprint2bCMessagingTest.kt.",
+            )
+
+        override suspend fun commitInitiatorPending(
+            conversationId: String,
+            stateBlob: String,
+            bootstrapArtifactsBlob: String,
+            nowMs: Long,
+        ): Unit = error(
+            "FakeSessionTransactionRepository (Sprint 2b-B variant) does not " +
+                "support commitInitiatorPending. Use the Sprint 2b-C variant " +
+                "in Sprint2bCMessagingTest.kt.",
+        )
     }
 
     private fun newSprint2bBFakePair(): Pair<FakeOpkReservationRepository, FakePendingRatchetStateRepository> {

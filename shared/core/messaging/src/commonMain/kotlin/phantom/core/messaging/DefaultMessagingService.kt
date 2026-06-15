@@ -242,6 +242,42 @@ class DefaultMessagingService(
      * [phantom.core.storage.PendingRatchetStateRepository] pair.
      */
     private val pendingSessionCapEnforcer: PendingSessionCapEnforcer? = null,
+    /**
+     * Sprint 2b-C L3 — read-side handle on the pending session
+     * companion table. The outbound encrypt path's PENDING-reuse
+     * check at `encryptUnderLock` reads this BEFORE
+     * `tryLoadSession` so an INITIATOR pending row within
+     * `PENDING_TTL_MS` is reused (no new OPK consumed; cached
+     * `x3dhInit` re-attached from `bootstrap_artifacts_blob`). The
+     * inbound flow's pending fallback (Sprint 2b-C Slice 4) reads
+     * this AFTER the active-decrypt MAC failure but BEFORE entering
+     * the inbound-repair branch.
+     *
+     * Nullable + default null so legacy fixtures construct DMS
+     * without wiring the repo. Production AppContainer wires the
+     * SqlDelight-backed instance.
+     */
+    private val pendingRatchetStateRepository: phantom.core.storage.PendingRatchetStateRepository? = null,
+    /**
+     * Sprint 2b-C — wall-clock provider for PENDING_TTL_MS expiry
+     * checks + `commitInitiatorPending(nowMs = ...)`. Defaults to
+     * the system clock; tests substitute a fixed value to make TTL
+     * boundaries deterministic.
+     */
+    private val nowMsProvider: () -> Long = { Clock.System.now().toEpochMilliseconds() },
+    /**
+     * Sprint 2b-C L8 — `opk_not_found_total{reason}` debuggability
+     * seam. The inbound-repair branch records here when
+     * `recipientBootstrapInMemory` throws
+     * [SessionBootstrapException.OpkNotFound]. Nullable + default
+     * null so legacy fixtures construct DMS without wiring; production
+     * AppContainer wires a single process-local instance.
+     *
+     * See [OpkNotFoundMetric] for the contract (counter only — NOT a
+     * telemetry pipeline; deferred export to logcat / Statsig is
+     * named work).
+     */
+    private val opkNotFoundMetric: OpkNotFoundMetric? = null,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -371,6 +407,26 @@ class DefaultMessagingService(
         // re-try on the next reconnect.
         const val PREKEY_BUNDLE_FETCH_TIMEOUT_MS: Long = 8_000L
 
+        /**
+         * Sprint 2b-C — outbound INITIATOR pending session lifetime.
+         *
+         * 10 minutes Alpha-locked default (Vladislav 2026-06-15).
+         * The encrypt path's PENDING-reuse check at
+         * `encryptUnderLock` matches a pending row only when
+         * `(now - reservedAtMs) < PENDING_TTL_MS`. An expired
+         * pending row is overwritten in place by the bootstrap
+         * branch's next `commitInitiatorPending` (INSERT OR REPLACE
+         * shape) — no separate cleanup step.
+         *
+         * Trade-off: 10 min covers slow networks + brief offline
+         * periods (so the peer has time to respond before our
+         * `x3dhInit` becomes stale) while limiting the window in
+         * which a stale `x3dhInit` could be replayed to the peer.
+         * 1 hour was considered and rejected as too generous for
+         * Alpha; field telemetry post-Sprint-2b may revisit.
+         */
+        const val PENDING_TTL_MS: Long = 10L * 60L * 1000L
+
         // PR-D2b.1 (2026-05-17): TTL for partial voice reassembly state in
         // the durable `voice_chunks` table. 24 h is intentionally generous
         // so a phone that loses connectivity overnight on Tele2 can still
@@ -417,7 +473,13 @@ class DefaultMessagingService(
      * `senderSigningPublicKeyHex = null` — wasted bytes once the
      * recipient cached them.
      */
-    private suspend fun encryptUnderLock(
+    // Visibility: `internal` so Sprint 2b-C M-2bC-2/3/5 cells can
+    // exercise the outbound encrypt path directly without standing
+    // up the full sendMessage integration (messageRepository +
+    // conversationRepository + transport.send). The public entry
+    // points (sendMessage / sendAudio) call this internally; nothing
+    // outside the module reaches it.
+    internal suspend fun encryptUnderLock(
         conversationId: String,
         recipientPublicKeyHex: String,
         plaintext: ByteArray,
@@ -472,6 +534,91 @@ class DefaultMessagingService(
                 MessagingLogLevel.INFO,
                 "SEND_TRACE session_lookup conv=$convTag suspect=$sessionSuspect",
             )
+
+            // ═════════════════════════════════════════════════════════
+            // Sprint 2b-C Slice 3 — outbound INITIATOR pending reuse.
+            //
+            // BEFORE consulting `tryLoadSession` (which reads the
+            // active slot), check whether an INITIATOR pending row
+            // exists for this conversation. If yes AND within
+            // PENDING_TTL_MS AND the cached `BootstrapArtifacts.recipientPubkeyHex`
+            // matches AND not session-suspect → reuse: encrypt under
+            // the pending state, re-attach the cached `x3dhInit`
+            // from `bootstrap_artifacts_blob`, advance the pending
+            // row in place (no TTL refresh; preserves the original
+            // bootstrap timestamp). NO new OPK is consumed.
+            //
+            // Skipped when:
+            //  - no pendingRatchetStateRepository wired (legacy DMS
+            //    fixtures);
+            //  - pending row absent;
+            //  - `bootstrap_artifacts_blob` null (RESPONDER pending
+            //    rows have null artifacts; only INITIATOR pendings
+            //    are reusable);
+            //  - artifacts JSON malformed (BootstrapArtifacts.fromBlob
+            //    returns null on malformed input — fall through to
+            //    fresh bootstrap rather than crash);
+            //  - artifacts.recipientPubkeyHex != recipientPublicKeyHex
+            //    (defense-in-depth — same conversation id should
+            //    imply same recipient, but explicit check guards
+            //    against any future code path that reuses conv ids);
+            //  - TTL expired;
+            //  - sessionSuspect set (peer's receive side reported
+            //    MAC failure on active; fresh bootstrap is safer
+            //    than reusing the stale `x3dhInit`).
+            // ═════════════════════════════════════════════════════════
+            val pendingEntity = pendingRatchetStateRepository?.get(conversationId)
+            val pendingArtifacts = BootstrapArtifacts.fromBlob(
+                json = json,
+                blob = pendingEntity?.bootstrapArtifactsBlob,
+            )
+            val nowMs = nowMsProvider()
+            val canReusePending = pendingEntity != null &&
+                pendingArtifacts != null &&
+                (nowMs - pendingEntity.reservedAtMs) < PENDING_TTL_MS &&
+                pendingArtifacts.recipientPubkeyHex == recipientPublicKeyHex &&
+                !sessionSuspect &&
+                sessionTransactionRepository != null
+            if (canReusePending) {
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "SEND_TRACE pending_reuse conv=$convTag " +
+                        "ageMs=${nowMs - pendingEntity!!.reservedAtMs}",
+                )
+                val pendingState = json.decodeFromString<phantom.core.crypto.RatchetState>(
+                    pendingEntity.stateBlob,
+                )
+                val (advancedState, encrypted) = ratchet.encrypt(pendingState, plaintext)
+
+                val ourSigning = signingKeyProvider() ?: error(
+                    "encryptUnderLock (pending reuse): local Ed25519 signing keypair " +
+                        "is missing. Either onboarding or migration must run first.",
+                )
+                val ourSigningHex = ourSigning.publicKey.bytes
+                    .joinToString("") { "%02x".format(it.toInt().and(0xFF)) }
+
+                val wireFrame = WireFrame(
+                    encryptedMessage = encrypted,
+                    x3dhInit = pendingArtifacts!!.x3dhInit,
+                    senderSigningPublicKeyHex = ourSigningHex,
+                )
+                afterEncrypt(wireFrame)
+
+                // Update pending row in place. reservedAtMs PRESERVED
+                // (we do NOT refresh TTL on reuse — Alpha lock).
+                sessionTransactionRepository!!.commitInitiatorPending(
+                    conversationId = conversationId,
+                    stateBlob = json.encodeToString(advancedState),
+                    bootstrapArtifactsBlob = pendingEntity.bootstrapArtifactsBlob!!,
+                    nowMs = pendingEntity.reservedAtMs,
+                )
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "SEND_TRACE pending_reuse_committed conv=$convTag",
+                )
+                return@withLock wireFrame
+            }
+
             val existingState = sessionManager.tryLoadSession(conversationId)
             // ═════════════════════════════════════════════════════════
             // RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a (2026-06-15) — outbound
@@ -665,9 +812,64 @@ class DefaultMessagingService(
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE after_encrypt_callback_start conv=$convTag bootstrap=true")
                 afterEncrypt(wireFrame)
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE after_encrypt_callback_ok conv=$convTag")
-                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_start conv=$convTag")
-                sessionManager.saveSession(conversationId, newState)
-                messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
+
+                // ═════════════════════════════════════════════════
+                // Sprint 2b-C Slice 3 — outbound bootstrap writes
+                // pending, NOT active.
+                //
+                // The active `ratchet_state` row is replaced only at
+                // promotion time (Sprint 2b-C inbound flow / Slice 4
+                // — the peer's reply under the new chain triggers
+                // promotePendingToActive). Writing to pending here
+                // also enables outbound reuse (Slice 3 reuse check
+                // above) so msg #2 before promotion does NOT consume
+                // a second OPK.
+                //
+                // The legacy `saveSession` to active is preserved as
+                // a fallback when sessionTransactionRepository is
+                // null (test fixtures that construct DMS without
+                // wiring the new repos). Production AppContainer
+                // wires the SqlDelight-backed instance so the
+                // commit-to-pending path is always taken at runtime.
+                // ═════════════════════════════════════════════════
+                val sessionTxRepo = sessionTransactionRepository
+                if (sessionTxRepo != null) {
+                    val bootstrapArtifactsBlob = BootstrapArtifacts(
+                        x3dhInit = bootstrap.x3dhInit,
+                        recipientPubkeyHex = recipientPublicKeyHex,
+                    ).toBlob(json)
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "SEND_TRACE commit_initiator_pending_start conv=$convTag",
+                    )
+                    sessionTxRepo.commitInitiatorPending(
+                        conversationId = conversationId,
+                        stateBlob = json.encodeToString(newState),
+                        bootstrapArtifactsBlob = bootstrapArtifactsBlob,
+                        nowMs = nowMsProvider(),
+                    )
+                    messagingLog(
+                        MessagingLogLevel.INFO,
+                        "SEND_TRACE commit_initiator_pending_ok conv=$convTag",
+                    )
+                    // L7 cap enforcement — same shape as the inbound
+                    // flow's post-commit enforce. A new conversation
+                    // raises the count; INSERT OR REPLACE on the same
+                    // conv leaves it unchanged. The enforcer is
+                    // idempotent (no-op when count ≤ cap).
+                    val evicted = pendingSessionCapEnforcer?.enforce() ?: 0
+                    if (evicted > 0) {
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "SEND_TRACE pending_cap_evict_outbound conv=$convTag evicted=$evicted",
+                        )
+                    }
+                } else {
+                    // Legacy fallback (test fixtures only).
+                    messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_start conv=$convTag")
+                    sessionManager.saveSession(conversationId, newState)
+                    messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
+                }
 
                 // PR-CRYPTO-SESSION-REPAIR1 commit 4 (2026-05-30): clear
                 // session_suspect ONLY after the local crypto commit
@@ -2524,6 +2726,148 @@ class DefaultMessagingService(
                             e.message?.contains("verification", ignoreCase = true) == true
                         ) {
                             // ═════════════════════════════════════════════════════════
+                            // Sprint 2b-C Slice 4 — pending fallback BEFORE inbound
+                            // repair branch.
+                            //
+                            // Active session decrypt just failed MAC. Before
+                            // entering the (more expensive) inbound-repair
+                            // branch — which fetches the X3DH candidate state
+                            // via recipientBootstrapInMemory — try the pending
+                            // row. If the conversation has a pending session
+                            // (outbound INITIATOR pending or inbound RESPONDER
+                            // pending from a prior commitBootstrap) AND the
+                            // current envelope decrypts under that pending
+                            // state, the envelope belongs to the new chain
+                            // and we promote pending->active atomically.
+                            //
+                            // This covers the typical Sprint 2b-C steady-state
+                            // flow:
+                            //   - We sent msg #1 → outbound bootstrap wrote
+                            //     pending (INITIATOR).
+                            //   - Peer received, recipient-bootstrapped, replied.
+                            //   - The reply arrives here: active is stale (we
+                            //     never wrote active for this conv under Slice
+                            //     3), MAC fails on active → fall to pending.
+                            //   - Pending decrypts the reply → promote.
+                            //
+                            // Pending fallback skipped when:
+                            //   - pendingRatchetStateRepository null (legacy
+                            //     test fixture);
+                            //   - no pending row for this conv;
+                            //   - pending decrypt also fails MAC (fall through
+                            //     to inbound-repair branch below).
+                            //
+                            // On promote=false (rare race: pending evicted
+                            // between decrypt success and promote call), we
+                            // still return the decrypted plaintext per the
+                            // Slice 4 lock (Vladislav 2026-06-15) — successful
+                            // decrypt is never held; log carries the verdict.
+                            // ═════════════════════════════════════════════════════════
+                            val pendingEntity = pendingRatchetStateRepository?.get(conversationId)
+                            val sessionTxForPending = sessionTransactionRepository
+                            if (pendingEntity != null && sessionTxForPending != null) {
+                                val pendingDecryptStartMs = Clock.System.now().toEpochMilliseconds()
+                                val pendingDecrypt: Pair<RatchetState, ByteArray>? = try {
+                                    val pendingState = json.decodeFromString<RatchetState>(pendingEntity.stateBlob)
+                                    ratchet.decrypt(pendingState, encrypted)
+                                } catch (ce: kotlinx.coroutines.CancellationException) {
+                                    throw ce
+                                } catch (t: Throwable) {
+                                    null
+                                }
+                                if (pendingDecrypt != null) {
+                                    val (advancedPendingState, decryptedPlaintext) = pendingDecrypt
+                                    // Two-step: persist the advanced pending
+                                    // state THEN promote. Crash between leaves
+                                    // pending updated; future inbound retries
+                                    // the fallback (idempotent through
+                                    // markProcessed ledger below).
+                                    pendingRatchetStateRepository.upsert(
+                                        conversationId = conversationId,
+                                        stateBlob = json.encodeToString(advancedPendingState),
+                                        reservedAtMs = pendingEntity.reservedAtMs,
+                                        bootstrapArtifactsBlob = pendingEntity.bootstrapArtifactsBlob,
+                                    )
+                                    val promoted = sessionTxForPending.promotePendingToActive(conversationId)
+                                    // PR #317 review P1-2 (2026-06-15) — REMOVED
+                                    // the safety-net `saveSession(advancedPendingState)`
+                                    // that fired on promote=false. The original safety
+                                    // net adopted the new chain into the active slot
+                                    // without consuming the backing OPK at the SOLE
+                                    // promote-time consume site — a path that could
+                                    // accept a new session while leaving the OPK in
+                                    // the local pool, available for republish and
+                                    // reuse by a different peer. That broke the
+                                    // deferred-consume invariant (§ADR-029 L4).
+                                    //
+                                    // Behaviour on promote=false now:
+                                    //  - log `promotion=false reason=pending_evicted_between_commit_and_promote`
+                                    //  - return the decrypted plaintext (Slice 4
+                                    //    lock — no hold on a successful decrypt)
+                                    //  - do NOT update `ratchet_state` (active
+                                    //    stays whatever it held before this
+                                    //    envelope arrived — typically the
+                                    //    pre-bootstrap RESPONDER row).
+                                    //
+                                    // Recovery path is peer-conditional:
+                                    //  - If the peer's NEXT outbound to this
+                                    //    conversation re-attaches `x3dhInit`
+                                    //    (their own Sprint 2a guard fires on a
+                                    //    role/state condition), the inbound-
+                                    //    repair branch below re-derives via
+                                    //    recipientBootstrapInMemory + a fresh
+                                    //    reserve/commit/promote cycle and
+                                    //    active is replaced cleanly. Pending is
+                                    //    already gone (the L7 race that hit us
+                                    //    here deleted it), so the pending
+                                    //    fallback above no-ops on retry — the
+                                    //    repair branch is the only recovery.
+                                    //  - If the peer treats its bootstrap as
+                                    //    complete and ships plain envelopes
+                                    //    WITHOUT `x3dhInit`, active MAC-fails
+                                    //    forever → `fail_mac action=hold` path
+                                    //    until either side's Sprint 2a guard
+                                    //    fires on a future outbound or the user
+                                    //    re-pairs. Sprint 2b-C does NOT add a
+                                    //    "stuck active" detector; the residual
+                                    //    hold rate is the observable signal.
+                                    //
+                                    // The tradeoff is intentional (§ADR-029
+                                    // amendment 2026-06-15): a stale active is
+                                    // recoverable; a silently-adopted new
+                                    // active over an unconsumed OPK is a
+                                    // stealthy crypto-invariant breach.
+                                    val promotionLog = if (promoted) "promotion=true"
+                                        else "promotion=false reason=pending_evicted_between_commit_and_promote"
+                                    messagingLog(
+                                        MessagingLogLevel.INFO,
+                                        "DECRYPT_TRACE pending_fallback_ok msgId=${deliver.messageId.take(8)} " +
+                                            "conv=${conversationId.take(8)} " +
+                                            "plaintextBytes=${decryptedPlaintext.size} " +
+                                            "elapsedMs=${Clock.System.now().toEpochMilliseconds() - pendingDecryptStartMs} " +
+                                            promotionLog,
+                                    )
+                                    processedEnvelopeRepository?.markProcessed(
+                                        envelopeId = deliver.messageId,
+                                        conversationId = conversationId,
+                                        senderPubKeyHex = senderPubKeyHex,
+                                        payloadType = "unknown",
+                                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                                        nowMs = Clock.System.now().toEpochMilliseconds(),
+                                    )
+                                    return@withLock decryptedPlaintext
+                                }
+                                // Pending decrypt also failed MAC → log + fall
+                                // through to the inbound-repair branch.
+                                messagingLog(
+                                    MessagingLogLevel.INFO,
+                                    "DECRYPT_TRACE pending_fallback_fail msgId=${deliver.messageId.take(8)} " +
+                                        "conv=${conversationId.take(8)} " +
+                                        "reason=mac_fail_under_pending",
+                                )
+                            }
+
+                            // ═════════════════════════════════════════════════════════
                             // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 2 (2026-05-29) —
                             // ADDITIVE inbound-repair branch (architect-ACKed
                             // mini-lock fe90c8a9 + commit-1 ACK 61724ed7).
@@ -2661,36 +3005,67 @@ class DefaultMessagingService(
                                 if (repairResult.isSuccess) {
                                     val (advancedState, decryptedPlaintext) =
                                         repairResult.getOrThrow()
-                                    // Commit the advanced state ONLY NOW —
-                                    // candidate-decrypt succeeded, so the new
-                                    // ratchet is valid and replaces the stale
-                                    // on-disk row.
-                                    sessionManager.saveSession(conversationId, advancedState)
-                                    // Sprint 2b-B L4 phase 3 success — also
-                                    // upsert the candidate into the pending
-                                    // slot so the Sprint 2b-C pending->active
-                                    // promotion path has the row it needs.
-                                    // The active row above stays in place to
-                                    // preserve decrypt continuity until 2b-C
-                                    // wires the promotion trigger; the
-                                    // reservation row stays in place (under
-                                    // amended L4 OPK consumption is deferred
-                                    // to promotion); the `local_one_time_pre_key`
-                                    // row stays in place. M-2bB-5 pins this
-                                    // tri-preservation contract.
+                                    // ═════════════════════════════════════
+                                    // Sprint 2b-C Slice 4 — removed the
+                                    // pre-Slice-4 `saveSession + commitBootstrap`
+                                    // dual-write. The candidate's advanced
+                                    // state goes through `commitBootstrap`
+                                    // (writes pending) then
+                                    // `promotePendingToActive` (atomically
+                                    // copies pending->active + consumes OPK +
+                                    // releases reservation). Net effect:
+                                    // active row is the advanced state, OPK
+                                    // is consumed AT THIS SITE for the first
+                                    // time (deferred-consume contract per
+                                    // amended L4).
                                     //
-                                    // commitBootstrap returns false when the
-                                    // reservation was released between L4
-                                    // phase 1 and phase 3 (e.g. by an L7 cap
-                                    // eviction or L6 sweep). In that race
-                                    // window the pending row is intentionally
-                                    // dropped — the active row is the source
-                                    // of truth for this envelope, so no
-                                    // correctness loss; just no Sprint 2b-C
-                                    // promotion handle for THIS conversation
-                                    // until the next inbound repair fires.
+                                    // Branch matrix (PR #317 Round 3 P2-B
+                                    // 2026-06-16):
+                                    //   (A) sessionTx == null — legacy
+                                    //       fixture WITHOUT Sprint 2b-C
+                                    //       wiring. Production never enters
+                                    //       this branch (AppContainer wires
+                                    //       SqlDelight-backed sessionTx).
+                                    //       Behaviour: saveSession-only,
+                                    //       log reason=`legacy_fixture`.
+                                    //   (B) opkIdForCommit == null AND
+                                    //       sessionTx != null — production
+                                    //       3-DH path (peer's x3dhInit
+                                    //       carried NO opkKeyIdHex because
+                                    //       our published bundle had no
+                                    //       OPKs available when peer fetched
+                                    //       it; server-contract pin #1 falls
+                                    //       back to 3-DH). No OPK to
+                                    //       reserve, no OPK to consume — the
+                                    //       deferred-consume protocol is
+                                    //       moot. Behaviour: saveSession
+                                    //       directly to active (no pending,
+                                    //       no promotion), log reason=
+                                    //       `no_opk_in_x3dh_init`.
+                                    //   (C) 4-DH production path — the
+                                    //       normal Sprint 2b-C commit ->
+                                    //       promote flow with deferred
+                                    //       consume. On commit=false log
+                                    //       reason=`reservation_released_between_phases`;
+                                    //       on commit=true promote=false
+                                    //       log reason=
+                                    //       `pending_evicted_between_commit_and_promote`.
+                                    //       No saveSession safety-net on
+                                    //       (C) — see PR #317 P1-2 comment
+                                    //       blocks below for the deferred-
+                                    //       consume invariant rationale.
+                                    //
+                                    // All branches return decrypted plaintext
+                                    // — Slice 4 lock: successful decrypt is
+                                    // not held; the log line carries the
+                                    // promotion verdict for diagnostics.
+                                    // ═════════════════════════════════════
                                     val opkIdForCommit = inboundX3dhInit.opkKeyIdHex
                                     val sessionTx = sessionTransactionRepository
+                                    var promoted = false
+                                    var commitSucceeded = false
+                                    val noOpkPath = opkIdForCommit == null && sessionTx != null
+                                    val legacyFixturePath = sessionTx == null
                                     if (opkIdForCommit != null && sessionTx != null) {
                                         val advancedStateJson = json.encodeToString(advancedState)
                                         val committed = sessionTx.commitBootstrap(
@@ -2699,6 +3074,7 @@ class DefaultMessagingService(
                                             stateBlob = advancedStateJson,
                                             bootstrapArtifactsBlob = null,
                                         )
+                                        commitSucceeded = committed
                                         if (!committed) {
                                             messagingLog(
                                                 MessagingLogLevel.INFO,
@@ -2707,17 +3083,45 @@ class DefaultMessagingService(
                                                     "conv=${conversationId.take(8)} " +
                                                     "reason=reservation_released_between_phases",
                                             )
+                                            // PR #317 review P1-2 (2026-06-15) —
+                                            // REMOVED the safety-net `saveSession`
+                                            // for the commit-false case. The
+                                            // original safety net adopted the
+                                            // advanced chain into active without
+                                            // running the SOLE OPK-consume site
+                                            // (promote). That broke the
+                                            // deferred-consume invariant
+                                            // (§ADR-029 L4) — a new session could
+                                            // be accepted while leaving its
+                                            // backing OPK in the local pool,
+                                            // republishable + reusable by a
+                                            // different peer.
+                                            //
+                                            // Behaviour on commit-false now:
+                                            //  - log + return decrypted plaintext
+                                            //  - do NOT update `ratchet_state`
+                                            //
+                                            // Recovery on commit-false is
+                                            // peer-conditional in the same way
+                                            // as the pending-fallback promote-
+                                            // false branch above (the reservation
+                                            // got released between phase 1 and
+                                            // phase 3 — typically L7 cap eviction
+                                            // or L6 sweep — so pending was never
+                                            // written either, and there is
+                                            // nothing for a Sprint 2b-C runtime
+                                            // re-entry to find). The next
+                                            // recovery requires the peer to
+                                            // attach `x3dhInit` again on a
+                                            // future outbound, re-firing this
+                                            // same repair branch. If the peer
+                                            // does not, active MAC-fails →
+                                            // `fail_mac action=hold`. See the
+                                            // pending-fallback branch comment
+                                            // above for the full tradeoff
+                                            // rationale (§ADR-029 amendment
+                                            // 2026-06-15).
                                         } else {
-                                            // Sprint 2b-B L7 — enforce the
-                                            // cap after every successful
-                                            // commit. Repeated repairs for
-                                            // the same conversation_id
-                                            // upsert the SAME pending row
-                                            // (INSERT OR REPLACE), so the
-                                            // cap counts DISTINCT
-                                            // conversations, not repairs.
-                                            // M-2bB-6 + M-2bB-7 pin
-                                            // eviction behaviour.
                                             val evicted = pendingSessionCapEnforcer?.enforce() ?: 0
                                             if (evicted > 0) {
                                                 messagingLog(
@@ -2727,7 +3131,45 @@ class DefaultMessagingService(
                                                         "evicted=$evicted",
                                                 )
                                             }
+                                            // Sprint 2b-C Slice 4 — atomic
+                                            // promotion. Reads pending (which
+                                            // holds the just-committed
+                                            // advanced state) + replaces
+                                            // active + deletes pending +
+                                            // releases reservation + deletes
+                                            // local OPK. All in one tx.
+                                            promoted = sessionTx.promotePendingToActive(conversationId)
+                                            // PR #317 review P1-2 — REMOVED the
+                                            // safety-net `saveSession` for the
+                                            // promote-false case for the same
+                                            // deferred-consume reason as the
+                                            // commit-false branch above.
                                         }
+                                    } else if (noOpkPath) {
+                                        // Branch (B) — production 3-DH path.
+                                        // x3dhInit carried no opkKeyIdHex
+                                        // (relay handed peer a 3-DH bundle
+                                        // because our published bundle had
+                                        // no OPKs at fetch time). No OPK
+                                        // lifecycle to coordinate — write
+                                        // active directly. The deferred-
+                                        // consume invariant doesn't apply
+                                        // because no OPK is being consumed.
+                                        sessionManager.saveSession(conversationId, advancedState)
+                                    } else {
+                                        // Branch (A) — legacy fixture without
+                                        // Sprint 2b-C wiring. Production
+                                        // never enters this branch.
+                                        sessionManager.saveSession(conversationId, advancedState)
+                                    }
+                                    val promotionLogSegment = when {
+                                        noOpkPath -> "promotion=skipped reason=no_opk_in_x3dh_init"
+                                        legacyFixturePath -> "promotion=skipped reason=legacy_fixture"
+                                        promoted -> "promotion=true"
+                                        !commitSucceeded ->
+                                            "promotion=false reason=reservation_released_between_phases"
+                                        else ->
+                                            "promotion=false reason=pending_evicted_between_commit_and_promote"
                                     }
                                     messagingLog(
                                         MessagingLogLevel.INFO,
@@ -2735,7 +3177,8 @@ class DefaultMessagingService(
                                             "conv=${conversationId.take(8)} " +
                                             "bootstrap=true " +
                                             "plaintextBytes=${decryptedPlaintext.size} " +
-                                            "elapsedMs=${Clock.System.now().toEpochMilliseconds() - repairStartMs}",
+                                            "elapsedMs=${Clock.System.now().toEpochMilliseconds() - repairStartMs} " +
+                                            promotionLogSegment,
                                     )
                                     // markProcessed PROCESSED — matches the
                                     // existing state != null success path at
@@ -2796,6 +3239,16 @@ class DefaultMessagingService(
                                         inboundX3dhInit.opkKeyIdHex?.let { opkId ->
                                             opkReservationRepository.release(opkId)
                                         }
+                                    }
+                                    // Sprint 2b-C L8 — opk_not_found_total
+                                    // metric seam. Increments only on the
+                                    // exact OpkNotFound class (the field-
+                                    // smoke shape); other failure classes
+                                    // already log their distinct errorClass.
+                                    if (err is phantom.core.messaging.SessionBootstrapException.OpkNotFound) {
+                                        opkNotFoundMetric?.recordOpkNotFound(
+                                            OpkNotFoundMetric.Reason.INBOUND_REPAIR_OPK_NOT_FOUND,
+                                        )
                                     }
                                     // INTENTIONAL fall-through to the existing
                                     // hold branch below. The candidate state
