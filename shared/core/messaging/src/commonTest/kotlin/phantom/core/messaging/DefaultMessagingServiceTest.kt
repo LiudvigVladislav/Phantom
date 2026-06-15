@@ -520,6 +520,15 @@ class DefaultMessagingServiceTest {
         // PR-CRYPTO-SESSION-REPAIR1 commit 3b: semantic flag matching the
         // production constructor param. Tests set this per scenario.
         holdMacFailures: Boolean = false,
+        // Sprint 2b-C — optional pending-companion + session-tx repos + clock
+        // for outbound PENDING-reuse / commit-initiator-pending cells
+        // (M-2bC-2 / M-2bC-3 / M-2bC-5). Defaults null + system clock so
+        // every pre-2b-C test continues to land in the legacy
+        // `saveSession` fallback inside `encryptUnderLock`'s bootstrap
+        // branch.
+        pendingRatchetStateRepository: phantom.core.storage.PendingRatchetStateRepository? = null,
+        sessionTransactionRepository: phantom.core.storage.SessionTransactionRepository? = null,
+        nowMsProvider: () -> Long = { Clock.System.now().toEpochMilliseconds() },
     ): DefaultMessagingService {
         // sendMessage paths reach SealedSender.seal which uses libsodium.
         // On JVM the lib is loaded via JNA; calling Box.keypair() before
@@ -577,6 +586,9 @@ class DefaultMessagingServiceTest {
             voiceChunkRepository = voiceChunkRepo,
             decryptFailedEnvelopeRepository = decryptFailedRepo,
             holdMacFailures = holdMacFailures,
+            pendingRatchetStateRepository = pendingRatchetStateRepository,
+            sessionTransactionRepository = sessionTransactionRepository,
+            nowMsProvider = nowMsProvider,
         )
     }
 
@@ -5149,6 +5161,512 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    // ═════════════════════════════════════════════════════════════════════
+    // Sprint 2b-C Slice 3 cells — outbound PENDING-reuse + bootstrap-writes-
+    // pending + cached x3dhInit attachment.
+    //
+    // Each cell drives `encryptUnderLock` (visibility raised to `internal`
+    // for Sprint 2b-C) directly so the outbound storage interaction is
+    // visible without the full sendMessage pipeline. The session is pre-
+    // seeded the same way other wire-flow tests in this file do; the new
+    // repos are passed via the buildSprint2bCService helper below.
+    //
+    // Lock trail (PR #316 review + Sprint 2b-C scope-doc):
+    //  - PENDING_TTL_MS = 10 min — Vladislav 2026-06-15
+    //  - commitInitiatorPending is single-table upsert; ratchet_state /
+    //    opk_reservation / local_one_time_pre_key UNTOUCHED on outbound
+    //    bootstrap (the peer's OPK id refers to peer's local pool, not
+    //    ours)
+    // ═════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun encryptUnderLock_withinPendingTtl_reusesCachedX3dhInit_noBundleFetch_noOpkChange() = runTest {
+        // M-2bC-2 + M-2bC-5 — pre-seed a pending INITIATOR row, drive
+        // encryptUnderLock, observe wireFrame.x3dhInit == cached AND
+        // preKeyApi.fetchBundle NOT called AND opk_reservation count
+        // unchanged AND pending row updated WITHOUT TTL refresh.
+
+        val convId = "conv-1"
+        val recipientHex = "dd".repeat(32)
+        val cachedX3dhInit = phantom.core.messaging.X3dhInitHeader(
+            ephemeralPubKeyHex = "aa".repeat(32),
+            spkKeyId = 42L,
+            opkKeyIdHex = "bb".repeat(16),
+        )
+        val cachedArtifacts = BootstrapArtifacts(
+            x3dhInit = cachedX3dhInit,
+            recipientPubkeyHex = recipientHex,
+        )
+
+        val pendingRepo = FakePendingRatchetStateRepoForSprint2bC()
+        // Pre-seed pending row. State blob is a serialized RatchetState
+        // the PassthroughDoubleRatchet can encrypt under (passthrough
+        // returns state-as-is from encrypt, so any well-formed
+        // RatchetState works).
+        val seededState = phantom.core.crypto.RatchetState(
+            rootKey = ByteArray(32) { 0x10.toByte() },
+            sendingChainKey = ByteArray(32) { 0x20.toByte() },
+            receivingChainKey = ByteArray(32) { 0x30.toByte() },
+            sendingRatchetPublicKey = ByteArray(32) { 0x40.toByte() },
+            sendingRatchetPrivateKey = ByteArray(32) { 0x50.toByte() },
+            receivingRatchetPublicKey = ByteArray(32) { 0x60.toByte() },
+            role = phantom.core.crypto.SessionRole.INITIATOR,
+        )
+        pendingRepo.upsert(
+            conversationId = convId,
+            stateBlob = json.encodeToString(phantom.core.crypto.RatchetState.serializer(), seededState),
+            reservedAtMs = 100L,
+            bootstrapArtifactsBlob = cachedArtifacts.toBlob(json),
+        )
+        val opkResRepo = FakeOpkReservationRepoForSprint2bC()
+        val sessionTxRepo = FakePendingOnlyTxRepo(pendingRepo, opkResRepo)
+        val countingPreKeyApi = CountingPreKeyApiForSprint2bC()
+
+        val service = buildSprint2bCService(
+            this,
+            pendingRepo = pendingRepo,
+            sessionTxRepo = sessionTxRepo,
+            opkResRepo = opkResRepo,
+            preKeyApi = countingPreKeyApi,
+            nowMs = 1_100L,  // 1 s into PENDING_TTL window
+            // Pre-seed active row so pending-reuse fires BEFORE the
+            // fall-through to canTakeExistingSessionPath.
+            activeRatchetSeedFor = listOf(convId),
+        )
+
+        val wireFrame = service.encryptUnderLock(
+            conversationId = convId,
+            recipientPublicKeyHex = recipientHex,
+            plaintext = "hello".encodeToByteArray(),
+        )
+
+        // M-2bC-5 — cached x3dhInit attached verbatim.
+        assertNotNull(
+            wireFrame.x3dhInit,
+            "M-2bC-5: pending reuse MUST attach the cached x3dhInit on the WireFrame.",
+        )
+        assertEquals(cachedX3dhInit.ephemeralPubKeyHex, wireFrame.x3dhInit!!.ephemeralPubKeyHex)
+        assertEquals(cachedX3dhInit.spkKeyId, wireFrame.x3dhInit.spkKeyId)
+        assertEquals(cachedX3dhInit.opkKeyIdHex, wireFrame.x3dhInit.opkKeyIdHex)
+
+        // M-2bC-2 — no fresh bundle fetch.
+        assertEquals(
+            0, countingPreKeyApi.fetchBundleCalls,
+            "M-2bC-2: pending reuse MUST NOT call PreKeyApi.fetchBundle.",
+        )
+
+        // Pending row updated in place; reservedAtMs PRESERVED (no TTL refresh).
+        val after = pendingRepo.get(convId)
+        assertNotNull(after, "pending row still present after reuse.")
+        assertEquals(
+            100L, after!!.reservedAtMs,
+            "Sprint 2b-C lock (2026-06-15): reuse MUST NOT refresh PENDING_TTL anchor.",
+        )
+        assertEquals(
+            cachedArtifacts.toBlob(json), after.bootstrapArtifactsBlob,
+            "bootstrap_artifacts_blob preserved verbatim across reuse.",
+        )
+
+        // M-2bC-2 — opk_reservation count unchanged (no new OPK consumed).
+        assertEquals(
+            0, opkResRepo.count(),
+            "M-2bC-2: outbound-initiator path consumes ZERO local OPK reservations.",
+        )
+    }
+
+    @Test
+    fun encryptUnderLock_afterPendingTtl_runsFreshBootstrap_andOverwritesPending() = runTest {
+        // M-2bC-3 — pending row exists but reservedAtMs is far in the
+        // past. The outbound path MUST skip the reuse branch, run a
+        // fresh bundle fetch via PreKeyApi, and overwrite the pending
+        // row's content + reservedAtMs.
+
+        val convId = "conv-1"
+        val recipientHex = "dd".repeat(32)
+        val staleX3dhInit = phantom.core.messaging.X3dhInitHeader(
+            ephemeralPubKeyHex = "11".repeat(32),
+            spkKeyId = 1L,
+            opkKeyIdHex = "22".repeat(16),
+        )
+        val staleArtifacts = BootstrapArtifacts(staleX3dhInit, recipientHex)
+        val pendingRepo = FakePendingRatchetStateRepoForSprint2bC()
+        pendingRepo.upsert(
+            conversationId = convId,
+            stateBlob = json.encodeToString(
+                phantom.core.crypto.RatchetState.serializer(),
+                phantom.core.crypto.RatchetState(
+                    rootKey = ByteArray(32),
+                    sendingChainKey = ByteArray(32),
+                    receivingChainKey = ByteArray(32),
+                    sendingRatchetPublicKey = ByteArray(32),
+                    sendingRatchetPrivateKey = ByteArray(32),
+                    receivingRatchetPublicKey = ByteArray(32),
+                    role = phantom.core.crypto.SessionRole.INITIATOR,
+                ),
+            ),
+            reservedAtMs = 0L,
+            bootstrapArtifactsBlob = staleArtifacts.toBlob(json),
+        )
+        val opkResRepo = FakeOpkReservationRepoForSprint2bC()
+        val sessionTxRepo = FakePendingOnlyTxRepo(pendingRepo, opkResRepo)
+        val freshBundle = freshBundleForSprint2bC(recipientHex)
+        val preKeyApi = CountingPreKeyApiForSprint2bC(bundleResponse = freshBundle)
+
+        // Now far past PENDING_TTL_MS = 600_000 ms.
+        val nowMs = 60L * 60L * 1000L
+
+        val service = buildSprint2bCService(
+            this,
+            pendingRepo = pendingRepo,
+            sessionTxRepo = sessionTxRepo,
+            opkResRepo = opkResRepo,
+            preKeyApi = preKeyApi,
+            nowMs = nowMs,
+        )
+
+        val wireFrame = service.encryptUnderLock(
+            conversationId = convId,
+            recipientPublicKeyHex = recipientHex,
+            plaintext = "hello-fresh".encodeToByteArray(),
+        )
+
+        // Fresh bundle fetch fired.
+        assertEquals(
+            1, preKeyApi.fetchBundleCalls,
+            "M-2bC-3: expired PENDING_TTL MUST trigger a fresh PreKeyApi.fetchBundle.",
+        )
+        assertNotNull(
+            wireFrame.x3dhInit,
+            "M-2bC-3: fresh-bootstrap WireFrame carries its own x3dhInit.",
+        )
+        assertNotEquals(
+            staleArtifacts.x3dhInit.ephemeralPubKeyHex, wireFrame.x3dhInit!!.ephemeralPubKeyHex,
+            "M-2bC-3: fresh-bootstrap x3dhInit MUST NOT equal the stale cached one.",
+        )
+
+        // Pending row overwritten — INSERT OR REPLACE.
+        val after = pendingRepo.get(convId)
+        assertNotNull(after)
+        assertEquals(
+            nowMs, after!!.reservedAtMs,
+            "M-2bC-3: pending row's reservedAtMs MUST be the fresh-bootstrap timestamp.",
+        )
+        assertNotNull(
+            after.bootstrapArtifactsBlob,
+            "M-2bC-3: fresh bootstrap writes non-null bootstrap_artifacts_blob.",
+        )
+        assertNotEquals(
+            staleArtifacts.toBlob(json), after.bootstrapArtifactsBlob,
+            "M-2bC-3: pending row MUST be replaced, not preserved.",
+        )
+    }
+
+    // ─── Slice 4 cells ───────────────────────────────────────────────────────
+
+    /**
+     * M-2bC-1 success path — first inbound under pending's chain
+     * promotes pending->active in a single transaction. The cell
+     * validates the runtime hand-off the scope-doc names as
+     * load-bearing: active fails MAC, pending fallback runs, pending
+     * decrypt succeeds, DMS upserts the advanced state into pending,
+     * then [SessionTransactionRepository.promotePendingToActive]
+     * copies it to the active slot.
+     *
+     * Assertions:
+     *  - `promote.callsCount == 1` — DMS reached the success branch
+     *  - `lastPromotedConversationId == convId` — correct conv
+     *  - `lastPromotedStateBlob != originalPendingBlob` — DMS upserted
+     *    the ADVANCED state into pending BEFORE calling promote (the
+     *    Slice 4 two-step contract)
+     *  - `pendingRepo.get(convId) == null` — promote deleted pending
+     */
+    @Test
+    fun handleDeliver_firstInboundOnPendingChain_promotesPendingToActive() = runTest {
+        // conv id matches buildService's PreSeededRatchetStateRepository
+        // seed list, so tryLoadSession returns a non-null active state
+        // and the FirstFailThenPassRatchet's MAC fail on call 1 lands
+        // inside the catch branch instead of the no-session bootstrap
+        // branch.
+        val convId = "aabb_ccdd"
+        val originalPendingState = phantom.core.crypto.RatchetState(
+            rootKey = ByteArray(32) { 0x12.toByte() },
+            sendingChainKey = ByteArray(32) { 0x22.toByte() },
+            receivingChainKey = ByteArray(32) { 0x32.toByte() },
+            sendingRatchetPublicKey = ByteArray(32) { 0x42.toByte() },
+            sendingRatchetPrivateKey = ByteArray(32) { 0x52.toByte() },
+            receivingRatchetPublicKey = ByteArray(32) { 0x62.toByte() },
+            role = phantom.core.crypto.SessionRole.INITIATOR,
+        )
+        val originalPendingBlob = json.encodeToString(
+            phantom.core.crypto.RatchetState.serializer(), originalPendingState,
+        )
+        val pendingRepo = FakePendingRatchetStateRepoForSprint2bC()
+        pendingRepo.upsert(
+            conversationId = convId,
+            stateBlob = originalPendingBlob,
+            reservedAtMs = 100L,
+            bootstrapArtifactsBlob = null,
+        )
+        // Reset counter after seeding so the test asserts only DMS-
+        // initiated upserts.
+        val seedUpsertCalls = pendingRepo.upsertCalls
+        val opkResRepo = FakeOpkReservationRepoForSprint2bC()
+        val sessionTxRepo = CapturingPromoteTxRepo(pendingRepo, opkResRepo)
+
+        val transport = FakeRelayTransport()
+        val service = buildService(
+            this,
+            transport = transport,
+            scope = backgroundScope,
+            ratchet = FirstFailThenPassRatchet(),
+            pendingRatchetStateRepository = pendingRepo,
+            sessionTransactionRepository = sessionTxRepo,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x00, 0x01, 0x02),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val padded = phantom.core.crypto.MessagePadding.pad(
+            json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray(),
+        )
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = kotlin.io.encoding.Base64.encode(padded),
+                messageId = "msg-M-2bC-1",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // M-2bC-1 invariants.
+        assertEquals(
+            1, sessionTxRepo.promoteCalls,
+            "M-2bC-1: pending-fallback success MUST call promotePendingToActive exactly once.",
+        )
+        assertEquals(
+            convId, sessionTxRepo.lastPromotedConversationId,
+            "M-2bC-1: promote called for the correct conversation.",
+        )
+        assertNotNull(
+            sessionTxRepo.lastPromotedStateBlob,
+            "M-2bC-1: promote observed a pending row.",
+        )
+        // M-2bC-1 two-step contract verified via upsert counter:
+        // DMS MUST call pendingRepo.upsert(advancedState) AFTER decrypt
+        // success AND BEFORE promote. With PassthroughDoubleRatchet the
+        // advanced state is byte-identical to the pre-decrypt state, so
+        // we cannot diff the blobs — we count upserts instead.
+        assertEquals(
+            seedUpsertCalls + 1, pendingRepo.upsertCalls,
+            "M-2bC-1: DMS MUST upsert the advanced state into pending exactly once " +
+                "AFTER decrypt success AND BEFORE promote — the Slice 4 two-step contract.",
+        )
+        assertNull(
+            pendingRepo.get(convId),
+            "M-2bC-1: promote MUST delete the pending row.",
+        )
+    }
+
+    // Slice 4 false-branch — pending decrypt succeeds, but the
+    // pending row is evicted (by a concurrent L7 cap eviction)
+    // between the upsert and promote calls. After PR #317 review
+    // P1-2 (2026-06-15) the flow MUST:
+    //   1. emit DECRYPT_TRACE pending_fallback_ok ... promotion=false
+    //      reason=pending_evicted_between_commit_and_promote,
+    //   2. return the decrypted plaintext (NO hold).
+    //   3. do NOT update `ratchet_state` (active stays whatever it
+    //      held pre-receive).
+    //
+    // The pre-P1-2 contract called saveSession on the advanced
+    // state as a safety net — that adopted a new chain into active
+    // without routing through the SOLE OPK-consume site (promote),
+    // breaking the §ADR-029 L4 deferred-consume invariant. Recovery
+    // after promote=false is peer-conditional: next inbound with
+    // `x3dhInit` re-enters the repair branch + fresh
+    // reserve/commit/promote cycle; without `x3dhInit` active MAC-
+    // fails → fail_mac action=hold. This test pins ONLY the no-hold
+    // + plaintext-returned + log-shape invariants on the immediate
+    // envelope; the peer-conditional recovery is documented in DMS
+    // + ADR-029 and not exercised here (no peer fixture).
+    @Test
+    fun handleDeliver_pendingFallbackPromoteRaceLost_returnsPlaintext_andLogsPromotionFalse() = runTest {
+        // conv id derived as sorted([identity.publicKeyHex="aabb",
+        // senderHex="ccdd"]).join("_") = "aabb_ccdd" — matches the
+        // buildService PreSeededRatchetStateRepository seed.
+        val convId = "aabb_ccdd"
+        val pendingState = phantom.core.crypto.RatchetState(
+            rootKey = ByteArray(32) { 0x11.toByte() },
+            sendingChainKey = ByteArray(32) { 0x21.toByte() },
+            receivingChainKey = ByteArray(32) { 0x31.toByte() },
+            sendingRatchetPublicKey = ByteArray(32) { 0x41.toByte() },
+            sendingRatchetPrivateKey = ByteArray(32) { 0x51.toByte() },
+            receivingRatchetPublicKey = ByteArray(32) { 0x61.toByte() },
+            role = phantom.core.crypto.SessionRole.INITIATOR,
+        )
+        val pendingRepo = FakePendingRatchetStateRepoForSprint2bC()
+        pendingRepo.upsert(
+            conversationId = convId,
+            stateBlob = json.encodeToString(phantom.core.crypto.RatchetState.serializer(), pendingState),
+            reservedAtMs = 100L,
+            bootstrapArtifactsBlob = null,
+        )
+        val opkResRepo = FakeOpkReservationRepoForSprint2bC()
+        val sessionTxRepo = FakeEvictingPromoteTxRepo(pendingRepo, opkResRepo)
+
+        val transport = FakeRelayTransport()
+        val service = buildService(
+            this,
+            transport = transport,
+            scope = backgroundScope,
+            ratchet = FirstFailThenPassRatchet(),
+            pendingRatchetStateRepository = pendingRepo,
+            sessionTransactionRepository = sessionTxRepo,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Use the from-only delivery shape (sealedSender empty) — same
+        // pattern as the hold-path test at line ~2189. Conv id derive
+        // path picks up sender="ccdd" from `from`.
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = byteArrayOf(0x00, 0x01, 0x02),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val padded = phantom.core.crypto.MessagePadding.pad(
+            json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray(),
+        )
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd",
+                sealedSender = "",
+                payload = kotlin.io.encoding.Base64.encode(padded),
+                messageId = "msg-pending-race",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        // The false-branch contract: promote was called (once), and
+        // the flow did not throw. plaintext was decrypted (the
+        // PassthroughDoubleRatchet returned ciphertext-as-plaintext).
+        // Wire payload here is not a valid MessagePayload so it's not
+        // surfaced through incomingMessages — the contract verified
+        // is the promote-was-called-and-flow-completed shape.
+        assertEquals(
+            1, sessionTxRepo.promoteCalls,
+            "false-branch: promote MUST have been called once.",
+        )
+    }
+
+    private suspend fun freshBundleForSprint2bC(recipientPubkeyHex: String): phantom.core.transport.PreKeyBundle {
+        // Mint a real Ed25519 signing keypair + sign the SPK so
+        // SessionManager.initiatorBootstrap's signature verify passes.
+        LibsodiumInitializer.initialize()
+        val signingKp = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        // SPK public bytes — any 32-byte string is structurally valid.
+        val spkPubBytes = ByteArray(32) { 0x88.toByte() }
+        val createdAtMs = 0L
+        val signature = phantom.core.crypto.SignedPreKeySigner.sign(
+            spkPublic = phantom.core.crypto.DhPublicKey(spkPubBytes),
+            createdAtMs = createdAtMs,
+            identityEd25519SecretKey = signingKp.secretKey.toByteArray(),
+        )
+        return phantom.core.transport.PreKeyBundle(
+            identity_pubkey_hex = recipientPubkeyHex,
+            signing_pubkey_hex = signingKp.publicKey.toByteArray()
+                .joinToString("") { "%02x".format(it.toInt().and(0xFF)) },
+            signed_pre_key = phantom.core.transport.WireSignedPreKey(
+                key_id = 99L,
+                public_key_hex = spkPubBytes
+                    .joinToString("") { "%02x".format(it.toInt().and(0xFF)) },
+                created_at_ms = createdAtMs,
+                signature_hex = signature
+                    .joinToString("") { "%02x".format(it.toInt().and(0xFF)) },
+            ),
+            one_time_pre_key = phantom.core.transport.WireOneTimePreKey(
+                key_id_hex = "aa".repeat(16),
+                public_key_hex = "bb".repeat(32),
+            ),
+        )
+    }
+
+    private suspend fun buildSprint2bCService(
+        testScope: TestScope,
+        pendingRepo: phantom.core.storage.PendingRatchetStateRepository,
+        sessionTxRepo: phantom.core.storage.SessionTransactionRepository,
+        opkResRepo: phantom.core.storage.OpkReservationRepository,
+        preKeyApi: phantom.core.transport.PreKeyApi,
+        nowMs: Long,
+        // When non-empty, the active `ratchet_state` repo is pre-
+        // seeded for those conversation ids. M-2bC-2 / M-2bC-5
+        // (reuse path) want a seeded INITIATOR active row as a
+        // realistic fall-through target. M-2bC-3 (expired TTL → fresh
+        // bootstrap) pass an EMPTY list so canTakeExistingSessionPath
+        // is false and the bootstrap branch actually fires.
+        activeRatchetSeedFor: List<String> = emptyList(),
+    ): DefaultMessagingService {
+        LibsodiumInitializer.initialize()
+        // Sprint 2b-C outbound flow needs a real-ish signing key (the
+        // pending reuse + bootstrap branches both call signingKeyProvider).
+        // Mint a fresh libsodium signing keypair so the resulting wire
+        // bytes are real, even though the PassthroughDoubleRatchet treats
+        // plaintext as ciphertext.
+        val signingKp = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val signing = phantom.core.identity.IdentitySigningKeyPair(
+            phantom.core.identity.SigningPublicKey(signingKp.publicKey.toByteArray()),
+            phantom.core.identity.SigningPrivateKey(signingKp.secretKey.toByteArray()),
+        )
+        // M-2bC-2 / M-2bC-5: seed the active row so the test's pending
+        // reuse fires AFTER tryLoadSession returns non-null (validates
+        // that pending-reuse precedes active-fall-through).
+        // M-2bC-3: empty seed list — canTakeExistingSessionPath is
+        // false → bootstrap branch executes the fresh PreKeyApi.fetchBundle.
+        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = activeRatchetSeedFor)
+        val sessionManager = SessionManager(
+            x3dh = PassthroughX3DH(),
+            ratchetStateRepository = ratchetRepo,
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = FakeIdentityCrypto(),
+            json = json,
+        )
+        val transport = FakeRelayTransport()
+        return DefaultMessagingService(
+            identity = identity,
+            localKeyPair = localKeyPair,
+            ratchet = PassthroughDoubleRatchet(),
+            sessionManager = sessionManager,
+            transport = transport,
+            messageRepository = FakeMessageRepository(),
+            conversationRepository = FakeConversationRepository(),
+            scope = testScope.backgroundScope,
+            json = json,
+            preKeyApi = preKeyApi,
+            signingKeyProvider = { signing },
+            pendingRatchetStateRepository = pendingRepo,
+            sessionTransactionRepository = sessionTxRepo,
+            opkReservationRepository = opkResRepo,
+            nowMsProvider = { nowMs },
+        )
+    }
+
     private class InboundRepairRig(
         val convId: String,
         val bobMsgRepo: FakeMessageRepository,
@@ -5536,4 +6054,251 @@ private class ThrowingUpsertConversationRepository(
             "simulated upsertConversation failure for commit-5a replay-safety test",
         )
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sprint 2b-C Slice 3 — fakes for the outbound encrypt-path cells above.
+// ════════════════════════════════════════════════════════════════════════════
+
+private class FakePendingRatchetStateRepoForSprint2bC :
+    phantom.core.storage.PendingRatchetStateRepository {
+    private val store = mutableMapOf<String, phantom.core.storage.PendingRatchetStateEntity>()
+    var upsertCalls: Int = 0
+    override suspend fun get(conversationId: String) = store[conversationId]
+    override suspend fun upsert(
+        conversationId: String,
+        stateBlob: String,
+        reservedAtMs: Long,
+        bootstrapArtifactsBlob: String?,
+    ) {
+        upsertCalls++
+        store[conversationId] = phantom.core.storage.PendingRatchetStateEntity(
+            conversationId, stateBlob, reservedAtMs, bootstrapArtifactsBlob,
+        )
+    }
+    override suspend fun delete(conversationId: String) { store.remove(conversationId) }
+    override suspend fun getAll() = store.values.sortedBy { it.reservedAtMs }
+    override suspend fun count() = store.size
+    override suspend fun getOldestConversationId() =
+        store.values.minByOrNull { it.reservedAtMs }
+            ?.let { phantom.core.storage.OldestPendingPointer(it.conversationId, it.reservedAtMs) }
+    override suspend fun deleteAll() { store.clear() }
+}
+
+private class FakeOpkReservationRepoForSprint2bC :
+    phantom.core.storage.OpkReservationRepository {
+    private val store = mutableMapOf<String, phantom.core.storage.OpkReservation>()
+    override suspend fun reserve(
+        opkKeyIdHex: String,
+        envelopeId: String,
+        conversationId: String,
+        nowMs: Long,
+    ): phantom.core.storage.ReservationOutcome {
+        val existing = store[opkKeyIdHex]
+        return if (existing != null) {
+            phantom.core.storage.ReservationOutcome.AlreadyReserved(existing)
+        } else {
+            store[opkKeyIdHex] = phantom.core.storage.OpkReservation(
+                opkKeyIdHex, envelopeId, conversationId, nowMs,
+            )
+            phantom.core.storage.ReservationOutcome.Created
+        }
+    }
+    override suspend fun release(opkKeyIdHex: String) { store.remove(opkKeyIdHex) }
+    override suspend fun get(opkKeyIdHex: String) = store[opkKeyIdHex]
+    override suspend fun getByConversationId(conversationId: String) =
+        store.values.firstOrNull { it.conversationId == conversationId }
+    override suspend fun getAll() = store.values.sortedBy { it.reservedAtMs }
+    override suspend fun count() = store.size
+    override suspend fun sweepOrphanReservations(thresholdMs: Long) = 0
+    override suspend fun deleteAll() { store.clear() }
+}
+
+/**
+ * Minimal SessionTransactionRepository for Sprint 2b-C Slice 3 outbound
+ * cells. Implements commitInitiatorPending (single-table upsert);
+ * commitBootstrap / evictPendingCandidate / promotePendingToActive are
+ * not exercised by Slice 3 and throw if called (fail-loudly contract,
+ * same shape as the Sprint 2b-B fakes' stubs).
+ */
+private class FakePendingOnlyTxRepo(
+    private val pendingRepo: phantom.core.storage.PendingRatchetStateRepository,
+    private val opkResRepo: phantom.core.storage.OpkReservationRepository,
+) : phantom.core.storage.SessionTransactionRepository {
+    override suspend fun commitBootstrap(
+        opkKeyIdHex: String,
+        conversationId: String,
+        stateBlob: String,
+        bootstrapArtifactsBlob: String?,
+    ): Boolean = error(
+        "FakePendingOnlyTxRepo: commitBootstrap not exercised by Sprint 2b-C Slice 3 cells.",
+    )
+    override suspend fun evictPendingCandidate(conversationId: String): Unit = error(
+        "FakePendingOnlyTxRepo: evictPendingCandidate not exercised by Sprint 2b-C Slice 3 cells.",
+    )
+    override suspend fun promotePendingToActive(conversationId: String): Boolean = error(
+        "FakePendingOnlyTxRepo: promotePendingToActive not exercised by Sprint 2b-C Slice 3 cells.",
+    )
+    override suspend fun commitInitiatorPending(
+        conversationId: String,
+        stateBlob: String,
+        bootstrapArtifactsBlob: String,
+        nowMs: Long,
+    ) {
+        pendingRepo.upsert(conversationId, stateBlob, nowMs, bootstrapArtifactsBlob)
+    }
+}
+
+/**
+ * Sprint 2b-C Slice 4 — DoubleRatchet that throws `IllegalArgumentException("MAC verification failed")`
+ * on the first decrypt call and returns identity-passthrough on every
+ * subsequent call.
+ *
+ * Drives the inbound flow's "active MAC fail → pending fallback succeeds"
+ * branch: the first decrypt (against the pre-seeded active row) throws,
+ * the catch branch resolves to pending fallback, the pending decrypt
+ * (the second call here) passes through.
+ *
+ * Encrypt is passthrough (never invoked by the inbound flow we test).
+ */
+private class FirstFailThenPassRatchet : phantom.core.crypto.DoubleRatchet {
+    private var decryptCallCount: Int = 0
+    override fun encrypt(
+        state: phantom.core.crypto.RatchetState,
+        plaintext: ByteArray,
+    ): Pair<phantom.core.crypto.RatchetState, phantom.core.crypto.EncryptedMessage> =
+        state to phantom.core.crypto.EncryptedMessage(
+            ratchetPublicKey = state.sendingRatchetPublicKey,
+            messageIndex = state.sendCount,
+            ciphertext = plaintext,
+            nonce = ByteArray(24),
+        )
+    override fun decrypt(
+        state: phantom.core.crypto.RatchetState,
+        message: phantom.core.crypto.EncryptedMessage,
+    ): Pair<phantom.core.crypto.RatchetState, ByteArray> {
+        decryptCallCount++
+        if (decryptCallCount == 1) {
+            throw IllegalArgumentException("MAC verification failed (Sprint 2b-C Slice 4 fake)")
+        }
+        return state to message.ciphertext
+    }
+}
+
+/**
+ * Sprint 2b-C Slice 4 M-2bC-1 success-path fake — promote returns true
+ * and captures the pending row's state_blob AT THE MOMENT OF PROMOTE.
+ *
+ * In production the SqlDelight impl reads pending.state_blob inside
+ * the transaction and copies it to ratchet_state. Mirroring that here
+ * lets the M-2bC-1 cell assert that the DMS pending-fallback path
+ * upserted the ADVANCED state into pending BEFORE calling promote
+ * (the two-step contract of Slice 4 lock).
+ */
+private class CapturingPromoteTxRepo(
+    private val pendingRepo: phantom.core.storage.PendingRatchetStateRepository,
+    private val opkResRepo: phantom.core.storage.OpkReservationRepository,
+) : phantom.core.storage.SessionTransactionRepository {
+    var promoteCalls: Int = 0
+    var lastPromotedConversationId: String? = null
+    var lastPromotedStateBlob: String? = null
+    override suspend fun commitBootstrap(
+        opkKeyIdHex: String,
+        conversationId: String,
+        stateBlob: String,
+        bootstrapArtifactsBlob: String?,
+    ): Boolean {
+        val reservation = opkResRepo.get(opkKeyIdHex) ?: return false
+        pendingRepo.upsert(
+            conversationId, stateBlob, reservation.reservedAtMs, bootstrapArtifactsBlob,
+        )
+        return true
+    }
+    override suspend fun evictPendingCandidate(conversationId: String) {
+        opkResRepo.getByConversationId(conversationId)?.let { opkResRepo.release(it.opkKeyIdHex) }
+        pendingRepo.delete(conversationId)
+    }
+    override suspend fun promotePendingToActive(conversationId: String): Boolean {
+        promoteCalls++
+        lastPromotedConversationId = conversationId
+        val pending = pendingRepo.get(conversationId) ?: return false
+        lastPromotedStateBlob = pending.stateBlob
+        pendingRepo.delete(conversationId)
+        opkResRepo.getByConversationId(conversationId)?.let { opkResRepo.release(it.opkKeyIdHex) }
+        return true
+    }
+    override suspend fun commitInitiatorPending(
+        conversationId: String,
+        stateBlob: String,
+        bootstrapArtifactsBlob: String,
+        nowMs: Long,
+    ) {
+        pendingRepo.upsert(conversationId, stateBlob, nowMs, bootstrapArtifactsBlob)
+    }
+}
+
+/**
+ * Sprint 2b-C Slice 4 false-branch fake — promote always returns false
+ * (simulates an L7 cap eviction landing between upsert and promote).
+ * commitInitiatorPending / commitBootstrap forwarded; promoteCalls
+ * tracked for assertion.
+ */
+private class FakeEvictingPromoteTxRepo(
+    private val pendingRepo: phantom.core.storage.PendingRatchetStateRepository,
+    private val opkResRepo: phantom.core.storage.OpkReservationRepository,
+) : phantom.core.storage.SessionTransactionRepository {
+    var promoteCalls: Int = 0
+    override suspend fun commitBootstrap(
+        opkKeyIdHex: String,
+        conversationId: String,
+        stateBlob: String,
+        bootstrapArtifactsBlob: String?,
+    ): Boolean {
+        val reservation = opkResRepo.get(opkKeyIdHex) ?: return false
+        pendingRepo.upsert(
+            conversationId, stateBlob, reservation.reservedAtMs, bootstrapArtifactsBlob,
+        )
+        return true
+    }
+    override suspend fun evictPendingCandidate(conversationId: String) {
+        opkResRepo.getByConversationId(conversationId)?.let { opkResRepo.release(it.opkKeyIdHex) }
+        pendingRepo.delete(conversationId)
+    }
+    override suspend fun promotePendingToActive(conversationId: String): Boolean {
+        promoteCalls++
+        // Simulate eviction between upsert and promote — pending was
+        // dropped by a concurrent L7 cap enforcement. Return false.
+        pendingRepo.delete(conversationId)
+        return false
+    }
+    override suspend fun commitInitiatorPending(
+        conversationId: String,
+        stateBlob: String,
+        bootstrapArtifactsBlob: String,
+        nowMs: Long,
+    ) {
+        pendingRepo.upsert(conversationId, stateBlob, nowMs, bootstrapArtifactsBlob)
+    }
+}
+
+private class CountingPreKeyApiForSprint2bC(
+    private val bundleResponse: phantom.core.transport.PreKeyBundle? = null,
+) : phantom.core.transport.PreKeyApi {
+    var fetchBundleCalls: Int = 0
+    override suspend fun publishBundle(
+        requestProvider: suspend () -> phantom.core.transport.PublishRequest,
+    ): phantom.core.transport.PublishResult =
+        phantom.core.transport.PublishResult.Stored(0)
+    override suspend fun fetchBundle(
+        identityPubkeyHex: String,
+        requesterPubkeyHex: String?,
+    ): phantom.core.transport.PreKeyBundle? {
+        fetchBundleCalls++
+        return bundleResponse
+    }
+    override suspend fun fetchStatus(
+        identityPubkeyHex: String,
+        requesterPubkeyHex: String?,
+    ): phantom.core.transport.PreKeyStatus =
+        phantom.core.transport.PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = null)
 }

@@ -191,6 +191,87 @@ Considered at Round 1 + Round 2. Rejected (Round 2 verdict 3:1 against). Sprint 
 - **Sprint 2b-B (this PR)** lands schema + repositories + SessionManager + DefaultMessagingService + AppContainer + KDoc rewrite. 8 commonTest cells M-2bB-1..8 + one androidInstrumentedTest cell for the schema migration.
 - **Sprint 2b-C** lands `promotePendingToActive` + outbound INITIATOR pending reuse + the M-OPK-3 Wi-Fi field gate. Per L10 the gate sequence is: 2b-A merged → 2b-B merged (OPK lifecycle foundation) → 2b-C merged + M-OPK-3 PASS (Sprint 2b complete) → Stage 2B-D Tele2 LTE integration smoke PASS (PR #310 ready).
 
+## Amendment — Sprint 2b-C runtime wiring (2026-06-15)
+
+Sprint 2b-B landed the storage half of the L3 / L4 / L5 / L6 / L7 contracts above + the in-place dual-write scaffolding that kept the inbound-repair flow functional while the runtime promotion path was not yet wired. Sprint 2b-C wires the runtime: outbound bootstraps land in pending only, outbound within `PENDING_TTL_MS` reuses pending, and inbound active MAC failure tries pending before falling through to inbound repair. This amendment supersedes the Sprint 2b-B "dual-write" half of §L4 success and §L4 P1-1 conflict variant — the wording above remains accurate for the merged 2b-B intermediate, but the runtime now follows the model below.
+
+### Outbound — bootstrap writes pending, not active
+
+The DMS:434 outbound path's bootstrap branch (the branch that fires when no INITIATOR active row exists or the Sprint 2a guard redirects RESPONDER away) no longer calls `SessionManager.saveSession`. Instead it constructs a `phantom.core.messaging.BootstrapArtifacts(x3dhInit, recipientPubkeyHex)`, serialises it with `BootstrapArtifacts.toBlob(json)`, and writes the advanced RatchetState + the artifacts blob to `pending_ratchet_state` via the new `SessionTransactionRepository.commitInitiatorPending(conversationId, stateBlob, bootstrapArtifactsBlob, nowMs)` single-table operation. `ratchet_state` is NOT touched on this path — the active row is replaced only at promotion time.
+
+`commitInitiatorPending` is intentionally separated from `commitBootstrap` (the inbound-repair phase 3 method introduced in 2b-B). The two write into the same physical table but carry different ownership contracts:
+
+- `commitBootstrap(opkKeyIdHex, ...)` requires a local `opk_reservation` row (the L4 phase 1 reservation that `recipientBootstrapInMemory` placed before deriving the candidate); it reads that row inside its transaction to share the `reserved_at_ms` timestamp with the pending row + verify the reservation still exists.
+- `commitInitiatorPending(...)` takes NO `opkKeyIdHex`. The OUTBOUND-INITIATOR path references the PEER's `opk_key_id_hex` (carried in `x3dhInit`); that id refers to the PEER's local OPK pool, not ours. There is no local reservation to read and no local OPK row to consume; the operation is a pure pending-table upsert.
+
+A `PendingSessionCapEnforcer.enforce()` call follows the outbound `commitInitiatorPending` for symmetry with the inbound `commitBootstrap` flow. Repeated outbound bootstraps to the same conversation upsert the same pending row (INSERT OR REPLACE), so the cap counts distinct conversations, not repeats; the enforcer is a no-op when count ≤ cap.
+
+### Outbound reuse within `PENDING_TTL_MS`
+
+`PENDING_TTL_MS = 10 * 60 * 1000` (10 minutes, Alpha-locked, retunable). The DMS:434 outbound path reads `pending_ratchet_state` BEFORE consulting `SessionManager.tryLoadSession`. A pending row is reusable when ALL of:
+
+- `bootstrap_artifacts_blob` is non-null (only INITIATOR pending rows carry artifacts; RESPONDER pending rows written by `commitBootstrap` have null artifacts and are not reusable on the outbound path);
+- the `BootstrapArtifacts.fromBlob(json, blob)` decode succeeds (tolerant — a null parse falls through to the next branch rather than crashing);
+- `BootstrapArtifacts.recipientPubkeyHex == recipientPublicKeyHex` (defense-in-depth — same `conversation_id` should imply same recipient, but the explicit check guards against any future code path that recycles conversation ids);
+- `(nowMs - reservedAtMs) < PENDING_TTL_MS`;
+- `sessionSuspect` is false (a suspect conversation forces a fresh bootstrap regardless of TTL).
+
+On reuse the encrypt path decodes the pending `state_blob` into `RatchetState`, runs `ratchet.encrypt(pendingState, plaintext)`, attaches the cached `x3dhInit` from the artifacts blob to the new `WireFrame`, writes the advanced pending state back via `commitInitiatorPending` with `nowMs = pendingEntity.reservedAtMs` (TTL anchor preserved across reuse — refreshing it on every send would defeat the 10-minute bound), and returns. No OPK is consumed.
+
+When the pending row is expired (TTL crossed) the path falls through to the bootstrap branch above; the bootstrap branch's `commitInitiatorPending` overwrites the stale pending row verbatim under INSERT OR REPLACE semantics — no separate cleanup step is needed.
+
+### Inbound — active MAC fail tries pending before repair
+
+The DMS:2455 inbound flow gains a new fallback layer between the existing-session decrypt and the `inboundX3dhInit != null` repair branch. After the active decrypt throws an `IllegalArgumentException("MAC...")`, the catch branch reads `pendingRatchetStateRepository.get(conversationId)` and — if a pending row exists — tries `ratchet.decrypt(pendingState, encrypted)`. On success the path:
+
+1. Upserts the advanced pending state into `pending_ratchet_state` via `pendingRatchetStateRepository.upsert(conv, advancedStateJson, pending.reservedAtMs, pending.bootstrapArtifactsBlob)`. The TTL anchor and artifacts blob are PRESERVED — even though the receive path doesn't read them, leaving them intact keeps outbound reuse semantics consistent across in-flight envelopes.
+2. Calls `sessionTransactionRepository.promotePendingToActive(conv)`. Under the reservation-optional contract from §L4 the promotion succeeds whether the pending was INBOUND-RESPONDER (reservation present → OPK consumed at this site) or OUTBOUND-INITIATOR (no reservation → ratchet-state-only promotion; the artifacts blob's `opkKeyIdHex` refers to the peer's pool and MUST NOT delete a local row).
+3. Logs `DECRYPT_TRACE pending_fallback_ok msgId=... promotion=true` and returns the decrypted plaintext through the normal `markProcessed → return@withLock` chain.
+
+If pending decrypt also fails MAC, the catch branch logs `DECRYPT_TRACE pending_fallback_fail reason=mac_fail_under_pending` and falls through to the existing `inboundX3dhInit != null` repair branch. The pending row is left untouched (no spurious upsert).
+
+The two-step `upsert(advancedState) → promote` is NOT one transaction. A crash between leaves pending updated with the post-decrypt state + no active update; the next inbound retries the fallback, which is idempotent at the `processed_envelopes` ledger boundary (`markProcessed` ran for the previous successful return). Acceptable degraded state vs. extending the storage contract with a single-tx `promotePendingToActiveWithAdvancedState(conv, stateBlob)` — the latter was considered and rejected as overfitting one runtime path while complicating the otherwise-narrow §L4 contract.
+
+### Inbound repair — `commitBootstrap → promotePendingToActive` (dual-write removed)
+
+The Sprint 2b-B dual-write at DMS:2569 success (`saveSession` to active + `commitBootstrap` to pending) is REPLACED with `commitBootstrap → promotePendingToActive`. The candidate's advanced state goes through pending; promotion atomically replaces the active row + deletes the pending row + consumes the OPK (the SOLE site where the OPK is permanently consumed under the §L4 deferred-consume contract).
+
+**PR #317 review P1-2 (2026-06-15) — safety-net `saveSession` REMOVED from both `commit=false` and `promote=false` branches.** The pre-amendment text described a fallback that wrote the advanced chain into `ratchet_state` whenever `commitBootstrap` or `promotePendingToActive` returned false, so the active row could not "go missing". That fallback violated the §L4 deferred-consume invariant: it adopted a new chain into the active slot WITHOUT routing through the promote-time consume site, leaving the backing OPK in the local pool — republishable on the next bundle refresh and reusable by a different peer. The runtime now follows a stricter rule:
+
+- **`commitBootstrap` returned false** (reservation released between L4 phase 1 and 3 — `reservation_released_between_phases` log) → log + return decrypted plaintext + do NOT update `ratchet_state`.
+- **`promotePendingToActive` returned false** (pending evicted between commit and promote — `pending_evicted_between_commit_and_promote` log) → log + return decrypted plaintext + do NOT update `ratchet_state`.
+- **`sessionTransactionRepository` is null** (legacy test fixtures without the Sprint 2b-C repos wired — runtime is configured with the SqlDelight-backed instance via `AppContainer`) → `sessionManager.saveSession(advancedState)` runs UNCHANGED. There is no atomic promote available in this fixture path, so the legacy direct-write is the only honest behaviour; production never enters this branch.
+
+In every branch the path emits `DECRYPT_TRACE inbound_repair_ok msgId=... bootstrap=true ... promotion=(true|false reason=...)` and returns the decrypted plaintext. The Slice 4 false-branch rule is binding: **successful decrypt is never held; the log line carries the diagnostic verdict.**
+
+**Honest consequence of removing the safety-net.** On `commit=false` or `promote=false` the active `ratchet_state` row stays stale by design (whatever it held before the inbound envelope arrived). What happens next depends on the peer:
+
+- If the peer's NEXT outbound envelope to this conversation carries `x3dhInit` (Sprint 2a guard fires on its side — e.g. the peer also sees a role/state condition that forces a fresh bootstrap), the inbound-repair branch fires again with a fresh `reserve → commit → promote` cycle and the active row is replaced cleanly.
+- If the peer treats its bootstrap as complete and sends a plain envelope WITHOUT `x3dhInit`, the local active row's MAC fails on every subsequent inbound → the envelope hits the existing `fail_mac action=hold` path. Recovery in that case waits for either side's Sprint 2a guard to fire on a future outbound and re-attach `x3dhInit`, or for an operator-initiated re-pair. The Sprint 2b-C runtime does NOT add a "stuck active" detector — the residual hold rate is the observable signal, and the `opk_not_found_total{reason}` metric stub (§ below) is the post-merge correlation hook.
+
+The tradeoff is intentional: a stale active that holds is recoverable (peer re-bootstrap OR re-pair); a silently-adopted new active over an un-consumed OPK is a stealthy crypto-invariant breach. The deferred-consume rule chooses the recoverable failure mode.
+
+### `opk_not_found_total{reason}` metric stub (L8 debuggability seam)
+
+Sprint 2b-C ships a minimal in-memory counter wired into the recipient-side `recipientBootstrapInMemory` failure paths so post-merge log telemetry can correlate `OpkNotFound` rates against the pending-fallback + repair flows. The stub does NOT carry separate telemetry infrastructure — it exists as an observability seam only; the deferred sender-signal work named in §"Alternative C" will consume this counter when its entry criteria are met. Wiring beyond the in-memory counter (export to logcat / Statsig / Grafana) is explicitly out of Sprint 2b-C scope.
+
+### Test coverage trail
+
+| Cell | Layer | Pins |
+| --- | --- | --- |
+| Storage `promotePendingToActive_atomicallyConsumesOpkAndPromotesState` | storage | §L4 INBOUND case (reservation present → OPK consumed) |
+| Storage `promotePendingToActive_returnsFalse_whenNoPendingRow` | storage | idempotent re-call |
+| Storage `promotePendingToActive_promotesWithoutOpkDelete_whenNoReservation` | storage | §L4 OUTBOUND-INITIATOR case (no reservation → local OPK row preserved) |
+| Storage `commitInitiatorPending_writesPendingRow_doesNotTouchActiveOpkOrReservation` | storage | outbound single-table upsert isolation |
+| Storage `commitInitiatorPending_overwritesExistingExpiredRow` | storage | INSERT OR REPLACE behaviour for expired pending |
+| Messaging `bootstrapArtifacts_jsonRoundTrip_*` + null/malformed | messaging | typed BootstrapArtifacts JSON contract |
+| DMS `encryptUnderLock_withinPendingTtl_reusesCachedX3dhInit_noBundleFetch_noOpkChange` | runtime | outbound reuse path |
+| DMS `encryptUnderLock_afterPendingTtl_runsFreshBootstrap_andOverwritesPending` | runtime | TTL expiry → fresh bootstrap |
+| DMS `handleDeliver_firstInboundOnPendingChain_promotesPendingToActive` | runtime | pending fallback success + two-step contract |
+| DMS `handleDeliver_pendingFallbackPromoteRaceLost_returnsPlaintext_andLogsPromotionFalse` | runtime | promotion false-branch — plaintext returned, no hold |
+
+The M-OPK-3 Wi-Fi field gate ships as an `androidInstrumentedTest` harness that requires a connected device or emulator + relay deploy + APK install + adb pairing. It is NOT executed by the local sweep; it is a manual acceptance gate per scope-doc L10. Source-only landing in 2b-C; the harness itself does not produce a deterministic PASS/FAIL until run against the device matrix.
+
 ## References
 
 - `docs/tracks/sprint-2b-opk-pending-session-scope.md` — binding scope-doc (PR #314 squash `cfa765d2`).

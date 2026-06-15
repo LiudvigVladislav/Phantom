@@ -384,4 +384,28 @@ internal class FakeSessionTransactionRepository(
         }
         pendingRepo.delete(conversationId)
     }
+
+    override suspend fun promotePendingToActive(conversationId: String): Boolean =
+        // Sprint 2b-B contract tests do not exercise promotion (added in
+        // Sprint 2b-C). This fake is intentionally not promotion-aware
+        // so an accidental call from a 2b-B cell fails loudly. The
+        // Sprint 2b-C variant lives in
+        // [Sprint2bCStorageContractTest.FakeSessionTransactionRepositoryWithPromotion]
+        // with the full reservation-optional algorithm.
+        error(
+            "FakeSessionTransactionRepository (Sprint 2b-B variant) does not " +
+                "support promotePendingToActive. Use the Sprint 2b-C variant in " +
+                "Sprint2bCStorageContractTest.kt.",
+        )
+
+    override suspend fun commitInitiatorPending(
+        conversationId: String,
+        stateBlob: String,
+        bootstrapArtifactsBlob: String,
+        nowMs: Long,
+    ): Unit = error(
+        "FakeSessionTransactionRepository (Sprint 2b-B variant) does not " +
+            "support commitInitiatorPending. Use the Sprint 2b-C variant in " +
+            "Sprint2bCStorageContractTest.kt.",
+    )
 }

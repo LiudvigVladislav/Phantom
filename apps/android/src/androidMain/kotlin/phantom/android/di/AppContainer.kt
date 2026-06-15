@@ -1060,6 +1060,11 @@ class AppContainer(private val context: Context) {
             pendingRatchetStateRepository = pendingRatchetStateRepo,
             sessionTransactionRepository = sessionTransactionRepo,
         )
+        // Sprint 2b-C L8 — opk_not_found_total{reason} counter (in-
+        // memory, process-local). Single instance per AppContainer
+        // so the metric persists across initMessaging invocations
+        // within a single process.
+        val opkNotFoundMetric = phantom.core.messaging.OpkNotFoundMetric()
         // PR C commit 11: DMS gains the prekey REST client (for the
         // first-message bundle-fetch path) plus a signing-key provider
         // that resolves the local Ed25519 keypair on demand. The HTTP
@@ -1699,6 +1704,26 @@ class AppContainer(private val context: Context) {
             sessionTransactionRepository = sessionTransactionRepo,
             opkReservationRepository    = opkReservationRepo,
             pendingSessionCapEnforcer   = pendingSessionCapEnforcer,
+            // Sprint 2b-C Slice 4 — outbound PENDING reuse +
+            // inbound PENDING fallback both read the pending
+            // companion row directly. Wiring the same repo here
+            // (already constructed at class scope above for
+            // SessionManager / PendingSessionCapEnforcer) flips
+            // the DMS encrypt + decrypt paths from the legacy
+            // saveSession-only fallback to the Sprint 2b-C
+            // protocol (commit -> promote on bootstrap, decrypt
+            // -> promote on first inbound under pending chain).
+            pendingRatchetStateRepository = pendingRatchetStateRepo,
+            // Sprint 2b-C — PENDING_TTL_MS expiry check + the
+            // outbound bootstrap's commitInitiatorPending call use
+            // the same clock. Default System.currentTimeMillis to
+            // match the existing Java/Kotlin wall-clock surfaces.
+            nowMsProvider = { System.currentTimeMillis() },
+            // Sprint 2b-C L8 — opk_not_found_total{reason} counter.
+            // In-memory only; export to logcat / external telemetry
+            // is named work for a future PR (see
+            // [OpkNotFoundMetric] KDoc).
+            opkNotFoundMetric = opkNotFoundMetric,
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.
