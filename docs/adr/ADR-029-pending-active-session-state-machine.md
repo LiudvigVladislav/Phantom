@@ -197,7 +197,7 @@ Sprint 2b-B landed the storage half of the L3 / L4 / L5 / L6 / L7 contracts abov
 
 ### Outbound — bootstrap writes pending, not active
 
-The DMS:434 outbound path's bootstrap branch (the branch that fires when no INITIATOR active row exists or the Sprint 2a guard redirects RESPONDER away) no longer calls `SessionManager.saveSession`. Instead it constructs a `phantom.core.messaging.BootstrapArtifacts(x3dhInit, recipientPubkeyHex)`, serialises it with `BootstrapArtifacts.toBlob(json)`, and writes the advanced RatchetState + the artifacts blob to `pending_ratchet_state` via the new `SessionTransactionRepository.commitInitiatorPending(conversationId, stateBlob, bootstrapArtifactsBlob, nowMs)` single-table operation. `ratchet_state` is NOT touched on this path — the active row is replaced only at promotion time.
+The DMS:434 outbound path's bootstrap branch (the branch that fires when no INITIATOR active row exists or the Sprint 2a guard redirects RESPONDER away) no longer calls `SessionManager.saveSession`. Instead it constructs a `phantom.core.messaging.BootstrapArtifacts(x3dhInit, recipientPubkeyHex)`, serialises it with `BootstrapArtifacts.toBlob(json)`, and writes the advanced RatchetState + the artifacts blob to `pending_ratchet_state` via the new `SessionTransactionRepository.commitInitiatorPending(conversationId, stateBlob, bootstrapArtifactsBlob, nowMs)` — a transactional cleanup-of-same-conv-stale-reservations + pending UPSERT (see the P1 paragraph below for the cleanup scope). `ratchet_state` is NOT touched on this path — the active row is replaced only at promotion time.
 
 `commitInitiatorPending` is intentionally separated from `commitBootstrap` (the inbound-repair phase 3 method introduced in 2b-B). The two write into the same physical table but carry different ownership contracts:
 
@@ -272,7 +272,8 @@ Sprint 2b-C ships a minimal in-memory counter wired into the recipient-side `rec
 | Storage `promotePendingToActive_atomicallyConsumesOpkAndPromotesState` | storage | §L4 INBOUND case (reservation present → OPK consumed) |
 | Storage `promotePendingToActive_returnsFalse_whenNoPendingRow` | storage | idempotent re-call |
 | Storage `promotePendingToActive_promotesWithoutOpkDelete_whenNoReservation` | storage | §L4 OUTBOUND-INITIATOR case (no reservation → local OPK row preserved) |
-| Storage `commitInitiatorPending_writesPendingRow_doesNotTouchActiveOpkOrReservation` | storage | outbound single-table upsert isolation |
+| Storage `commitInitiatorPending_writesPendingRow_doesNotTouchActiveOpkOrReservation` | storage | outbound pending UPSERT leaves UNRELATED active / OPK / reservation rows untouched (PR #317 Round 3 narrowed: same-conv stale reservations ARE released — see next row) |
+| Storage `commitInitiatorPending_releasesPriorInboundReservation_preservingLocalOpk_thenPromoteDoesNotDeleteOpk` | storage | PR #317 Round 3 P1 — transactional cleanup of same-conv stale `opk_reservation` rows so a subsequent `promotePendingToActive` does not silently delete an unrelated local OPK |
 | Storage `commitInitiatorPending_overwritesExistingExpiredRow` | storage | INSERT OR REPLACE behaviour for expired pending |
 | Messaging `bootstrapArtifacts_jsonRoundTrip_*` + null/malformed | messaging | typed BootstrapArtifacts JSON contract |
 | DMS `encryptUnderLock_withinPendingTtl_reusesCachedX3dhInit_noBundleFetch_noOpkChange` | runtime | outbound reuse path |

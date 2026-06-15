@@ -130,10 +130,14 @@ class Sprint2bCStorageContractTest {
 
     // ── Slice 3 — commitInitiatorPending ─────────────────────────────────────
     //
-    // Single-table upsert into pending_ratchet_state with the
-    // BootstrapArtifacts blob attached. Does NOT touch ratchet_state /
-    // local_one_time_pre_key / opk_reservation. Sprint 2b-C OUTBOUND-
-    // INITIATOR path uses this from DMS:434/620 bootstrap branch.
+    // Transactional cleanup of same-conv stale `opk_reservation`
+    // rows + UPSERT pending_ratchet_state with the BootstrapArtifacts
+    // blob attached. Does NOT touch ratchet_state / local_one_time_pre_key
+    // / UNRELATED opk_reservation rows. Same-conv stale reservations
+    // ARE released per PR #317 Round 3 P1 — covered by a separate
+    // cell below (`commitInitiatorPending_releasesPriorInboundReservation_*`).
+    // Sprint 2b-C OUTBOUND-INITIATOR path uses this from DMS:434/620
+    // bootstrap branch.
 
     @Test
     fun commitInitiatorPending_writesPendingRow_doesNotTouchActiveOpkOrReservation() = runTest {

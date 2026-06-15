@@ -198,15 +198,15 @@ interface SessionTransactionRepository {
     /**
      * Sprint 2b-C — OUTBOUND-INITIATOR pending commit.
      *
-     * Single-table upsert: writes `pending_ratchet_state` for
-     * [conversationId] with the supplied [stateBlob] (the advanced
-     * RatchetState the outbound encrypt produced) and the
-     * [bootstrapArtifactsBlob] (the [phantom.core.messaging.BootstrapArtifacts]
-     * JSON carrying the cached `X3dhInitHeader` + recipient
-     * identity hex for subsequent outbound reuse within
-     * `PENDING_TTL_MS`). The upsert uses INSERT OR REPLACE
-     * semantics, so an expired pending row is overwritten verbatim
-     * by the new bootstrap.
+     * Transactional cleanup of same-conv stale `opk_reservation`
+     * rows + UPSERT `pending_ratchet_state` for [conversationId]
+     * with the supplied [stateBlob] (the advanced RatchetState the
+     * outbound encrypt produced) and the [bootstrapArtifactsBlob]
+     * (the [phantom.core.messaging.BootstrapArtifacts] JSON
+     * carrying the cached `X3dhInitHeader` + recipient identity hex
+     * for subsequent outbound reuse within `PENDING_TTL_MS`). The
+     * UPSERT uses INSERT OR REPLACE semantics, so an expired
+     * pending row is overwritten verbatim by the new bootstrap.
      *
      * **Does NOT touch:**
      *  - `ratchet_state` — the outbound bootstrap no longer writes
