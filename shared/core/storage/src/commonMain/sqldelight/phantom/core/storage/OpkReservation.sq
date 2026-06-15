@@ -1,0 +1,84 @@
+-- Sprint 2b L5 — OPK reservation table.
+--
+-- A reservation pins a single one_time_pre_key entry for a single
+-- inbound bootstrap derivation in flight. The L4 three-phase protocol
+-- is:
+--   1. RESERVE — INSERT OR IGNORE into opk_reservation BEFORE the
+--      X3DH 4-DH derivation. Identifies (opk_key_id_hex, envelope_id,
+--      conversation_id, reserved_at_ms). An existing row with the same
+--      opk_key_id_hex (e.g. a crash-recovered mid-derive carcass)
+--      causes the insert to no-op; the caller treats this as an
+--      idempotent retry.
+--   2. DERIVE + DECRYPT — unchanged X3DH handshake + candidate-decrypt.
+--   3. COMMIT-OR-ROLLBACK — on candidate-decrypt success the
+--      reservation row is PRESERVED (OPK consumption is deferred to
+--      pending->active promotion in Sprint 2b-C). On failure ONLY the
+--      reservation row is DELETED; the local_one_time_pre_key row is
+--      preserved so the OPK can be reused.
+--
+-- The L7 cap-8 eviction path (PendingSessionCapEnforcer) DELETES the
+-- reservation row of the evicted pending candidate; the OPK row
+-- survives because L4 never consumed it.
+--
+-- The L6 startup sweep operates on this table: it joins with
+-- pending_ratchet_state on conversation_id and deletes only orphans
+-- (rows older than the threshold with NO matching pending row).
+--
+-- Cell M-2bB-3 / M-2bB-4 / M-2bB-5 / M-2bB-6 / M-2bB-7 / M-2bB-8 pin
+-- the L4 / L6 / L7 behaviour against this schema.
+
+CREATE TABLE opk_reservation (
+    opk_key_id_hex  TEXT    NOT NULL PRIMARY KEY,
+    envelope_id     TEXT    NOT NULL,
+    conversation_id TEXT    NOT NULL,
+    reserved_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX idx_opk_reservation_conversation_id
+    ON opk_reservation(conversation_id);
+
+CREATE INDEX idx_opk_reservation_reserved_at_ms
+    ON opk_reservation(reserved_at_ms);
+
+-- L4 phase 1 — INSERT OR IGNORE so a crash-recovered mid-derive
+-- carcass with the same opk_key_id_hex is no-op'd.
+reserve:
+INSERT OR IGNORE INTO opk_reservation(
+    opk_key_id_hex,
+    envelope_id,
+    conversation_id,
+    reserved_at_ms
+) VALUES (?, ?, ?, ?);
+
+-- L4 phase 3 failure + L7 cap-8 eviction path.
+release:
+DELETE FROM opk_reservation WHERE opk_key_id_hex = ?;
+
+getByOpkKeyId:
+SELECT * FROM opk_reservation WHERE opk_key_id_hex = ?;
+
+-- L7 cap-8 eviction needs to release the reservation tied to the
+-- evicted pending conversation. The index `idx_opk_reservation_conversation_id`
+-- backs this lookup.
+getByConversationId:
+SELECT * FROM opk_reservation WHERE conversation_id = ?;
+
+getAll:
+SELECT * FROM opk_reservation ORDER BY reserved_at_ms ASC;
+
+countAll:
+SELECT COUNT(*) FROM opk_reservation;
+
+-- L6 join-based sweep: rows older than threshold whose conversation_id
+-- has NO matching pending_ratchet_state row are orphans. Returns the
+-- list so the caller can DELETE one-by-one in a transaction and report
+-- the count.
+selectOrphansOlderThan:
+SELECT opk_key_id_hex FROM opk_reservation
+WHERE reserved_at_ms < ?
+  AND conversation_id NOT IN (
+    SELECT conversation_id FROM pending_ratchet_state
+  );
+
+deleteAll:
+DELETE FROM opk_reservation;

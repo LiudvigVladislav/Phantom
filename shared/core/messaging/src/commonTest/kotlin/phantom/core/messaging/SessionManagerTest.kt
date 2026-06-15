@@ -592,6 +592,7 @@ class SessionManagerTest {
 
         val bobState = bobMgr.recipientBootstrap(
             conversationId = "alice-bob",
+            envelopeId = "test-envelope-alice-bob",
             localIdentityKeyPair = bobIdentity,
             senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
             x3dhInit = initiatorResult.x3dhInit,
@@ -629,6 +630,7 @@ class SessionManagerTest {
         try {
             mgr.recipientBootstrap(
                 conversationId = "alice-bob",
+                envelopeId = "test-envelope-spk-missing",
                 localIdentityKeyPair = bobIdentity,
                 senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
                 x3dhInit = header,
@@ -673,6 +675,7 @@ class SessionManagerTest {
         try {
             mgr.recipientBootstrap(
                 conversationId = "x",
+                envelopeId = "test-envelope-x",
                 localIdentityKeyPair = bobIdentity,
                 senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
                 x3dhInit = header,
@@ -766,6 +769,7 @@ class SessionManagerTest {
 
         val candidate = bobMgr.recipientBootstrapInMemory(
             conversationId = "alice-bob",
+            envelopeId = "test-envelope-alice-bob-inmemory",
             localIdentityKeyPair = bobIdentity,
             senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
             x3dhInit = initiatorResult.x3dhInit,
@@ -790,13 +794,19 @@ class SessionManagerTest {
                 "Mini-lock §Scope item 5: OLD RATCHET SESSION MUST BE PRESERVED on failure.",
         )
 
-        // Gate 3: OPK was eagerly consumed (matches existing
-        // recipientBootstrap behaviour; explicit implementation decision
-        // documented in mini-lock §Scope item 5).
+        // Gate 3 (Sprint 2b-B L4 amendment, 2026-06-15): OPK is
+        // RESERVED, not deleted. The local_one_time_pre_key row is
+        // preserved here; OPK consumption is deferred to Sprint 2b-C
+        // pending->active promotion. Pre-Sprint-2b-B this assertion
+        // checked `!bobOpkRepo.has(...)` (eager consume); the L4
+        // reservation contract flips it.
         assertTrue(
-            !bobOpkRepo.has(bobOpkIdHex),
-            "OPK must be deleted from Bob's pool after eager consumption (explicit " +
-                "implementation decision matching recipientBootstrap pattern)",
+            bobOpkRepo.has(bobOpkIdHex),
+            "L4 amendment: OPK row MUST be preserved after " +
+                "recipientBootstrapInMemory — the row is RESERVED via " +
+                "OpkReservationRepository.reserve, not deleted. " +
+                "Consumption is deferred to Sprint 2b-C pending->active promotion. " +
+                "M-2bB-3 / M-2bB-4 cells pin the rollback + restart paths.",
         )
     }
 
@@ -818,6 +828,7 @@ class SessionManagerTest {
         try {
             mgr.recipientBootstrapInMemory(
                 conversationId = "alice-bob-spk-missing",
+                envelopeId = "test-envelope-alice-bob-spk-missing",
                 localIdentityKeyPair = bobIdentity,
                 senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
                 x3dhInit = header,
@@ -879,6 +890,7 @@ class SessionManagerTest {
         try {
             mgr.recipientBootstrapInMemory(
                 conversationId = "alice-bob-opk-missing",
+                envelopeId = "test-envelope-alice-bob-opk-missing",
                 localIdentityKeyPair = bobIdentity,
                 senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
                 x3dhInit = header,
@@ -965,6 +977,7 @@ class SessionManagerTest {
 
         val bobState = bobMgr.recipientBootstrap(
             conversationId = "alice-bob-regression",
+            envelopeId = "test-envelope-alice-bob-regression",
             localIdentityKeyPair = bobIdentity,
             senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
             x3dhInit = initiatorResult.x3dhInit,
@@ -1117,6 +1130,7 @@ class SessionManagerTest {
 
         val bobState = bobMgr.recipientBootstrap(
             conversationId = "alice-bob-role",
+            envelopeId = "test-envelope-alice-bob-role-wrapper",
             localIdentityKeyPair = bobIdentity,
             senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
             x3dhInit = initiatorResult.x3dhInit,
@@ -1199,6 +1213,7 @@ class SessionManagerTest {
 
         val candidate = bobMgr.recipientBootstrapInMemory(
             conversationId = "alice-bob-role",
+            envelopeId = "test-envelope-alice-bob-role-inmemory",
             localIdentityKeyPair = bobIdentity,
             senderIdentityPublicKeyHex = aliceIdentity.publicKey.bytes.toHexString(),
             x3dhInit = initiatorResult.x3dhInit,

@@ -50,11 +50,13 @@ sqldelight {
         create("PhantomDatabase") {
             packageName.set("phantom.core.storage.db")
             srcDirs("src/commonMain/sqldelight")
-            // Trek 2 Stage 2A (A2) — `transport_seq_state` table added
-            // at schema version 20 (see 20.sqm migration). Lands in the
-            // existing SQLCipher-protected phantom.db per OQ5 lock
-            // 2026-06-09; no separate database file.
-            version = 20
+            // Sprint 2b-B — `opk_reservation` + `pending_ratchet_state`
+            // tables added at schema version 21 (see 21.sqm migration).
+            // Backs the L4 two-phase OPK consume protocol + L3 pending
+            // session companion table per
+            // `docs/tracks/sprint-2b-opk-pending-session-scope.md`.
+            // Trek 2 Stage 2A (A2) added `transport_seq_state` at v20.
+            version = 21
         }
     }
 }

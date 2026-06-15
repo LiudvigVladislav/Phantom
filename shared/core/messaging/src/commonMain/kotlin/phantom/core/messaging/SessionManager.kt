@@ -3,6 +3,7 @@
 
 package phantom.core.messaging
 
+import kotlinx.datetime.Clock
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -17,7 +18,10 @@ import phantom.core.identity.IdentityCrypto
 import phantom.core.identity.SigningPublicKey
 import phantom.core.storage.LocalOneTimePreKeyRepository
 import phantom.core.storage.LocalSignedPreKeyRepository
+import phantom.core.storage.NoOpOpkReservationRepository
+import phantom.core.storage.OpkReservationRepository
 import phantom.core.storage.RatchetStateRepository
+import phantom.core.storage.ReservationOutcome
 
 /**
  * Manages per-conversation Double Ratchet state and the X3DH 4-DH
@@ -67,6 +71,23 @@ class SessionManager(
     private val oneTimePreKeyRepository: LocalOneTimePreKeyRepository,
     private val identityCrypto: IdentityCrypto,
     private val json: Json,
+    // Sprint 2b-B L4: the reservation repository pins an OPK in flight
+    // for an inbound bootstrap derivation so a mid-derive crash leaves
+    // the OPK row intact (the L6 startup sweep then mops the orphan
+    // reservation up). Pre-Sprint-2b the OPK was deleted eagerly at
+    // line 357 of [recipientBootstrapInMemory]; that pattern made the
+    // 2026-06-15 integration LTE smoke `OpkNotFound` re-derivation
+    // failure unrecoverable.
+    //
+    // Optional with a no-op default so existing test fixtures and the
+    // Alpha 1 migration path that constructs a SessionManager without
+    // wiring the new repository continue to compile. AppContainer
+    // injects the SqlDelight-backed implementation; in tests, the
+    // default no-op + fake LocalOneTimePreKeyRepository combination
+    // reproduces the pre-Sprint-2b "no reservation tracking" shape so
+    // existing assertions keep their semantics.
+    private val opkReservationRepository: OpkReservationRepository = NoOpOpkReservationRepository,
+    private val nowMsProvider: () -> Long = { Clock.System.now().toEpochMilliseconds() },
 ) {
 
     /**
@@ -210,6 +231,7 @@ class SessionManager(
      */
     suspend fun recipientBootstrap(
         conversationId: String,
+        envelopeId: String,
         localIdentityKeyPair: DhKeyPair,
         senderIdentityPublicKeyHex: String,
         x3dhInit: X3dhInitHeader,
@@ -217,16 +239,37 @@ class SessionManager(
         // PR-CRYPTO-INBOUND-X3DH-REPAIR1 commit 1 (2026-05-29) — refactored
         // into a thin wrapper over [recipientBootstrapInMemory] + [saveSession]
         // so the crypto-only and crypto+persist paths share byte-identical
-        // derivation logic. No behaviour change at this call site; the
-        // existing no-session bootstrap path in
+        // derivation logic. The existing no-session bootstrap path in
         // `DefaultMessagingService.handleDeliver` continues to call
         // [recipientBootstrap] and see the same persistence + return.
+        //
+        // Sprint 2b-B (2026-06-15): [recipientBootstrapInMemory] now
+        // RESERVES the OPK via [opkReservationRepository] instead of
+        // eagerly deleting the local pool row. The wrapper here
+        // preserves the wrapper's pre-Sprint-2b-B semantic — active
+        // direct save + OPK consume — by releasing the reservation and
+        // deleting the local OPK row immediately after derivation. The
+        // pending/active two-phase model (where consume is deferred to
+        // promotion) applies to the L4 InMemory + commitBootstrap path
+        // wired by [phantom.core.messaging.DefaultMessagingService] at
+        // line 2569; this wrapper services the legacy no-session path
+        // at DMS:2879 unchanged in user-visible behaviour.
         val state = recipientBootstrapInMemory(
             conversationId = conversationId,
+            envelopeId = envelopeId,
             localIdentityKeyPair = localIdentityKeyPair,
             senderIdentityPublicKeyHex = senderIdentityPublicKeyHex,
             x3dhInit = x3dhInit,
         )
+        x3dhInit.opkKeyIdHex?.let { opkId ->
+            // The reservation just created by InMemory is released here
+            // because the wrapper writes the active ratchet row directly
+            // (no candidate-decrypt gate, no pending slot). The OPK is
+            // deleted in the same logical save point — the no-session
+            // bootstrap path's atomic-consume guarantee, preserved.
+            opkReservationRepository.release(opkId)
+            oneTimePreKeyRepository.deleteByKeyId(opkId)
+        }
         saveSession(conversationId, state)
         return state
     }
@@ -259,36 +302,45 @@ class SessionManager(
      *    *OLD RATCHET SESSION MUST BE PRESERVED on candidate
      *    bootstrap / candidate-decrypt failure*.
      *
-     * 2. **OPK consumption follows the same eager-consume model as the
-     *    existing [recipientBootstrap]** — the referenced OPK is
-     *    deleted from the local pool BEFORE the X3DH handshake runs,
-     *    preserving the F1 single-use invariant.
+     * 2. **OPK lifecycle (Sprint 2b-B L4 — 2026-06-15 amendment).** The
+     *    referenced OPK is RESERVED — not deleted — before the X3DH
+     *    handshake runs. The `local_one_time_pre_key` row is preserved
+     *    here; an [phantom.core.storage.OpkReservationRepository.reserve]
+     *    row is created with the `envelopeId` + `conversationId` carry
+     *    so the L6 startup sweep can distinguish mid-derive crash
+     *    carcasses (orphan reservations) from live pending candidates
+     *    (reservations whose `conversation_id` matches a pending row).
      *
-     *    This is an **explicit implementation decision** (per mini-lock
-     *    §Scope item 5: "OPK consumption is left as an implementation
-     *    decision at commit-1 review"). The choice here — eager consume,
-     *    same as existing — is conservative because:
-     *      - it preserves the F1 invariant uniformly across both
-     *        bootstrap variants;
-     *      - it matches the semantic peers expect: a successful
-     *        x3dhInit (even one whose decrypt later fails) was a
-     *        legitimate consumption signal at the SessionManager layer,
-     *        and the relay's bundle-fetch path has already removed the
-     *        OPK from the public store anyway;
-     *      - the alternative (defer consumption until candidate-decrypt
-     *        succeeds) would need a separate OPK-reservation pathway
-     *        that complicates the F1 single-use guarantee and adds
-     *        schema-state without a clear win — the peer would still
-     *        derive a fresh OPK for any subsequent repair attempt
-     *        because the repair-on-suspect flow re-fetches the bundle
-     *        upstream.
+     *    OPK consumption is DEFERRED to Sprint 2b-C pending->active
+     *    promotion — the SOLE atomic cross-table site where the
+     *    `local_one_time_pre_key` row and the `opk_reservation` row are
+     *    deleted alongside the active `ratchet_state` upsert.
      *
-     *    If Commit 2's receive-path design surfaces a concrete need to
-     *    preserve OPK on candidate-decrypt failure, the policy can be
-     *    introduced as a parameter on this method at that review or as
-     *    a separate follow-up. The §Scope item 5 invariant — preservation
-     *    of the *ratchet session row* — holds regardless of OPK
-     *    lifecycle.
+     *    **Mental-model correction (PR #314 review C-1).** The
+     *    pre-Sprint-2b KDoc at the eager-delete site argued "safe
+     *    because we hold the only async reference; the pool is
+     *    per-device, not concurrent." That was wrong: the
+     *    `PreKeyApiClient.publishWithRetry` retry loop and
+     *    `recipientBootstrapInMemory` are not concurrent threads but
+     *    they DO race on the OPK pool's externally-observable state
+     *    via the publish wire body (the relay's atomic replace-wholesale
+     *    semantics then restored consumed OPKs to the public bundle —
+     *    the 2026-06-15 integration LTE smoke shape). Sprint 2b-A
+     *    closed the publish side of that race via the factory-lambda
+     *    re-snapshot (L1); this method's L4 reservation closes the
+     *    consume side.
+     *
+     *    The caller is responsible for either committing the candidate
+     *    state via
+     *    [phantom.core.storage.SessionTransactionRepository.commitBootstrap]
+     *    on candidate-decrypt success (L4 phase 3 success) or calling
+     *    [phantom.core.storage.OpkReservationRepository.release] on
+     *    candidate-decrypt failure (L4 phase 3 failure). The legacy
+     *    no-session bootstrap path at
+     *    `DefaultMessagingService.kt:2879` uses the [recipientBootstrap]
+     *    wrapper above, which preserves the wrapper's pre-Sprint-2b
+     *    semantic — release reservation + delete OPK + saveSession in
+     *    one logical save point.
      *
      * **Failure semantics:** any error propagates as the same typed
      * exception that [recipientBootstrap] would throw:
@@ -316,6 +368,7 @@ class SessionManager(
      */
     suspend fun recipientBootstrapInMemory(
         conversationId: String,
+        envelopeId: String,
         localIdentityKeyPair: DhKeyPair,
         senderIdentityPublicKeyHex: String,
         x3dhInit: X3dhInitHeader,
@@ -342,19 +395,80 @@ class SessionManager(
         }
         val spkKeyPair = DhKeyPair(spkPub, spkPriv)
 
-        // Resolve the OPK keypair if the initiator referenced one. Atomic
-        // consume: delete from local pool BEFORE deriving the secret so a
-        // mid-derive crash + retry can't reuse the same OPK twice.
+        // Resolve the OPK keypair if the initiator referenced one.
+        //
+        // Sprint 2b-B L4 (2026-06-15): REPLACE the pre-Sprint-2b eager
+        // delete here with a [OpkReservationRepository.reserve] call.
+        // The reservation pins the OPK in flight for this envelope's
+        // derivation and protects against:
+        //   - a mid-derive crash carcass — the L6 startup sweep
+        //     ([OpkReservationRepository.sweepOrphanReservations])
+        //     releases reservations with no matching
+        //     `pending_ratchet_state` row, leaving the local OPK row
+        //     intact;
+        //   - the 2026-06-15 integration LTE smoke `OpkNotFound` shape —
+        //     the OPK is no longer deleted at this point, so a
+        //     subsequent re-receive of an envelope referencing the same
+        //     `opk_key_id_hex` re-derives instead of failing.
+        // The `local_one_time_pre_key` row is NOT touched here. OPK
+        // consumption is DEFERRED to Sprint 2b-C pending->active
+        // promotion (the SOLE site where the OPK is permanently consumed
+        // via a single SQLDelight cross-table transaction).
+        //
+        // The caller (currently `DefaultMessagingService.handleDeliver`
+        // at line 2569 + [recipientBootstrap] wrapper) is responsible
+        // for either:
+        //   - committing the candidate state into the pending slot via
+        //     [SessionTransactionRepository.commitBootstrap] on
+        //     candidate-decrypt success (L4 phase 3 success), or
+        //   - calling [OpkReservationRepository.release] on
+        //     candidate-decrypt failure (L4 phase 3 failure).
         val opkKeyPair: DhKeyPair? = x3dhInit.opkKeyIdHex?.let { opkId ->
             val opk = oneTimePreKeyRepository.get(opkId)
                 ?: throw SessionBootstrapException.OpkNotFound(opkId)
-            // Single-use lifecycle: delete first, then use the value.
-            // Safe because we hold the only async reference; the pool
-            // is per-device, not concurrent. See § "OPK consumption"
-            // in this method's KDoc for the explicit implementation
-            // decision recorded in commit-1 review of PR-CRYPTO-
-            // INBOUND-X3DH-REPAIR1.
-            oneTimePreKeyRepository.deleteByKeyId(opkId)
+            val outcome = opkReservationRepository.reserve(
+                opkKeyIdHex = opkId,
+                envelopeId = envelopeId,
+                conversationId = conversationId,
+                nowMs = nowMsProvider(),
+            )
+            // PR #316 review P1-1 (2026-06-15): owner-check the
+            // ReservationOutcome.AlreadyReserved branch. INSERT OR
+            // IGNORE returns AlreadyReserved both for our own retry
+            // (same opkId + same conversationId + same envelopeId —
+            // idempotent) AND for the rare race where some OTHER
+            // inbound bootstrap derivation reserved the same
+            // opk_key_id_hex first. Proceeding into the X3DH derive in
+            // the second case would let this caller upsert a pending
+            // row pointing to a reservation that belongs to a
+            // different conversation; the L6 join + L7 cap LRU
+            // accounting would then both be silently corrupted (one
+            // pending without a matching reservation; one reservation
+            // pointing at the wrong conversation_id). Reject the
+            // mismatch by throwing
+            // [SessionBootstrapException.OpkReservationConflict]; the
+            // caller MUST NOT release in the failure branch — that
+            // reservation belongs to the other derivation.
+            if (outcome is ReservationOutcome.AlreadyReserved) {
+                val existing = outcome.existing
+                if (existing.conversationId != conversationId ||
+                    existing.envelopeId != envelopeId
+                ) {
+                    throw SessionBootstrapException.OpkReservationConflict(
+                        opkKeyIdHex = opkId,
+                        attemptedConversationId = conversationId,
+                        attemptedEnvelopeId = envelopeId,
+                        ownerConversationId = existing.conversationId,
+                        ownerEnvelopeId = existing.envelopeId,
+                    )
+                }
+                // Same owner + same envelope -> idempotent retry of
+                // our own prior derivation that crashed after the
+                // L4 phase 1 reserve but before the caller's commit /
+                // release. Safe to proceed; the caller will eventually
+                // commit / release for the eventual outcome of THIS
+                // attempt.
+            }
             DhKeyPair(
                 publicKey = DhPublicKey(opk.publicKeyHex.hexToByteArray()),
                 privateKey = DhPrivateKey(opk.privateKeyHex.hexToByteArray()),
@@ -590,4 +704,37 @@ sealed class SessionBootstrapException(message: String) : Exception(message) {
      */
     class MalformedBundle(detail: String) :
         SessionBootstrapException("malformed bundle: $detail")
+
+    /**
+     * Sprint 2b-B L4: the OPK id the peer referenced is already
+     * reserved by a DIFFERENT conversation / envelope. The reservation
+     * row in `opk_reservation` was created by some other in-flight
+     * inbound bootstrap derivation; consuming this OPK now would
+     * compromise both reservations + corrupt the L6 join semantics +
+     * the L7 cap LRU accounting.
+     *
+     * Diagnostic semantics: this is a tiny window — the reservation
+     * needs to land between this caller's bundle fetch and the local
+     * `recipientBootstrapInMemory` derivation, AND the peer needs to
+     * reference an OPK that some other peer has just bootstrapped
+     * against. Realistically only happens under deliberate attack
+     * (an attacker fetched our bundle, derived a session, then a
+     * relay-delivery race put a forged `x3dhInit` with the same OPK
+     * id in our queue ahead of the legitimate one) or extreme
+     * concurrency. The caller MUST NOT release the reservation in
+     * the failure branch — the reservation belongs to the other
+     * derivation, releasing it would compromise that flow.
+     */
+    class OpkReservationConflict(
+        val opkKeyIdHex: String,
+        val attemptedConversationId: String,
+        val attemptedEnvelopeId: String,
+        val ownerConversationId: String,
+        val ownerEnvelopeId: String,
+    ) : SessionBootstrapException(
+        "OPK reservation conflict on opk_key_id_hex=${opkKeyIdHex.take(16)}...: " +
+            "attempted by conv=${attemptedConversationId.take(8)}/" +
+            "env=${attemptedEnvelopeId.take(8)} but owned by " +
+            "conv=${ownerConversationId.take(8)}/env=${ownerEnvelopeId.take(8)}",
+    )
 }
