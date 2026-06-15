@@ -172,12 +172,14 @@ Sprint 2a's outbound role guard at `DefaultMessagingService:434` (commit `df3422
 
 ### L10 — Atomic-pair landing gate + Sprint complete gate + #310 ready gate
 
+> **Amendment 2026-06-16 — M-OPK-3 demoted from binding gate to documented field-shape harness.** The 2026-06-16 execution of M-OPK-3 against master `7e421728` (Sprint 2b-C merged) surfaced a runbook flaw: `am force-stop` does not wipe SQLDelight, so on relaunch the prekey lifecycle service emits `PREKEY_TRACE bootstrap_skip_existing_spk ... no publish`, `publishWithRetry` is never invoked, and the operator-applied `publishWithRetryDelayHook` never reaches its `attempt == 2` fire site. Without the publish stall there is no race window for the inbound `x3dhInit` to engineer, so the Sprint 2b-C inbound-repair branch is never entered and the gate produces an INCONCLUSIVE verdict ("not proven, not regressed"). The Variant 2 `pm clear` + first-pair workaround was considered and explicitly not promoted to a binding gate — see `docs/tests/M_OPK_3_runbook.md` §"Known limitation" for the reasoning. Sprint 2b-C runtime coverage at the unit-test layer (`Sprint2bCStorageContractTest` + the `M-2bC-*` cells in `DefaultMessagingServiceTest`) is deterministic; M-OPK-3 Wi-Fi was the optional field-shape harness on top, and that harness as-written does not engineer the race. The PR-staging gate sequence below is hereby revised: step 3's "Wi-Fi M-OPK-3 PASS" clause is removed; Stage 2B-D Tele2 LTE PASS (step 4) becomes the single binding promotion gate for PR #310 ready. Operator-facing communications and PR descriptions MUST use the revised sequence; the original wording below remains for audit trail only.
+
 The PR-staging gate sequence MUST be:
 
 1. **Sprint 2b-A merged solo**: technically mergeable as a release-pinned step. **Does NOT satisfy PR #313 lock.** Does NOT unblock PR #310. Closes ONLY the publish-snapshot consistency root cause + decrypt-existing-first protective layer.
 2. **Sprint 2b-A + Sprint 2b-B merged**: **OPK lifecycle foundation complete**. Satisfies the PR #313 lock's OPK-lifecycle / consume / idempotency / restart-resilience mandate. **Does NOT unblock PR #310 yet** — pending/active runtime wiring is in 2b-C.
-3. **Sprint 2b-A + 2b-B + 2b-C merged + Wi-Fi M-OPK-3 PASS**: **Sprint 2b complete**. The runtime pending→active wiring is in place. The Wi-Fi deterministic field gate (M-OPK-3) has reproduced the 2026-06-15 smoke shape and PASSED.
-4. **Stage 2B-D integration LTE smoke PASS on Tele2 LTE**: PR #310 unblocked for ready transition; Stage 2B-D promotion (`LONGPOLL_V2_ENABLED "0" → "1"` in release variant) entry-criteria met.
+3. **Sprint 2b-A + 2b-B + 2b-C merged** (revised 2026-06-16; original wording: "+ Wi-Fi M-OPK-3 PASS"): **Sprint 2b runtime complete at the unit-test level**. The runtime pending→active wiring is in place; storage + messaging unit cells are green; M-OPK-3 Wi-Fi field gate is documented field-shape harness rather than a binding gate (per the 2026-06-16 amendment above). **Does NOT unblock PR #310** — PR #310 ready still gates on step 4.
+4. **Stage 2B-D integration LTE smoke PASS on Tele2 LTE**: PR #310 unblocked for ready transition; Stage 2B-D promotion (`LONGPOLL_V2_ENABLED "0" → "1"` in release variant) entry-criteria met. **This is the single binding promotion gate after the 2026-06-16 amendment.**
 
 The gate wording in this lock is binding. PR descriptions, release notes, commit messages, and operator-facing communications MUST NOT claim Sprint 2b "complete" or "PR #310 unblocked" at any earlier gate.
 
@@ -276,7 +278,7 @@ Three PRs, each individually green at the local sweep level, each independently 
 
 PASS = step 7 + step 8. FAIL = either condition. INVALID = transport-blocked before step 6.
 
-The Wi-Fi field gate is the load-bearing acceptance gate for Sprint 2b-C landing. Tele2 LTE re-run remains a post-Sprint-2b integration smoke for PR #310 ready (per L10 gate 4).
+The Wi-Fi field gate was originally scoped as a load-bearing acceptance gate for Sprint 2b-C landing; the 2026-06-16 L10 amendment above demoted it to a documented field-shape harness (the runbook procedure as-written does not engineer the race — see `docs/tests/M_OPK_3_runbook.md` §"Known limitation"). Sprint 2b-C runtime coverage at the unit-test layer is now treated as sufficient for landing; Stage 2B-D Tele2 LTE remains the single binding promotion gate for PR #310 ready (per L10 gate 4, revised).
 
 ## Named non-goals (deferred to Sprint 2c / Sprint 3 / threat-model backlog)
 
@@ -308,7 +310,7 @@ The following Round 2 blind spots are NOT blockers for scope-lock but MUST be ad
 
 ## After this PR sequence
 
-After Sprint 2b-A + 2b-B + 2b-C land on master + M-OPK-3 PASS, the L10 gate sequence calls for:
+After Sprint 2b-A + 2b-B + 2b-C land on master (per L10 step 3, revised 2026-06-16 — M-OPK-3 PASS no longer required), the L10 gate sequence calls for:
 
 - **Stage 2B-D pre-promotion integration LTE smoke re-run** against the master-after-Sprint-2b state, with the Round 14 relay binary deployed + Sprint 2a crypto + Stage 2B-B client + Sprint 2b together. The runbook at `C:\temp\trek2-stage2b-b-d-integration-smoke-2026-06-15\runbook.md` applies with the addition that Layer 3 end-to-end-decrypt MUST now pass.
 - **If the integration smoke PASSES**: PR #310 flips ready-for-review. Stage 2B-D promotion (`LONGPOLL_V2_ENABLED "0" → "1"` in the release variant) proceeds.
