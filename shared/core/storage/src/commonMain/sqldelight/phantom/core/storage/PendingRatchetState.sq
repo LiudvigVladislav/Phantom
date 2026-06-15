@@ -1,0 +1,83 @@
+-- Sprint 2b L3 — pending session companion table.
+--
+-- The pending slot lives in a NEW table, NOT a column added to
+-- ratchet_state. The boundary is mechanical: a different repository
+-- accesses a different table, so the Sprint 2a outbound role guard at
+-- DefaultMessagingService:434 (which reads RatchetStateRepository) can
+-- NEVER accidentally see a pending row when deciding whether to take
+-- the bootstrap path.
+--
+-- Conceptually one row per conversation_id, holding the candidate
+-- Double Ratchet state derived by the L4 three-phase protocol.
+-- Promotion to the active ratchet_state row happens in Sprint 2b-C
+-- (the M-2bC-1 / M-2bC-4 cells) — the SOLE site that also DELETES the
+-- corresponding local_one_time_pre_key row and opk_reservation row,
+-- atomically consuming the OPK.
+--
+-- bootstrap_artifacts_blob carries the serialized BootstrapArtifacts
+-- JSON (X3dhInitHeader plus recipient identity hex) needed for
+-- Sprint 2b-C OUTBOUND reuse of an INITIATOR pending slot — sending a
+-- subsequent message within PENDING_TTL reuses the cached x3dhInit so
+-- it does NOT consume a second OPK. The column is NULL for RESPONDER
+-- pending rows (inbound flow, no outbound reuse needed); NON-NULL for
+-- INITIATOR pending rows (which Sprint 2b-C will introduce). In
+-- Sprint 2b-B all production callers pass NULL — the column exists at
+-- the schema level so the M-2bC-5 outbound-reuse cell can slot in
+-- without a follow-up migration.
+--
+-- state_blob is the same wire encoding as ratchet_state.state_blob:
+-- the RatchetStateStorageCodec rs1: + Base64(IdentityCipher.wrap(...))
+-- frame, reusing the existing Keystore alias phantom_ratchet_wrap_v1
+-- per the L3 lock (identical threat model, no benefit from a separate
+-- alias at Alpha).
+--
+-- Cells M-2bB-1 / M-2bB-2 / M-2bB-5 pin the isolation + atomicity
+-- contracts against this schema; M-2bB-8 pins the L6 join-based sweep
+-- using this table's conversation_id column.
+
+CREATE TABLE pending_ratchet_state (
+    conversation_id          TEXT    NOT NULL PRIMARY KEY,
+    state_blob               TEXT    NOT NULL,
+    reserved_at_ms           INTEGER NOT NULL,
+    bootstrap_artifacts_blob TEXT
+);
+
+CREATE INDEX idx_pending_ratchet_state_reserved_at_ms
+    ON pending_ratchet_state(reserved_at_ms);
+
+getByConversationId:
+SELECT state_blob, reserved_at_ms, bootstrap_artifacts_blob
+FROM pending_ratchet_state
+WHERE conversation_id = ?;
+
+-- L4 phase 3 success path.
+upsert:
+INSERT OR REPLACE INTO pending_ratchet_state(
+    conversation_id,
+    state_blob,
+    reserved_at_ms,
+    bootstrap_artifacts_blob
+) VALUES (?, ?, ?, ?);
+
+-- L7 cap-8 eviction + Sprint 2b-C promotion path.
+deleteByConversationId:
+DELETE FROM pending_ratchet_state WHERE conversation_id = ?;
+
+getAll:
+SELECT conversation_id, state_blob, reserved_at_ms, bootstrap_artifacts_blob
+FROM pending_ratchet_state
+ORDER BY reserved_at_ms ASC;
+
+countAll:
+SELECT COUNT(*) FROM pending_ratchet_state;
+
+-- L7 cap-8: returns the OLDEST conversation_id (by reserved_at_ms)
+-- when the cap is exceeded. PendingSessionCapEnforcer issues this
+-- query, then deletes both the pending row and its opk_reservation
+-- companion via a transaction.
+getOldestConversationId:
+SELECT conversation_id, reserved_at_ms FROM pending_ratchet_state
+ORDER BY reserved_at_ms ASC LIMIT 1;
+
+deleteAll:
+DELETE FROM pending_ratchet_state;

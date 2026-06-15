@@ -1,0 +1,46 @@
+-- 21.sqm — opk_reservation + pending_ratchet_state tables for
+-- Sprint 2b-B (L3 / L5 / L7 / L8). Upgrades schema version 20 -> 21.
+--
+-- These tables back the two-phase OPK consume protocol (L4) and the
+-- pending/active session state machine (L3). The Sprint 2b-A merge
+-- (L1 publish-snapshot consistency fix) closed the observed
+-- 2026-06-15 integration LTE smoke root cause; this migration adds
+-- the schema half of the broader PR #313 OPK-lifecycle mandate. The
+-- runtime that uses these tables lives in:
+--   - SessionManager.recipientBootstrapInMemory (reserve before
+--     X3DH 4-DH derivation, no eager delete)
+--   - DefaultMessagingService.handleDeliver (commitBootstrap on
+--     success, release on failure)
+--   - PendingSessionCapEnforcer (L7 cap-8 LRU eviction)
+--   - AppContainer.init (L6 join-based startup sweep)
+--
+-- The Sprint 2b-C wiring (pending->active promotion + outbound
+-- INITIATOR reuse via bootstrap_artifacts_blob + M-OPK-3 field gate)
+-- is a follow-up PR that does NOT change this schema.
+--
+-- Fresh installs of v21+ get these tables from OpkReservation.sq and
+-- PendingRatchetState.sq directly. Existing installs at v20 run the
+-- statements below to upgrade.
+
+CREATE TABLE opk_reservation (
+    opk_key_id_hex  TEXT    NOT NULL PRIMARY KEY,
+    envelope_id     TEXT    NOT NULL,
+    conversation_id TEXT    NOT NULL,
+    reserved_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX idx_opk_reservation_conversation_id
+    ON opk_reservation(conversation_id);
+
+CREATE INDEX idx_opk_reservation_reserved_at_ms
+    ON opk_reservation(reserved_at_ms);
+
+CREATE TABLE pending_ratchet_state (
+    conversation_id          TEXT    NOT NULL PRIMARY KEY,
+    state_blob               TEXT    NOT NULL,
+    reserved_at_ms           INTEGER NOT NULL,
+    bootstrap_artifacts_blob TEXT
+);
+
+CREATE INDEX idx_pending_ratchet_state_reserved_at_ms
+    ON pending_ratchet_state(reserved_at_ms);

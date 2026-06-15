@@ -40,6 +40,7 @@ import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_ICE
 import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_OFFER
 import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_REJECT
 import phantom.core.messaging.MessagingService
+import phantom.core.messaging.PendingSessionCapEnforcer
 import phantom.core.messaging.SessionManager
 import phantom.core.storage.DatabaseDriverFactory
 import phantom.core.storage.PhantomDatabaseHolder
@@ -243,10 +244,47 @@ class AppContainer(private val context: Context) {
         scope = appScope,
         log = { line -> android.util.Log.i("PhantomUI", line) },
     )
+    // Sprint 2b-B L3 (2026-06-15) — extracted the Keystore-backed
+    // ratchet-state cipher so the active `ratchet_state` repo + the
+    // companion `pending_ratchet_state` repo + the cross-table
+    // `SessionTransactionRepository` all share a single cipher
+    // instance per the L3 alias-reuse lock (`phantom_ratchet_wrap_v1`).
+    private val ratchetKeystoreCipher = phantom.core.storage.createAndroidRatchetKeystoreCipher()
     private val ratchetRepo = SqlDelightRatchetStateRepository(
         db = dbHolder.database,
-        blobCipher = phantom.core.storage.createAndroidRatchetKeystoreCipher(),
+        blobCipher = ratchetKeystoreCipher,
     )
+    // Sprint 2b-B L5 — opk_reservation table backing the L4 two-phase
+    // consume protocol. The pre-Sprint-2b-B eager-delete at
+    // `SessionManager.recipientBootstrapInMemory:357` was replaced
+    // with a reservation: an inbound bootstrap derivation pins the
+    // OPK row in flight (no eager delete), and consumption is
+    // deferred to Sprint 2b-C pending->active promotion. The
+    // L6 startup sweep in [initMessagingFromStorage] mops up
+    // mid-derive crash carcasses without touching live pending rows.
+    val opkReservationRepo = phantom.core.storage.SqlDelightOpkReservationRepository(
+        db = dbHolder.database,
+    )
+    // Sprint 2b-B L3 — pending_ratchet_state companion table for the
+    // pending session slot. Per L3 the slot lives in a separate
+    // table (not a column on ratchet_state) so the Sprint 2a outbound
+    // role guard at DefaultMessagingService:434 — which reads
+    // RatchetStateRepository — can NEVER accidentally see a pending
+    // row when deciding the bootstrap path.
+    val pendingRatchetStateRepo = phantom.core.storage.SqlDelightPendingRatchetStateRepository(
+        db = dbHolder.database,
+        blobCipher = ratchetKeystoreCipher,
+    )
+    // Sprint 2b-B L4 phase 3 — atomic cross-table commitBootstrap.
+    // Reads the opk_reservation row + upserts the pending row in a
+    // single SQLDelight transaction so a concurrent release between
+    // L4 phase 1 and phase 3 cannot drop the candidate state into
+    // a stale slot.
+    val sessionTransactionRepo: phantom.core.storage.SessionTransactionRepository =
+        phantom.core.storage.SqlDelightSessionTransactionRepository(
+            db = dbHolder.database,
+            blobCipher = ratchetKeystoreCipher,
+        )
     val reactionRepo     = SqlDelightReactionRepository(dbHolder.database)
     val groupRepo        = SqlDelightGroupRepository(dbHolder.database)
     val senderKeyRepo    = SqlDelightSenderKeyRepository(dbHolder.database)
@@ -1005,6 +1043,22 @@ class AppContainer(private val context: Context) {
             oneTimePreKeyRepository = oneTimePreKeyRepo,
             identityCrypto = sessionManagerIdentityCrypto,
             json = json,
+            // Sprint 2b-B L4 — reserve before derive (replaces the
+            // pre-Sprint-2b eager delete at line 357). The reservation
+            // pins the OPK row in flight for this envelope's
+            // derivation; the L6 startup sweep at
+            // [initMessagingFromStorage] mops up mid-derive carcasses.
+            opkReservationRepository = opkReservationRepo,
+        )
+        // Sprint 2b-B L7 — cap-8 LRU enforcer for in-flight pending
+        // session candidates. Invoked after each successful
+        // commitBootstrap on the inbound-repair branch
+        // (DefaultMessagingService:2569). The enforcer reads from the
+        // same pending + reservation repositories the rest of the
+        // L4 protocol uses, so eviction is observable through them.
+        val pendingSessionCapEnforcer = PendingSessionCapEnforcer(
+            pendingRatchetStateRepository = pendingRatchetStateRepo,
+            opkReservationRepository = opkReservationRepo,
         )
         // PR C commit 11: DMS gains the prekey REST client (for the
         // first-message bundle-fetch path) plus a signing-key provider
@@ -1636,6 +1690,15 @@ class AppContainer(private val context: Context) {
             // DefaultMessagingService.handleDeliver.
             decryptFailedEnvelopeRepository = decryptFailedEnvelopeRepo,
             holdMacFailures             = phantom.android.BuildConfig.DEBUG,
+            // Sprint 2b-B L4 phase 3 + L7 — wire the cross-table
+            // commitBootstrap transaction + reservation release + cap-8
+            // LRU enforcer. These three repositories form the L4 success
+            // / failure / cap path; the same OpkReservationRepository
+            // instance is also injected into SessionManager above for
+            // the L4 phase 1 reserve call.
+            sessionTransactionRepository = sessionTransactionRepo,
+            opkReservationRepository    = opkReservationRepo,
+            pendingSessionCapEnforcer   = pendingSessionCapEnforcer,
         )
         // Join the bootstrap job and mark ready (success or failure) so the UI
         // can observe bootstrapReady and remove any "setting up keys…" indicator.
@@ -1862,6 +1925,32 @@ class AppContainer(private val context: Context) {
                 phantom.core.crypto.DhPublicKey(record.publicKeyHex.hexToByteArray()),
                 phantom.core.crypto.DhPrivateKey(record.dhPrivateKeyHex.hexToByteArray()),
             )
+            // Sprint 2b-B L6 — startup recovery sweep. Runs BEFORE
+            // `initMessaging(...)` constructs DMS + starts receiving,
+            // so any orphan opk_reservation rows left by a mid-derive
+            // crash on a previous run are cleared before any new
+            // inbound envelope can derive against them. The sweep
+            // joins on pending_ratchet_state.conversation_id and only
+            // deletes reservations whose conversation has NO matching
+            // pending row (L6 join semantics). Threshold is 5 minutes
+            // per L6 lock — well above expected derivation latency,
+            // well below any user-facing reconnect cadence.
+            runCatching {
+                val sweptCount = opkReservationRepo.sweepOrphanReservations(
+                    thresholdMs = System.currentTimeMillis() - 5L * 60L * 1000L,
+                )
+                if (sweptCount > 0) {
+                    android.util.Log.i(
+                        "PhantomMessaging",
+                        "RECV_DIAG opk_reservation_startup_sweep_done swept=$sweptCount",
+                    )
+                }
+            }.onFailure {
+                android.util.Log.w(
+                    "PhantomMessaging",
+                    "RECV_DIAG opk_reservation_startup_sweep_fail: ${it.message}",
+                )
+            }
             initMessaging(record, dhKeyPair)
             android.util.Log.i(
                 "PhantomMessaging",

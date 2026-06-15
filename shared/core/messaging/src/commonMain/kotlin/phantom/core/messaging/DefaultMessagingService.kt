@@ -198,6 +198,50 @@ class DefaultMessagingService(
      * file in commit 2.
      */
     private val holdMacFailures: Boolean = false,
+    /**
+     * Sprint 2b-B L4 phase 3 success — atomic cross-table transaction
+     * that upserts the candidate ratchet state into
+     * `pending_ratchet_state`. Called on `inbound_repair_ok` (the
+     * candidate-decrypt success branch); the active `ratchet_state`
+     * row is also written above for decrypt continuity, so the
+     * Sprint 2b-B failure mode is "no pending row stored" — never
+     * a data-loss outcome. Sprint 2b-C wires the promotion path that
+     * reads pending and deletes the OPK + reservation atomically.
+     *
+     * Nullable + default null so existing test fixtures that
+     * construct DMS without storage continue to compile; production
+     * AppContainer always wires the SqlDelight-backed instance.
+     */
+    private val sessionTransactionRepository: phantom.core.storage.SessionTransactionRepository? = null,
+    /**
+     * Sprint 2b-B L4 phase 3 failure — release the OPK reservation
+     * that `SessionManager.recipientBootstrapInMemory` placed before
+     * the X3DH 4-DH derivation. The associated
+     * `local_one_time_pre_key` row is PRESERVED (OPK consumption is
+     * deferred to Sprint 2b-C pending->active promotion).
+     *
+     * Default [NoOpOpkReservationRepository] — keeps pre-Sprint-2b-B
+     * test fixtures source-compatible. Production AppContainer wires
+     * the SqlDelight-backed instance (the same one
+     * SessionManager.recipientBootstrapInMemory uses for reserve).
+     */
+    private val opkReservationRepository: phantom.core.storage.OpkReservationRepository =
+        phantom.core.storage.NoOpOpkReservationRepository,
+    /**
+     * Sprint 2b-B L7 — enforces the cap on in-flight pending session
+     * candidates after every successful [commitBootstrap]. On
+     * overflow the oldest pending row + its `opk_reservation` row are
+     * transactionally rolled back; the `local_one_time_pre_key` row
+     * is preserved (OPK consumption is deferred to Sprint 2b-C
+     * pending->active promotion).
+     *
+     * Nullable + default null so existing test fixtures construct DMS
+     * without wiring the enforcer; production AppContainer always
+     * wires the real instance against the same
+     * [phantom.core.storage.OpkReservationRepository] /
+     * [phantom.core.storage.PendingRatchetStateRepository] pair.
+     */
+    private val pendingSessionCapEnforcer: PendingSessionCapEnforcer? = null,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -2568,6 +2612,7 @@ class DefaultMessagingService(
                                 val repairResult: Result<Pair<RatchetState, ByteArray>> = try {
                                     val candidate = sessionManager.recipientBootstrapInMemory(
                                         conversationId = conversationId,
+                                        envelopeId = deliver.messageId,
                                         localIdentityKeyPair = localKeyPair,
                                         senderIdentityPublicKeyHex = senderPubKeyHex,
                                         x3dhInit = inboundX3dhInit,
@@ -2597,6 +2642,69 @@ class DefaultMessagingService(
                                     // ratchet is valid and replaces the stale
                                     // on-disk row.
                                     sessionManager.saveSession(conversationId, advancedState)
+                                    // Sprint 2b-B L4 phase 3 success — also
+                                    // upsert the candidate into the pending
+                                    // slot so the Sprint 2b-C pending->active
+                                    // promotion path has the row it needs.
+                                    // The active row above stays in place to
+                                    // preserve decrypt continuity until 2b-C
+                                    // wires the promotion trigger; the
+                                    // reservation row stays in place (under
+                                    // amended L4 OPK consumption is deferred
+                                    // to promotion); the `local_one_time_pre_key`
+                                    // row stays in place. M-2bB-5 pins this
+                                    // tri-preservation contract.
+                                    //
+                                    // commitBootstrap returns false when the
+                                    // reservation was released between L4
+                                    // phase 1 and phase 3 (e.g. by an L7 cap
+                                    // eviction or L6 sweep). In that race
+                                    // window the pending row is intentionally
+                                    // dropped — the active row is the source
+                                    // of truth for this envelope, so no
+                                    // correctness loss; just no Sprint 2b-C
+                                    // promotion handle for THIS conversation
+                                    // until the next inbound repair fires.
+                                    val opkIdForCommit = inboundX3dhInit.opkKeyIdHex
+                                    val sessionTx = sessionTransactionRepository
+                                    if (opkIdForCommit != null && sessionTx != null) {
+                                        val advancedStateJson = json.encodeToString(advancedState)
+                                        val committed = sessionTx.commitBootstrap(
+                                            opkKeyIdHex = opkIdForCommit,
+                                            conversationId = conversationId,
+                                            stateBlob = advancedStateJson,
+                                            bootstrapArtifactsBlob = null,
+                                        )
+                                        if (!committed) {
+                                            messagingLog(
+                                                MessagingLogLevel.INFO,
+                                                "DECRYPT_TRACE inbound_repair_commit_skip " +
+                                                    "msgId=${deliver.messageId.take(8)} " +
+                                                    "conv=${conversationId.take(8)} " +
+                                                    "reason=reservation_released_between_phases",
+                                            )
+                                        } else {
+                                            // Sprint 2b-B L7 — enforce the
+                                            // cap after every successful
+                                            // commit. Repeated repairs for
+                                            // the same conversation_id
+                                            // upsert the SAME pending row
+                                            // (INSERT OR REPLACE), so the
+                                            // cap counts DISTINCT
+                                            // conversations, not repairs.
+                                            // M-2bB-6 + M-2bB-7 pin
+                                            // eviction behaviour.
+                                            val evicted = pendingSessionCapEnforcer?.enforce() ?: 0
+                                            if (evicted > 0) {
+                                                messagingLog(
+                                                    MessagingLogLevel.INFO,
+                                                    "DECRYPT_TRACE pending_cap_evict " +
+                                                        "msgId=${deliver.messageId.take(8)} " +
+                                                        "evicted=$evicted",
+                                                )
+                                            }
+                                        }
+                                    }
                                     messagingLog(
                                         MessagingLogLevel.INFO,
                                         "DECRYPT_TRACE inbound_repair_ok msgId=${deliver.messageId.take(8)} " +
@@ -2636,6 +2744,23 @@ class DefaultMessagingService(
                                             "errorClass=${err?.let { it::class.simpleName } ?: "Unknown"} " +
                                             "action=fall_through_to_hold",
                                     )
+                                    // Sprint 2b-B L4 phase 3 failure — release
+                                    // the reservation that `recipientBootstrapInMemory`
+                                    // placed before deriving the candidate. The
+                                    // `local_one_time_pre_key` row is
+                                    // PRESERVED (the OPK was never consumed),
+                                    // so a subsequent retry that re-derives
+                                    // against the same `opk_key_id_hex` finds
+                                    // the row in place. M-2bB-3 pins this
+                                    // rollback invariant. Release is
+                                    // idempotent — a no-op if
+                                    // `recipientBootstrapInMemory` threw
+                                    // BEFORE reaching the reserve call (e.g.
+                                    // `SpkNotFound`), so the catch-all
+                                    // failure path here is safe.
+                                    inboundX3dhInit.opkKeyIdHex?.let { opkId ->
+                                        opkReservationRepository.release(opkId)
+                                    }
                                     // INTENTIONAL fall-through to the existing
                                     // hold branch below. The candidate state
                                     // is discarded (local val inside the
@@ -2878,6 +3003,7 @@ class DefaultMessagingService(
                     )
                     val freshState = sessionManager.recipientBootstrap(
                         conversationId = conversationId,
+                        envelopeId = deliver.messageId,
                         localIdentityKeyPair = localKeyPair,
                         senderIdentityPublicKeyHex = senderPubKeyHex,
                         x3dhInit = x3dhInit,
