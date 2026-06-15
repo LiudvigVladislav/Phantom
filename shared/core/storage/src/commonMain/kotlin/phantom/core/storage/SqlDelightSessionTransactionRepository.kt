@@ -41,31 +41,33 @@ class SqlDelightSessionTransactionRepository(
                 .getByOpkKeyId(opkKeyIdHex)
                 .executeAsOneOrNull()
             if (reservation == null) {
-                // No reservation → false. The orphan-reservation
-                // cleanup below would have no `opkKeyIdHex` to spare
-                // anyway; skip it.
                 // The reservation we set in L4 phase 1 has been
                 // released between then and now (e.g. an L7 cap
                 // eviction or L6 sweep raced with this callback).
                 // Drop the candidate from the pending slot; return
-                // false to the caller.
+                // false to the caller. We do NOT touch `ratchet_state`
+                // on either branch of this transaction.
                 //
-                // PR #316 review P2-1 (2026-06-15): we do NOT touch
-                // `ratchet_state` at all on either branch of this
-                // transaction. Under the current Sprint 2b-B DMS:2569
-                // wiring the caller has ALREADY written the advanced
-                // state to `ratchet_state` via `saveSession` BEFORE
-                // invoking `commitBootstrap`, so a false return here
-                // leaves the active row holding whatever `saveSession`
-                // wrote — typically the advanced state. The DMS
-                // caller logs `inbound_repair_commit_skip` and still
-                // emits `inbound_repair_ok`; the decrypted plaintext
-                // is returned to the user. The only observable effect
-                // of false is that Sprint 2b-C will not find a
-                // pending row for this conversation until the next
-                // inbound envelope re-derives. See
+                // PR #317 (Sprint 2b-C) — the DMS caller does NOT
+                // pre-write `saveSession(advancedState)` anymore
+                // (Sprint 2b-B's dual-write was removed in the same
+                // PR's Slice 4 + PR #317 review P1-2 lock). A false
+                // return here means active stays whatever it held
+                // pre-receive — typically the pre-bootstrap RESPONDER
+                // row. The DMS caller logs
+                // `DECRYPT_TRACE inbound_repair_commit_skip
+                // reason=reservation_released_between_phases` and
+                // still emits `inbound_repair_ok ... promotion=false
+                // reason=reservation_released_between_phases`; the
+                // decrypted plaintext is returned to the user (Slice 4
+                // lock — successful decrypt is never held). Recovery
+                // is peer-conditional: next inbound with `x3dhInit`
+                // re-enters the repair branch + fresh
+                // reserve/commit/promote cycle; without `x3dhInit`
+                // active MAC-fails → `fail_mac action=hold`. See
                 // [SessionTransactionRepository.commitBootstrap] KDoc
-                // for the binding contract.
+                // and ADR-029 §"Inbound repair" amendment for the
+                // binding contract and tradeoff rationale.
                 return@transactionWithResult false
             }
             // PR #317 review P1-1 (2026-06-15) — cleanup-on-commit.
@@ -129,22 +131,56 @@ class SqlDelightSessionTransactionRepository(
         bootstrapArtifactsBlob: String,
         nowMs: Long,
     ): Unit = withContext(Dispatchers.IO) {
-        // Single-table upsert. No race condition with cross-table
-        // state because:
-        //  - we do not read `opk_reservation` (outbound-initiator has
-        //    none);
-        //  - we do not read `ratchet_state` (outbound bootstrap no
-        //    longer touches the active slot);
-        //  - the upsert itself is atomic at the SQLDelight statement
-        //    level.
-        // See [SessionTransactionRepository.commitInitiatorPending]
-        // KDoc for the binding contract.
-        db.pendingRatchetStateQueries.upsert(
-            conversation_id          = conversationId,
-            state_blob               = RatchetStateStorageCodec.encodeForStorage(stateBlob, blobCipher),
-            reserved_at_ms           = nowMs,
-            bootstrap_artifacts_blob = bootstrapArtifactsBlob,
-        )
+        // PR #317 review P1 (2026-06-16) — wrap in a SQLDelight
+        // transaction and release ANY prior `opk_reservation` rows for
+        // this conversation BEFORE the pending UPSERT.
+        //
+        // Scenario the cleanup closes:
+        //  1. Peer's inbound bootstrap commits → pending(conv, RESPONDER)
+        //     + opk_reservation(opk_X, conv) both live; promote pending
+        //     for any reason (peer never replied; cap eviction raced;
+        //     L6 sweep window not reached).
+        //  2. Local side initiates an OUTBOUND bootstrap to the same
+        //     peer. `commitInitiatorPending` UPSERTs the pending row to
+        //     OUTBOUND INITIATOR (no reservation owner), but
+        //     `opk_reservation(opk_X)` still points at this
+        //     `conversation_id`.
+        //  3. Peer's first reply triggers `promotePendingToActive`:
+        //     reads the pending row (INITIATOR), copies to active,
+        //     deletes pending, reads `opk_reservation` by
+        //     conversation_id → finds opk_X → DELETES the local
+        //     `opk_X` row from our pool.
+        //  4. opk_X had nothing to do with this OUTBOUND INITIATOR
+        //     pending — it backed the long-dead INBOUND pending we
+        //     just overwrote. We silently nuked a live local OPK.
+        //
+        // The cleanup releases reservation rows ONLY (NOT
+        // `local_one_time_pre_key`). The §L4 deferred-consume contract
+        // says: reservation released = OPK returns to pool. The
+        // overwritten INBOUND pending is gone, so its reservation has
+        // no owner; releasing it is the correct lifecycle move.
+        //
+        // After this loop the invariant "at most one `opk_reservation`
+        // row per `conversation_id`, and any such row matches the
+        // pending row's bootstrap-backing OPK" holds for OUTBOUND
+        // INITIATOR (zero reservations) as it does for INBOUND
+        // RESPONDER (one matching reservation). `promotePendingToActive`
+        // and `evictPendingCandidate`'s `getByConversationId`
+        // lookups are therefore well-defined after this UPSERT.
+        db.transaction {
+            val staleReservations = db.opkReservationQueries
+                .getByConversationId(conversationId)
+                .executeAsList()
+            for (stale in staleReservations) {
+                db.opkReservationQueries.release(stale.opk_key_id_hex)
+            }
+            db.pendingRatchetStateQueries.upsert(
+                conversation_id          = conversationId,
+                state_blob               = RatchetStateStorageCodec.encodeForStorage(stateBlob, blobCipher),
+                reserved_at_ms           = nowMs,
+                bootstrap_artifacts_blob = bootstrapArtifactsBlob,
+            )
+        }
     }
 
     override suspend fun promotePendingToActive(conversationId: String): Boolean =

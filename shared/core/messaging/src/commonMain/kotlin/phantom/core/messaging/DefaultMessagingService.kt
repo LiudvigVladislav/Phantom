@@ -3019,38 +3019,53 @@ class DefaultMessagingService(
                                     // time (deferred-consume contract per
                                     // amended L4).
                                     //
-                                    // Failure / race branches:
-                                    //   - commitBootstrap false (reservation
-                                    //     released between L4 phase 1 and 3):
-                                    //     pending NOT written, no promotion
-                                    //     possible. Fall back to saveSession
-                                    //     so the advanced state still lands
-                                    //     in active — plaintext decrypted is
-                                    //     a correctness win; future-inbound
-                                    //     under the new chain succeeds on
-                                    //     active. Log reason=
-                                    //     `reservation_released_between_phases`.
-                                    //   - commit true, promote false (pending
-                                    //     evicted between commit and promote
-                                    //     — e.g. L7 cap eviction fired in
-                                    //     the same critical region): same
-                                    //     saveSession fallback. Log reason=
-                                    //     `pending_evicted_between_commit_and_promote`.
-                                    //   - sessionTransactionRepository null
-                                    //     (legacy test fixture without the
-                                    //     new repos wired): saveSession-only,
-                                    //     no commit/promote. Behaviour
-                                    //     identical to pre-Slice-4.
+                                    // Branch matrix (PR #317 Round 3 P2-B
+                                    // 2026-06-16):
+                                    //   (A) sessionTx == null — legacy
+                                    //       fixture WITHOUT Sprint 2b-C
+                                    //       wiring. Production never enters
+                                    //       this branch (AppContainer wires
+                                    //       SqlDelight-backed sessionTx).
+                                    //       Behaviour: saveSession-only,
+                                    //       log reason=`legacy_fixture`.
+                                    //   (B) opkIdForCommit == null AND
+                                    //       sessionTx != null — production
+                                    //       3-DH path (peer's x3dhInit
+                                    //       carried NO opkKeyIdHex because
+                                    //       our published bundle had no
+                                    //       OPKs available when peer fetched
+                                    //       it; server-contract pin #1 falls
+                                    //       back to 3-DH). No OPK to
+                                    //       reserve, no OPK to consume — the
+                                    //       deferred-consume protocol is
+                                    //       moot. Behaviour: saveSession
+                                    //       directly to active (no pending,
+                                    //       no promotion), log reason=
+                                    //       `no_opk_in_x3dh_init`.
+                                    //   (C) 4-DH production path — the
+                                    //       normal Sprint 2b-C commit ->
+                                    //       promote flow with deferred
+                                    //       consume. On commit=false log
+                                    //       reason=`reservation_released_between_phases`;
+                                    //       on commit=true promote=false
+                                    //       log reason=
+                                    //       `pending_evicted_between_commit_and_promote`.
+                                    //       No saveSession safety-net on
+                                    //       (C) — see PR #317 P1-2 comment
+                                    //       blocks below for the deferred-
+                                    //       consume invariant rationale.
+                                    //
                                     // All branches return decrypted plaintext
-                                    // — Slice 4 lock (Vladislav 2026-06-15):
-                                    // successful decrypt is not held; the
-                                    // log line carries the promotion verdict
-                                    // for diagnostics.
+                                    // — Slice 4 lock: successful decrypt is
+                                    // not held; the log line carries the
+                                    // promotion verdict for diagnostics.
                                     // ═════════════════════════════════════
                                     val opkIdForCommit = inboundX3dhInit.opkKeyIdHex
                                     val sessionTx = sessionTransactionRepository
                                     var promoted = false
                                     var commitSucceeded = false
+                                    val noOpkPath = opkIdForCommit == null && sessionTx != null
+                                    val legacyFixturePath = sessionTx == null
                                     if (opkIdForCommit != null && sessionTx != null) {
                                         val advancedStateJson = json.encodeToString(advancedState)
                                         val committed = sessionTx.commitBootstrap(
@@ -3130,13 +3145,26 @@ class DefaultMessagingService(
                                             // deferred-consume reason as the
                                             // commit-false branch above.
                                         }
+                                    } else if (noOpkPath) {
+                                        // Branch (B) — production 3-DH path.
+                                        // x3dhInit carried no opkKeyIdHex
+                                        // (relay handed peer a 3-DH bundle
+                                        // because our published bundle had
+                                        // no OPKs at fetch time). No OPK
+                                        // lifecycle to coordinate — write
+                                        // active directly. The deferred-
+                                        // consume invariant doesn't apply
+                                        // because no OPK is being consumed.
+                                        sessionManager.saveSession(conversationId, advancedState)
                                     } else {
-                                        // Legacy fixture without Sprint 2b-C
-                                        // wiring — preserve pre-Slice-4
-                                        // saveSession behaviour.
+                                        // Branch (A) — legacy fixture without
+                                        // Sprint 2b-C wiring. Production
+                                        // never enters this branch.
                                         sessionManager.saveSession(conversationId, advancedState)
                                     }
                                     val promotionLogSegment = when {
+                                        noOpkPath -> "promotion=skipped reason=no_opk_in_x3dh_init"
+                                        legacyFixturePath -> "promotion=skipped reason=legacy_fixture"
                                         promoted -> "promotion=true"
                                         !commitSucceeded ->
                                             "promotion=false reason=reservation_released_between_phases"

@@ -52,26 +52,43 @@ interface SessionTransactionRepository {
      * production callers pass NULL; Sprint 2b-C introduces non-NULL
      * writes for INITIATOR pending rows.
      *
-     * **Active row interaction (PR #316 review P2-1 — 2026-06-15).**
-     * This method does NOT touch `ratchet_state` at all. In the
-     * current Sprint 2b-B DMS:2569 wiring the caller has already
-     * written the advanced state to `ratchet_state` via
-     * `sessionManager.saveSession(conversationId, advancedState)`
-     * BEFORE invoking `commitBootstrap`. The dual-write is
-     * intentional Sprint 2b-B-only scaffolding: the active row
-     * preserves decrypt continuity for the next inbound envelope on
-     * the same chain while the pending row is the seed Sprint 2b-C
-     * promotion will read. A `false` return from this method
-     * therefore leaves the active row in whatever state the caller's
-     * prior `saveSession` left it — typically the advanced state
-     * just written. The DMS caller does NOT roll the active write
-     * back on a `false` here; the inbound-repair flow still emits
-     * `inbound_repair_ok` and returns the decrypted plaintext (the
-     * decrypt itself was a correctness win regardless of the pending
-     * commit). The only observable effect of `false` is that
-     * Sprint 2b-C will not find a pending row for this conversation
-     * until the next inbound envelope triggers another bootstrap
-     * derivation.
+     * **Active row interaction (PR #317 — 2026-06-16).** This method
+     * does NOT touch `ratchet_state` on either branch. Under
+     * Sprint 2b-C the DMS:2569 inbound-repair caller no longer
+     * pre-writes `saveSession(advancedState)` to active before
+     * invoking `commitBootstrap` (the Sprint 2b-B dual-write was
+     * removed in Slice 4 + further hardened by PR #317 review P1-2 —
+     * see ADR-029 §"Inbound repair — `commitBootstrap →
+     * promotePendingToActive` (dual-write removed)"). The Sprint 2b-C
+     * runtime treats `commitBootstrap` + `promotePendingToActive`
+     * as the SOLE path that updates the active row from an inbound
+     * bootstrap.
+     *
+     * A `false` return here therefore leaves the active `ratchet_state`
+     * row stale by design — whatever it held pre-receive (typically
+     * the pre-bootstrap RESPONDER row). The DMS caller logs
+     * `DECRYPT_TRACE inbound_repair_commit_skip
+     * reason=reservation_released_between_phases` and still emits
+     * `inbound_repair_ok ... promotion=false reason=...` so the
+     * decrypted plaintext is returned to the user (Slice 4 lock —
+     * successful decrypt is never held). Recovery is peer-conditional:
+     * the next inbound envelope under the new chain re-fires this
+     * branch only if the peer attaches `x3dhInit` again; without
+     * `x3dhInit` the active row MAC-fails on every subsequent inbound
+     * → `fail_mac action=hold` until either side's Sprint 2a guard
+     * re-fires or the user re-pairs.
+     *
+     * **PR #317 review P1-1 (2026-06-15) cleanup.** Before the
+     * pending UPSERT, implementations MUST release any prior
+     * `opk_reservation` rows for the same `conversationId` whose
+     * `opk_key_id_hex` differs from this caller's. Such priors
+     * become orphan the moment the pending row is overwritten — the
+     * L6 sweep would not pick them up because the pending companion
+     * still matches. After the cleanup the invariant "at most one
+     * reservation per (conversation_id) AND that row's
+     * `opk_key_id_hex` matches the pending row's bootstrap-backing
+     * OPK" holds for both `promotePendingToActive` and
+     * `evictPendingCandidate` lookups.
      *
      * @return true if the reservation was present and the pending
      *         row was upserted; false if the reservation was missing.
@@ -202,9 +219,25 @@ interface SessionTransactionRepository {
      *    OPK to delete here. The peer-pool OPK is the relay's
      *    concern (consumed at bundle-fetch time per server-contract
      *    pin #1).
-     *  - `opk_reservation` — outbound bootstrap places no
-     *    reservation. [promotePendingToActive]'s reservation-
-     *    optional shape covers this case at promote time.
+     *
+     * **DOES release stale `opk_reservation` rows for the conversation
+     * (PR #317 review P1 — 2026-06-16).** Outbound bootstrap itself
+     * places no reservation, but a PRIOR inbound bootstrap on the
+     * same conversation may have left a reservation row alive (its
+     * pending companion is about to be overwritten by this call).
+     * Implementations MUST release any `opk_reservation` rows keyed
+     * by [conversationId] inside the same transaction as the pending
+     * UPSERT, deleting the reservation row only (NOT the
+     * `local_one_time_pre_key` row — the L4 deferred-consume contract
+     * keeps the OPK in the pool). Without this cleanup, the orphan
+     * reservation would survive until a future
+     * [promotePendingToActive] read it by conversation_id and
+     * deleted an unrelated local OPK row by the inbound-bootstrap's
+     * `opk_key_id_hex`. After the cleanup the invariant "at most one
+     * reservation per conversation_id, and any such row matches the
+     * pending row's bootstrap-backing OPK" holds — empty for
+     * outbound INITIATOR pending, one matching row for inbound
+     * RESPONDER pending.
      *
      * [bootstrapArtifactsBlob] is REQUIRED non-null on this path —
      * the outbound-reuse path keys on its presence to discriminate
@@ -212,12 +245,14 @@ interface SessionTransactionRepository {
      * rows written by [commitBootstrap] (which always pass null
      * under Sprint 2b-C).
      *
-     * **Single-table upsert + no race.** Unlike [commitBootstrap]
-     * the operation has no cross-table precondition to verify in a
-     * transaction, so there is no "reservation released between
-     * phases" failure mode and the return type is [Unit]. An L7
-     * cap-enforcer call from the messaging layer SHOULD follow a
-     * successful commit (same shape as the inbound flow's
+     * **Cross-table cleanup, no commit failure.** Unlike
+     * [commitBootstrap] this method has no precondition that can
+     * fail at runtime (no reservation read), so the return type is
+     * [Unit]. The cross-table reservation cleanup described above is
+     * a strict-superset write — implementations release zero or more
+     * orphan reservation rows then UPSERT pending unconditionally.
+     * An L7 cap-enforcer call from the messaging layer SHOULD follow
+     * a successful commit (same shape as the inbound flow's
      * post-commit enforce).
      *
      * @param conversationId the outbound conversation

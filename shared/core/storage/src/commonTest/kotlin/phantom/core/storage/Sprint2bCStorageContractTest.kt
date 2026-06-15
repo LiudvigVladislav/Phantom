@@ -219,6 +219,114 @@ class Sprint2bCStorageContractTest {
         assertEquals("""{"second":true}""", current.bootstrapArtifactsBlob)
     }
 
+    // ── PR #317 review P1 (2026-06-16) — stale-reservation cleanup ───────
+    //
+    // Closes the cross-table cardinality gap where a prior INBOUND
+    // bootstrap leaves an opk_reservation row alive for `conv-X`
+    // (its pending companion was overwritten by a fresh OUTBOUND
+    // INITIATOR bootstrap on the same conversation). Without the
+    // cleanup, the next `promotePendingToActive(conv-X)` reads the
+    // orphan reservation by conversation_id and deletes an
+    // unrelated local OPK row by the inbound bootstrap's
+    // `opk_key_id_hex` — silently nuking a live OPK that has
+    // nothing to do with the outbound INITIATOR pending.
+
+    @Test
+    fun commitInitiatorPending_releasesPriorInboundReservation_preservingLocalOpk_thenPromoteDoesNotDeleteOpk() = runTest {
+        val opkResRepo = FakeOpkReservationRepository()
+        val pendingRepo = FakePendingRatchetStateRepository()
+        val activeRepo = FakeRatchetStateRepositoryForSprint2bC()
+        val localOpkRepo = FakeLocalOneTimePreKeyRepositoryForSprint2bC()
+        val sessionTx = FakeSessionTransactionRepositoryWithPromotion(
+            opkResRepo, pendingRepo, activeRepo, localOpkRepo,
+        )
+
+        // ─── Step 1 — seed inbound bootstrap end-state for conv-X ───
+        // Inbound RESPONDER pending live + opk_reservation(opk_X, conv-X)
+        // live + local OPK row for opk_X live. This is the post-
+        // commitBootstrap state from §L4 phase 3.
+        val opkXHex = "11".repeat(16)
+        localOpkRepo.insert(
+            LocalOneTimePreKeyEntity(
+                keyIdHex = opkXHex,
+                publicKeyHex = "aa".repeat(32),
+                privateKeyHex = "bb".repeat(32),
+                uploadedAtMs = 500L,
+            ),
+        )
+        opkResRepo.reserve(
+            opkKeyIdHex = opkXHex,
+            envelopeId = "env-inbound",
+            conversationId = "conv-X",
+            nowMs = 1_000L,
+        )
+        pendingRepo.upsert(
+            conversationId = "conv-X",
+            stateBlob = "inbound-responder-state",
+            reservedAtMs = 1_000L,
+            bootstrapArtifactsBlob = null,
+        )
+
+        // ─── Step 2 — local side fires a fresh OUTBOUND bootstrap on
+        // the same conv-X (peer never replied; sessionSuspect cleared;
+        // Sprint 2a role guard routes us through the bootstrap
+        // branch). commitInitiatorPending MUST release the inbound
+        // reservation as part of the same transaction.
+        sessionTx.commitInitiatorPending(
+            conversationId = "conv-X",
+            stateBlob = "outbound-initiator-state",
+            bootstrapArtifactsBlob = """{"x3dhInit":{"opkKeyIdHex":"$opkXHex"},"recipientPubkeyHex":"cc"}""",
+            nowMs = 5_000L,
+        )
+
+        // Reservation gone — pending row overwritten with INITIATOR
+        // state — local OPK PRESERVED (the §L4 deferred-consume
+        // contract says reservation release does NOT touch
+        // local_one_time_pre_key).
+        assertNull(
+            opkResRepo.get(opkXHex),
+            "PR #317 P1: prior inbound reservation MUST be released by commitInitiatorPending.",
+        )
+        assertNull(
+            opkResRepo.getByConversationId("conv-X"),
+            "PR #317 P1: no reservation row may remain keyed by conv-X after commitInitiatorPending.",
+        )
+        assertTrue(
+            localOpkRepo.has(opkXHex),
+            "PR #317 P1: local_one_time_pre_key row for opk_X MUST be preserved — reservation release does not consume OPK.",
+        )
+        val outboundPending = pendingRepo.get("conv-X")
+        assertNotNull(outboundPending, "outbound INITIATOR pending row must be present.")
+        assertEquals(
+            "outbound-initiator-state",
+            outboundPending!!.stateBlob,
+            "pending row overwritten with the outbound INITIATOR state.",
+        )
+
+        // ─── Step 3 — peer's first reply triggers promote. Without
+        // the P1 cleanup the orphan opk_reservation(opk_X, conv-X)
+        // would survive and promotePendingToActive would silently
+        // delete local opk_X. With the cleanup, the reservation is
+        // gone and promote runs the reservation-optional OUTBOUND-
+        // INITIATOR branch — ratchet-state-only, local pool
+        // untouched.
+        val promoted = sessionTx.promotePendingToActive("conv-X")
+        assertTrue(promoted, "promote must succeed on the outbound INITIATOR pending.")
+        assertEquals(
+            "outbound-initiator-state",
+            activeRepo.getRatchetState("conv-X"),
+            "active ratchet_state upserted with outbound INITIATOR state.",
+        )
+        assertNull(pendingRepo.get("conv-X"), "pending row deleted on promote.")
+        assertTrue(
+            localOpkRepo.has(opkXHex),
+            "PR #317 P1 LOAD-BEARING: promote MUST NOT delete local opk_X. " +
+                "Without the commitInitiatorPending cleanup, the orphan inbound reservation " +
+                "would have survived into this promote and the lookup by conv-X would have " +
+                "matched it → silent deletion of an unrelated local OPK.",
+        )
+    }
+
     @Test
     fun promotePendingToActive_promotesWithoutOpkDelete_whenNoReservation() = runTest {
         val opkResRepo = FakeOpkReservationRepository()
@@ -359,6 +467,15 @@ private class FakeSessionTransactionRepositoryWithPromotion(
         bootstrapArtifactsBlob: String,
         nowMs: Long,
     ) {
+        // PR #317 review P1 (2026-06-16) — release stale reservations
+        // for this conversation before overwriting pending. Mirrors
+        // the SqlDelight impl's same-tx cleanup. Reservation row only
+        // (NOT the local_one_time_pre_key) per the §L4 deferred-
+        // consume contract.
+        val stale = opkResRepo.getByConversationId(conversationId)
+        if (stale != null) {
+            opkResRepo.release(stale.opkKeyIdHex)
+        }
         pendingRepo.upsert(
             conversationId = conversationId,
             stateBlob = stateBlob,
