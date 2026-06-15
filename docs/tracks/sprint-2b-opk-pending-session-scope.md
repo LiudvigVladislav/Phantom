@@ -59,7 +59,11 @@ private suspend fun publishBundle(
 suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult
 ```
 
-`PreKeyApiClient.publishWithRetry` invokes `requestProvider()` ON EACH RETRY ATTEMPT, re-serialises a fresh `bodyBytes`, and sends that to `transport.publish(url, bodyBytes)`. The fix covers ALL FOUR call sites in `PreKeyLifecycleService`: `bootstrapForNewIdentity` (line 99), `maybeReplenishOneTimePreKeys` (line 205), `verifyBundleOnRelay` (line 180), `maybeRotateSignedPreKey` (line 268). Module boundary preservation per ADR-001: repository reads stay in `shared/core/messaging`, HTTP retry logic stays in `shared/core/transport`. Cells M-2bA-1 + M-2bA-2 pin this.
+`PreKeyApiClient.publishWithRetry` invokes `requestProvider()` ON EACH RETRY ATTEMPT, re-serialises a fresh `bodyBytes`, and sends that to `transport.publish(url, bodyBytes)`. The fix covers ALL FOUR call sites in `PreKeyLifecycleService`: `bootstrapForNewIdentity` (line 99), `maybeReplenishOneTimePreKeys` (line 205), `verifyBundleOnRelay` (line 180), `maybeRotateSignedPreKey` (line 268).
+
+**No bootstrap-path exception.** All four call sites — including `bootstrapForNewIdentity` — MUST pass `opksProvider = { oneTimePreKeyRepository.getAll() }`. The pre-amendment Round 2 wording allowed `bootstrapForNewIdentity` to close over its in-memory `generated_opks` list because "the snapshot is point-in-time-of-call by definition." That exception is REJECTED here: it is exactly the failure mode of the 2026-06-15 smoke. After `generateAndPersistOpks` persists the freshly-generated OPKs to the DB, a concurrent `recipientBootstrapInMemory` invocation between publish attempts can consume one of them locally. If the bootstrap path closure captures the in-memory list, the retry republishes the stale 40-OPK list. The L1 invariant is: every retry attempt rebuilds the OPK list from the DB, with no exception for the call site that just persisted them.
+
+Module boundary preservation per ADR-001: repository reads stay in `shared/core/messaging`, HTTP retry logic stays in `shared/core/transport`. Cells M-2bA-1 + M-2bA-2 + M-2bA-5 pin this (M-2bA-5 added in this amendment — asserts `bootstrapForNewIdentity` retry reads from DB on attempt N, not from the in-memory generated_opks closure).
 
 ### L2 — Decrypt-existing-first ordering at the inbound repair callsite (codifies Round 2 LOCK-A2)
 
@@ -73,25 +77,45 @@ The pending session slot MUST live in a NEW companion table, NOT a column added 
 
 ```sql
 CREATE TABLE pending_ratchet_state (
-    conversation_id TEXT NOT NULL PRIMARY KEY,
-    state_blob      TEXT NOT NULL,
-    reserved_at_ms  INTEGER NOT NULL
+    conversation_id          TEXT NOT NULL PRIMARY KEY,
+    state_blob               TEXT NOT NULL,
+    reserved_at_ms           INTEGER NOT NULL,
+    bootstrap_artifacts_blob TEXT
 );
 ```
 
-A new `PendingRatchetStateRepository` interface in `shared/core/storage` exposes `get / upsert / delete / getAll` operations distinct from the existing `RatchetStateRepository`. The Keystore alias is reused (`phantom_ratchet_wrap_v1`) — identical threat model, no benefit from a separate alias at Alpha. The Sprint 2a outbound role guard at `DefaultMessagingService:434` continues to read the ACTIVE slot ONLY and MUST NEVER read the pending slot for outbound decisions. The boundary is mechanical (different repository, different table). Cells M-2bB-1 + M-2bB-2 pin this.
+`bootstrap_artifacts_blob` is a NULLABLE column carrying the serialized bootstrap metadata needed for **outbound reuse** of an INITIATOR pending slot (the Sprint 2b-C scenario where a subsequent outbound send within PENDING_TTL reuses the cached `x3dhInit` instead of consuming a second OPK). The blob is a JSON-encoded record:
+
+```json
+{
+  "x3dh_init": {
+    "spk_key_id": <Long>,
+    "ephemeral_pub_key_hex": "<64-char hex>",
+    "opk_key_id_hex": "<32-char hex>"
+  },
+  "recipient_pubkey_hex": "<64-char hex>"
+}
+```
+
+The column is NULL for RESPONDER pending slots (created via L4 inbound flow — no outbound reuse needed; the pending state represents a session derived from a peer's bootstrap envelope). The column is NON-NULL for INITIATOR pending slots (created when this node initiated a fresh X3DH bootstrap to a peer — Sprint 2a guard fires on a RESPONDER active slot, triggering a new bootstrap). The Sprint 2b-C outbound reuse path reads this blob, re-constructs the X3dhInitHeader, and attaches it to the new outbound `WireFrame` without consuming a second OPK from the pool.
+
+A new `PendingRatchetStateRepository` interface in `shared/core/storage` exposes `get / upsert / delete / getAll` operations distinct from the existing `RatchetStateRepository`. The `upsert` signature is `upsert(conversationId: String, state: RatchetState, bootstrapArtifacts: BootstrapArtifacts? = null)`. The Keystore alias is reused (`phantom_ratchet_wrap_v1`) — identical threat model, no benefit from a separate alias at Alpha. The Sprint 2a outbound role guard at `DefaultMessagingService:434` continues to read the ACTIVE slot ONLY and MUST NEVER read the pending slot for outbound decisions, EXCEPT for the explicit Sprint 2b-C pending-INITIATOR reuse check (the architect L-ARCH-3 contract). The boundary is mechanical (different repository, different table). Cells M-2bB-1 + M-2bB-2 + M-2bC-5 pin this (M-2bC-5 added: `pendingInitiatorReuse_attachesStoredX3dhInit_withoutConsumingFreshOpk`).
 
 ### L4 — Two-phase OPK consume protocol
 
-The eager delete at `SessionManager.recipientBootstrapInMemory:357` MUST be replaced with a three-phase protocol:
+The eager delete at `SessionManager.recipientBootstrapInMemory:357` MUST be replaced with a three-phase protocol where **OPK consumption is DEFERRED to pending→active promotion**, NOT performed at successful decrypt:
 
 1. **Reserve**: write `opk_reservation(opk_key_id_hex PK, envelope_id, reserved_at_ms)` BEFORE the X3DH 4-DH derivation. Use `INSERT OR IGNORE` semantics — if an existing reservation for the same opk_key_id_hex exists (e.g., from a previous derivation attempt that crashed mid-flight), the insert is a no-op and the existing reservation is read back.
 2. **Derive + decrypt**: run the existing X3DH 4-DH handshake + candidate-decrypt unchanged.
 3. **Commit-or-rollback**:
-   - **Success**: in a single SQLDelight cross-table transaction, DELETE the `local_one_time_pre_key` row, DELETE the `opk_reservation` row, and UPSERT the pending ratchet state via `PendingRatchetStateRepository.upsert(conversationId, advancedState)`. The OPK is now permanently consumed.
+   - **Success**: in a single SQLDelight cross-table transaction, UPSERT the pending ratchet state via `PendingRatchetStateRepository.upsert(conversationId, advancedState, bootstrapArtifactsBlob)`. The `local_one_time_pre_key` row and the `opk_reservation` row are **preserved**. The OPK is not yet permanently consumed.
    - **Failure**: DELETE only the `opk_reservation` row. The `local_one_time_pre_key` row is preserved. The existing ACTIVE ratchet state is untouched. The OPK remains available for a future retry.
 
-Cells M-2bB-3 + M-2bB-4 + M-2bB-5 pin this.
+**OPK consumption happens at pending→active promotion (Sprint 2b-C):** when the pending slot is promoted to active — either because the local node received its first envelope under the pending session's chain (RESPONDER promotion) or because the peer's reply arrived under the new INITIATOR session (INITIATOR promotion) — a single SQLDelight cross-table transaction DELETES the `local_one_time_pre_key` row, DELETES the `opk_reservation` row, REPLACES the active `ratchet_state` row with the promoted pending state, and DELETES the `pending_ratchet_state` row. Only at this moment is the OPK irreversibly consumed.
+
+This deferred-consume model is the reconciliation of the L4 success path with the L7 eviction path: an evicted pending candidate has its reservation still in place (per L4 success phase), so L7 eviction releases the reservation cleanly and the OPK row is preserved. The pre-amendment L4 (which consumed the OPK at decrypt success) made L7's "rollback the reserve" wording physically impossible because the reservation was already gone.
+
+Cells M-2bB-3 + M-2bB-4 + M-2bB-5 + M-2bC-4 pin this (M-2bC-4 added: `promotePendingToActive_atomicallyConsumesOpkAndPromotesState`).
 
 ### L5 — `opk_reservation` table schema + repository
 
@@ -113,7 +137,11 @@ Reservations have a 5-minute TTL. On process startup, `AppContainer` calls `OpkR
 
 ### L7 — `PENDING_SESSION_CANDIDATE_CAP = 8` with LRU eviction (defense-in-depth)
 
-The number of in-flight pending session candidates per identity is capped at `PENDING_SESSION_CANDIDATE_CAP = 8`. When a new bootstrap would exceed the cap, the OLDEST pending candidate (by `reserved_at_ms`) is evicted; the eviction MUST transactionally release the evicted candidate's OPK reservation (rolling back the reserve from L4 phase 1) and delete the pending ratchet state row. The cap is a **defense-in-depth** mitigation on top of the server-side rate limits in server-contract pins #2/#3/#4 (publish 10/hour, fetch 60/min, WS message 60/min). The relay's existing rate limits already bound the realistic attack rate; the client cap bounds local memory + storage growth from a peer that happens to spam pending bootstraps within those rate envelopes.
+The number of in-flight pending session candidates per identity is capped at `PENDING_SESSION_CANDIDATE_CAP = 8`. When a new bootstrap would exceed the cap, the OLDEST pending candidate (by `reserved_at_ms`) is evicted; the eviction MUST transactionally DELETE the evicted candidate's `pending_ratchet_state` row AND DELETE its associated `opk_reservation` row (the reservation that the L4 phase 1 created and L4 phase 3 success kept in place per the L4 deferred-consume model). The `local_one_time_pre_key` row is **preserved** — the OPK was never consumed because L4 defers consumption to promotion, and an evicted pending candidate never reaches promotion. The evicted OPK returns to the pool and becomes available for future bootstrap candidates.
+
+This contract is internally consistent only because L4 was amended to defer OPK consumption to promotion. Under the pre-amendment L4 (which consumed at decrypt success), L7 eviction would have hit the contradiction Vladislav flagged at PR #314 review: the reservation would already be gone, the OPK would already be gone, and "rollback to reserve" would be physically impossible. Under the amended L4, eviction releases the reservation cleanly.
+
+The cap is a **defense-in-depth** mitigation on top of the server-side rate limits in server-contract pins #2/#3/#4 (publish 10/hour, fetch 60/min, WS message 60/min). The relay's existing rate limits already bound the realistic attack rate; the client cap bounds local memory + storage growth from a peer that happens to spam pending bootstraps within those rate envelopes.
 
 The default value `8` is an Alpha-locked design choice, NOT a derived constant. It is retunable post-merge based on field telemetry. The lock is on the existence of the cap, not on the specific value. Cells M-2bB-6 + M-2bB-7 pin this.
 
@@ -152,6 +180,7 @@ Three PRs, each individually green at the local sweep level, each independently 
 - **M-2bA-2** `publishWithRetry_perAttemptResnapshot_bodyDoesNotContainDeletedOpk` — body of attempt 2 MUST NOT contain `opk_consumed` deleted between attempts 1 and 2.
 - **M-2bA-3** `handleDeliver_existingSessionDecryptsCleanly_doesNotInvokeInboundRepair` — `SpyOneTimePreKeyRepo.deleteCalls.size == 0` after delivering an `x3dhInit`-bearing envelope that decrypts cleanly under the existing session. The load-bearing decrypt-existing-first invariant.
 - **M-2bA-4** Sprint 2a regression — U1/U2/U3 at `DefaultMessagingServiceTest.kt` continue to assert byte-identical wire shape (role guard + suspect override behaviour preserved). No code change inside these tests; if they fail, Sprint 2b-A is reverted.
+- **M-2bA-5** `bootstrapForNewIdentity_publishRetry_readsFromDbNotGeneratedOpksClosure` — `BodyCapturingPublishTransport` runs `bootstrapForNewIdentity`, scripts attempt 1 timeout, deletes one OPK from the DB via a spy, scripts attempt 2 timeout, deletes another, scripts attempt 3 success. Asserts attempt 1 body differs from attempt 2 body differs from attempt 3 body; the in-memory `generated_opks` closure is NOT used; all attempts read from `oneTimePreKeyRepository.getAll()`. The no-bootstrap-exception invariant.
 
 **Local sweep:**
 - `:shared:core:transport:jvmTest` green (including all new M-2bA cells)
@@ -176,11 +205,11 @@ Three PRs, each individually green at the local sweep level, each independently 
 **Tests (commonTest):**
 - **M-2bB-1** `pendingRatchetStateRepository_writes_areIsolatedFromActive` — writing to pending slot does NOT update `RatchetStateRepository.getRatchetState(conv)`.
 - **M-2bB-2** `sprint2aGuard_readsActiveSlot_neverReadsPending` — Sprint 2a U1/U2/U3 with a populated pending slot continue to read ONLY the active slot.
-- **M-2bB-3** `recipientBootstrapInMemory_failedDecrypt_preservesOpk` — when candidate-decrypt fails, `opkRepo.has(opkId) == true` AND `opkReservationRepo.has(opkId) == false`. The load-bearing rollback invariant.
+- **M-2bB-3** `recipientBootstrapInMemory_failedDecrypt_preservesOpkAndReleasesReservation` — when candidate-decrypt fails, `opkRepo.has(opkId) == true` AND `opkReservationRepo.has(opkId) == false`. The load-bearing rollback invariant.
 - **M-2bB-4** `recipientBootstrapInMemory_processCrashMidDerive_opkSurvivesRestart` — `runTest` simulates: reserve + crash. After process restart (via `SessionManager` recreation against the same backing repos + startup sweep), `opkRepo.has(opkId) == true` AND `opkReservationRepo.has(opkId) == false` (sweep ran).
-- **M-2bB-5** `commitBootstrap_atomicallyDeletesOpkAndReservationAndUpsertsPending` — all three operations land in a single transaction or none of them.
-- **M-2bB-6** `pendingSessionCapEnforcer_evictsOldestOnOverflow` — after 9 reserves, the oldest pending row + its reservation are rolled back.
-- **M-2bB-7** `pendingSessionCapEnforcer_evictionRollsBackOpk` — evicted candidate's OPK row is restored (`opkRepo.has(opkId) == true` post-eviction).
+- **M-2bB-5** `commitBootstrap_atomicallyUpsertsPendingAndPreservesOpkAndReservation` — successful candidate-decrypt + UPSERT of `pending_ratchet_state` row land in a single transaction; `opk_reservation` row is PRESERVED (not deleted at decrypt success per amended L4); `local_one_time_pre_key` row is PRESERVED.
+- **M-2bB-6** `pendingSessionCapEnforcer_evictsOldestOnOverflow_releasesReservationPreservesOpk` — after 9 reserves, the oldest pending row + its reservation are evicted; the associated `local_one_time_pre_key` row is preserved (OPK returns to pool because L4 never consumed it). The amended L7 invariant.
+- **M-2bB-7** `pendingSessionCapEnforcer_evictionRollsBackReservationOnly` — `opkReservationRepo.has(evictedOpkId) == false` AND `opkRepo.has(evictedOpkId) == true` post-eviction (asserts the reservation is released but the OPK survives because it was never consumed).
 
 **Instrumented tests (androidInstrumentedTest):**
 - Schema migration test asserting fresh installs + upgrade installs land at the same schema version.
@@ -203,8 +232,10 @@ Three PRs, each individually green at the local sweep level, each independently 
 
 **Tests (commonTest):**
 - **M-2bC-1** `firstInboundOnPendingChain_promotesPendingToActive` — pending row deletion + active row upsert in a single transaction.
-- **M-2bC-2** `outboundSendWithinPendingTtl_reusesPendingSlot_noOpkConsume` — second outbound send before promotion uses cached pending state; `opkRepo.deleteCalls.size` unchanged.
-- **M-2bC-3** `outboundSendAfterPendingTtl_runsFreshBootstrap` — expired pending slot is discarded; new bootstrap consumes a fresh OPK.
+- **M-2bC-2** `outboundSendWithinPendingTtl_reusesPendingSlot_noOpkConsume` — second outbound send before promotion reads `bootstrap_artifacts_blob` from the pending slot, attaches the cached `x3dhInit` to the WireFrame, and emits without calling `oneTimePreKeyRepository.deleteByKeyId(_)` or `reserve(_)` for a new OPK. The L-ARCH-3 outbound-reuse invariant.
+- **M-2bC-3** `outboundSendAfterPendingTtl_runsFreshBootstrap` — expired pending slot is discarded; new bootstrap reserves a fresh OPK.
+- **M-2bC-4** `promotePendingToActive_atomicallyConsumesOpkAndPromotesState` — promotion runs DELETE on `local_one_time_pre_key` row + DELETE on `opk_reservation` row + REPLACE on `ratchet_state` row + DELETE on `pending_ratchet_state` row in a single SQLDelight transaction. The deferred-consume invariant from amended L4.
+- **M-2bC-5** `pendingInitiatorReuse_attachesStoredX3dhInit_withoutConsumingFreshOpk` — given a pending INITIATOR slot with `bootstrap_artifacts_blob` populated, the outbound send path reconstructs the `X3dhInitHeader` from the blob, attaches it to the new outbound `WireFrame`, and the OPK pool count is UNCHANGED (`opkRepo.count()` before == after). Pins the schema's `bootstrap_artifacts_blob` contract from amended L3.
 
 **Instrumented tests (androidInstrumentedTest):**
 - **M-OPK-3** `publishRetryDuringConsume_secondReplyDecryptsOk` — the load-bearing acceptance gate. Test harness: `publishWithRetryDelayHook` stalls publish attempt 3 for 5s while inbound `recipientBootstrapInMemory` consumes OPK_X locally; an injected second reply (`am start` triggered from the test driver) MUST decrypt under the inbound-repair path with ZERO `errorClass=OpkNotFound` and ZERO `fail_mac action=hold` in logcat. Reproduces the 2026-06-15 smoke shape deterministically. Wi-Fi only — no Tele2 required for landing.
