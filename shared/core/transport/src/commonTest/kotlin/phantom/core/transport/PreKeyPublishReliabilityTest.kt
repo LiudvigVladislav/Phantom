@@ -115,7 +115,7 @@ class PreKeyPublishReliabilityTest {
         // Simulate a concurrent in-flight publish by acquiring the mutex directly.
         api.publishMutex.lock()
 
-        val debounced = api.publishBundle(sampleRequest())
+        val debounced = api.publishBundle { sampleRequest() }
 
         assertTrue(debounced is PublishResult.Stored)
         assertEquals(0, (debounced as PublishResult.Stored).storedOpks,
@@ -126,7 +126,7 @@ class PreKeyPublishReliabilityTest {
         // Release the lock and verify a normal call succeeds.
         api.publishMutex.unlock()
 
-        val real = api.publishBundle(sampleRequest())
+        val real = api.publishBundle { sampleRequest() }
         assertTrue(real is PublishResult.Stored)
         assertEquals(5, (real as PublishResult.Stored).storedOpks,
             "real call after mutex released must return server response")
@@ -148,7 +148,7 @@ class PreKeyPublishReliabilityTest {
 
         var thrown: Throwable? = null
         try {
-            api.publishBundle(sampleRequest())
+            api.publishBundle { sampleRequest() }
             fail("expected SocketTimeoutException to propagate after all retries")
         } catch (e: java.net.SocketTimeoutException) {
             thrown = e
@@ -172,7 +172,7 @@ class PreKeyPublishReliabilityTest {
             publishTransport = transport,
         )
 
-        val result = api.publishBundle(sampleRequest())
+        val result = api.publishBundle { sampleRequest() }
 
         // 422 maps to Unexpected(422) — not a retryable status.
         assertTrue(result is PublishResult.Failure)
@@ -210,7 +210,7 @@ class PreKeyPublishReliabilityTest {
 
         val tBefore = testScheduler.currentTime
         try {
-            api.publishBundle(sampleRequest())
+            api.publishBundle { sampleRequest() }
         } catch (ignored: java.net.SocketTimeoutException) {
             // Expected — all retries exhausted.
         }
@@ -250,7 +250,7 @@ class PreKeyPublishReliabilityTest {
             publishTransport = transport,
         )
 
-        val result = api.publishBundle(sampleRequest())
+        val result = api.publishBundle { sampleRequest() }
 
         assertEquals(2, transport.callCount, "should succeed on the second attempt")
         assertTrue(result is PublishResult.Stored)
@@ -271,7 +271,7 @@ class PreKeyPublishReliabilityTest {
             publishTransport = transport408,
         )
 
-        val result408 = api408.publishBundle(sampleRequest())
+        val result408 = api408.publishBundle { sampleRequest() }
 
         assertEquals(PreKeyApiClient.PUBLISH_MAX_ATTEMPTS, transport408.callCount,
             "408 should trigger retries up to PUBLISH_MAX_ATTEMPTS")
@@ -287,7 +287,7 @@ class PreKeyPublishReliabilityTest {
             publishTransport = transport400,
         )
 
-        val result400 = api400.publishBundle(sampleRequest())
+        val result400 = api400.publishBundle { sampleRequest() }
 
         assertEquals(1, transport400.callCount, "400 must not trigger retries")
         assertTrue(result400 is PublishResult.Failure)

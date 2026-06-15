@@ -819,6 +819,102 @@ The security improvement is in separation, not in regeneration.
 - Tag `v0.1.0-alpha.2` after Phase 1 Week 4 PR merges; this is the
   Alpha-2 release snapshot per Phase 1 Track E plan
 
+## Amendment — Sprint 2b L1 publish protocol factory-lambda re-snapshot (2026-06-15)
+
+The 2026-06-15 integration LTE smoke captured
+`errorClass=OpkNotFound action=fall_through_to_hold → fail_mac action=hold`
+on a Tecno device after a Sprint 2a-guarded emulator reply. Two
+Council rounds confirmed the root cause: a **publish-snapshot
+consistency gap** in `PreKeyApiClient.publishWithRetry`. The
+serialized `PublishRequest` body was captured ONCE before the retry
+loop and replayed identically across all attempts; a retry succeeded
+server-side AFTER a local OPK consume; the relay's atomic
+"replace wholesale" publish semantics (this ADR's "Atomic OPK consume"
+contract on the consume side, and the relay's `prekeys.rs:273-276`
+replace contract on the publish side) restored the relay-side OPK
+pool to the stale 40-OPK snapshot that included the already-consumed
+OPK; a subsequent peer bundle fetch handed that consumed OPK to a
+peer; the peer's `x3dhInit` referenced it; the local
+`oneTimePreKeyRepository.get(opkKeyIdHex)` returned `null`.
+
+The original ADR-009 implementation notes (above) implicitly assumed
+that the publish body was a point-in-time-of-call snapshot of the
+client's OPK pool. The publish-with-retry overlay (PR-R0 / PR-R0.1)
+made this implicit assumption load-bearing for correctness, and the
+field smoke proved it wrong.
+
+### Locked invariant
+
+`PreKeyApi.publishBundle` MUST take a factory lambda
+(`suspend () -> PublishRequest`), and `PreKeyApiClient.publishWithRetry`
+MUST invoke that lambda on EVERY retry attempt — rebuilding the
+serialized body from the current state of
+`oneTimePreKeyRepository.getAll()` each time. The pre-amendment
+shape that captured `bodyBytes` once before the loop is rejected;
+attempt N's body MUST reflect the local OPK pool at the start of
+attempt N.
+
+The corresponding helper at `PreKeyLifecycleService.publishBundle`
+takes `opksProvider: suspend () -> List<LocalOneTimePreKeyEntity>`.
+All four production call sites — `bootstrapForNewIdentity`,
+`verifyBundleOnRelay`, `maybeReplenishOneTimePreKeys`,
+`maybeRotateSignedPreKey` — pass
+`{ oneTimePreKeyRepository.getAll() }`. **No bootstrap-path
+exception** is permitted: the freshly-generated `generated_opks`
+list returned by `generateAndPersistOpks` MUST NOT be closed over by
+the factory lambda. After `insertAll(...)` persists the new OPKs to
+the DB, a concurrent `recipientBootstrapInMemory` invocation between
+publish attempts can locally consume one of them; if the bootstrap
+call site closed over the in-memory list, the retry would republish
+the stale 40-OPK snapshot — exactly the failure mode the field smoke
+captured. The factory lambda always reads from the DB.
+
+This invariant is verified by the M-2bA-1 + M-2bA-2 + M-2bA-5 cells
+landed alongside this amendment in
+`shared/core/transport/src/commonTest/.../PreKeyPublishResnapshotTest.kt`
+and
+`shared/core/messaging/src/commonTest/.../PreKeyLifecycleServiceTest.kt`.
+
+The L2 protective layer (decrypt-existing-first ordering at
+`DefaultMessagingService.kt:2411`) was already in place from
+PR-CRYPTO-SESSION-REPAIR1 + PR-CRYPTO-INBOUND-X3DH-REPAIR1; the
+Sprint 2b-A pin is a regression lock via M-2bA-3 — not new
+behaviour.
+
+### Out of scope for this amendment
+
+The complementary `MigrationManager.run(...)` publish path (a single-
+shot migration-time publish that runs before any session exists and
+therefore has no concurrent OPK consume surface) is structurally
+satisfied via a degenerate `{ publishRequest }` lambda — the L1
+contract holds at the interface level; operationally the lifecycle
+service's steady-state publishes carry the load-bearing race-closing
+guarantee.
+
+### Relationship to the broader OPK lifecycle work (Sprint 2b-B/C)
+
+The publish-snapshot consistency fix above closes the OBSERVED smoke
+root cause. The broader OPK lifecycle / consume / idempotency /
+restart-resilience axis (the PR #313 lock surface) is addressed by
+Sprint 2b-B and Sprint 2b-C as scoped in
+`docs/tracks/sprint-2b-opk-pending-session-scope.md` — two-phase
+consume protocol with reservations, companion `pending_ratchet_state`
+table, pending→active state machine, and a Wi-Fi M-OPK-3 field gate.
+A separate ADR-029 written in 2b-B will lock the pending/active
+state-machine + OPK reserve protocol; this amendment covers only the
+publish protocol re-snapshot half of Sprint 2b.
+
+### Trail
+
+- Smoke evidence:
+  `C:\temp\trek2-stage2b-b-d-integration-smoke-2026-06-15\` +
+  `docs/PROJECT_LOG.md` 2026-06-15 entry.
+- Council durables:
+  `C:\temp\sprint-2b-{reconnaissance,council-layer1,council-layer1-round2}-2026-06-15\`.
+- Track-doc scope-lock:
+  `docs/tracks/sprint-2b-opk-pending-session-scope.md` (PR #314
+  squash `cfa765d2`).
+
 ## References
 
 - Signal Protocol whitepaper (Marlinspike & Perrin, 2016)

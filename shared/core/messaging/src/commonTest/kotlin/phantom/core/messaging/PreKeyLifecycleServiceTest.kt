@@ -85,9 +85,13 @@ class PreKeyLifecycleServiceTest {
         // (signed_prekey_age_days = null). Tests that exercise the
         // "relay already has our bundle" branch override this.
         var fetchStatusResult: PreKeyStatus = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = null)
-        override suspend fun publishBundle(request: PublishRequest): PublishResult {
+        // Sprint 2b L1: PreKeyApi.publishBundle takes a factory lambda
+        // invoked once per retry attempt. This fake invokes it exactly
+        // once and records the resulting request — tests that assert on
+        // a single happy-path attempt see the same shape as before.
+        override suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult {
             publishCount++
-            lastRequest = request
+            lastRequest = requestProvider()
             return publishResult
         }
         override suspend fun fetchBundle(
@@ -367,5 +371,137 @@ class PreKeyLifecycleServiceTest {
         // Local SPK was persisted before publish — that's fine, a retry
         // will republish from the existing local state.
         assertNotNull(rig.spkRepo.get())
+    }
+
+    // ── Sprint 2b M-2bA-5 ───────────────────────────────────────────────────
+    //
+    // The load-bearing "no bootstrap exception" invariant from scope-doc
+    // L1: even on the bootstrap path, the `opksProvider` lambda passed
+    // into the publish helper MUST read from the repository on every
+    // invocation. It MUST NOT close over the in-memory `generated_opks`
+    // list returned by `generateAndPersistOpks`.
+    //
+    // The 2026-06-15 integration smoke shape: a concurrent inbound
+    // bootstrap can locally consume one of the freshly-generated OPKs
+    // between publish attempts. If the bootstrap path passed
+    // `{ generated_opks }`, the retry would republish the stale 40-OPK
+    // snapshot including the just-consumed key. The L1 lock REJECTS
+    // that closure (see scope-doc L1 §"No bootstrap-path exception"
+    // and the M-2bA-5 cell).
+    //
+    // Mechanism: a [RetryingFakePreKeyApi] simulates the 3-attempt
+    // retry loop directly — it invokes `requestProvider` three times,
+    // captures each result, and mutates the OPK repository between
+    // invocations. We do NOT exercise `PreKeyApiClient.publishWithRetry`
+    // here (M-2bA-1 + M-2bA-2 cover that at the transport layer); the
+    // M-2bA-5 invariant is specifically that the lambda the lifecycle
+    // service hands to `PreKeyApi.publishBundle` reflects post-consume
+    // repository state, not closure state.
+
+    private class RetryingFakePreKeyApi(
+        private val mutateBetweenAttempts: suspend () -> Unit,
+    ) : PreKeyApi {
+        val capturedRequests: MutableList<PublishRequest> = mutableListOf()
+        var publishCount: Int = 0
+        override suspend fun publishBundle(
+            requestProvider: suspend () -> PublishRequest,
+        ): PublishResult {
+            publishCount++
+            // Simulate the 3-attempt retry loop. Invoke requestProvider
+            // BEFORE the first mutation so attempt 1 sees the initial
+            // pool; mutate after each capture so attempts 2 + 3 see
+            // post-consume state if (and only if) the lambda reads from
+            // the repository.
+            capturedRequests.add(requestProvider())
+            mutateBetweenAttempts()
+            capturedRequests.add(requestProvider())
+            mutateBetweenAttempts()
+            capturedRequests.add(requestProvider())
+            return PublishResult.Stored(storedOpks = capturedRequests.last().one_time_pre_keys.size)
+        }
+        override suspend fun fetchBundle(
+            identityPubkeyHex: String,
+            requesterPubkeyHex: String?,
+        ): PreKeyBundle? = null
+        override suspend fun fetchStatus(
+            identityPubkeyHex: String,
+            requesterPubkeyHex: String?,
+        ): PreKeyStatus = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = null)
+    }
+
+    @Test
+    fun bootstrapForNewIdentity_publishRetry_readsFromDbNotGeneratedOpksClosure() = runTest {
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val spkRepo = InMemorySignedPreKeyRepo()
+        val opkRepo = InMemoryOneTimePreKeyRepo()
+
+        // The retry-loop fake mutates the OPK repository between
+        // invocations — deleting one OPK each time, simulating an
+        // inbound bootstrap consume that races the publish retry.
+        val api = RetryingFakePreKeyApi(
+            mutateBetweenAttempts = {
+                val first = opkRepo.store.keys.firstOrNull()
+                if (first != null) opkRepo.deleteByKeyId(first)
+            },
+        )
+
+        val service = PreKeyLifecycleService(
+            identityManager = identityManager,
+            signedPreKeyRepository = spkRepo,
+            oneTimePreKeyRepository = opkRepo,
+            preKeyApi = api,
+            x3dh = LibsodiumX3DH(),
+            nowMsProvider = { 1_700_000_000_000L },
+        )
+
+        val result = service.bootstrapForNewIdentity()
+        assertTrue(result.isSuccess, "happy path must succeed; got $result")
+
+        // The fake invoked requestProvider 3 times — one captured
+        // request per retry attempt.
+        assertEquals(3, api.capturedRequests.size,
+            "lambda must be invoked once per retry attempt")
+
+        val opksAttempt1 = api.capturedRequests[0].one_time_pre_keys.map { it.key_id_hex }.toSet()
+        val opksAttempt2 = api.capturedRequests[1].one_time_pre_keys.map { it.key_id_hex }.toSet()
+        val opksAttempt3 = api.capturedRequests[2].one_time_pre_keys.map { it.key_id_hex }.toSet()
+
+        // L1 INVARIANT: lambda reads from the repository on every
+        // invocation, so post-consume state IS visible across attempts.
+        // Attempt 1: full pool (REFILL_BATCH_SIZE).
+        // Attempt 2: pool minus 1 OPK (the one we deleted between 1+2).
+        // Attempt 3: pool minus 2 OPKs (delete between 2+3 too).
+        assertEquals(PreKeyLifecycleService.REFILL_BATCH_SIZE, opksAttempt1.size,
+            "attempt 1 must list the full freshly-generated pool")
+        assertEquals(PreKeyLifecycleService.REFILL_BATCH_SIZE - 1, opksAttempt2.size,
+            "attempt 2 must reflect the 1-OPK consume since attempt 1 — " +
+                "post-Sprint-2b L1 lambda reads from DB, not generated_opks closure")
+        assertEquals(PreKeyLifecycleService.REFILL_BATCH_SIZE - 2, opksAttempt3.size,
+            "attempt 3 must reflect the 2-OPK consume since attempt 1")
+
+        // The consumed OPKs are GONE from later attempts — closure over
+        // the in-memory generated_opks list would replay them.
+        val deletedBetween1And2 = opksAttempt1 - opksAttempt2
+        val deletedBetween2And3 = opksAttempt2 - opksAttempt3
+        assertEquals(1, deletedBetween1And2.size,
+            "exactly one OPK must drop out between attempt 1 and 2")
+        assertEquals(1, deletedBetween2And3.size,
+            "exactly one OPK must drop out between attempt 2 and 3")
+        assertFalse(opksAttempt2.containsAll(deletedBetween1And2),
+            "consumed OPK from attempt 1 MUST NOT reappear in attempt 2 — " +
+                "the no-bootstrap-closure invariant (L1)")
+        assertFalse(opksAttempt3.containsAll(deletedBetween2And3),
+            "consumed OPK from attempt 2 MUST NOT reappear in attempt 3")
+
+        // Identity + signing hex stay stable across attempts — only the
+        // OPK list churns. (Sanity check that the lambda re-constructs
+        // PublishRequest correctly per invocation.)
+        val identityHex0 = api.capturedRequests[0].identity_pubkey_hex
+        assertTrue(api.capturedRequests.all { it.identity_pubkey_hex == identityHex0 },
+            "identity hex stable across retries")
+        val spkKeyId0 = api.capturedRequests[0].signed_pre_key.key_id
+        assertTrue(api.capturedRequests.all { it.signed_pre_key.key_id == spkKeyId0 },
+            "SPK key_id stable across retries")
     }
 }
