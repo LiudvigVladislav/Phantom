@@ -589,6 +589,57 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-16 · Stage 2B-D Tele2 LTE integration smoke PASS + PR #310 MERGED + Round 14 LIVE on production relay
+
+**Goal:** run the integration LTE smoke that gates PR #310 ready-for-review and the Stage 2B-D rollout flag flip — the same smoke the 2026-06-15 entry failed on Layer 3 with `errorClass=OpkNotFound action=fall_through_to_hold` → `fail_mac action=hold`. With Sprint 2b-A + 2b-B + 2b-C on master (PRs #315 / #316 / #317), the three-layer bundle was expected to flip Layer 3 to PASS while preserving the Layer 1 (Round 14 wire) and Layer 2 (Sprint 2a guard) PASS from the 2026-06-15 run.
+
+**Bundle under test:**
+
+- Master `fd8f93d9` (Sprint 2b-A + 2b-B + 2b-C + PR #318 docs merged).
+- Client APK from `:apps:android:assembleDebug` against master `fd8f93d9` with `LONGPOLL_V2_ENABLED == "1"` (debug variant default), SHA-256 `7bdea25ea9064160c2e2f249881c5d059b7c56be5138dffc9f0f35bd3bd2824c`. `BuildConfig.java` verified to carry `LONGPOLL_V2_ENABLED = "1"` + `POLL_SKIP_LP_AND_PP = "0"` + `S6_DEBUG_TRIGGER_ENABLED = "1"` + the production `RELAY_URL`.
+- Relay binary from `feat/round14-poll-chunked-flush` head `736973f1` (PR #310 pre-merge) deployed to `relay.phntm.pro` with `RELAY_POLL_CHUNKED_FLUSH=1` + `RELAY_POLL_HOLD_SECS=30` + `RELAY_ENABLE_DIAG_SHAPE=0` (M13 mutex clean). Banner verified: `relay feature flags heartbeat_echo_enabled=true slow_post_diag_enabled=false poll_chunked_flush=true`. `/health` returned `HTTP/2 200`.
+- Tecno `103603734A004351` on Tele2 LTE (Wi-Fi off, mobile data validated against a third-party browser fetch) + emulator `emulator-5554` on host Wi-Fi.
+
+**Smoke window:** ~14:14 → ~14:20 local on Tecno (UTC-5 device clock), ~19:14 → ~19:20 UTC on relay clock. Logs durable at `C:\temp\stage-2b-d-smoke-2026-06-16\logs\`: `tecno-lte.log` (1586 lines), `peer.log` (737 lines), `stage-2b-d-relay-20260615-221017.log` (158 lines). Findings at `C:\temp\stage-2b-d-smoke-2026-06-16\findings.md`.
+
+**Three-layer verdict — all PASS:**
+
+1. **Layer 1 — Round 14 paced chunked-flush wire transport on Tele2 LTE — PASS.** 19 `phase_event op=poll event=responseBodyEnd byteCount=4608` events on the Tecno hybrid log; each one decomposes into 4 × 1152-byte chunks separated by ~250-300 ms inter-chunk paces, matching the locked Round 14 D15 contract. Sample first cycle (873 ms wall clock): `body_chunk cumulative_bytes=875 chunk_bytes=875 elapsedMs=2` → `cumulative_bytes=1152 chunk_bytes=277 elapsedMs=3` → `cumulative_bytes=2304 chunk_bytes=1152 elapsedMs=249` → `cumulative_bytes=3456 chunk_bytes=1152 elapsedMs=554` → `responseBodyEnd byteCount=4608 elapsedMs=873` → `body_chunk cumulative_bytes=4608 chunk_bytes=1152 elapsedMs=878` → `body_eof cumulative_bytes=4608 elapsedMs=878`. Relay-side mirror: 34 `rest_poll_returned` events all carrying `chunked_flush=true hold_secs=30 long_poll_opt_in=true padded_poll_opt_in=true`. The pre-Round-14 baseline reproduced the byte-budget stall on this carrier at ~3978 / 4608 bytes; under Round 14 all 4608 bytes arrived complete on every observed poll.
+
+2. **Layer 2 — Sprint 2a outbound role guard on Tele2 LTE — PASS.** Peer log shows 3 hits of `SEND_TRACE bootstrap_path conv=190f3506d224 reason=responder_role_redirected` at 19:15:27.086, 19:17:40.728, 19:18:38.598 UTC. Each hit means the Sprint 2a guard at `DefaultMessagingService.kt:434` redirected the emulator's outbound from the existing-session path into the bootstrap branch, attached a fresh `x3dhInit`, fetched the recipient prekey bundle, ran the 4-DH bootstrap, and saved the new session — the same trail the 2026-06-15 entry validated, now repeated three times in one smoke window.
+
+3. **Layer 3 — Sprint 2b-C inbound repair + promotion — PASS (the layer that broke on 2026-06-15, now clean).** Tecno log shows 3 `DECRYPT_TRACE inbound_repair_ok ... bootstrap=true ... promotion=true` events for msgIds `930a922b` (elapsedMs=138), `f8152025` (elapsedMs=140), `6a22457b` (elapsedMs=102) plus 3 steady-state `DECRYPT_TRACE ok ... bootstrap=false` decrypts for msgIds `43653c7c`, `15c61e5d`, `582747ff` after the bootstraps completed. The Sprint 2b-C runtime is now load-bearing in this trace: every fresh-bootstrap envelope went `commitBootstrap → promotePendingToActive` and emitted `promotion=true`. The deferred-consume contract from ADR-029 §L4 held. Counter-evidence absent: `errorClass=OpkNotFound` 0 hits, `fail_mac action=hold` 0 hits, `promotion=false` 0 hits, `pending_fallback_ok` 0 hits, `no_opk_in_x3dh_init` 0 hits. UI confirmation: Tecno rendered all four exchanged messages (`alpha-1`, `beta-1`, `alpha-2`, `beta-2`) without operator intervention.
+
+**Bonus stress signal — Sprint 2b-C absorbed a broken upstream publish path.** Tecno's prekey lifecycle service attempted to republish its bundle during the smoke window and ran out of retries: `prekey_publish_retry attempt=1 reason=SocketTimeoutException elapsedMs=60588` → `prekey_publish_retry attempt=2 elapsedMs=60588` → `prekey_publish_fail_giving_up attempts=3`. This is the pre-existing T2 carrier-ceiling slow-POST class on Tele2 LTE upstream documented at `project_t2_outcome_2026_06_05.md` — NOT a Round 14 / Sprint 2b regression. The Sprint 2b-C runtime nonetheless absorbed all three fresh-bootstrap envelopes cleanly because the emulator already held Tecno's pre-existing prekey bundle and the local `local_one_time_pre_key` rows that emu's `x3dhInit` referenced were still present in Tecno's pool (Sprint 2b-C deferred-consume = no eager delete). This makes the verdict stronger than a quiet baseline would have been: Stage 2B-D incidentally stress-tested Sprint 2b-C against a broken upstream publish path AND the crypto stayed correct.
+
+**Verdict-script regex bug caught in independent review (informational).** The PowerShell verdict script in the smoke runbook patterned `body_chunk byteCount=1152` and returned 0 hits, suggesting Layer 1 partial; the actual log format is `body_chunk cumulative_bytes=N chunk_bytes=M`. A correct pattern (`body_chunk chunk_bytes=1152`) yields 16 hits across 4 successful poll cycles. The verdict logic itself did NOT consume the 1152 count in its pass/fail check (it gated on `byteCount=4608` >= 2, which was 19), so the final PASS decision was correct. The pattern is corrected in the runbook for future runs.
+
+**Phase H rollback (post-smoke):** removed `RELAY_POLL_CHUNKED_FLUSH=1` from `~/Phantom/deploy/.env`, `git checkout master`, `docker compose up -d --build --force-recreate relay`. Post-rollback banner: `relay feature flags heartbeat_echo_enabled=true slow_post_diag_enabled=false` (no `poll_chunked_flush=true`). `/health` 200. Production back on legacy mono padded poll while PR #310 finished review.
+
+**PR #310 closed:**
+
+- Rebased `feat/round14-poll-chunked-flush` from base `2ddb922a` onto current master `fd8f93d9` to clear the stale-base mergeable=false state. Conflict in `docs/PROJECT_LOG.md` resolved by keeping the 2026-06-16 Sprint 2b-C / M-OPK-3 entry from PR #318 + adding the PR's own 2026-06-15 Round 14 rebase entry in correct reverse-chrono slot. Rust diff byte-identical to the original `6780fa6d`; only the parent SHA and docs slot changed. Branch head moved `736973f1` → `c00fdc1a`; force-pushed via `--force-with-lease`. CI on the rebased head 4/4 PASS: `build-and-test` (1m39s), `build-test` (49s), `lint` (43s), `relay-loopback-only-ports` (11s).
+- PR #310 body updated to reflect the PASS: Summary leader rewritten with the smoke verdict + link to the PASS comment; "Merge gate" section rewritten as closed by the 2026-06-16 PASS; Test plan items checked off for the smoke + rollback procedure; new "After merge — separate follow-ups" section calling out the Stage 2B-D rollout flag flip + the env flip on VPS as post-merge work.
+- Merged to master as squash `345d9761` `feat(relay): Round 14 paced padded poll (#310)`.
+
+**Production deploy after merge (2026-06-16 ~14:59 UTC):**
+
+1. VPS `cd ~/Phantom && git pull origin master` → HEAD now `345d9761`.
+2. `cd ~/Phantom/deploy && echo "RELAY_POLL_CHUNKED_FLUSH=1" >> .env` (other flags unchanged: `RELAY_POLL_HOLD_SECS=30`, `RELAY_ENABLE_DIAG_SHAPE=0`).
+3. `docker compose up -d --build --force-recreate relay`.
+4. Verified banner: `relay feature flags heartbeat_echo_enabled=true slow_post_diag_enabled=false poll_chunked_flush=true`. M13 mutex clean. `/health` 200.
+5. Live traffic immediately observed: existing emulator identity `799dc224` connected, completed prekey publish, opened WS, polled. Relay log shows `rest_poll_returned ... chunked_flush=true hold_secs=30 long_poll_opt_in=true padded_poll_opt_in=true` on every poll. No errors, no panics, no M13 misfires.
+
+**Round 14 chunked-flush is now LIVE on production relay.**
+
+**PR consequences:**
+
+- **PR #310** merged; this is the only PR change. `LONGPOLL_V2_ENABLED` is still `"0"` in the release variant (`apps/android/build.gradle.kts:591`), so production release builds (which are not yet shipped to users in Stage 2B-D) still emit no LP/PP opt-in headers; only the debug variant + this PR's test APK exercise the chunked-flush path end-to-end against production.
+- **Stage 2B-D rollout flag flip** (`LONGPOLL_V2_ENABLED "0" → "1"` in the release block) is the actual user-visible Stage 2B-D promotion. That flip is a separate follow-up PR (named separately so it carries its own review + rollback story). After this PROJECT_LOG entry merges, the rollout flag flip PR is the next ship.
+- **Sprint 2b is functionally complete on Layer 3 per the amended L10 gate sequence** (`docs/tracks/sprint-2b-opk-pending-session-scope.md` §L10 amended 2026-06-16 in PR #318): Sprint 2b-A + 2b-B + 2b-C merged + Stage 2B-D Tele2 LTE smoke PASS = the binding promotion gate is met.
+
+**Durable trail:** `C:\temp\stage-2b-d-smoke-2026-06-16\findings.md` + the three captured logs + the PR #310 PASS comment at https://github.com/LiudvigVladislav/Phantom/pull/310#issuecomment-4711681426.
+
 ### 2026-06-16 · Sprint 2b-C MERGED + M-OPK-3 Wi-Fi run INCONCLUSIVE → Stage 2B-D Tele2 LTE remains the real promotion gate
 
 **Goal:** ship Sprint 2b-C runtime (pending→active promotion + outbound INITIATOR pending reuse + L4 deferred-consume end-to-end), then run the M-OPK-3 Wi-Fi field gate that `docs/tests/M_OPK_3_runbook.md` defines as the recommended pre-Stage-2B-D acceptance smoke.
