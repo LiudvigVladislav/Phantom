@@ -85,8 +85,34 @@ Note that `phantom.android.BuildConfig` + `android.os.SystemProperties` are Andr
 
 The deterministic per-runtime-path coverage Sprint 2b-C ships is at the unit level: cells M-2bC-1 (pending fallback → promote success), M-2bC-2/5 (outbound reuse + cached x3dhInit), M-2bC-3 (TTL expiry → fresh bootstrap), M-2bC-4 (storage atomicity), and the false-branch cell (promote returns false → plaintext returned + log degraded). Those all execute in `:shared:core:messaging:jvmTest` + `:shared:core:storage:jvmTest`. M-OPK-3 is the field-shape acceptance gate on top.
 
+## Known limitation — relaunch-with-existing-SPK skips the publish cycle (2026-06-16)
+
+**Symptom.** A run that follows the §"Procedure (Wi-Fi only)" steps verbatim does NOT engineer the race. The logcat shows neither `M_OPK_3_HARNESS publish_retry_stall` (the hook never reaches the fire site) nor `inbound_repair_ok promotion=true` (the inbound-repair runtime path is never entered). User-visible delivery still works, so the run reads as "no errors" but does not prove the Sprint 2b-C runtime; it produces an INCONCLUSIVE verdict that has to be honestly recorded as "race not engineered", NOT as PASS.
+
+**Root cause.** Step 6 in §"Procedure" assumes that the `am force-stop` + `am start` cycle on Tecno triggers a fresh prekey publish cycle that the operator-applied `publishWithRetryDelayHook` patch can stall. It does not. `force-stop` is a process kill; it does NOT wipe SQLDelight rows. On the next launch, the prekey lifecycle service finds the local `signed_pre_key` row already present and emits `PREKEY_TRACE bootstrap_skip_existing_spk — local SPK already present, no publish` ~3 seconds after process start. `publishWithRetry` is never invoked → `attempt` never reaches `2` → the hook's `if (stallMs > 0L && attempt == 2)` guard is never evaluated → no stall → no race window.
+
+The runbook §"Procedure" line "The local prekey lifecycle service WILL publish on startup; attempt 3 stalls 5 s per the hook" is therefore wrong for any relaunch flow that is not preceded by a `pm clear` (or some other action that removes the local SPK row).
+
+**Variant 2 workaround — `pm clear` + fresh-pair publish.** A first-pair publish IS triggered when the local DB is empty. A modified procedure that exercises a publish stall is:
+
+1. `pm clear phantom.android` on Tecno → onboarding from zero (no existing SPK) → Phantom emits a publish on the very first identity provisioning.
+2. `setprop debug.phantom_retry_delay_ms 5000` BEFORE launching the app.
+3. Launch Phantom on Tecno; the publish cycle fires; the hook stalls attempt 2 IF attempt 1 retries.
+4. During the 5-second stall: on the emulator (also freshly `pm clear`-ed and onboarded), initiate a pair with Tecno via QR scan (or whatever the current pair UI is). The emulator's first outbound message to Tecno carries `x3dhInit` referencing one of Tecno's freshly-published OPKs; the race is engineered on the next prekey publish in that window.
+
+The Variant 2 workaround is **not promoted to a binding gate** by this document. The reasons:
+
+- It exercises a DIFFERENT scenario than the runbook's original intent (first-pair publish race, not the relaunch-with-existing-pair race the original §"Procedure" describes);
+- It still depends on attempt 1 actually retrying for the hook to fire, which is conditional on transport conditions that are not under operator control on clean Wi-Fi;
+- The deterministic Sprint 2b-C runtime coverage already lives in unit tests (`Sprint2bCStorageContractTest` + the M-2bC-* cells in `DefaultMessagingServiceTest`);
+- The acceptance-meaningful field signal is the **Stage 2B-D Tele2 LTE integration smoke** — that is the carrier and transport stack where the 2026-06-15 `errorClass=OpkNotFound action=fall_through_to_hold` failure shape actually manifested, and a Tele2 LTE re-run after Sprint 2b-C is the operational gate that decides whether the fix lands. A Wi-Fi-only harness cannot reproduce the Tele2 LTE timing pressure that opens the original race window organically.
+
+**Operational policy.** Until the runbook is rewritten with a binding scenario that reliably engineers the race on Wi-Fi (or until a Variant 2 fresh-pair scenario is itself locked as a binding gate after a separate scope discussion), the M-OPK-3 line item in `docs/tracks/sprint-2b-opk-pending-session-scope.md` L10 is treated as **executed but inconclusive**, and Stage 2B-D Tele2 LTE remains the binding promotion gate for PR #310 ready-for-review and the Stage 2B-D rollout flag flip.
+
 ## References
 
 - `docs/tracks/sprint-2b-opk-pending-session-scope.md` — binding scope-doc, §"Instrumented tests (androidInstrumentedTest)".
 - `docs/adr/ADR-029-pending-active-session-state-machine.md` — final 2b-C runtime model + acceptance trail.
 - 2026-06-15 integration LTE smoke evidence: `C:\temp\trek2-stage2b-b-d-integration-smoke-2026-06-15\`.
+- 2026-06-16 M-OPK-3 Wi-Fi run that surfaced the §"Known limitation" above: `C:\temp\m-opk-3-tecno-20260616-021243.log` (UTF-16) — runbook-as-written did not engineer the race; root cause + Variant 2 workaround documented in this file's §"Known limitation".
+- `docs/PROJECT_LOG.md` 2026-06-16 entry — Sprint 2b-C ship + M-OPK-3 inconclusive + Stage 2B-D remains the binding gate.
