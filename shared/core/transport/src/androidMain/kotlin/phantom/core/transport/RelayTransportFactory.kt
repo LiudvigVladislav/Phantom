@@ -326,22 +326,7 @@ actual fun createPreKeyPublishHttpClient(): HttpClient {
  * The cost (TLS handshake per call) is acceptable: publish runs at most 3 times
  * per onboarding/rotation event, never per message.
  */
-private class AndroidNativeOkHttpPreKeyPublishTransport(
-    /**
-     * T2 diagnostic round 2 (2026-06-16) — when `true` AND the publish
-     * response is a 2xx, the body read is skipped entirely and an
-     * empty `bodyText` is returned. AppContainer wires this from
-     * `BuildConfig.PUBLISH_SKIP_SUCCESS_BODY_READ == "1"` (debug
-     * default `"0"`, release pinned `"0"`, operator override via
-     * `local.properties` `publishSkipSuccessBodyRead=1`).
-     *
-     * The transport module's `androidMain` source set cannot directly
-     * reference `phantom.android.BuildConfig` (that constant lives in
-     * the downstream `apps:android` module's generated BuildConfig),
-     * so the flag is plumbed in via this constructor parameter.
-     */
-    private val skipBodyReadOnSuccess: Boolean = false,
-) : PreKeyPublishHttpTransport {
+private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTransport {
     override suspend fun publish(
         url: String,
         bodyBytes: ByteArray,
@@ -393,15 +378,40 @@ private class AndroidNativeOkHttpPreKeyPublishTransport(
             )
         }
 
-        // T2 diagnostic round 2 — Item 2 experimental skip-body-read
-        // gate (read from constructor param plumbed from AppContainer).
-        val skipBodyOnSuccess = skipBodyReadOnSuccess
+        // T2 fix (2026-06-16, post Phase 1+2 field evidence): on a
+        // successful 2xx response, skip the response body read entirely
+        // and return `bodyText = ""`. Phase 1 baseline run on Tele2 LTE
+        // proved the server returns 201 Created in ~600 ms (headers +
+        // Content-Length arrive); Phase 2 experimental run with the
+        // body read skipped on 2xx proved that this is the only stall
+        // — single attempt, `prekey_publish_ok elapsedMs=545`, no
+        // retries.
+        //
+        // The carrier middlebox between Caddy and Tecno appears to drop
+        // the response body bytes after headers; OkHttp's
+        // `Http1ExchangeCodec$FixedLengthSource.read` then waits the
+        // full 60 s `readTimeout` for bytes that never arrive. Since
+        // the relay endpoint's contract is "201 means stored", we don't
+        // actually need to read the body — the integer `storedOpks` in
+        // the JSON is informational only.
+        //
+        // The companion lifecycle-layer fix is in
+        // `PreKeyApiClient.publishWithRetry()` — empty-body on 2xx
+        // synthesises `PublishResult.Stored(storedOpks = 0)` instead of
+        // calling `json.decodeFromString(...)` which would throw
+        // `JsonDecodingException` on empty input.
+        //
+        // Non-2xx responses (HTTP 400 / 409 / 422 / 429 / 5xx) still
+        // read the body for error context (the relay's error JSON or
+        // plaintext is propagated into `PublishResult.Failure` for log
+        // visibility on rejected publishes).
 
         client.newCall(request).execute().use { response ->
-            // Phase 2 — headers received. This is THE discrimination
-            // signal. If this line fires on a publish that later
-            // throws SocketTimeoutException, the response object
-            // already exists with valid headers and status.
+            // Phase 1 — headers received. Retained from the diagnostic
+            // round 2 trace because it confirms the carrier delivered
+            // the response status. The full trace shape was useful for
+            // the 2026-06-16 discrimination run and stays in place as
+            // a debug-build diagnostic for any future similar stall.
             if (requestId.isNotEmpty()) {
                 val headersElapsed = System.currentTimeMillis() - startMs
                 relayLog(
@@ -414,9 +424,9 @@ private class AndroidNativeOkHttpPreKeyPublishTransport(
                 )
             }
 
-            // Phase 3 — body read start (or skip).
+            // Phase 2 — body read decision: skip on 2xx, read on non-2xx.
             val bodyReadStartMs = System.currentTimeMillis()
-            val body = if (skipBodyOnSuccess && response.code in 200..299) {
+            val body = if (response.code in 200..299) {
                 if (requestId.isNotEmpty()) {
                     relayLog(
                         RelayLogLevel.INFO,
@@ -485,10 +495,8 @@ private class AndroidNativeOkHttpPreKeyPublishTransport(
     }
 }
 
-actual fun createPreKeyPublishHttpTransport(
-    skipBodyReadOnSuccess: Boolean,
-): PreKeyPublishHttpTransport =
-    AndroidNativeOkHttpPreKeyPublishTransport(skipBodyReadOnSuccess)
+actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
+    AndroidNativeOkHttpPreKeyPublishTransport()
 
 /**
  * Android production [RestFallbackTransport] — PR-D1.

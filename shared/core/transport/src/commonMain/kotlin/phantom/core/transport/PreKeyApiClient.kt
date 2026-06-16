@@ -393,11 +393,31 @@ class PreKeyApiClient(
             )
             return when (statusValue) {
                 201 -> {
-                    val parsed = json.decodeFromString(
-                        PublishResponse.serializer(),
-                        nativeResp.bodyText,
-                    )
-                    PublishResult.Stored(parsed.storedOpks)
+                    // T2 carrier-ceiling fix (2026-06-16, post Phase 1+2
+                    // field evidence). The Android publish transport
+                    // skips the response body read on 2xx because the
+                    // Tele2 LTE carrier middlebox stalls the body
+                    // bytes after the 201 headers, producing a 60 s
+                    // `SocketTimeoutException` in `FixedLengthSource.read`.
+                    // When `bodyText` is empty we synthesise
+                    // `PublishResult.Stored(storedOpks = 0)` instead of
+                    // calling `decodeFromString(PublishResponse, "")`
+                    // which would throw `JsonDecodingException`. The
+                    // `storedOpks` value is informational only — the
+                    // server contract is "201 == stored, REPLACE
+                    // wholesale" so the publish-success branch does
+                    // not need the count. Non-Android transports
+                    // (iOS / JVM stubs) preserve the JSON-decode path
+                    // because they do not skip the body read.
+                    if (nativeResp.bodyText.isEmpty()) {
+                        PublishResult.Stored(storedOpks = 0)
+                    } else {
+                        val parsed = json.decodeFromString(
+                            PublishResponse.serializer(),
+                            nativeResp.bodyText,
+                        )
+                        PublishResult.Stored(parsed.storedOpks)
+                    }
                 }
                 409 ->
                     PublishResult.Failure(
