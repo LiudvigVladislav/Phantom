@@ -358,6 +358,14 @@ private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTrans
                 statusCode = response.code,
                 bodyText = body,
                 elapsedMs = elapsedMs,
+                // T2 carrier-ceiling instrumentation Item 3 (2026-06-16):
+                // OkHttp's Protocol.toString() returns the canonical
+                // wire token (`"http/1.1"`, `"h2"`, `"h3"`, ...). The
+                // returned value is null only if OkHttp's response
+                // object did not carry a protocol — which shouldn't
+                // happen on a successful execute() but the field is
+                // nullable as defence-in-depth.
+                protocol = response.protocol.toString(),
             )
         }
     }

@@ -151,6 +151,27 @@ pub fn router(state: Arc<AppState>) -> Router {
         http_routes
     };
 
+    // ── T2 carrier-ceiling instrumentation probe (2026-06-16 Option A Item 4) ──
+    //
+    // Conditional route registration: same gating idiom as the
+    // `/diag/slow-post` route above. With `RELAY_T2_DIAG=0` (production
+    // default) the path returns 404; the operator opts in by flipping
+    // `RELAY_T2_DIAG=1` on the VPS `.env`. The mutual-exclusion (M13-style)
+    // contract with `RELAY_ENABLE_SLOW_POST_DIAG=1` is enforced at config
+    // load time — see `crate::config::load_t2_diag_from_env`.
+    //
+    // This route is also mounted AFTER the 30 s `TimeoutLayer` so it can run
+    // a paced upload probe longer than 30 s without being killed by the
+    // surrounding layer; the global `RequestBodyLimitLayer` still applies.
+    //
+    // Locked design in `C:\temp\t2-reconnaissance-2026-06-16\synthesis\
+    // option-a-scope-lock.md` Item 4.
+    let http_routes = if state.config.t2_diag_enabled {
+        http_routes.route("/diag-upstream-shape", post(crate::t2_diag::diag_upstream_shape))
+    } else {
+        http_routes
+    };
+
     // Trek 2 Stage 1 Q3 — `/relay/poll` carved out of the 30 s
     // `TimeoutLayer` that wraps `http_routes`. Mounted on its own
     // sub-router with a 60 s timeout so the server-side long-poll hold
@@ -165,6 +186,27 @@ pub fn router(state: Arc<AppState>) -> Router {
             Duration::from_secs(60),
         ));
 
+    // ── T2 carrier-ceiling instrumentation middlewares ─────────────────────
+    //
+    // Two tower middlewares applied at the top-level router (so they
+    // observe every request before path-specific routing dispatches), but
+    // each function short-circuits to passthrough unless BOTH
+    // `t2_diag_enabled = true` AND the request path matches the narrow
+    // scope (today: only `/prekeys/publish`).
+    //
+    // Composition order: `body_counter_middleware` runs INSIDE
+    // `timeout_trigger_middleware` so that when the 30 s `TimeoutLayer`
+    // converts the inner handler's pending state into a 408 response, the
+    // outer timeout-trigger middleware sees that 408 and emits its log
+    // line. The body counter is added with `.layer()` AFTER the
+    // timeout-trigger so it sits closer to the handler in the tower
+    // composition (tower applies layers in reverse — last added is
+    // closest to the inner service).
+    //
+    // When `RELAY_T2_DIAG=0` both middleware functions short-circuit on
+    // their first line and pass through with zero overhead — they ship
+    // unconditionally in the router and are observably no-ops in
+    // production.
     Router::new()
         .route("/ws", get(ws_handler))
         .merge(poll_route)
@@ -178,6 +220,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             )
         }))
         .layer(RequestBodyLimitLayer::new(max_body))
+        // T2 instrumentation — body counter (Item 1, runs INSIDE
+        // timeout_trigger so the body wrapper is closest to the handler).
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::t2_diag::body_counter_middleware,
+        ))
+        // T2 instrumentation — timeout-trigger 408 detector (Item 2, runs
+        // OUTSIDE body_counter so it observes the layer-converted 408
+        // response). Both functions short-circuit unless
+        // `state.config.t2_diag_enabled = true`.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::t2_diag::timeout_trigger_middleware,
+        ))
         .with_state(state)
 }
 

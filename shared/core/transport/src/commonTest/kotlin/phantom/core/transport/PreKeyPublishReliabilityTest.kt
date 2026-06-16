@@ -94,6 +94,77 @@ class PreKeyPublishReliabilityTest {
         }
     }
 
+    // ── Test 0: T2 diag client-side trace gate (2026-06-16 Option A Item 3) ──
+
+    /**
+     * The `t2DiagPublishTraceEnabled` constructor flag controls whether
+     * the `T2_DIAG_PUBLISH_TRACE` log lines are emitted at attempt
+     * start / response / exception. The default is `false` so unit tests
+     * and any non-Android consumer see no new trace surface.
+     *
+     * This test verifies the contract at the constructor + behaviour
+     * level: with either flag value the publish flow completes
+     * successfully and the underlying transport receives exactly one
+     * call. The actual log emission shape is platform-specific (the
+     * `relayLog` expect function dispatches to `android.util.Log` on
+     * Android and stdout on JVM), so verifying the exact log text from
+     * commonTest would require a custom log sink the production code
+     * doesn't carry. The operator-facing contract that this gate works
+     * correctly is verified at deploy time by inspecting logcat for the
+     * `T2_DIAG_PUBLISH_TRACE` prefix.
+     */
+    @Test
+    fun publishBundle_succeeds_with_t2DiagPublishTraceEnabled_true() = runTest {
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(
+                statusCode = 201,
+                bodyText = """{"stored_opks": 5}""",
+                elapsedMs = 1L,
+                protocol = "h2",
+            )
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+            t2DiagPublishTraceEnabled = true,
+        )
+
+        val result = api.publishBundle { sampleRequest() }
+
+        assertTrue(result is PublishResult.Stored)
+        assertEquals(5, (result as PublishResult.Stored).storedOpks)
+        assertEquals(1, transport.callCount)
+    }
+
+    @Test
+    fun publishBundle_succeeds_with_t2DiagPublishTraceEnabled_default_false() = runTest {
+        // Default-constructed PreKeyApiClient does NOT receive the trace
+        // flag — verify the existing publish path is unchanged.
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(
+                statusCode = 201,
+                bodyText = """{"stored_opks": 7}""",
+                elapsedMs = 1L,
+                // No protocol field — null. Default constructor of
+                // PreKeyPublishHttpResponse leaves it null, mirroring
+                // the JVM stub and pre-Item-3 behaviour.
+            )
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+            // t2DiagPublishTraceEnabled omitted — default `false`.
+        )
+
+        val result = api.publishBundle { sampleRequest() }
+
+        assertTrue(result is PublishResult.Stored)
+        assertEquals(7, (result as PublishResult.Stored).storedOpks)
+        assertEquals(1, transport.callCount)
+    }
+
     // ── Test 1: mutex deduplicates parallel calls ─────────────────────────────
 
     /**

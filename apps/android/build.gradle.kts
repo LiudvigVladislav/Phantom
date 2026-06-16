@@ -492,6 +492,45 @@ android {
                 "POLL_SKIP_LP_AND_PP",
                 "\"$pollSkipLpAndPp\"",
             )
+
+            // T2 carrier-ceiling instrumentation client-side gate (2026-06-16
+            // Option A Item 3 scope-lock). When set to "1" AND
+            // `BuildConfig.DEBUG == true`, `PreKeyApiClient.publishWithRetry`
+            // emits an additional `T2_DIAG_PUBLISH_TRACE` log line per
+            // attempt carrying: client-side request_id (for correlation
+            // with server-side `t2_diag_publish_chunk` / `_timeout` lines
+            // by timestamp), attempt N/M, negotiated HTTP protocol
+            // (`http/1.1` / `h2` / `h3` / `unknown_pre_response`), body
+            // bytes, elapsed_ms at success/failure, and the failure-class
+            // exception simpleName chain on retry-triggering throws.
+            //
+            // The instrumentation answers two open T2 questions:
+            //   (a) Does the ~5 KB cliff happen exclusively on H1.1/H2
+            //       connections (TCP byte-budget) and not on H3 (QUIC)?
+            //   (b) Which timer fires first on a stalled publish — the
+            //       server's 30 s axum TimeoutLayer or the client's 60 s
+            //       OkHttp writeTimeout?
+            //
+            // Debug default "1" so an operator session pulling logs from
+            // a debug APK captures the trace automatically. Release pins
+            // to "0" in the release block below — release APKs continue
+            // to emit only the existing `PREKEY_TRACE` lines (no T2 trace
+            // overhead, no diagnostic-specific log surface visible to a
+            // production user).
+            //
+            // Override via `local.properties` `relayT2DiagClient=0` or env
+            // `RELAY_T2_DIAG_CLIENT=0` to force the trace off on a debug
+            // build (e.g. while bisecting trace-volume regressions).
+            val relayT2DiagClient = localOrEnv(
+                "relayT2DiagClient",
+                "RELAY_T2_DIAG_CLIENT",
+                "1",
+            )
+            buildConfigField(
+                "String",
+                "RELAY_T2_DIAG_CLIENT",
+                "\"$relayT2DiagClient\"",
+            )
         }
         release {
             isMinifyEnabled = true
@@ -631,6 +670,20 @@ android {
             // debug-only `BuildConfig.DEBUG` runtime gate is
             // belt-and-braces.
             buildConfigField("String", "POLL_SKIP_LP_AND_PP", "\"0\"")
+
+            // T2 carrier-ceiling instrumentation client-side gate (2026-06-16
+            // Option A Item 3 scope-lock). Release builds ALWAYS pin the
+            // client-side T2 diag trace flag to "0" — a release APK can
+            // never emit `T2_DIAG_PUBLISH_TRACE` lines even if the debug
+            // block's runtime override somehow leaked into a release
+            // BuildConfig. The runtime gate at the trace emission point
+            // checks `BuildConfig.DEBUG && BuildConfig.RELAY_T2_DIAG_CLIENT
+            // == "1"`; with `BuildConfig.DEBUG == false` AND this field
+            // pinned to `"0"`, the trace is unreachable from release builds
+            // by both halves of the AND. Defence-in-depth backstop per the
+            // same OQ7 + OQ11 idiom as `LONGPOLL_V2_ENABLED` and
+            // `POLL_SKIP_LP_AND_PP`.
+            buildConfigField("String", "RELAY_T2_DIAG_CLIENT", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

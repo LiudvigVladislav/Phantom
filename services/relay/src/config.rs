@@ -89,6 +89,45 @@ pub struct RelayConfig {
     /// Locked design in `docs/tracks/rc-direct-stability1.md` §10 T2.
     pub slow_post_diag_enabled: bool,
 
+    // ── T2 carrier-ceiling instrumentation (2026-06-16 reconnaissance Option A) ──
+
+    /// When `true`, the relay enables the T2 carrier-ceiling slow-POST
+    /// instrumentation suite:
+    ///   - A tower body-wrapper middleware on `/prekeys/publish` emits
+    ///     `event=t2_diag_publish_chunk` per HTTP/1.1 chunk (or HTTP/2 DATA
+    ///     frame) consumed from the request body. Terminal events:
+    ///     `t2_diag_publish_body_complete` on normal end-of-stream and
+    ///     `t2_diag_publish_body_error` on read error.
+    ///   - An outer "timeout-trigger" middleware on `/prekeys/publish`
+    ///     detects the 30 s axum `TimeoutLayer` 408 response and emits
+    ///     `event=t2_diag_publish_timeout` carrying the last observed
+    ///     `cumulative_bytes` correlated by `request_id`.
+    ///   - The probe endpoint `POST /diag-upstream-shape` is mounted
+    ///     (analogous to `/diag/slow-post`, but designed for controlled
+    ///     paced-chunk upstream POST measurement and instrumented with the
+    ///     same per-chunk log shape).
+    ///
+    /// Default `false`. Set by env var `RELAY_T2_DIAG=1` exactly; any
+    /// other value (including `"true"` / `"yes"` / unset) fails closed.
+    /// Mirrors the strict-parse pattern of `slow_post_diag_enabled` and
+    /// `poll_chunked_flush`.
+    ///
+    /// MUTUAL EXCLUSION (M13-style): `RELAY_T2_DIAG=1` and
+    /// `RELAY_ENABLE_SLOW_POST_DIAG=1` are mutually exclusive in
+    /// production — the relay refuses to start with `std::process::exit(2)`
+    /// when both are set. Rationale: both diagnostics co-instrument the
+    /// request-body stream and emit overlapping per-chunk log lines on
+    /// adjacent endpoints; running them simultaneously would let a
+    /// misdirected POST to `/diag/slow-post` skew the `t2_diag_publish_*`
+    /// counters on a concurrent `/prekeys/publish` and vice-versa. The
+    /// `poll_chunked_flush` mutex against `RELAY_ENABLE_DIAG_SHAPE`
+    /// covers a different concern (response-side octet-stream conflict);
+    /// this mutex covers request-side body-counter conflict.
+    ///
+    /// Locked design in `C:\temp\t2-reconnaissance-2026-06-16\synthesis\
+    /// option-a-scope-lock.md` Item 5.
+    pub t2_diag_enabled: bool,
+
     // ── Round 14 paced padded poll (Trek 2 Round 14) ──────────────────────────
 
     /// When `true`, the relay emits the padded `/relay/poll` response body
@@ -196,6 +235,11 @@ impl RelayConfig {
             // exercise the handler construct a config with this flipped to
             // `true` rather than relying on the surrounding env.
             slow_post_diag_enabled: false,
+            // T2 carrier-ceiling instrumentation off in tests by default;
+            // tests that exercise the body-counter middleware or the
+            // `/diag-upstream-shape` handler construct a config with this
+            // flipped to `true`.
+            t2_diag_enabled: false,
             // Round 14 paced padded poll is off in tests by default; tests that
             // exercise the chunked path construct a config with this set to
             // `true`.
@@ -274,6 +318,12 @@ impl RelayConfig {
             slow_post_diag_enabled: std::env::var("RELAY_ENABLE_SLOW_POST_DIAG")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            // T2 carrier-ceiling instrumentation: strict `"1"` parse, fails
+            // closed on any other value. Mirrors slow_post_diag gate
+            // pattern. Also enforces M13-style mutex against
+            // `RELAY_ENABLE_SLOW_POST_DIAG` at startup (see
+            // `load_t2_diag_from_env`).
+            t2_diag_enabled: load_t2_diag_from_env(),
             // Round 14 paced padded poll: strict `"1"` parse, fails closed
             // on any other value. Mirrors slow_post_diag gate pattern.
             // Also enforces M13 mutex against `RELAY_ENABLE_DIAG_SHAPE` at
@@ -329,6 +379,49 @@ impl RelayConfig {
 ///
 /// This implements M13 from the Round 14 scope doc test list as a
 /// startup-validation contract.
+/// T2 instrumentation (2026-06-16 Option A scope-lock Item 5) — parse
+/// `RELAY_T2_DIAG` env var with strict `"1"` semantics AND enforce
+/// mutual exclusion (M13-style) against `RELAY_ENABLE_SLOW_POST_DIAG`.
+///
+/// Strict `"1"` parse: any value other than the literal string `"1"`
+/// (including `"true"` / `"yes"` / empty / unset) evaluates to `false`.
+/// Mirrors `RELAY_ENABLE_SLOW_POST_DIAG`, `RELAY_ENABLE_HEARTBEAT_ECHO`,
+/// and `RELAY_POLL_CHUNKED_FLUSH` patterns.
+///
+/// Mutual exclusion: if BOTH `RELAY_T2_DIAG=1` and
+/// `RELAY_ENABLE_SLOW_POST_DIAG=1` are set in env at startup, the relay
+/// exits with `std::process::exit(2)` and a clear FATAL message.
+/// Rationale: both diagnostics co-instrument request-body streams and
+/// emit overlapping per-chunk log lines on adjacent endpoints; a
+/// misdirected POST to `/diag/slow-post` would skew the
+/// `t2_diag_publish_*` counters on a concurrent `/prekeys/publish` and
+/// vice-versa. This is a different concern from the
+/// `RELAY_POLL_CHUNKED_FLUSH` ↔ `RELAY_ENABLE_DIAG_SHAPE` mutex (which
+/// covers response-side octet-stream conflict).
+///
+/// This implements the M13-analogue startup-validation contract for the
+/// T2 instrumentation suite (scope-lock Item 5 binding).
+fn load_t2_diag_from_env() -> bool {
+    let t2_diag = std::env::var("RELAY_T2_DIAG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let slow_post_diag = std::env::var("RELAY_ENABLE_SLOW_POST_DIAG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if t2_diag && slow_post_diag {
+        eprintln!(
+            "FATAL: RELAY_T2_DIAG=1 and RELAY_ENABLE_SLOW_POST_DIAG=1 \
+             are mutually exclusive in production. Both diagnostics \
+             co-instrument the request-body stream with overlapping \
+             per-chunk log shapes on adjacent endpoints; running them \
+             simultaneously would let a misdirected POST skew either \
+             counter. Pick one for this run."
+        );
+        std::process::exit(2);
+    }
+    t2_diag
+}
+
 fn load_round14_poll_chunked_flush_from_env() -> bool {
     let chunked_flush = std::env::var("RELAY_POLL_CHUNKED_FLUSH")
         .map(|v| v == "1")
@@ -384,6 +477,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("media_ttl_secs", &self.media_ttl_secs)
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
             .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)
+            .field("t2_diag_enabled", &self.t2_diag_enabled)
             .field("poll_chunked_flush", &self.poll_chunked_flush)
             .field("poll_hold_secs", &self.poll_hold_secs)
             // `seq_mac_key` carries its own `[REDACTED]` Debug impl from

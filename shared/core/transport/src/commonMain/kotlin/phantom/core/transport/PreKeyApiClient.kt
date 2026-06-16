@@ -103,6 +103,28 @@ class PreKeyApiClient(
      * @see createPreKeyPublishHttpTransport
      */
     private val publishTransport: PreKeyPublishHttpTransport? = null,
+    /**
+     * T2 carrier-ceiling instrumentation client-side gate (2026-06-16
+     * Option A Item 3 scope-lock). When `true`, `publishWithRetry`
+     * emits an additional `T2_DIAG_PUBLISH_TRACE` log line per attempt
+     * carrying: client-side request_id, attempt N/M, negotiated HTTP
+     * protocol from `PreKeyPublishHttpResponse.protocol`, body bytes,
+     * elapsed_ms at success/failure, and the failure-class exception
+     * simpleName on retry-triggering throws.
+     *
+     * Default `false` so unit tests and any non-Android consumer get
+     * zero new log noise. Android AppContainer wires this from
+     * `BuildConfig.DEBUG && BuildConfig.RELAY_T2_DIAG_CLIENT == "1"`.
+     * Release builds (where `BuildConfig.DEBUG == false` AND
+     * `BuildConfig.RELAY_T2_DIAG_CLIENT == "0"`) compute `false` from
+     * either half of the AND and emit no T2 trace overhead.
+     *
+     * The existing `PREKEY_TRACE` log lines (`prekey_publish_start`,
+     * `prekey_publish_retry`, `prekey_publish_ok`, etc.) are unchanged
+     * regardless of this flag. The T2 trace is an additive diagnostic
+     * channel.
+     */
+    private val t2DiagPublishTraceEnabled: Boolean = false,
 ) : PreKeyApi {
 
     // One in-flight publish per PreKeyApiClient instance at a time.
@@ -193,6 +215,29 @@ class PreKeyApiClient(
         // lifecycle service); we capture the tag from the first attempt's
         // body for the give-up log. Initialised on attempt 1.
         var identityTag = ""
+        // T2 carrier-ceiling instrumentation (2026-06-16 Option A Item 3).
+        // Generate a single client-side request_id at the start of the
+        // entire publishWithRetry call so ALL attempts (and any subsequent
+        // T2_DIAG_PUBLISH_TRACE lines on retries) share the same id. An
+        // operator correlates these with the server-side
+        // `event=t2_diag_publish_chunk` / `_body_complete` / `_timeout`
+        // lines by timestamp: the relay generates its own request_id per
+        // POST, and the two sides cannot exchange ids transparently
+        // through OkHttp + Caddy without a custom header. Timestamp
+        // correlation is sufficient because only one publish per
+        // identity can be in-flight at a time (the publishMutex).
+        //
+        // The id is 16 hex chars: epoch-millis low 32 bits + a random low
+        // 32 bits. Enough entropy to uniquely identify one publish cycle
+        // within a 30 s diagnostic window without a counter dependency.
+        val t2DiagRequestId: String = if (t2DiagPublishTraceEnabled) {
+            val high = (totalStartMs and 0xFFFFFFFFL).toString(16).padStart(8, '0')
+            val low = kotlin.random.Random.Default.nextInt().toUInt()
+                .toString(16).padStart(8, '0')
+            "$high$low"
+        } else {
+            ""
+        }
 
         val transport = publishTransport
             ?: error("PreKeyApiClient requires a publishTransport (PR-R0.1). " +
@@ -230,6 +275,17 @@ class PreKeyApiClient(
                     "spk_key_id=${request.signed_pre_key.key_id} " +
                     "bodyBytes=${bodyBytes.size} attempt=$attempt/${PUBLISH_MAX_ATTEMPTS}",
             )
+            // T2 diag — emit the gated start trace once per attempt. See
+            // BuildConfig.RELAY_T2_DIAG_CLIENT (Android-side) for the wire.
+            if (t2DiagPublishTraceEnabled) {
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "T2_DIAG_PUBLISH_TRACE phase=attempt_start " +
+                        "request_id=$t2DiagRequestId identity=$identityTag… " +
+                        "attempt=$attempt/${PUBLISH_MAX_ATTEMPTS} " +
+                        "bodyBytes=${bodyBytes.size}",
+                )
+            }
             val attemptStartMs = Clock.System.now().toEpochMilliseconds()
 
             val nativeResp: PreKeyPublishHttpResponse = try {
@@ -237,6 +293,25 @@ class PreKeyApiClient(
             } catch (t: Throwable) {
                 val elapsed = Clock.System.now().toEpochMilliseconds() - attemptStartMs
                 lastException = t
+                // T2 diag — emit the gated failure trace once per attempt
+                // that throws (before the existing PREKEY_TRACE retry log
+                // line fires). The failure-class simpleName is the
+                // discriminator we need to attribute the stall: a
+                // SocketTimeoutException means OkHttp's writeTimeout
+                // fired client-side; a different exception class on a 60 s
+                // budget would suggest a server-side or middlebox
+                // truncation that arrived as a different signal.
+                if (t2DiagPublishTraceEnabled) {
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "T2_DIAG_PUBLISH_TRACE phase=attempt_threw " +
+                            "request_id=$t2DiagRequestId identity=$identityTag… " +
+                            "attempt=$attempt/${PUBLISH_MAX_ATTEMPTS} " +
+                            "elapsedMs=$elapsed " +
+                            "exception_class=${t::class.simpleName ?: "<anon>"} " +
+                            "protocol=unknown_pre_response",
+                    )
+                }
                 if (attempt < PUBLISH_MAX_ATTEMPTS && t.isRetryable()) {
                     val nextDelay = PUBLISH_RETRY_DELAYS_MS[attempt - 1]
                     relayLog(
@@ -264,6 +339,24 @@ class PreKeyApiClient(
             // We have a response — check if it warrants a retry.
             val elapsed = Clock.System.now().toEpochMilliseconds() - attemptStartMs
             val statusValue = nativeResp.statusCode
+
+            // T2 diag — emit the gated response trace once per attempt
+            // that produced an HTTP response (even retryable 408/5xx).
+            // The protocol field discriminates `http/1.1` / `h2` / `h3`:
+            // a stall observed only on h2 + h1.1 but absent on h3 would
+            // suggest the carrier mechanism is TCP byte-budget enforcement
+            // bypassable by QUIC.
+            if (t2DiagPublishTraceEnabled) {
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "T2_DIAG_PUBLISH_TRACE phase=attempt_response " +
+                        "request_id=$t2DiagRequestId identity=$identityTag… " +
+                        "attempt=$attempt/${PUBLISH_MAX_ATTEMPTS} " +
+                        "status=$statusValue " +
+                        "elapsedMs=$elapsed " +
+                        "protocol=${nativeResp.protocol ?: "<absent>"}",
+                )
+            }
 
             // HTTP 408 or 5xx: server-side transient. Retry if budget remains.
             if ((statusValue == 408 || statusValue in 500..599) &&
