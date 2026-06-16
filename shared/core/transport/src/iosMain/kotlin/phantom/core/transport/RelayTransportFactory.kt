@@ -28,9 +28,7 @@ actual fun createPreKeyPublishHttpClient(): HttpClient = HttpClient(Darwin)
 // iOS stub — PR-R0.1. The 8192-byte Ktor body streaming bug is Android-only
 // (OkHttp engine adapter). iOS is not a production path yet; throw to surface
 // any accidental invocation at development time.
-actual fun createPreKeyPublishHttpTransport(
-    @Suppress("UNUSED_PARAMETER") skipBodyReadOnSuccess: Boolean,
-): PreKeyPublishHttpTransport =
+actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
     throw NotImplementedError(
         "Native publish transport is not implemented for iOS. " +
             "iOS production wiring is planned for Beta.",

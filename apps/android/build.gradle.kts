@@ -532,43 +532,6 @@ android {
                 "\"$relayT2DiagClient\"",
             )
 
-            // T2 diagnostic round 2 — experimental "skip body read on
-            // 2xx" toggle (2026-06-16 scope-lock at
-            // `C:\temp\t2-reconnaissance-2026-06-16\synthesis\
-            // diagnostic-round-2-scope-lock.md` Item 2). When this field
-            // is `"1"` AND the publish response is a 2xx, the Android
-            // `AndroidNativeOkHttpPreKeyPublishTransport.publish()`
-            // skips `response.body?.string()` and returns an empty
-            // `bodyText`. This is a deliberate trade — the experiment
-            // ONLY needs to know whether skipping body read makes
-            // publishes succeed end-to-end on Tele2 LTE (i.e. whether
-            // the 60 s SocketTimeoutException is in the response
-            // body read or somewhere before headers).
-            //
-            // Debug default `"0"` — phase trace alone is collected
-            // without behaviour change (baseline run captures the
-            // discrimination signal). Operator opts in to the
-            // experimental run via `local.properties`
-            // `publishSkipSuccessBodyRead=1` or env
-            // `PUBLISH_SKIP_SUCCESS_BODY_READ=1`. Release pins to
-            // `"0"` in the release block below — defence-in-depth
-            // backstop, the experiment is operator-only on debug.
-            //
-            // Stage 2B-D smoke and any other operator run that depends
-            // on `storedOpks` count from the response JSON should NOT
-            // use this flag. The phase trace fires regardless of the
-            // flag value; the experiment is the behaviour change, not
-            // the trace.
-            val publishSkipSuccessBodyRead = localOrEnv(
-                "publishSkipSuccessBodyRead",
-                "PUBLISH_SKIP_SUCCESS_BODY_READ",
-                "0",
-            )
-            buildConfigField(
-                "String",
-                "PUBLISH_SKIP_SUCCESS_BODY_READ",
-                "\"$publishSkipSuccessBodyRead\"",
-            )
         }
         release {
             isMinifyEnabled = true
@@ -723,16 +686,6 @@ android {
             // `POLL_SKIP_LP_AND_PP`.
             buildConfigField("String", "RELAY_T2_DIAG_CLIENT", "\"0\"")
 
-            // T2 diagnostic round 2 — experimental "skip body read on
-            // 2xx" toggle (2026-06-16). Release builds ALWAYS pin the
-            // flag to `"0"` so a release APK can NEVER skip body read
-            // even if the debug-only operator override somehow leaked
-            // into a release BuildConfig. Defence-in-depth backstop per
-            // the same OQ7 + OQ11 idiom as `LONGPOLL_V2_ENABLED` and
-            // `RELAY_T2_DIAG_CLIENT`. The body-read skip would lose
-            // `storedOpks` count visibility on every successful
-            // publish — production must never lose that signal.
-            buildConfigField("String", "PUBLISH_SKIP_SUCCESS_BODY_READ", "\"0\"")
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.

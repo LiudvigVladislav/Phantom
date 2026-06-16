@@ -436,4 +436,127 @@ class PreKeyPublishReliabilityTest {
         assertTrue(result400 is PublishResult.Failure)
         assertEquals(PublishResult.Reason.BadRequest, (result400 as PublishResult.Failure).reason)
     }
+
+    // ── T2 carrier-ceiling two-layer fix (2026-06-16, post Phase 1+2 field evidence) ──
+
+    /**
+     * Layer 2 contract: when the transport returns 2xx with an empty
+     * `bodyText` (the production Android shape after the Layer 1
+     * unconditional-skip-on-2xx change), `publishWithRetry` must
+     * synthesise `PublishResult.Stored(storedOpks = 0)` instead of
+     * attempting `json.decodeFromString(PublishResponse, "")` which
+     * would throw `JsonDecodingException: Expected JSON, got ""`.
+     *
+     * Phase 2 field run on Tele2 LTE 2026-06-16 caught this lifecycle
+     * layer: the transport itself succeeded (publish elapsedMs = 545
+     * vs the 186 000 ms baseline timeout) but the decode threw and
+     * triggered the retry budget anyway. This test covers the
+     * lifecycle fix in isolation from the transport.
+     */
+    @Test
+    fun publishBundle_succeeds_with_2xx_and_empty_body_synthesizing_zero_storedOpks() = runTest {
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(
+                statusCode = 201,
+                bodyText = "",
+                elapsedMs = 1L,
+            )
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+        )
+
+        val result = api.publishBundle { sampleRequest() }
+
+        assertTrue(
+            result is PublishResult.Stored,
+            "2xx + empty body must synthesise PublishResult.Stored (no JsonDecodingException); got $result",
+        )
+        assertEquals(
+            0, (result as PublishResult.Stored).storedOpks,
+            "synthesised Stored must carry storedOpks = 0 (count lost when body skipped)",
+        )
+        assertEquals(
+            1, transport.callCount,
+            "single attempt must succeed — no retry on a successful publish",
+        )
+    }
+
+    /**
+     * Backward-compatibility contract: a 2xx response that DOES carry a
+     * JSON body (the iOS / JVM stub path, or any future transport that
+     * does not skip the body read) continues to decode normally and
+     * carries the server's `stored_opks` count through to the result.
+     */
+    @Test
+    fun publishBundle_decodes_2xx_with_JSON_body_normally() = runTest {
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(
+                statusCode = 201,
+                bodyText = """{"stored_opks": 42}""",
+                elapsedMs = 1L,
+            )
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+        )
+
+        val result = api.publishBundle { sampleRequest() }
+
+        assertTrue(
+            result is PublishResult.Stored,
+            "2xx + JSON body must decode normally; got $result",
+        )
+        assertEquals(
+            42, (result as PublishResult.Stored).storedOpks,
+            "JSON-decoded storedOpks must reach the result unchanged",
+        )
+        assertEquals(1, transport.callCount)
+    }
+
+    /**
+     * Error-context contract: non-2xx responses still propagate the
+     * server's body verbatim into `PublishResult.Failure.serverMessage`
+     * for log visibility. The Layer 1 transport change reads the body
+     * on non-2xx exactly as before (the skip-body-on-2xx branch is
+     * conditional on `response.code in 200..299`), and the Layer 2
+     * lifecycle change is gated on the 201 branch, so neither layer
+     * should disturb 4xx / 5xx handling.
+     */
+    @Test
+    fun publishBundle_reads_body_on_non_2xx_for_error_context() = runTest {
+        val errorBody = """{"error":"signing_key_mismatch","detail":"identity already bound"}"""
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(
+                statusCode = 409,
+                bodyText = errorBody,
+                elapsedMs = 1L,
+            )
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+        )
+
+        val result = api.publishBundle { sampleRequest() }
+
+        assertTrue(
+            result is PublishResult.Failure,
+            "409 must surface as PublishResult.Failure; got $result",
+        )
+        assertEquals(
+            PublishResult.Reason.SigningKeyMismatch,
+            (result as PublishResult.Failure).reason,
+        )
+        assertEquals(
+            errorBody, result.serverMessage,
+            "non-2xx body must reach Failure.serverMessage verbatim — no Layer 1 / Layer 2 interference",
+        )
+        assertEquals(1, transport.callCount, "409 must not trigger retries")
+    }
 }
