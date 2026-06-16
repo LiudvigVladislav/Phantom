@@ -167,7 +167,7 @@ After APK lands, Vladislav runs scenarios on Tecno (real device, Wi-Fi only sinc
 **Extended (run if time allows; do NOT block merge if OEM behaves oddly):**
 
 4. **App swiped from recents (task killed).** Swipe PHANTOM from the recents stack. Wait ~10 s for the foreground service to re-establish. From the emu send 3 text messages. Same expected chain as scenario 2. OEM aggressive battery saver / "Phone Master"-class apps on Tecno HiOS may interfere here — if so, that's data, not a blocker.
-5. **Doze idle.** Plug Tecno into power so the system trusts the device, let the screen go off for ~10 min, send a single text message from emu, wake the screen. Expected: notification appears within the H1e AlarmManager 45 s recovery window. Full chain visible.
+5. **Doze idle.** Plug Tecno into power so the system trusts the device, let the screen go off for ~10 min, send a single text message from emu, wake the screen. Expected: notification appears once the receiver wakes the radio and the inbound envelope reaches the device — most likely via the per-envelope ACK deadline tripping a REST mode switch and the long-poll backbone delivering. Note: the AlarmManager 45 s proactive `forceReconnect` claim in earlier docs has been amended (see ADR-011 Status note § "Amendment 2026-06-17"); recovery now flows through REST mode switching rather than a wakeup-driven WS reconnect. Full chain visible.
 
 **For each scenario** the log either shows the full chain (DMS-side `NOTIF invoke_attempt` → `NOTIF invoke_ok` → AppContainer `NOTIF callback_invoked` → `NOTIF callback_returned` → manager `NOTIF show_entry` → `NOTIF api_level` → `NOTIF permission_check` → `NOTIF channel_check` → `NOTIF notify_called` → `NOTIF notify_returned`) **or breaks at a specific step**. The break point is the diagnostic finding.
 
@@ -305,7 +305,7 @@ When groups / channels add their own paths in future PRs, they extend this enum 
 
 **Test #78 result (Vladislav + architect 2026-05-23):**
 
-PASS on core scenarios (foreground / background / locked) **and** extended (task-killed / Doze) — all five delivered notifications, no callback breaks, no `callback_threw`, no `invoke_threw`, no `SecurityException`, no `AndroidRuntime`. Logcat capture on Tecno SDK 31 (Tele2 Иркутская handset, Wi-Fi only) over 8 incoming events shows the full chain × 8:
+PASS on core scenarios (foreground / background / locked) **and** extended (task-killed / Doze) — all five delivered notifications, no callback breaks, no `callback_threw`, no `invoke_threw`, no `SecurityException`, no `AndroidRuntime`. Logcat capture on Tecno SDK 31 (Tele2 Irkutsk Oblast handset, Wi-Fi only) over 8 incoming events shows the full chain × 8:
 
 ```
 NOTIF invoke_attempt → invoke_ok → callback_invoked → show_entry →

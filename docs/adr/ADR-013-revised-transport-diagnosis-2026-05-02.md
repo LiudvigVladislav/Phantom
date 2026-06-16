@@ -4,18 +4,30 @@ Status: Superseded by PR-H1c (#132) + PR-H1e (#134) — 2026-05-14
 Date: 2026-05-02
 Layer: core/transport (shared), app/service (android), services/relay
 
-> **Note (2026-05-14).** This ADR correctly diagnosed the stale-socket
-> behaviour on Tecno HiOS + МТС cellular (forceReconnect cycling while
-> the reconnect loop stayed parked, and the relay's one-active-connection
-> rule contributing to the failure mode). The remedy ultimately taken
-> was **not** an architectural restructure of the reconnect path.
-> Instead, PR-H1c and PR-H1e closed the issue through six lower-level
-> fixes: inbound-frame liveness, OkHttp WS-protocol Ping at 15 s,
-> `ping_send_failed → forceReconnect + break`, `TransportState
-> .Reconnecting` for soft UX, AlarmManager proactive reconnect at 45 s,
-> and server-side TCP `SO_KEEPALIVE`. The diagnosis below remains
-> accurate; the proposed structural remedies were superseded by this
-> lighter-touch alternative path.
+> **Note (2026-05-14, amended 2026-06-17).** This ADR correctly diagnosed
+> the stale-socket behaviour on Tecno HiOS + a Russian mobile carrier
+> (forceReconnect cycling while the reconnect loop stayed parked, and
+> the relay's one-active-connection rule contributing to the failure
+> mode). The remedy ultimately taken was **not** an architectural
+> restructure of the reconnect path. Instead, PR-H1c and PR-H1e closed
+> the issue through six lower-level fixes: inbound-frame liveness,
+> OkHttp WS-protocol Ping at 15 s, `ping_send_failed → forceReconnect +
+> break`, `TransportState.Reconnecting` for soft UX, AlarmManager
+> proactive reconnect at 45 s, and server-side TCP `SO_KEEPALIVE`.
+>
+> The "AlarmManager proactive reconnect at 45 s" clause above is no
+> longer accurate. PR-R0.4a (`18a23b6d`) and PR-R0.4b (`727e1a83`)
+> removed the stale-inbound proactive `forceReconnect` from both
+> `PhantomWakeupReceiver` and the `KtorRelayTransport.startIdleWatchdog`
+> consumer. `PhantomWakeupReceiver` now only logs liveness fields; the
+> idle watchdog emits `InboundStalledEvent` which is routed into a REST
+> mode switch, not into a WS reconnect. See ADR-011 Status note §
+> "Amendment 2026-06-17" for the full posture.
+>
+> The diagnosis below remains accurate; the proposed structural
+> remedies were superseded by the lighter-touch alternative path, and
+> the lighter-touch path has itself been amended so that recovery now
+> flows through REST mode switching rather than through WS reconnect.
 
 ---
 
