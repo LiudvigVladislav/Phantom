@@ -36,6 +36,7 @@ private class StaticFakePublishTransport(
         url: String,
         bodyBytes: ByteArray,
         contentType: String,
+        requestId: String,
     ): PreKeyPublishHttpResponse = PreKeyPublishHttpResponse(statusCode, body, elapsedMs = 0L)
 }
 

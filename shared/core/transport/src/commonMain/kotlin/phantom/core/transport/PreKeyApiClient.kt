@@ -289,7 +289,19 @@ class PreKeyApiClient(
             val attemptStartMs = Clock.System.now().toEpochMilliseconds()
 
             val nativeResp: PreKeyPublishHttpResponse = try {
-                transport.publish(url, bodyBytes)
+                // T2 diagnostic round 2 — plumb the client-side
+                // `request_id` through the transport so the five
+                // `T2_PUBLISH_PHASE` log lines emitted inside the
+                // Android impl correlate exactly with the existing
+                // `T2_DIAG_PUBLISH_TRACE` lines by id. Empty string
+                // disables phase trace emission inside the impl —
+                // production release builds AND any test that didn't
+                // opt into T2 diag trace will pass `""` here.
+                transport.publish(
+                    url = url,
+                    bodyBytes = bodyBytes,
+                    requestId = t2DiagRequestId,
+                )
             } catch (t: Throwable) {
                 val elapsed = Clock.System.now().toEpochMilliseconds() - attemptStartMs
                 lastException = t

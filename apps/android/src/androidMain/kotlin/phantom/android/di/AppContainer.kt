@@ -1086,7 +1086,18 @@ class AppContainer(private val context: Context) {
         val preKeyApi = phantom.core.transport.PreKeyApiClient(
             httpClient = restHttpClient,
             relayBaseUrl = relayHttpBase,
-            publishTransport = createPreKeyPublishHttpTransport(),
+            // T2 diagnostic round 2 (2026-06-16 Option A Item 2 scope-
+            // lock). The skip-body-read-on-success toggle is wired
+            // here: when `BuildConfig.PUBLISH_SKIP_SUCCESS_BODY_READ ==
+            // "1"` (debug default `"0"`; release pinned `"0"`; operator
+            // override via `local.properties` `publishSkipSuccessBodyRead=1`),
+            // the Android publish transport skips the body read on 2xx
+            // and returns an empty `bodyText`. Deliberate trade —
+            // `storedOpks` count from response JSON lost on this run.
+            publishTransport = createPreKeyPublishHttpTransport(
+                skipBodyReadOnSuccess =
+                    phantom.android.BuildConfig.PUBLISH_SKIP_SUCCESS_BODY_READ == "1",
+            ),
             // T2 carrier-ceiling instrumentation client-side gate
             // (2026-06-16 Option A Item 3). `true` only when BOTH
             // `BuildConfig.DEBUG == true` AND
