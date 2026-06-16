@@ -4296,7 +4296,7 @@ class DefaultMessagingService(
      * next sweep finds nothing to do. Messages that still fail (peer
      * still has no bundle) stay in WAITING for the next sweep.
      */
-    override suspend fun retryWaitingMessages(): Result<Int> = runCatching {
+    override suspend fun retryWaitingMessages(source: String): Result<Int> = runCatching {
         // Snapshot the WAITING set first so a successful retry that
         // mutates state doesn't shift the iteration cursor underneath us.
         val convIds = conversationRepository.getAllConversations()
@@ -4324,6 +4324,17 @@ class DefaultMessagingService(
                 )
             }
         }
+        // DWS-UX.1 (2026-06-17): tag every retry sweep with the
+        // trigger label so the first-message yellow-dot UX
+        // investigation can discriminate which path (ticker vs WS
+        // reconnect collector) drove the recovery on a given
+        // message id. `waiting_count` is the number of placeholder
+        // rows we attempted to re-send — zero means the sweep ran
+        // but found nothing to do.
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "RETRY_TRACE retry_waiting_messages source=$source waiting_count=$attempts",
+        )
         attempts
     }
 

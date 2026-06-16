@@ -642,6 +642,32 @@ class KtorRelayTransport(
                 "ping_interval_ms=15000 " +
                 "read_timeout_ms=60000",
         )
+
+        // DWS-UX.1 (2026-06-17): raw ping-timeout counter, emitted on
+        // every session close whose throwable class is
+        // `SocketTimeoutException`, regardless of whether the
+        // `PingTimeoutTextParser` regex matched on the exception
+        // message. The `ws_ping_timeout_diag` line above gates
+        // `okhttp_ping_timeout_detected` on the parser; field smoke on
+        // Tele2 LTE 2026-06-16/17 captured 32 ping-timeout sessions
+        // with `WS_DEGRADED = 0` because the parser may not match
+        // every Tele2-close exception shape. This raw line is the
+        // baseline counter that `WS_DEGRADED` was supposed to be, with
+        // no parser dependency, so `grep ws_ping_timeout_raw` returns
+        // the honest session count for telemetry. NOT wired to any
+        // actuation — diagnostic-only, mirroring the
+        // `ws_ping_timeout_diag` posture.
+        if (okhttpThrowableClass == "SocketTimeoutException") {
+            relayLog(
+                RelayLogLevel.INFO,
+                "${genTag(stats.sessionEpoch)} ws_ping_timeout_raw " +
+                    "session_id=${stats.sessionEpoch} " +
+                    "duration_ms=$durationMs " +
+                    "inbound_frames=${stats.inboundFrames} " +
+                    "since_last_inbound_ms=$sinceLastInboundMs " +
+                    "parser_detected=$okhttpPingTimeoutDetected",
+            )
+        }
     }
 
     override suspend fun connect(

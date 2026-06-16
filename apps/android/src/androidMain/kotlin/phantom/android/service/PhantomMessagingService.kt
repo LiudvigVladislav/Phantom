@@ -249,13 +249,26 @@ class PhantomMessagingService : Service() {
             runCatching { app.ready.await() }
             val hybrid = app.container.hybridTransport ?: return@launch
             val prefs = app.container.transportPreferences
+            val transportManager = app.container.transportManager
             hybrid.stateMachine.state.collect { mode ->
                 val modeLabel = prefs.privacyMode.name
+                // DWS-UX.1 (2026-06-17): read the currently-connected outer
+                // transport kind instead of hardcoding "Direct". The
+                // earlier text "Online via Direct · …" was a factual lie
+                // when the user was in Ghost (Tor) or Private (Reality)
+                // and the REST overlay fired — the relay was reachable
+                // via the configured outer transport, NOT via a fresh
+                // Direct connection. Read the kind from TransportManager;
+                // fall back to "relay" on transient null state so the
+                // string is still a coherent sentence.
+                val transportName = Companion.transportNameForOverlay(
+                    transportManager.state.value,
+                )
                 val text = when (mode) {
                     phantom.core.transport.RestMode.RestActive ->
-                        "Online via Direct · Limited realtime · $modeLabel"
+                        "Online via $transportName · Limited realtime · $modeLabel"
                     phantom.core.transport.RestMode.WsCandidate ->
-                        "Online via Direct · Recovering · $modeLabel"
+                        "Online via $transportName · Recovering · $modeLabel"
                     phantom.core.transport.RestMode.WsActive ->
                         null // Let the TransportManager state collector reassert
                 }
@@ -1039,6 +1052,26 @@ class PhantomMessagingService : Service() {
         private const val TAG = "PhantomMessagingService"
         const val CHANNEL_ID = "phantom_messaging"
         const val NOTIFICATION_ID = 1001
+
+        /**
+         * DWS-UX.1 (2026-06-17): derive the outer transport label for
+         * the REST fallback notification overlay. Reads
+         * [phantom.core.transport.ManagerState.Connected.kind] when
+         * the outer is connected; falls back to the generic `"relay"`
+         * word on pre-connected or failed states so the overlay does
+         * not lie. The test contract
+         * [phantom.android.service.TransportNameForOverlayTest] pins
+         * the contract; living on the companion makes the helper
+         * straightforwardly testable on the JVM unit-test source set
+         * without a foreground-service runtime.
+         */
+        internal fun transportNameForOverlay(
+            managerState: phantom.core.transport.ManagerState,
+        ): String = when (managerState) {
+            is phantom.core.transport.ManagerState.Connected ->
+                managerState.kind.toString()
+            else -> "relay"
+        }
 
         /**
          * PR-LTE-NETCHANGE1 (2026-05-28) — boolean intent extra set by
