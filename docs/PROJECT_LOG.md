@@ -589,6 +589,37 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-17 · Voice notes on Tele2 LTE smoke PASS — voice transport-independent contract empirically confirmed
+
+**Goal:** field-verify the ADR-028 §"Layer 3" claim "voice = REST media" on the actual Tele2 LTE failure profile. The 2026-06-16 deep audit (4-agent fan-out + Ruflo independent verdict, durables at `C:\temp\direct-media-truth-audit-2026-06-16\`) reached consensus that voice manifest envelopes + media chunks structurally deliver via long-poll backbone + REST `/media/v3`, but flagged "voice-on-long-poll on Tele2 LTE" as NEEDS-FIELD-SMOKE — the Stage 2B-D 2026-06-16 smoke had been text-only.
+
+**Setup.** Tecno `103603734A004351` on Tele2 LTE (Wi-Fi off, LTE-only); emulator `emulator-5554` on host Wi-Fi. Same APK from master `2779c164` (debug variant, byte-identical to PR #323 post-merge sanity smoke APK, SHA-256 `c8dff3a0fb5f48359752d905dd89508f18beced90620a6ed7a8e4876d6a16684`). Fresh `pm clear` + onboard both. Pair via QR. Send a baseline text message, then voice notes in both directions, then wait for natural Mode-2 WS death, then more voice notes.
+
+**Outcome — PASS + STRESS-PASS.**
+
+| Voice note | Direction | mediaId | chunks | Outcome |
+|---|---|---|---|---|
+| 1 | Tecno → Emu | `D3NB_pJG` | 9 | `MEDIA_TX manifest_sent` → emu `MEDIA_RX manifest_acked_and_queued` → emu `MEDIA_RX message_ready path=AUDIO_LOCAL` in ~22 s |
+| 2 | Tecno → Emu | `SLKqCJJv` | 12 | same shape, ~26 s wall-time |
+| 3 | Emu → Tecno | `6dJ3bIi1` | 9 | symmetric — receiver `message_ready` |
+| 4 | Emu → Tecno | `FiH6PAoX` | 15 | symmetric — receiver `message_ready` |
+
+Counter-evidence absent for all four voice notes: `MEDIA_RX download_failed = 0`, `MEDIA_RX decrypt_failed = 0`, `MEDIA_RX sha256_mismatch = 0`, `MEDIA_RX chunk_not_ready_deadline_exceeded = 0`.
+
+**Stress evidence — voice delivered DESPITE active WS failure.** Tecno-side `REST_TRACE mode_switched WsActive → RestActive reason=active_outbound_ack_timeout` fired BEFORE the first voice send (the per-envelope ACK deadline tripped early); the first voice manifest therefore went through REST short-poll path from the start, not WS. Emulator-side cycled through **14 mode switches** during the smoke window (`inbound_idle_timeout → ws_frame_text_received → ws_alive_60s` loop every ~60 s). Tecno-side `ws_ping_timeout_diag = 32` confirms Direct WSS thrashed in canonical Mode-2 pattern throughout. Voice delivery remained correct end-to-end across all this.
+
+**Other invariants verified by the same smoke window.** `prekey_publish_retry = 0` + `body_read_threw = 0` + `prekey_publish_ok = 2` + `body_read_skipped` fires — PR #323 T2 fix held. `inbound_repair_ok ... promotion=true` fired + `OpkNotFound = 0` + `fail_mac action=hold = 0` + `promotion=false = 0` — Sprint 2b-C OPK lifecycle held.
+
+**Side-finding (NOT regression, NOT blocker, captured for future-track).** First message after pairing showed yellow dot ~8 seconds in UI; root cause `prekey_fetch_result=timeout 8s` + retry path (the PR-G3/G4-era artifact pattern). Retry succeeded (`prekey_publish_ok` follow-up), message delivered. Emulator UI periodically showed `Recovering` status — honest display of the 14 mode-switch cycle. Both observations are user-perceptible UX surfaces for the queued **DWS-UX hardening track** (next-track-pending), NOT for any voice fix.
+
+**What this closes.** The single biggest open question from the 2026-06-16 deep audit: "does voice actually deliver on Tele2 LTE when Direct WSS dies?" Answer: **yes, and it does so because the long-poll backbone + REST media side-channel are real production paths, not theoretical claims.** ADR-028 §"Layer 3" contract verified by field evidence. Multi-transport reliability framing 2026-06-09 (item 5 "voice messages = REST/long-poll-compatible, MUST NOT depend on a live WS") verified by field evidence.
+
+**What this does NOT close.** Direct WSS instability on Tele2 LTE is unchanged — that is by design per ADR-028 §"Bounded promise" and per the queued DWS-UX hardening track. The voice gaps catalogued in the audit (10 MiB-vs-1 MiB cap mismatch, no upload-resume across crash, receiver-side download cancel absent, voice blocked in Tor / Ghost) remain real and are tracked separately. Calls remain scaffold-only (no TURN, signaling gated on `WsActive`); voice smoke says nothing about calls.
+
+**Smoke-template discipline lesson.** The PowerShell verdict script used grep markers (`early_manifest_sent`, `chunk_uploaded`, `download_complete`) that did not match the actual log line names in master `2779c164` (`manifest_sent`, `manifest_acked_and_queued`, `message_ready`). The script printed `INCONCLUSIVE` despite a clear PASS — a manual re-read of the raw log was required to surface the true verdict. Discipline correction: future smoke templates on new subsystems must grep the actual source for log markers before authoring, rather than relying on second-hand citations.
+
+**Durable trail.** `C:\temp\voice-smoke-2026-06-17\logs\tecno-voice.log` + `emu-voice.log` (operator workstation, not in repo). Memory `project_voice_smoke_pass_2026_06_17` carries the structured outcome. Memory `project_dws_ux_hardening_track_pointer_2026_06_17` carries the locked next-track direction (intent: "Direct is fast when it can be, long-poll is reliable when Direct dies — make degradation fast, quiet, and understandable" — explicitly NOT "make Direct WSS reliable like long-poll").
+
 ### 2026-06-16 · T2 carrier-ceiling prekey-publish bug CLOSED on Tele2 LTE field evidence (PR #323 squash `5cf18e5f` + post-merge sanity smoke)
 
 **Goal:** close the T2 carrier-ceiling `POST /prekeys/publish` bug that has been firing the `prekey_publish_retry SocketTimeoutException` pattern on every Tele2 LTE upstream publish since 2026-05-14. The 2026-06-16 Stage 2B-D smoke entry above mentions this class as a side-incident absorbed by Sprint 2b-C, but it remained an open Reliability-track item with its own field gate.
