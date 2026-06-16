@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-05-21
 **Build:** master at `8f4c68c9` — post-Alpha-1, ongoing development. Alpha-1 baseline (2026-04-27, tag `v0.1.0-alpha.1`) is preserved as historical context within this document; the project has since landed the M1w encrypted-media-upload trilogy, the M2 chunk-size sprint (M2a-M2h.1), the D0r/D1 REST fallback transport, the H1/H2 first-message + reconnect reliability sprint, and the REC recording-panel UX trilogy. There is **no fixed release deadline** as of the 2026-05-14 strategic pivot — see [`docs/project/MASTER_TIMELINE_2026.md`](docs/project/MASTER_TIMELINE_2026.md) for the live tracker.
-**Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS — Wi-Fi only since 2026-05-14, no SIM card; Pixel emulators API 35 on Windows dev machine), Tele2 LTE Иркутская (real-device, second SIM phone pending), MTS Wi-Fi (real-device, no SIM cellular path) Hetzner VPS relay (`relay.phntm.pro`).
+**Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS — Wi-Fi only since 2026-05-14, no SIM card; Pixel emulators API 35 on Windows dev machine), Tele2 LTE Irkutsk Oblast (real-device, second SIM phone pending), MTS Wi-Fi (real-device, no SIM cellular path) Hetzner VPS relay (`relay.phntm.pro`).
 
 ---
 
@@ -31,7 +31,7 @@ This file separates two kinds of items:
 
 ### ISSUE-001: WebSocket reconnect cycles on aggressive-OEM Android skins and stateful carrier middleboxes
 
-**Symptom.** On certain OEM Android skins (Tecno HiOS verified) AND on multiple Russian carrier networks (МТС, Tele2 LTE — verified independently of OEM) the foreground-service notification stays visible and the WebSocket connects successfully, but the connection silently dies after some idle period (originally ~60 s on OEM-only diagnoses, later ~30–155 s under the carrier-middlebox half-open TCP pattern). Each cycle:
+**Symptom.** On certain OEM Android skins (Tecno HiOS verified) AND on multiple Russian carrier networks (MTS, Tele2 LTE — verified independently of OEM) the foreground-service notification stays visible and the WebSocket connects successfully, but the connection silently dies after some idle period (originally ~60 s on OEM-only diagnoses, later ~30–155 s under the carrier-middlebox half-open TCP pattern). Each cycle:
 
 1. Client logs `SocketTimeoutException`, or — under the half-open pattern — no outbound `Ping` reaches the server at all (server-side `pings_received=0 inbound_frames=0` over the whole session).
 2. Reconnect succeeds within ~1 s once the dead socket is detected and torn down.
@@ -39,23 +39,23 @@ This file separates two kinds of items:
 
 **Impact.** A message sent to a recipient mid-reconnect arrives ~1–3 s later than usual. **No messages are lost** (PR-H2b processed-envelope ledger neutralises any relay redelivery — see ISSUE-004). On stable Wi-Fi without a stateful middlebox the connection has been stable across multi-minute QA sessions with the same code path and the same relay endpoint. The issue compounds two effects: (a) the OEM-side power management on Tecno HiOS that parks the Wi-Fi radio between transmissions, and (b) stateful network elements on the Russian carrier path that drop a long-lived idle WebSocket without sending a FIN.
 
-**Root cause.** The 2026-05-04 4-test matrix on the same МТС Wi-Fi (Tecno Spark Go vs Pixel 8 Pro emulator on a stable PC) demonstrated the cycle on **both** devices — so OEM radio parking is one cause, not the only one. The actual primary contributor in production on Russian carriers is a stateful network element along the path (Carrier-Grade NAT, transit border filtering / TSPU, or both) that goes one-way silent without an explicit close. PR-H1b (`0baa4196`) diagnosed this as the half-open TCP black-hole pattern from `session_summary` lines (`pings_received=2-5` server-side vs `pings_sent=11` client-side, `since_last_ping_ms ≈ 153 s` on every dying session).
+**Root cause.** The 2026-05-04 4-test matrix on the same MTS Wi-Fi (Tecno Spark Go vs Pixel 8 Pro emulator on a stable PC) demonstrated the cycle on **both** devices — so OEM radio parking is one cause, not the only one. The actual primary contributor in production on Russian carriers is a stateful network element along the path (Carrier-Grade NAT, transit border filtering / TSPU, or both) that goes one-way silent without an explicit close. PR-H1b (`0baa4196`) diagnosed this as the half-open TCP black-hole pattern from `session_summary` lines (`pings_received=2-5` server-side vs `pings_sent=11` client-side, `since_last_ping_ms ≈ 153 s` on every dying session).
 
 **Mitigations shipped (current production policy, locked via the H1c/H1e diagnostic sprint).**
 
 The most recent policy is the PR-H1e "Run C" configuration (PR #134, master `bcc501be`, locked 2026-05-14 after a 4-run heartbeat experiment on `diag/h1e-ws-ping-experiments`):
 
-- **App-level RelayMessage Ping/Pong over WS frames disabled** (`APP_LEVEL_PING_ENABLED=false`). Run C empirically doubled WS lifetime by removing this redundant heartbeat layer; tighter cadences (Run B 5 s) made the cycle worse, not better. App-level Ping was an early defensive belt that turned out to be a kill trigger on stateful middleboxes.
+- **App-level RelayMessage Ping/Pong over WS frames is not sent.** Run C empirically doubled WS lifetime by removing this redundant heartbeat layer; tighter cadences (Run B 5 s) made the cycle worse, not better. App-level Ping was an early defensive belt that turned out to be a kill trigger on stateful middleboxes. The `APP_LEVEL_PING_ENABLED` constant in `RelayTransportConfig.kt` literally evaluates to `true` on master but is not consumed by any sender; runtime behaviour matches the Run C policy. The constant is dead config and a future cleanup may delete or rename it.
 - **OkHttp WebSocket `pingInterval(15s)` hard-coded** as the sole client-side liveness check.
 - **Dead-socket watchdog** triggers off the last inbound frame timestamp via `RelayTransport.lastInboundFrameElapsedMs` — ANY inbound frame keeps the socket alive, not just Pong (PR-H1c, `e946caba`).
-- **AlarmManager proactive reconnect at 45 s stale inbound** survives Doze and OEM AlarmManager throttling as a safety net below the 60 s pong-watchdog floor (ADR-011, now Accepted; PR-H1c).
+- **AlarmManager wakeup at 60 s** is scheduled and fires on schedule. Amended posture (2026-05-16): PR-R0.4a (`18a23b6d`) and PR-R0.4b (`727e1a83`) removed the stale-inbound proactive `forceReconnect` from `PhantomWakeupReceiver` and from `KtorRelayTransport.startIdleWatchdog`. The receiver now only calls `pokeConnectivity()` and writes a diagnostic log line; the idle watchdog emits `InboundStalledEvent` which is routed into a REST mode switch by `HybridRelayTransport`, not into a WS reconnect. Recovery from a half-open WS now flows through the REST state machine rather than through `forceReconnect`. See ADR-011 Status note § "Amendment 2026-06-17" for the full posture description.
 - **Distinct `TransportState.Reconnecting`** drives a "Reconnecting…" UX badge instead of the chat going dark.
 - **Server-side TCP `SO_KEEPALIVE`** (idle 15 s, interval 5 s, retries 3) via `socket2` `#[cfg(unix)]`, so the relay can drop half-open sockets server-side without waiting for the next read attempt.
 - Foreground service holds `WifiLock(WIFI_MODE_FULL_HIGH_PERF)` (downgraded to `FULL` by HiOS but kept anyway as defence-in-depth) and a partial `WakeLock` for its full lifetime (`74e6af0a`).
 - `forceCancelAllEngineCalls()` so a hung WebSocket aborts in <2 s instead of 60 s (`2ee1d08d`).
 - `cancelAndJoin` between reconnect generations so stale ping-timers cannot fire on the new socket (`846d6bed`).
 
-**Test #37 verified** detection time dropped from 155 s → 30–46 s, recovery 5 s → ~1 s, zero message loss across twelve consecutive reconnect cycles per device. **Test #41** (the locked H1e Run C policy on Tecno МТС + emulator-on-dev-Wi-Fi) confirmed zero MAC errors / ledger-dedup misses / FIFO flush issues across 12 reconnects per device.
+**Test #37 verified** detection time dropped from 155 s → 30–46 s, recovery 5 s → ~1 s, zero message loss across twelve consecutive reconnect cycles per device. **Test #41** (the locked H1e Run C policy on Tecno MTS + emulator-on-dev-Wi-Fi) confirmed zero MAC errors / ledger-dedup misses / FIFO flush issues across 12 reconnects per device.
 
 **Remaining residual on Tele2 LTE: WS Frame.Text silently dropped upstream** — see [ISSUE-018](#issue-018-tele2-lte-ws-frametext-silently-dropped-upstream) for the half of this story that the H1 sprint did not close. The REST fallback transport (PR-D0r / PR-D1 / PR-D1b / PR-D1c / PR-D1c.1 / PR-D1d) was built to address the Tele2-class case where even a healthy underlying TCP can no longer carry application frames.
 
@@ -98,7 +98,7 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 
 **Fix shipped.** PR-H2b introduces a new `processed_envelopes` SQLDelight table (forward-only `15.sqm` migration, schema v15 → v16) that records every successfully-decrypted envelope id regardless of payload type (text, voice manifest, group control, read receipt). The ledger guard runs **before** `ratchet.decrypt`, so a re-delivered envelope is `Duplicate envelope (already in ledger)` rather than a MAC fail. `INSERT OR IGNORE` makes the guard race-safe under parallel decrypt; the ledger has an 8-day TTL (one day longer than relay store) so it cannot mask a legitimate replay-attack window. Read receipts and other control payloads that never inserted into `messages.id` (and so bypassed the legacy `messages.id` guard) are now also covered. The legacy `messages.id` guard is retained as defence-in-depth.
 
-**Test #34 / #37 verified** the fix end-to-end: 12 messages each direction across 12 reconnect cycles per device on Tecno МТС + emulator, zero MAC errors, no duplicate UI rows.
+**Test #34 / #37 verified** the fix end-to-end: 12 messages each direction across 12 reconnect cycles per device on Tecno MTS + emulator, zero MAC errors, no duplicate UI rows.
 
 **Related sprint work:** PR-H2a (`674ce231`) strict FIFO outbox via per-envelope `sequenceTs` + `outboundSendMutex`; PR-H2a.2 (`72e59ce9`) holds the mutex across the entire flush-Send loop so live-send cannot race past a higher `sequenceTs`. The complete trilogy closes the client-side reorder source (H2a/H2a.2) **and** the relay-redelivery class (H2b).
 
@@ -224,7 +224,7 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 
 **Status:** Diagnosis revised 2026-05-04 (ADR-013 was wrong about firmware-radio-parking). The original "Tor + UnifiedPush hybrid" architecture proposed in `feat/tor-unified-push-transport` / ADR-016 / ADR-018 was **superseded by the 2026-05-14 strategic pivot and the 2026-05-15 follow-up**: UnifiedPush was retired (always-on third-party push channel was deemed an unrecoverable metadata leak), and Tor was demoted to a text-only emergency fallback after Test #42 on Tele2 LTE showed Reality probe failures dropping straight through to Tor. The current production stack now has three transports — direct WSS (`Standard`), Reality (`Private`, the load-bearing path on RU mobile per the pivot), and Tor (`Ghost`, text-only) — plus a REST-poll fallback (PR-D0r / PR-D1*) when WS Frame.Text is being dropped by the carrier middlebox. The "silent drops on cellular Russia" symptom no longer has a single fix; it is addressed in layers and tracked via the M1w / M2 / D0r / D1 sprints rather than a single hybrid PR.
 
-**Revised root cause.** The 4-test matrix on 2026-05-04 (Tecno Spark Go + Pixel 8 Pro emulator on the same МТС WiFi, identical network path) demonstrated that the "WebSocket dropped silently every 50-60 s" symptom appears on the **Pixel emulator running on a stable Windows PC** as well — invalidating the Tecno-firmware-radio-parking explanation. Both devices stay perfectly stable behind any VPN. The actual root cause is a **stateful network element along the path between Russian carrier WiFi and Hetinki relay**: Carrier-Grade NAT, transit border filtering (TSPU), or both. VPN tunnels emit their own keepalives at 10-25 s and refresh the NAT entry; bare WSS without TCP keepalive does not.
+**Revised root cause.** The 4-test matrix on 2026-05-04 (Tecno Spark Go + Pixel 8 Pro emulator on the same MTS WiFi, identical network path) demonstrated that the "WebSocket dropped silently every 50-60 s" symptom appears on the **Pixel emulator running on a stable Windows PC** as well — invalidating the Tecno-firmware-radio-parking explanation. Both devices stay perfectly stable behind any VPN. The actual root cause is a **stateful network element along the path between Russian carrier WiFi and Hetinki relay**: Carrier-Grade NAT, transit border filtering (TSPU), or both. VPN tunnels emit their own keepalives at 10-25 s and refresh the NAT entry; bare WSS without TCP keepalive does not.
 
 **Earlier (now-superseded) diagnoses.** Original investigation in ADR-010/ADR-011/ADR-013 attributed the cycle to Tecno HiOS firmware Wi-Fi radio parking. That hypothesis explained the Tecno cycle but cannot explain the matching cycle on a Pixel emulator on a stable PC. The 2026-05-04 4-test matrix (`docs/research/transport-investigation-2026-05-04/`) refuted firmware-radio as root cause. ADR-013 should be read as historical record only.
 
@@ -238,12 +238,12 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 - Rust relay — `axum::serve::Listener` wrapper applies `socket2::TcpKeepalive` to each accepted stream.
 - Caddy and relay containers — namespaced kernel sysctls in `deploy/docker-compose.yml`.
 
-Test 5 (МТС WiFi, both devices): connection lifetime improved 50 s → 120 s, but voice burst delivery still fails because the connection silently goes one-way during the burst. Layer 2 is **partially effective but not sufficient on its own** for cellular Russia. Kept as defence-in-depth on the direct WSS path; Tor mode will be the primary path for users on restrictive networks.
+Test 5 (MTS WiFi, both devices): connection lifetime improved 50 s → 120 s, but voice burst delivery still fails because the connection silently goes one-way during the burst. Layer 2 is **partially effective but not sufficient on its own** for cellular Russia. Kept as defence-in-depth on the direct WSS path; Tor mode will be the primary path for users on restrictive networks.
 
 **Current transport stack (post-2026-05-15 pivot):**
 
 - **`Standard` — direct WSS.** Works on every tested network when the carrier path is healthy.
-- **`Private` — Reality / VLESS+REALITY through Xray.** The load-bearing transport on Russian mobile carriers (Tele2 / МТС). Auto-skipped when a system VPN is active (see ISSUE-015). When Reality probe fails, the chain falls through to Tor for text.
+- **`Private` — Reality / VLESS+REALITY through Xray.** The load-bearing transport on Russian mobile carriers (Tele2 / MTS). Auto-skipped when a system VPN is active (see ISSUE-015). When Reality probe fails, the chain falls through to Tor for text.
 - **`Ghost` — Tor v3 onion service** via `kmp-tor 2.6.0` (Tor 0.4.9.5, all four Android ABIs incl. ARM32). Demoted to text-only emergency fallback after Test #42 (2026-05-15) — cannot carry WebRTC for calls (TCP-only) and cannot carry voice messages reliably on RU LTE.
 - **REST fallback (PR-D0r / PR-D1 series).** When Tele2-class middlebox is silently dropping WS Frame.Text (the "Layer A" diagnosis 2026-05-16, see ISSUE-001 / Tele2 diagnostic notes in `docs/PROJECT_LOG.md`), the orchestrator flips the active transport to REST short-poll with server-side idempotency. PR-M1w then carries voice via the encrypted media-upload path on top of REST.
 
@@ -302,7 +302,7 @@ The `feat/tor-unified-push-transport` branch retained as historical research art
 
 **Status:** Documented limitation. Mitigated in client by skipping Reality from the transport chain whenever the system reports an active VPN, so the user does not pay a 20 s per-mode connect penalty for a guaranteed-failing probe.
 
-**Symptom.** With any system-wide Android VPN active (tested with one commercial provider on МТС Wi-Fi 2026-05-11), the Reality probe (`GET https://relay.phntm.pro/health` over the local SOCKS listener that Xray exposes) times out at the full 20 s budget with `InterruptedIOException: timeout`. Without the VPN, the same probe succeeds in ~0.6 s on the same network and the same Xray configuration.
+**Symptom.** With any system-wide Android VPN active (tested with one commercial provider on MTS Wi-Fi 2026-05-11), the Reality probe (`GET https://relay.phntm.pro/health` over the local SOCKS listener that Xray exposes) times out at the full 20 s budget with `InterruptedIOException: timeout`. Without the VPN, the same probe succeeds in ~0.6 s on the same network and the same Xray configuration.
 
 **Server-side audit (2026-05-11).** Caddy access logs (`docker logs phantom-caddy --since 12h`) show **zero requests** in the probe window for the test from the device's VPN exit IP. The relay's `phantom-relay` container correspondingly logs no `connect` event for that identity. The packets do not reach the relay's edge.
 
@@ -326,7 +326,7 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 **User-visible effect.** With a VPN on:
 - `Standard` connects in ~2 s via Direct (unchanged).
-- `Private` connects via Tor — bootstrap time depends on bridge availability (~2 min on the audited VPN+МТС Wi-Fi path; without VPN this is much slower on МТС, see ISSUE-013 / Tor bridge work).
+- `Private` connects via Tor — bootstrap time depends on bridge availability (~2 min on the audited VPN+MTS Wi-Fi path; without VPN this is much slower on MTS, see ISSUE-013 / Tor bridge work).
 - `Ghost` is unchanged.
 
 **Why we do not try Reality as a "last resort" under VPN.** With a 20 s per-attempt budget and a server-side audit showing the packets do not arrive, Reality under VPN is a guaranteed 20 s wasted per fallback walk. Adding it as a tail of the chain would make every fallback to Tor strictly worse without ever rescuing a real user.
@@ -335,9 +335,9 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 ### ISSUE-016: Tor on RU carrier networks without VPN — RESOLVED via PR-E Briar bridge import (Test #6, 2026-05-11)
 
-**Status: ✅ RESOLVED (single-test confirmation, awaiting production-stability re-verification).** PR-E (2026-05-12) imported Briar's `bridges-s-ru` snowflake set including the Google-AMP-cache fallback fronted on `www.google.com`. Test #6 (2026-05-11 21:25-21:32 МТС Wi-Fi without VPN, Tecno Spark Go) reached `Online via Tor · Ghost` in ~6 minutes on the very first KitchenSink (1/4) attempt. PR-D's bridge rotation order + the Ghost-mode AllFailed copy ("Tor is blocked or slowed by this network. Try Private/Reality or enable a VPN.") remain in place as the fallback if a future TSPU adaptation breaks the AMP-cache route.
+**Status: ✅ RESOLVED (single-test confirmation, awaiting production-stability re-verification).** PR-E (2026-05-12) imported Briar's `bridges-s-ru` snowflake set including the Google-AMP-cache fallback fronted on `www.google.com`. Test #6 (2026-05-11 21:25-21:32 MTS Wi-Fi without VPN, Tecno Spark Go) reached `Online via Tor · Ghost` in ~6 minutes on the very first KitchenSink (1/4) attempt. PR-D's bridge rotation order + the Ghost-mode AllFailed copy ("Tor is blocked or slowed by this network. Try Private/Reality or enable a VPN.") remain in place as the fallback if a future TSPU adaptation breaks the AMP-cache route.
 
-**Test #6 outcome timeline (МТС Wi-Fi, no VPN, 2026-05-11):**
+**Test #6 outcome timeline (MTS Wi-Fi, no VPN, 2026-05-11):**
 
 | Time | State |
 |---|---|
@@ -353,11 +353,11 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 **Compare to pre-PR-E state.** PR-D + the older snowflake bridges (Netlify-hosted, fronted on `vuejs.org`) timed out at 30 % after 12 minutes on the same network in Test #5 the previous day. The new bridge pool reached 100 % in half that time. The Google-AMP-cache snowflake entries from `bridges-s-ru` are the most likely cause — TSPU cannot block `www.google.com` without breaking the local internet, so the broker-discovery TLS request gets through where the older `vuejs.org`-fronted broker was silently dropped.
 
-**Caveat:** single test on a single device on a single МТС session. Worth a few more МТС sessions across different times of day before claiming production stability. The architecture-side question ("can PHANTOM offer Ghost without VPN to RU users at all?") is answered yes; the operational question ("how often does it work in practice?") needs more data.
+**Caveat:** single test on a single device on a single MTS session. Worth a few more MTS sessions across different times of day before claiming production stability. The architecture-side question ("can PHANTOM offer Ghost without VPN to RU users at all?") is answered yes; the operational question ("how often does it work in practice?") needs more data.
 
 **Original problem (kept for context).**
 
-**Symptom.** Selecting Ghost privacy mode on МТС Wi-Fi without a VPN: every one of the four bridge profiles in [`BRIDGE_ROTATION_ORDER`] times out without reaching `Ready`. Test #5 (2026-05-11, captured logcat at 11:22-11:34 МТС Wi-Fi):
+**Symptom.** Selecting Ghost privacy mode on MTS Wi-Fi without a VPN: every one of the four bridge profiles in [`BRIDGE_ROTATION_ORDER`] times out without reaching `Ready`. Test #5 (2026-05-11, captured logcat at 11:22-11:34 MTS Wi-Fi):
 
 | Profile | Reached % | Result |
 |---|---|---|
@@ -370,11 +370,11 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 **Root cause.** Upstream censorship layer (TSPU) on Russian carrier networks blocks Tor bridge wire signatures and throttles Tor circuit traffic even when an individual bridge handshake succeeds. The 50%/72% stall on snowflake/mixed is the classic "circuit build" or "loading consensus document" phase — the bridge negotiated a connection but the underlying Tor protocol traffic between guard and middle relays is being filtered. This matches the externally documented behaviour of TSPU against Tor (see e.g. Tor Project's "Russia" bridge guidance, which itself recommends VPN+Tor for users in cellular RU). It is below the application layer and cannot be fixed in PHANTOM code without either deploying additional bridges in non-blocked CIDR ranges or adding alternative pluggable transports.
 
-**What works on МТС without VPN (verified Test #5 + earlier tests):**
+**What works on MTS without VPN (verified Test #5 + earlier tests):**
 - ✅ Standard (Direct WSS) — connects in ~1.3 s.
 - ✅ Private (Reality through our Hetzner Xray endpoint) — connects in ~0.6 s on a healthy day.
 
-**What does not work on МТС without VPN:**
+**What does not work on MTS without VPN:**
 - 🔴 Ghost (Tor) — fails in all four bridge profiles. The user-facing Ghost AllFailed notification is now `"Tor is blocked or slowed by this network. Try Private/Reality or enable a VPN."` so the next step is unambiguous.
 
 **What works with a VPN active:**
@@ -458,7 +458,7 @@ These are documented for transparency about what we resolved during the developm
 
 **Status:** Known carrier-network limitation. Mitigated by automatic transport degrade to REST short-poll (PR-D0r / PR-D1d).
 
-**Symptom.** On Tele2 LTE Иркутская (verified Test #48 on Tecno `103603734A004351`, 2026-05-16), the WebSocket completes the 101 Upgrade handshake successfully but every subsequent application WS frame from phone to server is silently lost upstream. Server-side `session_summary` lines show `pings_received=0 inbound_frames=0` across ~20 consecutive phone WS sessions, each terminating at the server's ~153 s read timeout. The client side OkHttp `pingInterval(15s)` timeout firing at ~31 s is the **symptom**, not the cause — phone-side ping frames never reach the server in the first place.
+**Symptom.** On Tele2 LTE Irkutsk Oblast (verified Test #48 on Tecno `103603734A004351`, 2026-05-16), the WebSocket completes the 101 Upgrade handshake successfully but every subsequent application WS frame from phone to server is silently lost upstream. Server-side `session_summary` lines show `pings_received=0 inbound_frames=0` across ~20 consecutive phone WS sessions, each terminating at the server's ~153 s read timeout. The client side OkHttp `pingInterval(15s)` timeout firing at ~31 s is the **symptom**, not the cause — phone-side ping frames never reach the server in the first place.
 
 **Root cause.** Stateful Tele2 middlebox classifier that admits the WS Upgrade but treats subsequent persistent-WS-frame traffic as suspect and silently drops the body. The H1c/H1e hardening (PR-H1d disable-app-level-ping was considered then killed as wrong direction — `pings_received=0` on the server proves the symptom is not "client sends too fast", so removing client pings just extends zombie-WS lifetime without fixing anything).
 

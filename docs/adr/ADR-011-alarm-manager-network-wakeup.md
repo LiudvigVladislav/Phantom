@@ -8,30 +8,53 @@ Layer: app/service (android)
 
 ---
 
-## Status note (2026-05-21)
+## Status note (2026-05-21, amended 2026-06-17)
 
-This ADR landed in production through the H1 reliability sprint. The decision section below is preserved as originally drafted; this status note records what shipped and where.
+This ADR landed in production through the H1 reliability sprint. The decision section below is preserved as originally drafted; this status note records what shipped, where, and how it has been amended since.
 
 **Implementation references:**
 
-- **PR-H1c (#132, master `e946caba`, 2026-05-13)** — shipped the six-layer stale-socket recovery that includes the AlarmManager wakeup as designed in this ADR. The receiver path checks `lastInboundFrameElapsedMs` (broader than the original `lastPongMark` — see Decision §5 below) and calls `forceReconnect()` when the inbound channel is stale. **Test #37** verified detection time 155 s → 30–46 s, recovery 5 s → ~1 s, zero message loss across twelve consecutive reconnect cycles per device on Tecno МТС + emulator.
-- **PR-H1e (#134, master `bcc501be`, 2026-05-14)** — locked the final production cadence after a four-run heartbeat experiment on `diag/h1e-ws-ping-experiments`. The locked Run C policy is:
-  - `APP_LEVEL_PING_ENABLED=false` — the redundant app-level RelayMessage Ping/Pong layer is disabled; OkHttp WS Ping is the sole client-side liveness check.
+- **PR-H1c (#132, master `e946caba`, 2026-05-13)** — shipped the six-layer stale-socket recovery that includes the AlarmManager wakeup as designed in this ADR. The receiver path checked `lastInboundFrameElapsedMs` (broader than the original `lastPongMark` — see Decision §5 below) and called `forceReconnect()` when the inbound channel was stale. **Test #37** verified detection time 155 s → 30–46 s, recovery 5 s → ~1 s, zero message loss across twelve consecutive reconnect cycles per device.
+- **PR-H1e (#134, master `bcc501be`, 2026-05-14)** — locked the final heartbeat cadence after a four-run experiment on `diag/h1e-ws-ping-experiments`. The locked Run C cadence was:
+  - App-level `RelayMessage.Ping` / `Pong` over WS frames is no longer sent. OkHttp WS Ping is the sole client-side liveness check.
   - OkHttp WS `pingInterval(15s)` hard-coded.
-  - AlarmManager proactive reconnect at 45 s of stale inbound (below the 60 s pong-watchdog floor in §122 of the original decision) — survives Doze and OEM AlarmManager throttling as a safety net.
+  - AlarmManager proactive reconnect at 45 s of stale inbound was the locked actuation **as of 2026-05-14** — superseded by PR-R0.4a / PR-R0.4b in May 2026 (see amendment below).
   - Dead-socket watchdog continues ticking on `PING_INTERVAL_MS`.
 
-**Acceptance criteria (from §397 below) — verification status:**
+### Amendment 2026-06-17 — actuation layer revised by PR-R0.4a and PR-R0.4b
 
-1. **3-minute screen-off Tecno HiOS delivery within 90 s** — verified by Test #37 / Test #41. Tecno is now Wi-Fi-only since 2026-05-14 (no SIM), so the OEM-radio-park leg of the original criterion is no longer reproducible on the current hardware; the half-open TCP middlebox class (which the same fix addresses) IS reproduced on a daily basis on Tele2 LTE.
-2. **`adb shell dumpsys alarm | grep phantom` shows the `PhantomWakeupReceiver` entry repeating at ~60 s** — confirmed in PR-H1c diagnostic logs.
+The "AlarmManager proactive reconnect at 45 s of stale inbound" claim above is no longer true at runtime. Two subsequent merges removed the actuation:
+
+- **PR-R0.4a (#149, master `18a23b6d`, 2026-05-16)** — removed the stale-inbound proactive `forceReconnect` from `PhantomWakeupReceiver`. Rationale recorded inline in the receiver file: "Idle 1:1 chat with no messages produces zero inbound frames indefinitely — that is not a dead socket." After this change the receiver only calls `pokeConnectivity()` and writes a diagnostic log line; it does NOT call `transport.forceReconnect()`.
+- **PR-R0.4b (#151, master `727e1a83`, 2026-05-16)** — removed the matching stale-inbound dead-socket forceReconnect from `KtorRelayTransport.startIdleWatchdog()`. The 60-second idle watchdog still emits `InboundStalledEvent` for telemetry, but its consumer routes that signal into a REST mode-switch (PR-RECV-DIAG1 v1.6 / v1.8), not into a WS reconnect.
+
+Net effect on master at the time of this amendment:
+
+- **`forceReconnect()` reachable in production from one path only**: `KtorRelayTransport.startAckWatchdog()` calls it when an envelope's per-recipient ACK has been pending for `ACK_TIMEOUT_MS = 60_000`. That path requires `pendingAcks > 0`, so an idle 1:1 chat with no outbound traffic does not exercise it.
+- **`PhantomWakeupReceiver` is now a passive diagnostic.** It reads `lastInboundFrameElapsedMs` / `lastPongElapsedMs` / `pendingAcks` / `isConnected` and logs them. No `forceReconnect()` call exists in this file on master.
+- **`startIdleWatchdog`** emits `InboundStalledEvent` only. The consumer (`HybridRelayTransport`) translates this into `RestStateMachine.Event.InboundIdleTimeout` → REST mode switch. The WS layer is not torn down.
+- **`Event.ActiveOutboundAckTimeout`** (PR-D1d, per-envelope 10-second deadline) is now the fastest actuator for outbound failure. It triggers a REST mode switch IMMEDIATELY rather than waiting for `startAckWatchdog`'s 60-second multi-envelope threshold.
+
+This amendment was not intended to retire the AlarmManager wakeup mechanism itself. The system-level wakeup, the `WakeLock` discipline, the `setExactAndAllowWhileIdle()` scheduling, and the radio-park bypass argument from the Diagnosis section below all remain load-bearing. What changed is the action taken on each fire. The receiver still wakes; it no longer forces a reconnect from inside the receiver. Recovery is now driven by the per-envelope ACK deadline and by REST mode-switch transitions.
+
+### `APP_LEVEL_PING_ENABLED` clarification
+
+The configuration constant `APP_LEVEL_PING_ENABLED` in `RelayTransportConfig.kt:181` literally evaluates to `true` on master, but **no production code reads it**. There is no `RelayMessage.Ping` producer in the WS path. The `SessionStats.pongsReceived` counter therefore never advances; the `ws_ping_timeout_diag` log line annotates this with `app_level_dead_counter=true`. Runtime behaviour matches the locked `APP_LEVEL_PING_ENABLED=false` policy from PR-H1e Run C; only the constant value drifted. The flag is dead config — flipping it changes nothing observable. A future cleanup commit may delete or rename it.
+
+### Acceptance criteria (from §397 below) — verification status
+
+1. **3-minute screen-off Tecno HiOS delivery within 90 s** — verified by Test #37 / Test #41. The hardware on which the original criterion was reproducible no longer carries a SIM; the half-open TCP middlebox class (which the same fix addresses) IS reproduced on a daily basis on Tele2 LTE.
+2. **`adb shell dumpsys alarm | grep phantom` shows the `PhantomWakeupReceiver` entry repeating** — confirmed in PR-H1c diagnostic logs. After PR-R0.4a the receiver still fires on the same schedule but no longer calls `forceReconnect`.
 3. **`USE_EXACT_ALARM` revoke fallback** — implemented per Risks R1; verified in the AppContainer / `PhantomMessagingService.kt` wakeup path.
-4. **60-minute Doze soak with ≤ 3 % battery drain** — not formally measured. Field-tested on multiple device sessions without complaints; battery impact has not regressed against the Briar / Element reference numbers cited in §299.
-5. **Receiver logs "pong fresh — no action" vs "stale pong — forcing reconnect"** — both log lines present in production logcat after H1c. Note that under Run C the trigger is `lastInboundFrameElapsedMs`, not strictly pong age, so a more general phrasing is used in production code.
+4. **60-minute Doze soak with ≤ 3 % battery drain** — not formally measured. Field-tested on multiple device sessions without complaints.
+5. **Receiver logs "pong fresh — no action" vs "stale pong — forcing reconnect"** — superseded by the PR-R0.4a posture. The receiver now logs a single diagnostic line that does NOT branch on a forceReconnect decision because no such branch exists.
 
-**Remaining open question.** OQ-2 (adaptive interval — fire more often during active conversations, less often when idle for hours) is **still open** and tracked in `docs/PROJECT_LOG.md → Open follow-ups`. The locked 45 s / 60 s cadence is the production answer until that follow-up is picked up; no urgency given current battery field data.
+### Remaining open questions
 
-The Decision section below is preserved as-written for archival reasons. Read the Status note above for what's actually true today.
+- OQ-2 (adaptive interval — fire more often during active conversations, less often when idle for hours) is **still open** and tracked in `docs/PROJECT_LOG.md → Open follow-ups`.
+- The future-track DWS-UX hardening (queued; not opened) will revisit "which existing detector earns actuation" rather than adding a new detector. The post-PR-R0.4a detection-rich / action-poor posture is intentional but worth telemetry-baselining before a Council on the next actuation lever.
+
+The Decision section below is preserved as-written for archival reasons. Read the Status note + Amendment above for what is actually true on master today.
 
 ---
 
