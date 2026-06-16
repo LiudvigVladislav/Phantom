@@ -70,8 +70,16 @@ interface MessagingService {
      * Returns the number of messages re-attempted (success OR continued
      * failure — both count). Caller wires this into the WS reconnect
      * signal and a periodic ticker. PR C-followup-3.
+     *
+     * DWS-UX.1 (2026-06-17): callers MUST pass a short [source] label
+     * (e.g. `"ticker"`, `"ws_reconnect"`, `"manual"`) so the
+     * `RETRY_TRACE` log line discriminates the trigger path. The
+     * first-message yellow-dot UX investigation needs this field to
+     * distinguish whether a recovery came from the 60 s ticker or
+     * from a WS reconnect collector. Defaults to `"unknown"` so
+     * legacy call sites and unit tests keep working unchanged.
      */
-    suspend fun retryWaitingMessages(): Result<Int>
+    suspend fun retryWaitingMessages(source: String = "unknown"): Result<Int>
 
     /**
      * Mark all unread messages in a conversation as READ locally.

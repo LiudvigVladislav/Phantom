@@ -139,7 +139,34 @@ fun ConnectionBanner(
             dotColor = Danger
         }
         is ConnectionUiState.Error -> {
-            label = "Offline — reconnecting"
+            // DWS-UX.1 (2026-06-17): the pre-DWS-UX label
+            // "Offline — reconnecting" implied recovery was actively
+            // in progress, but `ConnectionUiState.Error.cause` can be
+            // either a transient network throwable (where the
+            // reconnect loop will eventually succeed and the
+            // promise is honest) or a more terminal failure class
+            // (where nothing the user can wait for is happening).
+            // Discriminate by Throwable simple class name so
+            // transient transport exceptions keep the
+            // "reconnecting" promise while other classes nudge the
+            // user to check setup. No actuation change — the
+            // reconnect loop continues either way per the locked
+            // [phantom.core.transport.RelayTransportConfig
+            // .RECONNECT_INFINITE] posture.
+            //
+            // Capture into a local val because `uiState` is a
+            // delegated property (`by stateFlow`) and the compiler
+            // cannot smart-cast it across the lambda boundary.
+            val errorState = uiState as ConnectionUiState.Error
+            label = when (errorState.cause::class.simpleName) {
+                "SocketTimeoutException",
+                "SocketException",
+                "ConnectException",
+                "UnknownHostException",
+                "IOException",
+                -> "Offline — reconnecting"
+                else -> "Cannot connect — please check setup"
+            }
             dotColor = Danger
         }
     }

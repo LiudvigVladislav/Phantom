@@ -1824,7 +1824,10 @@ class AppContainer(private val context: Context) {
         appScope.launch {
             while (true) {
                 kotlinx.coroutines.delay(60 * 1000L)
-                runCatching { service.retryWaitingMessages() }
+                // DWS-UX.1 (2026-06-17): tag the trigger so
+                // `RETRY_TRACE` can discriminate the 60 s ticker path
+                // from the WS reconnect collector path below.
+                runCatching { service.retryWaitingMessages(source = "ticker") }
                     .onFailure {
                         android.util.Log.w(
                             "PendingBundleRetry",
@@ -1839,7 +1842,11 @@ class AppContainer(private val context: Context) {
         appScope.launch {
             transport.state.collect { st ->
                 if (st is phantom.core.transport.TransportState.Connected) {
-                    runCatching { service.retryWaitingMessages() }
+                    // DWS-UX.1 (2026-06-17): see comment above the
+                    // ticker call site.
+                    runCatching {
+                        service.retryWaitingMessages(source = "ws_reconnect")
+                    }
                         .onFailure {
                             android.util.Log.w(
                                 "PendingBundleRetry",
