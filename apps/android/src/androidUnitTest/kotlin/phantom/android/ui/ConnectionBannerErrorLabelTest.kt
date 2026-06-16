@@ -13,41 +13,29 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 /**
- * DWS-UX.1 (2026-06-17) — pins the
- * [phantom.android.ui.ConnectionBanner] `Error` label discriminator.
- * Pre-DWS-UX the label was the bare string `"Offline — reconnecting"`,
- * which implied that recovery was actively in progress. When the
+ * DWS-UX.1 (2026-06-17) — pins the production
+ * [phantom.android.ui.connectionErrorLabel] discriminator. Pre-
+ * DWS-UX the label was the bare string `"Offline — reconnecting"`
+ * inlined into the composable's `when` arm, which implied that
+ * recovery was actively in progress. When the
  * `TransportState.Error` cause is a transient transport throwable
  * (e.g. socket timeout, network down) the reconnect-loop promise is
  * honest, but for other Throwable classes the promise may be empty
  * and the user is misled.
  *
- * The discriminator under test is the pure mapping from
- * `Throwable::class.simpleName` to one of two label strings; the
- * actual label assignment lives inside the `@Composable
- * ConnectionBanner` (untestable from a JVM unit-test source set
- * without a Compose runtime). This test therefore restates the
- * mapping in the same shape used by the composable's `when` arm so a
- * future refactor that diverges them fails this assertion.
+ * Earlier draft of this test re-implemented the discriminator in a
+ * private mirror function — PR-#327 review caught that shape as
+ * false-confidence (the test could stay green while the production
+ * code drifted). The discriminator was therefore lifted out of the
+ * composable into the file-level
+ * [phantom.android.ui.connectionErrorLabel] function so that this
+ * test calls the real production code path.
  */
 class ConnectionBannerErrorLabelTest {
 
-    /**
-     * Mirror of the `when` arm at
-     * `ConnectionBanner.kt:ConnectionUiState.Error` introduced by
-     * DWS-UX.1. Kept in sync by hand; the composable cannot be
-     * called directly from a JVM unit test (no Compose runtime).
-     */
+    /** Sugar so the test reads cleanly. Delegates to production code. */
     private fun labelFor(cause: Throwable): String =
-        when (cause::class.simpleName) {
-            "SocketTimeoutException",
-            "SocketException",
-            "ConnectException",
-            "UnknownHostException",
-            "IOException",
-            -> "Offline — reconnecting"
-            else -> "Cannot connect — please check setup"
-        }
+        connectionErrorLabel(cause)
 
     @Test
     fun socket_timeout_keeps_reconnecting_promise() {

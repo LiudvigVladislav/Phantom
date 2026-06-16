@@ -60,6 +60,36 @@ import phantom.android.transport.ConnectionUiState
  */
 private const val DELAYED_SHOW_MS = 1_500L
 
+/**
+ * DWS-UX.1 (2026-06-17): map a [ConnectionUiState.Error] cause to a
+ * user-facing banner label. Socket / network / IO throwables keep the
+ * historical `"Offline — reconnecting"` promise — the reconnect loop
+ * really is iterating and the underlying class is transient enough
+ * that the wording is honest. Any other Throwable class — typically
+ * an `IllegalStateException` or `IllegalArgumentException` from a
+ * configuration or auth path — surfaces an action-oriented
+ * `"Cannot connect — please check setup"` instead of a hollow
+ * reconnect promise.
+ *
+ * The mapping lives at file-level (not inside the composable's
+ * `when` arm) so [ConnectionBannerErrorLabelTest] calls the actual
+ * production code instead of a hand-copied mirror. A future refactor
+ * that changes the discriminator now fails the test directly.
+ *
+ * Behaviour-preserving: the existing reconnect loop continues
+ * unchanged regardless of which label is shown.
+ */
+internal fun connectionErrorLabel(cause: Throwable): String =
+    when (cause::class.simpleName) {
+        "SocketTimeoutException",
+        "SocketException",
+        "ConnectException",
+        "UnknownHostException",
+        "IOException",
+        -> "Offline — reconnecting"
+        else -> "Cannot connect — please check setup"
+    }
+
 @Composable
 fun ConnectionBanner(
     stateFlow: State<ConnectionUiState>,
@@ -146,27 +176,18 @@ fun ConnectionBanner(
             // reconnect loop will eventually succeed and the
             // promise is honest) or a more terminal failure class
             // (where nothing the user can wait for is happening).
-            // Discriminate by Throwable simple class name so
-            // transient transport exceptions keep the
-            // "reconnecting" promise while other classes nudge the
-            // user to check setup. No actuation change — the
-            // reconnect loop continues either way per the locked
-            // [phantom.core.transport.RelayTransportConfig
-            // .RECONNECT_INFINITE] posture.
+            // The discriminator lives in [connectionErrorLabel] so
+            // the unit test calls the production mapping directly;
+            // copying the `when` arm into the test was caught at
+            // PR-review time as a false-confidence shape. No
+            // actuation change — the existing reconnect loop
+            // continues unchanged.
             //
             // Capture into a local val because `uiState` is a
             // delegated property (`by stateFlow`) and the compiler
             // cannot smart-cast it across the lambda boundary.
             val errorState = uiState as ConnectionUiState.Error
-            label = when (errorState.cause::class.simpleName) {
-                "SocketTimeoutException",
-                "SocketException",
-                "ConnectException",
-                "UnknownHostException",
-                "IOException",
-                -> "Offline — reconnecting"
-                else -> "Cannot connect — please check setup"
-            }
+            label = connectionErrorLabel(errorState.cause)
             dotColor = Danger
         }
     }
