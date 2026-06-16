@@ -589,6 +589,32 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-16 · T2 carrier-ceiling prekey-publish bug CLOSED on Tele2 LTE field evidence (PR #323 squash `5cf18e5f` + post-merge sanity smoke)
+
+**Goal:** close the T2 carrier-ceiling `POST /prekeys/publish` bug that has been firing the `prekey_publish_retry SocketTimeoutException` pattern on every Tele2 LTE upstream publish since 2026-05-14. The 2026-06-16 Stage 2B-D smoke entry above mentions this class as a side-incident absorbed by Sprint 2b-C, but it remained an open Reliability-track item with its own field gate.
+
+**Chain of evidence (Phase 1 → Phase 2 → PR #323 → post-merge sanity):**
+
+1. **Phase 1 — baseline (PR #322 instrumentation, master `4dacd9d0`).** Tele2 LTE field run produced the five `T2_PUBLISH_PHASE` lines that proved the carrier middlebox delivers `headers_received status=201 protocol=http/1.1` in ~600 ms and then stalls the response body bytes; OkHttp's `Http1ExchangeCodec$FixedLengthSource.read` waits the full 60 s `readTimeout` for bytes that never arrive (the `phase=body_read_threw` event). This was Outcome A of the discriminator: response-direction stall, not upload.
+
+2. **Phase 2 — experimental skip-body-on-2xx.** A debug-only gate (`PUBLISH_SKIP_SUCCESS_BODY_READ="1"`) on the same Tele2 LTE site reduced the publish call from 186 000 ms to 545 ms in a single attempt. The transport-layer fix shape was confirmed. Phase 2 also caught a second layer: with the body skipped, `PreKeyApiClient.publishWithRetry` then threw `JsonDecodingException` from `json.decodeFromString(PublishResponse, "")` and burned the retry budget anyway. The fix needed a transport-layer AND a lifecycle-layer change.
+
+3. **PR #323 ship** (`5cf18e5f` squash). Transport layer: `AndroidNativeOkHttpPreKeyPublishTransport.publish()` now unconditionally skips `response.body?.string()` on any 2xx and returns `bodyText = ""`. Non-2xx still reads the body for error context. The experimental gate + the `skipBodyReadOnSuccess` constructor / factory parameter is retired across `commonMain` / `androidMain` / `jvmMain` / `iosMain`. Lifecycle layer: `PreKeyApiClient.publishWithRetry` 201 branch synthesises `PublishResult.Stored(storedOpks = 0)` when `bodyText.isEmpty()`, avoiding the empty-body decode throw. Three new unit cells cover (2xx + empty body → Stored(0)), (2xx + JSON body → decode unchanged), (non-2xx → body in `Failure.serverMessage` verbatim). The `T2_PUBLISH_PHASE` trace lines are kept on debug builds (gated by `BuildConfig.RELAY_T2_DIAG_CLIENT == "1"`) as a diagnostic-tier instrument for any future similar stall.
+
+4. **Post-merge sanity smoke on Tele2 LTE — PASS.** Tecno `103603734A004351`, master `5cf18e5f`, debug APK SHA-256 `c8dff3a0fb5f48359752d905dd89508f18beced90620a6ed7a8e4876d6a16684`, fresh `pm clear phantom.android` + reinstall, Wi-Fi off, Tele2 LTE. Onboarding-driven publish on a fresh identity. Single attempt at 08:01:18.806 → 08:01:19.507 local. Timeline: `prekey_publish_start opks=40 bodyBytes=5863 attempt=1/3` (08:01:18.806) → `T2_PUBLISH_PHASE phase=call_execute_start request_id=d0859dc224eec33f elapsedMs=0` (+7 ms) → `phase=headers_received status=201 protocol=http/1.1 elapsedMs=587` (+594 ms) → `phase=body_read_skipped status=201 elapsedMs=588` (+595 ms) → `PREKEY_TRACE prekey_publish_ok status=201 elapsedMs=588 attempt=1` (+701 ms). Total wall-time **701 ms**, down from the pre-fix 186 000 ms (~265×). Counter-evidence absent: `body_read_start = 0`, `body_read_end = 0`, `body_read_threw = 0`, `JsonDecodingException = 0`, `prekey_publish_retry = 0`, `publish_fail_giving_up = 0`. Independent architect review of the same log produced the identical verdict against an independent set of grep patterns.
+
+**Verdict:** T2 carrier-ceiling prekey-publish bug **CLOSED** on field evidence. Both layers (transport unconditional skip-body on 2xx + lifecycle empty-body synthesis) confirmed working on Tele2 LTE post-merge.
+
+**Out-of-scope side-finding (not blocking T2 verdict).** The same smoke window captured a WebSocket ping timeout ~30 s after the publish completed. This is a separate Direct WSS / mobile-LTE stability class (the architectural multi-transport reliability framing of 2026-06-09 designates WS as the fast path, not the reliability backbone; long-poll + REST short-poll fallback carry delivery guarantees). It does NOT regress T2 publish and does NOT alter the T2 verdict. Captured as a future-work pointer for the Direct WSS hardening track, NOT as an open T2 follow-up.
+
+**Reliability-track posture after this close.** With T2 publish closed and Stage 2B-D Round 14 long-poll live on production relay (2026-06-16 entry above), the Reliability backbone is functionally complete for the current alpha surface. The remaining open Reliability items are Direct WSS hardening (separate track), Reality libXray Arm G (separate track), and Tor/Ghost parity (separate track) — each with their own scope-doc.
+
+**Durable trail:**
+
+- PR #323 squash `5cf18e5f` on master.
+- APK SHA-256 `c8dff3a0fb5f48359752d905dd89508f18beced90620a6ed7a8e4876d6a16684` (debug, `:apps:android:assembleDebug` against master `5cf18e5f`).
+- Logcat at `C:\temp\t2-smoke-post-323-2026-06-16\logs\tecno-post323.log` (durable on operator workstation, not in repo).
+
 ### 2026-06-16 · Stage 2B-D Tele2 LTE integration smoke PASS + PR #310 MERGED + Round 14 LIVE on production relay
 
 **Goal:** run the integration LTE smoke that gates PR #310 ready-for-review and the Stage 2B-D rollout flag flip — the same smoke the 2026-06-15 entry failed on Layer 3 with `errorClass=OpkNotFound action=fall_through_to_hold` → `fail_mac action=hold`. With Sprint 2b-A + 2b-B + 2b-C on master (PRs #315 / #316 / #317), the three-layer bundle was expected to flip Layer 3 to PASS while preserving the Layer 1 (Round 14 wire) and Layer 2 (Sprint 2a guard) PASS from the 2026-06-15 run.
