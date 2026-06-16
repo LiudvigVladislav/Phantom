@@ -106,7 +106,21 @@ expect fun createPreKeyPublishHttpClient(): HttpClient
  * Non-Android actuals (iOS, JVM) throw [NotImplementedError] because the
  * streaming bug is Android-only and iOS/desktop are not production paths.
  */
-expect fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport
+expect fun createPreKeyPublishHttpTransport(
+    /**
+     * T2 diagnostic round 2 (2026-06-16) — when `true` AND the publish
+     * response is a 2xx, the Android impl skips
+     * `response.body?.string()` and returns an empty `bodyText`.
+     * Defaults to `false` so unit tests and any non-Android consumer
+     * get unchanged read-full-body behaviour.
+     *
+     * AppContainer wires this on Android from
+     * `BuildConfig.PUBLISH_SKIP_SUCCESS_BODY_READ == "1"`. Debug
+     * default `"0"`, release pinned `"0"`, operator override via
+     * `local.properties` `publishSkipSuccessBodyRead=1`.
+     */
+    skipBodyReadOnSuccess: Boolean = false,
+): PreKeyPublishHttpTransport
 
 /**
  * Returns a [RestFallbackTransport] for the new REST short-poll fallback

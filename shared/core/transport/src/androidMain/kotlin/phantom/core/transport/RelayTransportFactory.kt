@@ -326,11 +326,27 @@ actual fun createPreKeyPublishHttpClient(): HttpClient {
  * The cost (TLS handshake per call) is acceptable: publish runs at most 3 times
  * per onboarding/rotation event, never per message.
  */
-private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTransport {
+private class AndroidNativeOkHttpPreKeyPublishTransport(
+    /**
+     * T2 diagnostic round 2 (2026-06-16) — when `true` AND the publish
+     * response is a 2xx, the body read is skipped entirely and an
+     * empty `bodyText` is returned. AppContainer wires this from
+     * `BuildConfig.PUBLISH_SKIP_SUCCESS_BODY_READ == "1"` (debug
+     * default `"0"`, release pinned `"0"`, operator override via
+     * `local.properties` `publishSkipSuccessBodyRead=1`).
+     *
+     * The transport module's `androidMain` source set cannot directly
+     * reference `phantom.android.BuildConfig` (that constant lives in
+     * the downstream `apps:android` module's generated BuildConfig),
+     * so the flag is plumbed in via this constructor parameter.
+     */
+    private val skipBodyReadOnSuccess: Boolean = false,
+) : PreKeyPublishHttpTransport {
     override suspend fun publish(
         url: String,
         bodyBytes: ByteArray,
         contentType: String,
+        requestId: String,
     ): PreKeyPublishHttpResponse = withContext(Dispatchers.IO) {
         // Fresh OkHttpClient per call — no pool state, no adapter state.
         val client = OkHttpClient.Builder()
@@ -351,8 +367,106 @@ private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTrans
             .build()
 
         val startMs = System.currentTimeMillis()
+
+        // T2 diagnostic round 2 — Item 1 phase traces (2026-06-16). The
+        // five `T2_PUBLISH_PHASE` log lines below discriminate WHERE in
+        // the OkHttp response cycle the SocketTimeoutException fires
+        // on a failing Tele2 LTE publish. The discrimination signal is
+        // whether `phase=headers_received` appears before
+        // `phase=body_read_threw` — its presence proves the response
+        // headers arrived but the body read hung (cheap fix shape);
+        // its absence proves the response never reached the client at
+        // all (compression / H2 / Caddy investigation lane).
+        //
+        // All five lines are gated on `requestId.isNotEmpty()` — the
+        // caller (`PreKeyApiClient.publishWithRetry()`) passes its
+        // 16-hex-char `t2DiagRequestId` here only when
+        // `t2DiagPublishTraceEnabled = true` (AppContainer wires that
+        // from `BuildConfig.DEBUG && BuildConfig.RELAY_T2_DIAG_CLIENT
+        // == "1"`). Release builds receive `requestId = ""` from the
+        // caller path and emit no phase trace.
+        if (requestId.isNotEmpty()) {
+            relayLog(
+                RelayLogLevel.INFO,
+                "T2_PUBLISH_PHASE phase=call_execute_start " +
+                    "request_id=$requestId elapsedMs=0",
+            )
+        }
+
+        // T2 diagnostic round 2 — Item 2 experimental skip-body-read
+        // gate (read from constructor param plumbed from AppContainer).
+        val skipBodyOnSuccess = skipBodyReadOnSuccess
+
         client.newCall(request).execute().use { response ->
-            val body = response.body?.string() ?: ""
+            // Phase 2 — headers received. This is THE discrimination
+            // signal. If this line fires on a publish that later
+            // throws SocketTimeoutException, the response object
+            // already exists with valid headers and status.
+            if (requestId.isNotEmpty()) {
+                val headersElapsed = System.currentTimeMillis() - startMs
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "T2_PUBLISH_PHASE phase=headers_received " +
+                        "request_id=$requestId " +
+                        "status=${response.code} " +
+                        "protocol=${response.protocol} " +
+                        "elapsedMs=$headersElapsed",
+                )
+            }
+
+            // Phase 3 — body read start (or skip).
+            val bodyReadStartMs = System.currentTimeMillis()
+            val body = if (skipBodyOnSuccess && response.code in 200..299) {
+                if (requestId.isNotEmpty()) {
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "T2_PUBLISH_PHASE phase=body_read_skipped " +
+                            "request_id=$requestId " +
+                            "status=${response.code} " +
+                            "elapsedMs=${bodyReadStartMs - startMs}",
+                    )
+                }
+                ""
+            } else {
+                if (requestId.isNotEmpty()) {
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "T2_PUBLISH_PHASE phase=body_read_start " +
+                            "request_id=$requestId " +
+                            "elapsedMs=${bodyReadStartMs - startMs}",
+                    )
+                }
+                // Phase 4/5 — body read end or throw. The catch is
+                // INSIDE the `.use {}` so the phase is logged BEFORE
+                // the exception escapes the block. After logging the
+                // throw, re-throw unchanged so the retry-classification
+                // logic in `PreKeyApiClient.publishWithRetry()` is
+                // preserved bit-for-bit.
+                try {
+                    val text = response.body?.string() ?: ""
+                    if (requestId.isNotEmpty()) {
+                        relayLog(
+                            RelayLogLevel.INFO,
+                            "T2_PUBLISH_PHASE phase=body_read_end " +
+                                "request_id=$requestId " +
+                                "length=${text.length} " +
+                                "elapsedMs=${System.currentTimeMillis() - startMs}",
+                        )
+                    }
+                    text
+                } catch (t: Throwable) {
+                    if (requestId.isNotEmpty()) {
+                        relayLog(
+                            RelayLogLevel.INFO,
+                            "T2_PUBLISH_PHASE phase=body_read_threw " +
+                                "request_id=$requestId " +
+                                "class=${t::class.simpleName ?: "<anon>"} " +
+                                "elapsedMs=${System.currentTimeMillis() - startMs}",
+                        )
+                    }
+                    throw t
+                }
+            }
             val elapsedMs = System.currentTimeMillis() - startMs
             PreKeyPublishHttpResponse(
                 statusCode = response.code,
@@ -371,8 +485,10 @@ private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTrans
     }
 }
 
-actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
-    AndroidNativeOkHttpPreKeyPublishTransport()
+actual fun createPreKeyPublishHttpTransport(
+    skipBodyReadOnSuccess: Boolean,
+): PreKeyPublishHttpTransport =
+    AndroidNativeOkHttpPreKeyPublishTransport(skipBodyReadOnSuccess)
 
 /**
  * Android production [RestFallbackTransport] — PR-D1.

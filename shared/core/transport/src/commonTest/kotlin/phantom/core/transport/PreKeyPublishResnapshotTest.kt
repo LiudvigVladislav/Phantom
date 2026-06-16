@@ -67,6 +67,7 @@ class PreKeyPublishResnapshotTest {
             url: String,
             bodyBytes: ByteArray,
             contentType: String,
+            requestId: String,
         ): PreKeyPublishHttpResponse {
             callCount++
             captureSink(bodyBytes.copyOf())

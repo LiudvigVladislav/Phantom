@@ -33,6 +33,16 @@ interface PreKeyPublishHttpTransport {
      * @param url          Full HTTPS URL, e.g. "https://relay.phntm.pro/prekeys/publish".
      * @param bodyBytes    UTF-8-encoded JSON payload (pre-built by caller).
      * @param contentType  MIME type; defaults to "application/json".
+     * @param requestId    T2 diagnostic round 2 (2026-06-16) — optional
+     *                     client-side correlation id for the five
+     *                     `T2_PUBLISH_PHASE` log lines emitted by the
+     *                     Android impl. Empty string disables the phase
+     *                     trace emission (production default; tests pass
+     *                     `""` unless they exercise the phase trace).
+     *                     `PreKeyApiClient.publishWithRetry()` plumbs its
+     *                     16-hex-char `t2DiagRequestId` here so the
+     *                     phase lines correlate exactly with the
+     *                     existing `T2_DIAG_PUBLISH_TRACE` lines by id.
      * @throws Throwable   Any network exception propagated as-is for the caller's
      *                     isRetryable() classification.
      */
@@ -40,6 +50,7 @@ interface PreKeyPublishHttpTransport {
         url: String,
         bodyBytes: ByteArray,
         contentType: String = "application/json",
+        requestId: String = "",
     ): PreKeyPublishHttpResponse
 }
 

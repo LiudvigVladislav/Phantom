@@ -41,12 +41,15 @@ class PreKeyPublishReliabilityTest {
         private val script: suspend (attempt: Int) -> PreKeyPublishHttpResponse,
     ) : PreKeyPublishHttpTransport {
         var callCount: Int = 0
+        var lastRequestId: String = ""
         override suspend fun publish(
             url: String,
             bodyBytes: ByteArray,
             contentType: String,
+            requestId: String,
         ): PreKeyPublishHttpResponse {
             callCount++
+            lastRequestId = requestId
             return script(callCount)
         }
     }
@@ -59,12 +62,15 @@ class PreKeyPublishReliabilityTest {
         private val script: suspend (attempt: Int) -> PreKeyPublishHttpResponse,
     ) : PreKeyPublishHttpTransport {
         var callCount: Int = 0
+        var lastRequestId: String = ""
         override suspend fun publish(
             url: String,
             bodyBytes: ByteArray,
             contentType: String,
+            requestId: String,
         ): PreKeyPublishHttpResponse {
             callCount++
+            lastRequestId = requestId
             return script(callCount) // script may throw
         }
     }
@@ -135,6 +141,72 @@ class PreKeyPublishReliabilityTest {
         assertTrue(result is PublishResult.Stored)
         assertEquals(5, (result as PublishResult.Stored).storedOpks)
         assertEquals(1, transport.callCount)
+    }
+
+    @Test
+    fun publishBundle_plumbs_t2DiagRequestId_through_to_transport_when_trace_enabled() = runTest {
+        // T2 diagnostic round 2 (2026-06-16) — verify the `requestId`
+        // generated inside `publishWithRetry` is plumbed through to
+        // the `PreKeyPublishHttpTransport.publish(requestId = …)`
+        // call, so the Android impl's five `T2_PUBLISH_PHASE` log
+        // lines can correlate with `T2_DIAG_PUBLISH_TRACE` lines by
+        // exact id (not by timestamp).
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(
+                statusCode = 201,
+                bodyText = """{"stored_opks": 5}""",
+                elapsedMs = 1L,
+                protocol = "h2",
+            )
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+            t2DiagPublishTraceEnabled = true,
+        )
+
+        val result = api.publishBundle { sampleRequest() }
+
+        assertTrue(result is PublishResult.Stored)
+        assertEquals(5, (result as PublishResult.Stored).storedOpks)
+        // The id format is 16 hex chars (epoch-ms low 32 + Random low
+        // 32). Concrete value is non-deterministic; assert the SHAPE.
+        assertEquals(
+            16, transport.lastRequestId.length,
+            "T2 diag request_id MUST be 16 hex chars when t2DiagPublishTraceEnabled = true; got '${transport.lastRequestId}'",
+        )
+        assertTrue(
+            transport.lastRequestId.all { it.isDigit() || it in 'a'..'f' },
+            "T2 diag request_id MUST be lowercase hex; got '${transport.lastRequestId}'",
+        )
+    }
+
+    @Test
+    fun publishBundle_plumbs_empty_t2DiagRequestId_when_trace_disabled() = runTest {
+        // Inverse contract: with the gate off, the transport receives
+        // an empty string for `requestId` and emits no phase trace.
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(
+                statusCode = 201,
+                bodyText = """{"stored_opks": 3}""",
+                elapsedMs = 1L,
+            )
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+            // t2DiagPublishTraceEnabled omitted — default false.
+        )
+
+        val result = api.publishBundle { sampleRequest() }
+
+        assertTrue(result is PublishResult.Stored)
+        assertEquals(
+            "", transport.lastRequestId,
+            "T2 diag request_id MUST be empty when t2DiagPublishTraceEnabled = false (default); got '${transport.lastRequestId}'",
+        )
     }
 
     @Test
