@@ -481,7 +481,11 @@ The canonical funding-channel list lives in [](../../funding.json) at the reposi
 
 > Обновляется по мере прогресса. Когда задача меняется — менять этот блок и резерв-помечать в треках выше.
 
-**Текущий фокус (2026-06-10):** Trek 2 Stage 2B-A client long-poll shell — implementation PR pending against the scope merged in PR #304 (master `9c02a3c8`). Stage 1.x server prerequisite SHIPPED on the same day in PR #303 (master `e3794e6e`), so the server contract the shell types itself against is live on master. Strategic order locked: backbone (Stage 2B-A → Stage 2B-B) first → Direct WSS hardening → Reality Android repair → Tor/Ghost polish.
+**Текущий фокус (2026-06-16):** ⚡ Reliability backbone функционально complete для текущего alpha surface. Stage 2B-D Tele2 LTE integration smoke PASS + Round 14 paced padded poll LIVE on production relay (PR #310 squash `345d9761`, VPS deploy ~14:59 UTC) + `LONGPOLL_V2_ENABLED` release pin flipped `"0"` → `"1"` (PR #320 squash `a213b3ab`) → user-visible Stage 2B-D rollout active. Sprint 2b OPK lifecycle closed end-to-end (Sprint 2b-A `30617121` publish-snapshot consistency + 2b-B `b40c2908` storage + ADR-029 + 2b-C `7e421728` runtime promotion). **T2 carrier-ceiling prekey-publish bug CLOSED on Tele2 LTE field evidence (PR #323 squash `5cf18e5f` + post-merge sanity smoke).** Strategic order from 2026-06-10 still binding for remaining Reliability items: Direct WSS hardening → Reality Android repair → Tor/Ghost polish.
+
+**Next-track decision pending.** Per `project_next_tracks_priorities_2026_06_16`: (1) production observation period sanity (Vladislav-led VPS), (2) Direct WSS hardening (the WS ping timeout side-finding from the T2 post-#323 smoke points at this), (3) Reality libXray Arm G (RC-LIBXRAY-REALITY-WIRE1 sub-track scoped but not started), (4) Tor/Ghost parity, (5) Calls (WebRTC+TURN+long-poll fallback). Auto-pickup OFF — Vladislav explicitly triggers next track.
+
+**Activity on 2026-06-15 → 2026-06-16:** Sprint 2a (PR #311 `df34222d`) + Sprint 2b-A/B/C (#315 / #316 / #317) + M-OPK-3 docs amendment (#318) + Round 14 (#310) + Stage 2B-D rollout flag flip (#320) + T2 instrumentation (#321 / #322) + T2 fix (#323).
 
 **Activity on 2026-06-09 → 2026-06-10:**
 
