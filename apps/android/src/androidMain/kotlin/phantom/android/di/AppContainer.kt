@@ -1087,6 +1087,21 @@ class AppContainer(private val context: Context) {
             httpClient = restHttpClient,
             relayBaseUrl = relayHttpBase,
             publishTransport = createPreKeyPublishHttpTransport(),
+            // T2 carrier-ceiling instrumentation client-side gate
+            // (2026-06-16 Option A Item 3). `true` only when BOTH
+            // `BuildConfig.DEBUG == true` AND
+            // `BuildConfig.RELAY_T2_DIAG_CLIENT == "1"`. Release
+            // builds satisfy neither half (DEBUG false, the field
+            // pinned to "0"), so production APKs see `false` and
+            // emit zero T2 trace overhead. Debug builds default to
+            // `true` so an operator pulling logs from a debug APK
+            // captures the trace automatically; the
+            // `local.properties` `relayT2DiagClient=0` (or env
+            // `RELAY_T2_DIAG_CLIENT=0`) override forces it off on a
+            // debug build for trace-volume bisects.
+            t2DiagPublishTraceEnabled =
+                phantom.android.BuildConfig.DEBUG &&
+                    phantom.android.BuildConfig.RELAY_T2_DIAG_CLIENT == "1",
         )
 
         // PR-D1b (2026-05-16): construct the REST fallback orchestrator using

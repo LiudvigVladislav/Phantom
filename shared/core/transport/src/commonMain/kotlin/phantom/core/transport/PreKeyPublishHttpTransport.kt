@@ -54,4 +54,23 @@ data class PreKeyPublishHttpResponse(
     val bodyText: String,
     /** Wall-clock elapsed time for this single HTTP round-trip, in milliseconds. */
     val elapsedMs: Long,
+    /**
+     * Negotiated HTTP protocol on this call's wire — `"http/1.1"`,
+     * `"h2"`, `"h2_prior_knowledge"`, `"h3"`, `"spdy/3.1"`, or
+     * implementation-specific strings. Null when the platform
+     * implementation cannot expose the value (e.g. JVM stub) or when
+     * the response object never carried protocol metadata.
+     *
+     * T2 carrier-ceiling instrumentation (2026-06-16 Option A Item 3):
+     * the orchestrator distinguishes HTTP/1.1 + HTTP/2 (over TCP, both
+     * subject to the carrier byte-budget mechanism) from HTTP/3 (over
+     * QUIC/UDP, not subject to the TCP byte-budget). If field stalls
+     * turn out to come exclusively from H1.1/H2 connections, the fix
+     * shape changes — HTTP/3 negotiation may be the cheap fix.
+     *
+     * Production callers emit this field into trace lines ONLY when the
+     * client-side T2 diag gate is on (see [PreKeyApiClient]'s
+     * `t2DiagPublishTraceEnabled` flag).
+     */
+    val protocol: String? = null,
 )

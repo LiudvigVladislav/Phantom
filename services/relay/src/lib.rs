@@ -19,3 +19,4 @@ pub mod rest_fallback;
 pub mod routes;
 pub mod seq_mac;
 pub mod state;
+pub mod t2_diag;
