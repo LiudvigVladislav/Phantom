@@ -63,6 +63,35 @@ pub struct RelayConfig {
     /// that kill WS control-plane Ping/Pong on the target carrier.
     pub heartbeat_echo_enabled: bool,
 
+    // ── Arm D re-validation diagnostic (RC-DIRECT-STABILITY1 2026-06-18) ──
+
+    /// When `true`, the relay emits an INFO-level `ws_text_frame_received`
+    /// log line for every WS Text frame received, **before** any prefix
+    /// check fires, and promotes the existing `heartbeat_echo_received`,
+    /// `heartbeat_echo_sent`, `heartbeat_echo_rejected` debug lines to
+    /// INFO so they survive the default `phantom_relay=info` log filter.
+    ///
+    /// Closes the Ruflo-flagged Arm D evidentiary gap (2026-06-18): the
+    /// original Arm D 2026-06-04 run recorded "0 heartbeat_echo_received"
+    /// — but that line is a `tracing::debug!` and is invisible at the
+    /// production log level. The flag makes Text-frame receipt visible
+    /// at the same log level as `ws_protocol_ping_received` so an
+    /// operator can answer the binary question "did any Text frame reach
+    /// the relay" purely from `RUST_LOG=phantom_relay=info` output.
+    ///
+    /// Set by env var `RELAY_DIAG_WS_TEXT_TRACE=1` exactly; any other
+    /// value (including `"true"`, `"yes"`, empty, unset) fails closed.
+    /// Independent of `RELAY_ENABLE_HEARTBEAT_ECHO`: the echo handler
+    /// remains controlled by that flag; this flag only controls log
+    /// verbosity. No payload bytes are logged — only `text_len`,
+    /// `prefix_match`, `oversized` booleans. No behaviour change.
+    ///
+    /// Cleanup: this flag is diagnostic-only and should be turned off on
+    /// the production VPS once the Arm D re-run completes. The log line
+    /// itself adds a small but real per-frame cost; do NOT leave it on
+    /// indefinitely.
+    pub diag_ws_text_trace_enabled: bool,
+
     // ── T2 slow-POST diagnostic (RC-DIRECT-STABILITY1 §10) ────────────────────
 
     /// When `true`, the relay exposes `POST /diag/slow-post` for the T2
@@ -231,6 +260,11 @@ impl RelayConfig {
             // exercise the echo handler construct a config with this flipped
             // to `true` rather than relying on the surrounding env.
             heartbeat_echo_enabled: false,
+            // Arm D re-validation WS Text trace off in tests by default;
+            // tests that exercise the diagnostic emit path construct a
+            // config with this flipped to `true` rather than relying on
+            // the surrounding env.
+            diag_ws_text_trace_enabled: false,
             // T2 slow-POST diagnostic is off in tests by default; tests that
             // exercise the handler construct a config with this flipped to
             // `true` rather than relying on the surrounding env.
@@ -308,6 +342,13 @@ impl RelayConfig {
             // closed. A typo like `=true` therefore silently keeps the
             // diagnostic disabled — explicit activation is required.
             heartbeat_echo_enabled: std::env::var("RELAY_ENABLE_HEARTBEAT_ECHO")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+            // Arm D re-validation diagnostic: strict `"1"` parse, fails
+            // closed on any other value. Mirrors `heartbeat_echo_enabled`
+            // gate pattern. Independent of the echo handler gate — this
+            // controls only log-line verbosity, never behaviour.
+            diag_ws_text_trace_enabled: std::env::var("RELAY_DIAG_WS_TEXT_TRACE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
             // T2 slow-POST diagnostic: strict `"1"` parse, fails closed on
@@ -476,6 +517,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("max_media_bytes", &self.max_media_bytes)
             .field("media_ttl_secs", &self.media_ttl_secs)
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
+            .field("diag_ws_text_trace_enabled", &self.diag_ws_text_trace_enabled)
             .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)
             .field("t2_diag_enabled", &self.t2_diag_enabled)
             .field("poll_chunked_flush", &self.poll_chunked_flush)

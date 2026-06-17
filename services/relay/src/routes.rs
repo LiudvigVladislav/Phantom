@@ -513,6 +513,36 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                         // client heartbeat path).
                         inbound_frames += 1;
                         last_inbound_at_ms = now_ms();
+                        // RC-DIRECT-STABILITY1 Arm D re-validation (2026-06-18).
+                        // Closes the Ruflo-flagged Arm D evidentiary gap:
+                        // the original 2026-06-04 run recorded
+                        // "0 heartbeat_echo_received" but that line is a
+                        // `tracing::debug!` and is invisible at the
+                        // default `phantom_relay=info` log filter. We
+                        // cannot conclude the Text frame failed to reach
+                        // the relay; we can only conclude the operator
+                        // could not see the debug line.
+                        //
+                        // When `RELAY_DIAG_WS_TEXT_TRACE=1` is set on the
+                        // VPS, emit an INFO line for EVERY Text frame
+                        // received, BEFORE any prefix check fires, so an
+                        // operator running production-default log level
+                        // can answer the binary question "did any Text
+                        // frame reach the relay" without redeploying with
+                        // RUST_LOG=debug. No payload bytes are logged —
+                        // only `text_len`, `prefix_match`, `oversized`
+                        // booleans. No behaviour change vs disabled.
+                        if state.config.diag_ws_text_trace_enabled {
+                            let raw_view = text.as_str();
+                            tracing::info!(
+                                event        = "ws_text_frame_received",
+                                conn_id      = conn_id,
+                                key          = %&identity[..identity.len().min(16)],
+                                text_len     = raw_view.len() as u64,
+                                prefix_match = raw_view.starts_with(HEARTBEAT_ECHO_PREFIX),
+                                oversized    = raw_view.len() > HEARTBEAT_ECHO_MAX_LEN,
+                            );
+                        }
                         // PR-F2-relay (2026-05-12): fast-path application-level
                         // ping. Send pong directly back on THIS socket — mirror
                         // what the WS-protocol Message::Ping handler below does
@@ -620,13 +650,28 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                             match build_heartbeat_echo_response(raw) {
                                 Some((parsed, response_msg)) => {
                                     echo_frames_received += 1;
-                                    tracing::debug!(
-                                        conn_id     = conn_id,
-                                        seq         = parsed.seq,
-                                        client_ms   = parsed.client_ms,
-                                        payload_len = raw.len(),
-                                        "heartbeat_echo_received"
-                                    );
+                                    // RC-DIRECT-STABILITY1 Arm D re-validation
+                                    // (2026-06-18): promote debug→info under
+                                    // `RELAY_DIAG_WS_TEXT_TRACE=1` so the
+                                    // operator running production-default log
+                                    // level sees per-frame receipt confirmation.
+                                    if state.config.diag_ws_text_trace_enabled {
+                                        tracing::info!(
+                                            conn_id     = conn_id,
+                                            seq         = parsed.seq,
+                                            client_ms   = parsed.client_ms,
+                                            payload_len = raw.len(),
+                                            "heartbeat_echo_received"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            conn_id     = conn_id,
+                                            seq         = parsed.seq,
+                                            client_ms   = parsed.client_ms,
+                                            payload_len = raw.len(),
+                                            "heartbeat_echo_received"
+                                        );
+                                    }
                                     if let Err(e) = socket.send(response_msg).await {
                                         close_origin = "error";
                                         close_error_str =
@@ -639,18 +684,34 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                                         break;
                                     }
                                     echo_frames_sent += 1;
-                                    tracing::debug!(
-                                        conn_id = conn_id,
-                                        seq     = parsed.seq,
-                                        "heartbeat_echo_sent"
-                                    );
+                                    if state.config.diag_ws_text_trace_enabled {
+                                        tracing::info!(
+                                            conn_id = conn_id,
+                                            seq     = parsed.seq,
+                                            "heartbeat_echo_sent"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            conn_id = conn_id,
+                                            seq     = parsed.seq,
+                                            "heartbeat_echo_sent"
+                                        );
+                                    }
                                 }
                                 None => {
-                                    tracing::debug!(
-                                        conn_id     = conn_id,
-                                        payload_len = raw.len(),
-                                        "heartbeat_echo_rejected (malformed or oversize)"
-                                    );
+                                    if state.config.diag_ws_text_trace_enabled {
+                                        tracing::info!(
+                                            conn_id     = conn_id,
+                                            payload_len = raw.len(),
+                                            "heartbeat_echo_rejected (malformed or oversize)"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            conn_id     = conn_id,
+                                            payload_len = raw.len(),
+                                            "heartbeat_echo_rejected (malformed or oversize)"
+                                        );
+                                    }
                                 }
                             }
                         } else {
