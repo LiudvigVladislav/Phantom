@@ -90,6 +90,7 @@ async fn main() {
     // signal that the diagnostic handler is live.
     tracing::info!(
         heartbeat_echo_enabled = cfg.heartbeat_echo_enabled,
+        diag_ws_text_trace_enabled = cfg.diag_ws_text_trace_enabled,
         slow_post_diag_enabled = cfg.slow_post_diag_enabled,
         t2_diag_enabled = cfg.t2_diag_enabled,
         poll_chunked_flush = cfg.poll_chunked_flush,
