@@ -177,6 +177,20 @@ class RestFallbackOrchestrator(
      * may remain in this file after Stage 2B-B.
      */
     private val csprng: Csprng = LibsodiumCsprng,
+    /**
+     * 3.6 Fast REST degradation gate (2026-06-18). Pass-through to the
+     * [RestStateMachine] constructor — see the field doc on
+     * `RestStateMachine.mode2FastPathEnabled` for the full mechanism.
+     *
+     * Wired through from `phantom.android.di.AppContainer` based on
+     * `BuildConfig.MODE_2_FAST_PATH_ENABLED == "1"` (no
+     * `BuildConfig.DEBUG` conjunction). The release-side `"0"` literal
+     * pin in `apps/android/build.gradle.kts` is the SOLE production-side
+     * guard — production stays off until a separate named PR flips the
+     * release literal from `"0"` to `"1"`. Default `false` keeps
+     * existing callers and tests source-compatible.
+     */
+    private val mode2FastPathEnabled: Boolean = false,
 ) {
 
     /**
@@ -219,6 +233,7 @@ class RestFallbackOrchestrator(
         log = log,
         onModeSwitched = onModeSwitched,
         onRestPollDegraded = onRestPollDegraded,
+        mode2FastPathEnabled = mode2FastPathEnabled,
     )
 
     /** Convenience flow proxying [stateMachine.state]. */

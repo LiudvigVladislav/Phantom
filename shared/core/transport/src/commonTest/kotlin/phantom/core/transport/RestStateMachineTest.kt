@@ -346,4 +346,259 @@ class RestStateMachineTest {
             "Expected transition sequence not observed; got: $seen",
         )
     }
+
+    // ── 3.6 Fast REST degradation (2026-06-18) ────────────────────────────
+    //
+    // Mode-2 signature = inboundFrames == 0 AND okhttpPingTimeoutDetected
+    // AND durationMs in MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS.
+    //
+    // - Boundary cases pin the duration window: 24_999 misses, 25_000 hits,
+    //   65_000 hits, 65_001 misses; plus ping-flag-false and
+    //   inboundFrames-positive cases.
+    // - Behavioural cases pin the actuation flag semantics + telemetry +
+    //   WsCandidate regression interaction + Mode-1 protection + flag-off
+    //   pendingAcks > 0 path + exact telemetry format.
+    //
+    // The mapper that lifts `WsSessionEndedEvent` →
+    // `RestStateMachine.Event.WsSessionEnded` lives in `androidMain`
+    // (file-level `internal fun` in `HybridRelayTransport.kt`) and is
+    // unit-tested in `androidUnitTest` against the propagation invariant
+    // — keeping the mapper test next to the only caller keeps visibility
+    // tight and avoids exposing the mapper publicly from `commonMain`.
+
+    private fun mode2Event(
+        durationMs: Long = 31_000L,
+        inboundFrames: Int = 0,
+        pendingAcksAtClose: Int = 0,
+        okhttpPingTimeoutDetected: Boolean = true,
+    ): RestStateMachine.Event.WsSessionEnded =
+        RestStateMachine.Event.WsSessionEnded(
+            durationMs = durationMs,
+            inboundFrames = inboundFrames,
+            pendingAcksAtClose = pendingAcksAtClose,
+            okhttpPingTimeoutDetected = okhttpPingTimeoutDetected,
+        )
+
+    private fun buildWithFastPath(
+        clock: FakeClock = FakeClock(),
+        mode2FastPathEnabled: Boolean = true,
+        logSink: MutableList<String> = mutableListOf(),
+    ): RestStateMachine = RestStateMachine(
+        now = { clock.nowMs },
+        log = { logSink.add(it) },
+        mode2FastPathEnabled = mode2FastPathEnabled,
+    )
+
+    // ── Boundary tests (6) ───────────────────────────────────────────────
+
+    @Test
+    fun mode2_signature_misses_just_below_min_duration() {
+        val sm = buildWithFastPath()
+        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MIN_DURATION_MS - 1))
+        assertEquals(
+            RestMode.WsActive, sm.current,
+            "24_999 ms is one below the lower bound — must NOT fast-path",
+        )
+    }
+
+    @Test
+    fun mode2_signature_matches_at_exact_min_duration() {
+        val sm = buildWithFastPath()
+        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MIN_DURATION_MS))
+        assertEquals(
+            RestMode.RestActive, sm.current,
+            "25_000 ms is inclusive of the lower bound — must fast-path",
+        )
+    }
+
+    @Test
+    fun mode2_signature_matches_at_exact_max_duration() {
+        val sm = buildWithFastPath()
+        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MAX_DURATION_MS))
+        assertEquals(
+            RestMode.RestActive, sm.current,
+            "65_000 ms is inclusive of the upper bound — must fast-path",
+        )
+    }
+
+    @Test
+    fun mode2_signature_misses_just_above_max_duration() {
+        val sm = buildWithFastPath()
+        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MAX_DURATION_MS + 1))
+        assertEquals(
+            RestMode.WsActive, sm.current,
+            "65_001 ms is one above the upper bound — must NOT fast-path",
+        )
+    }
+
+    @Test
+    fun mode2_signature_misses_when_ping_timeout_flag_false() {
+        val sm = buildWithFastPath()
+        sm.onEvent(mode2Event(okhttpPingTimeoutDetected = false))
+        assertEquals(
+            RestMode.WsActive, sm.current,
+            "absent ping-timeout signal MUST NOT fast-path even if other " +
+                "conditions match — would over-trip on server-initiated " +
+                "closes and auth failures",
+        )
+    }
+
+    @Test
+    fun mode2_signature_misses_when_inbound_frames_positive() {
+        val sm = buildWithFastPath()
+        sm.onEvent(mode2Event(inboundFrames = 1))
+        assertEquals(
+            RestMode.WsActive, sm.current,
+            "any positive inboundFrames is a healthy session signal — " +
+                "must NOT fast-path",
+        )
+    }
+
+    // ── Behavioural tests (8) ────────────────────────────────────────────
+
+    @Test
+    fun mode2_first_match_with_flag_on_triggers_fast_path() {
+        val logs = mutableListOf<String>()
+        val sm = buildWithFastPath(logSink = logs)
+        sm.onEvent(mode2Event())
+        assertEquals(RestMode.RestActive, sm.current)
+        assertTrue(
+            logs.any { it.contains("mode_switched") && it.contains("mode_2_fast_path") },
+            "mode_switched line must carry the mode_2_fast_path reason; logs=$logs",
+        )
+    }
+
+    @Test
+    fun mode2_first_match_with_flag_off_increments_idle_counter() {
+        val sm = buildWithFastPath(mode2FastPathEnabled = false)
+        // Matched-signature event with idle classification (pending == 0).
+        sm.onEvent(mode2Event())
+        assertEquals(
+            RestMode.WsActive, sm.current,
+            "with flag off, single matched event must NOT transition — " +
+                "must fall through to existing IDLE_FAIL_THRESHOLD counter",
+        )
+        // Two more idle fails complete the existing 3-cycle threshold.
+        sm.onEvent(idleFail())
+        sm.onEvent(idleFail())
+        assertEquals(
+            RestMode.RestActive, sm.current,
+            "existing IDLE_FAIL_THRESHOLD = 3 path must still work with " +
+                "flag off",
+        )
+    }
+
+    @Test
+    fun mode2_telemetry_fires_with_action_fast_path_when_flag_on() {
+        val logs = mutableListOf<String>()
+        val sm = buildWithFastPath(logSink = logs)
+        sm.onEvent(mode2Event())
+        assertTrue(
+            logs.any {
+                it.contains("mode_2_signature_matched") && it.contains("action=fast_path")
+            },
+            "matched-signature telemetry must label action=fast_path when " +
+                "flag is on; logs=$logs",
+        )
+    }
+
+    @Test
+    fun mode2_telemetry_fires_with_action_observe_only_when_flag_off() {
+        val logs = mutableListOf<String>()
+        val sm = buildWithFastPath(mode2FastPathEnabled = false, logSink = logs)
+        sm.onEvent(mode2Event())
+        assertTrue(
+            logs.any {
+                it.contains("mode_2_signature_matched") && it.contains("action=observe_only")
+            },
+            "matched-signature telemetry must label action=observe_only " +
+                "when flag is off; logs=$logs",
+        )
+    }
+
+    @Test
+    fun mode2_does_not_affect_ws_candidate_regression_path() {
+        val clock = FakeClock()
+        val sm = buildWithFastPath(clock = clock)
+        // Drive to RestActive via existing 3-idle threshold (NOT fast-path
+        // — use plain idleFail() with okhttpPingTimeoutDetected=false so
+        // signature does NOT match).
+        sm.onEvent(idleFail())
+        sm.onEvent(idleFail())
+        sm.onEvent(idleFail())
+        assertEquals(RestMode.RestActive, sm.current)
+        // RestActive → WsCandidate via Frame.Text.
+        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        assertEquals(RestMode.WsCandidate, sm.current)
+        // WsCandidate close (regardless of Mode-2 signature) → RestActive
+        // via existing regression path; fast-path never executes from
+        // WsCandidate state.
+        sm.onEvent(mode2Event())
+        assertEquals(
+            RestMode.RestActive, sm.current,
+            "WsCandidate regression path must still hit transitionToRest " +
+                "with reason=candidate_session_regression regardless of " +
+                "Mode-2 signature",
+        )
+    }
+
+    @Test
+    fun mode1_like_healthy_close_does_not_trigger_fast_path() {
+        val sm = buildWithFastPath()
+        // Mode-1 8-pong rhythm: lifetime > 65_000 ms, inboundFrames > 0.
+        sm.onEvent(
+            RestStateMachine.Event.WsSessionEnded(
+                durationMs = 150_000L,
+                inboundFrames = 5,
+                pendingAcksAtClose = 0,
+                okhttpPingTimeoutDetected = true, // even with the flag set
+            )
+        )
+        assertEquals(
+            RestMode.WsActive, sm.current,
+            "Mode-1 healthy 8-pong rhythm MUST NOT trip fast-path; field " +
+                "FAIL on this case would mean Mode-1 protection is broken",
+        )
+    }
+
+    @Test
+    fun mode2_flag_off_with_pending_acks_increments_active_counter() {
+        val sm = buildWithFastPath(mode2FastPathEnabled = false)
+        // Matched-signature event BUT `pendingAcksAtClose > 0` — the
+        // existing code classifies this as an ACTIVE fail, not idle.
+        // With the fast-path gate OFF, the state machine must still
+        // honour the existing ACTIVE_FAIL_THRESHOLD = 2 path.
+        sm.onEvent(mode2Event(pendingAcksAtClose = 1))
+        assertEquals(
+            RestMode.WsActive, sm.current,
+            "one active fail must not transition under existing threshold",
+        )
+        sm.onEvent(mode2Event(pendingAcksAtClose = 1))
+        assertEquals(
+            RestMode.RestActive, sm.current,
+            "with flag off, ACTIVE_FAIL_THRESHOLD = 2 path must still work " +
+                "after a matched-signature event with pending acks > 0",
+        )
+    }
+
+    @Test
+    fun mode2_matched_signature_telemetry_format_is_locked() {
+        val logs = mutableListOf<String>()
+        val sm = buildWithFastPath(logSink = logs)
+        sm.onEvent(
+            mode2Event(
+                durationMs = 42_000L,
+                inboundFrames = 0,
+                pendingAcksAtClose = 3,
+            )
+        )
+        val matchedLine = logs.firstOrNull { it.contains("mode_2_signature_matched") }
+        assertEquals(
+            "REST_TRACE mode_2_signature_matched action=fast_path " +
+                "duration_ms=42000 inbound_frames=0 pending_acks=3",
+            matchedLine,
+            "matched-signature telemetry format MUST be exact for grep-based " +
+                "post-mortem analysis; format change requires architect review",
+        )
+    }
 }

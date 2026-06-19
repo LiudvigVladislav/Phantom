@@ -532,6 +532,42 @@ android {
                 "\"$relayT2DiagClient\"",
             )
 
+            // 3.6 Fast REST degradation (2026-06-18). When set to "1",
+            // `AppContainer` reads `BuildConfig.MODE_2_FAST_PATH_ENABLED`
+            // directly (no `BuildConfig.DEBUG` conjunction) and passes
+            // `mode2FastPathEnabled=true` to `RestFallbackOrchestrator`,
+            // which in turn passes it to `RestStateMachine`. The state
+            // machine then bypasses the existing 2/3-cycle counter
+            // wait and transitions to `RestMode.RestActive` on the
+            // FIRST `Event.WsSessionEnded` matching the Mode-2
+            // signature (zero inbound frames + parser-confirmed
+            // OkHttp ping watchdog + duration inside the locked
+            // 25 000-65 000 ms window). Detection latency on Tele2
+            // LTE drops from ~93 s to ~30 s.
+            //
+            // Matched-signature telemetry (`REST_TRACE
+            // mode_2_signature_matched action=...`) fires regardless
+            // of this flag — operator can observe Mode-2 frequency on
+            // builds where actuation is off.
+            //
+            // Default `"0"` on debug — opt-in via
+            // `local.properties` `fastRestMode2=1` or env
+            // `MODE_2_FAST_PATH_ENABLED=1`. Release builds pin to
+            // literal `"0"` below; that literal IS the rollout
+            // contract (no `BuildConfig.DEBUG` conjunction in
+            // AppContainer's setter), so promotion to production
+            // default is one-line: flip the release literal to `"1"`.
+            val fastRestMode2 = localOrEnv(
+                "fastRestMode2",
+                "MODE_2_FAST_PATH_ENABLED",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "MODE_2_FAST_PATH_ENABLED",
+                "\"$fastRestMode2\"",
+            )
+
         }
         release {
             isMinifyEnabled = true
@@ -685,6 +721,18 @@ android {
             // same OQ7 + OQ11 idiom as `LONGPOLL_V2_ENABLED` and
             // `POLL_SKIP_LP_AND_PP`.
             buildConfigField("String", "RELAY_T2_DIAG_CLIENT", "\"0\"")
+
+            // 3.6 Fast REST degradation (2026-06-18). Release builds
+            // pin the gate to literal "0" as the SOLE production-side
+            // mechanism for keeping actuation off. AppContainer reads
+            // `BuildConfig.MODE_2_FAST_PATH_ENABLED` directly without
+            // a `BuildConfig.DEBUG` conjunction — so a future named
+            // PR can promote actuation by changing ONLY this line to
+            // `"1"` and shipping the release build. If the runtime
+            // gate had `BuildConfig.DEBUG &&` in it, the flip would
+            // be permanently ineffective. The literal here is the
+            // load-bearing rollout knob.
+            buildConfigField("String", "MODE_2_FAST_PATH_ENABLED", "\"0\"")
 
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by

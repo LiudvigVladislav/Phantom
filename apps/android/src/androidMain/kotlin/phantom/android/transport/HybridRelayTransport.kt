@@ -31,6 +31,7 @@ import phantom.core.transport.SendOutcome
 import phantom.core.transport.TransportKind
 import phantom.core.transport.TransportState
 import phantom.core.transport.WsDegradationDetector
+import phantom.core.transport.WsSessionEndedEvent
 
 /**
  * PR-D1b (2026-05-16): wraps the existing [KtorRelayTransport] (WS path)
@@ -128,6 +129,34 @@ import phantom.core.transport.WsDegradationDetector
  * [send] that sees the new mode is guaranteed to see the migration in
  * flight and suspend on [awaitPendingMigrationIfNeeded].
  */
+
+/**
+ * 3.6 Fast REST degradation mapper (2026-06-18). Lifts a transport-layer
+ * [WsSessionEndedEvent] into the state-machine-facing
+ * [RestStateMachine.Event.WsSessionEnded], preserving the
+ * `okhttpPingTimeoutDetected` flag that the Mode-2 signature depends on.
+ *
+ * Lives here as a file-level `internal` extension because both source
+ * types are part of `commonMain`, but exposing the mapper publicly from
+ * `commonMain` would widen the API surface of the shared transport
+ * module for a function whose only caller is this single Android
+ * collector. Keeping it `internal` to `apps:android` confines the API
+ * surface to the call site that actually needs it.
+ *
+ * Unit-tested in `apps/android/src/androidUnitTest/.../HybridRelayTransportMapperTest.kt`
+ * for the propagation invariant: `okhttpPingTimeoutDetected` (true and
+ * false), `durationMs`, `inboundFrames`, `pendingAcksAtClose` all
+ * survive the boundary unchanged. Adding additional fields to either
+ * side requires updating this mapper; the test then proves they survive.
+ */
+internal fun WsSessionEndedEvent.toRestStateMachineEvent(): RestStateMachine.Event.WsSessionEnded =
+    RestStateMachine.Event.WsSessionEnded(
+        durationMs = durationMs,
+        inboundFrames = inboundFrames,
+        pendingAcksAtClose = pendingAcksAtClose,
+        okhttpPingTimeoutDetected = okhttpPingTimeoutDetected,
+    )
+
 class HybridRelayTransport(
     private val wsTransport: KtorRelayTransport,
     private val orchestrator: RestFallbackOrchestrator,
@@ -427,13 +456,15 @@ class HybridRelayTransport(
         scope.launch {
             wsTransport.wsSessionEnded.collect { event ->
                 if (restCapabilityActive) {
-                    submitStateEvent(
-                        RestStateMachine.Event.WsSessionEnded(
-                            durationMs = event.durationMs,
-                            inboundFrames = event.inboundFrames,
-                            pendingAcksAtClose = event.pendingAcksAtClose,
-                        )
-                    )
+                    // 3.6 Fast REST degradation (2026-06-18). Use the
+                    // production mapper instead of inline construction
+                    // so the `okhttpPingTimeoutDetected` boolean (added
+                    // to `RestStateMachine.Event.WsSessionEnded` for
+                    // the Mode-2 signature) survives the boundary. The
+                    // mapper is unit-tested in androidUnitTest
+                    // (`HybridRelayTransportMapperTest.kt`) against the
+                    // exact propagation invariant.
+                    submitStateEvent(event.toRestStateMachineEvent())
                 } else {
                     maybeRetryBootstrap()
                 }

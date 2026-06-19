@@ -83,6 +83,32 @@ class RestStateMachine(
      * for backward compatibility with existing tests.
      */
     private val onRestPollDegraded: ((BreakerOpenReason) -> Unit)? = null,
+    /**
+     * 3.6 Fast REST degradation gate (2026-06-18). When `true`, the
+     * first [Event.WsSessionEnded] in [RestMode.WsActive] that matches
+     * the Mode-2 signature (`inboundFrames == 0` AND
+     * `okhttpPingTimeoutDetected == true` AND
+     * `durationMs in MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS`)
+     * transitions straight to [RestMode.RestActive] via the
+     * `mode_2_fast_path` reason — skipping the
+     * [ACTIVE_FAIL_THRESHOLD] / [IDLE_FAIL_THRESHOLD] counters.
+     *
+     * Detection latency drops from ~93 s (3 × ~31 s sessions under the
+     * existing idle counter) to ~30 s (one matching session lifetime +
+     * sub-second event handling). When `false`, the existing counter
+     * logic remains the only RestActive promotion path.
+     *
+     * The matched-signature telemetry line fires regardless of this
+     * gate (action=fast_path vs action=observe_only) so a production
+     * post-mortem can count how often Mode-2 fires even on builds where
+     * we choose not to act on it.
+     *
+     * Default `false` for backwards compatibility with existing tests
+     * and for production safety. Wired through
+     * [phantom.core.transport.RestFallbackOrchestrator] from
+     * `BuildConfig.MODE_2_FAST_PATH_ENABLED` in `AppContainer`.
+     */
+    private val mode2FastPathEnabled: Boolean = false,
 ) {
     private val _state = MutableStateFlow<RestMode>(RestMode.WsActive)
     val state: StateFlow<RestMode> = _state.asStateFlow()
@@ -139,6 +165,44 @@ class RestStateMachine(
     private fun onWsSessionEnded(event: Event.WsSessionEnded) {
         when (_state.value) {
             RestMode.WsActive -> {
+                // 3.6 Fast REST degradation (2026-06-18). Check the Mode-2
+                // signature BEFORE the existing counter logic. Three
+                // conditions joined by AND:
+                //   1. zero inbound Text frames during the session (idle
+                //      death, not a healthy close)
+                //   2. parser-confirmed OkHttp WS-Ping watchdog fired
+                //      (rules out server-initiated close, auth failure,
+                //      manual disconnect)
+                //   3. session duration inside the locked Mode-2 window
+                //      ([MODE_2_MIN_DURATION_MS]..[MODE_2_MAX_DURATION_MS]
+                //      inclusive) — rules out very-short failures AND
+                //      healthy Mode-1 8-pong rhythm at 120-170 s
+                //
+                // The matched-signature telemetry line ALWAYS fires when
+                // the signature matches, regardless of whether the gate
+                // is on. This lets a post-mortem count how often Mode-2
+                // fires on production even on builds where we choose not
+                // to actuate. `action=fast_path` ⇒ flag on,
+                // `action=observe_only` ⇒ flag off.
+                val signatureMatches = event.inboundFrames == 0 &&
+                    event.okhttpPingTimeoutDetected &&
+                    event.durationMs in MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS
+                if (signatureMatches) {
+                    val action = if (mode2FastPathEnabled) "fast_path" else "observe_only"
+                    log(
+                        "REST_TRACE mode_2_signature_matched action=$action " +
+                            "duration_ms=${event.durationMs} " +
+                            "inbound_frames=${event.inboundFrames} " +
+                            "pending_acks=${event.pendingAcksAtClose}",
+                    )
+                    if (mode2FastPathEnabled) {
+                        transitionToRest("mode_2_fast_path")
+                        return
+                    }
+                    // Flag off — fall through to existing counter logic
+                    // so the build with telemetry-only observation does
+                    // not silently lose the close event's counter tick.
+                }
                 if (event.inboundFrames > 0) {
                     // Healthy session despite close — reset both counters.
                     if (activeFailCount > 0 || idleFailCount > 0) {
@@ -326,6 +390,24 @@ class RestStateMachine(
             val durationMs: Long,
             val inboundFrames: Int,
             val pendingAcksAtClose: Int,
+            /**
+             * 3.6 Fast REST degradation (2026-06-18). When `true`, the WS
+             * session ended via OkHttp WS-Ping watchdog (parser-confirmed
+             * "after N successful ping/pongs" pattern in the throwable
+             * message). Required field of the Mode-2 signature alongside
+             * `inboundFrames == 0` and a duration in
+             * [MODE_2_MIN_DURATION_MS]..[MODE_2_MAX_DURATION_MS].
+             *
+             * Default `false` keeps prior callers and tests source-compatible.
+             * The production producer in `HybridRelayTransport` propagates
+             * the value from
+             * `phantom.core.transport.WsSessionEndedEvent.okhttpPingTimeoutDetected`
+             * via a file-level `internal` extension mapper in
+             * `HybridRelayTransport.kt` (`androidMain`) — that mapper is
+             * unit-tested in `androidUnitTest` against the exact
+             * propagation invariant.
+             */
+            val okhttpPingTimeoutDetected: Boolean = false,
         ) : Event()
 
         /**
@@ -439,6 +521,33 @@ class RestStateMachine(
          * single Frame.Text is not enough to commit.
          */
         const val CANDIDATE_COMMIT_MS: Long = 60_000L
+
+        /**
+         * 3.6 Fast REST degradation (2026-06-18) — lower bound of the
+         * Mode-2 signature duration window. Sessions ending below this
+         * floor are short failures (TLS handshake fail, immediate carrier
+         * NACK, etc.) and do NOT match the signature.
+         *
+         * 25 000 ms is comfortably below the dominant Mode-2 death point
+         * on Tele2 LTE (~31 s = `2 × pingInterval(15s) + ~1 s overhead`)
+         * to absorb minor jitter while excluding pre-Ping failures.
+         */
+        const val MODE_2_MIN_DURATION_MS: Long = 25_000L
+
+        /**
+         * 3.6 Fast REST degradation (2026-06-18) — upper bound of the
+         * Mode-2 signature duration window. Sessions ending above this
+         * ceiling are healthy Mode-1 rhythm (120-170 s on Wi-Fi per
+         * `project_arm_c_lifetime_linear_in_interval_2026_06_04`) and
+         * MUST NOT trip the fast-path.
+         *
+         * 65 000 ms is just above the warm-window Mode-2 death point
+         * (~61 s = `4 × pingInterval(15s) + ~1 s overhead` per pool
+         * isolation canary v2 distribution) so warm-window Mode-2
+         * sessions are still caught. The Mode-1 8-pong rhythm has a
+         * floor of 120 s; 65 000 ms is safely below it.
+         */
+        const val MODE_2_MAX_DURATION_MS: Long = 65_000L
     }
 }
 
