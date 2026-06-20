@@ -275,6 +275,7 @@ class RestFallbackOrchestratorPollLoopTest {
                     durationMs = 1000L,
                     inboundFrames = 0,
                     pendingAcksAtClose = 1,
+                    sessionEpoch = 0L,
                 ),
             )
         }

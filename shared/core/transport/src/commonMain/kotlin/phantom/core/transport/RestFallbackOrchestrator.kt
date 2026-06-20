@@ -191,6 +191,17 @@ class RestFallbackOrchestrator(
      * existing callers and tests source-compatible.
      */
     private val mode2FastPathEnabled: Boolean = false,
+    /**
+     * R3.6 Sticky-per-route Fast REST degradation gate (2026-06-20).
+     * Pass-through to [RestStateMachine]. When `true`, a Mode-2 fast-path
+     * transition arms a sticky REST window; only `ws_alive_60s` on a new
+     * WS session after a route change clears it.
+     *
+     * Build-time invariant: requires [mode2FastPathEnabled] to also be `true`
+     * (enforced in [RestStateMachine.init]). Wired through from `AppContainer`
+     * based on `BuildConfig.MODE_2_STICKY_ENABLED == "1"`. Default `false`.
+     */
+    private val mode2StickyEnabled: Boolean = false,
 ) {
 
     /**
@@ -234,6 +245,7 @@ class RestFallbackOrchestrator(
         onModeSwitched = onModeSwitched,
         onRestPollDegraded = onRestPollDegraded,
         mode2FastPathEnabled = mode2FastPathEnabled,
+        mode2StickyEnabled = mode2StickyEnabled,
     )
 
     /** Convenience flow proxying [stateMachine.state]. */

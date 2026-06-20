@@ -32,6 +32,8 @@ import phantom.core.transport.TransportKind
 import phantom.core.transport.TransportState
 import phantom.core.transport.WsDegradationDetector
 import phantom.core.transport.WsSessionEndedEvent
+import phantom.core.transport.WsSessionLifecycleEvent
+import phantom.core.transport.epochOrUnknown
 
 /**
  * PR-D1b (2026-05-16): wraps the existing [KtorRelayTransport] (WS path)
@@ -87,8 +89,8 @@ import phantom.core.transport.WsSessionEndedEvent
  *
  * **State-machine feeds** wired by [startWsCollectors] (always) and
  * [startRestCollectors] (only after a successful bootstrap):
- * - `wsTransport.wsSessionEnded` → [RestStateMachine.Event.WsSessionEnded]
- *   (REST-only — drives WsCandidate → RestActive degrade).
+ * - `wsTransport.wsSessionLifecycle` → [RestStateMachine.Event.WsSessionConnected] /
+ *   [RestStateMachine.Event.WsSessionEnded] (single ordered lifecycle stream).
  * - every `wsTransport.incoming` emission → forward to `_incoming`
  *   (ALWAYS), and if REST is up, also `WsFrameTextReceived`.
  * - every `wsTransport.acks` emission → forward acks via Flow chain
@@ -131,23 +133,51 @@ import phantom.core.transport.WsSessionEndedEvent
  */
 
 /**
- * 3.6 Fast REST degradation mapper (2026-06-18). Lifts a transport-layer
- * [WsSessionEndedEvent] into the state-machine-facing
- * [RestStateMachine.Event.WsSessionEnded], preserving the
- * `okhttpPingTimeoutDetected` flag that the Mode-2 signature depends on.
+ * R3.6 (2026-06-20): mapper from the ordered lifecycle stream event
+ * [WsSessionLifecycleEvent.Ended] to the state-machine-facing
+ * [RestStateMachine.Event.WsSessionEnded].
  *
- * Lives here as a file-level `internal` extension because both source
- * types are part of `commonMain`, but exposing the mapper publicly from
- * `commonMain` would widen the API surface of the shared transport
- * module for a function whose only caller is this single Android
- * collector. Keeping it `internal` to `apps:android` confines the API
- * surface to the call site that actually needs it.
+ * Carries all legacy fields PLUS [WsSessionLifecycleEvent.Ended.sessionEpoch]
+ * so the sticky-recovery epoch filter in [RestStateMachine.onWsSessionEnded]
+ * can distinguish the active recovery candidate's close from stale closes of
+ * older sessions.
  *
  * Unit-tested in `apps/android/src/androidUnitTest/.../HybridRelayTransportMapperTest.kt`
- * for the propagation invariant: `okhttpPingTimeoutDetected` (true and
- * false), `durationMs`, `inboundFrames`, `pendingAcksAtClose` all
- * survive the boundary unchanged. Adding additional fields to either
- * side requires updating this mapper; the test then proves they survive.
+ * (L8/L9 cases): `sessionEpoch`, `okhttpPingTimeoutDetected`, `durationMs`,
+ * `inboundFrames`, `pendingAcksAtClose` all survive the boundary unchanged.
+ */
+internal fun WsSessionLifecycleEvent.Ended.toRestStateMachineEvent(): RestStateMachine.Event.WsSessionEnded =
+    RestStateMachine.Event.WsSessionEnded(
+        durationMs = durationMs,
+        inboundFrames = inboundFrames,
+        pendingAcksAtClose = pendingAcksAtClose,
+        okhttpPingTimeoutDetected = okhttpPingTimeoutDetected,
+        sessionEpoch = sessionEpoch,
+    )
+
+/**
+ * Legacy mapper kept for [WsDegradationCollectorBindings] compatibility.
+ * The degradation detector still takes [WsSessionEndedEvent] parameters
+ * directly; the lifecycle channel's [WsSessionLifecycleEvent.Ended] is
+ * converted here for the collector's telemetry path.
+ */
+internal fun WsSessionLifecycleEvent.Ended.toLegacyEndedEvent(): WsSessionEndedEvent =
+    WsSessionEndedEvent(
+        durationMs = durationMs,
+        inboundFrames = inboundFrames,
+        pendingAcksAtClose = pendingAcksAtClose,
+        closeOrigin = closeOrigin,
+        closeError = closeError,
+        okhttpPingTimeoutDetected = okhttpPingTimeoutDetected,
+    )
+
+/**
+ * Legacy compatibility: kept so the existing [WsDegradationCollectorBindingsTest]
+ * call sites (which use [WsSessionEndedEvent] directly) continue to compile.
+ * The production [HybridRelayTransport] collector now consumes [WsSessionLifecycleEvent]
+ * from the ordered channel and uses [WsSessionLifecycleEvent.Ended.toRestStateMachineEvent].
+ *
+ * @deprecated Prefer [WsSessionLifecycleEvent.Ended.toRestStateMachineEvent].
  */
 internal fun WsSessionEndedEvent.toRestStateMachineEvent(): RestStateMachine.Event.WsSessionEnded =
     RestStateMachine.Event.WsSessionEnded(
@@ -155,6 +185,9 @@ internal fun WsSessionEndedEvent.toRestStateMachineEvent(): RestStateMachine.Eve
         inboundFrames = inboundFrames,
         pendingAcksAtClose = pendingAcksAtClose,
         okhttpPingTimeoutDetected = okhttpPingTimeoutDetected,
+        // Legacy path has no epoch — use sentinel -1L which never matches a live
+        // recoveryWsEpoch (valid epochs start at 1).
+        sessionEpoch = -1L,
     )
 
 class HybridRelayTransport(
@@ -165,11 +198,11 @@ class HybridRelayTransport(
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     // PR-WS-HEALTH-STATE1 Commit 3.2a (2026-06-01): telemetry-only WS
     // degradation detector. Nullable so existing JVM/commonTest
-    // constructions stay backward-compatible. When non-null, the three
-    // WS event collectors below feed [WsDegradationDetector] AFTER
-    // their existing [submitStateEvent] call per design note §8 step 4.
+    // constructions stay backward-compatible. When non-null, the WS
+    // lifecycle collector below feeds [WsDegradationDetector] AFTER
+    // its [submitStateEvent] call per design note §8 step 4.
     //
-    // The `wsSessionEnded` collector ALWAYS emits the mandatory
+    // The lifecycle dispatcher's `Ended` branch ALWAYS feeds the
     // `WS_DEGRADED_TELEMETRY session_total` line per close, regardless
     // of [restCapabilityActive], so the denominator for calibration
     // ratios is honest from cold start (per design note rev2 P2-3).
@@ -242,7 +275,7 @@ class HybridRelayTransport(
 
     /**
      * PR-WS-HEALTH-STATE1 Commit 3.2a (architect P2-1, 2026-06-01): the
-     * three WS event collectors below ([wsSessionEnded] /
+     * three WS event collectors below ([wsSessionLifecycle] /
      * [outboundAckDeadlineExpired] / [inboundStalled]) each run in their
      * own `scope.launch` on [appScope] (`Dispatchers.Default`). The
      * detector is documented as "not thread-safe" — it owns a mutable
@@ -295,7 +328,6 @@ class HybridRelayTransport(
      * can avoid starting duplicates. WS-passthrough collectors are started
      * once at [bootstrapAndStart] entry and never replaced.
      */
-    private var wsSessionEndedJob: Job? = null
     private var wsFramesStateJob: Job? = null
     private var wsAcksStateJob: Job? = null
     private var restInboundJob: Job? = null
@@ -449,43 +481,22 @@ class HybridRelayTransport(
                 )
             }
         }
-        // wsSessionEnded drives BOTH (a) the state machine when REST is
-        // active and (b) the bootstrap-retry loop when REST is not. Wire it
-        // here so the retry mechanism works even if the very first
-        // bootstrap returned capability=false.
+        // R3.6 (2026-06-20): single ordered lifecycle collector backed by a
+        // Channel.UNLIMITED stream so Connected and Ended events are delivered in
+        // strict emission order with no loss (Channel.UNLIMITED + check isSuccess).
+        //
+        // The dispatch body is extracted to [dispatchWsSessionLifecycleEvent] (internal)
+        // so unit tests can drive it directly without needing to stand up a full
+        // coroutine / Flow pipeline.
+        //
+        // IMPL-LOCK #3: all three side effects preserved in [dispatchWsSessionLifecycleEvent].
+        // IMPL-LOCK #4: continue-on-error policy is inside the extracted helper.
         scope.launch {
-            wsTransport.wsSessionEnded.collect { event ->
-                if (restCapabilityActive) {
-                    // 3.6 Fast REST degradation (2026-06-18). Use the
-                    // production mapper instead of inline construction
-                    // so the `okhttpPingTimeoutDetected` boolean (added
-                    // to `RestStateMachine.Event.WsSessionEnded` for
-                    // the Mode-2 signature) survives the boundary. The
-                    // mapper is unit-tested in androidUnitTest
-                    // (`HybridRelayTransportMapperTest.kt`) against the
-                    // exact propagation invariant.
-                    submitStateEvent(event.toRestStateMachineEvent())
-                } else {
-                    maybeRetryBootstrap()
-                }
-                // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only. Always
-                // emits the mandatory `session_total` line so calibration
-                // has the denominator (sessions-without-trigger). The
-                // `record/emit` path is gated on `okhttpPingTimeoutDetected`
-                // — only true ping-timeout closes contribute to the
-                // sliding-window detector, per design note §5 event mapping.
-                wsDegradationDetector?.let { det ->
-                    wsDegradationMutex.withLock {
-                        feedDegradationDetectorOnWsSessionEnded(
-                            detector = det,
-                            event = event,
-                            currentKind = degradationCurrentKindProvider(),
-                        )
-                    }
-                }
+            wsTransport.wsSessionLifecycle.collect { event ->
+                dispatchWsSessionLifecycleEvent(event)
             }
         }
-        // PR-D1d: per-envelope ACK deadline. Parallel to wsSessionEnded.
+        // PR-D1d: per-envelope ACK deadline. Parallel to the lifecycle collector.
         // Fires when a sent envelope is not acknowledged by the relay within
         // 10 s, triggering an immediate WS_ACTIVE → REST_ACTIVE switch on
         // the first bad send — without waiting for two full session deaths as
@@ -553,7 +564,7 @@ class HybridRelayTransport(
                     //
                     // Now: when inbound stalls without REST capability,
                     // trigger maybeRetryBootstrap() — the same recovery
-                    // path the wsSessionEnded branch uses. Rate-limited
+                    // path the lifecycle dispatcher's Ended branch uses. Rate-limited
                     // inside maybeRetryBootstrap via
                     // BOOTSTRAP_RETRY_MIN_INTERVAL_MS so a chronically-
                     // silent socket doesn't hammer /auth/session.
@@ -582,6 +593,45 @@ class HybridRelayTransport(
                 }
             }
         }
+    }
+
+    /**
+     * R3.6 (2026-06-20) IMPL-LOCK #3 + #4: top-level [WsSessionLifecycleDispatcher]
+     * constructed once and reused for every event. Lazily initialised so
+     * `this` is fully constructed before any reference to private members
+     * is captured into the dispatcher's lambdas.
+     *
+     * Production calls go through `dispatchWsSessionLifecycleEvent`; unit
+     * tests construct a fresh [WsSessionLifecycleDispatcher] directly with
+     * mock callbacks so the exact same dispatch logic is exercised in
+     * tests as in production — no when-arms reimplemented in test code.
+     */
+    private val lifecycleDispatcher: WsSessionLifecycleDispatcher by lazy {
+        WsSessionLifecycleDispatcher(
+            submitStateEvent = { event -> submitStateEvent(event) },
+            maybeRetryBootstrap = { maybeRetryBootstrap() },
+            feedDegradationDetector = { legacyEvent ->
+                wsDegradationDetector?.let { det ->
+                    wsDegradationMutex.withLock {
+                        feedDegradationDetectorOnWsSessionEnded(
+                            detector = det,
+                            event = legacyEvent,
+                            currentKind = degradationCurrentKindProvider(),
+                        )
+                    }
+                }
+            },
+            errorLogger = { msg -> Log.e(TAG, msg) },
+            restCapabilityActiveProvider = { restCapabilityActive },
+        )
+    }
+
+    /**
+     * `internal` visibility so the single collector at [activateRestCollectors]
+     * and unit tests can drive the dispatcher through the same surface.
+     */
+    internal suspend fun dispatchWsSessionLifecycleEvent(event: WsSessionLifecycleEvent) {
+        lifecycleDispatcher.dispatch(event)
     }
 
     /**
@@ -723,29 +773,23 @@ class HybridRelayTransport(
      * PR-LTE-NETCHANGE1 (2026-05-28): NARROW public entry-point for
      * submitting `Event.NetworkChanged` into the REST state machine.
      *
-     * **Deliberately scoped to one line.** Per the mini-lock and the
-     * external transport architect's 2026-05-28 ownership guardrail,
-     * `HybridRelayTransport` does NOT own the network-change rewalk
-     * (clear preferences, `disconnect()`, `transportManager.release()`,
-     * restart connect generation). Those four actions live in
-     * `TransportRewalkCoordinator` because that is where the
-     * lifecycle / preferences / TransportManager references already
-     * sit (`HybridRelayTransport.kt` has zero references to either —
-     * verified grep, 2026-05-28).
+     * R3.6 (2026-06-20): signature extended with [clearsMode2Sticky] so
+     * [TransportRewalkCoordinator] can propagate whether this network change
+     * should lift a sticky REST window into recovery mode. `true` for
+     * genuine route changes (Wi-Fi ↔ cellular, VPN, network gained/lost);
+     * `false` for VALIDATED_CHANGED which is not a true route change
+     * (sticky_kept in state machine).
      *
-     * This method only forwards the event to the state machine so it
-     * can run its existing `NetworkChanged` transition path (reset
-     * counters per `RestStateMachine.kt:32`, transition to
-     * `RestMode.WsCandidate` if currently `RestActive` per :37).
+     * **Deliberately scoped.** [HybridRelayTransport] does NOT own the rewalk
+     * (clear preferences, `disconnect()`, `transportManager.release()`, restart).
+     * Those live in [TransportRewalkCoordinator]. This method only forwards
+     * the event so the state machine can run its existing NetworkChanged logic.
      *
-     * Short-circuits on `restCapabilityActive=false` like the rest of
-     * the `submitStateEvent` family — when REST is not active, the
-     * state-machine reaction would be a no-op anyway, and the
-     * coordinator's other reset steps still run from outside this
-     * method.
+     * Short-circuits on `restCapabilityActive=false` like the rest of the
+     * `submitStateEvent` family.
      */
-    suspend fun submitNetworkChangedEvent() {
-        submitStateEvent(RestStateMachine.Event.NetworkChanged)
+    suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
+        submitStateEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = clearsMode2Sticky))
     }
 
     /**

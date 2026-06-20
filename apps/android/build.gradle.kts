@@ -568,6 +568,21 @@ android {
                 "\"$fastRestMode2\"",
             )
 
+            // R3.6 Sticky-per-route Fast REST degradation (2026-06-20).
+            // Opt-in via `-PmodeSticky=1` (local.properties) or env MODE_2_STICKY_ENABLED=1.
+            // Default "0" on debug. Release builds pin to literal "0" below.
+            // Requires MODE_2_FAST_PATH_ENABLED="1" (build-time invariant in RestStateMachine).
+            val modeSticky = localOrEnv(
+                "modeSticky",
+                "MODE_2_STICKY_ENABLED",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "MODE_2_STICKY_ENABLED",
+                "\"$modeSticky\"",
+            )
+
         }
         release {
             isMinifyEnabled = true
@@ -733,6 +748,12 @@ android {
             // be permanently ineffective. The literal here is the
             // load-bearing rollout knob.
             buildConfigField("String", "MODE_2_FAST_PATH_ENABLED", "\"0\"")
+
+            // R3.6 Sticky-per-route Fast REST degradation (2026-06-20).
+            // Release builds ALWAYS pin to literal "0". Promotion is a
+            // deliberate one-line flip in a separate named PR after smoke PASS.
+            // Requires MODE_2_FAST_PATH_ENABLED="1" (build-time invariant).
+            buildConfigField("String", "MODE_2_STICKY_ENABLED", "\"0\"")
 
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by

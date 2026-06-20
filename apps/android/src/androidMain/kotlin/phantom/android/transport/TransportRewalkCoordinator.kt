@@ -188,7 +188,9 @@ internal class TransportRewalkCoordinator(
             // off, so this is safe before bootstrap has succeeded.
             val hybrid = hybridTransportProvider()
             if (hybrid != null) {
-                runCatching { hybrid.submitNetworkChangedEvent() }
+                // R3.6: pass clearsMode2Sticky so the state machine knows whether
+                // this route change should lift the sticky REST window into recovery.
+                runCatching { hybrid.submitNetworkChangedEvent(clearsMode2Sticky = reason.clearsMode2Sticky) }
                     .onFailure { e ->
                         Log.w(
                             TAG,
@@ -285,6 +287,19 @@ internal enum class NetworkChangeReason {
     // re-introduce the destructive cold-start rewalk that the architect
     // caught in PR #241 review.
 }
+
+/**
+ * R3.6 (2026-06-20): whether this network-change reason represents a genuine
+ * route change that should lift a sticky REST window into recovery mode.
+ *
+ * `true` for all reasons that indicate the IP path or carrier has genuinely
+ * changed (Wi-Fi ↔ cellular, VPN toggled, network gained/lost, other).
+ * `false` for [NetworkChangeReason.VALIDATED_CHANGED] only — the validated-
+ * capability flip is an in-path quality signal, NOT a route change; the sticky
+ * window should remain armed until a real route change arrives.
+ */
+internal val NetworkChangeReason.clearsMode2Sticky: Boolean
+    get() = this != NetworkChangeReason.VALIDATED_CHANGED
 
 /**
  * Snapshot of the meaningful network state at the moment the observer's
