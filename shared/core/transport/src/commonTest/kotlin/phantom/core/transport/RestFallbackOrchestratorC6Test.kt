@@ -103,6 +103,7 @@ class RestFallbackOrchestratorC6Test {
                 orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                        sessionEpoch = 0L,
                     ),
                 )
             }
@@ -523,6 +524,7 @@ class RestFallbackOrchestratorC6Test {
                 orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                        sessionEpoch = 0L,
                     ),
                 )
             }

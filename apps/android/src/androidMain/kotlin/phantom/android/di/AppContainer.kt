@@ -1334,6 +1334,26 @@ class AppContainer(private val context: Context) {
                     }
                 },
                 s6DebugTriggerEnabled = s6DebugEnabled,
+                // 3.6 Fast REST degradation (2026-06-18). Gate reads
+                // BuildConfig.MODE_2_FAST_PATH_ENABLED directly — NO
+                // `BuildConfig.DEBUG` conjunction. The rollout contract
+                // is: release builds pin the field to literal "0" via
+                // the release block; a separate named PR flips that
+                // pin to "1" to enable production-default actuation.
+                // Adding `BuildConfig.DEBUG` here would make that flip
+                // permanently ineffective because release builds would
+                // still gate at the DEBUG=false half. Operator opt-in
+                // on debug is via `-PfastRestMode2=1` which sets the
+                // debug-block resolved value to "1".
+                mode2FastPathEnabled =
+                    phantom.android.BuildConfig.MODE_2_FAST_PATH_ENABLED == "1",
+                // R3.6 Sticky-per-route Fast REST degradation (2026-06-20).
+                // Gate reads BuildConfig.MODE_2_STICKY_ENABLED directly — NO
+                // BuildConfig.DEBUG conjunction (same rollout model as MODE_2_FAST_PATH_ENABLED).
+                // Release builds pin to literal "0"; a separate named PR flips to "1".
+                // Build-time invariant: requires MODE_2_FAST_PATH_ENABLED == "1".
+                mode2StickyEnabled =
+                    phantom.android.BuildConfig.MODE_2_STICKY_ENABLED == "1",
             )
             // Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence)
             // — wire the freshly-constructed orchestrator into the

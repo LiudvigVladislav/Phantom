@@ -83,6 +83,47 @@ class RestStateMachine(
      * for backward compatibility with existing tests.
      */
     private val onRestPollDegraded: ((BreakerOpenReason) -> Unit)? = null,
+    /**
+     * 3.6 Fast REST degradation gate (2026-06-18). When `true`, the
+     * first [Event.WsSessionEnded] in [RestMode.WsActive] that matches
+     * the Mode-2 signature (`inboundFrames == 0` AND
+     * `okhttpPingTimeoutDetected == true` AND
+     * `durationMs in MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS`)
+     * transitions straight to [RestMode.RestActive] via the
+     * `mode_2_fast_path` reason — skipping the
+     * [ACTIVE_FAIL_THRESHOLD] / [IDLE_FAIL_THRESHOLD] counters.
+     *
+     * Detection latency drops from ~93 s (3 × ~31 s sessions under the
+     * existing idle counter) to ~30 s (one matching session lifetime +
+     * sub-second event handling). When `false`, the existing counter
+     * logic remains the only RestActive promotion path.
+     *
+     * The matched-signature telemetry line fires regardless of this
+     * gate (action=fast_path vs action=observe_only) so a production
+     * post-mortem can count how often Mode-2 fires even on builds where
+     * we choose not to act on it.
+     *
+     * Default `false` for backwards compatibility with existing tests
+     * and for production safety. Wired through
+     * [phantom.core.transport.RestFallbackOrchestrator] from
+     * `BuildConfig.MODE_2_FAST_PATH_ENABLED` in `AppContainer`.
+     */
+    private val mode2FastPathEnabled: Boolean = false,
+    /**
+     * R3.6 Sticky-per-route Fast REST degradation (2026-06-20). When `true`,
+     * a Mode-2 fast-path transition arms a sticky REST window that suppresses
+     * any [Event.WsFrameTextReceived]-driven exit from [RestMode.RestActive]
+     * until the WS layer proves recovery via `ws_alive_60s` on a brand-new
+     * session after a route change that sets [Event.NetworkChanged.clearsMode2Sticky].
+     *
+     * Build-time invariant: `mode2StickyEnabled` requires `mode2FastPathEnabled`.
+     * Enforced in `init { require(...) }`.
+     *
+     * Default `false` for backward compatibility with existing tests and for
+     * production safety. Wired through [RestFallbackOrchestrator] from
+     * `BuildConfig.MODE_2_STICKY_ENABLED` in `AppContainer`.
+     */
+    private val mode2StickyEnabled: Boolean = false,
 ) {
     private val _state = MutableStateFlow<RestMode>(RestMode.WsActive)
     val state: StateFlow<RestMode> = _state.asStateFlow()
@@ -96,6 +137,56 @@ class RestStateMachine(
     private var idleFailCount: Int = 0
     private var candidateEnteredAtMs: Long? = null
 
+    // ── R3.6 Sticky-recovery fields ─────────────────────────────────────────
+
+    /**
+     * R3.6 (2026-06-20): monotonic floor for session epoch observations.
+     * Updated on every observed [Event.WsSessionConnected], regardless of
+     * [stickyRecovery] state. Defends against delayed stale `Connected(N)`
+     * events with `N <= lastObservedEpoch` being processed out of order.
+     * Initial value -1L because valid epochs start at 1 (incremented from 0
+     * before first use in `wsSessionEpoch`).
+     */
+    private var lastObservedEpoch: Long = -1L
+
+    /**
+     * R3.6: tracks the recovery lifecycle state for the sticky REST window.
+     * Set to [StickyRecoveryState.PendingNewSession] by [armSticky] when a
+     * Mode-2 fast-path fires and [mode2StickyEnabled] is true.
+     */
+    private var stickyRecovery: StickyRecoveryState = StickyRecoveryState.None
+
+    /** R3.6: epoch of the WS session currently serving as the recovery candidate. */
+    private var recoveryWsEpoch: Long = -1L
+
+    /** R3.6: wall-clock ms at which the current recovery attempt started. */
+    private var recoveryStartedAtMs: Long = 0L
+
+    /** R3.6: true while sticky REST suppression is active (mode2StickyEnabled && was armed). */
+    private var mode2StickyRestActive: Boolean = false
+
+    /** R3.6: wall-clock ms at which [armSticky] last fired. */
+    private var stickyArmedAtMs: Long = 0L
+
+    /** R3.6: monotonically increasing generation counter; incremented each time [armSticky] fires. */
+    private var stickyGen: Int = 0
+
+    /** R3.6: whether the first suppressed frame-text log for this gen has been emitted. */
+    private var stickyFrameSuppressedLogged: Boolean = false
+
+    /** R3.6: count of frame-text suppression events in this gen. */
+    private var stickySuppressedCount: Int = 0
+
+    /** R3.6: sticky-recovery lifecycle states. */
+    private enum class StickyRecoveryState { None, PendingNewSession, InFlight }
+
+    init {
+        // R3.6 build-time invariant: sticky requires fast-path to be enabled.
+        require(!(mode2StickyEnabled && !mode2FastPathEnabled)) {
+            "MODE_2_STICKY_ENABLED requires MODE_2_FAST_PATH_ENABLED"
+        }
+    }
+
     /**
      * Submit an [Event] to the state machine. Idempotent w.r.t. duplicate
      * events: e.g. multiple [Event.WsFrameTextReceived] in [RestMode.RestActive]
@@ -104,9 +195,10 @@ class RestStateMachine(
      */
     fun onEvent(event: Event) {
         when (event) {
+            is Event.WsSessionConnected -> onWsSessionConnected(event)
             is Event.WsSessionEnded -> onWsSessionEnded(event)
             is Event.WsFrameTextReceived -> onWsFrameText()
-            is Event.NetworkChanged -> onNetworkChanged()
+            is Event.NetworkChanged -> onNetworkChanged(event)
             is Event.WsOutboundAckReceived -> onWsOutboundAck()
             is Event.WsAliveTickElapsed -> onAliveTick()
             is Event.ActiveOutboundAckTimeout -> onActiveOutboundAckTimeout(event)
@@ -136,9 +228,94 @@ class RestStateMachine(
         onRestPollDegraded?.invoke(event.reason)
     }
 
+    /**
+     * R3.6: handle a new WS session coming online. Updates [lastObservedEpoch] as a
+     * monotonic floor, then — if [mode2StickyEnabled] and we are in
+     * [StickyRecoveryState.PendingNewSession] — opens an InFlight probation window.
+     */
+    private fun onWsSessionConnected(event: Event.WsSessionConnected) {
+        if (event.sessionEpoch <= lastObservedEpoch) {
+            log(
+                "REST_TRACE sticky_recovery_stale_connect_ignored " +
+                    "gen=$stickyGen last_observed_epoch=$lastObservedEpoch " +
+                    "event_epoch=${event.sessionEpoch}"
+            )
+            return
+        }
+        lastObservedEpoch = event.sessionEpoch
+
+        when (stickyRecovery) {
+            StickyRecoveryState.None -> return
+            StickyRecoveryState.PendingNewSession -> {
+                stickyRecovery = StickyRecoveryState.InFlight
+                recoveryWsEpoch = event.sessionEpoch
+                recoveryStartedAtMs = now()
+                candidateEnteredAtMs = now()
+                transitionToCandidate("ws_recovery_probation")
+                log(
+                    "REST_TRACE sticky_recovery_started gen=$stickyGen " +
+                        "reason=new_ws_session ws_epoch=${event.sessionEpoch}"
+                )
+            }
+            StickyRecoveryState.InFlight -> {
+                log(
+                    "REST_TRACE sticky_recovery_restarted gen=$stickyGen " +
+                        "reason=new_ws_session_during_recovery " +
+                        "old_epoch=$recoveryWsEpoch new_epoch=${event.sessionEpoch}"
+                )
+                recoveryWsEpoch = event.sessionEpoch
+                recoveryStartedAtMs = now()
+                candidateEnteredAtMs = now()
+            }
+        }
+    }
+
     private fun onWsSessionEnded(event: Event.WsSessionEnded) {
         when (_state.value) {
             RestMode.WsActive -> {
+                // 3.6 Fast REST degradation (2026-06-18). Check the Mode-2
+                // signature BEFORE the existing counter logic. Three
+                // conditions joined by AND:
+                //   1. zero inbound Text frames during the session (idle
+                //      death, not a healthy close)
+                //   2. parser-confirmed OkHttp WS-Ping watchdog fired
+                //      (rules out server-initiated close, auth failure,
+                //      manual disconnect)
+                //   3. session duration inside the locked Mode-2 window
+                //      ([MODE_2_MIN_DURATION_MS]..[MODE_2_MAX_DURATION_MS]
+                //      inclusive) — rules out very-short failures AND
+                //      healthy Mode-1 8-pong rhythm at 120-170 s
+                //
+                // The matched-signature telemetry line ALWAYS fires when
+                // the signature matches, regardless of whether the gate
+                // is on. This lets a post-mortem count how often Mode-2
+                // fires on production even on builds where we choose not
+                // to actuate. `action=fast_path` ⇒ flag on,
+                // `action=observe_only` ⇒ flag off.
+                val signatureMatches = event.inboundFrames == 0 &&
+                    event.okhttpPingTimeoutDetected &&
+                    event.durationMs in MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS
+                if (signatureMatches) {
+                    val action = if (mode2FastPathEnabled) "fast_path" else "observe_only"
+                    log(
+                        "REST_TRACE mode_2_signature_matched action=$action " +
+                            "duration_ms=${event.durationMs} " +
+                            "inbound_frames=${event.inboundFrames} " +
+                            "pending_acks=${event.pendingAcksAtClose}",
+                    )
+                    if (mode2FastPathEnabled) {
+                        transitionToRest("mode_2_fast_path")
+                        // R3.6: arm sticky AFTER the transition so the state is
+                        // already RestActive when armSticky fires.
+                        if (mode2StickyEnabled) {
+                            armSticky()
+                        }
+                        return
+                    }
+                    // Flag off — fall through to existing counter logic
+                    // so the build with telemetry-only observation does
+                    // not silently lose the close event's counter tick.
+                }
                 if (event.inboundFrames > 0) {
                     // Healthy session despite close — reset both counters.
                     if (activeFailCount > 0 || idleFailCount > 0) {
@@ -173,7 +350,33 @@ class RestStateMachine(
                 }
             }
             RestMode.WsCandidate -> {
-                // Regression: a candidate session closed before we could commit
+                // R3.6: during sticky InFlight recovery, check the epoch so a stale
+                // close from the OLD session (which preceded the recovery candidate)
+                // does not falsely fail the recovery.
+                if (mode2StickyEnabled && stickyRecovery == StickyRecoveryState.InFlight) {
+                    if (event.sessionEpoch != recoveryWsEpoch) {
+                        // Stale close from a session that is no longer the recovery candidate.
+                        log(
+                            "REST_TRACE sticky_recovery_stale_close_ignored " +
+                                "gen=$stickyGen recovery_epoch=$recoveryWsEpoch " +
+                                "event_epoch=${event.sessionEpoch}"
+                        )
+                        return
+                    }
+                    // The recovery candidate itself died — sticky stays armed.
+                    val elapsedMs = now() - recoveryStartedAtMs
+                    log(
+                        "REST_TRACE sticky_recovery_failed gen=$stickyGen " +
+                            "reason=candidate_session_regression " +
+                            "ws_epoch=${event.sessionEpoch} " +
+                            "elapsed_ms_since_recovery=$elapsedMs"
+                    )
+                    stickyRecovery = StickyRecoveryState.None
+                    recoveryWsEpoch = -1L
+                    transitionToRest("candidate_session_regression")
+                    return
+                }
+                // Non-sticky regression: a candidate session closed before we could commit
                 // back to WsActive. Drop back to RestActive and reset counters
                 // so the next round of WS sessions starts fresh.
                 transitionToRest("candidate_session_regression")
@@ -188,13 +391,29 @@ class RestStateMachine(
 
     private fun onWsFrameText() {
         if (_state.value == RestMode.RestActive) {
+            // R3.6: while sticky is armed AND we are in RestActive, suppress the
+            // frame-text-received upgrade signal. Raw Frame.Text is NOT evidence
+            // of a healthy Direct WSS (locked invariant #1). Only ws_alive_60s on
+            // the recovery candidate session can clear the sticky window.
+            if (mode2StickyEnabled && mode2StickyRestActive) {
+                if (!stickyFrameSuppressedLogged) {
+                    stickyFrameSuppressedLogged = true
+                    val elapsedMs = now() - stickyArmedAtMs
+                    log(
+                        "REST_TRACE sticky_frame_suppressed gen=$stickyGen " +
+                            "elapsed_ms=$elapsedMs"
+                    )
+                }
+                stickySuppressedCount++
+                return
+            }
             transitionToCandidate("ws_frame_text_received")
         }
         // In WsActive: no-op (frames are expected).
         // In WsCandidate: no-op (we already saw the upgrade signal).
     }
 
-    private fun onNetworkChanged() {
+    private fun onNetworkChanged(event: Event.NetworkChanged) {
         // Reset counters in any mode — a new network's behaviour is unknown
         // and stale counter state should not influence the next decisions.
         if (activeFailCount > 0 || idleFailCount > 0) {
@@ -202,12 +421,64 @@ class RestStateMachine(
         }
         activeFailCount = 0
         idleFailCount = 0
+
+        // R3.6: sticky branching on clearsMode2Sticky flag.
+        if (mode2StickyEnabled && mode2StickyRestActive) {
+            if (!event.clearsMode2Sticky) {
+                // Route-change that does NOT clear sticky (e.g. VALIDATED_CHANGED).
+                // Keep sticky armed; do NOT lift to WsCandidate.
+                log("REST_TRACE sticky_kept gen=$stickyGen reason=validated_change")
+                return
+            }
+            // Route change that clears sticky — arm recovery.
+            when (stickyRecovery) {
+                StickyRecoveryState.None -> {
+                    stickyRecovery = StickyRecoveryState.PendingNewSession
+                    log(
+                        "REST_TRACE sticky_recovery_pending gen=$stickyGen " +
+                            "reason=route_change"
+                    )
+                }
+                StickyRecoveryState.PendingNewSession -> {
+                    // Already pending — restart the pending phase.
+                    log(
+                        "REST_TRACE sticky_recovery_pending_restarted gen=$stickyGen " +
+                            "reason=route_change_during_pending"
+                    )
+                }
+                StickyRecoveryState.InFlight -> {
+                    // Already in flight — restart recovery on route change.
+                    log(
+                        "REST_TRACE sticky_recovery_restarted gen=$stickyGen " +
+                            "reason=route_change_during_recovery"
+                    )
+                    stickyRecovery = StickyRecoveryState.PendingNewSession
+                    recoveryWsEpoch = -1L
+                }
+            }
+            // While sticky is armed AND RestActive, do NOT lift to WsCandidate
+            // directly — wait for the new WS session to arrive (PendingNewSession).
+            return
+        }
+
         if (_state.value == RestMode.RestActive) {
             transitionToCandidate("network_changed")
         }
     }
 
     private fun onWsOutboundAck() {
+        // R3.6: during sticky InFlight recovery, ws_outbound_ack is NOT a proof
+        // signal (locked invariant #9). Short-circuit before the existing
+        // transitionToWsActive call so the candidate's probe timer still runs.
+        if (mode2StickyEnabled && stickyRecovery == StickyRecoveryState.InFlight &&
+            _state.value == RestMode.WsCandidate
+        ) {
+            log(
+                "REST_TRACE sticky_recovery_ack_ignored gen=$stickyGen " +
+                    "reason=outbound_routes_via_rest_no_epoch"
+            )
+            return
+        }
         if (_state.value == RestMode.WsCandidate) {
             transitionToWsActive("ws_outbound_ack")
         }
@@ -278,6 +549,23 @@ class RestStateMachine(
 
     // ── Transition helpers ───────────────────────────────────────────────────
 
+    /**
+     * R3.6: arm the sticky REST window. NOT idempotent — must only be called
+     * once per Mode-2 fast-path actuation, AFTER [transitionToRest] has moved
+     * the state to [RestMode.RestActive]. Asserts [stickyRecovery] is [StickyRecoveryState.None].
+     */
+    private fun armSticky() {
+        check(stickyRecovery == StickyRecoveryState.None) {
+            "armSticky called when stickyRecovery=$stickyRecovery (must be None)"
+        }
+        stickyGen++
+        mode2StickyRestActive = true
+        stickyArmedAtMs = now()
+        stickyFrameSuppressedLogged = false
+        stickySuppressedCount = 0
+        log("REST_TRACE sticky_armed gen=$stickyGen reason=mode_2_fast_path")
+    }
+
     private fun transitionToRest(reason: String) {
         val from = _state.value
         if (from == RestMode.RestActive) return
@@ -301,6 +589,26 @@ class RestStateMachine(
     private fun transitionToWsActive(reason: String) {
         val from = _state.value
         if (from == RestMode.WsActive) return
+        // R3.6 cleanup hook — runs BEFORE any state mutation so a throwing
+        // onModeSwitched cannot leave sticky in an inconsistent state.
+        if (mode2StickyEnabled && mode2StickyRestActive &&
+            stickyRecovery == StickyRecoveryState.InFlight &&
+            reason == "ws_alive_60s"
+        ) {
+            val elapsedMs = now() - stickyArmedAtMs
+            log(
+                "REST_TRACE sticky_cleared gen=$stickyGen " +
+                    "reason=ws_recovery_proved proof=ws_alive_60s " +
+                    "total_suppressed=$stickySuppressedCount " +
+                    "elapsed_ms_since_arm=$elapsedMs"
+            )
+            mode2StickyRestActive = false
+            stickyRecovery = StickyRecoveryState.None
+            recoveryWsEpoch = -1L
+            recoveryStartedAtMs = 0L
+            stickyFrameSuppressedLogged = false
+            stickySuppressedCount = 0
+        }
         activeFailCount = 0
         idleFailCount = 0
         candidateEnteredAtMs = null
@@ -315,17 +623,56 @@ class RestStateMachine(
      */
     sealed class Event {
         /**
+         * R3.6 (2026-06-20): emitted immediately after the WS handshake succeeds,
+         * before any frames are read. [sessionEpoch] matches the per-session counter
+         * in [KtorRelayTransport] so the state machine can correlate `Connected(N)`
+         * with its eventual `Ended(N, ...)` for sticky-recovery epoch filtering.
+         */
+        data class WsSessionConnected(val sessionEpoch: Long) : Event()
+
+        /**
          * Emitted once per WS session at the moment the WebSocket closes
          * (any reason: protocol error, RST, server close, OS network drop).
          * [inboundFrames] is the count of Frame.Text the client received
          * over the just-ended session; [pendingAcksAtClose] is the number
          * of envelopes the client had sent but not yet received an ACK for
          * when the session ended.
+         *
+         * R3.6: [sessionEpoch] carries the per-session counter so the
+         * sticky-recovery state machine can filter stale close events from
+         * sessions that are no longer the active recovery candidate.
+         * No default — callers MUST supply it (production mapper updated).
          */
         data class WsSessionEnded(
             val durationMs: Long,
             val inboundFrames: Int,
             val pendingAcksAtClose: Int,
+            /**
+             * 3.6 Fast REST degradation (2026-06-18). When `true`, the WS
+             * session ended via OkHttp WS-Ping watchdog (parser-confirmed
+             * "after N successful ping/pongs" pattern in the throwable
+             * message). Required field of the Mode-2 signature alongside
+             * `inboundFrames == 0` and a duration in
+             * [MODE_2_MIN_DURATION_MS]..[MODE_2_MAX_DURATION_MS].
+             *
+             * Default `false` keeps prior callers and tests source-compatible.
+             * The production producer in `HybridRelayTransport` propagates
+             * the value from
+             * `phantom.core.transport.WsSessionEndedEvent.okhttpPingTimeoutDetected`
+             * via a file-level `internal` extension mapper in
+             * `HybridRelayTransport.kt` (`androidMain`) — that mapper is
+             * unit-tested in `androidUnitTest` against the exact
+             * propagation invariant.
+             */
+            val okhttpPingTimeoutDetected: Boolean = false,
+            /**
+             * R3.6 (2026-06-20): per-session epoch from [KtorRelayTransport].
+             * Used by the sticky-recovery state machine to distinguish the
+             * active recovery candidate's close from stale closes of older
+             * sessions. Required; the production producer in [KtorRelayTransport]
+             * always supplies the current `mySession` epoch.
+             */
+            val sessionEpoch: Long,
         ) : Event()
 
         /**
@@ -341,8 +688,20 @@ class RestStateMachine(
          * Emitted on Android `ConnectivityManager` capability changes
          * (Wi-Fi ↔ cellular, network gained/lost). Resets counters because
          * the new path's behaviour is unknown.
+         *
+         * R3.6 (2026-06-20): converted from `object` to `data class` to carry
+         * [clearsMode2Sticky]. When `true`, a sticky REST window armed by Mode-2
+         * fast-path actuation enters recovery mode — waiting for a new WS session
+         * to prove itself via `ws_alive_60s`. When `false` (e.g. VALIDATED_CHANGED),
+         * the sticky window stays armed and the route change is logged as
+         * `sticky_kept`.
+         *
+         * Callers that previously sent `Event.NetworkChanged` (object) must be
+         * updated to `Event.NetworkChanged(clearsMode2Sticky = ...)`. All call
+         * sites must supply the flag explicitly — no default, so the compiler
+         * catches every missing argument.
          */
-        object NetworkChanged : Event()
+        data class NetworkChanged(val clearsMode2Sticky: Boolean) : Event()
 
         /**
          * Emitted when an outbound envelope completes its ACK round-trip
@@ -439,6 +798,33 @@ class RestStateMachine(
          * single Frame.Text is not enough to commit.
          */
         const val CANDIDATE_COMMIT_MS: Long = 60_000L
+
+        /**
+         * 3.6 Fast REST degradation (2026-06-18) — lower bound of the
+         * Mode-2 signature duration window. Sessions ending below this
+         * floor are short failures (TLS handshake fail, immediate carrier
+         * NACK, etc.) and do NOT match the signature.
+         *
+         * 25 000 ms is comfortably below the dominant Mode-2 death point
+         * on Tele2 LTE (~31 s = `2 × pingInterval(15s) + ~1 s overhead`)
+         * to absorb minor jitter while excluding pre-Ping failures.
+         */
+        const val MODE_2_MIN_DURATION_MS: Long = 25_000L
+
+        /**
+         * 3.6 Fast REST degradation (2026-06-18) — upper bound of the
+         * Mode-2 signature duration window. Sessions ending above this
+         * ceiling are healthy Mode-1 rhythm (120-170 s on Wi-Fi per
+         * `project_arm_c_lifetime_linear_in_interval_2026_06_04`) and
+         * MUST NOT trip the fast-path.
+         *
+         * 65 000 ms is just above the warm-window Mode-2 death point
+         * (~61 s = `4 × pingInterval(15s) + ~1 s overhead` per pool
+         * isolation canary v2 distribution) so warm-window Mode-2
+         * sessions are still caught. The Mode-1 8-pong rhythm has a
+         * floor of 120 s; 65 000 ms is safely below it.
+         */
+        const val MODE_2_MAX_DURATION_MS: Long = 65_000L
     }
 }
 

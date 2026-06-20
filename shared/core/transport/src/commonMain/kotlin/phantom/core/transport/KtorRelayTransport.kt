@@ -19,6 +19,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -27,6 +28,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -75,6 +77,60 @@ data class WsSessionEndedEvent(
     // compatibility with any commonTest construction.
     val okhttpPingTimeoutDetected: Boolean = false,
 )
+
+/**
+ * R3.6 Fast REST degradation (2026-06-20) — ordered, guaranteed-delivery
+ * lifecycle stream. Replaces the former [WsSessionEndedEvent] SharedFlow
+ * (which used `tryEmit` semantics and could silently drop events on a full
+ * buffer) with a single [Channel.UNLIMITED] channel that preserves emission
+ * order and guarantees delivery as long as the channel is open.
+ *
+ * Two event subtypes:
+ *   - [Connected] — emitted immediately after the WebSocket handshake
+ *     succeeds (same timing as the `"WebSocket connected successfully"` log
+ *     line). Carries the per-session epoch so the consumer can correlate
+ *     the connected session with its eventual [Ended] event.
+ *   - [Ended] — replaces the former [WsSessionEndedEvent] emission. Carries
+ *     all legacy fields PLUS [Ended.sessionEpoch] for the sticky-recovery
+ *     epoch filter in [RestStateMachine].
+ *
+ * Channel lifetime equals the transport object lifetime. The channel is
+ * never explicitly closed; it is garbage-collected with the transport.
+ * IMPL-LOCK #1 (scope memo): exposed via [receiveAsFlow], NOT
+ * [consumeAsFlow], so collector termination does NOT close the channel.
+ */
+sealed interface WsSessionLifecycleEvent {
+    /**
+     * Emitted after the WS handshake succeeds, before any frames are read.
+     * [sessionEpoch] matches the value of `wsSessionEpoch` for this session.
+     */
+    data class Connected(val sessionEpoch: Long) : WsSessionLifecycleEvent
+
+    /**
+     * Emitted in the `finally` block of each per-session iteration,
+     * after [WsSessionEndedEvent] telemetry fields are assembled.
+     * Carries the same semantic fields as the legacy [WsSessionEndedEvent]
+     * plus [sessionEpoch] for sticky-recovery epoch correlation.
+     */
+    data class Ended(
+        val durationMs: Long,
+        val inboundFrames: Int,
+        val pendingAcksAtClose: Int,
+        val closeOrigin: String,
+        val closeError: String?,
+        val okhttpPingTimeoutDetected: Boolean,
+        val sessionEpoch: Long,
+    ) : WsSessionLifecycleEvent {
+        /** Helper for IMPL-LOCK #4 error logging — returns epoch as string. */
+        fun epochOrUnknown(): String = sessionEpoch.toString()
+    }
+}
+
+/** Returns the session epoch of any lifecycle event, or "unknown" for new variants. */
+fun WsSessionLifecycleEvent.epochOrUnknown(): String = when (this) {
+    is WsSessionLifecycleEvent.Connected -> sessionEpoch.toString()
+    is WsSessionLifecycleEvent.Ended -> sessionEpoch.toString()
+}
 
 /**
  * PR-D1d (2026-05-17): emitted when a sent envelope's per-envelope ACK
@@ -140,21 +196,32 @@ class KtorRelayTransport(
 
     // Typing events are ephemeral and never stored or encrypted.
     // extraBufferCapacity = 10 ensures rapid keystrokes never block the read loop.
-    // PR-D1b (2026-05-16): per-session-end event exposed for the REST
-    // fallback state machine. Emitted exactly once per session, in the
-    // `finally` block of `runReconnectLoop`, AFTER `emitSessionSummary`.
-    // Listeners (notably `HybridRelayTransport` in the Android app layer)
-    // forward this into `RestStateMachine.Event.WsSessionEnded` to feed
-    // the 2-active-fail / 3-idle-fail trigger logic. The transport itself
-    // makes no decisions based on this flow — it is a pure observation.
+
+    // R3.6 Fast REST degradation (2026-06-20): ordered lifecycle channel.
+    // Channel.UNLIMITED-backed stream; trySend on UNLIMITED never fails
+    // while the channel is open. The channel is never explicitly closed —
+    // its lifetime equals the transport object lifetime. The
+    // check(... .isSuccess) wrapper (IMPL-LOCK #2) turns any invariant
+    // violation into a loud failure rather than a silent drop.
     //
-    // `tryEmit` cannot block or throw with a non-zero `extraBufferCapacity`,
-    // so adding this never affects the reconnect path's correctness.
-    private val _wsSessionEnded = MutableSharedFlow<WsSessionEndedEvent>(
-        replay = 0,
-        extraBufferCapacity = 8,
-    )
-    val wsSessionEnded: SharedFlow<WsSessionEndedEvent> = _wsSessionEnded.asSharedFlow()
+    // IMPL-LOCK #1: exposed via receiveAsFlow() so collector termination
+    // does NOT close the channel. consumeAsFlow() would close it and make
+    // subsequent trySend(...).isSuccess return false.
+    private val _wsSessionLifecycle: Channel<WsSessionLifecycleEvent> =
+        Channel(Channel.UNLIMITED)
+
+    /**
+     * Ordered, guaranteed-delivery lifecycle stream. Emits [WsSessionLifecycleEvent.Connected]
+     * after each successful WS handshake and [WsSessionLifecycleEvent.Ended] in each
+     * session's `finally` block. Single consumer only ([HybridRelayTransport]).
+     *
+     * IMPL-LOCK #1: backed by [receiveAsFlow] so collector cancellation does
+     * NOT close the underlying [Channel]. The producer emits into [_wsSessionLifecycle]
+     * for the lifetime of this transport object — independent of how many times the
+     * flow is collected and abandoned.
+     */
+    val wsSessionLifecycle: Flow<WsSessionLifecycleEvent> =
+        _wsSessionLifecycle.receiveAsFlow()
 
     // PR-D1d (2026-05-17): fast per-envelope ACK deadline. Emitted on
     // [transportScope] after [RelayTransportConfig.ACK_DEADLINE_MS] elapses
@@ -841,6 +908,16 @@ class KtorRelayTransport(
                     sessionStats = stats
                     _state.value = TransportState.Connected
                     relayLog(RelayLogLevel.INFO, "${genTag(mySession)} WebSocket connected successfully")
+                    // R3.6: emit Connected into the ordered lifecycle channel so the
+                    // sticky-recovery state machine (via HybridRelayTransport) can
+                    // open a recovery probation window on this new session.
+                    // IMPL-LOCK #2: check isSuccess — trySend on UNLIMITED only
+                    // fails if the channel is closed (invariant violation).
+                    check(
+                        _wsSessionLifecycle.trySend(
+                            WsSessionLifecycleEvent.Connected(mySession)
+                        ).isSuccess
+                    ) { "WS lifecycle channel unexpectedly closed (Connected emission epoch=$mySession)" }
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -931,32 +1008,37 @@ class KtorRelayTransport(
                     closeMessage = closeMessage,
                     thrown = caughtThrowable,
                 )
-                // PR-D1b (2026-05-16): also emit a structured
-                // [WsSessionEndedEvent] for the REST fallback state machine.
-                // This is observation-only; no reconnect/recovery logic
-                // depends on it firing. `tryEmit` is non-blocking with the
-                // buffered SharedFlow, so this cannot wedge the finally
-                // path even if no one is listening.
-                _wsSessionEnded.tryEmit(
-                    WsSessionEndedEvent(
-                        durationMs = sessionStats?.let {
-                            (Clock.System.now().toEpochMilliseconds() - it.startedAtMs)
-                                .coerceAtLeast(0)
-                        } ?: 0L,
-                        inboundFrames = sessionStats?.inboundFrames?.toInt() ?: 0,
-                        pendingAcksAtClose = pendingAckCount,
-                        closeOrigin = origin.name.lowercase(),
-                        closeError = caughtThrowable?.message,
-                        // PR-WS-HEALTH-STATE1 Commit 3.2a: same detector
-                        // signal used by `ws_ping_timeout_diag` above
-                        // (`emitSessionSummary`). Re-parsing the message
-                        // here is a 1-µs operation against a stable
-                        // OkHttp idiom and avoids cross-function state.
-                        okhttpPingTimeoutDetected =
-                            PingTimeoutTextParser
-                                .parseSuccessfulPingPongs(caughtThrowable?.message) >= 0,
-                    )
-                )
+                // R3.6 (2026-06-20): assemble the common fields once for the
+                // ordered lifecycle channel emission below.
+                val sessionDurationMs = sessionStats?.let {
+                    (Clock.System.now().toEpochMilliseconds() - it.startedAtMs)
+                        .coerceAtLeast(0)
+                } ?: 0L
+                val sessionInboundFrames = sessionStats?.inboundFrames?.toInt() ?: 0
+                val sessionCloseOrigin = origin.name.lowercase()
+                val sessionCloseError = caughtThrowable?.message
+                // PR-WS-HEALTH-STATE1 Commit 3.2a: same detector signal.
+                val pingTimeoutDetected =
+                    PingTimeoutTextParser.parseSuccessfulPingPongs(caughtThrowable?.message) >= 0
+
+                // R3.6 IMPL-LOCK #2: emit Ended into the ordered channel.
+                // trySend on UNLIMITED only fails if the channel is closed;
+                // the check enforces the invariant loudly rather than
+                // silently dropping a load-bearing lifecycle event.
+                check(
+                    _wsSessionLifecycle.trySend(
+                        WsSessionLifecycleEvent.Ended(
+                            durationMs = sessionDurationMs,
+                            inboundFrames = sessionInboundFrames,
+                            pendingAcksAtClose = pendingAckCount,
+                            closeOrigin = sessionCloseOrigin,
+                            closeError = sessionCloseError,
+                            okhttpPingTimeoutDetected = pingTimeoutDetected,
+                            sessionEpoch = mySession,
+                        )
+                    ).isSuccess
+                ) { "WS lifecycle channel unexpectedly closed (Ended emission epoch=$mySession)" }
+
                 if (currentSessionStats === sessionStats) {
                     currentSessionStats = null
                 }
