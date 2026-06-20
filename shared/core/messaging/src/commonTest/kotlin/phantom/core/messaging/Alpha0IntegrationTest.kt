@@ -77,6 +77,11 @@ private class BufferingRelayTransport : RelayTransport {
         _state.value = TransportState.Disconnected
     }
 
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean {
+        disconnect()
+        return true
+    }
+
     override suspend fun send(message: RelayMessage.Send): Boolean {
         sent += message
         return if (online) {

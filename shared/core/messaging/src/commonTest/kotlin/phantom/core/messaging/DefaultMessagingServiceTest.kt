@@ -350,6 +350,7 @@ private class FakeRelayTransport : RelayTransport {
         socksProxyPort: Int?,
     ) {}
     override suspend fun disconnect() {}
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean = true
     override suspend fun send(message: RelayMessage.Send): Boolean {
         sent += message
         if (sent.size <= sendSuccessLimit) return true
@@ -5774,6 +5775,7 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
         socksProxyPort: Int?,
     ) {}
     override suspend fun disconnect() {}
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean = true
     override suspend fun send(message: phantom.core.transport.RelayMessage.Send): Boolean = true
     override suspend fun sendDeliveryAck(messageId: String): Boolean = true
     override suspend fun sendTyping(toPubKeyHex: String): Boolean = true

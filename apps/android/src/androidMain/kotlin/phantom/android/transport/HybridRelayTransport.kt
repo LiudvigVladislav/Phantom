@@ -242,6 +242,15 @@ class HybridRelayTransport(
 
     override suspend fun disconnect() = wsTransport.disconnect()
 
+    /**
+     * RC-RECONNECT-QUIESCENCE1 (2026-06-21): bounded-join disconnect for the
+     * rewalk transaction. Pass-through to [KtorRelayTransport.disconnectAndJoin]
+     * which holds the actual reconnect loop. See [RelayTransport.disconnectAndJoin]
+     * kdoc for the contract.
+     */
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean =
+        wsTransport.disconnectAndJoin(timeoutMs)
+
     override suspend fun forceReconnect() = wsTransport.forceReconnect()
 
     override suspend fun sendTyping(toPubKeyHex: String): Boolean =

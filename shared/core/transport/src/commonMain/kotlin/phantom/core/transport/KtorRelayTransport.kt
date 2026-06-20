@@ -13,9 +13,13 @@ import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -540,6 +544,147 @@ class KtorRelayTransport(
     // already advanced the generation: forceReconnect requested by three
     // watchdogs in the same 50 ms window collapses to one relaunch.
     private val connectionLifecycleMutex = Mutex()
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 review amendment P1 #3: dedicated scope for
+     * fire-and-forget cleanup launches inside [disconnectAndJoin]. Off the
+     * strict bound so a blocking [HttpClient.close] or session.close cannot
+     * defeat the documented hard timeout on `cancel + join`. SupervisorJob
+     * so a single failing close does not propagate to siblings or the
+     * parent. Never cancelled by the transport itself — its lifetime is the
+     * transport object's lifetime; it is collected with the rest of the
+     * instance.
+     */
+    private val cleanupScope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() + CoroutineName("KtorRelayTransport-cleanup"),
+    )
+
+    /**
+     * Hard cap on the number of in-flight cleanup launches.
+     * `withTimeoutOrNull` is cooperative and cannot interrupt a truly
+     * blocking `HttpClient.close()` or `session.close()`; a hung close
+     * can park its [cleanupScope] coroutine + worker thread
+     * indefinitely. The cap acknowledges this: cleanup is unbounded
+     * best-effort, but we refuse to enqueue a new cleanup once
+     * [cleanupCap] hung tasks are already in the scope. Refused refs
+     * are logged and abandoned to
+     * GC — better than letting the transport accumulate an unbounded
+     * number of hung coroutines across repeated teardowns.
+     */
+    private val cleanupCounterMutex = Mutex()
+    private var cleanupInflight: Int = 0
+    private val cleanupCap: Int = 8
+
+    /**
+     * Launch a cleanup block on [cleanupScope] subject to [cleanupCap].
+     * If the cap is exhausted, the launch is refused and the [label]
+     * is logged so the operator can spot accumulating hung cleanups.
+     * The block runs without any artificial timeout —
+     * `withTimeoutOrNull` cannot interrupt a truly blocking
+     * `HttpClient.close()` / `session.close()` because those calls have
+     * no suspension points where the timeout could fire. Wrapping them
+     * in `withTimeoutOrNull` would only lie about the bound. The cap is
+     * the honest mechanism.
+     *
+     * Decrement of [cleanupInflight] happens in a finally guarded by
+     * [NonCancellable] so a propagating cancellation never leaks a slot.
+     */
+    private suspend fun maybeLaunchCleanup(label: String, action: suspend () -> Unit) {
+        val accepted = cleanupCounterMutex.withLock {
+            if (cleanupInflight >= cleanupCap) {
+                false
+            } else {
+                cleanupInflight++
+                true
+            }
+        }
+        if (!accepted) {
+            relayLog(
+                RelayLogLevel.WARN,
+                "${genTag()} cleanup budget exhausted ($cleanupCap in flight); refusing $label — ref abandoned to GC",
+            )
+            return
+        }
+        cleanupScope.launch {
+            try {
+                action()
+            } catch (ce: CancellationException) {
+                // best-effort cleanup — swallow CE here so the slot is freed;
+                // structured-concurrency parent in cleanupScope is SupervisorJob
+                // so this does not propagate.
+            } catch (t: Throwable) {
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "${genTag()} cleanup $label threw: ${t::class.simpleName}: ${t.message}",
+                )
+            } finally {
+                withContext(NonCancellable) {
+                    cleanupCounterMutex.withLock { cleanupInflight-- }
+                }
+            }
+        }
+    }
+
+    /**
+     * Test seam: snapshot of the cleanup-inflight counter for the cap
+     * regression test.
+     */
+    internal suspend fun cleanupInflightForTest(): Int = cleanupCounterMutex.withLock { cleanupInflight }
+
+    /**
+     * Test seam: directly invoke [maybeLaunchCleanup] so the cap-behaviour
+     * regression test can saturate the cap without seeding real HttpClient
+     * / WS-session refs. The action runs on [cleanupScope].
+     */
+    internal suspend fun launchCleanupForTest(label: String, action: suspend () -> Unit) {
+        maybeLaunchCleanup(label, action)
+    }
+
+    /**
+     * Test seam (Vladislav 2026-06-22): deterministic teardown for unit
+     * tests. Cancels every long-lived scope owned by this transport
+     * instance ([cleanupScope] + per-generation [scope]) and waits for
+     * the in-flight cleanup-counter to drop to zero. Without this,
+     * tests that exercise cleanup leave SupervisorJob children alive
+     * past the test's `runBlocking` exit, accumulating in the Gradle
+     * test JVM and eventually hanging the worker.
+     */
+    internal suspend fun closeForTest(awaitInflightTimeoutMs: Long = 5_000L) {
+        runCatching { scope?.cancel() }
+        runCatching { cleanupScope.cancel() }
+        // Wait for the cleanup-inflight counter to drop. The cancelled
+        // cleanupScope frees in-flight launches via their CE-catching
+        // finally block (`cleanupInflight--`).
+        withTimeoutOrNull(awaitInflightTimeoutMs) {
+            while (cleanupInflightForTest() > 0) {
+                delay(10)
+            }
+        }
+    }
+
+    /**
+     * Test seam (P1 flush-order anchor): the value of `reconnectJob?.isCancelled`
+     * captured at the moment [flushPendingOutbox] is invoked from
+     * [teardownAndJoin]. The legacy `disconnect()` path MUST flush BEFORE
+     * `job.cancel()`, so this is observed as `false` when the order is
+     * correct; `true` (or stale `null`) means flush ran after cancel.
+     */
+    @Volatile internal var jobIsCancelledAtFlushTimeForTest: Boolean? = null
+
+    /**
+     * Test seams (P1 fifth-round teardown-atomicity anchors): seed the
+     * per-generation watchdog jobs and scope so a test can prove
+     * teardownAndJoin cancels them inside the critical NonCancellable
+     * region, even if the caller is cancelled mid-flight. Production
+     * code initialises these inside `runReconnectLoop`; the tests
+     * pre-seed them without launching a real reconnect loop.
+     */
+    internal fun seedPingJobForTest(j: Job) { pingJob = j }
+    internal fun seedAckWatchdogJobForTest(j: Job) { ackWatchdogJob = j }
+    internal fun seedGenerationScopeForTest(s: CoroutineScope) { scope = s }
+    internal fun pingJobForTest(): Job? = pingJob
+    internal fun ackWatchdogJobForTest(): Job? = ackWatchdogJob
+    internal fun generationScopeForTest(): CoroutineScope? = scope
     @Volatile private var connectionGeneration: Long = 0L
 
     // PR-H1a (2026-05-13): per-WebSocket-session epoch. Bumped every time
@@ -744,48 +889,58 @@ class KtorRelayTransport(
         signChallenge: suspend (challenge: ByteArray) -> ByteArray?,
         socksProxyPort: Int?,
     ) {
-        this.relayUrl = relayUrl
-        this.identityHex = identityPublicKeyHex
-        this.signingPubKeyHex = signingPublicKeyHex
-        this.challengeSigner = signChallenge
-        this.socksProxyPort = socksProxyPort
-        disconnectRequested = false
-        // Reset the pong staleness mark so the AlarmManager keepalive does
-        // not see a stale value inherited from the previous WS session
-        // (e.g. after a Privacy-mode switch the new connect runs an outer
-        // chain walk + auth-handshake that can take 30-90 s; without this
-        // reset `lastPongElapsedMs` would already report 100s+ at the very
-        // first alarm and trigger forceReconnect that tears down the
-        // in-flight handshake — observed cross-device test 2026-05-10).
-        lastPongMark = timeSource.markNow()
-        // PR-H1c: same rationale for the inbound-frame liveness mark, which
-        // now drives both the in-process pong-timeout watchdog and the
-        // AlarmManager proactive reconnect.
-        lastInboundFrameMark = timeSource.markNow()
         relayLog(
             RelayLogLevel.INFO,
             "${genTag()} connect() called: url=$relayUrl identity=${identityPublicKeyHex.take(16)}… signing=${signingPublicKeyHex.take(16)}… socks=${socksProxyPort ?: "direct"}",
         )
-        // PR-F2: serialize lifecycle setup. The lock is held only while
-        // we cancel the prior reconnect loop and launch a new one — never
-        // across the suspending join() below — so racing connect()/
-        // forceReconnect() callers serialize on setup but do not block
-        // the connection itself.
+        // PR-F2 + RC-RECONNECT-QUIESCENCE1 (2026-06-21): lifecycle setup runs
+        // strictly under [connectionLifecycleMutex]. The lock IS held across
+        // the bounded suspending `job.join()` inside `disconnectAndJoin` —
+        // callers serialise correctly.
+        //
+        // `this.relayUrl` and the other connect-parameter writes (identityHex,
+        // signingPubKeyHex, challengeSigner, socksProxyPort) MUST be performed
+        // strictly inside the mutex AND only on the fresh-launch branch. If
+        // they ran before the lock acquisition (the earlier shape), a parallel
+        // connect() could overwrite the still-alive loop's config while it was
+        // mid-auth or mid-handshake. Likewise the resets (`disconnectRequested`,
+        // `lastPongMark`, `lastInboundFrameMark`) run strictly under the mutex
+        // on the fresh-launch branch.
         val newJob = connectionLifecycleMutex.withLock {
-            // If a reconnect loop is already running, do NOT spawn a second
-            // one. A second connect() in the wild typically comes from a
-            // double-start of the foreground service (AlarmManager wakeup
-            // + lifecycle bring-back firing in the same window). Returning
-            // the existing job preserves the original "suspend until the
-            // loop ends" semantics callers expect.
             val existing = reconnectJob
-            if (existing != null && existing.isActive && !disconnectRequested) {
+            if (existing != null && !existing.isCompleted) {
+                // Old loop is still alive (active OR cancelling / draining
+                // after a timed-out disconnectAndJoin). REFUSE to write new
+                // params (would corrupt the live loop's config). Caller must
+                // disconnect / disconnectAndJoin first if they want to change
+                // params. Reuse the existing job's join semantics.
                 relayLog(
-                    RelayLogLevel.INFO,
-                    "${genTag()} connect: reconnect loop already active — joining existing job, no new loop spawned",
+                    RelayLogLevel.WARN,
+                    "${genTag()} connect: reconnect loop already alive (isCompleted=${existing.isCompleted}, isActive=${existing.isActive}, isCancelled=${existing.isCancelled}) — IGNORING new connect params, joining existing job. Caller must disconnect first if they want to change relayUrl/identity/signing/socks.",
                 )
+                // Review amendment P2: signal the test barrier that we've
+                // taken the reuse branch under the mutex (no params written).
+                connectReuseBranchSignalForTest?.complete(Unit)
                 existing
             } else {
+                // No active loop; safe to write fresh config and launch.
+                this.relayUrl = relayUrl
+                this.identityHex = identityPublicKeyHex
+                this.signingPubKeyHex = signingPublicKeyHex
+                this.challengeSigner = signChallenge
+                this.socksProxyPort = socksProxyPort
+                disconnectRequested = false
+                // Reset the pong staleness mark so the AlarmManager keepalive
+                // does not see a stale value inherited from the previous WS
+                // session (e.g. after a Privacy-mode switch the new connect
+                // runs an outer chain walk + auth-handshake that can take
+                // 30-90 s; without this reset `lastPongElapsedMs` would
+                // already report 100s+ at the very first alarm and trigger
+                // forceReconnect that tears down the in-flight handshake —
+                // observed cross-device test 2026-05-10).
+                lastPongMark = timeSource.markNow()
+                // PR-H1c: same rationale for the inbound-frame liveness mark.
+                lastInboundFrameMark = timeSource.markNow()
                 connectionGeneration += 1
                 relayLog(
                     RelayLogLevel.INFO,
@@ -1737,8 +1892,30 @@ class KtorRelayTransport(
     }
 
     private suspend fun sendRaw(message: RelayMessage): Boolean {
+        // RC-RECONNECT-QUIESCENCE1 review amendment P1 (2026-06-21):
+        // sendRaw used to return `true` even when `session == null`
+        // because `session?.send(...)` short-circuits silently. That
+        // turned every call after a quiescence-driven `session = null`
+        // into a SILENT FALSE SUCCESS — AckDelivery messages were
+        // removed from outbox as "sent" and Send messages were moved
+        // to pendingAcks as "sent" without the relay ever receiving
+        // them. The outbox/ACK invariant the upcoming reconnect-
+        // quiescence gate relies on cannot tolerate that.
+        //
+        // Fail loudly when session is absent. The caller (sendInternal
+        // / flushPendingOutbox) sees `false` and treats the message
+        // the same way it treats any other send failure: re-queue or
+        // surface up.
+        val activeSession = session
+        if (activeSession == null) {
+            relayLog(
+                RelayLogLevel.WARN,
+                "${genTag()} sendRaw refused: no active WS session (transport mid-teardown or pre-connect)",
+            )
+            return false
+        }
         return try {
-            session?.send(Frame.Text(json.encodeToString(message)))
+            activeSession.send(Frame.Text(json.encodeToString(message)))
             true
         } catch (e: Exception) {
             relayLog(
@@ -1751,28 +1928,263 @@ class KtorRelayTransport(
     }
 
     override suspend fun disconnect() {
-        relayLog(RelayLogLevel.INFO, "${genTag()} disconnect() called")
-        disconnectRequested = true
-        // Best-effort flush of any pending outbox items before tearing down the
-        // scope. Bounded to 3 s so disconnect never blocks indefinitely.
-        withTimeoutOrNull(3_000L) {
-            if (session != null) flushPendingOutbox(wsSessionEpoch)
+        // Split flush policy between legacy [disconnect] and the rewalk-targeted
+        // [disconnectAndJoin]. Legacy disconnect callers (logout, shutdown,
+        // transport replacement) have no follow-up `WsActive → RestActive`
+        // transition that would trigger PR-D1c REST migration of pending
+        // stores. They need best-effort flush BEFORE teardown so an alive
+        // session has a chance to drain pendingOutbox + pendingAcks via
+        // sendRaw. The flush is bounded at 3 s (same as the pre-amendment
+        // behaviour on master). Items that fail to send remain in the
+        // pending stores, which the transport instance will likely drop
+        // on disposal — that is logout's existing semantics, unchanged.
+        //
+        // Discards the Boolean result — disconnect() callers do not need
+        // to discriminate timeout from clean join.
+        teardownAndJoin(timeoutMs = 10_000L, flushBeforeClose = true)
+    }
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 (2026-06-21): bounded-teardown variant of
+     * [disconnect] for the rewalk transaction in
+     * [phantom.android.transport.TransportRewalkCoordinator]. See
+     * [RelayTransport.disconnectAndJoin] kdoc for the contract.
+     *
+     * Discipline:
+     *
+     *   1. Acquire [connectionLifecycleMutex].
+     *   2. Capture local `val job = reconnectJob`.
+     *   3. Set `disconnectRequested = true` (signals the loop to exit).
+     *   4. Publish [TransportState.Disconnected] IMMEDIATELY so external
+     *      observers see disconnected even if a close path hangs.
+     *   5. NO flushPendingOutbox here. The outbox/ACK invariant the
+     *      upcoming reconnect-quiescence gate relies on requires the
+     *      pending stores to remain intact for the PR-D1c REST migration
+     *      in HybridRelayTransport to pick up on the next non-RestActive
+     *      → RestActive transition. (Legacy [disconnect], used for
+     *      logout/shutdown, performs a bounded best-effort flush BEFORE
+     *      the critical region — a property of [disconnect], not of
+     *      `disconnectAndJoin`.)
+     *   6. CRITICAL TEARDOWN — uninterruptible under
+     *      `withContext(NonCancellable)`. Atomic block runs even when
+     *      the caller is cancelled, so the transport cannot be left in
+     *      a half-torn-down state. Steps:
+     *        - `job.cancel()`;
+     *        - detach `session` + `currentGenerationClient` refs and
+     *          dispatch `session.close()` + `HttpClient.close()` to TWO
+     *          INDEPENDENT fire-and-forget coroutines on [cleanupScope]
+     *          (Dispatchers.IO + SupervisorJob), gated by a hard cap
+     *          ([cleanupCap]); the cleanup body runs without any
+     *          artificial `withTimeoutOrNull` (cooperative timeouts
+     *          cannot interrupt a blocking close, so the cap is the
+     *          honest bound);
+     *        - cancel `pingJob`, `ackWatchdogJob`, and the per-generation
+     *          `scope` (separate SupervisorJob — cancelling `job` alone
+     *          does NOT cascade into it).
+     *      The blocking `close()` calls themselves run on `cleanupScope`
+     *      OUTSIDE NonCancellable; the cap bounds their accumulation.
+     *   7. Strict bound `withTimeoutOrNull(timeoutMs)` covers ONLY
+     *      `job.join()`. Everything else listed above already ran in the
+     *      critical region; the only remaining cancellable / bounded
+     *      suspension is waiting for the loop body to exit.
+     *   8. `reconnectJob = null` ONLY if the captured `job` is null OR
+     *      `job.isCompleted`. On timeout the underlying job is still
+     *      draining; nulling the reference would let a subsequent
+     *      `connect()` / `forceReconnect()` launch a parallel fresh loop.
+     *      Subsequent `disconnectAndJoin()` re-awaits the SAME job.
+     *   9. Return `true` if the strict-bound body completed (clean join),
+     *      `false` if it timed out.
+     *
+     * [CancellationException] from the strict-bound body propagates
+     * unchanged. Non-CE exceptions during the fire-and-forget close
+     * calls are logged on [cleanupScope] and never propagate into the
+     * strict-bound body.
+     */
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean {
+        return teardownAndJoin(timeoutMs = timeoutMs, flushBeforeClose = false)
+    }
+
+    /**
+     * Shared teardown impl invoked by [disconnect] (with
+     * `flushBeforeClose = true`) and [disconnectAndJoin] (with
+     * `flushBeforeClose = false`). Holds [connectionLifecycleMutex],
+     * publishes `Disconnected`, cancels the reconnect job, optionally
+     * flushes the pending outbox while a session is still alive, hands
+     * off the WS-session and HTTP-client closes to [cleanupScope]
+     * (best-effort, unbounded), and finally enforces the strict
+     * `cancel + join` bound. See [RelayTransport.disconnectAndJoin]
+     * kdoc for the contract.
+     */
+    private suspend fun teardownAndJoin(timeoutMs: Long, flushBeforeClose: Boolean): Boolean {
+        return connectionLifecycleMutex.withLock {
+            relayLog(
+                RelayLogLevel.INFO,
+                "${genTag()} disconnectAndJoin() called timeoutMs=$timeoutMs",
+            )
+
+            // ─── CRITICAL TEARDOWN TRANSACTION ───────────────────────────────
+            //
+            // P1 fifth-round fix: the entire critical teardown transaction
+            // runs inside a single `withContext(NonCancellable)` block so
+            // caller cancellation between any two steps CANNOT leave the
+            // transport in a half-torn-down state (state=Disconnected but
+            // reconnect-loop + ping/ACK/generation watchdogs still alive —
+            // exactly the zombie-work class quiescence must eliminate).
+            //
+            // The earlier shape had three vulnerable windows:
+            //   (a) caller cancels during the 3 s flush → CE escapes before
+            //       `job.cancel()` and before cleanup dispatch;
+            //   (b) caller cancels between the flush block and the strict
+            //       bound → same outcome with `job` cancelled but no
+            //       ping/ACK/scope cancels;
+            //   (c) caller cancels after the NonCancellable cleanup region
+            //       but before the second `withTimeoutOrNull` → the
+            //       deferred CE fires at the next suspension and
+            //       `pingJob`/`ackWatchdogJob`/`scope.cancel()` never run.
+            //       Note: `scope` here is the per-generation scope, a
+            //       distinct SupervisorJob — cancelling `reconnectJob`
+            //       alone does NOT propagate into it.
+            //
+            // Fix: the critical transaction (set flags, publish
+            // Disconnected, optional flush, cancel reconnect job, detach
+            // session/client refs, queue cleanups, cancel ping/ACK/scope
+            // watchdogs) is uninterruptible. Caller CE that arrives during
+            // the flush is captured into `pendingCe` and rethrown AFTER
+            // the critical work is complete. Only `job.join()` remains
+            // cancellable/bounded inside the strict timeout.
+            val job = reconnectJob
+            var pendingCe: CancellationException? = null
+
+            // Pre-flush state. Non-suspending — runs synchronously even
+            // under a cancelled parent.
+            disconnectRequested = true
+            _state.value = TransportState.Disconnected
+
+            // Optional flush — CANCELLABLE. If the caller is cancelled
+            // during the bounded 3 s window, CE is captured and the
+            // critical teardown below still runs to completion.
+            //
+            // Caller policy:
+            //   - [disconnect] (logout/shutdown): flushBeforeClose = true.
+            //     Best-effort drain through alive session; bounded at
+            //     3 s. Anything that fails remains in pending stores
+            //     and will be lost when the transport instance is
+            //     disposed — existing logout contract, unchanged.
+            //     The flush runs BEFORE `job.cancel()`: after cancel the
+            //     reconnect-loop body enters its finally block and may
+            //     close `generationClient` / the WS session concurrently
+            //     with the flush, defeating the drain.
+            //   - [disconnectAndJoin] (rewalk / quiescence-entry):
+            //     flushBeforeClose = false. Pending stores LEFT INTACT
+            //     for PR-D1c REST migration on the next non-RestActive
+            //     → RestActive transition. AckDelivery entries are
+            //     out-of-scope of D1c (snapshot filter); their loss is
+            //     tolerated by the relay's existing redelivery
+            //     semantics and the H2b idempotent envelope ledger
+            //     dedupes at the application layer.
+            if (flushBeforeClose) {
+                flushPendingOutboxCallsForTest++
+                jobIsCancelledAtFlushTimeForTest = job?.isCancelled
+                try {
+                    withTimeoutOrNull(3_000L) {
+                        if (session != null) flushPendingOutbox(wsSessionEpoch)
+                    }
+                } catch (ce: CancellationException) {
+                    // Caller cancelled mid-flush. Capture; critical
+                    // teardown below still runs. CE is rethrown after
+                    // the critical region completes.
+                    pendingCe = ce
+                }
+            }
+
+            // CRITICAL TEARDOWN — UNINTERRUPTIBLE. The entire block runs
+            // even when the parent is cancelled, because `NonCancellable`
+            // overrides the Job context. Steps:
+            //   1. cancel the reconnect loop;
+            //   2. detach session/client refs + queue cleanups on
+            //      cleanupScope (the blocking close() calls themselves
+            //      run on cleanupScope and are bounded by [cleanupCap],
+            //      NOT by caller cancellation);
+            //   3. cancel the per-generation watchdog jobs + scope.
+            //      `scope` is a separate SupervisorJob — cancelling
+            //      `reconnectJob` alone does NOT cascade into it.
+            withContext(NonCancellable) {
+                job?.cancel()
+
+                val sessionRef = session
+                val clientRef = currentGenerationClient
+                session = null
+                currentGenerationClient = null
+                if (clientRef != null) {
+                    maybeLaunchCleanup("generationClient.close") {
+                        clientRef.close()
+                    }
+                }
+                if (sessionRef != null) {
+                    maybeLaunchCleanup("session.close") {
+                        sessionRef.close()
+                    }
+                }
+
+                pingJob?.cancel()
+                ackWatchdogJob?.cancel()
+                scope?.cancel()
+            }
+            // ─── END CRITICAL TEARDOWN TRANSACTION ───────────────────────────
+
+            // If caller was cancelled during the flush, propagate CE now —
+            // critical teardown is complete and the reconnect job is
+            // cancelled. We do NOT wait on join(); the next caller can
+            // re-await via disconnectAndJoin.
+            val capturedCe = pendingCe
+            if (capturedCe != null) {
+                // Keep reconnectJob reference intact for the next caller.
+                if (job == null) reconnectJob = null
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "${genTag()} disconnectAndJoin: critical teardown completed under caller CE — " +
+                        "ping/ACK/scope cancelled, reconnect job cancelled; propagating CE without waiting on join",
+                )
+                throw capturedCe
+            }
+
+            // Strict bound: ONLY `job.join()` remains cancellable / bounded.
+            // session.close() / generationClient.close() are NOT in the
+            // strict bound; they were dispatched to cleanupScope above and
+            // may complete after disconnectAndJoin returns.
+            val completed = withTimeoutOrNull(timeoutMs) {
+                if (job != null) job.join()
+                true
+            }
+
+            // Null reconnectJob ONLY if the captured job has fully exited
+            // (or was already null). On timeout the underlying job is
+            // still draining; keep the reference so:
+            //   - a subsequent disconnectAndJoin() can re-await the SAME job;
+            //   - a subsequent connect() observes the still-alive job and
+            //     refuses to launch a parallel loop;
+            //   - a subsequent forceReconnect() observes the cancelled-not-
+            //     completed job and refuses to launch a parallel loop.
+            if (job == null || job.isCompleted) {
+                reconnectJob = null
+            }
+
+            if (completed == true) {
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "${genTag()} disconnectAndJoin: completed cleanly within ${timeoutMs}ms (close calls handed off to cleanupScope)",
+                )
+                true
+            } else {
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "${genTag()} disconnectAndJoin: cancel+join exceeded ${timeoutMs}ms — " +
+                        "coordinator MUST revoke route change. reconnectJob retained: " +
+                        "isCompleted=${job?.isCompleted} isCancelled=${job?.isCancelled}",
+                )
+                false
+            }
         }
-        pingJob?.cancel()
-        ackWatchdogJob?.cancel()
-        scope?.cancel()
-        session?.close()
-        session = null
-        currentGenerationClient?.close()
-        currentGenerationClient = null
-        // ADR-013: cancel the reconnect job and the parent transportScope
-        // so any zombie reconnect loops from previous forceReconnect()
-        // calls are also signalled to exit. Their webSocket{} blocks may
-        // still be parked in kernel recv(), but JVM teardown will release
-        // them eventually.
-        reconnectJob?.cancel()
-        reconnectJob = null
-        _state.value = TransportState.Disconnected
     }
 
     override fun isConnected(): Boolean = _state.value is TransportState.Connected
@@ -1813,6 +2225,33 @@ class KtorRelayTransport(
         // and skip the relaunch — at most one fresh loop per burst.
         val entryGen = connectionGeneration
         connectionLifecycleMutex.withLock {
+            // RC-RECONNECT-QUIESCENCE1 review amendment P1: refuse to launch
+            // a fresh loop when the transport is mid-teardown. This preserves
+            // the invariants disconnectAndJoin establishes:
+            //   - disconnectRequested == true means a disconnect/disconnectAndJoin
+            //     is in progress. Launching a new loop here would either be
+            //     immediately torn down (waste) or — worse — overwrite the
+            //     reconnectJob reference and lose the still-draining old job
+            //     that a subsequent disconnectAndJoin needs to re-await.
+            //   - reconnectJob.isCancelled but !isCompleted means a prior
+            //     disconnectAndJoin timed out while the old loop was still
+            //     draining. The reference MUST stay so the next
+            //     disconnectAndJoin can re-await the SAME job.
+            if (disconnectRequested) {
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "${genTag()} forceReconnect: ignored — disconnectRequested=true (teardown in progress); reconnectJob ref preserved",
+                )
+                return
+            }
+            val savedJob = reconnectJob
+            if (savedJob != null && savedJob.isCancelled && !savedJob.isCompleted) {
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "${genTag()} forceReconnect: ignored — existing reconnect job is in cancellation drain (isCancelled=true, isCompleted=false). Caller must wait for the drain to complete before forcing a new loop.",
+                )
+                return
+            }
             if (entryGen != connectionGeneration) {
                 relayLog(
                     RelayLogLevel.INFO,
@@ -2070,4 +2509,67 @@ class KtorRelayTransport(
             removePendingAckLocked(msgId, reason = "ack_received")
         }
     }
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 test hook: install [job] as the current
+     * `reconnectJob` so `disconnectAndJoin` can exercise its cancel + join
+     * + bounded-timeout discipline without spinning up a real Ktor
+     * `webSocket{}` body. Caller MUST cancel/join the job in test teardown
+     * if it is left running after the assertions complete.
+     */
+    internal fun seedReconnectJobForTest(job: Job) {
+        reconnectJob = job
+    }
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 test hook: read the current `reconnectJob`
+     * reference. Used by the disconnect-and-join contract test to assert
+     * that the field is NOT nulled prematurely (must stay non-null until
+     * the bounded join completes per the disconnectAndJoin contract).
+     */
+    internal fun reconnectJobForTest(): Job? = reconnectJob
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 test seam: directly
+     * seed the connect parameters without going through `connect()` so the
+     * "alive loop ⇒ ignore new params" regression test can compare pre/post
+     * field state without launching a real reconnect loop.
+     */
+    internal fun setConnectParamsForTest(
+        relayUrl: String,
+        identityHex: String,
+        signingPubKeyHex: String,
+        socksProxyPort: Int?,
+    ) {
+        this.relayUrl = relayUrl
+        this.identityHex = identityHex
+        this.signingPubKeyHex = signingPubKeyHex
+        this.socksProxyPort = socksProxyPort
+    }
+
+    /** Read seams used by the connect()-param-race regression test. */
+    internal fun relayUrlForTest(): String = relayUrl
+    internal fun identityHexForTest(): String = identityHex
+    internal fun signingPubKeyHexForTest(): String = signingPubKeyHex
+
+    /**
+     * Review amendment P2 test seam: connect()-params-race regression test
+     * sets this to a [CompletableDeferred] BEFORE calling `connect()`. The
+     * connect() body completes the deferred at the moment it takes the
+     * reuse branch (alive reconnect job present, params NOT written) —
+     * exactly where the test wants its assertions to fire. Replaces the
+     * fragile `delay(100)` barrier in the earlier test shape.
+     */
+    @Volatile internal var connectReuseBranchSignalForTest: CompletableDeferred<Unit>? = null
+
+    /**
+     * Review amendment P2 test seam: count of flushPendingOutbox invocations.
+     * The flush-policy regression test uses this to pin that `disconnect`
+     * invokes flush while `disconnectAndJoin` does not.
+     */
+    @Volatile internal var flushPendingOutboxCallsForTest: Int = 0
+
+    /** Test seam exposing the private `sendRaw` so tests can pin the
+     *  null-session contract (`session == null` → return `false`). */
+    internal suspend fun sendRawForTest(message: RelayMessage): Boolean = sendRaw(message)
 }
