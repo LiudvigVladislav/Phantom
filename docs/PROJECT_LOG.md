@@ -19,18 +19,27 @@
 ## Current state
 
 **Released:** `v0.1.0-alpha.1` (tag → commit `0246b50f`, GitHub Release published)
-**Branch state:** `master` is the only active branch; all Alpha 1 feature
-branches merged. Latest commit at the time of writing: `0bc715e1`.
-**Production:** `relay.phntm.pro` running master, `phntm.pro/terms` and
-`/privacy` serving themed HTML in EN + RU.
+**Branch state:** `master` is the integration target; short-lived feature / canary / docs branches are created per track and deleted after merge. Latest commit at the time of writing: `e601cf3b` (PR #328 R3.6 sticky-per-route Fast REST degradation, 2026-06-21).
+**Production:** Round 14 paced padded poll LIVE on `relay.phntm.pro` since 2026-06-16 (`RELAY_POLL_CHUNKED_FLUSH=1` deployed; `chunked_flush=true` confirmed in live traffic). Exact deployed relay commit not pinned here — verify against the VPS startup log if a tie-back is needed. `phntm.pro/terms` and `/privacy` serving themed HTML in EN + RU.
 **Licensing:** AGPL-3.0-or-later established as the formal project
 licence (LICENSE + NOTICE + SPDX headers on every .kt and .rs file +
 README §License — all shipped in the four-commit licence-hygiene
 patch on 2026-04-27).
 
-### What works today (master `8f4c68c9`, 2026-05-21)
+### What works today (master `e601cf3b`, 2026-06-21)
 
-This block reflects the current production state of `master` after the M1w / M2 / H1 / H2 / D-track / REC sprints. The Alpha-1 baseline immediately below is preserved as a historical reference point.
+This block summarizes capabilities present on `master`; production activation is stated per item. Coverage spans the Trek 2 Stage 1.x → 2A → 2B-A → 2B-B → 2B-D long-poll backbone delivery, the Sprint 2b OPK lifecycle + pending/active session work, the T2 carrier-ceiling prekey-publish bug close, the voice transport-independent confirmation, the DWS-UX telemetry baseline + ADR-011 honesty pass, and the R3.6 sticky-per-route Fast REST degradation. Capabilities added or hardened since the 2026-05-21 baseline below:
+
+- ✅ **Trek 2 long-poll backbone LIVE on production** — `RELAY_POLL_HOLD_SECS > 0` and `RELAY_POLL_CHUNKED_FLUSH=1` deployed; Stage 2B-D release flag `LONGPOLL_V2_ENABLED` flipped `"0"` → `"1"` in PR #320 so release APKs activate the Round 14 paced padded poll path (4×1152 byte chunks ~300 ms cadence, canonical `byteCount=4608`). Stage 1.x server prerequisite (`seq_mac` HMAC tag, atomic `RestTokenStore::issue()`, `MAX_POLL_HOLD_SECS_CAP=480` dual-layer clamp, `PER_IDENTITY_HOLD_CAP=3` CAS-bounded) shipped in PR #303. Stage 2B-B client implementation (10 client locks L1-L10) shipped in PR #309.
+- ✅ **OPK lifecycle + pending/active session foundation** — Sprint 2b A/B/C (PRs #315/#316/#317): factory-lambda re-snapshot in `PreKeyApi.publishBundle`, two-phase DEFERRED OPK consume + `opk_reservation` + `pending_ratchet_state` companion + cap-8 LRU + pending-coordinated sweep, runtime promotion + outbound pending-INITIATOR reuse via `bootstrap_artifacts_blob`. ADR-029 added. Stage 2B-D Tele2 LTE integration smoke PASS 2026-06-16 (all three layers — Round 14 wire + Sprint 2a guard + Sprint 2b-C inbound-repair, zero `OpkNotFound` / `fail_mac action=hold` / `promotion=false`).
+- ✅ **T2 carrier-ceiling prekey-publish bug CLOSED** (PR #323) — Two-layer fix: Layer 1 `AndroidNativeOkHttpPreKeyPublishTransport.publish()` unconditional skip-body on 2xx; Layer 2 `PreKeyApiClient.publishWithRetry()` 201 branch synthesises `Stored(storedOpks=0)` on empty body. Post-merge sanity smoke PASS on Tecno Tele2 LTE: 701 ms total wall-time (vs 186 000 ms pre-fix), all 4 FAIL signals = 0. The reliability backbone is now functionally complete for the current alpha surface.
+- ✅ **Voice notes on Tele2 LTE field-confirmed** (PR #325) — ADR-028 §"Layer 3" "voice = REST media" + multi-transport framing 2026-06-09 verified on the media payload. 4 voice notes (9-15 chunks each) sent Tecno ↔ emu over Tele2 LTE, all `message_ready path=AUDIO_LOCAL`, media errors = 0. Voice manifest envelope delivered through the long-poll backbone while the emu did 14 WS ↔ REST mode switches and Tecno hit `ws_ping_timeout_diag=32`.
+- 🟡 **R3.6 sticky-per-route Fast REST degradation merged in PR #328 + field-validated, release-disabled** — Ordered `WsSessionLifecycleEvent` channel with guaranteed enqueue, supervised single-collector dispatcher, sticky-recovery state machine with `lastObservedEpoch` monotonic floor and 60-second `ws_alive_60s` probation. Field-validated 2026-06-21 on Tele2 LTE → Wi-Fi route change: Mode 2 detected at 31 s, 10 dead WS sessions with ZERO flap, two REST deliveries with decrypt OK, exact 60-second Wi-Fi recovery probation, `wifi-A` via `ws_deliver_in` on the recovered Direct. **Release flags `MODE_2_FAST_PATH_ENABLED` and `MODE_2_STICKY_ENABLED` stay literal `"0"` post-merge — R3.6 is INACTIVE on production builds and awaits a separate rollout PR after the next-track reconnect-quiescence work lands.** Debug opt-in via `localOrEnv("fastRestMode2"/"modeSticky", ...)`. NOT a Direct WSS stability fix; protects the user-visible delivery path from `Frame.Text`-driven flap, nothing more.
+- ✅ **DWS-UX telemetry baseline + UX honesty** (PR #327) — `ws_ping_timeout_raw` raw counter, REST overlay actual `TransportKind`, Error-label discriminator (transport-fail vs delivery-fail), `retryWaitingMessages` source field. ZERO actuation in this PR. ADR-011 honesty pass (PR #326) aligns four track docs with the post-PR-R0.4a actuation posture.
+
+### What worked at the 2026-05-21 baseline (master `8f4c68c9`)
+
+This block reflects the production state at the 2026-05-21 baseline, after the M1w / M2 / H1 / H2 / D-track / REC sprints. Capabilities since then are summarised in the "What works today" block above. The Alpha-1 baseline immediately below is preserved as a historical reference point.
 
 - ✅ **End-to-end encrypted 1:1 messaging** — Double Ratchet + Sealed Sender via libsodium; identity-prekey separation per ADR-009 implemented; F22 prekey private-key wrap via Android Keystore (ADR-023 Accepted, PR #56 `d862f3d0`); F8 Double Ratchet state wrap (ADR-024, PR #60 `cc48a333`); H2b idempotent envelope ledger (PR #129 `7008cf3e`) neutralises relay redelivery.
 - ✅ **Multi-transport stack with runtime gating** — three transports plus a fallback layer:
@@ -588,6 +597,56 @@ latency.
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
+
+### 2026-06-21 · R3.6 sticky-per-route Fast REST degradation MERGED on master `e601cf3b` + Tele2 LTE failover and Wi-Fi recovery field PASS
+
+**Goal:** ship R3.6 sticky-per-route on top of the bare 3.6 Fast REST fast-path (`d3935300`) so a single inbound WS `Frame.Text` can no longer flip the mode back from `RestActive` to `WsCandidate` while sticky is armed — closing the flap surface exposed by the 2026-06-18 Tele2 LTE smoke that had produced 18 `candidate_session_regression` cycles in 13 minutes.
+
+**Outcome:** PR #328 squash `e601cf3b`. The R3.6 architecture (originally scoped through R1 → R3.5 → R3.6 impl-locked over five review iterations) introduces an ordered `WsSessionLifecycleEvent` channel (`Channel.UNLIMITED` + `receiveAsFlow` + checked `trySend`) replacing the legacy `wsSessionEnded` SharedFlow; a supervised single-collector dispatcher extracted as `internal class WsSessionLifecycleDispatcher` so unit tests drive the production code path with mock callbacks; a sticky-recovery state machine (`StickyRecoveryState { None, PendingNewSession, InFlight }` + `lastObservedEpoch` monotonic floor + 60-second `ws_alive_60s` probation cleanup hook at the top of `transitionToWsActive`). Field smoke on Tecno BF7-12 over Tele2 LTE → Wi-Fi route change 2026-06-21 01:46-01:54 PASS:
+
+- Mode 2 detected at 31.038 s from WS connect (`mode_switched reason=mode_2_fast_path`), `sticky_armed gen=1` 1 ms later.
+- 10 Mode-2-killed Tele2 WS sessions `gen=1 s=2..s=11` plus `gen=1 s=12` closed locally on the route change. ZERO `candidate_session_regression` and ZERO `mode_switched reason=ws_frame_text_received` across the entire 391-second sticky window.
+- Two control envelopes delivered via REST: `9e83b798` via `inbound_repair_ok promotion=true` (466 ms ingress → decrypt), `a0d26aaf` via plain `DECRYPT_TRACE ok` (142 ms ingress → decrypt).
+- Wi-Fi recovery exact 60.015-second probation: `sticky_recovery_pending reason=route_change` → new WS `gen=2 s=13` 2.376 s later → `sticky_recovery_started reason=new_ws_session ws_epoch=13` +46 ms → `sticky_cleared reason=ws_recovery_proved proof=ws_alive_60s total_suppressed=0 elapsed_ms_since_arm=391301`. Ordering invariant satisfied (pending < started < cleared).
+- `wifi-A` (`c96337a4`) delivered via `RECV_DIAG ws_deliver_in` on the recovered Direct, `inbound_repair_ok promotion=true` 267 ms later.
+- ZERO `LIFECYCLE_CONSUMER_ERROR`, ZERO `fail_mac action=hold`, ZERO `OpkNotFound`.
+
+**NOT_EXERCISED suppression branch.** `total_suppressed=0` in the `sticky_cleared` line. Across 391 s of sticky window and 10 dead WS sessions the WS never delivered a `Frame.Text` during the suppression-eligible state. Unit coverage holds — `WsLifecycleDispatchBehaviourTest` 8 behavioural tests drive the production dispatcher with mock callbacks (R-A bootstrap retry / R-B detector mutex / R-C Connected non-trigger / IMPL-LOCK #4 continue-on-error / `CancellationException` propagation / L7 ordering through real channel→flow→dispatcher); `RestStateMachineTest.cleanup_completes_before_onModeSwitched_so_throw_does_not_leak_sticky` proves the cleanup hook runs before state mutation by transitioning back to RestActive after a throwing callback and asserting a follow-up `WsFrameTextReceived` triggers a real `WsCandidate` transition (would have been suppressed had sticky leaked).
+
+**Side-finding (NOT part of R3.6 contract).** After `sticky_cleared`, the recovered Direct (`gen=2 s=13`) eventually died too — `gen=2 s=14 WebSocket connected successfully` at 01:54:16, ping timeout after 106 s / 5 successful pongs on Wi-Fi. This is a distinct WS-stability signature (NOT Mode 2 — Mode 2 needs zero inbound + 25-65 s duration). Feeds the next reconnect-quiescence / Direct-stability track; not relevant to the R3.6 failover contract.
+
+**Rollout safety.** Release pins `MODE_2_FAST_PATH_ENABLED` and `MODE_2_STICKY_ENABLED` stay literal `"0"` in the release block of `apps/android/build.gradle.kts`. Build-time invariant `require(!(mode2StickyEnabled && !mode2FastPathEnabled))` in `RestStateMachine.init`. Debug opt-in via `localOrEnv("fastRestMode2"/"modeSticky", ...)`. Release pin enforced by `Mode2FastPathReleaseBuildConfigPinTest` and `Mode2StickyReleaseBuildConfigPinTest`.
+
+**Key commits:** master `e601cf3b` (PR #328 squash); branch parent `d3935300` (bare 3.6 fast-path, originally tagged "FAILED on Tele2 LTE 2026-06-19 smoke" but the FAIL was traced to crypto-state contamination from `pm clear` + force-restart in the original runbook, not the 3.6 mechanism — the 2026-06-20 fresh-pair smoke confirmed 3.6 core works).
+
+**Follow-ups:**
+- Reconnect quiescence / backoff for the Direct-side WS-stability signature (NOT Mode 2) — separate next track.
+- Direct WSS Mode 2 root-cause work — research direction, not promotion-blocking.
+- Rollout flip (`MODE_2_FAST_PATH_ENABLED` and `MODE_2_STICKY_ENABLED` release pins `"0"` → `"1"`) — deferred until field evidence accumulates and the reconnect-quiescence track lands.
+
+### 2026-06-20 · 3.6 bare Fast REST fast-path fresh-pair smoke PASS — 2026-06-19 FAIL re-attributed to crypto-state contamination
+
+**Goal:** independently verify whether the 2026-06-19 bare 3.6 Fast REST fast-path smoke FAIL (18 `candidate_session_regression` cycles in 13 minutes) was caused by the 3.6 mechanism itself or by ambient crypto-state contamination from the original runbook's `pm clear` + force-restart sequence.
+
+**Outcome:** fresh-pair smoke on Tecno BF7-12 over Tele2 LTE 2026-06-20 PASS. Pair re-created from a clean slate (Vladislav-led on operator workstation); APK and runbook identical to 2026-06-19 except the harness no longer does `pm clear` between sessions. Mode 2 detected at 31.04 s, ONE real `mode_switched reason=mode_2_fast_path` event (verdict-script counter showed 2 because a telemetry mirror line in `TransportRewalkCoordinator` matched the same grep — discounted), both control envelopes delivered via REST through the `seq_mac_verified loop=wsActivePollLoop` chain (`57cfbbf4` 2.17 s end-to-end, `0a428415` 1.79 s end-to-end), crypto clean (`fail_mac = 0`), ZERO `candidate_session_regression`.
+
+The 18 regressions on 2026-06-18 are now attributed to crypto-state contamination (stale envelope + bootstrap timing collisions producing decrypt failures and reconnects). The raw `Frame.Text` defect (single inbound text in `RestActive` flips state to `WsCandidate` without crypto-outcome inspection) is NOT refuted by this run — simply not activated on the clean pair. R3.6 sticky-per-route remains the correct architectural fix; this smoke just demotes its priority from "blocker on Tele2" to "principled defence". Side-finding: 32 Direct WSS reconnects in 17 minutes — Direct loop costs battery + radio + handshake even when REST safety-net handles every control envelope; feeds the DWS-UX hardening track.
+
+**Two R2.6 runbook bugs identified:**
+- `$id:` PowerShell drive-prefix parse error in the verdict block (`"DECRYPT_TRACE ok msgId=$id:"` is parsed as a drive reference) — fixed in subsequent runbook iterations to `${id}:`.
+- Wrong first-ingress marker: helper greps `REST_TRACE poll_received id=X` but production emits `REST_TRACE seq_mac_verified id=X seq=N loop=wsActivePollLoop` as the first per-id ingress marker on the wsActivePollLoop path.
+
+**Key memory entries:** [project-3-6-fresh-pair-smoke-pass-2026-06-20] (durable verdict); [project-3-6-fast-rest-smoke-fail-2026-06-19] (re-attributed FAIL).
+
+**Follow-ups:** R3.6 sticky-per-route code phase greenlit per architect frame — separate scope-lock work (eventually landing as PR #328 above).
+
+### 2026-06-19 → 2026-06-20 · DWS-UX telemetry baseline + UX honesty fixes shipped (PR #327 squash `929b2072`); ADR-011 honesty pass (PR #326 squash `e05af400`)
+
+**Goal:** ship the first track of the DWS-UX execution plan locked 2026-06-17 — telemetry baseline + UX honesty fixes — with ZERO actuation. Lay the observability foundation for the eventual Direct WSS hardening track without changing user-visible behaviour or transport semantics.
+
+**Outcome:** PR #327 merges the four-piece DWS-UX-1 deliverable: `ws_ping_timeout_raw` raw counter, REST overlay reporting the actual `TransportKind`, Error-label discriminator distinguishing transport failure from delivery failure, and `retryWaitingMessages` source field exposing where the retry decision originates. Hard constraints honoured — NO ACK deadline / inbound stall / quiescence / Recovering suppression / optimistic placeholder / Direct WSS root-cause fix / Calls / TURN / Reality / attachments in this PR. PR #326 follows with the ADR-011 honesty pass, aligning four track docs with the post-PR-R0.4a actuation posture so the documentation no longer claims actuation in places where only observability ships. PR #325 (`63899f1f`, also in this window) is the docs-only voice notes Tele2 LTE smoke PASS evidence carried forward from the 2026-06-17 session.
+
+**Follow-ups:** The 1-week production-observation gate that was originally locked for opening the DWS-1 scope-lock Council was cancelled in the subsequent reconnaissance pass; reconnaissance completed and R3.6 sticky-per-route shipped on top (PR #328). Next step is the reconnect-quiescence track to address the Direct-side WS-stability signature observed in the 2026-06-21 R3.6 field smoke side-finding.
 
 ### 2026-06-17 · Voice notes on Tele2 LTE smoke PASS — voice transport-independent contract empirically confirmed
 
