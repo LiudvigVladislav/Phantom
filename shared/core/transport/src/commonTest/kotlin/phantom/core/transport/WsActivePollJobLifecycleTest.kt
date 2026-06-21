@@ -483,7 +483,7 @@ class WsActivePollJobLifecycleTest {
         // public RestStateMachine API as the orchestrator does:
         // `WsOutboundAckReceived` is the canonical event that puts the
         // machine into WsActive (see `RestStateMachine.kt`).
-        orch.stateMachine.onEvent(RestStateMachine.Event.WsOutboundAckReceived)
+        orch.stateMachine.onEventNow(RestStateMachine.Event.WsOutboundAckReceived)
         runCurrent()
         assertEquals(RestMode.WsActive, orch.stateMachine.state.value)
 

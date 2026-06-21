@@ -938,8 +938,14 @@ class RestFallbackOrchestrator(
         }
     }
 
-    /** Forward an event into the state machine. */
-    fun submitEvent(event: RestStateMachine.Event) {
+    /**
+     * Forward an event into the state machine.
+     *
+     * RC-RECONNECT-QUIESCENCE1 (2026-06-22): SUSPEND so the
+     * state-machine's gate-mutating event handlers can acquire their
+     * single gateLock for atomic compute-then-publish transitions.
+     */
+    suspend fun submitEvent(event: RestStateMachine.Event) {
         stateMachine.onEvent(event)
     }
 

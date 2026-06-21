@@ -641,8 +641,9 @@ class KtorRelayTransport(
     }
 
     /**
-     * Test seam (Vladislav 2026-06-22): deterministic teardown for unit
-     * tests. Cancels every long-lived scope owned by this transport
+     * Test seam (test-lifecycle requirement, 2026-06-22): deterministic
+     * teardown for unit tests. Cancels every long-lived scope owned by
+     * this transport
      * instance ([cleanupScope] + per-generation [scope]) and waits for
      * the in-flight cleanup-counter to drop to zero. Without this,
      * tests that exercise cleanup leave SupervisorJob children alive

@@ -1136,7 +1136,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         check(caps.restFallback)
         // Flip state to RestActive so the legacy pollLoop also spawns.
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
+            orch.submitEventNow(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L,
                     inboundFrames = 0,
@@ -1298,7 +1298,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
+            orch.submitEventNow(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -1415,7 +1415,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
+            orch.submitEventNow(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -1504,7 +1504,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
+            orch.submitEventNow(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -1632,7 +1632,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
+            orch.submitEventNow(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -1763,7 +1763,7 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
+            orch.submitEventNow(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,

@@ -72,28 +72,28 @@ class RestStateMachineTest {
     @Test
     fun two_active_fails_transitions_to_rest_active() {
         val sm = build()
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.WsActive, sm.current, "one fail must not transition")
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
     }
 
     @Test
     fun three_idle_fails_transitions_to_rest_active() {
         val sm = build()
-        sm.onEvent(idleFail())
-        sm.onEvent(idleFail())
+        sm.onEventNow(idleFail())
+        sm.onEventNow(idleFail())
         assertEquals(RestMode.WsActive, sm.current, "two idle fails must not transition")
-        sm.onEvent(idleFail())
+        sm.onEventNow(idleFail())
         assertEquals(RestMode.RestActive, sm.current)
     }
 
     @Test
     fun mixed_one_active_plus_two_idle_does_not_transition() {
         val sm = build()
-        sm.onEvent(activeFail())
-        sm.onEvent(idleFail())
-        sm.onEvent(idleFail())
+        sm.onEventNow(activeFail())
+        sm.onEventNow(idleFail())
+        sm.onEventNow(idleFail())
         assertEquals(
             RestMode.WsActive, sm.current,
             "1 active + 2 idle should not transition — separate counters",
@@ -103,40 +103,40 @@ class RestStateMachineTest {
     @Test
     fun healthy_session_resets_counters() {
         val sm = build()
-        sm.onEvent(activeFail())
-        sm.onEvent(healthyClose())
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
+        sm.onEventNow(healthyClose())
+        sm.onEventNow(activeFail())
         // After reset by healthyClose, one more active fail brings count back to 1.
         assertEquals(RestMode.WsActive, sm.current)
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current, "two fails after reset should now trip")
     }
 
     @Test
     fun network_change_in_ws_active_resets_counters() {
         val sm = build()
-        sm.onEvent(activeFail())
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.WsActive, sm.current, "first fail post-reset doesn't trip")
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
     }
 
     @Test
     fun rest_active_to_candidate_on_frame_text() {
         val sm = build()
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(RestMode.WsCandidate, sm.current)
     }
 
     @Test
     fun rest_active_to_candidate_on_network_change() {
         val sm = build()
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         assertEquals(RestMode.WsCandidate, sm.current)
     }
 
@@ -144,18 +144,18 @@ class RestStateMachineTest {
     fun candidate_to_ws_active_on_60s_alive_tick() {
         val clock = FakeClock()
         val sm = build(clock)
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(RestMode.WsCandidate, sm.current)
 
         // Tick at 30s — too early.
         clock.advance(30_000L)
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
         assertEquals(RestMode.WsCandidate, sm.current, "30s is below commit threshold")
 
         // Tick at 60s — exactly at threshold, must commit.
         clock.advance(30_000L)
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
         assertEquals(RestMode.WsActive, sm.current)
     }
 
@@ -163,46 +163,46 @@ class RestStateMachineTest {
     fun candidate_to_ws_active_on_outbound_ack() {
         val clock = FakeClock()
         val sm = build(clock)
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(RestMode.WsCandidate, sm.current)
 
         // Outbound ACK arrives immediately — should commit without waiting 60s.
-        sm.onEvent(RestStateMachine.Event.WsOutboundAckReceived)
+        sm.onEventNow(RestStateMachine.Event.WsOutboundAckReceived)
         assertEquals(RestMode.WsActive, sm.current)
     }
 
     @Test
     fun candidate_to_rest_active_on_session_close_regression() {
         val sm = build()
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(RestMode.WsCandidate, sm.current)
 
         // Session dies before commit — back to RestActive.
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
     }
 
     @Test
     fun outbound_ack_in_ws_active_resets_counters() {
         val sm = build()
-        sm.onEvent(activeFail())
-        sm.onEvent(RestStateMachine.Event.WsOutboundAckReceived)
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
+        sm.onEventNow(RestStateMachine.Event.WsOutboundAckReceived)
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.WsActive, sm.current, "one fail post-reset doesn't trip")
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
     }
 
     @Test
     fun counters_reset_on_transition_to_rest_active() {
         val sm = build()
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
         // Now switch to candidate, then have a regression.
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
-        sm.onEvent(activeFail()) // regression -> RestActive
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(activeFail()) // regression -> RestActive
         assertEquals(RestMode.RestActive, sm.current)
         // Counters should be 0 again — verified indirectly by going back through
         // candidate and requiring 2 fresh fails from a hypothetical next WsActive.
@@ -211,26 +211,26 @@ class RestStateMachineTest {
     @Test
     fun frame_text_in_ws_active_is_noop() {
         val sm = build()
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(RestMode.WsActive, sm.current, "frame text in WsActive should not transition")
     }
 
     @Test
     fun alive_tick_in_ws_active_is_noop() {
         val sm = build()
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
         assertEquals(RestMode.WsActive, sm.current)
     }
 
     @Test
     fun session_end_in_rest_active_is_noop() {
         val sm = build()
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
         // While in RestActive, additional session ends should not transition.
-        sm.onEvent(activeFail())
+        sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
-        sm.onEvent(idleFail())
+        sm.onEventNow(idleFail())
         assertEquals(RestMode.RestActive, sm.current)
     }
 
@@ -242,7 +242,7 @@ class RestStateMachineTest {
         val sm = RestStateMachine(now = { 0L }, log = { logs += it })
 
         assertEquals(RestMode.WsActive, sm.current)
-        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id1", 10_000L))
+        sm.onEventNow(RestStateMachine.Event.ActiveOutboundAckTimeout("id1", 10_000L))
         assertEquals(RestMode.RestActive, sm.current)
         assertTrue(
             logs.any { it.contains("mode_switched") && it.contains("reason=active_outbound_ack_timeout") },
@@ -255,11 +255,11 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = RestStateMachine(now = { 0L }, log = { logs += it })
         // Drive to RestActive via the threshold path.
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
         assertEquals(RestMode.RestActive, sm.current)
         logs.clear()
 
-        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id2", 10_000L))
+        sm.onEventNow(RestStateMachine.Event.ActiveOutboundAckTimeout("id2", 10_000L))
         assertEquals(RestMode.RestActive, sm.current, "RestActive state must not change")
         assertFalse(
             logs.any { it.contains("mode_switched") },
@@ -272,12 +272,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = RestStateMachine(now = { 0L }, log = { logs += it })
         // Drive to RestActive then to WsCandidate.
-        sm.onEvent(activeFail()); sm.onEvent(activeFail())
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(activeFail()); sm.onEventNow(activeFail())
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
 
-        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id3", 10_000L))
+        sm.onEventNow(RestStateMachine.Event.ActiveOutboundAckTimeout("id3", 10_000L))
         assertEquals(RestMode.WsCandidate, sm.current, "WsCandidate state must not change")
         assertFalse(
             logs.any { it.contains("mode_switched") },
@@ -291,8 +291,8 @@ class RestStateMachineTest {
         val sm = RestStateMachine(now = { 0L }, log = { logs += it })
         assertEquals(RestMode.WsActive, sm.current)
 
-        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("msg-a", 10_000L))
-        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("msg-b", 11_000L))
+        sm.onEventNow(RestStateMachine.Event.ActiveOutboundAckTimeout("msg-a", 10_000L))
+        sm.onEventNow(RestStateMachine.Event.ActiveOutboundAckTimeout("msg-b", 11_000L))
 
         assertEquals(RestMode.RestActive, sm.current)
         val switchCount = logs.count { it.contains("mode_switched") && it.contains("reason=active_outbound_ack_timeout") }
@@ -303,12 +303,12 @@ class RestStateMachineTest {
     fun network_changed_after_ack_timeout_resets_counters_but_transitions_to_ws_candidate() {
         val sm = build()
         // Trigger REST via deadline.
-        sm.onEvent(RestStateMachine.Event.ActiveOutboundAckTimeout("id-x", 10_000L))
+        sm.onEventNow(RestStateMachine.Event.ActiveOutboundAckTimeout("id-x", 10_000L))
         assertEquals(RestMode.RestActive, sm.current)
 
         // NetworkChanged must lift to WsCandidate — same as if we'd arrived
         // via the threshold mechanism. Existing behaviour must not break.
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         assertEquals(
             RestMode.WsCandidate, sm.current,
             "NetworkChanged after RestActive must transition to WsCandidate",
@@ -333,10 +333,10 @@ class RestStateMachineTest {
         val seen = mutableListOf<RestMode>()
         // Read initial value, then snapshot after each event.
         seen += sm.current
-        sm.onEvent(activeFail()); seen += sm.current
-        sm.onEvent(activeFail()); seen += sm.current
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived); seen += sm.current
-        sm.onEvent(RestStateMachine.Event.WsOutboundAckReceived); seen += sm.current
+        sm.onEventNow(activeFail()); seen += sm.current
+        sm.onEventNow(activeFail()); seen += sm.current
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived); seen += sm.current
+        sm.onEventNow(RestStateMachine.Event.WsOutboundAckReceived); seen += sm.current
 
         assertTrue(
             seen == listOf(
@@ -399,7 +399,7 @@ class RestStateMachineTest {
     @Test
     fun mode2_signature_misses_just_below_min_duration() {
         val sm = buildWithFastPath()
-        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MIN_DURATION_MS - 1))
+        sm.onEventNow(mode2Event(durationMs = RestStateMachine.MODE_2_MIN_DURATION_MS - 1))
         assertEquals(
             RestMode.WsActive, sm.current,
             "24_999 ms is one below the lower bound — must NOT fast-path",
@@ -409,7 +409,7 @@ class RestStateMachineTest {
     @Test
     fun mode2_signature_matches_at_exact_min_duration() {
         val sm = buildWithFastPath()
-        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MIN_DURATION_MS))
+        sm.onEventNow(mode2Event(durationMs = RestStateMachine.MODE_2_MIN_DURATION_MS))
         assertEquals(
             RestMode.RestActive, sm.current,
             "25_000 ms is inclusive of the lower bound — must fast-path",
@@ -419,7 +419,7 @@ class RestStateMachineTest {
     @Test
     fun mode2_signature_matches_at_exact_max_duration() {
         val sm = buildWithFastPath()
-        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MAX_DURATION_MS))
+        sm.onEventNow(mode2Event(durationMs = RestStateMachine.MODE_2_MAX_DURATION_MS))
         assertEquals(
             RestMode.RestActive, sm.current,
             "65_000 ms is inclusive of the upper bound — must fast-path",
@@ -429,7 +429,7 @@ class RestStateMachineTest {
     @Test
     fun mode2_signature_misses_just_above_max_duration() {
         val sm = buildWithFastPath()
-        sm.onEvent(mode2Event(durationMs = RestStateMachine.MODE_2_MAX_DURATION_MS + 1))
+        sm.onEventNow(mode2Event(durationMs = RestStateMachine.MODE_2_MAX_DURATION_MS + 1))
         assertEquals(
             RestMode.WsActive, sm.current,
             "65_001 ms is one above the upper bound — must NOT fast-path",
@@ -439,7 +439,7 @@ class RestStateMachineTest {
     @Test
     fun mode2_signature_misses_when_ping_timeout_flag_false() {
         val sm = buildWithFastPath()
-        sm.onEvent(mode2Event(okhttpPingTimeoutDetected = false))
+        sm.onEventNow(mode2Event(okhttpPingTimeoutDetected = false))
         assertEquals(
             RestMode.WsActive, sm.current,
             "absent ping-timeout signal MUST NOT fast-path even if other " +
@@ -451,7 +451,7 @@ class RestStateMachineTest {
     @Test
     fun mode2_signature_misses_when_inbound_frames_positive() {
         val sm = buildWithFastPath()
-        sm.onEvent(mode2Event(inboundFrames = 1))
+        sm.onEventNow(mode2Event(inboundFrames = 1))
         assertEquals(
             RestMode.WsActive, sm.current,
             "any positive inboundFrames is a healthy session signal — " +
@@ -465,7 +465,7 @@ class RestStateMachineTest {
     fun mode2_first_match_with_flag_on_triggers_fast_path() {
         val logs = mutableListOf<String>()
         val sm = buildWithFastPath(logSink = logs)
-        sm.onEvent(mode2Event())
+        sm.onEventNow(mode2Event())
         assertEquals(RestMode.RestActive, sm.current)
         assertTrue(
             logs.any { it.contains("mode_switched") && it.contains("mode_2_fast_path") },
@@ -477,15 +477,15 @@ class RestStateMachineTest {
     fun mode2_first_match_with_flag_off_increments_idle_counter() {
         val sm = buildWithFastPath(mode2FastPathEnabled = false)
         // Matched-signature event with idle classification (pending == 0).
-        sm.onEvent(mode2Event())
+        sm.onEventNow(mode2Event())
         assertEquals(
             RestMode.WsActive, sm.current,
             "with flag off, single matched event must NOT transition — " +
                 "must fall through to existing IDLE_FAIL_THRESHOLD counter",
         )
         // Two more idle fails complete the existing 3-cycle threshold.
-        sm.onEvent(idleFail())
-        sm.onEvent(idleFail())
+        sm.onEventNow(idleFail())
+        sm.onEventNow(idleFail())
         assertEquals(
             RestMode.RestActive, sm.current,
             "existing IDLE_FAIL_THRESHOLD = 3 path must still work with " +
@@ -497,7 +497,7 @@ class RestStateMachineTest {
     fun mode2_telemetry_fires_with_action_fast_path_when_flag_on() {
         val logs = mutableListOf<String>()
         val sm = buildWithFastPath(logSink = logs)
-        sm.onEvent(mode2Event())
+        sm.onEventNow(mode2Event())
         assertTrue(
             logs.any {
                 it.contains("mode_2_signature_matched") && it.contains("action=fast_path")
@@ -511,7 +511,7 @@ class RestStateMachineTest {
     fun mode2_telemetry_fires_with_action_observe_only_when_flag_off() {
         val logs = mutableListOf<String>()
         val sm = buildWithFastPath(mode2FastPathEnabled = false, logSink = logs)
-        sm.onEvent(mode2Event())
+        sm.onEventNow(mode2Event())
         assertTrue(
             logs.any {
                 it.contains("mode_2_signature_matched") && it.contains("action=observe_only")
@@ -528,17 +528,17 @@ class RestStateMachineTest {
         // Drive to RestActive via existing 3-idle threshold (NOT fast-path
         // — use plain idleFail() with okhttpPingTimeoutDetected=false so
         // signature does NOT match).
-        sm.onEvent(idleFail())
-        sm.onEvent(idleFail())
-        sm.onEvent(idleFail())
+        sm.onEventNow(idleFail())
+        sm.onEventNow(idleFail())
+        sm.onEventNow(idleFail())
         assertEquals(RestMode.RestActive, sm.current)
         // RestActive → WsCandidate via Frame.Text.
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(RestMode.WsCandidate, sm.current)
         // WsCandidate close (regardless of Mode-2 signature) → RestActive
         // via existing regression path; fast-path never executes from
         // WsCandidate state.
-        sm.onEvent(mode2Event())
+        sm.onEventNow(mode2Event())
         assertEquals(
             RestMode.RestActive, sm.current,
             "WsCandidate regression path must still hit transitionToRest " +
@@ -551,7 +551,7 @@ class RestStateMachineTest {
     fun mode1_like_healthy_close_does_not_trigger_fast_path() {
         val sm = buildWithFastPath()
         // Mode-1 8-pong rhythm: lifetime > 65_000 ms, inboundFrames > 0.
-        sm.onEvent(
+        sm.onEventNow(
             RestStateMachine.Event.WsSessionEnded(
                 durationMs = 150_000L,
                 inboundFrames = 5,
@@ -574,12 +574,12 @@ class RestStateMachineTest {
         // existing code classifies this as an ACTIVE fail, not idle.
         // With the fast-path gate OFF, the state machine must still
         // honour the existing ACTIVE_FAIL_THRESHOLD = 2 path.
-        sm.onEvent(mode2Event(pendingAcksAtClose = 1))
+        sm.onEventNow(mode2Event(pendingAcksAtClose = 1))
         assertEquals(
             RestMode.WsActive, sm.current,
             "one active fail must not transition under existing threshold",
         )
-        sm.onEvent(mode2Event(pendingAcksAtClose = 1))
+        sm.onEventNow(mode2Event(pendingAcksAtClose = 1))
         assertEquals(
             RestMode.RestActive, sm.current,
             "with flag off, ACTIVE_FAIL_THRESHOLD = 2 path must still work " +
@@ -591,7 +591,7 @@ class RestStateMachineTest {
     fun mode2_matched_signature_telemetry_format_is_locked() {
         val logs = mutableListOf<String>()
         val sm = buildWithFastPath(logSink = logs)
-        sm.onEvent(
+        sm.onEventNow(
             mode2Event(
                 durationMs = 42_000L,
                 inboundFrames = 0,
@@ -627,7 +627,7 @@ class RestStateMachineTest {
 
     // Drive to RestActive via Mode-2 fast path to arm sticky.
     private fun driveToStickyRestActive(sm: RestStateMachine) {
-        sm.onEvent(mode2Event())
+        sm.onEventNow(mode2Event())
         assertEquals(RestMode.RestActive, sm.current, "must be RestActive after Mode-2 fast-path")
     }
 
@@ -651,7 +651,7 @@ class RestStateMachineTest {
     fun test2_frame_text_suppressed_in_rest_active_while_sticky_armed() {
         val sm = buildWithSticky()
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(
             RestMode.RestActive, sm.current,
             "ws_frame_text_received MUST be suppressed while sticky armed in RestActive",
@@ -666,7 +666,7 @@ class RestStateMachineTest {
         val sm = buildWithSticky(logSink = logs)
         driveToStickyRestActive(sm)
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertTrue(
             logs.any { it.contains("sticky_frame_suppressed") && it.contains("gen=1") },
             "sticky_frame_suppressed must log exactly once per gen; logs=$logs",
@@ -680,9 +680,9 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         val countBefore = logs.count { it.contains("sticky_frame_suppressed") }
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         val countAfter = logs.count { it.contains("sticky_frame_suppressed") }
         assertEquals(countBefore, countAfter, "sticky_frame_suppressed must only log ONCE per gen")
     }
@@ -695,7 +695,7 @@ class RestStateMachineTest {
         val sm = buildWithSticky(logSink = logs)
         driveToStickyRestActive(sm)
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         assertEquals(RestMode.RestActive, sm.current, "must stay RestActive after pending-phase network change")
         assertTrue(
             logs.any { it.contains("sticky_recovery_pending") && it.contains("reason=route_change") },
@@ -711,9 +711,9 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current, "InFlight must transition to WsCandidate for probation")
         assertTrue(
             logs.any { it.contains("sticky_recovery_started") && it.contains("ws_epoch=2") },
@@ -729,12 +729,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         // Advance 60 s and tick.
         clock.advance(60_000L)
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
         assertEquals(RestMode.WsActive, sm.current, "ws_alive_60s must transition to WsActive")
         assertTrue(
             logs.any { it.contains("sticky_cleared") && it.contains("proof=ws_alive_60s") },
@@ -750,11 +750,11 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.WsOutboundAckReceived)
+        sm.onEventNow(RestStateMachine.Event.WsOutboundAckReceived)
         assertEquals(
             RestMode.WsCandidate, sm.current,
             "ws_outbound_ack MUST NOT clear sticky during InFlight (not a proof signal)",
@@ -773,12 +773,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
         // Recovery candidate dies.
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 5_000L, inboundFrames = 0, pendingAcksAtClose = 0,
             okhttpPingTimeoutDetected = false, sessionEpoch = 2L,
         ))
@@ -797,12 +797,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
         // Close from OLD session (epoch 1 != recovery epoch 2).
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 31_000L, inboundFrames = 0, pendingAcksAtClose = 0,
             okhttpPingTimeoutDetected = true, sessionEpoch = 1L,
         ))
@@ -821,7 +821,7 @@ class RestStateMachineTest {
         val sm = buildWithSticky(logSink = logs)
         driveToStickyRestActive(sm)
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = false))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = false))
         assertEquals(RestMode.RestActive, sm.current, "sticky_kept must remain in RestActive")
         assertTrue(
             logs.any { it.contains("sticky_kept") && it.contains("reason=validated_change") },
@@ -837,23 +837,23 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         // Advance 30 s — half-way to ws_alive_60s.
         clock.advance(30_000L)
         // Second new session arrives.
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 3L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 3L))
         assertTrue(
             logs.any { it.contains("sticky_recovery_restarted") && it.contains("new_epoch=3") },
             "sticky_recovery_restarted must fire with new_epoch=3; logs=$logs",
         )
         // Tick at 30 s after second connect — should NOT clear sticky (timer was reset).
         clock.advance(30_000L)
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
         assertEquals(RestMode.WsCandidate, sm.current, "timer must have been reset by second connect")
         // Tick at 60 s after second connect — should clear sticky.
         clock.advance(30_000L)
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
         assertEquals(RestMode.WsActive, sm.current, "sticky must clear at 60s from second connect")
     }
 
@@ -864,7 +864,7 @@ class RestStateMachineTest {
         val sm = buildWithSticky()
         driveToStickyRestActive(sm)
         assertEquals(RestMode.RestActive, sm.current, "pre-condition: must be in RestActive")
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         assertEquals(RestMode.RestActive, sm.current, "must STAY in RestActive after pending")
     }
 
@@ -874,7 +874,7 @@ class RestStateMachineTest {
     fun test14_fast_path_without_sticky_does_not_arm_sticky() {
         val logs = mutableListOf<String>()
         val sm = buildWithFastPath(logSink = logs)  // sticky NOT enabled
-        sm.onEvent(mode2Event())
+        sm.onEventNow(mode2Event())
         assertEquals(RestMode.RestActive, sm.current, "fast-path must still fire")
         assertFalse(
             logs.any { it.contains("sticky_armed") },
@@ -889,12 +889,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(logSink = logs)
         // Two active fails (not mode-2 signature) then a network change.
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 31_000L, inboundFrames = 0, pendingAcksAtClose = 1,
             sessionEpoch = 0L,
         ))
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         // Counter reset should fire because activeFailCount == 1 > 0.
         assertTrue(
             logs.any { it.contains("counters_reset") && it.contains("reason=network_changed") },
@@ -926,10 +926,10 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         logs.clear()
         // Second route change while still in PendingNewSession.
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         assertTrue(
             logs.any { it.contains("sticky_recovery_pending_restarted") },
             "sticky_recovery_pending_restarted must fire on duplicate route change; logs=$logs",
@@ -943,11 +943,11 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         assertTrue(
             logs.any { it.contains("sticky_recovery_restarted") &&
                 it.contains("reason=route_change_during_recovery") },
@@ -962,12 +962,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
         // Stale connected with epoch <= lastObservedEpoch.
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
         assertTrue(
             logs.any { it.contains("sticky_recovery_stale_connect_ignored") },
             "sticky_recovery_stale_connect_ignored must fire; logs=$logs",
@@ -981,12 +981,12 @@ class RestStateMachineTest {
     fun test20_non_sticky_outbound_ack_in_ws_active_still_resets_counters() {
         // Without sticky: outbound ack still resets counters.
         val sm = buildWithFastPath()
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 31_000L, inboundFrames = 0, pendingAcksAtClose = 1,
             sessionEpoch = 0L,
         ))
-        sm.onEvent(RestStateMachine.Event.WsOutboundAckReceived)
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsOutboundAckReceived)
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 31_000L, inboundFrames = 0, pendingAcksAtClose = 1,
             sessionEpoch = 0L,
         ))
@@ -1007,9 +1007,9 @@ class RestStateMachineTest {
             mode2FastPathEnabled = false,
             mode2StickyEnabled = false,
         )
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(42L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(42L))
         logs.clear()
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(41L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(41L))
         assertTrue(
             logs.any { it.contains("sticky_recovery_stale_connect_ignored") },
             "Stale epoch filter must fire even without sticky enabled; logs=$logs",
@@ -1023,10 +1023,10 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(logSink = logs)
         // Baseline: epoch 42 observed.
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(42L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(42L))
         logs.clear()
         // Stale: 41 <= 42.
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(41L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(41L))
         assertTrue(
             logs.any { it.contains("sticky_recovery_stale_connect_ignored") &&
                 it.contains("last_observed_epoch=42") && it.contains("event_epoch=41") },
@@ -1035,11 +1035,11 @@ class RestStateMachineTest {
 
         // Now arm sticky + put into PendingNewSession.
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         assertEquals(RestMode.RestActive, sm.current)
         logs.clear()
         // Send the SAME stale epoch — must still be ignored; PendingNewSession must stay.
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(41L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(41L))
         assertTrue(
             logs.any { it.contains("sticky_recovery_stale_connect_ignored") },
             "stale_connect_ignored must fire even in PendingNewSession; logs=$logs",
@@ -1055,11 +1055,11 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         // Ended for the same epoch — recovery fails.
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 5_000L, inboundFrames = 0, pendingAcksAtClose = 0,
             okhttpPingTimeoutDetected = false, sessionEpoch = 2L,
         ))
@@ -1078,12 +1078,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
         // Stale Ended from old session (epoch 1 != recoveryWsEpoch 2).
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 31_000L, inboundFrames = 0, pendingAcksAtClose = 0,
             okhttpPingTimeoutDetected = true, sessionEpoch = 1L,
         ))
@@ -1106,13 +1106,13 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         val t0 = clock.nowMs
 
         // 30 s in: recovery candidate dies.
         clock.advance(30_000L)
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 30_000L, inboundFrames = 0, pendingAcksAtClose = 0,
             okhttpPingTimeoutDetected = false, sessionEpoch = 2L,
         ))
@@ -1121,7 +1121,7 @@ class RestStateMachineTest {
 
         // 65 s in: timer tick fires (would have been the proof window).
         clock.advance(35_000L)
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
         // onAliveTick early-returns because state != WsCandidate.
         assertFalse(
             logs.any { it.contains("sticky_cleared") },
@@ -1152,7 +1152,7 @@ class RestStateMachineTest {
     fun test24_ws_session_connected_carries_epoch() {
         val sm = buildWithSticky()
         // No exception; epoch arrives correctly.
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 99L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 99L))
         // State is WsActive (no sticky armed yet, None state), so it returns early.
         assertEquals(RestMode.WsActive, sm.current, "outside recovery context, Connected is a no-op on state")
     }
@@ -1165,12 +1165,12 @@ class RestStateMachineTest {
         val logs = mutableListOf<String>()
         val sm = buildWithSticky(clock = clock, logSink = logs)
         driveToStickyRestActive(sm)
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
         logs.clear()
         // Ended with sentinel epoch -1L (legacy/unknown) — this is a stale close (epoch mismatch: -1 != 2).
-        sm.onEvent(RestStateMachine.Event.WsSessionEnded(
+        sm.onEventNow(RestStateMachine.Event.WsSessionEnded(
             durationMs = 31_000L, inboundFrames = 0, pendingAcksAtClose = 0,
             sessionEpoch = -1L,
         ))
@@ -1212,15 +1212,15 @@ class RestStateMachineTest {
         // Arm sticky via Mode-2 fast-path.
         driveToStickyRestActive(sm)
         // Route change → PendingNewSession.
-        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        sm.onEventNow(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         // New WS session → InFlight.
-        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
+        sm.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 2L))
         assertEquals(RestMode.WsCandidate, sm.current)
 
         // Advance past 60 s and trigger the alive tick.
         clock.advance(60_001L)
         val threw = try {
-            sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+            sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
             false
         } catch (_: IllegalStateException) {
             true
@@ -1244,7 +1244,7 @@ class RestStateMachineTest {
             "Post-throw state must be WsActive because cleanup + state mutation completed " +
                 "before the callback threw",
         )
-        sm.onEvent(
+        sm.onEventNow(
             RestStateMachine.Event.ActiveOutboundAckTimeout(
                 msgId = "m-cleanup-probe",
                 ageMs = 11_000L,
@@ -1255,7 +1255,7 @@ class RestStateMachineTest {
             "ActiveOutboundAckTimeout must transition the machine to RestActive without arming sticky",
         )
         val logsBeforeProbe = logs.size
-        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived)
+        sm.onEventNow(RestStateMachine.Event.WsFrameTextReceived)
         assertEquals(
             RestMode.WsCandidate, sm.current,
             "Sticky must be CLEARED behaviourally: a raw Frame.Text in RestActive must " +

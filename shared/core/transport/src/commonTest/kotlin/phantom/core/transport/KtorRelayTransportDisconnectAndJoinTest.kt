@@ -50,7 +50,7 @@ import kotlin.test.assertTrue
 class KtorRelayTransportDisconnectAndJoinTest {
 
     /**
-     * Vladislav 2026-06-22 hang-diagnosis directive: every transport
+     * Test lifecycle requirement (2026-06-22): every transport
      * created in a test gets registered here and drained by
      * [closeAllTransports] in [@AfterTest][AfterTest]. Without this,
      * the Gradle test JVM accumulates SupervisorJob roots across tests
@@ -726,8 +726,9 @@ private class StubbornNeverCompletingJob {
     suspend fun releaseForTeardown() {
         release.complete(Unit)
         runCatching { job.cancelAndJoin() }
-        // Vladislav 2026-06-22: also cancel the fixture's own scope so
-        // it does not leak into the Gradle test JVM across tests.
+        // Test lifecycle requirement (2026-06-22): also cancel the
+        // fixture's own scope so it does not leak into the Gradle test
+        // JVM across tests.
         runCatching { scope.cancel() }
     }
 }
