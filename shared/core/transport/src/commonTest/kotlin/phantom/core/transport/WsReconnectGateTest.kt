@@ -876,12 +876,17 @@ class WsReconnectGateTest {
         assertEquals("ws_alive_60s", wsActiveCallbacks.single().third)
     }
 
-    // ── Test 20: full Mode 2 → quiescence → recovery lifecycle ──────────────
+    // ── State-machine lifecycle anchor (predecessor of integration Test 20) ─
 
     @Test
-    fun test_20_full_mode2_quiescence_recovery_lifecycle() = runBlocking {
-        // Locked Test 20 (Vladislav 2026-06-22) — state-machine-level
-        // end-to-end of the quiescence lifecycle:
+    fun state_machine_quiescence_recovery_lifecycle() = runBlocking {
+        // State-machine-level anchor for the locked Test 20 lifecycle.
+        // The FULL integration Test 20 (HybridRelayTransport pending-WS
+        // outbox migration into REST + REST acceptance + pending stores
+        // cleared + no duplicate WS re-send) is in
+        // `HybridRelayTransportIntegrationTest20.kt`; the test below
+        // pins ONLY the state-machine transitions so the lifecycle
+        // contract is observable without a full transport fixture.
         //   1. Mode 2 silent-drop session ends → fast-path REST + sticky armed
         //      → gate flips Open → Quiesced.
         //   2. During quiescence the state machine stays in RestActive
@@ -991,6 +996,60 @@ class WsReconnectGateTest {
         assertTrue(
             captured.none { it.contains(rawTokenStr) },
             "no raw token value in any log line; got entries containing rawToken=${captured.filter { it.contains(rawTokenStr) }}",
+        )
+    }
+
+    @Test
+    fun new_probe_gets_full_budget_when_residual_count_persisted_into_Quiesced() = runBlocking {
+        // Test gap #2 strengthening (2026-06-22). The existing
+        // `new_probe_gets_full_budget_after_partially_used_previous_probe`
+        // passes through `WsSessionConnected → CandidateProving`
+        // which auto-resets `probeAttemptCount` to 0 in the
+        // ProbeClaimed → CandidateProving transition. That means the
+        // assertion at the end (Probe B gets full 5-attempt budget)
+        // would PASS even if the `issueProbeAfterRewalk`-side reset
+        // were absent.
+        //
+        // This variant uses [setResidualProbeStateForTest] to construct
+        // the EXACT residual state the new defensive reset defends
+        // against: gate manually placed in Quiesced with a non-zero
+        // `probeAttemptCount`. Without the new
+        // `probeAttemptCount = 0` inside `issueProbeAfterRewalk`,
+        // Probe B would exhaust after 5 - 3 = 2 attempts and this
+        // test would fail.
+        val sm = newSm(tokenSequence = listOf(0x1111L))
+        armSticky(sm)
+        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        // Construct the residual state: Quiesced + non-zero count.
+        sm.setResidualProbeStateForTest(
+            gate = WsReconnectGate.Quiesced(stickyGen = 1),
+            probeAttemptCount = 3,
+        )
+        assertEquals(3, sm.probeAttemptCountForTest(), "residual state seeded")
+
+        // Issue a fresh probe. The defensive reset inside
+        // `issueProbeAfterRewalk` MUST drop the counter back to 0.
+        val routeEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
+        sm.issueProbeAfterRewalk(routeEpoch)
+        assertEquals(
+            0, sm.probeAttemptCountForTest(),
+            "issueProbeAfterRewalk MUST reset probeAttemptCount to 0; got ${sm.probeAttemptCountForTest()}",
+        )
+
+        // Claim probe and burn the full 5-attempt budget.
+        val owner = sm.allocateConnectionGeneration()
+        val claim = sm.awaitAndClaimProbe(ownerGeneration = owner) as ClaimResult.Claimed
+        repeat(4) { i ->
+            sm.recordProbeAttemptFailed(permit = claim.probe, reason = "burn_${i + 1}")
+            assertTrue(
+                sm.gate.value is WsReconnectGate.ProbeClaimed,
+                "attempt ${i + 1} of 5 MUST NOT exhaust budget; got ${sm.gate.value}",
+            )
+        }
+        sm.recordProbeAttemptFailed(permit = claim.probe, reason = "burn_5")
+        assertTrue(
+            sm.gate.value is WsReconnectGate.Quiesced,
+            "5th attempt MUST exhaust the FULL budget (not 5-3=2); got ${sm.gate.value}",
         )
     }
 

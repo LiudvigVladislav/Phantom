@@ -52,6 +52,19 @@ kotlin {
         val androidUnitTest by getting {
             dependencies {
                 implementation(kotlin("test"))
+                // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-1 (2026-06-22).
+                // `HybridRelayTransportIntegrationTest20` needs to call
+                // `internal` test seams on `KtorRelayTransport` /
+                // `RestStateMachine` that live in a different Gradle module.
+                // Rather than re-publishing those seams as public API surface
+                // (test backdoors leaking into debug/beta APK), the test
+                // reaches them through `kotlin.reflect.full.callSuspend`. The
+                // seams stay `internal` so they are not reachable as
+                // Kotlin source-level API from a sibling module — reflection
+                // bypasses source-level visibility, but the reflection
+                // bridge file lives only in `androidUnitTest`, which is
+                // excluded from any APK.
+                implementation(kotlin("reflect"))
                 implementation(project(":shared:core:transport"))
             }
         }

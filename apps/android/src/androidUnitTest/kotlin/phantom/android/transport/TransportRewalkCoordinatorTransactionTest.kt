@@ -450,6 +450,120 @@ class TransportRewalkCoordinatorTransactionTest {
         assertTrue(prefs.lastSuccessAt != null, "lastSuccessAt preserved")
     }
 
+    /**
+     * Strengthened variant of [TracingGate] whose revoke methods
+     * SUSPEND BEFORE writing the call log. This actually exercises the
+     * `withContext(NonCancellable)` wrap in
+     * [TransportRewalkCoordinator]'s catch path — without a real
+     * suspension point, the non-NonCancellable shape would still
+     * "complete" the revoke synchronously and the test would pass
+     * regardless of the wrap. With the suspension, a cancelled parent
+     * would throw CE on entry to `yield()` and the revoke would
+     * NEVER record its log line.
+     */
+    private class SuspendingRevokeGate(
+        private val log: CallLog,
+        initialGate: WsReconnectGate = WsReconnectGate.Quiesced(stickyGen = 1),
+    ) : RewalkCoordinatorGateProvider {
+        private val _gate = MutableStateFlow(initialGate)
+        override val gate: StateFlow<WsReconnectGate> = _gate.asStateFlow()
+        var routeEpoch = 0L
+            private set
+        var issueResult: ProbeIssueResult = ProbeIssueResult.ProbeIssued(ProbeToken(0xCAFEL))
+
+        override suspend fun beginRouteChange(clearsMode2Sticky: Boolean): RouteChangeOutcome {
+            val current = _gate.value
+            return when {
+                current is WsReconnectGate.Open -> {
+                    routeEpoch += 1
+                    log.add("beginRouteChange:$routeEpoch")
+                    log.add("outcome:OpenReconnect:cms=$clearsMode2Sticky")
+                    RouteChangeOutcome.OpenReconnect(routeEpoch)
+                }
+                !clearsMode2Sticky -> {
+                    log.add("beginRouteChange:$routeEpoch")
+                    log.add("outcome:QuiescencePreserved:cms=$clearsMode2Sticky")
+                    RouteChangeOutcome.QuiescencePreserved(routeEpoch)
+                }
+                else -> {
+                    routeEpoch += 1
+                    log.add("beginRouteChange:$routeEpoch")
+                    log.add("outcome:StickyRecovery:cms=$clearsMode2Sticky")
+                    RouteChangeOutcome.StickyRecovery(routeEpoch)
+                }
+            }
+        }
+        override suspend fun revokeRouteChange(routeEpoch: Long, reason: String) {
+            // REAL suspension point — without `withContext(NonCancellable)`
+            // wrap in the catch, this `yield()` would throw CE on a
+            // cancelled parent, and `log.add` would NEVER fire.
+            kotlinx.coroutines.yield()
+            log.add("revokeRouteChange:$routeEpoch:$reason")
+        }
+        override suspend fun issueProbeAfterRewalk(routeEpoch: Long): ProbeIssueResult {
+            log.add("issueProbeAfterRewalk:$routeEpoch")
+            return issueResult
+        }
+        override suspend fun revokeProbe(routeEpoch: Long, reason: String) {
+            // REAL suspension point — see revokeRouteChange comment above.
+            kotlinx.coroutines.yield()
+            log.add("revokeProbe:$routeEpoch:$reason")
+        }
+    }
+
+    @Test
+    fun real_cancellation_with_suspending_revokeProbe_still_completes_via_NonCancellable() = runBlocking {
+        // Test gap #1 strengthening (2026-06-22). The original
+        // `real_job_cancellation_in_restart_callback_still_revokes_probe_via_NonCancellable`
+        // test used a [TracingGate] whose `revokeProbe` was a pure
+        // `log.add(...)` with no suspension. Without the
+        // `withContext(NonCancellable)` wrap, that test would have
+        // passed anyway because the cancelled parent's CE never had
+        // a suspension point to fire on.
+        //
+        // This variant uses [SuspendingRevokeGate] whose revoke methods
+        // `yield()` BEFORE writing the log. The NonCancellable wrap is
+        // now the SOLE reason the revoke completes — remove it and
+        // the test would fail.
+        val log = CallLog()
+        val gate = SuspendingRevokeGate(log)
+        val hybrid = TracingHybrid(log)
+        val prefs = InMemoryPrefs()
+        val rewalkScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            .also { livingScopes.add(it) }
+        lateinit var coord: TransportRewalkCoordinator
+        coord = TransportRewalkCoordinator(
+            scope = rewalkScope,
+            transportPreferences = prefs,
+            releaseTransport = { log.add("release") },
+            hybridTransportProvider = { hybrid },
+            requestServiceRestart = { reason ->
+                log.add("requestServiceRestart:${reason.name}")
+                val jobField = coord.javaClass.getDeclaredField("currentRewalkJob").apply {
+                    isAccessible = true
+                }
+                val job = jobField.get(coord) as? kotlinx.coroutines.Job
+                job?.cancel(CancellationException("test cancel from restart"))
+                throw CancellationException("test cancel from restart")
+            },
+            nowMs = { 1_000L },
+            gateCoordinator = gate,
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        assertTrue(log.contains("issueProbeAfterRewalk:1"))
+        // The KEY assertion: the SUSPENDING revoke still completed.
+        // Remove the `withContext(NonCancellable)` wrap and the
+        // `yield()` inside `revokeProbe` would throw CE before
+        // `log.add("revokeProbe:...")` runs.
+        assertTrue(
+            log.contains("revokeProbe:1:service_restart_cancelled"),
+            "suspending revokeProbe MUST complete via NonCancellable wrap; got ${log.snapshot()}",
+        )
+    }
+
     @Test
     fun real_job_cancellation_in_restart_callback_still_revokes_probe_via_NonCancellable() = runBlocking {
         // P1 (ninth round, 2026-06-22): the catch (CancellationException)

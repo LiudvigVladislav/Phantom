@@ -644,6 +644,32 @@ class HybridRelayTransport(
     }
 
     /**
+     * Integration Test 20 seam (2026-06-22). Production sets
+     * `restCapabilityActive = true` only after [bootstrapAndStart]
+     * completes (which performs a full REST `/auth/session` round
+     * trip). Integration tests cannot stand up a live relay, so this
+     * seam lets the test pre-set the flag and exercise the
+     * `submitStateEvent → maybeArmMigrationLocked → migratePendingWsToRest`
+     * path directly.
+     *
+     * Internal so production callers cannot reach it; the flag's
+     * production-side write-once contract is unchanged.
+     */
+    internal fun setRestCapabilityActiveForTest(active: Boolean) {
+        restCapabilityActive = active
+    }
+
+    /**
+     * Integration Test 20 seam (2026-06-22). Awaits the migration
+     * coroutine spawned by [maybeArmMigrationLocked] so the test can
+     * synchronously observe the post-migration state of the WS
+     * pending stores.
+     */
+    internal suspend fun awaitMigrationDoneForTest() {
+        migrationJob?.join()
+    }
+
+    /**
      * Switch the wrapper into REST-fallback-aware mode. Idempotent — safe
      * to call from a retry path.
      *

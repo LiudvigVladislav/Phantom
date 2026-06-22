@@ -218,6 +218,29 @@ class RestStateMachine(
      */
     private var probeAttemptCount: Int = 0
 
+    /**
+     * Test gap #2 strengthening (2026-06-22). Direct seam to mutate
+     * `probeAttemptCount` and `_gate.value` without going through
+     * the public API. Used by the residual-count regression
+     * test: the existing
+     * `new_probe_gets_full_budget_after_partially_used_previous_probe`
+     * passes through `WsSessionConnected` which auto-resets the
+     * counter, so it cannot prove that the `issueProbeAfterRewalk`
+     * reset actually fires. This seam constructs the exact residual
+     * state the reset defends against.
+     */
+    internal suspend fun setResidualProbeStateForTest(
+        gate: WsReconnectGate,
+        probeAttemptCount: Int,
+    ) {
+        gateLock.withLock {
+            this.probeAttemptCount = probeAttemptCount
+            _gate.value = gate
+        }
+    }
+
+    internal suspend fun probeAttemptCountForTest(): Int = gateLock.withLock { probeAttemptCount }
+
     /** Convenience accessor. */
     val current: RestMode
         get() = _state.value

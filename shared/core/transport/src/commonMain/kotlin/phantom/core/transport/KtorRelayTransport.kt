@@ -684,17 +684,27 @@ class KtorRelayTransport(
      * past the test's `runBlocking` exit, accumulating in the Gradle
      * test JVM and eventually hanging the worker.
      */
-    internal suspend fun closeForTest(awaitInflightTimeoutMs: Long = 5_000L) {
+    /**
+     * Returns `true` iff the per-instance scopes were cancelled AND
+     * the `cleanupInflight` counter reached `0` within
+     * [awaitInflightTimeoutMs]. Returns `false` on timeout —
+     * fix-round-3 (2026-06-22) makes this signal explicit so the
+     * caller can fail loudly instead of accumulating zombie
+     * cleanup-scope tasks across tests.
+     */
+    internal suspend fun closeForTest(awaitInflightTimeoutMs: Long = 5_000L): Boolean {
         runCatching { scope?.cancel() }
         runCatching { cleanupScope.cancel() }
         // Wait for the cleanup-inflight counter to drop. The cancelled
         // cleanupScope frees in-flight launches via their CE-catching
         // finally block (`cleanupInflight--`).
-        withTimeoutOrNull(awaitInflightTimeoutMs) {
+        val drained = withTimeoutOrNull(awaitInflightTimeoutMs) {
             while (cleanupInflightForTest() > 0) {
                 delay(10)
             }
-        }
+            true
+        } ?: false
+        return drained && cleanupInflightForTest() == 0
     }
 
     /**
@@ -705,6 +715,23 @@ class KtorRelayTransport(
      * correct; `true` (or stale `null`) means flush ran after cancel.
      */
     @Volatile internal var jobIsCancelledAtFlushTimeForTest: Boolean? = null
+
+    /**
+     * Deterministic seams for the closing-test-package's
+     * flush-cancellation test (2026-06-22). When non-null:
+     *
+     *   - [flushEnteredForTest] is completed at the moment the flush
+     *     block enters its `withTimeoutOrNull(3 s)` body. The test
+     *     awaits this signal before issuing its `cancel(...)` so the
+     *     cancellation lands DURING the flush, not before it.
+     *   - [flushReleaseForTest] is awaited by the flush body before it
+     *     proceeds to the `if (session != null) flushPendingOutbox(...)`
+     *     line. The test completes this deferred AFTER cancelling the
+     *     caller so the awaiting flush observes parent cancellation
+     *     and the catch path captures the CE into `pendingCe`.
+     */
+    @Volatile internal var flushEnteredForTest: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+    @Volatile internal var flushReleaseForTest: kotlinx.coroutines.CompletableDeferred<Unit>? = null
 
     /**
      * Test seams (P1 fifth-round teardown-atomicity anchors): seed the
@@ -1251,10 +1278,13 @@ class KtorRelayTransport(
                     // flushPendingOutbox below will then re-send everything
                     // in strict encrypt order before any new outbound traffic
                     // can interleave.
-                    mergeUnackedIntoOutboxOrdered(mySession)
-
-                    // Drain anything the app queued while the socket was down.
-                    flushPendingOutbox(mySession)
+                    // Drain pendingAcks back into pendingOutbox THEN re-send
+                    // everything queued. Extracted into [runReconnectMergeAndFlush]
+                    // so the production loop and the integration test seam
+                    // (`runReconnectMergeAndFlushForTest`) share a single
+                    // canonical sequence — if a future change adds a third
+                    // step, both call sites get it automatically.
+                    runReconnectMergeAndFlush(mySession)
 
                     readLoop(mySession)
                     // PR-H1b: extract close code + reason from the close
@@ -2064,6 +2094,16 @@ class KtorRelayTransport(
     }
 
     private suspend fun sendRaw(message: RelayMessage): Boolean {
+        // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-2 P1 (2026-06-22):
+        // wire-recording tap. `sendRaw` is the EXCLUSIVE gateway through
+        // which any [RelayMessage] reaches the WS — both the live-send
+        // path and [flushPendingOutbox] route through here. Test
+        // harnesses install a recorder via [sendRawAttemptForTest] to
+        // observe every WS write attempt; the recorder fires BEFORE the
+        // null-session guard so absence in the recording means the
+        // production code path NEVER tried to put the envelope on the
+        // wire (not "tried and was silently dropped").
+        sendRawAttemptForTest?.invoke(message)
         // RC-RECONNECT-QUIESCENCE1 review amendment P1 (2026-06-21):
         // sendRaw used to return `true` even when `session == null`
         // because `session?.send(...)` short-circuits silently. That
@@ -2259,6 +2299,14 @@ class KtorRelayTransport(
                 jobIsCancelledAtFlushTimeForTest = job?.isCancelled
                 try {
                     withTimeoutOrNull(3_000L) {
+                        // Deterministic seams for the flush-cancellation
+                        // test (see field kdoc above): a non-null
+                        // `flushEnteredForTest` lets the test know the
+                        // flush body has entered the timeout block, and
+                        // a non-null `flushReleaseForTest` makes the
+                        // body wait until the test releases it.
+                        flushEnteredForTest?.complete(Unit)
+                        flushReleaseForTest?.await()
                         if (session != null) flushPendingOutbox(wsSessionEpoch)
                     }
                 } catch (ce: CancellationException) {
@@ -2782,4 +2830,63 @@ class KtorRelayTransport(
     /** Test seam exposing the private `sendRaw` so tests can pin the
      *  null-session contract (`session == null` → return `false`). */
     internal suspend fun sendRawForTest(message: RelayMessage): Boolean = sendRaw(message)
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-2 (2026-06-22).
+     *
+     * Wire-recording hook for [sendRaw]. When non-null, the lambda is
+     * invoked once per [sendRaw] call, BEFORE the null-session guard,
+     * carrying the exact [RelayMessage] the production code is about
+     * to attempt to push onto the WS. Test harnesses use this to assert
+     * the WS write SET — including "set is empty" invariants that
+     * could not be expressed by observing the post-send state.
+     *
+     * Reads use `@Volatile` so a recorder installed on one thread is
+     * visible to the `sendRaw` writer on another without explicit
+     * synchronisation.
+     */
+    @Volatile internal var sendRawAttemptForTest: ((RelayMessage) -> Unit)? = null
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-3 (2026-06-22).
+     *
+     * Canonical reconnect-side merge/flush sequence shared by the
+     * production [runReconnectLoop] and the integration test seam
+     * [runReconnectMergeAndFlushForTest]. Both call sites invoke
+     * this single helper, so a future change to the sequence (e.g.
+     * a third step) propagates to BOTH automatically — the test
+     * seam can never drift away from production.
+     *
+     *   1. [mergeUnackedIntoOutboxOrdered] — drain `pendingAcks` from
+     *      the just-ended session back into `pendingOutbox`, merged
+     *      by `sequenceTs`. After [migratePendingWsToRest] this is a
+     *      no-op (`pendingAcks` is empty) but the production method
+     *      runs anyway.
+     *   2. [flushPendingOutbox] — iterate `pendingOutbox` and call
+     *      [sendRaw] for each entry. After migration this also exits
+     *      early at `if (pendingOutbox.isEmpty()) return`.
+     */
+    private suspend fun runReconnectMergeAndFlush(mySession: Long) {
+        mergeUnackedIntoOutboxOrdered(mySession)
+        flushPendingOutbox(mySession)
+    }
+
+    /**
+     * Test seam (2026-06-22). Delegates to the private
+     * [runReconnectMergeAndFlush] used by [runReconnectLoop] —
+     * sharing one canonical helper guarantees the test cannot drift
+     * from production: if a future loop change removes the merge or
+     * the flush, BOTH the production loop and this seam stop
+     * producing them. The integration test would then fail its
+     * "no migrated messageId on the wire" assertion only if a
+     * post-migration regression actually leaked an envelope.
+     *
+     * Visibility: `internal` — not reachable as Kotlin source-level
+     * API from a sibling module; integration tests in `apps:android`
+     * reach it through reflection in the same way as the seed/
+     * snapshot seams.
+     */
+    internal suspend fun runReconnectMergeAndFlushForTest(mySession: Long) {
+        runReconnectMergeAndFlush(mySession)
+    }
 }

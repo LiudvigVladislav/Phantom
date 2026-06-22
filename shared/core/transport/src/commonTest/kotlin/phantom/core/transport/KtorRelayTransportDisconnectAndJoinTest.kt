@@ -558,6 +558,71 @@ class KtorRelayTransportDisconnectAndJoinTest {
     // ── Fifth-round P1 anchors: critical teardown is atomic under caller CE ──
 
     @Test
+    fun deterministic_flushEntered_flushRelease_cancellation_anchor() = runBlocking {
+        // Closing-test-package anchor (2026-06-22).
+        // Pins the contract that caller cancellation arriving WHILE
+        // the legacy `disconnect()` is blocked inside its `flush`
+        // window still:
+        //   - captures the CE into `pendingCe`;
+        //   - runs the full critical NonCancellable teardown
+        //     (reconnect-job cancel + ping/ACK/scope cancel);
+        //   - rethrows CE to the caller after the critical region.
+        // Uses `flushEnteredForTest` / `flushReleaseForTest` deterministic
+        // seams: the flush body completes `flushEntered` as soon as it
+        // enters its `withTimeoutOrNull(3 s)` block and then `await`s
+        // `flushRelease` so the test can land its `cancel(...)` while
+        // the flush is genuinely in flight (rather than relying on
+        // the prior heuristic that cancellation would happen to land
+        // somewhere inside the body).
+        val transport = newTransport()
+        val holdingJob = StubbornNeverCompletingJob()
+        holdingJob.awaitEntered()
+        transport.seedReconnectJobForTest(holdingJob.job)
+        val pingSentinel = Job()
+        val ackSentinel = Job()
+        val genScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        transport.seedPingJobForTest(pingSentinel)
+        transport.seedAckWatchdogJobForTest(ackSentinel)
+        transport.seedGenerationScopeForTest(genScope)
+
+        val flushEntered = CompletableDeferred<Unit>()
+        val flushRelease = CompletableDeferred<Unit>()
+        transport.flushEnteredForTest = flushEntered
+        transport.flushReleaseForTest = flushRelease
+
+        var observedCe: CancellationException? = null
+        val caller = launch {
+            try {
+                transport.disconnect()
+            } catch (ce: CancellationException) {
+                observedCe = ce
+                throw ce
+            }
+        }
+        // Wait for the flush body to actually enter.
+        flushEntered.await()
+        // Now genuinely cancel the caller — the flush is in flight.
+        caller.cancel(CancellationException("test cancel mid-flush"))
+        // Release the flush. The block observes parent cancellation
+        // and propagates CE out of `withTimeoutOrNull`, which the
+        // outer try/catch captures into `pendingCe`. Then the critical
+        // teardown runs (NonCancellable) and the pendingCe is rethrown.
+        flushRelease.complete(Unit)
+        caller.join()
+
+        // All four sentinels MUST be cancelled by the critical region,
+        // regardless of the mid-flush cancellation.
+        assertTrue(holdingJob.job.isCancelled, "reconnect job cancelled in critical region")
+        assertTrue(pingSentinel.isCancelled, "pingJob cancelled in critical region")
+        assertTrue(ackSentinel.isCancelled, "ackWatchdogJob cancelled in critical region")
+        assertFalse(genScope.isActive, "per-generation scope cancelled in critical region")
+        // CE propagated to the caller (not swallowed).
+        assertNotNull(observedCe, "CancellationException MUST be rethrown to caller after critical region")
+
+        holdingJob.releaseForTeardown()
+    }
+
+    @Test
     fun legacy_disconnect_caller_cancellation_pre_join_still_cancels_reconnect_AND_watchdogs() = runBlocking {
         // Fifth-round P1 fix: the critical teardown transaction (set flags,
         // publish Disconnected, optional flush, cancel reconnect job,
