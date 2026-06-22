@@ -160,7 +160,7 @@ class RestStateMachine(
      * auto-derived `toString()`.
      */
     private val tokenSource: () -> Long = { 0L },
-) {
+) : WsReconnectGateProvider {
     private val _state = MutableStateFlow<RestMode>(RestMode.WsActive)
     val state: StateFlow<RestMode> = _state.asStateFlow()
 
@@ -168,7 +168,7 @@ class RestStateMachine(
 
     private val _gate = MutableStateFlow<WsReconnectGate>(WsReconnectGate.Open)
     /** Reconnect quiescence gate; observed by [KtorRelayTransport.runReconnectLoop]. */
-    val gate: StateFlow<WsReconnectGate> = _gate.asStateFlow()
+    override val gate: StateFlow<WsReconnectGate> = _gate.asStateFlow()
 
     /**
      * Monotonic route-change counter. Bumped by [beginRouteChange]; older
@@ -1242,7 +1242,7 @@ class RestStateMachine(
      * value is carried unchanged through every auth-retry inside that
      * loop and is bound to a probe atomically at claim time.
      */
-    suspend fun allocateConnectionGeneration(): Long = gateLock.withLock {
+    override suspend fun allocateConnectionGeneration(): Long = gateLock.withLock {
         connectionGenerationCounter += 1
         connectionGenerationCounter
     }
@@ -1473,7 +1473,7 @@ class RestStateMachine(
      *
      * [kotlinx.coroutines.CancellationException] propagates.
      */
-    suspend fun awaitReconnectPermit(ownerGeneration: Long): WsReconnectPermit {
+    override suspend fun awaitReconnectPermit(ownerGeneration: Long): WsReconnectPermit {
         while (true) {
             // Snapshot read of gate state (atomic).
             val current = _gate.value
@@ -1549,7 +1549,7 @@ class RestStateMachine(
      *   with identical `routeEpoch`, `token`, `ownerGeneration` AND the
      *   state-machine `routeEpoch` has not advanced since the claim.
      */
-    suspend fun validatePermitAfterAuth(permit: WsReconnectPermit): Boolean = gateLock.withLock {
+    override suspend fun validatePermitAfterAuth(permit: WsReconnectPermit): Boolean = gateLock.withLock {
         when (permit) {
             is WsReconnectPermit.OpenPermit -> {
                 val current = _gate.value
@@ -1591,7 +1591,7 @@ class RestStateMachine(
      * (matching routeEpoch + token + ownerGeneration). An old loop
      * holding a stale permit cannot drain another loop's budget.
      */
-    suspend fun recordProbeAttemptFailed(permit: WsReconnectPermit.ClaimedProbe, reason: String) {
+    override suspend fun recordProbeAttemptFailed(permit: WsReconnectPermit.ClaimedProbe, reason: String) {
         var attemptLog: String? = null
         var exhaustLog: String? = null
         var publishedGate: WsReconnectGate? = null

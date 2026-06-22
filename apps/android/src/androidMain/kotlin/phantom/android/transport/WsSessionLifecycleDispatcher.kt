@@ -47,7 +47,10 @@ internal class WsSessionLifecycleDispatcher(
             when (event) {
                 is WsSessionLifecycleEvent.Connected -> {
                     submitStateEvent(
-                        RestStateMachine.Event.WsSessionConnected(event.sessionEpoch)
+                        RestStateMachine.Event.WsSessionConnected(
+                            sessionEpoch = event.sessionEpoch,
+                            connectionGeneration = event.connectionGeneration,
+                        )
                     )
                 }
                 is WsSessionLifecycleEvent.Ended -> {

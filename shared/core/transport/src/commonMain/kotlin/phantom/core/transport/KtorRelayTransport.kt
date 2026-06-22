@@ -106,9 +106,19 @@ data class WsSessionEndedEvent(
 sealed interface WsSessionLifecycleEvent {
     /**
      * Emitted after the WS handshake succeeds, before any frames are read.
-     * [sessionEpoch] matches the value of `wsSessionEpoch` for this session.
+     *
+     * @property sessionEpoch matches `wsSessionEpoch` for this session.
+     * @property connectionGeneration the [phantom.core.transport.RestStateMachine]-
+     *   allocated per-loop owner identity. Carried so the state-machine's
+     *   single-lock `onWsSessionConnected` transaction can validate the
+     *   event against the current `ProbeClaimed.ownerGeneration`. Defaults
+     *   to `0L` for pre-quiescence call sites (HybridRelayTransport
+     *   mapper retains source compatibility).
      */
-    data class Connected(val sessionEpoch: Long) : WsSessionLifecycleEvent
+    data class Connected(
+        val sessionEpoch: Long,
+        val connectionGeneration: Long = 0L,
+    ) : WsSessionLifecycleEvent
 
     /**
      * Emitted in the `finally` block of each per-session iteration,
@@ -176,6 +186,17 @@ class KtorRelayTransport(
      * re-instantiation. Null port = direct.
      */
     private val httpClientFactory: (socksProxyPort: Int?) -> HttpClient,
+    /**
+     * RC-RECONNECT-QUIESCENCE1 commit 2b (2026-06-22). When non-null the
+     * reconnect loop observes the quiescence gate before each iteration
+     * via [WsReconnectGateProvider.awaitReconnectPermit] and re-validates
+     * the permit after the auth handshake. `null` ⇒ legacy behaviour
+     * (no gate; loop dials every iteration with normal backoff).
+     *
+     * Production wires the [phantom.core.transport.RestStateMachine]
+     * instance from `AppContainer`. Tests inject a fake.
+     */
+    private val gateProvider: WsReconnectGateProvider? = null,
 ) : RelayTransport {
 
     private val json = Json {
@@ -943,11 +964,19 @@ class KtorRelayTransport(
                 // PR-H1c: same rationale for the inbound-frame liveness mark.
                 lastInboundFrameMark = timeSource.markNow()
                 connectionGeneration += 1
+                // RC-RECONNECT-QUIESCENCE1 commit 2b: allocate an
+                // ownerGeneration from the gate provider ONCE per loop
+                // launch. Carried unchanged through every auth/handshake
+                // retry by `runReconnectLoop`. The gate-side counter is
+                // distinct from the transport's class-level
+                // `connectionGeneration` (which retains its existing
+                // PR-F2 coalescing role).
+                val ownerGen = gateProvider?.allocateConnectionGeneration() ?: 0L
                 relayLog(
                     RelayLogLevel.INFO,
-                    "${genTag()} connect: launching fresh reconnect loop",
+                    "${genTag()} connect: launching fresh reconnect loop (ownerGen=$ownerGen)",
                 )
-                val launched = transportScope.launch { runReconnectLoop() }
+                val launched = transportScope.launch { runReconnectLoop(ownerGen) }
                 reconnectJob = launched
                 launched
             }
@@ -966,14 +995,56 @@ class KtorRelayTransport(
      * that "gives up" after N attempts is worse than one that keeps trying
      * quietly in the background.
      */
-    private suspend fun runReconnectLoop() {
+    private suspend fun runReconnectLoop(ownerGeneration: Long = 0L) {
         var attempt = 0
+        // RC-RECONNECT-QUIESCENCE1 commit 2b — `currentClaim` carries a
+        // [WsReconnectPermit.ClaimedProbe] across the bounded retry
+        // budget so the same claim is consumed for the whole probe
+        // attempt window (no re-claim per iteration). Cleared when the
+        // gate transitions away from ProbeClaimed (route change /
+        // revoke / Connected → CandidateProving).
+        var currentClaim: WsReconnectPermit.ClaimedProbe? = null
         while (!disconnectRequested) {
+            // ─── Gate observation BEFORE client + auth ───
+            // Only consult the gate when:
+            //   - the provider is wired (production-or-test enables it);
+            //   - we don't already hold a [ClaimedProbe] for the
+            //     current ProbeAvailable iteration's budget.
+            val permit: WsReconnectPermit? = if (gateProvider != null && currentClaim == null) {
+                // CancellationException MUST propagate (disconnect /
+                // forceReconnect rely on this); deliberately no catch
+                // around the await.
+                gateProvider.awaitReconnectPermit(ownerGeneration)
+            } else if (currentClaim != null) {
+                // Re-use the claim we've been carrying across retries.
+                currentClaim
+            } else {
+                null
+            }
+            when (permit) {
+                is WsReconnectPermit.LoopRetired -> {
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "${genTag()} reconnect loop retired by gate (reason=${permit.reason}, ownerGeneration=$ownerGeneration); exiting",
+                    )
+                    break
+                }
+                is WsReconnectPermit.ClaimedProbe -> {
+                    currentClaim = permit
+                }
+                else -> Unit
+            }
             _state.value = TransportState.Connecting
             // Per-generation scope. Hoisted out of the webSocket{} block so the
             // finally below can cancelAndJoin it whether the block returned
             // cleanly OR threw.
             var generationScope: CoroutineScope? = null
+            // RC-RECONNECT-QUIESCENCE1 commit 2b: defensive try-catch
+            // around the factory invocation. Production factories don't
+            // normally throw, but OOM / engine-init errors are possible
+            // and that is still a "failed probe attempt" from the gate's
+            // point of view. The catch consumes budget owner-bound when
+            // a claim is carried.
             // Per-generation HttpClient. ADR-010 (Updated 2026-05-01): the
             // only way to force-close an active WebSocket on Tecno HiOS is
             // to destroy the OkHttp engine entirely via HttpClient.close().
@@ -981,7 +1052,29 @@ class KtorRelayTransport(
             // pong/ack watchdogs can close it when they detect liveness
             // failure, and the finally block closes it on every exit path
             // (clean close, exception, disconnect requested).
-            val generationClient: HttpClient = httpClientFactory(socksProxyPort)
+            val generationClient: HttpClient = try {
+                httpClientFactory(socksProxyPort)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                relayLog(
+                    RelayLogLevel.ERROR,
+                    "${genTag()} httpClientFactory threw (attempt=$attempt): ${t::class.simpleName}: ${t.message}",
+                )
+                val claimFactoryFail = currentClaim
+                if (claimFactoryFail != null && gateProvider != null) {
+                    gateProvider.recordProbeAttemptFailed(claimFactoryFail, reason = "factory_failed:${t::class.simpleName}")
+                    currentClaim = if (gateProvider.validatePermitAfterAuth(claimFactoryFail)) claimFactoryFail else null
+                }
+                if (disconnectRequested) break
+                val delayMs = min(
+                    RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
+                    RelayTransportConfig.RECONNECT_MAX_DELAY_MS,
+                )
+                delay(delayMs)
+                attempt++
+                continue
+            }
             currentGenerationClient = generationClient
             // F11 + F26: every reconnect generation does a fresh signed-challenge
             // handshake. Failing the handshake aborts THIS attempt only — the
@@ -996,12 +1089,23 @@ class KtorRelayTransport(
             val mySession = ++wsSessionEpoch
             val authedWsUrl = try {
                 buildAuthedWsUrl(generationClient)
+            } catch (ce: CancellationException) {
+                runCatching { generationClient.close() }
+                throw ce
             } catch (t: Throwable) {
                 relayLog(
                     RelayLogLevel.ERROR,
                     "${genTag(mySession)} Auth handshake failed (attempt=$attempt): ${t::class.simpleName} ${t.message}",
                 )
                 runCatching { generationClient.close() }
+                // RC-RECONNECT-QUIESCENCE1 commit 2b: owner-bound budget
+                // consumption — a failed auth attempt costs budget when
+                // we hold a [ClaimedProbe].
+                val claimAuthFail = currentClaim
+                if (claimAuthFail != null && gateProvider != null) {
+                    gateProvider.recordProbeAttemptFailed(claimAuthFail, reason = "auth_failed:${t::class.simpleName}")
+                    currentClaim = if (gateProvider.validatePermitAfterAuth(claimAuthFail)) claimAuthFail else null
+                }
                 if (disconnectRequested) break
                 val delayMs = min(
                     RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
@@ -1018,6 +1122,11 @@ class KtorRelayTransport(
                     "${genTag(mySession)} Auth handshake aborted (attempt=$attempt) — signing key not ready or relay returned no challenge",
                 )
                 runCatching { generationClient.close() }
+                val claimAuthAbort = currentClaim
+                if (claimAuthAbort != null && gateProvider != null) {
+                    gateProvider.recordProbeAttemptFailed(claimAuthAbort, reason = "auth_aborted")
+                    currentClaim = if (gateProvider.validatePermitAfterAuth(claimAuthAbort)) claimAuthAbort else null
+                }
                 if (disconnectRequested) break
                 val delayMs = min(
                     RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
@@ -1026,6 +1135,29 @@ class KtorRelayTransport(
                 delay(delayMs)
                 attempt++
                 continue
+            }
+            // ─── Gate RE-validation after auth, BEFORE webSocket(...) ───
+            // Permit may have been invalidated while auth ran (concurrent
+            // route-change, sticky-arm, or fresh-loop allocation). If
+            // so, abort this iteration and re-enter the loop top so the
+            // next `awaitReconnectPermit` reflects the current gate.
+            if (gateProvider != null && permit != null) {
+                val stillValid = gateProvider.validatePermitAfterAuth(permit)
+                if (!stillValid) {
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "${genTag(mySession)} permit_invalidated_after_auth (ownerGeneration=$ownerGeneration) — aborting iteration",
+                    )
+                    runCatching { generationClient.close() }
+                    val claimInvalidated = currentClaim
+                    if (claimInvalidated != null) {
+                        gateProvider.recordProbeAttemptFailed(claimInvalidated, reason = "permit_invalidated_after_auth")
+                    }
+                    currentClaim = null
+                    if (disconnectRequested) break
+                    attempt++
+                    continue
+                }
             }
             val redactedUrl = authedWsUrl
                 .replace(Regex("""id=[^&]+"""),             "id=<redacted>")
@@ -1071,9 +1203,18 @@ class KtorRelayTransport(
                     // fails if the channel is closed (invariant violation).
                     check(
                         _wsSessionLifecycle.trySend(
-                            WsSessionLifecycleEvent.Connected(mySession)
+                            WsSessionLifecycleEvent.Connected(
+                                sessionEpoch = mySession,
+                                connectionGeneration = ownerGeneration,
+                            )
                         ).isSuccess
                     ) { "WS lifecycle channel unexpectedly closed (Connected emission epoch=$mySession)" }
+                    // RC-RECONNECT-QUIESCENCE1 commit 2b: a successful
+                    // Connected consumes the carried claim — the state
+                    // machine transitions ProbeClaimed → CandidateProving
+                    // on its end. Drop our local handle so subsequent
+                    // iterations re-permit via awaitReconnectPermit.
+                    currentClaim = null
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -1135,6 +1276,15 @@ class KtorRelayTransport(
                     "${genTag(mySession)} WebSocket connect FAILED (attempt=$attempt, type=${e::class.simpleName}): ${e.message}",
                     e,
                 )
+                // RC-RECONNECT-QUIESCENCE1 commit 2b: owner-bound budget
+                // consumption for the WS-handshake / readLoop failure
+                // path. The state machine drops the gate to Quiesced
+                // when budget runs out, retiring this loop's claim.
+                val claimWsFail = currentClaim
+                if (claimWsFail != null && gateProvider != null) {
+                    gateProvider.recordProbeAttemptFailed(claimWsFail, reason = "ws_failed:${e::class.simpleName}")
+                    currentClaim = if (gateProvider.validatePermitAfterAuth(claimWsFail)) claimWsFail else null
+                }
                 if (disconnectRequested) break
                 val delayMs = min(
                     RelayTransportConfig.RECONNECT_BASE_DELAY_MS * (1L shl min(attempt, 16)),
@@ -2260,6 +2410,40 @@ class KtorRelayTransport(
                 )
                 return
             }
+            // RC-RECONNECT-QUIESCENCE1 commit 2b (review amendment):
+            // typed no-op when the gate is non-actionable. Cancelling the
+            // current loop while it holds [ProbeClaimed] would orphan the
+            // claim: the cancellation exits via CancellationException
+            // (NOT a probe-failure path), so `recordProbeAttemptFailed`
+            // never fires, the budget never debits, and a fresh loop
+            // launched here would suspend on `awaitReconnectPermit`
+            // forever (claim already taken). The same reasoning applies
+            // to [Quiesced] (no probe in flight — gate machine drives
+            // recovery), [ProbeAvailable] (the existing loop will claim
+            // on its next iteration; an out-of-band relaunch breaks the
+            // contract), and [CandidateProving] (60-second probation in
+            // progress — a stale tick must not perturb it).
+            //
+            // The watchdog-driven forceReconnect callers (in-process
+            // pong, in-process ACK, AlarmManager wakeup) were designed
+            // against the pre-quiescence assumption that the WS path is
+            // always trying to reconnect; under quiescence the gate
+            // machine owns the recovery cadence and out-of-band
+            // forceReconnect is structurally redundant — the right
+            // behaviour is to no-op + emit telemetry so the operator
+            // sees the refusal in logs.
+            val gateProviderLocal = gateProvider
+            if (gateProviderLocal != null) {
+                val currentGate = gateProviderLocal.gate.value
+                if (currentGate !is WsReconnectGate.Open) {
+                    relayLog(
+                        RelayLogLevel.WARN,
+                        "${genTag()} forceReconnect: refused — gate=${currentGate.simpleKind()} " +
+                            "(quiescence contract drives recovery; out-of-band relaunch suppressed)",
+                    )
+                    return
+                }
+            }
             relayLog(
                 RelayLogLevel.WARN,
                 "${genTag()} forceReconnect() called — abandoning current reconnect loop and launching a fresh one (ADR-013 hard reset, gen=$entryGen→${entryGen + 1})",
@@ -2283,12 +2467,16 @@ class KtorRelayTransport(
             runCatching { currentGenerationClient?.close() }
             scope?.cancel()
             val oldJob = reconnectJob
-            // Launch a brand-new reconnect loop on transportScope. It captures
-            // the same relayUrl/identityHex/signingPubKeyHex/challengeSigner
-            // stored on the instance, fetches a fresh challenge per generation,
-            // and starts its own runReconnectLoop iteration from attempt 0.
+            // RC-RECONNECT-QUIESCENCE1 commit 2b: allocate a fresh
+            // ownerGeneration BEFORE launching the new loop. If the
+            // gate is non-actionable (Quiesced / ProbeClaimed /
+            // CandidateProving) the new loop suspends on
+            // `awaitReconnectPermit` at the top of `runReconnectLoop`
+            // and does NOT open a socket — that is how forceReconnect
+            // honours quiescence without a special-case here.
+            val ownerGen = gateProvider?.allocateConnectionGeneration() ?: 0L
             reconnectJob = transportScope.launch {
-                runReconnectLoop()
+                runReconnectLoop(ownerGen)
             }
             connectionGeneration += 1
             // Best-effort: ask the old job to cancel after the new one has

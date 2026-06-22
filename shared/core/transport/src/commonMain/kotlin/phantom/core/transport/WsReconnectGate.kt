@@ -288,6 +288,64 @@ fun WsReconnectGate.simpleKind(): String = when (this) {
     is WsReconnectGate.CandidateProving -> "CandidateProving"
 }
 
+/**
+ * RC-RECONNECT-QUIESCENCE1 commit 2b (2026-06-22) — narrow facade the
+ * transport-side [phantom.core.transport.KtorRelayTransport.runReconnectLoop]
+ * needs from [phantom.core.transport.RestStateMachine]. Keeping the
+ * surface small means the transport doesn't pull in the entire
+ * state-machine API (mode, events, sticky bookkeeping) — only the
+ * five gate primitives below.
+ *
+ * Implementation lives on [RestStateMachine]; production callers
+ * inject the state-machine instance directly. Tests pass an in-memory
+ * fake.
+ */
+interface WsReconnectGateProvider {
+    /**
+     * Read-only snapshot of the current gate. The reconnect-loop
+     * consults it post-Connected to decide whether to relaunch after
+     * a candidate session dies (gate Quiesced ⇒ wait for next probe;
+     * gate Open ⇒ ordinary backoff).
+     */
+    val gate: kotlinx.coroutines.flow.StateFlow<WsReconnectGate>
+
+    /**
+     * Allocate a fresh per-loop generation counter, called ONCE at
+     * the start of each [phantom.core.transport.KtorRelayTransport.runReconnectLoop]
+     * launch. Carried through every auth/handshake retry inside that
+     * loop.
+     */
+    suspend fun allocateConnectionGeneration(): Long
+
+    /**
+     * Suspend until the gate is actionable (Open / ProbeAvailable).
+     * Returns the appropriate [WsReconnectPermit]. Throws
+     * [kotlinx.coroutines.CancellationException] when the calling
+     * coroutine is cancelled — callers MUST propagate it (`disconnect()`
+     * cancellation relies on this).
+     */
+    suspend fun awaitReconnectPermit(ownerGeneration: Long): WsReconnectPermit
+
+    /**
+     * Re-validate a previously issued permit AFTER the auth handshake
+     * succeeds but BEFORE `webSocket(...)` dial. Returns `false` if a
+     * concurrent route-change, sticky-arm, or fresh-loop allocation
+     * invalidated the permit; the caller must abort and re-enter the
+     * loop top.
+     */
+    suspend fun validatePermitAfterAuth(permit: WsReconnectPermit): Boolean
+
+    /**
+     * Owner-bound budget consumption. Called when a [WsReconnectPermit.ClaimedProbe]
+     * iteration exits WITHOUT producing a `Connected` event. Consumes
+     * budget ONLY when the permit matches the current gate's claim.
+     */
+    suspend fun recordProbeAttemptFailed(
+        permit: WsReconnectPermit.ClaimedProbe,
+        reason: String,
+    )
+}
+
 enum class ProbeIssueRejectReason {
     /** Gate was Open / ProbeAvailable / ProbeClaimed / CandidateProving. */
     GATE_NOT_QUIESCED,
