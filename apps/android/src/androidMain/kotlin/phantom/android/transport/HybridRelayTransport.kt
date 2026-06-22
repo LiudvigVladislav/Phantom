@@ -213,7 +213,7 @@ class HybridRelayTransport(
     // [TransportManager] or [ManagerState] types directly.
     private val wsDegradationDetector: WsDegradationDetector? = null,
     private val degradationCurrentKindProvider: () -> TransportKind? = { null },
-) : RelayTransport {
+) : RelayTransport, RewalkHybridFacade {
 
     // ── Delegated RelayTransport surface ─────────────────────────────────────
 
@@ -797,7 +797,7 @@ class HybridRelayTransport(
      * Short-circuits on `restCapabilityActive=false` like the rest of the
      * `submitStateEvent` family.
      */
-    suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
+    override suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
         submitStateEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = clearsMode2Sticky))
     }
 

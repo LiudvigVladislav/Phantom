@@ -1499,8 +1499,19 @@ class AppContainer(private val context: Context) {
             val rewalkCoordinator = phantom.android.transport.TransportRewalkCoordinator(
                 scope = appScope,
                 transportPreferences = transportPreferences,
-                transportManager = transportManager,
+                releaseTransport = { transportManager.release() },
                 hybridTransportProvider = { hybridTransport },
+                // RC-RECONNECT-QUIESCENCE1 commit 2c (2026-06-22): wire
+                // the [RestStateMachine] instance owned by
+                // [RestFallbackOrchestrator] as the typed gate
+                // coordinator. The cast is safe — `RestStateMachine`
+                // implements `RewalkCoordinatorGateProvider` (commit 2c
+                // surface addition). Production effect: the rewalk
+                // sequence runs as the transaction documented on
+                // `TransportRewalkCoordinator.performRewalk`. Tests that
+                // don't wire this fall back to the legacy
+                // pre-quiescence sequence.
+                gateCoordinator = restOrchestrator.stateMachine,
                 requestServiceRestart = { reason ->
                     val intent = android.content.Intent(
                         context.applicationContext,
@@ -1515,15 +1526,28 @@ class AppContainer(private val context: Context) {
                             reason.name,
                         )
                     }
-                    runCatching { context.applicationContext.startService(intent) }
-                        .onFailure { e ->
-                            android.util.Log.w(
-                                "PhantomHybrid",
-                                "NETWORK_TRACE service_restart_intent_failed " +
-                                    "errorClass=${e::class.simpleName} " +
-                                    "message=${e.message?.take(120)}",
-                            )
-                        }
+                    // RC-RECONNECT-QUIESCENCE1 commit 2c second-round amend
+                    // (2026-06-22): do NOT swallow startService failures.
+                    // The coordinator needs to see them so its
+                    // catch-and-revoke path fires (revokeProbe /
+                    // revokeRouteChange) and `lastRewalkAtMs` stays
+                    // un-bumped. Pre-amend behaviour swallowed
+                    // SecurityException / IllegalStateException etc. via
+                    // `runCatching` so the coordinator saw a false
+                    // success: gate stuck at ProbeAvailable, no
+                    // reconnect-loop launched, and the next recovery
+                    // attempt hit the rate-limit.
+                    //
+                    // Also treat `startService(intent) == null` as a
+                    // failure: per Android docs, null means "no matching
+                    // service component was found" — equivalent to the
+                    // service refusing to start.
+                    val component = context.applicationContext.startService(intent)
+                    if (component == null) {
+                        throw IllegalStateException(
+                            "startService returned null — PhantomMessagingService component not resolved",
+                        )
+                    }
                 },
             )
             transportRewalkCoordinator = rewalkCoordinator

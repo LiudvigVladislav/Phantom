@@ -276,6 +276,97 @@ sealed interface ProbeIssueResult {
 }
 
 /**
+ * RC-RECONNECT-QUIESCENCE1 commit 2c (2026-06-22) — narrow facade the
+ * rewalk-coordinator side of the transaction needs from
+ * [phantom.core.transport.RestStateMachine]. Separate from
+ * [WsReconnectGateProvider] (which is the reconnect-loop side) so
+ * each caller only sees the operations it should be performing.
+ *
+ * Implemented by [RestStateMachine]; production callers inject the
+ * state-machine instance directly. Tests pass an in-memory fake.
+ */
+interface RewalkCoordinatorGateProvider {
+    /** Read-only snapshot of the current gate. */
+    val gate: kotlinx.coroutines.flow.StateFlow<WsReconnectGate>
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 commit 2c second-round amend (2026-06-22):
+     * the coordinator now passes `clearsMode2Sticky` so the gate-side
+     * can route the transaction. Three typed outcomes per
+     * [RouteChangeOutcome]:
+     *
+     *   - [RouteChangeOutcome.OpenReconnect] — gate was [WsReconnectGate.Open].
+     *     `routeEpoch` is bumped. Coordinator runs ordinary network
+     *     rewalk (teardown + release + restart) WITHOUT issuing a
+     *     probe — there is no sticky to recover from.
+     *   - [RouteChangeOutcome.StickyRecovery] — gate was non-Open AND
+     *     `clearsMode2Sticky == true`. `routeEpoch` is bumped; any
+     *     in-flight `ProbeAvailable` / `ProbeClaimed` /
+     *     `CandidateProving` is flipped to `Quiesced` so the
+     *     subsequent `issueProbeAfterRewalk` can hand out a fresh
+     *     probe. Coordinator runs the full transaction including
+     *     probe issuance.
+     *   - [RouteChangeOutcome.QuiescencePreserved] — gate was non-Open
+     *     AND `clearsMode2Sticky == false` (typically `VALIDATED_CHANGED`).
+     *     `routeEpoch` is NOT bumped, gate is NOT flipped. The
+     *     coordinator runs NO substeps so the sticky-REST window
+     *     remains armed.
+     */
+    suspend fun beginRouteChange(clearsMode2Sticky: Boolean): RouteChangeOutcome
+
+    /**
+     * Log a rewalk substep abort. Does NOT decrement `routeEpoch` —
+     * the bumped value defeats stale-epoch attacks. The coordinator
+     * MUST call this on every failure path that ran `beginRouteChange`
+     * but did not reach `issueProbeAfterRewalk`.
+     */
+    suspend fun revokeRouteChange(routeEpoch: Long, reason: String)
+
+    /**
+     * Atomically transition `Quiesced → ProbeAvailable(routeEpoch, …)`
+     * with a fresh single-use token from the state-machine's token
+     * source. Returns a typed [ProbeIssueResult] — never
+     * fire-and-forget. The coordinator branches on the result before
+     * calling `requestServiceRestart`.
+     */
+    suspend fun issueProbeAfterRewalk(routeEpoch: Long): ProbeIssueResult
+
+    /**
+     * Revoke a probe issued by [issueProbeAfterRewalk] if a downstream
+     * rewalk substep (`requestServiceRestart`) failed AFTER the probe
+     * was issued. Transitions `ProbeAvailable(routeEpoch) → Quiesced`.
+     * No-op if the gate has already advanced.
+     */
+    suspend fun revokeProbe(routeEpoch: Long, reason: String)
+}
+
+/**
+ * RC-RECONNECT-QUIESCENCE1 commit 2c second-round amend (2026-06-22).
+ * Typed result of [RewalkCoordinatorGateProvider.beginRouteChange].
+ * See the method KDoc for branch semantics.
+ */
+sealed interface RouteChangeOutcome {
+    val routeEpoch: Long
+
+    /** Gate was [WsReconnectGate.Open]; ordinary rewalk, no probe needed. */
+    data class OpenReconnect(override val routeEpoch: Long) : RouteChangeOutcome
+
+    /**
+     * Gate was non-Open AND `clearsMode2Sticky == true`. Sticky
+     * recovery flow: teardown + release + probe + restart.
+     */
+    data class StickyRecovery(override val routeEpoch: Long) : RouteChangeOutcome
+
+    /**
+     * Gate was non-Open AND `clearsMode2Sticky == false`. Coordinator
+     * runs NO substeps; sticky window stays armed. `routeEpoch` is
+     * the UNCHANGED current value (no bump, no flip) so in-flight
+     * permits remain valid.
+     */
+    data class QuiescencePreserved(override val routeEpoch: Long) : RouteChangeOutcome
+}
+
+/**
  * Single-token kind label used by telemetry so [WsReconnectGate]
  * subclasses can be logged WITHOUT leaking opaque token values via
  * their `toString()` rendering.

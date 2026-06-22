@@ -160,7 +160,7 @@ class RestStateMachine(
      * auto-derived `toString()`.
      */
     private val tokenSource: () -> Long = { 0L },
-) : WsReconnectGateProvider {
+) : WsReconnectGateProvider, RewalkCoordinatorGateProvider {
     private val _state = MutableStateFlow<RestMode>(RestMode.WsActive)
     val state: StateFlow<RestMode> = _state.asStateFlow()
 
@@ -1279,32 +1279,59 @@ class RestStateMachine(
      * Held under [gateLock] so the routeEpoch bump and the stuck-state
      * flip are observed as a single atomic step.
      */
-    suspend fun beginRouteChange(): Long {
-        // Hold [gateLock] across BOTH the routeEpoch bump AND the
-        // return-value capture so two concurrent callers cannot observe
-        // the same returned epoch.
-        var bumpedEpoch = -1L
-        val flipped: Pair<WsReconnectGate, String>? = gateLock.withLock {
-            routeEpoch += 1
-            bumpedEpoch = routeEpoch
+    override suspend fun beginRouteChange(clearsMode2Sticky: Boolean): RouteChangeOutcome {
+        // Commit 2c second-round amend (2026-06-22): typed outcome.
+        // See [RewalkCoordinatorGateProvider.beginRouteChange] kdoc for
+        // branch semantics.
+        //   - Open ⇒ OpenReconnect (bump routeEpoch; ordinary rewalk).
+        //   - non-Open + clearsMode2Sticky=false ⇒ QuiescencePreserved
+        //     (NO bump, NO flip; sticky window stays armed).
+        //   - non-Open + clearsMode2Sticky=true ⇒ StickyRecovery
+        //     (bump routeEpoch; flip in-flight Probe* / CandidateProving
+        //     to Quiesced so issueProbeAfterRewalk can hand out a fresh
+        //     probe).
+        var publishedGate: WsReconnectGate? = null
+        var publishedReason: String? = null
+        val outcome: RouteChangeOutcome = gateLock.withLock {
             val current = _gate.value
-            val nextPair: Pair<WsReconnectGate, String>? = when (current) {
-                is WsReconnectGate.ProbeAvailable ->
-                    WsReconnectGate.Quiesced(current.stickyGen) to "route_change_invalidates_probe"
-                is WsReconnectGate.ProbeClaimed ->
-                    WsReconnectGate.Quiesced(current.stickyGen) to "route_change_invalidates_claim"
-                is WsReconnectGate.CandidateProving ->
-                    WsReconnectGate.Quiesced(current.stickyGen) to "route_change_invalidates_candidate"
-                else -> null
+            when {
+                current is WsReconnectGate.Open -> {
+                    routeEpoch += 1
+                    RouteChangeOutcome.OpenReconnect(routeEpoch)
+                }
+                !clearsMode2Sticky -> {
+                    // VALIDATED_CHANGED or similar non-route event under
+                    // quiescence: no bump, no flip. The current routeEpoch
+                    // is returned for telemetry only.
+                    RouteChangeOutcome.QuiescencePreserved(routeEpoch)
+                }
+                else -> {
+                    routeEpoch += 1
+                    if (current !is WsReconnectGate.Quiesced) {
+                        val stickyGen = when (current) {
+                            is WsReconnectGate.Quiesced -> current.stickyGen
+                            is WsReconnectGate.ProbeAvailable -> current.stickyGen
+                            is WsReconnectGate.ProbeClaimed -> current.stickyGen
+                            is WsReconnectGate.CandidateProving -> current.stickyGen
+                            is WsReconnectGate.Open -> error("unreachable: Open handled above")
+                        }
+                        val next = WsReconnectGate.Quiesced(stickyGen)
+                        probeAttemptCount = 0
+                        _gate.value = next
+                        publishedGate = next
+                        publishedReason = when (current) {
+                            is WsReconnectGate.ProbeAvailable -> "route_change_invalidates_probe"
+                            is WsReconnectGate.ProbeClaimed -> "route_change_invalidates_claim"
+                            is WsReconnectGate.CandidateProving -> "route_change_invalidates_candidate"
+                            else -> "route_change"
+                        }
+                    }
+                    RouteChangeOutcome.StickyRecovery(routeEpoch)
+                }
             }
-            if (nextPair != null) {
-                probeAttemptCount = 0
-                _gate.value = nextPair.first
-            }
-            nextPair
         }
-        flipped?.let { (next, reason) -> emitGateTelemetry(next, reason) }
-        return bumpedEpoch
+        publishedGate?.let { g -> publishedReason?.let { r -> emitGateTelemetry(g, r) } }
+        return outcome
     }
 
     /**
@@ -1315,7 +1342,7 @@ class RestStateMachine(
      * by a SUCCESSFUL rewalk; a failed teardown does not eat the
      * budget).
      */
-    fun revokeRouteChange(routeEpoch: Long, reason: String) {
+    override suspend fun revokeRouteChange(routeEpoch: Long, reason: String) {
         log("REST_TRACE ws_recovery_route_change_revoked route_epoch=$routeEpoch reason=$reason")
     }
 
@@ -1327,7 +1354,7 @@ class RestStateMachine(
      *
      * Returns a typed [ProbeIssueResult] — never fire-and-forget.
      */
-    suspend fun issueProbeAfterRewalk(routeEpoch: Long): ProbeIssueResult {
+    override suspend fun issueProbeAfterRewalk(routeEpoch: Long): ProbeIssueResult {
         var issuedToken: ProbeToken? = null
         var publishedReason: String? = null
         var publishedGate: WsReconnectGate? = null
@@ -1355,6 +1382,16 @@ class RestStateMachine(
                 // probe was issued (ownerGeneration > floor) may claim.
                 generationFloor = connectionGenerationCounter,
             )
+            // P1 (ninth round, 2026-06-22): defensively reset the
+            // per-probe attempt counter when a NEW probe is issued.
+            // Without this, a residual count from a prior probe (e.g.
+            // a race where the ProbeClaimed → CandidateProving reset
+            // did not fire due to gate-shape concurrency, or any
+            // future path that leaves the counter > 0 across a
+            // Quiesced state) would silently shorten the new probe's
+            // budget. Reset is atomic with the gate transition under
+            // the same lock acquisition.
+            probeAttemptCount = 0
             _gate.value = next
             issuedToken = token
             publishedGate = next
@@ -1374,7 +1411,7 @@ class RestStateMachine(
      * [WsReconnectGate.ProbeAvailable] back to [WsReconnectGate.Quiesced].
      * No-op if the gate has already transitioned away.
      */
-    suspend fun revokeProbe(routeEpoch: Long, reason: String) {
+    override suspend fun revokeProbe(routeEpoch: Long, reason: String) {
         var publishedGate: WsReconnectGate? = null
         var publishedReason: String? = null
         gateLock.withLock {

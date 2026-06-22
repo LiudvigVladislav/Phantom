@@ -83,7 +83,7 @@ class WsReconnectGateTest {
     fun probe_is_single_use_under_concurrent_claim() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val routeEpoch = sm.beginRouteChange()
+        val routeEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         val issue = sm.issueProbeAfterRewalk(routeEpoch)
         assertTrue(issue is ProbeIssueResult.ProbeIssued, "probe issued; got $issue")
 
@@ -114,7 +114,7 @@ class WsReconnectGateTest {
     fun second_attempt_to_claim_after_first_win_returns_PROBE_ALREADY_CLAIMED() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val routeEpoch = sm.beginRouteChange()
+        val routeEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(routeEpoch)
         val owner = sm.allocateConnectionGeneration()
         val first = sm.awaitAndClaimProbe(ownerGeneration = owner)
@@ -132,8 +132,8 @@ class WsReconnectGateTest {
     fun issueProbeAfterRewalk_rejects_stale_routeEpoch() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val firstEpoch = sm.beginRouteChange()
-        val secondEpoch = sm.beginRouteChange()
+        val firstEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
+        val secondEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         // Coordinator calls issueProbeAfterRewalk with the OLD epoch.
         val result = sm.issueProbeAfterRewalk(firstEpoch)
         assertTrue(result is ProbeIssueResult.Rejected)
@@ -149,7 +149,7 @@ class WsReconnectGateTest {
     fun token_is_consumed_and_absent_from_CandidateProving() = runBlocking {
         val sm = newSm(tokenSequence = listOf(0xABCDL))
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         // Need a network change to enter sticky-recovery pending state
         // before the claim → Connected transition becomes a CandidateProving.
@@ -185,7 +185,7 @@ class WsReconnectGateTest {
     fun candidate_death_returns_gate_to_Quiesced_with_same_stickyGen() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         sm.awaitAndClaimProbe(ownerGeneration = sm.allocateConnectionGeneration())
@@ -219,7 +219,7 @@ class WsReconnectGateTest {
         var t = 0L
         val sm = newSm(nowProvider = { t })
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         sm.awaitAndClaimProbe(ownerGeneration = sm.allocateConnectionGeneration())
@@ -241,7 +241,7 @@ class WsReconnectGateTest {
     fun probe_budget_exhausts_via_attempt_count() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         val owner = sm.allocateConnectionGeneration()
         val claim = sm.awaitAndClaimProbe(ownerGeneration = owner) as ClaimResult.Claimed
@@ -258,7 +258,7 @@ class WsReconnectGateTest {
         var t = 0L
         val sm = newSm(nowProvider = { t })
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         val owner = sm.allocateConnectionGeneration()
         val claim = sm.awaitAndClaimProbe(ownerGeneration = owner) as ClaimResult.Claimed
@@ -285,11 +285,11 @@ class WsReconnectGateTest {
     fun validatePermitAfterAuth_returns_false_after_routeEpoch_rolls() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         val owner = sm.allocateConnectionGeneration(); val claim = sm.awaitAndClaimProbe(ownerGeneration = owner) as ClaimResult.Claimed
         // Concurrent rewalk rolls routeEpoch.
-        sm.beginRouteChange()
+        sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         assertFalse(
             sm.validatePermitAfterAuth(claim.probe),
             "claim must invalidate after concurrent routeEpoch roll",
@@ -309,11 +309,11 @@ class WsReconnectGateTest {
     fun multiple_route_change_revocations_do_not_block_subsequent_probe_issuance() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val first = sm.beginRouteChange()
+        val first = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.revokeRouteChange(first, reason = "disconnect_join_timeout")
-        val second = sm.beginRouteChange()
+        val second = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.revokeRouteChange(second, reason = "release_failed")
-        val third = sm.beginRouteChange()
+        val third = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         val ok = sm.issueProbeAfterRewalk(third)
         assertTrue(ok is ProbeIssueResult.ProbeIssued, "third attempt succeeds; got $ok")
     }
@@ -324,7 +324,7 @@ class WsReconnectGateTest {
     fun revokeProbe_returns_gate_to_Quiesced() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         assertTrue(sm.gate.value is WsReconnectGate.ProbeAvailable)
         sm.revokeProbe(epoch, reason = "service_restart_failed")
@@ -336,7 +336,7 @@ class WsReconnectGateTest {
     fun revokeProbe_no_op_if_gate_already_advanced() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.awaitAndClaimProbe(ownerGeneration = sm.allocateConnectionGeneration())
         assertTrue(sm.gate.value is WsReconnectGate.ProbeClaimed)
@@ -359,7 +359,7 @@ class WsReconnectGateTest {
         // Full ABA cycle: Open → Quiesced → ProbeAvailable → ProbeClaimed →
         // CandidateProving → Open.
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         val ownerB = sm.allocateConnectionGeneration()
@@ -387,13 +387,13 @@ class WsReconnectGateTest {
     fun new_probe_issues_after_routeEpoch_reset_from_ProbeAvailable() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         assertTrue(sm.gate.value is WsReconnectGate.ProbeAvailable)
 
         // A second beginRouteChange MUST flip the stuck ProbeAvailable back
         // to Quiesced atomically with the routeEpoch bump.
-        val freshEpoch = sm.beginRouteChange()
+        val freshEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         assertTrue(
             sm.gate.value is WsReconnectGate.Quiesced,
             "beginRouteChange must atomically flip ProbeAvailable → Quiesced",
@@ -406,12 +406,12 @@ class WsReconnectGateTest {
     fun new_probe_issues_after_routeEpoch_reset_from_ProbeClaimed() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.awaitAndClaimProbe(ownerGeneration = sm.allocateConnectionGeneration())
         assertTrue(sm.gate.value is WsReconnectGate.ProbeClaimed)
 
-        val freshEpoch = sm.beginRouteChange()
+        val freshEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         assertTrue(sm.gate.value is WsReconnectGate.Quiesced)
         assertTrue(sm.issueProbeAfterRewalk(freshEpoch) is ProbeIssueResult.ProbeIssued)
     }
@@ -420,7 +420,7 @@ class WsReconnectGateTest {
     fun new_probe_issues_after_routeEpoch_reset_from_CandidateProving() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         sm.awaitAndClaimProbe(ownerGeneration = sm.allocateConnectionGeneration())
@@ -432,7 +432,7 @@ class WsReconnectGateTest {
         )
         assertTrue(sm.gate.value is WsReconnectGate.CandidateProving)
 
-        val freshEpoch = sm.beginRouteChange()
+        val freshEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         assertTrue(
             sm.gate.value is WsReconnectGate.Quiesced,
             "beginRouteChange must atomically flip CandidateProving → Quiesced",
@@ -447,7 +447,7 @@ class WsReconnectGateTest {
         // Even if two paths call beginRouteChange concurrently, the
         // counter must advance by exactly the number of calls (no loss).
         val results = (0 until 50).map {
-            async { sm.beginRouteChange() }
+            async { sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch }
         }.awaitAll()
         assertEquals(50, results.size)
         val maxEpoch = results.max()
@@ -463,7 +463,7 @@ class WsReconnectGateTest {
     fun wrong_generation_Connected_does_NOT_consume_token_or_change_gate() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         val ownerCorrect = sm.allocateConnectionGeneration()
@@ -505,12 +505,12 @@ class WsReconnectGateTest {
     fun stale_routeEpoch_Connected_does_NOT_consume_token() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         sm.awaitAndClaimProbe(ownerGeneration = sm.allocateConnectionGeneration())
         // Concurrent rewalk rolls routeEpoch (and flips the gate to Quiesced).
-        sm.beginRouteChange()
+        sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         // A stale connect for the OLD probe arrives. Gate is now Quiesced;
         // the connect handler MUST be a no-op (not ProbeClaimed any more).
         sm.onEvent(
@@ -586,7 +586,7 @@ class WsReconnectGateTest {
         assertEquals(1L, oldOwner)
         assertEquals(2L, secondAllocation)
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch) // floor = counter = 2
 
         val claim = sm.awaitAndClaimProbe(ownerGeneration = oldOwner)
@@ -611,7 +611,7 @@ class WsReconnectGateTest {
         // gate transitions (revoke / route-change / matching Connected).
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         val owner = sm.allocateConnectionGeneration()
         val claim = sm.awaitAndClaimProbe(ownerGeneration = owner) as ClaimResult.Claimed
@@ -627,12 +627,12 @@ class WsReconnectGateTest {
     fun recordProbeAttemptFailed_with_stale_permit_does_not_consume_budget() = runBlocking {
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         val owner = sm.allocateConnectionGeneration()
         val claim = sm.awaitAndClaimProbe(ownerGeneration = owner) as ClaimResult.Claimed
 
-        val newEpoch = sm.beginRouteChange()  // flips ProbeClaimed → Quiesced
+        val newEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch  // flips ProbeClaimed → Quiesced
         sm.issueProbeAfterRewalk(newEpoch)
         val freshOwner = sm.allocateConnectionGeneration()
         val freshClaim = sm.awaitAndClaimProbe(ownerGeneration = freshOwner) as ClaimResult.Claimed
@@ -663,7 +663,7 @@ class WsReconnectGateTest {
         val sm = newSm()
         val ownerA = sm.allocateConnectionGeneration()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch) // floor = counter = ownerA = 1
         val claim = sm.awaitAndClaimProbe(ownerGeneration = ownerA)
         assertTrue(claim is ClaimResult.Failure)
@@ -686,7 +686,7 @@ class WsReconnectGateTest {
         // bypassing the probe claim entirely.
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
 
@@ -732,7 +732,7 @@ class WsReconnectGateTest {
         val obsoleteOwner = sm.allocateConnectionGeneration()  // counter=1
         sm.allocateConnectionGeneration()                       // counter=2 — supersedes
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)  // floor = counter = 2
 
         // The obsolete owner observes ProbeAvailable but cannot claim;
@@ -752,7 +752,7 @@ class WsReconnectGateTest {
         // it is numerically greater than the probe's floor.
         val sm = newSm()
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         // No allocate ⇒ counter still 0.
         val claim = sm.awaitAndClaimProbe(ownerGeneration = 999L)
@@ -789,7 +789,7 @@ class WsReconnectGateTest {
             tokenSource = { 0xDEAD_BEEFL },
         )
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         val owner = sm.allocateConnectionGeneration()
@@ -802,7 +802,7 @@ class WsReconnectGateTest {
 
         // Concurrent route change — flips CandidateProving → Quiesced
         // (new routeEpoch).
-        val newRouteEpoch = sm.beginRouteChange()
+        val newRouteEpoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         assertTrue(sm.gate.value is WsReconnectGate.Quiesced, "route change Quiesced the candidate")
         assertEquals(newRouteEpoch, sm.currentRouteEpoch())
         val modeBeforeStaleTick = sm.state.value
@@ -857,7 +857,7 @@ class WsReconnectGateTest {
             tokenSource = { 0xDEAD_BEEFL },
         )
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         val owner = sm.allocateConnectionGeneration()
@@ -877,6 +877,80 @@ class WsReconnectGateTest {
     }
 
     @Test
+    fun new_probe_gets_full_budget_after_partially_used_previous_probe() = runBlocking {
+        // P1 (ninth round, 2026-06-22): regression for
+        // probeAttemptCount inheritance. A previous probe that
+        // partially exhausted its budget (e.g. 2 failures) must NOT
+        // shorten the budget of a NEW probe issued after a route
+        // change. The fresh `issueProbeAfterRewalk` resets the
+        // counter atomically under the gate lock.
+        val sm = newSm(tokenSequence = listOf(0x1111L, 0x2222L))
+        armSticky(sm)
+        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+
+        // Probe A: claim + 2 failures (count = 2).
+        val routeA = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
+        sm.issueProbeAfterRewalk(routeA)
+        val ownerA = sm.allocateConnectionGeneration()
+        val claimA = sm.awaitAndClaimProbe(ownerGeneration = ownerA) as ClaimResult.Claimed
+        sm.recordProbeAttemptFailed(permit = claimA.probe, reason = "fail_1")
+        sm.recordProbeAttemptFailed(permit = claimA.probe, reason = "fail_2")
+        // Gate is still ProbeClaimed (budget = 5, count = 2).
+        assertTrue(sm.gate.value is WsReconnectGate.ProbeClaimed)
+
+        // Worst-case race simulation: drop the gate back to Quiesced
+        // WITHOUT going through the ProbeClaimed → CandidateProving
+        // reset (e.g. a route change kicks in mid-probe). Use
+        // beginRouteChange — it Quiesces via the gate-flip path that
+        // ALSO resets the counter, but a different path (e.g.
+        // candidate-death without prior claim reset) could leave the
+        // counter at 2. To pin the issueProbeAfterRewalk-side reset,
+        // we run a fresh begin → issue cycle after a manual
+        // candidate-died + recovery flow.
+        sm.onEvent(
+            RestStateMachine.Event.WsSessionConnected(
+                sessionEpoch = 7L,
+                connectionGeneration = ownerA,
+            )
+        )
+        assertTrue(sm.gate.value is WsReconnectGate.CandidateProving)
+        // Candidate dies before the 60s probation.
+        sm.onEvent(
+            RestStateMachine.Event.WsSessionEnded(
+                durationMs = 4_000,
+                inboundFrames = 0,
+                pendingAcksAtClose = 0,
+                okhttpPingTimeoutDetected = false,
+                sessionEpoch = 7L,
+            )
+        )
+        assertTrue(sm.gate.value is WsReconnectGate.Quiesced)
+
+        // New route change → Probe B.
+        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        val routeB = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
+        sm.issueProbeAfterRewalk(routeB)
+        val ownerB = sm.allocateConnectionGeneration()
+        val claimB = sm.awaitAndClaimProbe(ownerGeneration = ownerB) as ClaimResult.Claimed
+
+        // Probe B MUST get the full locked budget: 5 attempts before
+        // exhaustion. Burn 4 failures — gate must still be ProbeClaimed.
+        repeat(4) { i ->
+            sm.recordProbeAttemptFailed(permit = claimB.probe, reason = "b_fail_${i + 1}")
+            assertTrue(
+                sm.gate.value is WsReconnectGate.ProbeClaimed,
+                "Probe B attempt ${i + 1} of 5 must NOT exhaust budget; got ${sm.gate.value}",
+            )
+        }
+        // 5th failure ⇒ exhaustion ⇒ Quiesced.
+        sm.recordProbeAttemptFailed(permit = claimB.probe, reason = "b_fail_5")
+        assertTrue(
+            sm.gate.value is WsReconnectGate.Quiesced,
+            "Probe B fifth attempt MUST exhaust the full budget; got ${sm.gate.value}",
+        )
+    }
+
+    @Test
     fun no_token_value_appears_in_collected_logs_during_full_lifecycle() = runBlocking {
         val captured = mutableListOf<String>()
         val rawToken = 0x1234_5678_9ABC_DEF0L
@@ -890,7 +964,7 @@ class WsReconnectGateTest {
             tokenSource = { rawToken },
         )
         armSticky(sm)
-        val epoch = sm.beginRouteChange()
+        val epoch = sm.beginRouteChange(clearsMode2Sticky = true).routeEpoch
         sm.issueProbeAfterRewalk(epoch)
         sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
         val owner = sm.allocateConnectionGeneration()
