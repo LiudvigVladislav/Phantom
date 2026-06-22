@@ -876,6 +876,124 @@ class WsReconnectGateTest {
         assertEquals("ws_alive_60s", wsActiveCallbacks.single().third)
     }
 
+    // ── Test 20: full Mode 2 → quiescence → recovery lifecycle ──────────────
+
+    @Test
+    fun test_20_full_mode2_quiescence_recovery_lifecycle() = runBlocking {
+        // Locked Test 20 (Vladislav 2026-06-22) — state-machine-level
+        // end-to-end of the quiescence lifecycle:
+        //   1. Mode 2 silent-drop session ends → fast-path REST + sticky armed
+        //      → gate flips Open → Quiesced.
+        //   2. During quiescence the state machine stays in RestActive
+        //      (long-poll path continues delivering envelopes —
+        //      modeled by asserting RestMode.RestActive holds the
+        //      whole window; the REST transport is independent of the
+        //      gate and is unaffected).
+        //   3. Wi-Fi switch (NetworkChanged(clearsMode2Sticky=true)) →
+        //      sticky_recovery_pending. The coordinator (modeled
+        //      here by direct calls) runs the locked transaction:
+        //      beginRouteChange(true) → StickyRecovery → issueProbeAfterRewalk.
+        //      The gate transitions Quiesced → ProbeAvailable.
+        //   4. Reconnect loop awaits permit, claims probe → ProbeClaimed.
+        //   5. WS session connects with matching ownerGeneration →
+        //      ProbeClaimed → CandidateProving.
+        //   6. 60-second ws_alive_60s probation tick → CandidateProving
+        //      → Open + sticky cleared. RestMode → WsActive.
+        //   7. Exactly ONE probe issued during the lifecycle (the
+        //      single recovery probe — no spurious re-probing).
+        //   8. probeAttemptCount lands back at 0; the gate is Open and
+        //      stable.
+        //
+        // What this test does NOT cover (deferred for real-device smoke):
+        //   - actual WebSocket I/O on Tele2 LTE;
+        //   - actual REST poll deliveries / outbox/ACK preservation;
+        //   - actual Tecno Tele2 LTE Mode 2 reproduction.
+        var t = 0L
+        val captured = mutableListOf<String>()
+        val sm = RestStateMachine(
+            now = { t },
+            log = { captured.add(it) },
+            mode2FastPathEnabled = true,
+            mode2StickyEnabled = true,
+            reconnectQuiescenceEnabled = true,
+            currentKindProvider = { TransportKind.Direct },
+            tokenSource = { 0xDEAD_BEEFL },
+        )
+        // Step 1: Mode 2 silent-drop session — fast-path armed, gate Quiesced.
+        sm.onEvent(
+            RestStateMachine.Event.WsSessionEnded(
+                durationMs = 31_000,
+                inboundFrames = 0,
+                pendingAcksAtClose = 0,
+                okhttpPingTimeoutDetected = true,
+                sessionEpoch = 1L,
+            ),
+        )
+        assertEquals(RestMode.RestActive, sm.state.value, "Mode 2 ⇒ RestActive (REST poll picks up)")
+        assertTrue(sm.gate.value is WsReconnectGate.Quiesced, "armSticky ⇒ Quiesced; got ${sm.gate.value}")
+        val stickyGenAtArm = (sm.gate.value as WsReconnectGate.Quiesced).stickyGen
+
+        // Step 2: simulate REST continuing to deliver — modeled by the
+        // state staying in RestActive while we burn some virtual time.
+        // (The state machine is event-driven; no event during this
+        // window means no transition.) The gate must STAY Quiesced.
+        t = 5_000L
+        assertEquals(RestMode.RestActive, sm.state.value, "REST poll continues during quiescence")
+        assertTrue(sm.gate.value is WsReconnectGate.Quiesced, "gate stays Quiesced during REST delivery")
+
+        // Step 3: Wi-Fi switch ⇒ NetworkChanged(clearsMode2Sticky=true)
+        // submits the recovery-pending event, then coordinator runs
+        // the locked transaction (begin → issueProbe).
+        t = 10_000L
+        sm.onEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = true))
+        val outcome = sm.beginRouteChange(clearsMode2Sticky = true)
+        assertTrue(outcome is RouteChangeOutcome.StickyRecovery, "Quiesced + clears=true ⇒ StickyRecovery; got $outcome")
+        val routeEpoch = outcome.routeEpoch
+        val issueResult = sm.issueProbeAfterRewalk(routeEpoch)
+        assertTrue(issueResult is ProbeIssueResult.ProbeIssued, "probe issued; got $issueResult")
+        assertTrue(sm.gate.value is WsReconnectGate.ProbeAvailable, "gate ⇒ ProbeAvailable")
+
+        // Step 4: reconnect loop allocates + claims probe.
+        val owner = sm.allocateConnectionGeneration()
+        val claim = sm.awaitAndClaimProbe(ownerGeneration = owner) as ClaimResult.Claimed
+        assertTrue(sm.gate.value is WsReconnectGate.ProbeClaimed, "after claim ⇒ ProbeClaimed")
+
+        // Step 5: WS session connects with matching owner ⇒ CandidateProving.
+        t = 11_000L
+        sm.onEvent(
+            RestStateMachine.Event.WsSessionConnected(
+                sessionEpoch = 42L,
+                connectionGeneration = owner,
+            ),
+        )
+        assertTrue(sm.gate.value is WsReconnectGate.CandidateProving, "Connected ⇒ CandidateProving; got ${sm.gate.value}")
+        assertEquals(RestMode.WsCandidate, sm.state.value, "RestMode ⇒ WsCandidate during probation")
+        val candidateSessionEpoch = (sm.gate.value as WsReconnectGate.CandidateProving).sessionEpoch
+        assertEquals(42L, candidateSessionEpoch)
+
+        // Step 6: 60-second probation tick ⇒ ws_alive_60s ⇒ Open + sticky cleared.
+        t = 11_000L + 60_001L
+        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        assertEquals(WsReconnectGate.Open, sm.gate.value, "after 60s probation ⇒ gate Open")
+        assertEquals(RestMode.WsActive, sm.state.value, "after probation ⇒ RestMode WsActive")
+
+        // Step 7: EXACTLY ONE probe issued during the lifecycle.
+        val probeIssuedCount = captured.count { it.contains("ws_recovery_probe_granted") }
+        assertEquals(1, probeIssuedCount, "exactly one recovery probe across the lifecycle; got=$probeIssuedCount logs=$captured")
+
+        // Step 8: sticky cleared telemetry fired; gate stable.
+        assertTrue(captured.any { it.contains("sticky_cleared") }, "sticky_cleared log present; got $captured")
+        assertEquals(WsReconnectGate.Open, sm.gate.value, "gate stable at Open at end of lifecycle")
+
+        // Defense in depth: the captured log MUST NOT contain a raw
+        // token value (token-redaction invariant from commit 2a).
+        val rawTokenStr = 0xDEAD_BEEFL.toString()
+        assertTrue(
+            captured.none { it.contains(rawTokenStr) },
+            "no raw token value in any log line; got entries containing rawToken=${captured.filter { it.contains(rawTokenStr) }}",
+        )
+    }
+
     @Test
     fun new_probe_gets_full_budget_after_partially_used_previous_probe() = runBlocking {
         // P1 (ninth round, 2026-06-22): regression for

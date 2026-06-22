@@ -1354,7 +1354,64 @@ class AppContainer(private val context: Context) {
                 // Build-time invariant: requires MODE_2_FAST_PATH_ENABLED == "1".
                 mode2StickyEnabled =
                     phantom.android.BuildConfig.MODE_2_STICKY_ENABLED == "1",
+                // RC-RECONNECT-QUIESCENCE1 commit 2d (2026-06-22).
+                // Gate reads BuildConfig.RECONNECT_QUIESCENCE_ENABLED
+                // directly — NO BuildConfig.DEBUG conjunction. Release
+                // builds pin to literal "0"; a separate named PR flips
+                // to "1" after Tecno Tele2 LTE smoke PASS. Build-time
+                // invariant: requires MODE_2_STICKY_ENABLED == "1".
+                //
+                // The flag controls THREE independent wirings:
+                //   1. RestStateMachine's internal gate transitions
+                //      (this ctor param: gate STAYS Open when off).
+                //   2. KtorRelayTransport's gateProvider (constructed
+                //      below — passed as null when off so the
+                //      reconnect loop runs the legacy unconditional
+                //      while loop).
+                //   3. TransportRewalkCoordinator's gateCoordinator
+                //      (passed as null when off so the coordinator's
+                //      legacy fallback runs `hybrid.disconnect()` +
+                //      restart, bypassing the typed RouteChangeOutcome
+                //      transaction entirely).
+                reconnectQuiescenceEnabled =
+                    phantom.android.BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1",
+                // Commit 2d second-round amend (2026-06-22): wire the
+                // currentKindProvider so `armSticky`'s Direct fence
+                // fires correctly. The HybridRelayTransport ctor
+                // already gets the same provider; reading the same
+                // `TransportManager.state.value` from both places keeps
+                // the snapshot consistent.
+                currentKindProvider = {
+                    (transportManager.state.value
+                        as? phantom.core.transport.ManagerState.Connected)?.kind
+                },
+                // Commit 2d second-round amend (2026-06-22): wire the
+                // CSPRNG-backed token source so issued probe tokens
+                // are unguessable. The orchestrator already relies on
+                // `LibsodiumCsprng` for jitter draws (Trek 2 Stage 2A
+                // A5+A7); using the same source here keeps the CSPRNG
+                // dependency single-instance.
+                tokenSource = {
+                    phantom.core.crypto.LibsodiumCsprng.uniformLong(Long.MAX_VALUE)
+                },
             )
+            // Commit 2d (2026-06-22): assign the late-wired
+            // `gateProvider` on the bare `wsTransport` ONLY when
+            // `RECONNECT_QUIESCENCE_ENABLED == "1"`. The field is
+            // mutable (`@Volatile var`) precisely so AppContainer can
+            // construct `wsTransport` eagerly at class-init time
+            // (before this `restOrchestrator` exists) and then wire
+            // the provider after `RestFallbackOrchestrator` is built.
+            // The first `runReconnectLoop` snapshots the field once on
+            // entry; the late assignment is observed by the first
+            // `awaitReconnectPermit` call because `connect()` runs
+            // STRICTLY AFTER this line.
+            wsTransport.gateProvider =
+                if (phantom.android.BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1") {
+                    restOrchestrator.stateMachine
+                } else {
+                    null
+                }
             // Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence)
             // — wire the freshly-constructed orchestrator into the
             // class-level reference so the S6 breaker trigger
@@ -1511,7 +1568,23 @@ class AppContainer(private val context: Context) {
                 // `TransportRewalkCoordinator.performRewalk`. Tests that
                 // don't wire this fall back to the legacy
                 // pre-quiescence sequence.
-                gateCoordinator = restOrchestrator.stateMachine,
+                // Commit 2d (2026-06-22): wire the state-machine instance
+                // as the typed gate coordinator ONLY when
+                // `RECONNECT_QUIESCENCE_ENABLED == "1"`. When the flag is
+                // off, `null` triggers the byte-for-byte legacy fallback
+                // path in `TransportRewalkCoordinator.performRewalk`
+                // (sticky-pref clear + submitNetworkChangedEvent +
+                // `hybrid.disconnect()` + release + restart, unconditional
+                // `lastRewalkAtMs` bump). Passing the state-machine
+                // unconditionally would engage the typed
+                // `OpenReconnect` transaction whose `disconnectAndJoin`
+                // is functionally different from the legacy `disconnect`
+                // — a regression risk for the flag-off case.
+                gateCoordinator = if (phantom.android.BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1") {
+                    restOrchestrator.stateMachine
+                } else {
+                    null
+                },
                 requestServiceRestart = { reason ->
                     val intent = android.content.Intent(
                         context.applicationContext,

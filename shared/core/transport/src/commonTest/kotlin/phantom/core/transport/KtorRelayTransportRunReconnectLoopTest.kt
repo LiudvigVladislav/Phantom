@@ -43,7 +43,7 @@ class KtorRelayTransportRunReconnectLoopTest {
         val factory = clientFactory as (Int?) -> io.ktor.client.HttpClient
         return KtorRelayTransport(
             httpClientFactory = factory,
-            gateProvider = gateProvider,
+            initialGateProvider = gateProvider,
         ).also { livingTransports.add(it) }
     }
 

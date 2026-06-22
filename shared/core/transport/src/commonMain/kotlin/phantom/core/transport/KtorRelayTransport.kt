@@ -186,18 +186,31 @@ class KtorRelayTransport(
      * re-instantiation. Null port = direct.
      */
     private val httpClientFactory: (socksProxyPort: Int?) -> HttpClient,
+    initialGateProvider: WsReconnectGateProvider? = null,
+) : RelayTransport {
+
     /**
-     * RC-RECONNECT-QUIESCENCE1 commit 2b (2026-06-22). When non-null the
+     * RC-RECONNECT-QUIESCENCE1 commit 2b (2026-06-22) + commit 2d
+     * lifecycle-wiring amend (2026-06-22). When non-null the
      * reconnect loop observes the quiescence gate before each iteration
      * via [WsReconnectGateProvider.awaitReconnectPermit] and re-validates
      * the permit after the auth handshake. `null` ⇒ legacy behaviour
      * (no gate; loop dials every iteration with normal backoff).
      *
-     * Production wires the [phantom.core.transport.RestStateMachine]
-     * instance from `AppContainer`. Tests inject a fake.
+     * Mutable (`@Volatile`) so production [phantom.android.di.AppContainer]
+     * can construct `wsTransport` eagerly at class-init time (before
+     * `RestFallbackOrchestrator.stateMachine` exists) and then assign
+     * the gate provider after `initMessaging()` builds the orchestrator.
+     * The first `runReconnectLoop` iteration begins only after
+     * `connect()` is called from the service, which runs strictly
+     * AFTER `initMessaging()`, so the late assignment is observed by
+     * the first awaitReconnectPermit call.
+     *
+     * Tests inject the fake via [initialGateProvider] in the constructor;
+     * AppContainer leaves [initialGateProvider] null and assigns the
+     * field directly when wiring the orchestrator.
      */
-    private val gateProvider: WsReconnectGateProvider? = null,
-) : RelayTransport {
+    @Volatile var gateProvider: WsReconnectGateProvider? = initialGateProvider
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -1004,6 +1017,14 @@ class KtorRelayTransport(
         // gate transitions away from ProbeClaimed (route change /
         // revoke / Connected → CandidateProving).
         var currentClaim: WsReconnectPermit.ClaimedProbe? = null
+        // Commit 2d lifecycle-wiring amend: snapshot the `gateProvider`
+        // field ONCE per loop launch. The field is `@Volatile var` so
+        // AppContainer can wire it after `initMessaging()`; smart-casts
+        // would otherwise fail on every direct read. Capturing once
+        // makes the loop see a stable provider for its entire
+        // lifetime — a subsequent forceReconnect or a fresh launch
+        // re-reads.
+        val gateProvider = this.gateProvider
         while (!disconnectRequested) {
             // ─── Gate observation BEFORE client + auth ───
             // Only consult the gate when:

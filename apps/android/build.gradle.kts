@@ -583,6 +583,38 @@ android {
                 "\"$modeSticky\"",
             )
 
+            // RC-RECONNECT-QUIESCENCE1 commit 2d (2026-06-22).
+            // Opt-in via `-PreconnectQuiesce=1` (local.properties) or env
+            // RECONNECT_QUIESCENCE_ENABLED=1. Default "0" on debug;
+            // release builds pin to literal "0" below.
+            //
+            // Requires MODE_2_STICKY_ENABLED="1" (build-time invariant
+            // in RestStateMachine — quiescence depends on the sticky
+            // window being armed before the gate engages).
+            //
+            // AppContainer reads this flag and decides BOTH:
+            //   (a) whether RestStateMachine receives
+            //       `reconnectQuiescenceEnabled = true` (gate transitions
+            //       on `armSticky` / `Connected` / `candidate_died` /
+            //       `ws_alive_60s` only fire when the flag is on);
+            //   (b) whether TransportRewalkCoordinator receives a non-null
+            //       `gateCoordinator` AND KtorRelayTransport receives a
+            //       non-null `gateProvider` (a permanently-wired
+            //       gateCoordinator would otherwise engage the typed
+            //       transaction `OpenReconnect` path even when the flag
+            //       is off; with `gateCoordinator = null` the coordinator
+            //       falls back to the byte-for-byte legacy sequence).
+            val reconnectQuiesce = localOrEnv(
+                "reconnectQuiesce",
+                "RECONNECT_QUIESCENCE_ENABLED",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "RECONNECT_QUIESCENCE_ENABLED",
+                "\"$reconnectQuiesce\"",
+            )
+
         }
         release {
             isMinifyEnabled = true
@@ -754,6 +786,14 @@ android {
             // deliberate one-line flip in a separate named PR after smoke PASS.
             // Requires MODE_2_FAST_PATH_ENABLED="1" (build-time invariant).
             buildConfigField("String", "MODE_2_STICKY_ENABLED", "\"0\"")
+
+            // RC-RECONNECT-QUIESCENCE1 commit 2d (2026-06-22).
+            // Release builds ALWAYS pin to literal "0". Promotion is a
+            // deliberate one-line flip in a separate named PR (with
+            // MODE_2_FAST_PATH_ENABLED and MODE_2_STICKY_ENABLED flipped
+            // together) AFTER Tecno Tele2 LTE smoke PASS.
+            // Requires MODE_2_STICKY_ENABLED="1" (build-time invariant).
+            buildConfigField("String", "RECONNECT_QUIESCENCE_ENABLED", "\"0\"")
 
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
