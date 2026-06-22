@@ -17,6 +17,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -67,8 +68,47 @@ class KtorRelayTransportDisconnectAndJoinTest {
 
     @AfterTest
     fun closeAllTransports() = runBlocking {
-        livingTransports.forEach { runCatching { it.closeForTest() } }
+        // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-4 P2 (2026-06-23).
+        // `closeForTest(): Boolean` returns `false` when the inner
+        // `cleanupInflight` drain timed out — a stuck cleanup scope.
+        // Discard via `runCatching { it.closeForTest() }` silently leaked
+        // zombie cleanup-scope workers into subsequent test runs and
+        // intermittently hung Gradle sweeps. The teardown now classifies
+        // three failure modes per transport and fails the test by name.
+        val failures = mutableListOf<String>()
+        livingTransports.forEachIndexed { idx, t ->
+            val outcome = runCatching {
+                withTimeoutOrNull(6_000L) {
+                    t.closeForTest(awaitInflightTimeoutMs = 5_000L)
+                }
+            }
+            when {
+                outcome.isFailure ->
+                    failures.add(
+                        "transport[$idx] closeForTest threw " +
+                            outcome.exceptionOrNull(),
+                    )
+                outcome.getOrNull() == null ->
+                    failures.add(
+                        "transport[$idx] closeForTest did not return within " +
+                            "6 s outer timeout; cleanupInflight=" +
+                            "${t.cleanupInflightForTest()}",
+                    )
+                outcome.getOrNull() == false ->
+                    failures.add(
+                        "transport[$idx] closeForTest reported stuck " +
+                            "cleanupInflight after the 5 s drain window; " +
+                            "cleanupInflight=${t.cleanupInflightForTest()}",
+                    )
+            }
+        }
         livingTransports.clear()
+        if (failures.isNotEmpty()) {
+            error(
+                "@AfterTest teardown failed (${failures.size} failure(s)):\n" +
+                    failures.joinToString("\n") { "  - $it" },
+            )
+        }
     }
 
     @Test

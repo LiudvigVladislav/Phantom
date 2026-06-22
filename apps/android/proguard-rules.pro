@@ -87,12 +87,25 @@
 
 
 # --------------------------------------------------------------------------
-# PHANTOM transport — keep logger helpers so R8 does not inline them away
-# when isMinifyEnabled is on, otherwise diagnostic output disappears in
-# release builds exactly when we need it most.
+# PHANTOM logger helpers
+# --------------------------------------------------------------------------
+# Keep the top-level logger files so R8 does not strip diagnostic output in
+# release builds. Wildcard scope is restricted to logger entry-point files
+# (`*_androidKt`).
+#
+# NOTE — production implementation classes (e.g. `KtorRelayTransport`) MUST
+# NOT be blanket-kept here. A `-keep class X { *; }` on a class that
+# carries `internal` test seams (e.g. `*ForTest` mutation / snapshot /
+# wire-recorder hooks) preserves those members AND their JVM-mangled names
+# in the release APK, leaving an in-process-reflection attack surface that
+# the seam visibility was meant to remove. Reference: RC-RECONNECT-QUIESCENCE1
+# commit 2e Layer 2 finding NEW-1 (2026-06-23) — see
+# `apps/android/src/test/java/.../R8TestSeamStripVerificationTest.kt`
+# and the `verifyR8StripsTestSeams` task wiring. If a future runtime
+# regression surfaces that genuinely needs a specific member preserved,
+# add a NARROW targeted rule (per-member, not a wildcard).
 # --------------------------------------------------------------------------
 -keep class phantom.core.transport.RelayLog_androidKt { *; }
--keep class phantom.core.transport.KtorRelayTransport { *; }
 -keep class phantom.core.messaging.MessagingLog_androidKt { *; }
 -keep class phantom.core.messaging.DefaultMessagingService { *; }
 

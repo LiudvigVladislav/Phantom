@@ -1161,6 +1161,24 @@ class AppContainer(private val context: Context) {
             // `"0"`; the trigger helper short-circuits with the
             // `breaker_test_trigger_refused` log.
             val s6DebugEnabled = phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"
+
+            // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-4 P2 NEW-2 (2026-06-23).
+            // The same `currentKindProvider` lambda must reach BOTH the
+            // `RestFallbackOrchestrator` (so `armSticky`'s Direct fence
+            // sees the right transport kind) AND the `HybridRelayTransport`
+            // degradation detector (so its kind-aware verdict matches).
+            // The previous shape declared the same expression at two
+            // separate ctor sites — the Kotlin compiler had no way to
+            // verify they reduced to identical reads, leaving a refactor
+            // hazard where one site could drift and produce observation
+            // skew between orchestrator and hybrid. Extracting a single
+            // shared lambda makes the single-source-of-truth invariant
+            // structural.
+            val sharedCurrentKindProvider: () -> phantom.core.transport.TransportKind? = {
+                (transportManager.state.value
+                    as? phantom.core.transport.ManagerState.Connected)?.kind
+            }
+
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
@@ -1377,14 +1395,10 @@ class AppContainer(private val context: Context) {
                     phantom.android.BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1",
                 // Commit 2d second-round amend (2026-06-22): wire the
                 // currentKindProvider so `armSticky`'s Direct fence
-                // fires correctly. The HybridRelayTransport ctor
-                // already gets the same provider; reading the same
-                // `TransportManager.state.value` from both places keeps
-                // the snapshot consistent.
-                currentKindProvider = {
-                    (transportManager.state.value
-                        as? phantom.core.transport.ManagerState.Connected)?.kind
-                },
+                // fires correctly. Single-source-of-truth lambda shared
+                // with HybridRelayTransport — see [sharedCurrentKindProvider]
+                // declaration above (fix-round-4 NEW-2 2026-06-23).
+                currentKindProvider = sharedCurrentKindProvider,
                 // Commit 2d second-round amend (2026-06-22): wire the
                 // CSPRNG-backed token source so issued probe tokens
                 // are unguessable. The orchestrator already relies on
@@ -1523,10 +1537,13 @@ class AppContainer(private val context: Context) {
                 processedEnvelopeRepository = processedEnvelopeRepo,
                 scope = appScope,
                 wsDegradationDetector = wsDegradationDetector,
-                degradationCurrentKindProvider = {
-                    (transportManager.state.value
-                        as? phantom.core.transport.ManagerState.Connected)?.kind
-                },
+                // Single-source-of-truth lambda shared with the
+                // RestFallbackOrchestrator's currentKindProvider — see
+                // [sharedCurrentKindProvider] declaration further up
+                // (fix-round-4 NEW-2 2026-06-23). Same lambda instance
+                // reaches both consumers so a future refactor cannot
+                // produce observation skew.
+                degradationCurrentKindProvider = sharedCurrentKindProvider,
             )
             hybridTransport = hybrid
             // Async REST bootstrap — never blocks AppContainer init. On failure

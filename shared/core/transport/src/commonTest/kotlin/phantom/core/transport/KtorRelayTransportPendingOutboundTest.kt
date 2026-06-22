@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -46,8 +47,44 @@ class KtorRelayTransportPendingOutboundTest {
 
     @AfterTest
     fun closeAllTransports() = runBlocking {
-        livingTransports.forEach { runCatching { it.closeForTest() } }
+        // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-4 P2 (2026-06-23).
+        // See `KtorRelayTransportDisconnectAndJoinTest.closeAllTransports`
+        // for the same teardown rationale: `closeForTest(): Boolean`
+        // must fail loudly when `cleanupInflight` does not drain.
+        val failures = mutableListOf<String>()
+        livingTransports.forEachIndexed { idx, t ->
+            val outcome = runCatching {
+                withTimeoutOrNull(6_000L) {
+                    t.closeForTest(awaitInflightTimeoutMs = 5_000L)
+                }
+            }
+            when {
+                outcome.isFailure ->
+                    failures.add(
+                        "transport[$idx] closeForTest threw " +
+                            outcome.exceptionOrNull(),
+                    )
+                outcome.getOrNull() == null ->
+                    failures.add(
+                        "transport[$idx] closeForTest did not return within " +
+                            "6 s outer timeout; cleanupInflight=" +
+                            "${t.cleanupInflightForTest()}",
+                    )
+                outcome.getOrNull() == false ->
+                    failures.add(
+                        "transport[$idx] closeForTest reported stuck " +
+                            "cleanupInflight after the 5 s drain window; " +
+                            "cleanupInflight=${t.cleanupInflightForTest()}",
+                    )
+            }
+        }
         livingTransports.clear()
+        if (failures.isNotEmpty()) {
+            error(
+                "@AfterTest teardown failed (${failures.size} failure(s)):\n" +
+                    failures.joinToString("\n") { "  - $it" },
+            )
+        }
     }
 
     private fun fakeSendMessage(id: String, recipient: String = "deadbeef"): RelayMessage.Send =
