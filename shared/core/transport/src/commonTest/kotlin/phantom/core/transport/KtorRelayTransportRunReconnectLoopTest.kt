@@ -13,7 +13,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -54,6 +53,13 @@ class KtorRelayTransportRunReconnectLoopTest {
         // See `KtorRelayTransportDisconnectAndJoinTest.closeAllTransports`
         // for the same teardown rationale: `closeForTest(): Boolean`
         // must fail loudly when `cleanupInflight` does not drain.
+        //
+        // fix-round-5 (2026-06-23): forensic `cleanupInflight` read also
+        // bounded so a stuck mutex cannot re-hang `@AfterTest` during
+        // diagnostic message construction.
+        suspend fun forensicInflightOrUnavailable(t: KtorRelayTransport): String =
+            withTimeoutOrNull(500L) { t.cleanupInflightForTest().toString() }
+                ?: "unavailable"
         val failures = mutableListOf<String>()
         livingTransports.forEachIndexed { idx, t ->
             val outcome = runCatching {
@@ -71,13 +77,13 @@ class KtorRelayTransportRunReconnectLoopTest {
                     failures.add(
                         "transport[$idx] closeForTest did not return within " +
                             "6 s outer timeout; cleanupInflight=" +
-                            "${t.cleanupInflightForTest()}",
+                            forensicInflightOrUnavailable(t),
                     )
                 outcome.getOrNull() == false ->
                     failures.add(
                         "transport[$idx] closeForTest reported stuck " +
                             "cleanupInflight after the 5 s drain window; " +
-                            "cleanupInflight=${t.cleanupInflightForTest()}",
+                            "cleanupInflight=${forensicInflightOrUnavailable(t)}",
                     )
             }
         }

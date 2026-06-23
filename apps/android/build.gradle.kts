@@ -851,25 +851,27 @@ android {
 }
 
 // --------------------------------------------------------------------------
-// RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-4 P1 — release R8 artifact proof.
+// Release R8 artifact proof — `verifyR8StripsTestSeams`.
 //
-// `verifyR8StripsTestSeams` reads the R8 mapping.txt for the release build
-// and fails if any `phantom.core.transport.*` class block lists a member
-// whose name ends in `ForTest` (= the seam survived release minification
-// and is reachable by JVM-level reflection in the release APK). The task
-// is wired as a `finalizedBy` on `assembleRelease`, so any future
-// proguard-rules.pro regression that re-introduces a wildcard `-keep` on
-// `KtorRelayTransport` (or any sibling class carrying `*ForTest` seams)
-// fails the release build by name.
+// The task reads the R8 mapping.txt produced by the release build and
+// fails if any `phantom.*` class block lists a member whose name
+// contains `ForTest`. A surviving `*ForTest` seam is a release-binary
+// attack surface — `internal` test seams become JVM-public after Kotlin
+// name-mangling, and a `-keep ... { *; }` wildcard in proguard-rules.pro
+// preserves both the member AND its mangled name so an in-process
+// reflection caller can reach it.
 //
-// References:
-//   - apps/android/proguard-rules.pro — line block above the `-keep`
-//     rules explains why wildcards on impl classes are forbidden.
-//   - C:\temp\rcr1-2e-review-2026-06-23\synthesis\synthesis-2026-06-23.md
-//     §2 — Layer 2 finding NEW-1 (2026-06-23) that motivated this task.
+// Coverage spans all `phantom.*` namespaces (production seams currently
+// live on `phantom.core.transport.*` AND `phantom.android.transport.*`;
+// any future `phantom.*` sibling that grows a test seam is caught by
+// the same rule without per-namespace maintenance).
+//
+// Wired as `finalizedBy` on `assembleRelease`, so any future
+// proguard-rules.pro regression that re-introduces a wildcard `-keep`
+// on a class carrying `*ForTest` seams fails the release build by name.
 // --------------------------------------------------------------------------
 tasks.register("verifyR8StripsTestSeams") {
-    description = "Fails if any `*ForTest` seam on a phantom.core.transport class " +
+    description = "Fails if any `*ForTest` seam on a phantom.* class " +
         "survived R8 minification into the release APK."
     group = "verification"
 
@@ -894,18 +896,17 @@ tasks.register("verifyR8StripsTestSeams") {
             lines.forEach { rawLine ->
                 val line = rawLine.trimEnd()
                 // A class-declaration line in mapping.txt has the shape:
-                //     "phantom.core.transport.SomeClass -> phantom.core.transport.x:"
+                //     "phantom.android.transport.SomeClass -> phantom.android.transport.x:"
                 // (left side = original FQCN, right side = renamed FQCN).
                 // Member lines under that class are indented.
                 if (!line.startsWith(" ") && !line.startsWith("#") && line.contains(" -> ")) {
                     val original = line.substringBefore(" -> ").trim()
-                    currentClass = if (original.startsWith("phantom.core.transport.")) original else null
+                    currentClass = if (original.startsWith("phantom.")) original else null
                     return@forEach
                 }
                 val klass = currentClass ?: return@forEach
-                // Inside a phantom.core.transport.* class block. A surviving
-                // `*ForTest` member is a release-binary attack surface per
-                // Layer 2 NEW-1 (2026-06-23).
+                // Inside any phantom.* class block. A surviving `*ForTest`
+                // member is a release-binary attack surface.
                 if (line.contains("ForTest")) {
                     violations.add("$klass :: ${line.trim()}")
                 }
@@ -914,20 +915,19 @@ tasks.register("verifyR8StripsTestSeams") {
         if (violations.isNotEmpty()) {
             throw GradleException(
                 "verifyR8StripsTestSeams: ${violations.size} `*ForTest` member(s) " +
-                    "on phantom.core.transport classes survived R8 release minification:\n" +
+                    "on phantom.* classes survived R8 release minification:\n" +
                     violations.joinToString("\n") { "  - $it" } +
                     "\n\nThese are `internal` test seams that MUST NOT survive into the " +
-                    "release APK. A `-keep class phantom.core.transport.<Class> { *; }` " +
-                    "wildcard rule in apps/android/proguard-rules.pro would preserve them " +
-                    "with their JVM-mangled names intact, enlarging the in-process " +
-                    "reflection attack surface (Layer 2 NEW-1, 2026-06-23). " +
-                    "Tighten the rule to a narrow per-member keep, or remove the wildcard, " +
-                    "then re-run `:apps:android:assembleRelease`.",
+                    "release APK. A `-keep class phantom.<...>.<Class> { *; }` wildcard " +
+                    "rule in apps/android/proguard-rules.pro would preserve them with " +
+                    "their JVM-mangled names intact, enlarging the in-process reflection " +
+                    "attack surface. Tighten the rule to a narrow per-member keep, or " +
+                    "remove the wildcard, then re-run `:apps:android:assembleRelease`.",
             )
         }
         logger.lifecycle(
             "verifyR8StripsTestSeams: PASS — no `*ForTest` members survived on any " +
-                "phantom.core.transport.* class in ${mappingPath.absolutePath}.",
+                "phantom.* class in ${mappingPath.absolutePath}.",
         )
     }
 }

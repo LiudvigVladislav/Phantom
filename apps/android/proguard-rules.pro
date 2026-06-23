@@ -98,12 +98,15 @@
 # carries `internal` test seams (e.g. `*ForTest` mutation / snapshot /
 # wire-recorder hooks) preserves those members AND their JVM-mangled names
 # in the release APK, leaving an in-process-reflection attack surface that
-# the seam visibility was meant to remove. Reference: RC-RECONNECT-QUIESCENCE1
-# commit 2e Layer 2 finding NEW-1 (2026-06-23) — see
-# `apps/android/src/test/java/.../R8TestSeamStripVerificationTest.kt`
-# and the `verifyR8StripsTestSeams` task wiring. If a future runtime
-# regression surfaces that genuinely needs a specific member preserved,
-# add a NARROW targeted rule (per-member, not a wildcard).
+# the seam visibility was meant to remove.
+#
+# The `verifyR8StripsTestSeams` Gradle task in `apps/android/build.gradle.kts`
+# enforces this invariant — it runs as `finalizedBy` on `assembleRelease`,
+# scans the R8 mapping.txt for any `phantom.*` class block listing a
+# member whose name contains `ForTest`, and fails the release build by
+# name if one survives. If a future runtime regression surfaces that
+# genuinely needs a specific member preserved, add a NARROW targeted
+# rule (per-member, not a wildcard).
 # --------------------------------------------------------------------------
 -keep class phantom.core.transport.RelayLog_androidKt { *; }
 -keep class phantom.core.messaging.MessagingLog_androidKt { *; }

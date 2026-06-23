@@ -75,6 +75,15 @@ class KtorRelayTransportDisconnectAndJoinTest {
         // zombie cleanup-scope workers into subsequent test runs and
         // intermittently hung Gradle sweeps. The teardown now classifies
         // three failure modes per transport and fails the test by name.
+        //
+        // fix-round-5 (2026-06-23): the forensic `cleanupInflight` read
+        // takes the same `cleanupCounterMutex` that the close path
+        // contends on, so a stall in the close suspend could also stall
+        // the forensic read and re-hang `@AfterTest`. Wrap each
+        // diagnostic read in its own short bounded timeout.
+        suspend fun forensicInflightOrUnavailable(t: KtorRelayTransport): String =
+            withTimeoutOrNull(500L) { t.cleanupInflightForTest().toString() }
+                ?: "unavailable"
         val failures = mutableListOf<String>()
         livingTransports.forEachIndexed { idx, t ->
             val outcome = runCatching {
@@ -92,13 +101,13 @@ class KtorRelayTransportDisconnectAndJoinTest {
                     failures.add(
                         "transport[$idx] closeForTest did not return within " +
                             "6 s outer timeout; cleanupInflight=" +
-                            "${t.cleanupInflightForTest()}",
+                            forensicInflightOrUnavailable(t),
                     )
                 outcome.getOrNull() == false ->
                     failures.add(
                         "transport[$idx] closeForTest reported stuck " +
                             "cleanupInflight after the 5 s drain window; " +
-                            "cleanupInflight=${t.cleanupInflightForTest()}",
+                            "cleanupInflight=${forensicInflightOrUnavailable(t)}",
                     )
             }
         }

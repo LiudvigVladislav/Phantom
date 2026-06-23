@@ -132,6 +132,15 @@ class HybridRelayTransportIntegrationTest20 {
      */
     @AfterTest
     fun closeAllOpenResources() = runBlocking {
+        // fix-round-5 (2026-06-23): the forensic `cleanupInflight` read
+        // takes the same `cleanupCounterMutex` that the close path
+        // contends on, so a stall in the close suspend could also stall
+        // the forensic read and re-hang `@AfterTest`. Wrap each
+        // diagnostic read in its own short bounded timeout.
+        suspend fun forensicInflightOrUnavailable(t: KtorRelayTransport): String =
+            withTimeoutOrNull(500L) {
+                t.cleanupInflightCountForIntegrationTest().toString()
+            } ?: "unavailable"
         val failures = mutableListOf<String>()
         openTransports.forEachIndexed { idx, t ->
             val outcome = runCatching {
@@ -149,14 +158,14 @@ class HybridRelayTransportIntegrationTest20 {
                     failures.add(
                         "transport[$idx] closeForIntegrationTest did not " +
                             "return within 6 s (outer timeout); " +
-                            "cleanupInflight=${t.cleanupInflightCountForIntegrationTest()}",
+                            "cleanupInflight=${forensicInflightOrUnavailable(t)}",
                     )
                 outcome.getOrNull() == false ->
                     failures.add(
                         "transport[$idx] closeForIntegrationTest reported " +
                             "stuck cleanupInflight after the 5 s drain " +
                             "window; cleanupInflight=" +
-                            "${t.cleanupInflightCountForIntegrationTest()}",
+                            forensicInflightOrUnavailable(t),
                     )
             }
         }
