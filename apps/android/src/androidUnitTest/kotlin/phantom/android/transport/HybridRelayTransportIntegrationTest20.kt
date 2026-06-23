@@ -67,15 +67,49 @@ import kotlin.test.assertTrue
  *     (the SAME path production uses)
  *   → state machine consumes ProbeClaimed → CandidateProving
  *   → `KtorRelayTransport.runReconnectMergeAndFlushForTest(epoch=2)`
- *     drives the REAL production reconnect-side merge/flush sequence
- *     (`mergeUnackedIntoOutboxOrdered` + `flushPendingOutbox`) — the
- *     same two methods `runReconnectLoop` invokes once a fresh WS
- *     session is up.
+ *     drives the production-shared `runReconnectMergeAndFlush` private
+ *     helper directly (the same private body that
+ *     `KtorRelayTransport.runReconnectLoop:1287` invokes on a fresh
+ *     post-Connected session, by construction — the test seam delegates
+ *     to the same private member, not to a parallel implementation).
+ *     The test verifies the helper's behaviour (merge + flush + sendRaw
+ *     chain) end-to-end through the wire-recorder. It does NOT
+ *     independently prove that `runReconnectLoop` continues to invoke
+ *     this helper on every fresh post-Connected session — a future
+ *     regression that removes the `runReconnectLoop:1287` call site
+ *     would leave Test 20 green because the test exercises the helper
+ *     directly via the parallel seam. See mini-lock §6
+ *     `L-Test20-invocation-gap` (`docs/tracks/rc-reconnect-quiescence1.md`)
+ *     for the load-bearing limit and the deferred follow-up fixture
+ *     work (a recording WebSocket session under a Ktor MockEngine WS
+ *     fixture OR an embedded loopback server) that would close it.
  *   → a wire-recorder installed via `sendRawAttemptForTest` observes
  *     every `RelayMessage` the production `sendRaw` path tries to
  *     push onto the WS, BEFORE the null-session guard. Absence in
  *     the recording means the production code path NEVER tried to
- *     put the migrated envelopes on the wire.
+ *     put the migrated envelopes on the wire — within the limit
+ *     above: the recording-empty assertion at the end of Phase 2 is
+ *     paired with the chain-proof positive control at Phase 0 below,
+ *     so it discriminates "empty-store early-exit" from "`sendRaw`
+ *     bypassed", but it does NOT discriminate either of those from
+ *     "`runReconnectLoop` removed the helper call entirely".
+ *
+ * Phase 0 — chain-proof positive control (fix-round-7 per architect
+ * review 2026-06-23):
+ *
+ *   Seed a unique sentinel envelope directly into `pendingOutbox` via
+ *   the reflection seam → invoke `runReconnectMergeAndFlushForTest`
+ *   directly → assert the wire-recorder observed the sentinel
+ *   exactly once → clear via `markPendingOutboundAcceptedByFallback`
+ *   → assert `pendingAcks` + `pendingOutbox` + `snapshotPendingOutbound`
+ *   all empty → reset the recorder. This proves the full chain
+ *   `non-empty store → mergeUnackedIntoOutboxOrdered → flushPendingOutbox
+ *   → sendRaw → recorder` is wired end-to-end and that the negative
+ *   assertion at the end of Phase 2 will discriminate "empty-store
+ *   early-exit" from "`sendRaw` bypassed". Without this control the
+ *   Phase 2 negative assertion would be ambiguous (empty recording
+ *   could mean either the wanted invariant OR a regression that
+ *   bypasses the flush path entirely).
  *
  * Assertions across BOTH phases:
  *
@@ -300,31 +334,110 @@ class HybridRelayTransportIntegrationTest20 {
             wireRecording.add(id)
         }
 
-        // ── Positive control (fix-round-3 2026-06-22) ───────────────
-        // Prove the recorder is actually wired BEFORE the negative
-        // assertion runs at the end. Without this, accidental deletion
-        // of `sendRawAttemptForTest?.invoke(message)` from `sendRaw`
-        // would leave the final "wire recording empty" check green
-        // for the wrong reason.
-        val sentinelId = "sentinel-recorder-${java.util.UUID.randomUUID()}"
-        val sentinelMsg = RelayMessage.Send(
+        // ── Phase 0 — chain-proof positive control ──────────────────
+        // (fix-round-7 per architect review 2026-06-23.)
+        //
+        // The earlier shape of the positive control was a single direct
+        // `sendRawForIntegrationTest(sentinel)` call followed by an
+        // `assertTrue(sentinel in wireRecording)` check. That earlier
+        // control proved the recorder hook is wired to `sendRaw`, but
+        // it did NOT prove that the Phase 2 negative assertion can
+        // discriminate the wanted "empty-store early-exit" outcome
+        // from the unwanted "the production `flushPendingOutbox` path
+        // got bypassed and `sendRaw` was never called for an unrelated
+        // reason" outcome. Both produce an empty recording.
+        //
+        // The new control walks the FULL chain:
+        //
+        //   non-empty `pendingOutbox`
+        //     → `runReconnectMergeAndFlushForTest` (the production-
+        //       shared private helper that `runReconnectLoop` invokes
+        //       on a fresh post-Connected session, by construction —
+        //       see KDoc class header for the load-bearing limit)
+        //     → `mergeUnackedIntoOutboxOrdered` (no-op on empty
+        //       `pendingAcks`) + `flushPendingOutbox` (iterates the
+        //       seeded entry)
+        //     → `sendRaw(sentinel)` (the production sendRaw body
+        //       invokes the `sendRawAttemptForTest` recorder BEFORE
+        //       its null-session guard, then returns `false` because
+        //       no live WS session is planted)
+        //     → recorder captures the sentinel messageId.
+        //
+        // If the recorder hook OR any step of that chain is broken,
+        // the assertion below fails by name BEFORE Phase 1 runs.
+
+        // (1) Plant a unique sentinel envelope directly in
+        //     `pendingOutbox`.
+        val controlSentinelId = "ctl-sentinel-${java.util.UUID.randomUUID()}"
+        val controlSentinelMsg = RelayMessage.Send(
             to = "aa".repeat(32),
             sealedSender = "",
-            payload = "c2VudGluZWw=",
-            messageId = sentinelId,
+            payload = "Y3RsLXNlbnRpbmVs",
+            messageId = controlSentinelId,
         )
-        ws.sendRawForIntegrationTest(sentinelMsg)
+        ws.seedOutboxForIntegrationTest(
+            controlSentinelMsg,
+            sequenceTs = 1L,
+            queuedAtMs = 0L,
+        )
+        assertEquals(
+            1, ws.snapshotPendingOutbound().size,
+            "control-sentinel precondition: pendingOutbox has exactly one " +
+                "seeded envelope; got ${ws.snapshotPendingOutbound()}",
+        )
+
+        // (2) Drive the SAME merge/flush helper the production
+        //     `runReconnectLoop:1287` invokes on a fresh post-Connected
+        //     session. Use a placeholder session epoch (1L) — the
+        //     helper does not check session liveness; the `sendRaw`
+        //     body inside `flushPendingOutbox` returns `false`
+        //     because no WS session is planted, but it fires the
+        //     recorder hook FIRST.
+        ws.runReconnectMergeAndFlushForIntegrationTest(mySession = 1L)
+
+        // (3) Recorder MUST have observed the sentinel exactly once.
+        val controlCount = wireRecording.count { it == controlSentinelId }
+        assertEquals(
+            1, controlCount,
+            "chain-proof positive control: the wire-recorder MUST observe " +
+                "the sentinel messageId EXACTLY ONCE after the production " +
+                "merge/flush chain runs against a non-empty pendingOutbox. " +
+                "This pins the chain non-empty store → " +
+                "mergeUnackedIntoOutboxOrdered → flushPendingOutbox → " +
+                "sendRaw → recorder is wired end-to-end and therefore " +
+                "guarantees the negative assertion at the end of Phase 2 " +
+                "discriminates 'empty-store early-exit' from 'sendRaw " +
+                "bypassed'. Got controlCount=$controlCount, " +
+                "wireRecording=${wireRecording.toList()}",
+        )
+
+        // (4) Drop the sentinel from BOTH stores atomically — the
+        //     production helper that the post-migration Phase 1
+        //     assertions also use.
+        ws.markPendingOutboundAcceptedByFallback(controlSentinelId)
+
+        // (5) After the cleanup, every store and the public union
+        //     snapshot must be empty — leaves the precondition clean
+        //     for Phase 1 migration.
+        assertEquals(
+            0, ws.snapshotPendingAcksCountForIntegrationTest(),
+            "post-control: pendingAcks must be empty after " +
+                "markPendingOutboundAcceptedByFallback",
+        )
+        assertEquals(
+            0, ws.snapshotOutboxCountForIntegrationTest(),
+            "post-control: pendingOutbox must be empty after " +
+                "markPendingOutboundAcceptedByFallback",
+        )
         assertTrue(
-            sentinelId in wireRecording,
-            "positive control: the wire-recorder MUST observe the sentinel " +
-                "messageId after a direct `sendRaw` invocation. If this " +
-                "assertion fails, `sendRaw` is no longer calling " +
-                "`sendRawAttemptForTest?.invoke(message)` and the Phase-2 " +
-                "negative assertion is meaningless. Got wireRecording=" +
-                "${wireRecording.toList()}",
+            ws.snapshotPendingOutbound().isEmpty(),
+            "post-control: snapshotPendingOutbound must be empty after " +
+                "markPendingOutboundAcceptedByFallback; got " +
+                "${ws.snapshotPendingOutbound()}",
         )
-        // Clear so the negative assertion at the end measures only
-        // recovery-side activity.
+
+        // (6) Reset the recorder so Phase 2's negative assertion
+        //     measures ONLY recovery-side activity.
         wireRecording.clear()
 
         // ── Real bootstrap ──────────────────────────────────────────

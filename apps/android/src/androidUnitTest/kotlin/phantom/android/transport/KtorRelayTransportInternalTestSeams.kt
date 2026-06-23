@@ -151,24 +151,3 @@ internal suspend fun KtorRelayTransport.cleanupInflightCountForIntegrationTest()
     return fn.callSuspend(this) as Int
 }
 
-/**
- * Positive-control bridge: exposes the production-private `sendRaw`
- * through the existing `sendRawForTest` internal seam. The
- * integration test invokes this with a sentinel envelope BEFORE the
- * main flow so an assertion can pin "the recorder is actually wired
- * to `sendRaw`." Without the positive control, an accidental
- * deletion of the recorder hook would leave the negative-control
- * assertion green.
- *
- * Returns the boolean `sendRaw` returns (`true` on successful WS
- * write, `false` on null session) — the integration test does not
- * care about that value; it only inspects the wire-recording.
- */
-internal suspend fun KtorRelayTransport.sendRawForIntegrationTest(
-    message: RelayMessage,
-): Boolean {
-    val fn = KtorRelayTransport::class.declaredMemberFunctions
-        .first { it.name == "sendRawForTest" }
-    fn.isAccessible = true
-    return fn.callSuspend(this, message) as Boolean
-}
