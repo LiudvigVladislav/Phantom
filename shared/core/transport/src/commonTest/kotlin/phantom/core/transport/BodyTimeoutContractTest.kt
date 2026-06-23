@@ -94,7 +94,7 @@ class BodyTimeoutContractTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
+            orch.submitEvent(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -143,7 +143,7 @@ class BodyTimeoutContractTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
+            orch.submitEvent(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -183,7 +183,7 @@ class BodyTimeoutContractTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
+            orch.submitEvent(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -242,7 +242,7 @@ class BodyTimeoutContractTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
+            orch.submitEvent(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -322,7 +322,7 @@ class BodyTimeoutContractTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
+            orch.submitEvent(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,

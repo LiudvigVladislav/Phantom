@@ -310,7 +310,7 @@ class RestFallbackOrchestratorBreakerTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
+            orch.submitEvent(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                     sessionEpoch = 0L,
@@ -450,7 +450,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -519,7 +519,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -586,7 +586,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -649,7 +649,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -881,7 +881,7 @@ class RestFallbackOrchestratorBreakerTest {
             val collectJob = launch { orch.inbound.collect { received += it } }
             runCurrent()
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -961,7 +961,7 @@ class RestFallbackOrchestratorBreakerTest {
             check(caps.restFallback)
             check(orch.peekVerifyKeyStateForTest() is VerifyKeyState.KeyPresent)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1015,7 +1015,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1094,7 +1094,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1178,7 +1178,7 @@ class RestFallbackOrchestratorBreakerTest {
             }
             runCurrent()
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1241,7 +1241,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1314,7 +1314,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1441,7 +1441,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1521,7 +1521,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1614,7 +1614,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1693,7 +1693,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -1849,7 +1849,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2020,7 +2020,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2112,7 +2112,7 @@ class RestFallbackOrchestratorBreakerTest {
                 RestFallbackResponse(statusCode = 410, bodyParsed = null, rawBody = "", elapsedMs = 1L)
             }
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2195,7 +2195,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2255,7 +2255,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2345,7 +2345,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2432,7 +2432,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2516,7 +2516,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2566,7 +2566,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -2757,7 +2757,7 @@ class RestFallbackOrchestratorBreakerTest {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEventNow(
+                orch.submitEvent(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
