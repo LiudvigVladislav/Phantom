@@ -184,7 +184,10 @@ class MigrationManagerTest {
         // invoked once per retry attempt. The migration path is single-
         // shot in production, and this fake invokes the lambda exactly
         // once and records the resulting request — same shape as before.
-        override suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult {
+        override suspend fun publishBundle(
+            forceJoinInFlight: Boolean,
+            requestProvider: suspend () -> PublishRequest,
+        ): PublishResult {
             publishCount++
             lastRequest = requestProvider()
             return publishResult

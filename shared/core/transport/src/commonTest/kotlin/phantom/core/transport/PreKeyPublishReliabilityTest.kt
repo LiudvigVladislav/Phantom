@@ -7,6 +7,9 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
 import io.ktor.http.HttpStatusCode
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -240,12 +243,20 @@ class PreKeyPublishReliabilityTest {
     // ── Test 1: mutex deduplicates parallel calls ─────────────────────────────
 
     /**
-     * Debounce test: when publishMutex is already locked (simulating an in-flight
-     * publish), a subsequent publishBundle call returns Stored(0) immediately
+     * Debounce test (RC-PREKEY-PUBLISH-DEBOUNCE-RACE 2026-06-25):
+     * when publishMutex is already locked (simulating an in-flight
+     * publish), a subsequent `publishBundle` call with the default
+     * `forceJoinInFlight = false` returns [PublishResult.Deferred]
      * without dispatching any transport call.
+     *
+     * Pre-fix the implementation returned a synthetic `Stored(0)` here,
+     * which downstream consumers logged as `upload_ok stored_opks=0`.
+     * The mini-lock invariant Inv-NoFalseSuccess REJECTS that shape —
+     * the debounce result must be honest, not synthesised as a storage
+     * success.
      */
     @Test
-    fun publishBundle_mutex_deduplicates_parallel_calls() = runTest {
+    fun publishBundle_mutex_default_returnsDeferred_not_Stored() = runTest {
         val transport = FakePreKeyPublishHttpTransport { _ ->
             PreKeyPublishHttpResponse(201, """{"stored_opks": 5}""", elapsedMs = 1L)
         }
@@ -260,9 +271,11 @@ class PreKeyPublishReliabilityTest {
 
         val debounced = api.publishBundle { sampleRequest() }
 
-        assertTrue(debounced is PublishResult.Stored)
-        assertEquals(0, (debounced as PublishResult.Stored).storedOpks,
-            "debounced call must return synthetic Stored(0)")
+        assertTrue(
+            debounced is PublishResult.Deferred,
+            "default-debounce result must be PublishResult.Deferred " +
+                "(Inv-NoFalseSuccess) — got $debounced",
+        )
         assertEquals(0, transport.callCount,
             "no transport call should fire when mutex is locked (debounce path)")
 
@@ -274,6 +287,73 @@ class PreKeyPublishReliabilityTest {
         assertEquals(5, (real as PublishResult.Stored).storedOpks,
             "real call after mutex released must return server response")
         assertEquals(1, transport.callCount, "exactly one transport call dispatched for the real call")
+    }
+
+    /**
+     * Force-join path (RC-PREKEY-PUBLISH-DEBOUNCE-RACE 2026-06-25):
+     * when called with `forceJoinInFlight = true`, a publishMutex hit
+     * MUST NOT short-circuit with [PublishResult.Deferred]. The call
+     * blocks on `publishMutex.lock()`, waits for the in-flight publish
+     * to release the mutex, and then runs its own publish attempt.
+     *
+     * This is the load-bearing path for the verify-driven republish in
+     * [PreKeyLifecycleService.verifyBundleOnRelay]: the relay reported
+     * zero record, so the republish MUST reach the relay regardless of
+     * the in-flight publish's outcome.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun publishBundle_mutex_forceJoinInFlight_waitsAndPublishes() = runTest {
+        val transport = FakePreKeyPublishHttpTransport { _ ->
+            PreKeyPublishHttpResponse(201, """{"stored_opks": 9}""", elapsedMs = 1L)
+        }
+        val api = PreKeyApiClient(
+            httpClient = unusedKtorClient,
+            relayBaseUrl = "https://relay.test",
+            publishTransport = transport,
+        )
+
+        // Hold the mutex to simulate an in-flight publish, then start
+        // the force-join call concurrently. The call must NOT return
+        // synchronously — it must suspend on `publishMutex.lock()`
+        // until we release the mutex below.
+        api.publishMutex.lock()
+
+        val deferred = async {
+            api.publishBundle(forceJoinInFlight = true) { sampleRequest() }
+        }
+
+        // Let the launched coroutine run up to the suspension point on
+        // `publishMutex.lock()`. The force-join branch is supposed to
+        // suspend here — the test scheduler will go idle once it does.
+        advanceUntilIdle()
+        assertTrue(
+            deferred.isActive,
+            "force-join publishBundle must SUSPEND on publishMutex while another " +
+                "publish holds the mutex (not short-circuit with Deferred)",
+        )
+        assertEquals(
+            0, transport.callCount,
+            "no transport call may fire while the mutex is still held",
+        )
+
+        // Release the in-flight publish — the force-join call now
+        // acquires the mutex and runs its own publish attempt.
+        api.publishMutex.unlock()
+        val result = deferred.await()
+        assertTrue(
+            result is PublishResult.Stored,
+            "force-join must complete with a real Stored result; got $result",
+        )
+        assertEquals(
+            9, (result as PublishResult.Stored).storedOpks,
+            "force-join must reflect the server response (storedOpks=9)",
+        )
+        assertEquals(
+            1, transport.callCount,
+            "force-join must dispatch exactly one transport call AFTER the " +
+                "mutex was released",
+        )
     }
 
     // ── Test 2: retry on SocketTimeoutException, gives up after 3 attempts ───

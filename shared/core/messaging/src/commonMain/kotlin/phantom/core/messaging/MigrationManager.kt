@@ -195,6 +195,20 @@ class MigrationManager(
         // state PreKeyLifecycleService publishes (L1 + M-2bA-1..5).
         when (val result = preKeyApi.publishBundle { publishRequest }) {
             is PublishResult.Stored -> { /* expected */ }
+            // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25): the migration
+            // path is single-shot and runs before any session exists, so
+            // a concurrent in-flight publish on the per-identity client
+            // is not architecturally possible here. If we somehow do see
+            // a Deferred (e.g. test rig wired the same client across two
+            // paths), surface it as an explicit migration failure rather
+            // than silently treating it as success — the pre-RC
+            // synthetic `Stored(0)` path is what this track removes.
+            is PublishResult.Deferred ->
+                throw MigrationException.PublishUnexpected(
+                    httpStatus = 0,
+                    serverMessage = "publishBundle returned Deferred during migration — " +
+                        "no in-flight publish is expected on this path",
+                )
             is PublishResult.Failure -> {
                 val reason = result.reason
                 when (reason) {
