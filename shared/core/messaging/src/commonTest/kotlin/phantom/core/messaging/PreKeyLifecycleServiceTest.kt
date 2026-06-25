@@ -824,11 +824,18 @@ class PreKeyLifecycleServiceTest {
             "publish #2 must NOT have entered the work section yet — still queued on mutex",
         )
 
-        // t3: publish #1 dies — simulate ConnectException ECONNREFUSED.
-        // Use `completeExceptionally` so the suspended `await()` re-throws
-        // and the bootstrap call surfaces the failure to its caller.
+        // t3: publish #1 dies — simulate a hard transport failure
+        // (the production shape is `ConnectException ECONNREFUSED`,
+        // a `java.net.SocketException`-class throwable on JVM). Use a
+        // plain `RuntimeException` here so the test stays in commonTest
+        // and so the throwable is NOT a `CancellationException` (which
+        // would carry coroutine-cancellation semantics rather than the
+        // transport-failure semantics the mini-lock contract pins). The
+        // lifecycle service's `publishBundle` helper catches any
+        // `Throwable` and rethrows, so the choice of concrete throwable
+        // only matters for the assert below: `bootstrapResult.isFailure`.
         firstPublishGate.completeExceptionally(
-            kotlinx.coroutines.CancellationException("simulated ECONNREFUSED — in-flight publish died"),
+            RuntimeException("simulated ECONNREFUSED — in-flight publish died"),
         )
 
         // t4–t5: publish #1 releases the mutex; publish #2 acquires
