@@ -186,13 +186,23 @@ class PreKeyLifecycleService(
             "PREKEY_TRACE verify_status identity=$identityTag… " +
                 "spk_age_days=${status.signed_prekey_age_days} opks_remaining=${status.remaining_opks}",
         )
-        // signed_prekey_age_days == null is the relay's signal that no
-        // entry exists for this identity. If an entry exists but the OPK
-        // pool is empty, the relay still returns Some(age_days) and the
-        // SPK-only fallback covers session bootstrap, so we do not need
-        // to republish in that case (maybeReplenishOneTimePreKeys handles
-        // the pool refill independently).
-        if (status.signed_prekey_age_days != null) {
+        // Force-republish trigger is the canonical "no relay record"
+        // signal. The relay returns `(signed_prekey_age_days = null,
+        // remaining_opks = 0)` iff and only if no identity record
+        // exists (verified at the source: `services/relay/src/prekeys.rs::status`
+        // — `None => PreKeyStatus { remaining_opks: 0, signed_prekey_age_days: None }`).
+        //
+        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) mini-lock §4
+        // Inv-ForcePathOnZeroRecord requires BOTH conditions together,
+        // so we check both explicitly. The two checks are equivalent
+        // at the current relay contract — but defense-in-depth: if
+        // a future relay-side refactor relaxed the equivalence (e.g.
+        // null-age-but-non-zero-OPKs returned during a partial-restore
+        // window), the AND check would correctly NOT force-republish
+        // because the SPK-only fallback already covers session
+        // bootstrap and `maybeReplenishOneTimePreKeys` handles the
+        // pool refill independently.
+        if (status.signed_prekey_age_days != null || status.remaining_opks != 0) {
             return Result.success(false)
         }
 

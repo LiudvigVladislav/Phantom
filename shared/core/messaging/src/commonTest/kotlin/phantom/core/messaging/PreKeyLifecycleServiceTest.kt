@@ -4,6 +4,11 @@
 package phantom.core.messaging
 
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import phantom.core.crypto.LibsodiumX3DH
 import phantom.core.identity.IdentityKeyPair
@@ -632,6 +637,227 @@ class PreKeyLifecycleServiceTest {
         assertEquals(
             max + 1, rig.api.statusCount,
             "status probe still ran on the overflow attempt",
+        )
+    }
+
+    @Test
+    fun verifyBundleOnRelay_doesNotForceRepublish_whenAgeIsNonNullButOpksAreZero() = runTest {
+        // Inv-ForcePathOnZeroRecord contract: force-republish ONLY when
+        // the relay reports the canonical "no record" signal
+        // (`signed_prekey_age_days == null AND remaining_opks == 0`).
+        //
+        // This negative test pins the AND check: if the relay returns
+        // a non-null age (i.e. the identity record exists) but
+        // remaining_opks happens to be 0 (e.g. pool freshly drained),
+        // verify MUST NOT force-republish. The SPK-only fallback
+        // covers session bootstrap and `maybeReplenishOneTimePreKeys`
+        // handles the pool refill independently — running an
+        // unsolicited force-republish here would waste an HTTP
+        // round-trip AND consume one slot of the per-session budget
+        // that defends against a true zero-record runaway.
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        rig.service.bootstrapForNewIdentity().getOrThrow()
+        rig.api.publishCount = 0
+        rig.api.lastForceJoinInFlight = false
+
+        // Relay says: identity is registered (age = 3 days), but the
+        // OPK pool happens to be drained (remaining_opks = 0).
+        rig.api.fetchStatusResult = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = 3)
+
+        val result = rig.service.verifyBundleOnRelay()
+        assertTrue(result.isSuccess)
+        assertFalse(
+            result.getOrNull()!!,
+            "verify MUST return false when age is non-null — record exists, no force-republish",
+        )
+        assertEquals(0, rig.api.publishCount, "no publish ran")
+        assertEquals(1, rig.api.statusCount, "exactly one status probe")
+    }
+
+    // ── RC-PREKEY-PUBLISH-DEBOUNCE-RACE 2026-06-25 — deterministic race repro
+    //
+    // Mini-lock §5 item 1 acceptance gate: a deterministic test that
+    // reproduces the exact pre-fix chain reproduced in the 2026-06-25
+    // baseline-blocker v2 field smoke:
+    //
+    //   t0:  bootstrap publish (publish #1) goes in-flight on the
+    //        transport — i.e. the publishMutex is held.
+    //   t1:  verifyBundleOnRelay fires. Relay reports zero record
+    //        (`spk_age_days = null AND opks_remaining = 0`).
+    //   t2:  Verify schedules a force-republish (publish #2). The
+    //        force flag bypasses the debounce gate — publish #2
+    //        SUSPENDS on the publishMutex instead of short-circuiting
+    //        with `PublishResult.Deferred`.
+    //   t3:  Publish #1 dies on the transport (simulated
+    //        `ConnectException ECONNREFUSED`). The transport throwable
+    //        propagates from the lifecycle service's bootstrap call.
+    //   t4:  Publish #1 releases the publishMutex; publish #2 acquires
+    //        it and runs its own attempt against the transport.
+    //   t5:  Publish #2 succeeds (relay returns `Stored(N)`). The
+    //        verify call returns `Result.success(true)`. The bundle
+    //        has reached the relay despite publish #1's failure.
+    //
+    // Pre-fix observable shape (what we are guarding against): publish
+    // #2 short-circuits with synthetic `Stored(0)` (logged as
+    // `PREKEY_TRACE upload_ok stored_opks=0`), publish #1 then dies,
+    // and no follow-up publish fires — bundle stays missing on the
+    // relay until the next app session. The post-fix shape (this
+    // test) guarantees a real publish #2 attempt that reaches the
+    // relay regardless of publish #1's outcome.
+    //
+    // Wiring rationale: this test uses a fake that reproduces
+    // [PreKeyApiClient]'s publishMutex semantics at the [PreKeyApi]
+    // interface surface — same `tryLock → Deferred default; lock on
+    // force-join` shape, same body-factory invocation contract.
+    // `PreKeyApiClient` itself is already covered separately by
+    // [PreKeyPublishReliabilityTest] (`publishBundle_mutex_default_returnsDeferred_not_Stored`
+    // + `publishBundle_mutex_forceJoinInFlight_waitsAndPublishes`).
+    // Avoiding a direct dependency on the real transport here keeps
+    // the messaging:commonTest module free of Ktor MockEngine
+    // dependencies.
+
+    private class RaceReproFakePreKeyApi(
+        private val firstPublishGate: CompletableDeferred<PublishResult>,
+        private val secondPublishResult: PublishResult,
+        private val statusResult: PreKeyStatus,
+    ) : PreKeyApi {
+        // Same mutex contract as `PreKeyApiClient.publishMutex` —
+        // at most one in-flight publish per identity at a time.
+        private val publishMutex: Mutex = Mutex()
+        // Signals to the test once publish #1 has entered the work
+        // section and is suspended on the gate. Test awaits this
+        // before scheduling the concurrent verify call.
+        val publishOneStarted: CompletableDeferred<Unit> = CompletableDeferred()
+        var publishStartCount: Int = 0
+        val forceFlags: MutableList<Boolean> = mutableListOf()
+
+        override suspend fun publishBundle(
+            forceJoinInFlight: Boolean,
+            requestProvider: suspend () -> PublishRequest,
+        ): PublishResult {
+            // Reproduce PreKeyApiClient's debounce semantics: tryLock
+            // → Deferred default; lock on force-join. Tests of the
+            // real client cover the same semantics in
+            // PreKeyPublishReliabilityTest.
+            if (!publishMutex.tryLock()) {
+                if (!forceJoinInFlight) return PublishResult.Deferred
+                publishMutex.lock()
+            }
+            return try {
+                publishStartCount += 1
+                forceFlags += forceJoinInFlight
+                requestProvider()  // exercise the body factory
+                if (publishStartCount == 1) {
+                    publishOneStarted.complete(Unit)
+                    firstPublishGate.await()
+                } else {
+                    secondPublishResult
+                }
+            } finally {
+                publishMutex.unlock()
+            }
+        }
+        override suspend fun fetchBundle(
+            identityPubkeyHex: String,
+            requesterPubkeyHex: String?,
+        ): PreKeyBundle? = null
+        override suspend fun fetchStatus(
+            identityPubkeyHex: String,
+            requesterPubkeyHex: String?,
+        ): PreKeyStatus = statusResult
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun raceRepro_bootstrapFails_verifyTriggersForceRepublish_bundleReachesRelay() = runTest {
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+
+        val firstPublishGate = CompletableDeferred<PublishResult>()
+        val api = RaceReproFakePreKeyApi(
+            firstPublishGate = firstPublishGate,
+            secondPublishResult = PublishResult.Stored(storedOpks = 100),
+            statusResult = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = null),
+        )
+        val spkRepo = InMemorySignedPreKeyRepo()
+        val opkRepo = InMemoryOneTimePreKeyRepo()
+        val service = PreKeyLifecycleService(
+            identityManager = identityManager,
+            signedPreKeyRepository = spkRepo,
+            oneTimePreKeyRepository = opkRepo,
+            preKeyApi = api,
+            x3dh = LibsodiumX3DH(),
+            nowMsProvider = { 1_700_000_000_000L },
+        )
+
+        // t0: launch bootstrap — publish #1 enters the API, takes the
+        // mutex, and suspends on `firstPublishGate.await()`.
+        val bootstrapJob = async {
+            service.bootstrapForNewIdentity()
+        }
+        api.publishOneStarted.await()
+        assertTrue(
+            bootstrapJob.isActive,
+            "bootstrap publish #1 must still be suspended on the gate",
+        )
+        assertEquals(1, api.publishStartCount, "publish #1 entered the work section")
+        assertEquals(listOf(false), api.forceFlags, "bootstrap publish defaults to force=false")
+
+        // t1–t2: verify-on-relay fires. Status returns null age + 0
+        // OPKs — canonical zero-record signal. Verify schedules
+        // force-republish (publish #2); publish #2 must SUSPEND on
+        // the publishMutex (held by publish #1) — NOT short-circuit
+        // with Deferred (the pre-fix anti-shape).
+        val verifyJob = async {
+            service.verifyBundleOnRelay()
+        }
+        advanceUntilIdle()
+        assertTrue(
+            verifyJob.isActive,
+            "verify-driven publish #2 must suspend on publishMutex while publish #1 holds it",
+        )
+        assertEquals(
+            1, api.publishStartCount,
+            "publish #2 must NOT have entered the work section yet — still queued on mutex",
+        )
+
+        // t3: publish #1 dies — simulate ConnectException ECONNREFUSED.
+        // Use `completeExceptionally` so the suspended `await()` re-throws
+        // and the bootstrap call surfaces the failure to its caller.
+        firstPublishGate.completeExceptionally(
+            kotlinx.coroutines.CancellationException("simulated ECONNREFUSED — in-flight publish died"),
+        )
+
+        // t4–t5: publish #1 releases the mutex; publish #2 acquires
+        // it and runs its attempt against the API, returning
+        // Stored(100). The verify call completes with success; the
+        // bootstrap call surfaces publish #1's failure.
+        val verifyResult = verifyJob.await()
+        val bootstrapResult = bootstrapJob.await()
+
+        assertEquals(
+            2, api.publishStartCount,
+            "publish #2 must reach the work section AFTER publish #1 released the mutex — " +
+                "Inv-RetryAfterFail + Inv-ForcePathOnZeroRecord",
+        )
+        assertEquals(
+            listOf(false, true), api.forceFlags,
+            "publish #1 force-flag = false (bootstrap), publish #2 force-flag = true (verify-driven)",
+        )
+        assertTrue(
+            verifyResult.isSuccess,
+            "verify-on-relay must succeed; got $verifyResult",
+        )
+        assertTrue(
+            verifyResult.getOrNull()!!,
+            "verify must report a republish ran",
+        )
+        assertTrue(
+            bootstrapResult.isFailure,
+            "bootstrap must surface publish #1's failure; got $bootstrapResult",
         )
     }
 }
