@@ -5734,6 +5734,7 @@ private class StubPreKeyApi(
     // (re-snapshot per retry). The stub returns Stored(0) without
     // examining the request, so the lambda is not invoked.
     override suspend fun publishBundle(
+        forceJoinInFlight: Boolean,
         requestProvider: suspend () -> phantom.core.transport.PublishRequest,
     ): phantom.core.transport.PublishResult =
         phantom.core.transport.PublishResult.Stored(0)
@@ -5795,6 +5796,7 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
 private object ThrowingPreKeyApi : phantom.core.transport.PreKeyApi {
     // Sprint 2b L1: factory-lambda signature.
     override suspend fun publishBundle(
+        forceJoinInFlight: Boolean,
         requestProvider: suspend () -> phantom.core.transport.PublishRequest,
     ): phantom.core.transport.PublishResult =
         error("ThrowingPreKeyApi: wire-flow tests must pre-seed ratchet state, not call publishBundle")
@@ -6286,6 +6288,7 @@ private class CountingPreKeyApiForSprint2bC(
 ) : phantom.core.transport.PreKeyApi {
     var fetchBundleCalls: Int = 0
     override suspend fun publishBundle(
+        forceJoinInFlight: Boolean,
         requestProvider: suspend () -> phantom.core.transport.PublishRequest,
     ): phantom.core.transport.PublishResult =
         phantom.core.transport.PublishResult.Stored(0)

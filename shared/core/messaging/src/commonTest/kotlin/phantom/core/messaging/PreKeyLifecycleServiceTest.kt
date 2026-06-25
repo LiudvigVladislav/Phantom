@@ -4,6 +4,11 @@
 package phantom.core.messaging
 
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import phantom.core.crypto.LibsodiumX3DH
 import phantom.core.identity.IdentityKeyPair
@@ -89,8 +94,16 @@ class PreKeyLifecycleServiceTest {
         // invoked once per retry attempt. This fake invokes it exactly
         // once and records the resulting request — tests that assert on
         // a single happy-path attempt see the same shape as before.
-        override suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult {
+        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25): track the force
+        // flag so tests can assert that the verify-driven republish path
+        // sets it. Default false matches the historical caller shape.
+        var lastForceJoinInFlight: Boolean = false
+        override suspend fun publishBundle(
+            forceJoinInFlight: Boolean,
+            requestProvider: suspend () -> PublishRequest,
+        ): PublishResult {
             publishCount++
+            lastForceJoinInFlight = forceJoinInFlight
             lastRequest = requestProvider()
             return publishResult
         }
@@ -404,6 +417,7 @@ class PreKeyLifecycleServiceTest {
         val capturedRequests: MutableList<PublishRequest> = mutableListOf()
         var publishCount: Int = 0
         override suspend fun publishBundle(
+            forceJoinInFlight: Boolean,
             requestProvider: suspend () -> PublishRequest,
         ): PublishResult {
             publishCount++
@@ -503,5 +517,354 @@ class PreKeyLifecycleServiceTest {
         val spkKeyId0 = api.capturedRequests[0].signed_pre_key.key_id
         assertTrue(api.capturedRequests.all { it.signed_pre_key.key_id == spkKeyId0 },
             "SPK key_id stable across retries")
+    }
+
+    // ── RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) ────────────────────────
+    //
+    // Mini-lock invariants under test (`docs/tracks/rc-prekey-publish-debounce-race.md` §4):
+    //  - Inv-NoFalseSuccess: verify-driven republish path does NOT accept a
+    //    `PublishResult.Deferred` synthetic success — the underlying call MUST
+    //    set `forceJoinInFlight = true` so the transport layer waits for the
+    //    in-flight publish, then runs its own attempt.
+    //  - Inv-ForcePathOnZeroRecord: the `spk_age_days = null AND
+    //    opks_remaining = 0` status response is the canonical trigger; the
+    //    republish call MUST carry the force flag.
+    //  - Inv-NoSpinningRetry: the per-session force-republish budget
+    //    ([PreKeyLifecycleService.MAX_FORCE_REPUBLISH_PER_SESSION]) caps the
+    //    number of force-republish attempts; the 6th call returns false and
+    //    issues no publish.
+
+    @Test
+    fun verifyBundleOnRelay_republishOnZeroRecord_setsForceJoinInFlight() = runTest {
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        rig.service.bootstrapForNewIdentity().getOrThrow()
+        // The bootstrap publish carried the default (false). Reset so we
+        // observe only the verify-driven republish.
+        rig.api.lastForceJoinInFlight = false
+        rig.api.publishCount = 0
+
+        // Default fetchStatusResult is (remaining_opks=0,
+        // signed_prekey_age_days=null) — the canonical "relay has no
+        // record" signal. verify must republish AND must pass the force
+        // flag so a publishMutex debounce doesn't short-circuit the
+        // republish with `PublishResult.Deferred`.
+        val result = rig.service.verifyBundleOnRelay()
+        assertTrue(result.isSuccess, "verify must succeed; got $result")
+        assertTrue(result.getOrNull()!!, "verify must report a republish ran")
+        assertEquals(1, rig.api.publishCount, "exactly one republish")
+        assertTrue(
+            rig.api.lastForceJoinInFlight,
+            "verify-driven republish MUST set forceJoinInFlight=true so a " +
+                "publishMutex debounce is joined (not short-circuited as Deferred) — " +
+                "Inv-ForcePathOnZeroRecord",
+        )
+    }
+
+    @Test
+    fun bootstrapPath_publish_doesNotSetForceJoinInFlight() = runTest {
+        // Companion to the verify-path test above: the bootstrap /
+        // replenish / rotate publish call sites are NOT verify-driven
+        // and must NOT escalate to the force-join path. Only the
+        // verify-on-relay path sees the relay's "zero record" signal
+        // and is responsible for the force-publish escalation.
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        rig.service.bootstrapForNewIdentity().getOrThrow()
+        assertEquals(1, rig.api.publishCount, "bootstrap publish ran once")
+        assertFalse(
+            rig.api.lastForceJoinInFlight,
+            "bootstrap publish MUST default to forceJoinInFlight=false — " +
+                "force-join is reserved for the verify-driven republish path",
+        )
+    }
+
+    @Test
+    fun verifyBundleOnRelay_forceRepublishBudgetExhaustsAfterMaxAttempts() = runTest {
+        // Inv-NoSpinningRetry: the per-session budget caps the number of
+        // verify-driven force-republish attempts at
+        // MAX_FORCE_REPUBLISH_PER_SESSION. The (N+1)th call must NOT
+        // issue a publish even though the relay still reports zero
+        // record; it returns false and is expected to log
+        // `verify_republish_budget_exhausted` (not asserted here — the
+        // observable contract is the publishCount ceiling).
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        rig.service.bootstrapForNewIdentity().getOrThrow()
+        // Reset post-bootstrap so we count only verify-driven publishes.
+        rig.api.publishCount = 0
+
+        val max = PreKeyLifecycleService.MAX_FORCE_REPUBLISH_PER_SESSION
+        // First `max` calls each consume one budget slot. Relay keeps
+        // reporting zero record (default fetchStatusResult), so each
+        // call republishes.
+        repeat(max) { i ->
+            val r = rig.service.verifyBundleOnRelay()
+            assertTrue(r.isSuccess, "verify call ${i + 1} should succeed; got $r")
+            assertTrue(
+                r.getOrNull()!!,
+                "verify call ${i + 1} should report a republish (budget remaining)",
+            )
+        }
+        assertEquals(
+            max, rig.api.publishCount,
+            "first $max verify-driven calls must each publish exactly once",
+        )
+        assertEquals(
+            max, rig.api.statusCount,
+            "status probe ran on each in-budget call",
+        )
+
+        // (max + 1)th call: budget exhausted. Status probe still runs
+        // (so the operator can see the relay is still missing the
+        // bundle), but no publish.
+        val overflow = rig.service.verifyBundleOnRelay()
+        assertTrue(overflow.isSuccess, "budget-exhausted call still succeeds (no throw)")
+        assertFalse(
+            overflow.getOrNull()!!,
+            "budget-exhausted call reports false — no republish ran",
+        )
+        assertEquals(
+            max, rig.api.publishCount,
+            "publishCount must NOT advance past $max — Inv-NoSpinningRetry",
+        )
+        assertEquals(
+            max + 1, rig.api.statusCount,
+            "status probe still ran on the overflow attempt",
+        )
+    }
+
+    @Test
+    fun verifyBundleOnRelay_doesNotForceRepublish_whenAgeIsNonNullButOpksAreZero() = runTest {
+        // Inv-ForcePathOnZeroRecord contract: force-republish ONLY when
+        // the relay reports the canonical "no record" signal
+        // (`signed_prekey_age_days == null AND remaining_opks == 0`).
+        //
+        // This negative test pins the AND check: if the relay returns
+        // a non-null age (i.e. the identity record exists) but
+        // remaining_opks happens to be 0 (e.g. pool freshly drained),
+        // verify MUST NOT force-republish. The SPK-only fallback
+        // covers session bootstrap and `maybeReplenishOneTimePreKeys`
+        // handles the pool refill independently — running an
+        // unsolicited force-republish here would waste an HTTP
+        // round-trip AND consume one slot of the per-session budget
+        // that defends against a true zero-record runaway.
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+        val rig = makeService(identityManager)
+
+        rig.service.bootstrapForNewIdentity().getOrThrow()
+        rig.api.publishCount = 0
+        rig.api.lastForceJoinInFlight = false
+
+        // Relay says: identity is registered (age = 3 days), but the
+        // OPK pool happens to be drained (remaining_opks = 0).
+        rig.api.fetchStatusResult = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = 3)
+
+        val result = rig.service.verifyBundleOnRelay()
+        assertTrue(result.isSuccess)
+        assertFalse(
+            result.getOrNull()!!,
+            "verify MUST return false when age is non-null — record exists, no force-republish",
+        )
+        assertEquals(0, rig.api.publishCount, "no publish ran")
+        assertEquals(1, rig.api.statusCount, "exactly one status probe")
+    }
+
+    // ── RC-PREKEY-PUBLISH-DEBOUNCE-RACE 2026-06-25 — deterministic race repro
+    //
+    // Mini-lock §5 item 1 acceptance gate: a deterministic test that
+    // reproduces the exact pre-fix chain reproduced in the 2026-06-25
+    // baseline-blocker v2 field smoke:
+    //
+    //   t0:  bootstrap publish (publish #1) goes in-flight on the
+    //        transport — i.e. the publishMutex is held.
+    //   t1:  verifyBundleOnRelay fires. Relay reports zero record
+    //        (`spk_age_days = null AND opks_remaining = 0`).
+    //   t2:  Verify schedules a force-republish (publish #2). The
+    //        force flag bypasses the debounce gate — publish #2
+    //        SUSPENDS on the publishMutex instead of short-circuiting
+    //        with `PublishResult.Deferred`.
+    //   t3:  Publish #1 dies on the transport (simulated
+    //        `ConnectException ECONNREFUSED`). The transport throwable
+    //        propagates from the lifecycle service's bootstrap call.
+    //   t4:  Publish #1 releases the publishMutex; publish #2 acquires
+    //        it and runs its own attempt against the transport.
+    //   t5:  Publish #2 succeeds (relay returns `Stored(N)`). The
+    //        verify call returns `Result.success(true)`. The bundle
+    //        has reached the relay despite publish #1's failure.
+    //
+    // Pre-fix observable shape (what we are guarding against): publish
+    // #2 short-circuits with synthetic `Stored(0)` (logged as
+    // `PREKEY_TRACE upload_ok stored_opks=0`), publish #1 then dies,
+    // and no follow-up publish fires — bundle stays missing on the
+    // relay until the next app session. The post-fix shape (this
+    // test) guarantees a real publish #2 attempt that reaches the
+    // relay regardless of publish #1's outcome.
+    //
+    // Wiring rationale: this test uses a fake that reproduces
+    // [PreKeyApiClient]'s publishMutex semantics at the [PreKeyApi]
+    // interface surface — same `tryLock → Deferred default; lock on
+    // force-join` shape, same body-factory invocation contract.
+    // `PreKeyApiClient` itself is already covered separately by
+    // [PreKeyPublishReliabilityTest] (`publishBundle_mutex_default_returnsDeferred_not_Stored`
+    // + `publishBundle_mutex_forceJoinInFlight_waitsAndPublishes`).
+    // Avoiding a direct dependency on the real transport here keeps
+    // the messaging:commonTest module free of Ktor MockEngine
+    // dependencies.
+
+    private class RaceReproFakePreKeyApi(
+        private val firstPublishGate: CompletableDeferred<PublishResult>,
+        private val secondPublishResult: PublishResult,
+        private val statusResult: PreKeyStatus,
+    ) : PreKeyApi {
+        // Same mutex contract as `PreKeyApiClient.publishMutex` —
+        // at most one in-flight publish per identity at a time.
+        private val publishMutex: Mutex = Mutex()
+        // Signals to the test once publish #1 has entered the work
+        // section and is suspended on the gate. Test awaits this
+        // before scheduling the concurrent verify call.
+        val publishOneStarted: CompletableDeferred<Unit> = CompletableDeferred()
+        var publishStartCount: Int = 0
+        val forceFlags: MutableList<Boolean> = mutableListOf()
+
+        override suspend fun publishBundle(
+            forceJoinInFlight: Boolean,
+            requestProvider: suspend () -> PublishRequest,
+        ): PublishResult {
+            // Reproduce PreKeyApiClient's debounce semantics: tryLock
+            // → Deferred default; lock on force-join. Tests of the
+            // real client cover the same semantics in
+            // PreKeyPublishReliabilityTest.
+            if (!publishMutex.tryLock()) {
+                if (!forceJoinInFlight) return PublishResult.Deferred
+                publishMutex.lock()
+            }
+            return try {
+                publishStartCount += 1
+                forceFlags += forceJoinInFlight
+                requestProvider()  // exercise the body factory
+                if (publishStartCount == 1) {
+                    publishOneStarted.complete(Unit)
+                    firstPublishGate.await()
+                } else {
+                    secondPublishResult
+                }
+            } finally {
+                publishMutex.unlock()
+            }
+        }
+        override suspend fun fetchBundle(
+            identityPubkeyHex: String,
+            requesterPubkeyHex: String?,
+        ): PreKeyBundle? = null
+        override suspend fun fetchStatus(
+            identityPubkeyHex: String,
+            requesterPubkeyHex: String?,
+        ): PreKeyStatus = statusResult
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun raceRepro_bootstrapFails_verifyTriggersForceRepublish_bundleReachesRelay() = runTest {
+        LibsodiumInitializer.initialize()
+        val (identityManager, _, _) = makeAlpha2Identity()
+
+        val firstPublishGate = CompletableDeferred<PublishResult>()
+        val api = RaceReproFakePreKeyApi(
+            firstPublishGate = firstPublishGate,
+            secondPublishResult = PublishResult.Stored(storedOpks = 100),
+            statusResult = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = null),
+        )
+        val spkRepo = InMemorySignedPreKeyRepo()
+        val opkRepo = InMemoryOneTimePreKeyRepo()
+        val service = PreKeyLifecycleService(
+            identityManager = identityManager,
+            signedPreKeyRepository = spkRepo,
+            oneTimePreKeyRepository = opkRepo,
+            preKeyApi = api,
+            x3dh = LibsodiumX3DH(),
+            nowMsProvider = { 1_700_000_000_000L },
+        )
+
+        // t0: launch bootstrap — publish #1 enters the API, takes the
+        // mutex, and suspends on `firstPublishGate.await()`.
+        val bootstrapJob = async {
+            service.bootstrapForNewIdentity()
+        }
+        api.publishOneStarted.await()
+        assertTrue(
+            bootstrapJob.isActive,
+            "bootstrap publish #1 must still be suspended on the gate",
+        )
+        assertEquals(1, api.publishStartCount, "publish #1 entered the work section")
+        assertEquals(listOf(false), api.forceFlags, "bootstrap publish defaults to force=false")
+
+        // t1–t2: verify-on-relay fires. Status returns null age + 0
+        // OPKs — canonical zero-record signal. Verify schedules
+        // force-republish (publish #2); publish #2 must SUSPEND on
+        // the publishMutex (held by publish #1) — NOT short-circuit
+        // with Deferred (the pre-fix anti-shape).
+        val verifyJob = async {
+            service.verifyBundleOnRelay()
+        }
+        advanceUntilIdle()
+        assertTrue(
+            verifyJob.isActive,
+            "verify-driven publish #2 must suspend on publishMutex while publish #1 holds it",
+        )
+        assertEquals(
+            1, api.publishStartCount,
+            "publish #2 must NOT have entered the work section yet — still queued on mutex",
+        )
+
+        // t3: publish #1 dies — simulate a hard transport failure
+        // (the production shape is `ConnectException ECONNREFUSED`,
+        // a `java.net.SocketException`-class throwable on JVM). Use a
+        // plain `RuntimeException` here so the test stays in commonTest
+        // and so the throwable is NOT a `CancellationException` (which
+        // would carry coroutine-cancellation semantics rather than the
+        // transport-failure semantics the mini-lock contract pins). The
+        // lifecycle service's `publishBundle` helper catches any
+        // `Throwable` and rethrows, so the choice of concrete throwable
+        // only matters for the assert below: `bootstrapResult.isFailure`.
+        firstPublishGate.completeExceptionally(
+            RuntimeException("simulated ECONNREFUSED — in-flight publish died"),
+        )
+
+        // t4–t5: publish #1 releases the mutex; publish #2 acquires
+        // it and runs its attempt against the API, returning
+        // Stored(100). The verify call completes with success; the
+        // bootstrap call surfaces publish #1's failure.
+        val verifyResult = verifyJob.await()
+        val bootstrapResult = bootstrapJob.await()
+
+        assertEquals(
+            2, api.publishStartCount,
+            "publish #2 must reach the work section AFTER publish #1 released the mutex — " +
+                "Inv-RetryAfterFail + Inv-ForcePathOnZeroRecord",
+        )
+        assertEquals(
+            listOf(false, true), api.forceFlags,
+            "publish #1 force-flag = false (bootstrap), publish #2 force-flag = true (verify-driven)",
+        )
+        assertTrue(
+            verifyResult.isSuccess,
+            "verify-on-relay must succeed; got $verifyResult",
+        )
+        assertTrue(
+            verifyResult.getOrNull()!!,
+            "verify must report a republish ran",
+        )
+        assertTrue(
+            bootstrapResult.isFailure,
+            "bootstrap must surface publish #1's failure; got $bootstrapResult",
+        )
     }
 }

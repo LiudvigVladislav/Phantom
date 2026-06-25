@@ -69,7 +69,27 @@ interface PreKeyApi {
      * `docs/tracks/sprint-2b-opk-pending-session-scope.md` L1 + the
      * ADR-009 publish protocol amendment).
      */
-    suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult
+    /**
+     * RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) amend: when
+     * `forceJoinInFlight == true`, a debounce hit (another publish
+     * already running for this identity) does NOT short-circuit with
+     * [PublishResult.Deferred]. Instead the call blocks on the publish
+     * mutex until the in-flight publish releases it, then runs its
+     * own [PreKeyApiClient.PUBLISH_MAX_ATTEMPTS] retry cycle. Used by
+     * the verify-driven republish path when the relay status check
+     * reports zero record (`spk_age_days == null AND opks_remaining
+     * == 0`) — that signal is unambiguous and the republish must not
+     * be silently dropped by the debounce gate.
+     *
+     * When `forceJoinInFlight == false` (the default for all other
+     * call sites — bootstrap, replenish, rotate), a debounce hit
+     * returns [PublishResult.Deferred] without contention. Default
+     * preserves the historical semantics of the non-force callers.
+     */
+    suspend fun publishBundle(
+        forceJoinInFlight: Boolean = false,
+        requestProvider: suspend () -> PublishRequest,
+    ): PublishResult
     suspend fun fetchBundle(
         identityPubkeyHex: String,
         requesterPubkeyHex: String? = null,
@@ -173,30 +193,71 @@ class PreKeyApiClient(
      *         retained (after dedup + cap), or [PublishResult.Failure]
      *         describing why the relay rejected the bundle.
      */
-    override suspend fun publishBundle(requestProvider: suspend () -> PublishRequest): PublishResult {
+    override suspend fun publishBundle(
+        forceJoinInFlight: Boolean,
+        requestProvider: suspend () -> PublishRequest,
+    ): PublishResult {
         // Debounce: if another publish is already running for this identity,
-        // skip silently rather than queue. The in-flight publish will leave
-        // the relay in the correct state.
+        // the default path returns [PublishResult.Deferred] without queueing.
+        // The in-flight publish will leave the relay in the correct state
+        // when it succeeds; if it fails, the verify-driven republish path
+        // (which calls back here with `forceJoinInFlight = true`) waits on
+        // the mutex and runs its own attempt.
         //
         // PreKeyApiClient is wired per-identity by AppContainer (see comment
         // above publishMutex), so the debounce log omits the identity tag —
         // operator can correlate via the instance / process boundary.
+        //
+        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25): the pre-fix shape
+        // returned `PublishResult.Stored(storedOpks = 0)` from this branch.
+        // That was a dishonest synthetic success: downstream consumers
+        // (PreKeyLifecycleService) logged `PREKEY_TRACE upload_ok stored_opks=0`,
+        // making the post-failure debounce look like a successful publish in
+        // operator-readable telemetry. The 2026-06-25 baseline-blocker field
+        // smoke proved the consequence — the verify-driven republish triggered
+        // when the relay had zero record, got debounced as the in-flight POST
+        // was already pending, was logged as success, and then the in-flight
+        // POST died with `ConnectException ECONNREFUSED` seven seconds later
+        // with no further attempt. Bundle never reached the relay. See
+        // `docs/tracks/rc-prekey-publish-debounce-race.md` §8 for the full
+        // timeline.
         if (!publishMutex.tryLock()) {
+            if (!forceJoinInFlight) {
+                relayLog(
+                    RelayLogLevel.INFO,
+                    "PREKEY_TRACE prekey_publish_debounced",
+                )
+                // Honest result: NOT stored. The in-flight publish may yet
+                // fail. Callers that need a guaranteed publish must retry
+                // with `forceJoinInFlight = true`.
+                return PublishResult.Deferred
+            }
+            // Force-join path (verify-republish when relay has zero record).
+            // Wait for the in-flight publish to release the mutex, then run
+            // OUR OWN publish attempt. The in-flight publish may have just
+            // succeeded (our attempt is redundant — one extra POST is the
+            // cost of guaranteed correctness) or failed (our attempt is the
+            // load-bearing one — without it the bundle stays missing from
+            // the relay). The two states are indistinguishable from the
+            // mutex alone, so we always re-publish on the force path.
             relayLog(
                 RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_debounced",
+                "PREKEY_TRACE prekey_publish_debounced force_join=true",
             )
-            // Another publish is already in-flight for this identity. Skip
-            // rather than queue — the in-flight call will leave the relay in
-            // the correct state. verifyBundleOnRelay() on the next reconnect
-            // catches any gap if the in-flight publish fails. Return a synthetic
-            // Stored(0) so callers do not crash; the 0 just means "we did not
-            // upload new OPKs in this call", which is accurate.
-            return PublishResult.Stored(storedOpks = 0)
+            relayLog(
+                RelayLogLevel.INFO,
+                "PREKEY_TRACE prekey_publish_force_join_wait",
+            )
+            publishMutex.lock()
+            relayLog(
+                RelayLogLevel.INFO,
+                "PREKEY_TRACE prekey_publish_force_join_acquired",
+            )
         }
 
-        // Lock acquired via tryLock(). Run the work and unconditionally unlock
-        // in the finally block — Mutex.tryLock() does NOT use the owner token
+        // Lock acquired via tryLock() OR via the force-join lock() above.
+        // Run the work and unconditionally unlock in the finally block —
+        // Mutex.tryLock() / Mutex.lock() do NOT use the owner token
         // mechanism, so we must call unlock() directly (not withLock{}).
         return try {
             publishWithRetry(requestProvider)
@@ -670,6 +731,29 @@ data class PreKeyStatus(
 sealed class PublishResult {
     data class Stored(val storedOpks: Int) : PublishResult()
     data class Failure(val reason: Reason, val serverMessage: String) : PublishResult()
+
+    /**
+     * RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25). Returned by
+     * [PreKeyApi.publishBundle] when an in-flight publish is already
+     * running for this identity AND the caller did NOT request the
+     * force-join path (`forceJoinInFlight = false`). The caller MUST
+     * NOT treat this as a successful storage — the in-flight publish
+     * may yet fail with a transport error, leaving the relay without
+     * the bundle. Pre-fix the implementation returned a synthetic
+     * `Stored(storedOpks = 0)` here, which downstream consumers logged
+     * as `PREKEY_TRACE upload_ok stored_opks=0`; that telemetry
+     * obscured the failure mode behind the 2026-06-25 baseline-blocker
+     * field-smoke verdict.
+     *
+     * Callers that need a guaranteed publish (e.g. verify-driven
+     * republish after the relay reported zero record:
+     * `spk_age_days=null AND opks_remaining=0`) MUST pass
+     * `forceJoinInFlight = true` — that path waits for the in-flight
+     * publish to release the mutex, then runs its own publish attempt
+     * so the caller's intent is honoured regardless of the in-flight
+     * outcome.
+     */
+    data object Deferred : PublishResult()
 
     sealed class Reason {
         /** Relay already bound a different signing key to this identity. */

@@ -13,6 +13,8 @@ import phantom.core.storage.LocalOneTimePreKeyEntity
 import phantom.core.storage.LocalOneTimePreKeyRepository
 import phantom.core.storage.LocalSignedPreKeyEntity
 import phantom.core.storage.LocalSignedPreKeyRepository
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import phantom.core.transport.PreKeyApi
 import phantom.core.transport.PublishRequest
 import phantom.core.transport.PublishResult
@@ -66,6 +68,25 @@ class PreKeyLifecycleService(
     private val x3dh: X3DHProtocol,
     private val nowMsProvider: () -> Long = { Clock.System.now().toEpochMilliseconds() },
 ) {
+
+    // ── RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) ───────────────
+    // Per-identity per-session retry budget for the verify-driven
+    // force-republish path. The mini-lock §4 Inv-NoSpinningRetry
+    // requires a guard against an unbounded loop where verify_status
+    // keeps reporting `spk_age_days=null AND opks_remaining=0` and
+    // each call schedules a full publishWithRetry cycle. The verify
+    // path itself costs an HTTP round-trip per attempt, so the
+    // natural rate is low, but a stuck relay or a persistent network
+    // class failure could still produce many attempts per session.
+    //
+    // The budget is per process lifetime (singleton ctor). Reset
+    // on app restart. Initial value 5 covers a healthy reconnect
+    // storm without permitting a runaway. Exhaustion logs a
+    // structured warning (`verify_republish_budget_exhausted`) and
+    // returns without scheduling the publish — the bundle gap is
+    // left to a future app session OR an explicit user action.
+    private val forceRepublishBudgetMutex = Mutex()
+    private var forceRepublishCount: Int = 0
 
     /**
      * Runs the onboarding bootstrap. Returns Result.success if the
@@ -165,13 +186,23 @@ class PreKeyLifecycleService(
             "PREKEY_TRACE verify_status identity=$identityTag… " +
                 "spk_age_days=${status.signed_prekey_age_days} opks_remaining=${status.remaining_opks}",
         )
-        // signed_prekey_age_days == null is the relay's signal that no
-        // entry exists for this identity. If an entry exists but the OPK
-        // pool is empty, the relay still returns Some(age_days) and the
-        // SPK-only fallback covers session bootstrap, so we do not need
-        // to republish in that case (maybeReplenishOneTimePreKeys handles
-        // the pool refill independently).
-        if (status.signed_prekey_age_days != null) {
+        // Force-republish trigger is the canonical "no relay record"
+        // signal. The relay returns `(signed_prekey_age_days = null,
+        // remaining_opks = 0)` iff and only if no identity record
+        // exists (verified at the source: `services/relay/src/prekeys.rs::status`
+        // — `None => PreKeyStatus { remaining_opks: 0, signed_prekey_age_days: None }`).
+        //
+        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) mini-lock §4
+        // Inv-ForcePathOnZeroRecord requires BOTH conditions together,
+        // so we check both explicitly. The two checks are equivalent
+        // at the current relay contract — but defense-in-depth: if
+        // a future relay-side refactor relaxed the equivalence (e.g.
+        // null-age-but-non-zero-OPKs returned during a partial-restore
+        // window), the AND check would correctly NOT force-republish
+        // because the SPK-only fallback already covers session
+        // bootstrap and `maybeReplenishOneTimePreKeys` handles the
+        // pool refill independently.
+        if (status.signed_prekey_age_days != null || status.remaining_opks != 0) {
             return Result.success(false)
         }
 
@@ -183,12 +214,47 @@ class PreKeyLifecycleService(
             MessagingLogLevel.WARN,
             "PREKEY_TRACE verify_republish_triggered identity=$identityTag… — relay has no record",
         )
+
+        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25). Inv-NoSpinningRetry:
+        // honour the per-identity per-session budget before running the
+        // force-republish path. Exhaustion logs a structured warning
+        // and returns; the bundle gap is left to a future app session.
+        val withinBudget = forceRepublishBudgetMutex.withLock {
+            if (forceRepublishCount >= MAX_FORCE_REPUBLISH_PER_SESSION) {
+                false
+            } else {
+                forceRepublishCount += 1
+                true
+            }
+        }
+        if (!withinBudget) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "PREKEY_TRACE verify_republish_budget_exhausted identity=$identityTag… " +
+                    "count=$MAX_FORCE_REPUBLISH_PER_SESSION " +
+                    "— skipping force-republish; bundle gap left to next app session",
+            )
+            return@runCatching false
+        }
+
         // Sprint 2b L1: factory lambda — every retry re-reads the OPK
         // pool from the DB. This second call site (Round 2 security
         // Blocker 1 / D-R2-2) shares the same publish-snapshot
         // consistency contract as the bootstrap / replenish / rotate
         // sites.
-        publishBundle(identity.publicKeyHex, signing, spkEntity) { oneTimePreKeyRepository.getAll() }
+        //
+        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25). Inv-ForcePathOnZeroRecord:
+        // pass `forceJoinInFlight = true` so a publishMutex hit (an
+        // in-flight publish is already running) does NOT short-circuit
+        // with `PublishResult.Deferred`. The verify path just established
+        // that the relay has zero record for this identity, so the
+        // republish MUST not be silently dropped by the debounce gate.
+        publishBundle(
+            identity.publicKeyHex,
+            signing,
+            spkEntity,
+            forceJoinInFlight = true,
+        ) { oneTimePreKeyRepository.getAll() }
         true
     }
 
@@ -346,6 +412,7 @@ class PreKeyLifecycleService(
         identityX25519Hex: String,
         signing: IdentitySigningKeyPair,
         spk: LocalSignedPreKeyEntity,
+        forceJoinInFlight: Boolean = false,
         opksProvider: suspend () -> List<LocalOneTimePreKeyEntity>,
     ) {
         // For onboarding the SPK was just generated in this call; persist
@@ -379,7 +446,18 @@ class PreKeyLifecycleService(
             // current local pool, not a pre-loop snapshot. SPK +
             // signing key + identity hex are stable across retries
             // and are captured by closure once.
-            preKeyApi.publishBundle {
+            //
+            // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25):
+            // [forceJoinInFlight] propagates to the transport layer.
+            // When true, a debounce hit waits for the in-flight publish
+            // to complete and then runs THIS caller's own publish
+            // attempt. When false (the default), a debounce hit
+            // returns [PublishResult.Deferred] and the consumer below
+            // logs `upload_deferred` honestly instead of the previous
+            // false-success `upload_ok stored_opks=0`.
+            preKeyApi.publishBundle(
+                forceJoinInFlight = forceJoinInFlight,
+            ) {
                 val freshOpks = opksProvider()
                 PublishRequest(
                     identity_pubkey_hex = identityX25519Hex,
@@ -410,6 +488,20 @@ class PreKeyLifecycleService(
                     MessagingLogLevel.INFO,
                     "PREKEY_TRACE upload_ok identity=$identityTag… " +
                         "stored_opks=${result.storedOpks} elapsedMs=$elapsed",
+                )
+            }
+            is PublishResult.Deferred -> {
+                // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25). Honest log:
+                // the publish was suppressed by the publish mutex because
+                // another publish is already in-flight for this identity.
+                // We do NOT claim `upload_ok stored_opks=0` here — the
+                // in-flight publish may yet fail, in which case the
+                // verify-driven republish path will pick it up with
+                // `forceJoinInFlight = true`.
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "PREKEY_TRACE upload_deferred identity=$identityTag… " +
+                        "elapsedMs=$elapsed reason=in_flight_publish",
                 )
             }
             is PublishResult.Failure -> {
@@ -443,6 +535,26 @@ class PreKeyLifecycleService(
         joinToString("") { "%02x".format(it.toInt().and(0xFF)) }
 
     companion object {
+        /**
+         * RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) Inv-NoSpinningRetry.
+         * Per-identity per-session maximum number of verify-driven
+         * force-republish attempts. Each attempt costs at minimum an
+         * HTTP round-trip for `verify_status` plus a full
+         * [PreKeyApiClient.PUBLISH_MAX_ATTEMPTS] publish retry cycle,
+         * so the natural rate is already low — this constant is the
+         * hard ceiling defending against a stuck relay state or a
+         * persistent network class failure that would otherwise let
+         * the verify path keep triggering forever. Reset on app
+         * restart.
+         *
+         * Initial value 5 covers a healthy reconnect storm without
+         * permitting a runaway. Exhaustion is logged via
+         * `PREKEY_TRACE verify_republish_budget_exhausted` and the
+         * verify call returns false; the bundle gap is left to a
+         * future app session or an explicit user action.
+         */
+        const val MAX_FORCE_REPUBLISH_PER_SESSION: Int = 5
+
         /**
          * Pool size threshold below which [maybeReplenishOneTimePreKeys]
          * fires. Mirrors ADR-009's "<20 remaining" policy.
