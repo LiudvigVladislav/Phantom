@@ -598,6 +598,42 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-26 · RC-PREKEY-PUBLISH-DEBOUNCE-RACE MERGED (PR #333 squash `5a5ce15b`) — prekey goal field-confirmed; full baseline still blocked by separate Emu outbound REST connectivity issue; RC PR #330 stays HOLD
+
+**Outcome:** PR #333 lands on `master` as squash `5a5ce15b`, closing the mini-lock from PR #332 (master `768f23e6`). Three commit rounds, three CI passes, three review verdicts; head at merge = `b6be5e2b`. RC PR #330 is NOT touched — it stays Draft / HOLD until baseline message exchange becomes field-stable end-to-end (which depends on a new short recon track scoped below, NOT on this PR).
+
+**Code shape:**
+
+- Transport: `PreKeyApiClient` gains a `PublishResult.Deferred` sealed-class variant. The `tryLock` debounce branch returns `Deferred` (no synthetic `Stored(0)`). New `forceJoinInFlight: Boolean = false` parameter on `PreKeyApi.publishBundle`; with `true` the call suspends on `publishMutex.lock()` instead of short-circuiting, then runs its own publish attempt.
+- Messaging-crypto: `PreKeyLifecycleService.verifyBundleOnRelay` passes `forceJoinInFlight = true` when the relay returns the canonical zero-record signal — both `signed_prekey_age_days == null` AND `remaining_opks == 0` per Inv-ForcePathOnZeroRecord verbatim (verified at source: `services/relay/src/prekeys.rs::status` `None => PreKeyStatus { remaining_opks: 0, signed_prekey_age_days: None }`). Per-session budget guard (`MAX_FORCE_REPUBLISH_PER_SESSION = 5`) gates the force path; exhaustion logs `PREKEY_TRACE verify_republish_budget_exhausted`. New `PREKEY_TRACE upload_deferred` log line replaces the pre-fix false-success `upload_ok stored_opks=0` from the debounce branch.
+- Messaging-crypto: `MigrationManager`'s `when` arm on `PublishResult.Deferred` throws an explicit `MigrationException.PublishUnexpected` — the one-shot migration path never silently swallows a `Deferred`.
+- Tests: 5 new in `PreKeyLifecycleServiceTest`, 2 new in `PreKeyPublishReliabilityTest`. The race-repro test reproduces the full deterministic chain in one body — publish #1 suspended on gated transport → verify sees zero record → publish #2 with force flag suspends on mutex → publish #1 dies (RuntimeException, not CancellationException — Round 3 fix per `b6be5e2b`) → publish #2 acquires mutex and returns `Stored(100)`. Six historical `PreKeyApi` fakes updated to match the new interface signature.
+
+**Locked invariants landed (mini-lock §4):**
+
+| Invariant | Outcome on `5a5ce15b` |
+|---|---|
+| Inv-NoFalseSuccess | `tryLock` debounce returns `Deferred`, consumer logs `upload_deferred` |
+| Inv-RetryAfterFail | `forceJoinInFlight = true` suspends on mutex, retry runs after release |
+| Inv-ForcePathOnZeroRecord | AND condition (`age == null && remaining == 0`) checked verbatim; negative test pins the AND |
+| Inv-NoSpinningRetry | 5-attempt per-session budget; 6th call returns false without publishing |
+| Inv-NoBaselineMaskingByRegression | All new tests assert observable behaviour (counts, force flag, mutex suspension), not log-shape |
+| Inv-NoRcCoupling | No reference to any of the three RC release flags |
+
+**CI on merge head `b6be5e2b`:** Android CI `28188108133` SUCCESS, Relay CI `28188108079` SUCCESS, Deploy lint `28188108105` SUCCESS, build-test SUCCESS. All four checks green at merge time.
+
+**Field-smoke baseline replay (mini-lock §5 item 7) — PREKEY GOAL CONFIRMED, FULL BASELINE NOT PASS:**
+
+- Tecno BF7-12 + Android emulator on Wi-Fi, post-fix APK `3d3317bd184c464337a6dd6e59bc2571eccbe659953b5e458a6802456decfb54`. Logs preserved at `C:\temp\smoke-pr333-baseline\` (tecno.log + emu.log).
+- The exact pre-fix race scenario reproduced on the post-fix APK and resolved per Inv-ForcePathOnZeroRecord. Tecno timeline: bootstrap `upload_start` at `05:01:50.352`, `prekey_publish_start attempt=1/3` at `05:01:51.092`, concurrent `verify_start` at `05:01:51.411`, `verify_status spk_age_days=null opks_remaining=0` + `verify_republish_triggered` at `05:01:51.556`, bootstrap publish completes `prekey_publish_ok status=201` at `05:01:51.678`, `bootstrap_done` at `05:01:51.679`, force-republish (publish #2) `upload_start` at `05:01:52.157` (waited for mutex release), `prekey_publish_ok status=201 attempt=1` at `05:01:53.363`. Subsequent verify cycles see `spk_age_days=0` with `opks_remaining` decrementing 40 → 39 → 38 — bundle present on relay, peers consuming OPK.
+- Pre-fix anti-pattern (synthetic `Stored(0)` from debounce gate masking a failing in-flight publish) was specifically searched for via `Select-String -Pattern "upload_ok stored_opks=0"` over both logs and is absent. The `upload_ok stored_opks=0` line that appears alongside `prekey_publish_ok status=201` is the post-PR-#323 expected shape (T2 carrier-ceiling fix skips the 2xx body read and synthesises an empty publish-result for the log).
+- However, the user-visible message exchange smoke failed: the second emulator → Tecno message (`ac074425-0b5e-4721-9871-a305e9360a42`) never reached the relay. REST_TRACE shows `send_start attempt=1/5` at `18:46:47.220`, 5 consecutive `event=connectFailed exception=SocketTimeoutException` against `relay.phntm.pro/65.108.154.152:443` (each ~5006 ms), then `send_fail_giving_up total_elapsedMs=53110 attempts=5` at `18:47:40.330` and `SEND_TRACE relay_send_return ok=false`. The same destination IP also produced `ws_auth event=connectFailed` at `18:43:07` and `op=poll event=connectFailed` at `18:46:44` + `18:46:50` on the emulator within the same window — repeated total-loss-of-connectivity, not a single flap. Tecno saw lighter degradation (one 30 s `http_status_fail` plus 20 s status-call latencies) but stayed reachable.
+- This is a sender-side transport/connectivity failure on the emulator: ratchet encrypt + sealed-sender pack + the entire crypto pipeline succeeded for `ac074425`; the bytes simply did not reach `:443`. It is **independent** of the prekey publish path that this PR touches, and outside the scope of this mini-lock's invariants.
+
+**Verdict:** PR #333 closes the mini-lock contract it set out to close. Full baseline-replay PASS is NOT achievable from this PR alone because the remaining blocker is a separate transport-layer failure; conflating the two into a single gate would have held a useful fix hostage to a new unrelated network problem. RC PR #330 stays Draft / HOLD; its Tele2 LTE smoke does NOT retry until baseline message exchange is field-stable end-to-end.
+
+**Follow-ups:** open a separate short recon / diagnostic track scoping the emulator outbound REST send timeout — network path vs client-side retry budget vs host-resolution. NOT a code-fix track in advance of facts; facts-first audit FIRST per the recurring rule. The new track lands its own mini-lock on `master` BEFORE any code work, per WORKING_RULES rule 3. RC PR #330 stays HOLD until that track lands and a clean baseline-replay PASS is observable.
+
 ### 2026-06-25 · RC-RECONNECT-QUIESCENCE1 (#330) field-smoke v2 BLOCKED before Tele2 phase by Emu prekey publish debounce race + new track RC-PREKEY-PUBLISH-DEBOUNCE-RACE opened with mini-lock
 
 **Outcome:** the v2 manual smoke against PR #330 head `6f49cd89` (architects APPROVED, Android CI `28023219092` SUCCESS 3m16s, APK SHA-256 `65ebaebf3a3f72e0eb8bc4bf381bcc85f72482370b0c401ad36a8d6f99803e35` with all three debug flags forced to `"1"`) could not establish a bidirectional baseline on Wi-Fi between a fresh-installed Tecno BF7-12 and a fresh-installed emulator peer. Tecno-side outbound to the emulator deferred 37 times with `SEND_TRACE prekey_fetch_result=404 — peer has not published yet`. Tracing the emulator log surfaced a race in the prekey publish coordination path.
