@@ -598,6 +598,38 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-25 · RC-RECONNECT-QUIESCENCE1 (#330) field-smoke v2 BLOCKED before Tele2 phase by Emu prekey publish debounce race + new track RC-PREKEY-PUBLISH-DEBOUNCE-RACE opened with mini-lock
+
+**Outcome:** the v2 manual smoke against PR #330 head `6f49cd89` (architects APPROVED, Android CI `28023219092` SUCCESS 3m16s, APK SHA-256 `65ebaebf3a3f72e0eb8bc4bf381bcc85f72482370b0c401ad36a8d6f99803e35` with all three debug flags forced to `"1"`) could not establish a bidirectional baseline on Wi-Fi between a fresh-installed Tecno BF7-12 and a fresh-installed emulator peer. Tecno-side outbound to the emulator deferred 37 times with `SEND_TRACE prekey_fetch_result=404 — peer has not published yet`. Tracing the emulator log surfaced a race in the prekey publish coordination path.
+
+**Empirical timeline** (preserved at `C:\temp\smoke-v2-20260625-1247\` on the operator workstation — `tecno-full.log` UTF-16, `emu-full.log` UTF-8, `tecno-utf8.txt` decoded, `baseline-blocker.txt` verdict):
+
+```text
+Emu identity ec44d78b...
+  22:43:02.798  PREKEY_TRACE prekey_publish_start native=true attempt=1/3  <-- HTTP POST in flight
+  22:43:16.615  PREKEY_TRACE verify_start                                    <-- 14 s later
+  22:43:16.763  PREKEY_TRACE verify_status spk_age_days=null opks_remaining=0
+  22:43:16.763  PREKEY_TRACE verify_republish_triggered -- relay has no record
+  22:43:16.859  PREKEY_TRACE prekey_publish_debounced                        <-- DEBOUNCED by in-flight POST
+  22:43:16.860  PREKEY_TRACE upload_ok stored_opks=0 elapsedMs=1             <-- FALSE SUCCESS LOG
+  22:43:23.824  PREKEY_TRACE prekey_publish_fail_giving_up                   <-- 7 s after debounce, ConnectException ECONNREFUSED
+  (no further publish attempts in the rest of the session)
+```
+
+**Verdict on RC #330:** NOT a FAIL on the reconnect-quiescence layer. Smoke was BLOCKED before the Tele2 LTE phase could begin, because bidirectional baseline could not be established at the messaging-crypto layer (the layer below RC's transport-quiescence surface). RC PR #330 stays Draft. No edits, no force-pushes, no merge. The code itself is APPROVED by the architects review pass on `6f49cd89` and Android CI is green; only the field-smoke gate (WORKING_RULES rule 8) is open, and it cannot be honestly closed until the prekey publish baseline becomes reliable.
+
+**Locked invariants for the new track `RC-PREKEY-PUBLISH-DEBOUNCE-RACE`** (per WORKING_RULES rule 3, mini-lock-before-code):
+1. A debounced prekey publish MUST NOT log `upload_ok` while the in-flight publish that suppressed it has not returned (Inv-NoFalseSuccess).
+2. After the in-flight publish fails, the debounced republish MUST be retried so the bundle eventually reaches the relay (Inv-RetryAfterFail).
+3. When `verify_status` reports `spk_age_days=null AND opks_remaining=0`, the republish path MUST bypass the debounce gate entirely — that case can never be the right one to debounce (Inv-ForcePathOnZeroRecord).
+4. Retry path MUST honour the existing `attempt=N/3` budget AND a per-identity per-session retry budget; no busy-loop (Inv-NoSpinningRetry).
+5. Tests MUST be deterministic and assert retry observability, not just log-shape (Inv-NoBaselineMaskingByRegression).
+6. The fix MUST NOT depend on any of the three RC release flags (Inv-NoRcCoupling).
+
+**Sequencing:** docs PR (this entry + `docs/tracks/rc-prekey-publish-debounce-race.md`) lands on master FIRST per Rule 3. Then the feature branch `feat/rc-prekey-publish-debounce-race` opens off the new master. After the prekey fix merges and the §5 item 7 field-smoke baseline replay passes, the RC-RECONNECT-QUIESCENCE1 branch rebases on top, the APK is rebuilt with the three flags forced to `"1"`, and the Tele2 LTE smoke is retried per its existing template.
+
+**Follow-ups:** mini-lock merge → feature branch + implementation → Android CI → field-smoke baseline replay PASS → RC PR #330 rebase → RC APK rebuild → Tele2 LTE smoke retry → RC PR Draft→Ready → merge → rollout PR. None of these steps proceed until the previous one passes.
+
 ### 2026-06-23 · RC-RECONNECT-QUIESCENCE1 draft PR #330 opened on `ecd67e04` + Android CI 30-min timeout on first run + retrospective rule-3 backfill (docs/tracks/rc-reconnect-quiescence1.md)
 
 **Goal:** ship the typed `WsReconnectGate` + rewalk transaction surface that stops the Tele2 LTE reconnect-loop storms observed when R3.6 sticky-per-route was enabled during the Tele2 field validation (R3.6 release flags stay `"0"` post-merge — INACTIVE on production builds — the storms appeared under the debug-flag-enabled field run). Mechanism opt-in behind release-pinned `BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "0"`; production behaviour unchanged at this PR's merge; a separate rollout PR flips the flag.
