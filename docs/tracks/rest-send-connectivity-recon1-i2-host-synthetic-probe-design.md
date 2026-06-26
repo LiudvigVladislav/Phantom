@@ -45,13 +45,24 @@ Three concurrent PowerShell windows on the operator workstation. The procedure i
 
 ### Tab A — host-side probe loop (writes machine-readable log)
 
+Sanity-check first (`%{exitcode}` was added in curl 7.75.0, so an older `curl.exe` would silently emit an empty field and break the FAIL discriminator):
+
+```powershell
+curl.exe --version
+# Expected: curl 7.75.0 or newer (Windows 10/11 system curl is current enough).
+# If the version is older OR `curl.exe` is not on PATH, install a current curl
+# and re-anchor `curl.exe` accordingly before starting the loop.
+```
+
+Then the probe loop:
+
 ```powershell
 $out = "C:\temp\smoke-pr333-baseline-i2\host-probe.tsv"
 New-Item -ItemType Directory -Force "C:\temp\smoke-pr333-baseline-i2" | Out-Null
-"ts`tconnect_s`ttls_s`ttotal_s`thttp_code`texitcode" | Out-File -FilePath $out -Encoding utf8
+"host_send_ts`tconnect_s`ttls_s`ttotal_s`thttp_code`texitcode" | Out-File -FilePath $out -Encoding utf8
 
 while ($true) {
-    $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $now = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
     $line = curl.exe --connect-timeout 5 --max-time 10 -s -o NUL `
         -w "$now`t%{time_connect}`t%{time_appconnect}`t%{time_total}`t%{http_code}`t%{exitcode}" `
         https://relay.phntm.pro/relay/poll 2>$null
@@ -65,25 +76,39 @@ Probe rate is 1/second to give dense temporal coverage of any failure burst (the
 
 `Ctrl+C` to stop after the reproduction completes or the 15-minute cap is hit.
 
-### Tab B — Tecno logcat capture (control)
+### Tab B — Tecno logcat capture (control), host-clock prefixed
+
+`logcat -v time` prints the device's local clock. To bind every logcat line to host wall-clock at the instant the host receives it, each line is prefixed with `[DateTime]::UtcNow` via `ForEach-Object` BEFORE the line is written to disk. The device-local `logcat -v time` field stays present as a payload column for debug context but is NOT the cross-correlation discriminator. The first tab-separated field of each line is the **host receive timestamp** (`host_recv_ts`), and that is what the analysis discipline in §5 uses.
 
 ```powershell
 $ADB = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 $TECNO = "103603734A004351"
 & $ADB -s $TECNO logcat -c
-& $ADB -s $TECNO logcat -v time *:I | Tee-Object -FilePath "C:\temp\smoke-pr333-baseline-i2\tecno.log"
+& $ADB -s $TECNO logcat -v time *:I | ForEach-Object {
+    $ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    "$ts`t$_"
+} | Tee-Object -FilePath "C:\temp\smoke-pr333-baseline-i2\tecno.log"
 ```
 
 Tecno is the I-1 physical-device control. Running its logcat in parallel gives a second concurrent baseline alongside the host probe.
 
-### Tab C — emu logcat capture + the reproduction trigger
+### Tab C — emu logcat capture + the reproduction trigger (host-clock prefixed)
+
+Same host-clock-prefix discipline as Tab B:
 
 ```powershell
 $ADB = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 $EMU = "emulator-5554"  # adjust if different
 & $ADB -s $EMU logcat -c
-& $ADB -s $EMU logcat -v time *:I | Tee-Object -FilePath "C:\temp\smoke-pr333-baseline-i2\emu.log"
+& $ADB -s $EMU logcat -v time *:I | ForEach-Object {
+    $ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    "$ts`t$_"
+} | Tee-Object -FilePath "C:\temp\smoke-pr333-baseline-i2\emu.log"
 ```
+
+The host-clock prefix is necessary for the cross-correlation invariant in §5. The device-local timestamp inside the logcat payload remains visible — useful when reading the file by hand — but it MUST NOT be the column used to align events across the three sources. Each PowerShell process writing the file uses the same host clock (`[DateTime]::UtcNow`), so the probe TSV and both logcats share a single reference.
+
+A consequence of this discipline: there is a small per-line latency between the device emitting a log line and the host receiving / timestamping it (typically sub-millisecond on local-USB / loopback adb, but the recon does not assume sub-ms; the `± 10 s` window in §6 is several orders of magnitude wider than any plausible host-receive latency).
 
 While Tab C is running, the operator interacts with the Phantom app on the emulator to drive a reproduction. The 2026-06-26 symptom appeared spontaneously a few minutes into a fresh-install Wi-Fi smoke; an effective trigger pattern (subject to change as evidence accrues) is:
 
@@ -98,18 +123,25 @@ The symptom is "REST send / poll / ws_auth connectFailed burst from `10.0.2.16` 
 
 On completion of the 15-minute window:
 
-| # | Artefact | Purpose |
-|---|---|---|
-| 1 | `C:\temp\smoke-pr333-baseline-i2\host-probe.tsv` (TSV log from Tab A) | Probe outcome per second across the window; the discriminator. |
-| 2 | `C:\temp\smoke-pr333-baseline-i2\tecno.log` (logcat from Tab B) | Concurrent physical-device control; expected to show no `connectFailed`. |
-| 3 | `C:\temp\smoke-pr333-baseline-i2\emu.log` (logcat from Tab C) | The emulator's record of REST send / poll / ws_auth events, including any `connectFailed` burst. |
-| 4 | UI verdict (text note) | Whether the operator observed the user-facing symptom (a stuck `Sending…` bubble or similar) and at what wall-clock time. |
+| # | Artefact | Discriminator column | Purpose |
+|---|---|---|---|
+| 1 | `C:\temp\smoke-pr333-baseline-i2\host-probe.tsv` (TSV log from Tab A) | `host_send_ts` (column 1) | Probe outcome per second across the window; the PASS / FAIL discriminator. |
+| 2 | `C:\temp\smoke-pr333-baseline-i2\tecno.log` (logcat from Tab B, host-clock prefixed) | `host_recv_ts` (column 1, prepended by `ForEach-Object`) | Concurrent physical-device control; expected to show no `connectFailed`. |
+| 3 | `C:\temp\smoke-pr333-baseline-i2\emu.log` (logcat from Tab C, host-clock prefixed) | `host_recv_ts` (column 1, prepended by `ForEach-Object`) | The emulator's record of REST send / poll / ws_auth events, including any `connectFailed` burst. |
+| 4 | UI verdict (text note) | Operator-recorded host UTC | Whether the operator observed the user-facing symptom (a stuck `Sending…` bubble or similar) and at what host wall-clock time. |
 
-All four artefacts share the operator-workstation host clock; no anchor approximation is required.
+All four artefacts use the operator-workstation host clock as the first / authoritative timestamp column:
+- `host_send_ts` in the TSV is taken just before the `curl` invocation each second.
+- `host_recv_ts` in both logcat files is the host-clock prefix written by the `ForEach-Object` block at the instant the host receives each logcat line.
+- The device-local `logcat -v time` field stays present in the line payload but is treated as debug context only, NOT as a cross-correlation column.
+
+This is the eliminator for the I-1 anchor approximation: cross-source alignment is exact at the host-clock instant of write, modulo the sub-second adb-receive jitter that is many orders of magnitude smaller than the `± 10 s` correlation window in §6.
 
 ## §5 Analysis discipline
 
-Cross-correlation between the three logs and the probe TSV is by host UTC timestamp. The TSV uses ISO 8601 UTC explicitly; `logcat -v time` records the device-local time but both devices' timestamps reduce to host clock at write-time (Tee-Object on the host). The recon-progress comment that reports the verdict produces a single timeline with all four sources interleaved at the second granularity around the failure window (if observed).
+Cross-correlation between the three logs and the probe TSV is by host UTC timestamp — explicitly, the `host_send_ts` column in `host-probe.tsv` and the `host_recv_ts` prefix column in `tecno.log` and `emu.log`. The device-local `logcat -v time` field inside each logcat line is debug context only and MUST NOT be used as the alignment key; if a future tool reads `logcat -v time` instead of the host-clock prefix, the analysis falls back to the I-1 anchor-approximation regime, which is explicitly what I-2 is designed to retire.
+
+The recon-progress comment that reports the verdict produces a single timeline with all four sources interleaved at the second granularity around the failure window (if observed), keyed on host UTC.
 
 The verdict closes on the answer to one question, evaluated within a `± 10 second` window around each `connectFailed` event in `emu.log`:
 
