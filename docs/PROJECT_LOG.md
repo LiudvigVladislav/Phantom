@@ -598,6 +598,35 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-27 · REST-SEND-CONNECTIVITY-RECON1 PARKED + VPN-TRANSPORT-COMPAT-RECON1 mini-lock opened
+
+**Outcome:** After three I-2 reproduction attempts the REST-SEND-CONNECTIVITY-RECON1 track parks per §10 of `docs/tracks/rest-send-connectivity-recon1.md` WITHOUT a formal closure on any of the six hypotheses from §4. The target signature (`emu connectFailed` to `65.108.154.152:443` from `10.0.2.16`) did not reproduce in either clean attempt. A separate VPN compatibility recon opens in parallel to investigate the environment contamination that surfaced in attempt #1; the Direct WSS / Mode 2 stabilisation track remains the principal forward direction for transport reliability work, independent of either recon.
+
+**Attempt summary:**
+
+- **#1** (2026-06-26, ~8 min, Mac host VPN ON): INVALIDATED. Host VPN ↔ AVD QEMU NAT/DNS proxy interaction; emu logs showed `UnknownHostException: Unable to resolve host "relay.phntm.pro"` while the host system resolver kept working (`curl https://relay.phntm.pro/relay/poll` returned a clean `401`). Disabling VPN and restarting the emu cleanly restored end-to-end delivery. This spawned the follow-up VPN compatibility recon.
+- **#2** (2026-06-26, ~29 min, VPN OFF): NOT TARGET REPRO. No emu / Tecno `connectFailed` to `65.108.154.152:443`. Host probe 1234/1236 SUCCESS, 2 isolated `ec=28`. All Phantom messages delivered (`relay_send_return ok=true`). Direct WSS Mode 2 ping-timeout pattern visible on both devices as a separate signal.
+- **#3** (2026-06-27, ~37 min, VPN OFF): NOT TARGET REPRO. No emu / Tecno `connectFailed` to `65.108.154.152:443`. Host probe 1597/1606 SUCCESS, 9 `ec=28` — including a 6-fail host-probe burst cluster at `21:53:10 → 21:54:03Z` (53 s span) without a co-incident emu / Tecno transport event in the same window. UX-visible `prekey_fetch_result=timeout` once (8002 ms, 2 ms over the 8000 ms budget) followed by a 4 s retry succeeding; message delivered, not lost.
+
+**Disposition:** Parked per §7 P-1 ("symptom non-reproducible"). Strict P-1 would ask for three CLEAN attempts; two were achieved (#2 and #3). The operator decision is to park now rather than spend further session time on a target that is not reproducing, on the explicit understanding that the original 2026-06-26 evidence stays on file as a single-shot event and that any future regression on the same shape re-opens this recon — NOT the prekey-debounce track or any other track. The I-1 hypothesis matrix (H-A REFUTED, H-B strongly supported but not final-confirmed) stays valid as the last successful discrimination.
+
+**Side-findings preserved (NOT actioned here):**
+
+- **2026-06-27 host-side probe burst cluster (`21:53:10 → 21:54:03Z`, 6 fails / 53 s).** Captured at `C:\temp\smoke-pr333-baseline-i2-v2\host-probe.tsv` on the operator workstation. If a future I-2 reproduction catches a co-incident emu burst PLUS host burst, the standing I-1 hypothesis matrix (H-A REFUTED) would need to be re-examined.
+- **Direct WSS Mode 2 / ping-timeout pattern.** ~10 hits per side per attempt across #2 + #3. Same Mode 2 family the Direct WSS track owns; NOT scope here.
+- **First-message UX delay (8 s prekey-fetch timeout + 4 s retry).** Same shape previously captured as a side-finding in the 2026-06-17 voice-smoke entry; transport correct, UX delay surface. Belongs to a future DWS-UX-class follow-up.
+
+**VPN-TRANSPORT-COMPAT-RECON1 mini-lock (`docs/tracks/vpn-transport-compat-recon1.md`):**
+
+- Goal: discriminate where VPN interaction breaks Phantom transport — DNS / TCP / TLS / application; AVD-only vs real-device-affected; Direct WSS only vs REST fallback also.
+- Seven hypotheses (H-VPN-AVD-DNS, H-VPN-AVD-NAT, H-VPN-OS-DNS, H-VPN-HOST-ROUTING, H-VPN-REAL-DEVICE-AFFECTED, H-VPN-DWSS-ONLY, H-VPN-REST-ALSO).
+- Five candidate diagnostic instruments (J-1 host VPN reachability matrix, J-2 AVD VPN reachability matrix, J-3 real-device under VPN, J-4 layer-bisection for the surviving hypothesis, J-5 Phantom path-by-path), explicitly NOT pre-committed in advance.
+- Four acceptance-gate verdicts (AVD-only / real-device-affected / path-specific / REST-also). Two-or-more concurrent verdicts → Council.
+- Three Park conditions (non-reproducible, VPN-vendor scope creep, operator unavailable).
+- Explicit out-of-scope set: no code change, no PR #330 work, no Direct WSS Mode 2 work, no REST-SEND recon re-open, no pre-locked fix shape.
+
+**Follow-ups:** J-1 runs as the first deliverable when the operator schedules it — host VPN ON/OFF reachability matrix from the Mac, no code, no fix shape. The recon does NOT block RC PR #330; RC #330's gating is the Direct WSS / Mode 2 track, which is the next forward direction for transport reliability work.
+
 ### 2026-06-26 · RC-PREKEY-PUBLISH-DEBOUNCE-RACE MERGED (PR #333 squash `5a5ce15b`) — prekey goal field-confirmed; full baseline still blocked by separate Emu outbound REST connectivity issue; RC PR #330 stays HOLD
 
 **Outcome:** PR #333 lands on `master` as squash `5a5ce15b`, closing the mini-lock from PR #332 (master `768f23e6`). Three commit rounds, three CI passes, three review verdicts; head at merge = `b6be5e2b`. RC PR #330 is NOT touched — it stays Draft / HOLD until baseline message exchange becomes field-stable end-to-end (which depends on a new short recon track scoped below, NOT on this PR).

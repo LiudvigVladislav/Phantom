@@ -89,3 +89,31 @@ The following candidates have surfaced in prior reviews / smokes and remain expl
 ## §9 Hand-off note
 
 If this session ends before any instrument runs, the next session picks up with: read `C:\temp\smoke-pr333-baseline\*.log`, fill in the I-1 minute-by-minute timeline as the first deliverable, and post the timeline + a recommended I-2 / I-4 sequence to a recon-progress PR comment. Do NOT propose a fix shape in that comment.
+
+## §10 Verdict — PARKED 2026-06-27
+
+The recon parks WITHOUT a formal closure on any of the six hypotheses from §4. The target signature (`emu connectFailed` to `65.108.154.152:443` from `10.0.2.16`) did not reproduce in either clean attempt; the only attempt that did encounter a failure-shape was invalidated by environment contamination unrelated to the original 2026-06-26 evidence.
+
+### Attempt summary
+
+| Attempt | Date | Window | VPN | Result | Notes |
+|---|---|---|---|---|---|
+| #1 | 2026-06-26 | ~8 min | Mac host ON | **INVALIDATED** | Host VPN ↔ AVD QEMU NAT/DNS proxy interaction prevented the emu from reaching the relay at the DNS layer (`UnknownHostException`). The target TCP-layer `connectFailed` signature could not even be tested. Spawned the follow-up VPN compatibility recon — see `vpn-transport-compat-recon1.md`. |
+| #2 | 2026-06-26 | ~29 min | OFF | **NOT TARGET REPRO** | No emu / Tecno `connectFailed` to `65.108.154.152:443`. Host probe 1234/1236 SUCCESS, 2 isolated `ec=28`. All Phantom messages delivered (`relay_send_return ok=true`). Direct WSS Mode 2 ping-timeout pattern visible on both devices as a separate signal. |
+| #3 | 2026-06-27 | ~37 min | OFF | **NOT TARGET REPRO** | No emu / Tecno `connectFailed` to `65.108.154.152:443`. Host probe 1597/1606 SUCCESS, 9 `ec=28`. Includes a 6-fail host-probe burst cluster at `21:53:10 → 21:54:03Z` (53 s span) without a co-incident emu / Tecno transport event in the same window — devices were idle, so the host blip cluster could not be cross-correlated against any Phantom-side attempt. UX-visible `prekey_fetch_result=timeout` once (8002 ms, 2 ms over 8000 ms budget) followed by a 4 s retry succeeding (`http_bundle_fetch_done status=200` → `relay_send_return ok=true`); message delivered, not lost. |
+
+### Disposition
+
+- Parked per §7 P-1 ("symptom non-reproducible") — strictly speaking the P-1 trigger asks for three CLEAN reproduction attempts; two were achieved before parking. The operator decision is to park now rather than spend further session time on a target that is not reproducing, on the explicit understanding that the original 2026-06-26 evidence stays on file as a single-shot event and that any future regression on the same shape re-opens this recon, NOT the prekey-debounce track or any other track.
+- The I-1 hypothesis matrix (`rest-send-connectivity-recon1-i1-timeline.md` §5) stays valid as the last successful discrimination: H-A REFUTED, H-B strongly supported but not final-confirmed.
+- No code change. No fix scope-lock. No RC PR #330 movement. RC #330 stays Draft / HOLD pending the Direct WSS / Mode 2 track, NOT pending this recon.
+
+### Side-findings preserved for future work
+
+- **2026-06-27 host-side probe burst cluster (`21:53:10 → 21:54:03Z`).** Nine `ec=28` host-probe failures, six clustered in 53 seconds, while Phantom devices were idle. If a future I-2 reproduction catches a co-incident emu burst plus host-probe burst, the standing hypothesis matrix from I-1 (H-A REFUTED, H-B strong) would need to be re-examined — that combined evidence could reopen H-A or H-C in a way the original 2026-06-26 corpus did not allow. The host-probe TSV from attempt #3 is preserved at `C:\temp\smoke-pr333-baseline-i2-v2\host-probe.tsv` on the operator workstation.
+- **Direct WSS Mode 2 / ping-timeout pattern.** Both emu and Tecno logs across attempts #2 and #3 show repeated `WebSocket connect FAILED ... sent ping but didn't receive pong within 15000ms` shapes (~10 hits per side per attempt). Delivery did not break — REST fallback caught the traffic. This is the same Mode 2 family the Direct WSS track owns; it is NOT a finding under this recon's scope.
+- **First-message UX delay (8 s prekey-fetch timeout + 4 s retry).** Attempt #3 surfaced the same "yellow dot" UX shape previously preserved as a side-finding in `[[project_voice_smoke_pass_2026_06_17]]`-class observations (`prekey_fetch_result=timeout` on the budget boundary, followed by a successful retry). The transport works correctly; the surface is a UX delay rather than a delivery failure. Belongs to a future DWS-UX-class follow-up, NOT this recon.
+
+### Next track pointer
+
+The follow-up VPN compatibility recon is opened in parallel with this parking — see `docs/tracks/vpn-transport-compat-recon1.md`. The Direct WSS / Mode 2 stabilisation track remains the principal forward direction for transport reliability work, independent of either recon.
