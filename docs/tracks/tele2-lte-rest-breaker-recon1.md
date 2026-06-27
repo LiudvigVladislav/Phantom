@@ -162,3 +162,43 @@ If Option 2 is chosen, the recon closes with `H-NetworkSideCancellation supporte
 If the operator schedules M-2, the next session designs the packet capture (`tcpdump` on Tecno via `adb shell tcpdump -i any 'host relay.phntm.pro and port 443' -w` if root is available, OR on an upstream router if not; relay-side `pcap` would also serve if the operator has VPS access). M-2's progress note appends another section to this file with the on-the-wire evidence.
 
 If the operator chooses Option 2 (close on M-1 + M-5 + T2 correlation), the next session writes the closure verdict PR with the §6 acceptance-gate disposition mapped to "H-NetworkSideCancellation supported via corpus + carry-forward" AND a forward-pointer for the parent `direct-wss-mode2-recon1.md` Phase B / RC PR #330 work to consider the architectural question raised in §10 Disposition.
+
+## §11 Closure verdict — 2026-06-28 (Option 2)
+
+Operator decision per §10 Disposition: close on M-1 + M-5 + carry-forward correlation with `rc-direct-stability1.md` §13 T2 outcome, without running M-2 packet capture. The recon ends in this state.
+
+### §6 acceptance-gate verdict
+
+**Composite verdict — Gate 2 (H-NetworkSideCancellation) and Gate 5 (H-Tele2LTESpecific), both supported but with the explicit honesty that neither is packet-confirmed and the K-2 corpus alone cannot fully exclude unrelated mechanisms:**
+
+- **H-NetworkSideCancellation: supported via M-1 + M-5 + T2 carry-forward, NOT packet-confirmed.** Per §10 hypothesis matrix. The `35002-35006 ms` clustering on every `op=poll` `InterruptedIOException` event matches the OkHttp `callTimeout` ceiling derived from `(pollHoldSecs=30 + POLL_HOLD_SAFETY_MARGIN_SECS=5) × 1000` at `RestFallbackOrchestrator.kt::computeLongPollReadTimeoutMs` line 3689. Zero `op=poll responseBodyEnd` across 30 minutes against 12 `responseHeadersEnd status=200` events: the relay returned headers + partial body (up to `cumulative_bytes=3456` of ~4608 expected), then the remaining bytes never arrived. The direction of investigation matches the T2 outcome from `rc-direct-stability1.md` §13 ("any long-held connection on Tele2 LTE uplink is structurally untrustworthy") applied to the downlink direction. **The K-2 corpus alone does not rule out**: relay-side response truncation under load; HTTP/2 stream backpressure on the downlink path; TLS-layer renegotiation race mid-body. M-2 packet capture would be required to conclusively pin the missing-chunks to TCP-layer cuts (RST / FIN / mid-stream silence) vs the listed alternatives. The operator decision is to accept the carry-forward correlation as sufficient evidence for this recon's closure, on the basis that the engineering implication is the same regardless of which sub-mechanism dominates: long-held connections on Tele2 LTE are not a reliable substrate for the long-poll response cycle.
+- **H-Tele2LTESpecific: supported.** Single-variable comparison K-1 (Tecno Wi-Fi, 88-90 successful REST poll / send / inbound_deliver events) vs K-2 (Tecno Tele2 LTE, 0 successful poll body completions) on the same master HEAD APK; the network class is the only variable that differs. Cross-reference with the existing `rc-direct-stability1.md` §13 Tele2 LTE evidence corroborates. **NOT** confirmed against other LTE carriers (MTS, Megafon, Beeline) — M-3 was not run; the verdict bounds to "this surface is observable on Tele2 LTE" without a strong claim that other carriers would behave identically.
+
+### Other §4 hypotheses, final status
+
+- **H-OrchestratorCancellation: REFUTED** at M-1 + M-5 evidence level. Fixed-budget timeout incompatible with WS-state-driven cancellation.
+- **H-BreakerCooldownTooAggressive: DEMOTED — not the root cause.** Breaker correctly counts genuine failures; cooldown ramp is a downstream artefact of the underlying failure surface, not the cause.
+- **H-BreakerOpenBlocksInboundDispatch: REFUTED** at M-5 source-read level. WS deliver-in path runs in a `scope.launch` block independent of breaker state.
+- **H-OkHttpInterruptionRace: REFUTED.** `InterruptedIOException` is OkHttp's stock `callTimeout` surface, not a dispatcher race.
+
+### What this verdict does NOT decide (forward-pointer)
+
+The closure of TELE2-LTE-REST-BREAKER-RECON1 does NOT, on its own, resolve the parent `direct-wss-mode2-recon1.md` Phase B blocker. The two findings (H-NetworkSideCancellation + H-Tele2LTESpecific) push the failure below the application layer, where this recon's facts-first scope does not propose fixes. The architectural question for the parent recon is now explicit:
+
+- Does PR #330's quiescence contract have a defensible meaning on a network class where REST fallback cannot complete long-poll bodies? If quiescence is supposed to gracefully suppress reconnect storm WHILE letting REST fallback continue to deliver — and REST fallback cannot deliver on Tele2 LTE because the long-poll body itself is structurally untrustworthy — then validating Phase B on Tele2 LTE produces a vacuously-passing or vacuously-failing test depending on framing.
+- Does the parent recon re-scope Phase B to Wi-Fi only (with the explicit honesty that "RC PR #330 quiescence validated on Wi-Fi; Tele2 LTE end-to-end delivery is a separate problem governed by `rc-direct-stability1.md` §13 long-connection-uplink finding")?
+- Does a separate fix-track open for the long-held-connection problem before Phase B continues? Candidate scope shapes (NOT promoted from this recon — listed only as the candidate set the parent recon may consider): short-poll mode on LTE, decoupling `callTimeout` from `readTimeout` in long-poll path, server-side keep-alive byte trickle to defeat NAT teardown, switching to a different relay endpoint or transport on LTE-detected paths. Each is a fix shape and remains explicitly out of scope for THIS recon's closure.
+
+These are operator decisions, NOT this recon's scope. The parent `direct-wss-mode2-recon1.md` track-doc may amend its §10 with the same forward-pointer when the operator chooses one of the three paths.
+
+### Side-findings preserved (NOT actioned by this closure)
+
+- **Round 14 padded poll body ~4608 bytes sits close to the T2 cumulative-bytes threshold class** (`rc-direct-stability1.md` §13 observed cutoff at ~5 KB). On Tele2 LTE downlink the call gets through ~75% of the body before the remaining chunks never arrive. Could be coincidence with the T2 byte threshold; could be that the same byte-budget mechanism applies to long-poll responses. NOT a hypothesis under this closed recon; reference for any future scope-lock on cumulative-bytes.
+- **`AndroidNativeOkHttpRestFallbackTransport.kt:330` couples `callTimeout` and `readTimeout` to the same 35 s budget** on long-poll enabled paths. A future fix-track might consider decoupling these. Out of scope here.
+- **K-2 Emu-side Sprint 2b-C `OpkNotFound` / `fail_mac` on 2 of 3 messages** (per parent recon §10 Phase A K-2 entry) — single observation, NOT scoped here. If it reproduces in subsequent runs, a separate `SPRINT-2B-C-INBOUND-REPAIR-REGRESSION-RECON` opens.
+
+### Hand-off
+
+The recon closes. The parent `direct-wss-mode2-recon1.md` track-doc gets a corresponding amendment in a separate follow-up docs PR (this PR's scope is the recon closure; the parent's amendment is a follow-up that the operator schedules after this PR merges). RC PR #330 stays Draft / HOLD throughout — its gating now becomes whichever of the three architectural-question paths the operator chooses for the parent recon.
+
+No code change. No fix scope-lock. No commit to PR #330's branch. The recon's evidence files (K-2 corpus + this track-doc with the M-1 + M-5 progress + this closure verdict) form the durable record.
