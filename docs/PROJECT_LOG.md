@@ -598,6 +598,38 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-28 · TELE2-LTE-REST-BREAKER-RECON1 M-1 + M-5 progress + closure verdict (Option 2) — Phase B architectural-question forward-pointer
+
+**Outcome:** Two-PR sequence on 2026-06-28. PR #341 (M-1 + M-5 combined progress note, two-round review) merged squash `51e72e03`; this PR adds §11 closure verdict per the operator-chosen Option 2 (close on M-1 + M-5 + carry-forward correlation with `rc-direct-stability1.md` §13 T2 outcome, without running M-2 packet capture). Recon closes with two hypotheses supported (H-NetworkSideCancellation, H-Tele2LTESpecific) but explicitly NOT packet-confirmed, and three forward-pointer paths for the parent `direct-wss-mode2-recon1.md` Phase B blocker that the operator now decides among.
+
+**M-1 + M-5 findings (re-read of K-2 corpus + source-code read, no field re-run):**
+
+- All 11 `op=poll callFailed exception=InterruptedIOException` events on Tecno carry `totalMs` in `35002-35006 ms` (4 ms spread; distribution: 1 × 35002, 1 × 35004, 5 × 35005, 4 × 35006). Tightly clustered at the 35 s budget ceiling — mechanistically incompatible with a WS-state-driven cancellation that would produce variable elapsed times.
+- 12 `op=poll responseHeadersEnd status=200` events appear in the corpus; **zero `op=poll responseBodyEnd` events** across the full 30 minutes. Polls received headers + partial body chunks (up to `cumulative_bytes=3456` of ~4608 expected padded Round 14 response), then the remaining bytes never arrived.
+- Source-read at master HEAD `b3943641`: `35 s = (pollHoldSecs=30 + POLL_HOLD_SAFETY_MARGIN_SECS=5) × 1000 ms` defined at `RestFallbackOrchestrator.kt::computeLongPollReadTimeoutMs` line 3689, threaded into OkHttp `callTimeout` via `AndroidNativeOkHttpRestFallbackTransport.kt`. The `InterruptedIOException` is the OkHttp call-timeout firing at its budgeted ceiling, NOT an orchestrator-internal interrupt.
+- Source-read: WS deliver-in path (`HybridRelayTransport.kt::startWsPassthroughCollectors` line 446) launches `scope.launch { wsTransport.incoming.collect { ... _incoming.emit(deliver) ... } }` independent of breaker state. When the breaker is open, only `op=poll` is skipped; WS frames continue to flow through.
+
+**Hypothesis matrix at closure:**
+
+- **H-OrchestratorCancellation: REFUTED** — fixed-budget 35 s timeout is OkHttp `callTimeout`, not WS-state-driven interrupt.
+- **H-NetworkSideCancellation: SUPPORTED via M-1 + M-5 + T2 carry-forward, NOT packet-confirmed.** Direction matches `rc-direct-stability1.md` §13 ("long-held connection on Tele2 LTE uplink is structurally untrustworthy") applied to downlink. Corpus alone cannot fully exclude relay-side response truncation under load, HTTP/2 stream backpressure, or TLS-layer renegotiation race. M-2 packet capture (NOT run per operator decision) would be required to conclusively pin to TCP-layer cuts vs the listed alternatives.
+- **H-BreakerCooldownTooAggressive: DEMOTED — not the root cause.** Breaker correctly counts genuine failures; cooldown ramp is downstream artefact.
+- **H-BreakerOpenBlocksInboundDispatch: REFUTED** at M-5 source-read level. WS deliver-in not gated by breaker.
+- **H-Tele2LTESpecific: SUPPORTED.** Single-variable K-1 Wi-Fi vs K-2 Tele2 LTE comparison + `rc-direct-stability1.md` §13 corroboration. Not confirmed against other LTE carriers — verdict bounded to "this surface is observable on Tele2 LTE".
+- **H-OkHttpInterruptionRace: REFUTED.** `InterruptedIOException` is OkHttp's stock `callTimeout` surface.
+
+**Net architectural picture:** K-2 inbound-delivery gap on Tecno is caused by two independent failures on the same network class, both rooted below the application layer: (1) Tele2 LTE long-held downlink connection drops body bytes before response completes (same family as T2 uplink finding, different direction); (2) Tele2 LTE Direct WSS dies in Mode 2 pp0 rhythm. Neither failure is in the application code at master HEAD. The R3.6 breaker policy is correctly observing the REST failure pattern; the WS deliver-in path is correctly wired and would deliver if WS sessions became alive.
+
+**Forward-pointer for parent `direct-wss-mode2-recon1.md` Phase B (NOT this recon's scope):** the closure does NOT resolve the parent's Phase B blocker. The architectural question is now explicit: does PR #330's quiescence contract have a defensible meaning on a network class where REST fallback cannot complete long-poll bodies? Three candidate paths for the operator to decide on the parent recon (NOT promoted here): (a) re-scope Phase B to Wi-Fi only with explicit honesty about Tele2 LTE governance by `rc-direct-stability1.md` §13; (b) open a separate fix-track for the long-held-connection problem before Phase B continues; (c) accept the LTE limitation and validate Phase B on Wi-Fi as best-available evidence. Candidate fix-shape sets (NOT promoted): short-poll mode on LTE, decoupling `callTimeout` from `readTimeout` in long-poll path, server-side keep-alive byte trickle to defeat NAT teardown, switching to a different relay endpoint or transport on LTE-detected paths.
+
+**Side-findings preserved (NOT actioned by this closure):**
+
+- Round 14 padded poll body (~4608 bytes) sits close to the T2 cumulative-bytes threshold class (~5 KB observed cutoff per `rc-direct-stability1.md` §13). Could be coincidence; could be that the same byte-budget mechanism applies to long-poll responses. Reference for any future scope-lock on cumulative-bytes.
+- `AndroidNativeOkHttpRestFallbackTransport.kt:330` couples `callTimeout` and `readTimeout` to the same 35 s budget on long-poll enabled paths. A future fix-track may consider decoupling these.
+- K-2 Emu-side Sprint 2b-C `OpkNotFound` / `fail_mac` on 2 of 3 messages — single observation, NOT scoped here. If reproduces, a separate `SPRINT-2B-C-INBOUND-REPAIR-REGRESSION-RECON` opens.
+
+**Follow-ups:** the parent `direct-wss-mode2-recon1.md` track-doc gets a corresponding amendment in a separate follow-up docs PR (scope of THIS PR is the recon closure only). RC PR #330 stays Draft / HOLD throughout — its gating now becomes whichever of the three architectural-question paths the operator chooses for the parent recon.
+
 ### 2026-06-27 · DIRECT-WSS-MODE2-RECON1 Phase A progress (K-1 clean + K-2 not-clean) + TELE2-LTE-REST-BREAKER-RECON1 mini-lock opened — Phase B blocked
 
 **Outcome:** Operator ran K-1 (Tecno Wi-Fi) and K-2 (Tecno Tele2 LTE) on master HEAD `5934310e` debug APK (SHA `3d3317bd...`). K-1 captured a clean baseline; K-2 captured the target Direct WSS Mode 2 shape but ALSO surfaced a separate REST-fallback failure on Tele2 LTE that refutes the parent recon's `H-REST-Survives` hypothesis on that network class. A new facts-first recon track opens to discriminate the REST breaker root cause before Phase B / RC PR #330 validation can proceed.
