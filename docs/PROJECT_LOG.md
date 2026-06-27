@@ -598,6 +598,36 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-27 · DIRECT-WSS-MODE2-RECON1 Phase A progress (K-1 clean + K-2 not-clean) + TELE2-LTE-REST-BREAKER-RECON1 mini-lock opened — Phase B blocked
+
+**Outcome:** Operator ran K-1 (Tecno Wi-Fi) and K-2 (Tecno Tele2 LTE) on master HEAD `5934310e` debug APK (SHA `3d3317bd...`). K-1 captured a clean baseline; K-2 captured the target Direct WSS Mode 2 shape but ALSO surfaced a separate REST-fallback failure on Tele2 LTE that refutes the parent recon's `H-REST-Survives` hypothesis on that network class. A new facts-first recon track opens to discriminate the REST breaker root cause before Phase B / RC PR #330 validation can proceed.
+
+**K-1 — Tecno Wi-Fi (CLEAN baseline):**
+
+- 21 WSS sessions on each device (Tecno + emu both Wi-Fi). Lifetime median ~136 s, 7 successful ping/pongs in 18/21 (Tecno) and 17/21 (emu) sessions. Outlier shape (76 s / 91 s / 121 s with 3 / 4 / 6 pongs) on both devices in the same sessions. `F-Mode1` baseline re-confirmed on master HEAD with a slight cadence shift vs the historical ~150 s × 8 pongs in `rc-direct-stability1.md` §1.
+- REST poll + send + inbound_deliver: 90 events on Tecno, 88 events on emu. `relay_send_return ok=false = 0` on both. Delivery worked.
+- Cross-device synchronisation `±2-3 s` per session-number side-finding noted; not promoted to a hypothesis.
+- Evidence files preserved at `C:\temp\direct-wss-mode2-k1-tecno-wifi\` with SHA-256 documented in parent track-doc §10.
+
+**K-2 — Tecno Tele2 LTE (NOT clean — Direct WSS captured BUT REST fallback failed):**
+
+- Tecno on Tele2 LTE (Wi-Fi disabled), emu on Mac's Wi-Fi, VPN OFF throughout.
+- Tecno: **21 WSS sessions, ALL ~31 s, ALL 0 successful ping/pongs.** Textbook `F-Mode2 pp0` shape from `rc-direct-stability1.md` §1 re-confirmed cleanly. `WebSocket connect` count 54 (~2.5× sessions worth of reconnect storm).
+- Tecno REST surface: **`H-REST-Survives` REFUTED on Tele2 LTE.** 11 `op=poll callFailed exception=InterruptedIOException` events. R3.6 sticky-recovery breaker cooldown ramped fully: `5 s → 10 s → 20 s → 40 s → 80 s → 120 s → 120 s` over ~5 minutes (7 `breaker_open ConsecutiveRestFailures` events). After breaker open, `poll_call_skipped reason=breaker_open_ConsecutiveRestFailures` events dominate the rest of the 30 min. **Zero `inbound_deliver` / `DECRYPT_TRACE` / `poll_received` events on Tecno across the entire session** — no messages received by Tecno after the breaker opened.
+- Emu side: 7 WSS sessions ~121 s × 6 pongs (Mac Wi-Fi rhythm). Bootstrap message `1efed06e` decrypted OK; 2 subsequent messages from Tecno (`f8b8bff8` + `5f86fce8`) hit `inbound_repair_fail errorClass=OpkNotFound action=fall_through_to_hold` → `fail_mac action=hold`. Same Sprint 2b-C territory as the prekey-debounce-race fix and Sprint 2b-A/B/C work. **Side-finding ONLY** — single observation, NOT scoped into TELE2-LTE-REST-BREAKER-RECON1 and NOT re-opening Sprint 2b-C from this PR.
+- Evidence files preserved at `~/Downloads/direct-wss-mode2-k2-tecno-lte/` with SHA-256 documented in parent track-doc §10.
+- Analysis-script bug noted: the `DELIVERY OK` PRELIMINARY CLASSIFICATION label is misleading because the script counted only `relay_send_return ok=false` (sender-side). Future K-runs need to also count receiver-side `inbound_deliver` / `DECRYPT_TRACE` / `fail_mac` / `breaker_open` to avoid the same false-positive classification.
+
+**TELE2-LTE-REST-BREAKER-RECON1 mini-lock (`docs/tracks/tele2-lte-rest-breaker-recon1.md`):**
+
+Discriminate the root cause of the Tecno Tele2 LTE REST-poll failure observed in K-2. Four concrete questions: source of `InterruptedIOException`, why breaker cooldown ramps to 120 s ceiling in ~5 minutes, whether breaker-open state itself halts inbound dispatch, whether the failure is Tele2-specific. Six hypotheses (H-OrchestratorCancellation, H-NetworkSideCancellation, H-BreakerCooldownTooAggressive, H-BreakerOpenBlocksInboundDispatch, H-Tele2LTESpecific, H-OkHttpInterruptionRace). Five candidate instruments M-1 through M-5 explicitly NOT pre-committed in advance; natural order M-1 (re-read K-2 corpus, cheap) → M-5 (source read, cheap) → M-2 / M-3 / M-4 depending on evidence. Six acceptance-gate verdicts. Three Park conditions. Out-of-scope explicit: NO code change, NO PR #330 work, NO Mode 2 root cause re-open, NO Sprint 2b-C re-open, NO pre-locked fix shape.
+
+**Phase B blocked.** Per `direct-wss-mode2-recon1.md` §6 rule that Phase B requires at least one CLEAN baseline (Direct WSS poor AND REST fallback delivering), K-2 does not unblock Phase B. K-1 Wi-Fi alone is not sufficient because PR #330's quiescence contract targets Tele2 LTE Mode 2 primarily — validating only on Wi-Fi would not exercise the contract's intended use case. K-3 (emu Wi-Fi) is NOT promoted as the next instrument either — it would produce a third baseline but would not address the Tele2 LTE REST-fallback question. The operator decision is to gate K-3 / Phase B / RC PR #330 work on the TELE2-LTE-REST-BREAKER-RECON1 outcome.
+
+**Follow-ups:** M-1 (re-read of K-2 corpus for orchestrator-state-transition timeline) runs as the first deliverable when the operator schedules it. RC PR #330 stays Draft / HOLD throughout — its gating is now TELE2-LTE-REST-BREAKER-RECON1 closure, not the broader Direct WSS / Mode 2 track directly.
+
+
+
 ### 2026-06-27 · REST-SEND-CONNECTIVITY-RECON1 PARKED + VPN-TRANSPORT-COMPAT-RECON1 mini-lock opened
 
 **Outcome:** After three I-2 reproduction attempts the REST-SEND-CONNECTIVITY-RECON1 track parks per §10 of `docs/tracks/rest-send-connectivity-recon1.md` WITHOUT a formal closure on any of the six hypotheses from §4. The target signature (`emu connectFailed` to `65.108.154.152:443` from `10.0.2.16`) did not reproduce in either clean attempt. A separate VPN compatibility recon opens in parallel to investigate the environment contamination that surfaced in attempt #1; the Direct WSS / Mode 2 stabilisation track remains the principal forward direction for transport reliability work, independent of either recon.
