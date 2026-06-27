@@ -139,3 +139,56 @@ If this session ends after Phase A completes: the next session designs K-5 (PR #
 If this session ends after Phase B completes: the next session prepares the verdict PR per the §6 disposition matched by the evidence.
 
 Do NOT propose a fix shape in any progress note. Do NOT touch PR #330 outside of the K-5 APK build (which is a build-time-only operation — no commits to PR #330's branch).
+
+## §10 Phase A progress — K-1 + K-2 (2026-06-27)
+
+### K-1 — Tecno Wi-Fi (clean baseline captured)
+
+Operator-executed 2026-06-27 over ~44 minutes on Windows. APK SHA-256 `3d3317bd184c464337a6dd6e59bc2571eccbe659953b5e458a6802456decfb54` (master HEAD `5934310e`, build cache identical to PR #333 baseline as all post-#333 PRs were docs-only). VPN OFF throughout. Network unchanged.
+
+| Side | WS sessions | Lifetime (median) | Pongs (mode) | REST poll / send / inbound_deliver | `relay_send_return ok=false` |
+|---|---|---|---|---|---|
+| Tecno (Wi-Fi) | 21 | ~136 s | 7 (18 of 21 sessions) | 90 | 0 |
+| Emu (Wi-Fi) | 21 | ~136 s | 7 (17 of 21 sessions) | 88 | 0 |
+
+`F-Mode1` baseline re-confirmed on master HEAD with slight cadence shift (~136 s × 7 pongs vs the historical ~150 s × 8 pongs in `rc-direct-stability1.md` §1). Outlier shape (lifetime ≈ 76 s / 91 s / 121 s with 3 / 4 / 6 pongs) appears on both devices in the same sessions — not pure Mode 2, but shows Wi-Fi rhythm is not always the clean 7-pong shape.
+
+Side-finding flagged on K-1 but NOT scoped: **cross-device synchronisation is exact.** Both Tecno and Emu deaths fall within `±2-3 s` on every session number. Most plausibly an artefact of synchronised 15 s pingInterval × shared idle conditions, but a relay-side anchor is not ruled out by the corpus alone. K-2 / K-3 evidence will tighten this. Evidence files: `C:\temp\direct-wss-mode2-k1-tecno-wifi\tecno.log` SHA-256 `8A50650ECB3F74AB8AB537E5C1D1B9F0E33194090528EBF8FE32F7FD214F7145`, `C:\temp\direct-wss-mode2-k1-tecno-wifi\emu.log` SHA-256 `7EA0A1CD3A112699F6DA5C8088F42D290F8079B33AB3235FDA1A686933258302`.
+
+K-1 disposition per §6: **A-Baseline-Captured (Wi-Fi)**. Phase A continues with K-2.
+
+### K-2 — Tecno Tele2 LTE (captured BUT NOT a clean baseline — REST fallback failed on LTE)
+
+Operator-executed 2026-06-27 over ~30 minutes on Mac (different Wi-Fi for the emulator). Tecno on Tele2 LTE only (Wi-Fi disabled). APK same as K-1. VPN OFF throughout.
+
+| Side | WS sessions | Lifetime (median) | Pongs (mode) | REST behaviour | Inbound delivered |
+|---|---|---|---|---|---|
+| Tecno (Tele2 LTE) | 21 | ~31 s | **0** (all 21 sessions) | **7 × `breaker_open ConsecutiveRestFailures`**, cooldown `5 s → 10 s → 20 s → 40 s → 80 s → 120 s → 120 s` | **0 `inbound_deliver` / 0 `DECRYPT_TRACE` / 0 `poll_received`** across the entire 30 min |
+| Emu (Mac Wi-Fi) | 7 | ~121 s | 6 (5 of 7 sessions) | 160 poll / send / deliver events | Bootstrap message decrypted OK, 2 subsequent messages held |
+
+**`F-Mode2 pp0` re-confirmed strongly on Tecno Tele2 LTE.** All 21 sessions ≈ 31 s with 0 successful ping/pongs — textbook `rc-direct-stability1.md` §1 `F-Mode2-pp0` shape. `WebSocket connect` count 54 (≈2.5× sessions worth of reconnect storm) on Tecno.
+
+**`H-REST-Survives` REFUTED on Tele2 LTE** (mini-lock §4 Phase A hypothesis). Tecno-side REST poll started failing with `op=poll callFailed exception=InterruptedIOException` (11 events) shortly after Direct WSS began flapping. The breaker (R3.6 sticky-recovery family, landed in PR #328) progressed through the full cooldown ramp `5000 → 10000 → 20000 → 40000 → 80000 → 120000 ms` over ~5 minutes and stayed at the 120 s ceiling. After breaker open, `poll_call_skipped reason=breaker_open_ConsecutiveRestFailures` events dominate Tecno's REST surface for the remainder of the 30 min, and zero inbound messages were delivered to Tecno from the relay.
+
+**Two independent blockers in one session, not one cascaded failure:**
+
+1. **Tecno-side REST poll breaker** (this is the new blocker for Phase B). Direct WSS Mode 2 happened to be co-incident, but the breaker progression and the `InterruptedIOException` failure class are surfaces of the REST-orchestrator / breaker layer, not the WS path. Without a clean REST fallback baseline on Tele2 LTE, PR #330's quiescence contract (which assumes REST fallback continues to deliver during WS storm-suppression) cannot be validated on this network class.
+2. **Emu-side crypto holds** on 2 of 3 Tecno-sent messages. `1efed06e` (bootstrap) decrypted OK with `bootstrap=true`. `f8b8bff8` hit `inbound_repair_fail errorClass=OpkNotFound action=fall_through_to_hold` → `fail_mac x3dhInitPresent=true action=hold` (repeated ×16+ over ~8 minutes of retries). `5f86fce8` hit `pending_fallback_fail reason=mac_fail_under_pending` → `fail_mac x3dhInitPresent=false action=hold`. This is the same Sprint 2b-C `OpkNotFound` / `fail_mac` family the prekey-debounce-race fix and Sprint 2b-A/B/C work was supposed to address, surfacing again in this corpus. Side-finding only — NOT scoped into TELE2-LTE-REST-BREAKER-RECON1 and NOT re-opening Sprint 2b-C from this PR.
+
+Evidence files: `~/Downloads/direct-wss-mode2-k2-tecno-lte/tecno.log` SHA-256 `13d597a28676d47a869890a52115de10a64c5f843560d6bd6c7a2fe382b20cda`, `~/Downloads/direct-wss-mode2-k2-tecno-lte/emu.log` SHA-256 `5186d939966f9def947c12fba6965fd00c8194a72e0f7335abdff2505d0fe651`. The PowerShell-equivalent analysis script's `DELIVERY OK` label is misleading on this corpus because it only counts `relay_send_return ok=false` (sender-side); future K-runs need to also count receiver-side `inbound_deliver` / `DECRYPT_TRACE` / `fail_mac` / `breaker_open` to avoid the same false-positive classification.
+
+K-2 disposition per §6: **NOT A-Baseline-Captured for Tele2 LTE.** Direct WSS Mode 2 shape is captured cleanly (`F-Mode2 pp0` re-confirmed) but the REST fallback assumption is refuted, so K-2 cannot serve as a clean baseline for Phase B comparison.
+
+### Phase B BLOCKED pending TELE2-LTE-REST-BREAKER-RECON1 verdict
+
+Per the parent §6 rule that Phase B requires at least one CLEAN baseline (one where Direct WSS is poor AND REST fallback continues to deliver), K-2 does not unblock Phase B. K-1 alone (Wi-Fi only) is not sufficient because PR #330's quiescence contract is targeted primarily at Tele2 LTE Mode 2 — validating only on Wi-Fi would not exercise the contract's intended use case.
+
+The next deliverable is the TELE2-LTE-REST-BREAKER-RECON1 mini-lock, opened in parallel with this progress note (`docs/tracks/tele2-lte-rest-breaker-recon1.md`). Until that recon closes with one of its acceptance-gate verdicts, this track stays open with Phase A at 1.5 / 3 network classes (Wi-Fi clean + LTE partially captured + emu-Wi-Fi K-3 NOT yet attempted).
+
+K-3 (emu Wi-Fi only) **is NOT promoted as next instrument**. Running K-3 ahead of resolving the Tele2 LTE REST-fallback question would produce a third baseline but would not address the Phase B blocker. The operator decision is to gate K-3 / Phase B / RC PR #330 work on the TELE2-LTE-REST-BREAKER-RECON1 outcome.
+
+### Side-findings preserved (NOT actioned in this PR)
+
+- **K-1 cross-device synchronisation (`±2-3 s` per session-number)** — probable artefact of synchronised pingInterval × shared idle but not conclusively distinguished from relay-side anchor. Reproduces in K-3 / repeat-K-1 would confirm; not promoted to a hypothesis under this recon's §4.
+- **K-2 Emu-side Sprint 2b-C `fail_mac` / `OpkNotFound` holds** on 2 of 3 messages — same family as the closed Sprint 2b-C work. Single observation in this corpus; NOT scoped into TELE2-LTE-REST-BREAKER-RECON1 and NOT re-opening the Sprint 2b-C track from this PR. If reproduces on multiple sessions, opens a separate `SPRINT-2B-C-INBOUND-REPAIR-REGRESSION-RECON` track.
+- **K-2 Tecno `WebSocket connect` count = 54 vs 21 sessions** (~2.5×) — reconnect storm on master HEAD, which is exactly what PR #330's quiescence is meant to suppress. Reference for the eventual Phase B comparison.
