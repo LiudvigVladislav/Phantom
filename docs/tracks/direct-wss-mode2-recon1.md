@@ -192,3 +192,57 @@ K-3 (emu Wi-Fi only) **is NOT promoted as next instrument**. Running K-3 ahead o
 - **K-1 cross-device synchronisation (`±2-3 s` per session-number)** — probable artefact of synchronised pingInterval × shared idle but not conclusively distinguished from relay-side anchor. Reproduces in K-3 / repeat-K-1 would confirm; not promoted to a hypothesis under this recon's §4.
 - **K-2 Emu-side Sprint 2b-C `fail_mac` / `OpkNotFound` holds** on 2 of 3 messages — same family as the closed Sprint 2b-C work. Single observation in this corpus; NOT scoped into TELE2-LTE-REST-BREAKER-RECON1 and NOT re-opening the Sprint 2b-C track from this PR. If reproduces on multiple sessions, opens a separate `SPRINT-2B-C-INBOUND-REPAIR-REGRESSION-RECON` track.
 - **K-2 Tecno `WebSocket connect` count = 54 vs 21 sessions** (~2.5×) — reconnect storm on master HEAD, which is exactly what PR #330's quiescence is meant to suppress. Reference for the eventual Phase B comparison.
+
+## §11 Phase B amendment — B1 / B2 split (2026-06-28)
+
+TELE2-LTE-REST-BREAKER-RECON1 closed 2026-06-28 (PR #342 squash `4302f56d`) with two supported hypotheses — H-NetworkSideCancellation supported via corpus + carry-forward (NOT packet-confirmed), and H-Tele2LTESpecific supported via K-1 vs K-2 comparison (NOT confirmed against other LTE carriers). The closure forwarded three candidate paths back to this parent recon. The operator decision recorded here is a fourth refinement: **Phase B SPLITS into B1 (Wi-Fi mechanical validation of PR #330) and B2 (separate Tele2 LTE delivery-blocker track to be opened on its own terms), with an explicit release / rollout gate.**
+
+The reformulation matters because the original framing of path (c) ("accept LTE limitation and validate Phase B on Wi-Fi as best-available evidence") risked reading as a product-level acceptance that PR #330 ships when Wi-Fi passes. The B1 / B2 split makes the framing more precise: validating the quiescence mechanism on Wi-Fi is one deliverable; the LTE delivery surface remains a release blocker on its own terms.
+
+### Phase B1 — Wi-Fi mechanical validation of PR #330
+
+**Scope.** Validate that PR #330's RC-RECONNECT-QUIESCENCE1 quiescence contract is mechanically correct on the network class where REST fallback can complete the long-poll cycle. This answers: "given a working REST fallback substrate, does the quiescence mechanism behave as the mini-lock contract requires?" — not: "is PR #330 sufficient to ship to LTE users?"
+
+- Build a fix-candidate APK from PR #330 head (currently `6f49cd89`) with the three RC release flags forced to `"1"`: `MODE_2_FAST_PATH_ENABLED`, `MODE_2_STICKY_ENABLED`, `RECONNECT_QUIESCENCE_ENABLED`. (This is K-5 in §5 of the original mini-lock — build-time operation only, NO commits to PR #330's branch.)
+- One Tecno session on Wi-Fi (~30 min) with the fix-candidate APK, paired with the emu on Wi-Fi. Compare against the K-1 Wi-Fi baseline (already captured 2026-06-27).
+- Extract the same per-session metrics defined for Phase B in §2: Mode 2 detection event presence, `sticky_armed` event presence, reconnect storm count during the quiescence window, REST fallback delivery during the window, `ws_recovery_probe_granted` / `ws_alive_60s` proof events, route-change probe count, message loss / duplicates, gate transitions.
+
+**B1 acceptance gate (mechanical correctness only):**
+
+- **B1-PASS:** All six Phase B hypotheses (H-330-Quiesces-Storm / Preserves-REST / Single-Probe-Per-RouteChange / Probe-Lives-60s / No-Self-Reentry / No-Message-Loss-Or-Dups) hold on the Wi-Fi run. The quiescence mechanism behaves per the PR #330 mini-lock contract on the network class where REST fallback works. **This does NOT mean PR #330 is ship-ready** — it means the mechanism is mechanically correct.
+- **B1-PARTIAL or B1-FAIL:** Per the original §6 Phase B dispositions. PR #330 stays Draft / HOLD; a separate fix-track may open for the failing hypotheses. The recon may amend B1 scope at that point.
+
+K-3 (emu Wi-Fi) under B1: still NOT promoted as a B1 prerequisite. K-3 would add a third baseline but does not add discrimination value for the quiescence-mechanism check; the K-1 Tecno Wi-Fi baseline + the K-6 Tecno Wi-Fi fix-candidate comparison are sufficient for B1.
+
+### Phase B2 — separate Tele2 LTE delivery-blocker track
+
+**Scope.** Tele2 LTE end-to-end delivery is a separate problem, governed by `rc-direct-stability1.md` §13 (long-connection-uplink finding) and the new TELE2-LTE-REST-BREAKER-RECON1 §11 closure (downlink long-poll body loss on the same network class). It is NOT a question this recon answers; it requires its own facts-first track when the operator opens it.
+
+**Not yet opened.** The B2 mini-lock is a forward-pointer only at the time of this amendment. When the operator schedules it, the candidate scope shapes (listed in TELE2-LTE-REST-BREAKER-RECON1 §11 closure as forward-pointer only — short-poll mode on LTE, decoupling `callTimeout` from `readTimeout`, server-side keep-alive byte trickle, alternative relay endpoint or transport on LTE-detected paths) become candidate hypotheses for B2's §4 — but each requires its own discrimination matrix and acceptance gates, NOT promotion as a fix from this recon.
+
+### Release / rollout gate (the load-bearing constraint of the B1 / B2 split)
+
+**PR #330 does NOT ship to LTE users on the strength of a B1-PASS verdict alone.** B1-PASS confirms the quiescence mechanism is mechanically correct on Wi-Fi; it does NOT confirm that the mechanism delivers messages on Tele2 LTE, because the underlying REST fallback substrate is structurally broken on that network class per the carry-forward evidence. Shipping PR #330 to LTE users without a B2-resolution would expose users to a known failure mode that this recon already documented.
+
+**Two paths to LTE rollout (NOT promoted from this recon — listed as the candidate decision set the operator will face after B1):**
+
+- **(i)** B2 closes with a fix-track verdict that resolves the long-held-connection problem on Tele2 LTE, the fix lands, and a B2-validated APK demonstrates Tele2 LTE end-to-end delivery in a separate field run. Then PR #330 may ship to LTE users.
+- **(ii)** An alternative transport for the LTE class lands separately (Reality, an alternative relay endpoint, or a relay-side hold-policy change) and demonstrates working delivery on Tele2 LTE without the long-poll body-loss surface. Then PR #330 may ship to LTE users.
+
+Either path requires affirmative evidence of working LTE delivery, NOT just B1-PASS on Wi-Fi. "Mechanism mechanically correct on Wi-Fi" is not sufficient evidence for shipping to a user population whose primary network is Tele2 LTE.
+
+### Forward-pointer summary
+
+| Deliverable | Status | Gate before next step |
+|---|---|---|
+| B1 Wi-Fi mechanical validation (K-5 build + K-6 Tecno Wi-Fi session) | Operator-scheduled, NOT auto-started | B1-PASS = quiescence mechanism mechanically correct on Wi-Fi |
+| B2 Tele2 LTE delivery-blocker track | NOT yet opened (forward-pointer only) | Operator decision after B1 closes |
+| PR #330 ship to LTE users | NOT permitted on B1-PASS alone | Requires B2 resolution OR alternative LTE transport |
+
+### What this amendment does NOT decide
+
+- **No code change.** This is a docs amendment to clarify the Phase B scope split.
+- **No fix scope-lock.** The B2 candidate fix-shape sets stay as forward-pointer.
+- **No commit to PR #330's branch.** The K-5 fix-candidate APK is a build-time operation when B1 runs.
+- **No promotion of B2 to a mini-lock today.** B2 is announced as the next track that opens when the operator schedules it.
+- **No re-opening of `rc-direct-stability1.md` §13 root-cause investigation.** §13's long-connection-uplink finding is carry-forward evidence used by both TELE2-LTE-REST-BREAKER-RECON1 (closed) and the eventual B2 track.
