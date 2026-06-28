@@ -598,6 +598,39 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-28 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 mini-lock opened — discriminate among five candidate methodologies (+ release-gate amendment fallback) for honestly closing B1
+
+**Outcome:** Operator greenlit the methodology recon flagged as forward-pointer in `direct-wss-mode2-recon1.md` §12 K-6 outcome. New track-doc at `docs/tracks/quiescence-validation-methodology-recon1.md` opens a facts-first recon to discriminate among candidate methodologies for field-validating PR #330's quiescence chain (`sticky → quiesced → probe → ws_alive_60s recovery`) when neither Wi-Fi (no Mode 2 reproduction) nor Tele2 LTE (broken REST fallback substrate per TELE2-LTE-REST-BREAKER-RECON1 §11 closure) can do the job alone.
+
+The recon does NOT propose a methodology; it discriminates among candidates and forwards a chosen path back to DIRECT-WSS-MODE2-RECON1 for execution.
+
+**Six candidate methodologies (H-MA through H-MF):**
+
+- H-MA — third network class that reproduces Mode 2 AND keeps REST alive (different LTE carrier, tethered Wi-Fi through mobile hotspot, degraded-RSSI Wi-Fi)
+- H-MB — synthetic in-app trigger via debug-only build flag (e.g., `DEBUG_FORCE_MODE_2_DETECTION="1"`) that injects "Mode 2 detected" state; must hit the SAME production code path the field would hit, not a parallel test-only path
+- H-MC — state-machine / integration validation against existing fake-transport infrastructure (`RestStateMachineTest.kt`, `RestFallbackOrchestratorBreakerTest.kt`, `WsActivePollJobLifecycleTest.kt`, `RestFallbackOrchestratorPollLoopTest.kt`); discriminates whether the fakes faithfully model the field surface or diverge in load-bearing ways
+- H-MD — combination MC + MA (state-machine primary, one field run on a network class where Mode 2 fires AND REST survives)
+- H-ME — combination MC + MB (state-machine primary, synthetic in-app trigger as field-shaped check)
+- H-MF — release-gate amendment fallback (not strictly a validation methodology; accept the validation gap and re-scope §11's release / rollout gate to Wi-Fi-only ship). Listed only because it is the realistic alternative if H-MA through H-ME all turn out to be infeasible.
+
+**Five candidate instruments (N-1 through N-5), explicitly NOT pre-committed in advance:**
+
+- N-1 existing-test inventory (cheap source-read; per-hypothesis test-coverage status on master HEAD)
+- N-2 fake-transport surface review (cheap source-read; whether existing fakes honestly model the field surface)
+- N-3 synthetic-trigger debug-flag design exercise (design-only feasibility note)
+- N-4 third-network-class survey (per-candidate go / no-go table)
+- N-5 release-gate review against PR #330's user-population network-class distribution
+
+Natural order: N-1 + N-2 first (cheapest), then N-3 / N-4 / N-5 driven by what N-1 + N-2 surface.
+
+**Six acceptance gates** (one per closure verdict: MC-sufficient / MD / ME / MA-only / MB-only / MF release-gate amendment) plus inconclusive escalation to Council.
+
+**Three Park conditions** (all methodologies fail feasibility / honesty bar; operator unavailable; separate fix-track lands that changes the substrate).
+
+**Out-of-scope explicit:** no code change in this recon; no fix scope-lock; specifically NOT pre-locked — extending B1's hypothesis set, weakening §11's release / rollout gate from inside this recon, dropping any of the six Phase B hypotheses, accepting "letter met / spirit not" verdicts as B1-PASS. PR #330 stays Draft / HOLD throughout. No commit to PR #330's branch.
+
+**Follow-ups:** N-1 (existing-test inventory) runs as the first deliverable when the operator schedules it. RC PR #330 stays Draft / HOLD; its gating now includes the closure of this recon plus the §11 release / rollout gate, in series.
+
 ### 2026-06-28 · DIRECT-WSS-MODE2-RECON1 §12 K-6 outcome — Wi-Fi non-regression PASS / quiescence NOT EXERCISED — methodology recon forward-pointer
 
 **Outcome:** Operator-executed K-6 on 2026-06-28: Tecno Wi-Fi + emu Wi-Fi pair (~30 min), VPN OFF, fix-candidate APK SHA-256 `65ebaebf3a3f72e0eb8bc4bf381bcc85f72482370b0c401ad36a8d6f99803e35` built from PR #330 head `6f49cd89` with three RC release flags forced to `"1"` via env vars at build time (verified in `BuildConfig.java`). NO commits made to PR #330's branch.
