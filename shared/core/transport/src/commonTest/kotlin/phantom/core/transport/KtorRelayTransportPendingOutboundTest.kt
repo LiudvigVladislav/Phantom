@@ -5,8 +5,11 @@ package phantom.core.transport
 
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -34,11 +37,62 @@ import kotlin.time.TimeSource
  */
 class KtorRelayTransportPendingOutboundTest {
 
+    private val livingTransports = mutableListOf<KtorRelayTransport>()
+
     private fun newTransport(): KtorRelayTransport = KtorRelayTransport(
         httpClientFactory = {
             error("test must not invoke httpClientFactory — pure in-memory exercise")
         },
-    )
+    ).also { livingTransports.add(it) }
+
+    @AfterTest
+    fun closeAllTransports() = runBlocking {
+        // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-4 P2 (2026-06-23).
+        // See `KtorRelayTransportDisconnectAndJoinTest.closeAllTransports`
+        // for the same teardown rationale: `closeForTest(): Boolean`
+        // must fail loudly when `cleanupInflight` does not drain.
+        //
+        // fix-round-5 (2026-06-23): forensic `cleanupInflight` read also
+        // bounded so a stuck mutex cannot re-hang `@AfterTest` during
+        // diagnostic message construction.
+        suspend fun forensicInflightOrUnavailable(t: KtorRelayTransport): String =
+            withTimeoutOrNull(500L) { t.cleanupInflightForTest().toString() }
+                ?: "unavailable"
+        val failures = mutableListOf<String>()
+        livingTransports.forEachIndexed { idx, t ->
+            val outcome = runCatching {
+                withTimeoutOrNull(6_000L) {
+                    t.closeForTest(awaitInflightTimeoutMs = 5_000L)
+                }
+            }
+            when {
+                outcome.isFailure ->
+                    failures.add(
+                        "transport[$idx] closeForTest threw " +
+                            outcome.exceptionOrNull(),
+                    )
+                outcome.getOrNull() == null ->
+                    failures.add(
+                        "transport[$idx] closeForTest did not return within " +
+                            "6 s outer timeout; cleanupInflight=" +
+                            forensicInflightOrUnavailable(t),
+                    )
+                outcome.getOrNull() == false ->
+                    failures.add(
+                        "transport[$idx] closeForTest reported stuck " +
+                            "cleanupInflight after the 5 s drain window; " +
+                            "cleanupInflight=${forensicInflightOrUnavailable(t)}",
+                    )
+            }
+        }
+        livingTransports.clear()
+        if (failures.isNotEmpty()) {
+            error(
+                "@AfterTest teardown failed (${failures.size} failure(s)):\n" +
+                    failures.joinToString("\n") { "  - $it" },
+            )
+        }
+    }
 
     private fun fakeSendMessage(id: String, recipient: String = "deadbeef"): RelayMessage.Send =
         RelayMessage.Send(
@@ -422,5 +476,187 @@ class KtorRelayTransportPendingOutboundTest {
         assertEquals("real-send", snapshot[0].id)
         assertNull(snapshot.firstOrNull { it.id == "inbound-id" },
             "AckDelivery entries in outbox must not appear in pending outbound snapshot")
+    }
+
+    // ── RC-RECONNECT-QUIESCENCE1 (2026-06-21) — Test 20 FOUNDATION ────────────
+    //
+    // Review 2026-06-21: the two tests below are the FOUNDATION
+    // for Test 20 — they prove the primitives (snapshot reads, mark-accepted
+    // clears) the production migration chain relies on. They do NOT yet drive
+    // the full production chain:
+    //
+    //     Mode 2 / quiescence
+    //       → state machine RestActive transition
+    //       → HybridRelayTransport.maybeArmMigrationLocked
+    //       → migratePendingWsToRest (under restOutboundOrderMutex)
+    //       → REST send via orchestrator
+    //       → markPendingOutboundAcceptedByFallback
+    //       → no loss, no duplicate.
+    //
+    // The full behavioral Test 20 lands AFTER the gate integration commit (so
+    // the gate's interaction with the migration coroutine is exercised end-to-
+    // end on a single test fixture). For now these foundation tests are the
+    // CI anchor that ensures the primitives stay correct while the gate work
+    // proceeds in subsequent commits.
+    //
+    // Scope-lock R3 requirement: an envelope in `pendingAcks` at the moment
+    // the gate transitions to `Quiesced` (after Mode 2 fast-path actuation)
+    // MUST either (a) migrate to the REST send path, or (b) remain visible to
+    // the migration coroutine in a stable in-memory store. Loss is forbidden.
+    //
+    // The PR-D1c migration in `HybridRelayTransport.maybeArmMigrationLocked`
+    // fires on every non-RestActive → RestActive transition, including the
+    // one produced by `mode_2_fast_path`. It calls `snapshotPendingOutbound()`
+    // and re-sends every entry via REST under `restOutboundOrderMutex`, then
+    // calls `markPendingOutboundAcceptedByFallback` to clear the WS-side maps.
+    //
+    // The reconnect-quiescence gate (R2/R3) suspends the reconnect-loop after
+    // sticky armed, which means `mergeUnackedIntoOutboxOrdered` (run at the
+    // START of the NEXT WS session in `runReconnectLoop`) does NOT execute
+    // before the migration coroutine reads the pending stores. These tests pin
+    // the foundation: the migration's read window observes the same
+    // `pendingAcks` content that was alive at session death — no clearing,
+    // no loss.
+
+    /**
+     * Test 20 (outbox/ACK invariant on quiescence entry). Envelopes sitting in
+     * `pendingAcks` at session-end remain visible to `snapshotPendingOutbound()`
+     * without the next session's `mergeUnackedIntoOutboxOrdered` having run.
+     *
+     * Scenario: two envelopes E1, E2 were sent on the WS and are awaiting ACK.
+     * The WS session dies (Mode 2 silent drop). The reconnect-quiescence gate
+     * will hold the reconnect-loop in `Quiesced` so no new session starts and
+     * `mergeUnackedIntoOutboxOrdered` is NOT invoked. The migration coroutine
+     * in `HybridRelayTransport`, triggered by the state-machine transition
+     * to `RestActive`, calls `snapshotPendingOutbound()` to drive the REST
+     * re-send. This test pins that the snapshot returns BOTH envelopes,
+     * in sequenceTs ASC order, so the migration sees the full set.
+     *
+     * Failure of this test would mean reconnect-quiescence cannot ship without
+     * a precursor PR that reroutes the orphaned `pendingAcks` envelopes into
+     * the migration's read window.
+     */
+    @Test
+    fun outbox_ack_invariant_pendingAcks_visible_to_migration_snapshot_under_quiescence() = runTest {
+        val transport = newTransport()
+        val now = TimeSource.Monotonic.markNow()
+        val seqE1 = transport.nextSequenceTsForTest()
+        val seqE2 = transport.nextSequenceTsForTest()
+        // Two envelopes on the wire awaiting ACK at the moment of session death.
+        transport.seedPendingAckForTest(
+            KtorRelayTransport.AckPending(
+                message = fakeSendMessage("E1"), sentAt = now, sequenceTs = seqE1, queuedAtMs = 100L,
+            ),
+        )
+        transport.seedPendingAckForTest(
+            KtorRelayTransport.AckPending(
+                message = fakeSendMessage("E2"), sentAt = now, sequenceTs = seqE2, queuedAtMs = 200L,
+            ),
+        )
+        // Reconnect-quiescence holds the reconnect-loop in Quiesced; no NEXT
+        // session starts; `mergeUnackedIntoOutboxOrdered` is never invoked in
+        // this window. Migration in HybridRelayTransport, however, fires on
+        // the WsActive → RestActive transition and reads via this snapshot.
+        val snapshot = transport.snapshotPendingOutbound()
+        assertEquals(2, snapshot.size,
+            "migration must see BOTH envelopes in pendingAcks at quiescence entry — loss is forbidden")
+        assertEquals("E1", snapshot[0].id,
+            "snapshot must preserve sequenceTs ASC order so bootstrap (E1) lands before follow-up (E2) via REST")
+        assertEquals("E2", snapshot[1].id)
+        assertEquals(seqE1, snapshot[0].sequenceTs)
+        assertEquals(seqE2, snapshot[1].sequenceTs)
+    }
+
+    /**
+     * Test 20 continuation. After the migration coroutine successfully delivers
+     * each envelope via REST, it calls `markPendingOutboundAcceptedByFallback`
+     * to clear the WS-side maps. This test pins that the clear is honoured so
+     * a subsequent WS reconnect does NOT re-flush a duplicate.
+     */
+    /**
+     * Review amendment P1 (2026-06-21): disconnectAndJoin no longer calls
+     * flushPendingOutbox in its strict bound. Previously `session = null`
+     * was set BEFORE flushPendingOutbox, so every `sendRaw()` returned
+     * `true` silently without actually sending. This test pins both halves
+     * of the fix:
+     *   - sendRaw refuses with `false` when `session == null` (loud
+     *     failure rather than silent false success);
+     *   - the pending stores remain intact (no false drain) so D1c REST
+     *     migration in HybridRelayTransport can pick them up on the
+     *     subsequent WsActive → RestActive transition.
+     */
+    @Test
+    fun outbox_ack_invariant_disconnectAndJoin_does_not_silently_drain_pending_stores() = runTest {
+        val transport = newTransport()
+        val now = TimeSource.Monotonic.markNow()
+        val seqAck = transport.nextSequenceTsForTest()
+        val seqSend = transport.nextSequenceTsForTest()
+        // Pre-seed both stores: an AckDelivery queued for the next live WS
+        // session and a Send awaiting ACK.
+        transport.seedOutboxForTest(
+            KtorRelayTransport.OutboxEntry(
+                message = RelayMessage.AckDelivery(messageId = "inbound-id-1"),
+                sequenceTs = seqAck,
+                queuedAtMs = 100L,
+            ),
+        )
+        transport.seedPendingAckForTest(
+            KtorRelayTransport.AckPending(
+                message = fakeSendMessage("out-id-1"),
+                sentAt = now,
+                sequenceTs = seqSend,
+                queuedAtMs = 200L,
+            ),
+        )
+
+        // Drive the quiescence-entry path: disconnectAndJoin with no live
+        // reconnect job and no live session is a clean teardown. It MUST
+        // NOT attempt to flush via the dead WS (which would have produced
+        // a silent false success under the old code path).
+        val result = transport.disconnectAndJoin(timeoutMs = 1_000)
+        assertTrue(result, "clean teardown returns true")
+
+        // Both stores must still hold their entries — D1c migration in
+        // HybridRelayTransport will pick them up on the next non-RestActive
+        // → RestActive transition.
+        val snapshot = transport.snapshotPendingOutbound()
+        assertEquals(
+            1, snapshot.size,
+            "Send entry MUST remain in pending stores after disconnectAndJoin — D1c migration owns the re-send",
+        )
+        assertEquals(
+            "out-id-1", snapshot[0].id,
+            "the surviving entry is the original Send (AckDelivery is filtered from snapshotPendingOutbound by design)",
+        )
+        // Snapshot does NOT include AckDelivery (snapshot_ignores_non_send_outbox_entries
+        // test pins this). To verify AckDelivery survived, inspect the outbox
+        // directly via the test seam.
+        val outboxAfter = transport.snapshotOutboxForTest()
+        assertTrue(
+            outboxAfter.any { it.message is RelayMessage.AckDelivery && (it.message as RelayMessage.AckDelivery).messageId == "inbound-id-1" },
+            "AckDelivery MUST remain in outbox after disconnectAndJoin — it cannot be silently drained " +
+                "via a sendRaw to a null session. Outbox after: $outboxAfter",
+        )
+    }
+
+    @Test
+    fun outbox_ack_invariant_mark_accepted_clears_pendingAcks_no_duplicate_on_reconnect() = runTest {
+        val transport = newTransport()
+        val now = TimeSource.Monotonic.markNow()
+        val seqE1 = transport.nextSequenceTsForTest()
+        transport.seedPendingAckForTest(
+            KtorRelayTransport.AckPending(
+                message = fakeSendMessage("E1"), sentAt = now, sequenceTs = seqE1, queuedAtMs = 100L,
+            ),
+        )
+        // Migration successfully delivered E1 via REST; mark it accepted.
+        transport.markPendingOutboundAcceptedByFallback("E1")
+        // pendingAcks must now be empty so a subsequent WS reconnect's
+        // `mergeUnackedIntoOutboxOrdered` does NOT re-queue E1 for a duplicate
+        // WS send.
+        val snapshot = transport.snapshotPendingOutbound()
+        assertTrue(snapshot.isEmpty(),
+            "after markPendingOutboundAcceptedByFallback the envelope must be gone from BOTH WS-side maps; " +
+                "got snapshot=$snapshot")
     }
 }

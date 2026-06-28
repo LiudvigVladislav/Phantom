@@ -213,7 +213,7 @@ class HybridRelayTransport(
     // [TransportManager] or [ManagerState] types directly.
     private val wsDegradationDetector: WsDegradationDetector? = null,
     private val degradationCurrentKindProvider: () -> TransportKind? = { null },
-) : RelayTransport {
+) : RelayTransport, RewalkHybridFacade {
 
     // ── Delegated RelayTransport surface ─────────────────────────────────────
 
@@ -241,6 +241,15 @@ class HybridRelayTransport(
     )
 
     override suspend fun disconnect() = wsTransport.disconnect()
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 (2026-06-21): bounded-join disconnect for the
+     * rewalk transaction. Pass-through to [KtorRelayTransport.disconnectAndJoin]
+     * which holds the actual reconnect loop. See [RelayTransport.disconnectAndJoin]
+     * kdoc for the contract.
+     */
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean =
+        wsTransport.disconnectAndJoin(timeoutMs)
 
     override suspend fun forceReconnect() = wsTransport.forceReconnect()
 
@@ -635,6 +644,32 @@ class HybridRelayTransport(
     }
 
     /**
+     * Integration Test 20 seam (2026-06-22). Production sets
+     * `restCapabilityActive = true` only after [bootstrapAndStart]
+     * completes (which performs a full REST `/auth/session` round
+     * trip). Integration tests cannot stand up a live relay, so this
+     * seam lets the test pre-set the flag and exercise the
+     * `submitStateEvent → maybeArmMigrationLocked → migratePendingWsToRest`
+     * path directly.
+     *
+     * Internal so production callers cannot reach it; the flag's
+     * production-side write-once contract is unchanged.
+     */
+    internal fun setRestCapabilityActiveForTest(active: Boolean) {
+        restCapabilityActive = active
+    }
+
+    /**
+     * Integration Test 20 seam (2026-06-22). Awaits the migration
+     * coroutine spawned by [maybeArmMigrationLocked] so the test can
+     * synchronously observe the post-migration state of the WS
+     * pending stores.
+     */
+    internal suspend fun awaitMigrationDoneForTest() {
+        migrationJob?.join()
+    }
+
+    /**
      * Switch the wrapper into REST-fallback-aware mode. Idempotent — safe
      * to call from a retry path.
      *
@@ -788,7 +823,7 @@ class HybridRelayTransport(
      * Short-circuits on `restCapabilityActive=false` like the rest of the
      * `submitStateEvent` family.
      */
-    suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
+    override suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
         submitStateEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = clearsMode2Sticky))
     }
 

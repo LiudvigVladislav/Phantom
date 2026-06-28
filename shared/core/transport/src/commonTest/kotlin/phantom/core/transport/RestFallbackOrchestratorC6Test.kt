@@ -100,7 +100,7 @@ class RestFallbackOrchestratorC6Test {
             val caps = orch.bootstrap()
             check(caps.restFallback)
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEvent(
+                orch.submitEventNow(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,
@@ -521,7 +521,7 @@ class RestFallbackOrchestratorC6Test {
         try {
             orch.bootstrap()
             repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEvent(
+                orch.submitEventNow(
                     RestStateMachine.Event.WsSessionEnded(
                         durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
                         sessionEpoch = 0L,

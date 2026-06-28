@@ -202,6 +202,40 @@ class RestFallbackOrchestrator(
      * based on `BuildConfig.MODE_2_STICKY_ENABLED == "1"`. Default `false`.
      */
     private val mode2StickyEnabled: Boolean = false,
+    /**
+     * RC-RECONNECT-QUIESCENCE1 commit 2d (2026-06-22). When `true`, the
+     * underlying [RestStateMachine] engages the quiescence gate
+     * transitions (`armSticky → Quiesced`, `Connected → CandidateProving`,
+     * `candidate_died → Quiesced`, `ws_alive_60s → Open`). Wired through
+     * from `AppContainer` based on
+     * `BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1"`. Default `false`.
+     *
+     * Build-time invariant: requires [mode2StickyEnabled] to also be
+     * `true` (enforced in [RestStateMachine.init]).
+     */
+    private val reconnectQuiescenceEnabled: Boolean = false,
+    /**
+     * RC-RECONNECT-QUIESCENCE1 commit 2d second-round amend (2026-06-22).
+     * Snapshot of the current [TransportKind]. Forwarded to the
+     * underlying [RestStateMachine] so the `armSticky` Direct-fence
+     * fires correctly under [reconnectQuiescenceEnabled]. Default
+     * returns `null` — quiescence then never engages (the gate stays
+     * Open), which is the legacy behaviour and what tests that don't
+     * care about quiescence get. Production wires
+     * `transportManager.state.value as? ManagerState.Connected?.kind`
+     * from `AppContainer`.
+     */
+    private val currentKindProvider: () -> TransportKind? = { null },
+    /**
+     * RC-RECONNECT-QUIESCENCE1 commit 2d second-round amend (2026-06-22).
+     * Single-use probe token source forwarded to the underlying
+     * [RestStateMachine]. Default returns `0L` — quiescence then issues
+     * deterministic zero-valued tokens (acceptable for tests that don't
+     * care, broken for production where tokens MUST be unguessable).
+     * Production wires `phantom.core.crypto.LibsodiumCsprng.uniformLong`
+     * from `AppContainer`.
+     */
+    private val tokenSource: () -> Long = { 0L },
 ) {
 
     /**
@@ -246,6 +280,9 @@ class RestFallbackOrchestrator(
         onRestPollDegraded = onRestPollDegraded,
         mode2FastPathEnabled = mode2FastPathEnabled,
         mode2StickyEnabled = mode2StickyEnabled,
+        reconnectQuiescenceEnabled = reconnectQuiescenceEnabled,
+        currentKindProvider = currentKindProvider,
+        tokenSource = tokenSource,
     )
 
     /** Convenience flow proxying [stateMachine.state]. */
@@ -938,8 +975,14 @@ class RestFallbackOrchestrator(
         }
     }
 
-    /** Forward an event into the state machine. */
-    fun submitEvent(event: RestStateMachine.Event) {
+    /**
+     * Forward an event into the state machine.
+     *
+     * RC-RECONNECT-QUIESCENCE1 (2026-06-22): SUSPEND so the
+     * state-machine's gate-mutating event handlers can acquire their
+     * single gateLock for atomic compute-then-publish transitions.
+     */
+    suspend fun submitEvent(event: RestStateMachine.Event) {
         stateMachine.onEvent(event)
     }
 

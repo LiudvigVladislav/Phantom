@@ -52,6 +52,19 @@ kotlin {
         val androidUnitTest by getting {
             dependencies {
                 implementation(kotlin("test"))
+                // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-1 (2026-06-22).
+                // `HybridRelayTransportIntegrationTest20` needs to call
+                // `internal` test seams on `KtorRelayTransport` /
+                // `RestStateMachine` that live in a different Gradle module.
+                // Rather than re-publishing those seams as public API surface
+                // (test backdoors leaking into debug/beta APK), the test
+                // reaches them through `kotlin.reflect.full.callSuspend`. The
+                // seams stay `internal` so they are not reachable as
+                // Kotlin source-level API from a sibling module — reflection
+                // bypasses source-level visibility, but the reflection
+                // bridge file lives only in `androidUnitTest`, which is
+                // excluded from any APK.
+                implementation(kotlin("reflect"))
                 implementation(project(":shared:core:transport"))
             }
         }
@@ -583,6 +596,38 @@ android {
                 "\"$modeSticky\"",
             )
 
+            // RC-RECONNECT-QUIESCENCE1 commit 2d (2026-06-22).
+            // Opt-in via `-PreconnectQuiesce=1` (local.properties) or env
+            // RECONNECT_QUIESCENCE_ENABLED=1. Default "0" on debug;
+            // release builds pin to literal "0" below.
+            //
+            // Requires MODE_2_STICKY_ENABLED="1" (build-time invariant
+            // in RestStateMachine — quiescence depends on the sticky
+            // window being armed before the gate engages).
+            //
+            // AppContainer reads this flag and decides BOTH:
+            //   (a) whether RestStateMachine receives
+            //       `reconnectQuiescenceEnabled = true` (gate transitions
+            //       on `armSticky` / `Connected` / `candidate_died` /
+            //       `ws_alive_60s` only fire when the flag is on);
+            //   (b) whether TransportRewalkCoordinator receives a non-null
+            //       `gateCoordinator` AND KtorRelayTransport receives a
+            //       non-null `gateProvider` (a permanently-wired
+            //       gateCoordinator would otherwise engage the typed
+            //       transaction `OpenReconnect` path even when the flag
+            //       is off; with `gateCoordinator = null` the coordinator
+            //       falls back to the byte-for-byte legacy sequence).
+            val reconnectQuiesce = localOrEnv(
+                "reconnectQuiesce",
+                "RECONNECT_QUIESCENCE_ENABLED",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "RECONNECT_QUIESCENCE_ENABLED",
+                "\"$reconnectQuiesce\"",
+            )
+
         }
         release {
             isMinifyEnabled = true
@@ -755,6 +800,14 @@ android {
             // Requires MODE_2_FAST_PATH_ENABLED="1" (build-time invariant).
             buildConfigField("String", "MODE_2_STICKY_ENABLED", "\"0\"")
 
+            // RC-RECONNECT-QUIESCENCE1 commit 2d (2026-06-22).
+            // Release builds ALWAYS pin to literal "0". Promotion is a
+            // deliberate one-line flip in a separate named PR (with
+            // MODE_2_FAST_PATH_ENABLED and MODE_2_STICKY_ENABLED flipped
+            // together) AFTER Tecno Tele2 LTE smoke PASS.
+            // Requires MODE_2_STICKY_ENABLED="1" (build-time invariant).
+            buildConfigField("String", "RECONNECT_QUIESCENCE_ENABLED", "\"0\"")
+
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.
@@ -794,5 +847,93 @@ android {
     // android.bundle.enableUncompressedNativeLibs=false in gradle.properties.
     packaging {
         jniLibs.useLegacyPackaging = true
+    }
+}
+
+// --------------------------------------------------------------------------
+// Release R8 artifact proof — `verifyR8StripsTestSeams`.
+//
+// The task reads the R8 mapping.txt produced by the release build and
+// fails if any `phantom.*` class block lists a member whose name
+// contains `ForTest`. A surviving `*ForTest` seam is a release-binary
+// attack surface — `internal` test seams become JVM-public after Kotlin
+// name-mangling, and a `-keep ... { *; }` wildcard in proguard-rules.pro
+// preserves both the member AND its mangled name so an in-process
+// reflection caller can reach it.
+//
+// Coverage spans all `phantom.*` namespaces (production seams currently
+// live on `phantom.core.transport.*` AND `phantom.android.transport.*`;
+// any future `phantom.*` sibling that grows a test seam is caught by
+// the same rule without per-namespace maintenance).
+//
+// Wired as `finalizedBy` on `assembleRelease`, so any future
+// proguard-rules.pro regression that re-introduces a wildcard `-keep`
+// on a class carrying `*ForTest` seams fails the release build by name.
+// --------------------------------------------------------------------------
+tasks.register("verifyR8StripsTestSeams") {
+    description = "Fails if any `*ForTest` seam on a phantom.* class " +
+        "survived R8 minification into the release APK."
+    group = "verification"
+
+    val mappingFile = layout.buildDirectory.file("outputs/mapping/release/mapping.txt")
+    inputs.file(mappingFile)
+    // Track only the inputs — there is no output artifact; running the
+    // task is the contract.
+    outputs.upToDateWhen { false }
+
+    doLast {
+        val mappingPath = mappingFile.get().asFile
+        if (!mappingPath.exists()) {
+            throw GradleException(
+                "verifyR8StripsTestSeams: R8 mapping file not found at " +
+                    "${mappingPath.absolutePath}. The release assemble must run " +
+                    "before this task; check that `assembleRelease` succeeded.",
+            )
+        }
+        val violations = mutableListOf<String>()
+        var currentClass: String? = null
+        mappingPath.useLines { lines ->
+            lines.forEach { rawLine ->
+                val line = rawLine.trimEnd()
+                // A class-declaration line in mapping.txt has the shape:
+                //     "phantom.android.transport.SomeClass -> phantom.android.transport.x:"
+                // (left side = original FQCN, right side = renamed FQCN).
+                // Member lines under that class are indented.
+                if (!line.startsWith(" ") && !line.startsWith("#") && line.contains(" -> ")) {
+                    val original = line.substringBefore(" -> ").trim()
+                    currentClass = if (original.startsWith("phantom.")) original else null
+                    return@forEach
+                }
+                val klass = currentClass ?: return@forEach
+                // Inside any phantom.* class block. A surviving `*ForTest`
+                // member is a release-binary attack surface.
+                if (line.contains("ForTest")) {
+                    violations.add("$klass :: ${line.trim()}")
+                }
+            }
+        }
+        if (violations.isNotEmpty()) {
+            throw GradleException(
+                "verifyR8StripsTestSeams: ${violations.size} `*ForTest` member(s) " +
+                    "on phantom.* classes survived R8 release minification:\n" +
+                    violations.joinToString("\n") { "  - $it" } +
+                    "\n\nThese are `internal` test seams that MUST NOT survive into the " +
+                    "release APK. A `-keep class phantom.<...>.<Class> { *; }` wildcard " +
+                    "rule in apps/android/proguard-rules.pro would preserve them with " +
+                    "their JVM-mangled names intact, enlarging the in-process reflection " +
+                    "attack surface. Tighten the rule to a narrow per-member keep, or " +
+                    "remove the wildcard, then re-run `:apps:android:assembleRelease`.",
+            )
+        }
+        logger.lifecycle(
+            "verifyR8StripsTestSeams: PASS — no `*ForTest` members survived on any " +
+                "phantom.* class in ${mappingPath.absolutePath}.",
+        )
+    }
+}
+
+afterEvaluate {
+    tasks.named("assembleRelease").configure {
+        finalizedBy("verifyR8StripsTestSeams")
     }
 }
