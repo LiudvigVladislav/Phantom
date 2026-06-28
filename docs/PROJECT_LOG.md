@@ -598,6 +598,29 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 N-1 progress — existing-test inventory on master HEAD
+
+**Outcome:** First instrument N-1 completed. Source-read only; no operator devices touched; PR #330 untouched. New §10 appended to `docs/tracks/quiescence-validation-methodology-recon1.md` (`+106 LOC`) catalogues 26 relevant test files across `shared/core/transport/src/commonTest` and `apps/android/src/androidUnitTest` and maps per-Phase-B-hypothesis coverage on master HEAD.
+
+Inventory summary: **0 of 6 hypotheses FULL-COVERED on master HEAD. 3 of 6 PARTIAL** (H-330-Preserves-REST, H-330-Probe-Lives-60s, H-330-No-Message-Loss-Or-Dups — related invariants well-covered in `RestStateMachineTest` / `RestFallbackOrchestratorBreakerTest` / `KtorRelayTransportFifoTest` / `KtorRelayTransportPendingOutboundTest` / `RestInboundDeduplicatorTest` / `AckInboundAndAdvanceCursorTest` / `BodyTimeoutContractTest`, but the gate-coordinated quiescence-window flow is not exercised). **3 of 6 NOT-COVERED** (H-330-Quiesces-Storm, H-330-Single-Probe-Per-RouteChange, H-330-No-Self-Reentry — the load-bearing `WsReconnectGate.kt` component is ABSENT on master; it is introduced by PR #330 as a 447-LOC new file containing the `Open / Quiesced / ProbeAvailable / ProbeClaimed / CandidateProving` state machine).
+
+Side-finding flagged but explicitly OUT OF SCOPE per §5 framing "master HEAD": PR #330 adds eight test files of its own (`WsReconnectGateTest` 1172 LOC, `HybridRelayTransportIntegrationTest20` 686 LOC, `TransportRewalkCoordinatorTransactionTest` 667 LOC, `KtorRelayTransportDisconnectAndJoinTest` 848 LOC, `KtorRelayTransportRunReconnectLoopTest` 480 LOC, `RestFallbackOrchestratorQuiescenceWiringTest` 184 LOC, `ReconnectQuiescenceReleaseBuildConfigPinTest` 117 LOC, `KtorRelayTransportInternalTestSeams` 153 LOC). Whether those tests honestly cover the six hypotheses at the state-machine / integration level is a separate question about PR #330's CI — not N-1's question, not opened here.
+
+Per §9 hand-off rule: N-1 progress note does NOT propose a methodology. N-1 does NOT decide H-MC's feasibility; that is N-2's job (fake-transport surface review). N-2 is operator-scheduled; do NOT auto-start.
+
+**Track status:** QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 still Open. N-1 first instrument complete. N-2 next when operator schedules. RC PR #330 Draft / HOLD unchanged. DIRECT-WSS-MODE2-RECON1 unchanged; §11 / §12 amendment landed in PR #343 / PR #344 still load-bearing.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — N-1 progress amendment on `quiescence-validation-methodology-recon1.md` (+106 LOC). Branch `docs/quiescence-validation-n1-inventory`. Off master `aab66577`.
+
+**Follow-ups:**
+
+- Operator: schedule N-2 (fake-transport surface review) when ready. Pure source-read; no operator devices.
+- N-2 reads `FakeRelayTransport`, the `RestFallbackTransport` test doubles, `BodyTimeoutTestTransport`, `FakePreKeyPublishHttpTransport`, etc. and assesses whether each faithfully models the surface PR #330's quiescence depends on (Mode 2 detector input signals, sticky window timing, recovery probe outcome).
+- N-2's output is a docs-only progress amendment on this same track-doc.
+- Methodology recommendation is NOT permitted in any N-x progress note per §9. The recon's closure verdict comes after the instruments produce evidence sufficient to support one of the §6 acceptance gates.
+
 ### 2026-06-28 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 mini-lock opened — discriminate among five candidate methodologies (+ release-gate amendment fallback) for honestly closing B1
 
 **Outcome:** Operator greenlit the methodology recon flagged as forward-pointer in `direct-wss-mode2-recon1.md` §12 K-6 outcome. New track-doc at `docs/tracks/quiescence-validation-methodology-recon1.md` opens a facts-first recon to discriminate among candidate methodologies for field-validating PR #330's quiescence chain (`sticky → quiesced → probe → ws_alive_60s recovery`) when neither Wi-Fi (no Mode 2 reproduction) nor Tele2 LTE (broken REST fallback substrate per TELE2-LTE-REST-BREAKER-RECON1 §11 closure) can do the job alone.
