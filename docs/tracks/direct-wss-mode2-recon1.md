@@ -246,3 +246,60 @@ Either path requires affirmative evidence of working LTE delivery, NOT just B1-P
 - **No commit to PR #330's branch.** The K-5 fix-candidate APK is a build-time operation when B1 runs.
 - **No promotion of B2 to a mini-lock today.** B2 is announced as the next track that opens when the operator schedules it.
 - **No re-opening of `rc-direct-stability1.md` §13 root-cause investigation.** §13's long-connection-uplink finding is carry-forward evidence used by both TELE2-LTE-REST-BREAKER-RECON1 (closed) and the eventual B2 track.
+
+## §12 K-6 outcome — Wi-Fi non-regression PASS, quiescence NOT EXERCISED (2026-06-28)
+
+Operator-executed K-6 on 2026-06-28: Tecno Wi-Fi + emu Wi-Fi pair (~30 min), VPN OFF, fix-candidate APK SHA-256 `65ebaebf3a3f72e0eb8bc4bf381bcc85f72482370b0c401ad36a8d6f99803e35` built from PR #330 head `6f49cd89` with all three RC release flags forced to `"1"` via env vars at build time (`MODE_2_FAST_PATH_ENABLED` + `MODE_2_STICKY_ENABLED` + `RECONNECT_QUIESCENCE_ENABLED` — verified in `BuildConfig.java`). NO commits made to PR #330's branch; the build was a detached-HEAD operation only.
+
+### Verdict: NEW class — B1 non-regression PASS / QUIESCENCE NOT EXERCISED
+
+This run does NOT close B1 per §11's acceptance gate. §11 required all six Phase B hypotheses to hold for B1-PASS; one of the six PASSED, four were NOT EXERCISED, and one was vacuously satisfied. The verdict is a third class that §11 did not anticipate but the field result demands: **the mechanism did not regress, but it also was not exercised by the field conditions** because Wi-Fi did not reproduce Mode 2 on this run (consistent with K-1's `F-Mode1` rhythm carry-forward).
+
+### Phase B hypothesis matrix on K-6
+
+| Hypothesis (§4 Phase B) | K-6 status | Evidence |
+|---|---|---|
+| H-330-Quiesces-Storm | **NOT EXERCISED** | Mode 2 detector never fired. Zero `MODE_2_KILLED` / `sticky_armed` / `mode_2_fast_path` / `ws_reconnect_quiesced` / `ws_recovery_probe_granted` events on either side. With no Mode 2 episode there is no storm to quiesce. |
+| H-330-Preserves-REST | **VACUOUSLY PASS** | REST events present (Tecno 71, emu 74; K-1 baseline 90/88, lower count attributable to shorter session window — 30 min vs K-1's 44 min). But REST was NOT stress-tested by a quiescence window, so the assertion that REST keeps delivering DURING quiescence cannot be verified from this corpus. |
+| H-330-Single-Probe-Per-RouteChange | **NOT EXERCISED** | No route change was driven during the session (static Wi-Fi throughout). The hypothesis discriminator requires at least one user-observable route change; this run had none. |
+| H-330-Probe-Lives-60s | **NOT EXERCISED in the quiescence context** | Five `mode_switched ... reason=ws_alive_60s` events observed on Tecno (4) + emu (1), BUT each one was a `WsCandidate → WS_ACTIVE` transition without a preceding `sticky_armed` event. These are the R3.6 sticky-per-route fast REST degradation lifecycle transitions that landed in PR #328 (already on master before PR #330); they are NOT quiescence-recovery probes. The `ws_alive_60s` proof field has the same name but the semantic context is different — the quiescence-recovery probe requires `sticky_armed` precondition. |
+| H-330-No-Self-Reentry | **VACUOUSLY PASS** | No quiescence probe was issued, so a probe cannot self-reenter. The hypothesis is not falsifiable on this corpus. |
+| H-330-No-Message-Loss-Or-Dups | **PASS** | `relay_send_return ok=false` count = 0 on both sides. Manual UI check (all 4 × 2 messages delivered as recorded by the operator). End-to-end correlation between sender's `SEND_TRACE relay_send_return ok=true` and receiver's decrypt path confirmed on the operator's UI verdict. |
+
+**Net: 1 PASS, 4 NOT EXERCISED, 1 VACUOUSLY PASS.** §11's `B1-PASS` definition ("all six Phase B hypotheses hold") is technically met — none of the six FAILED — but the spirit of validation (the mechanism was actually tested) was not met.
+
+### What this verdict establishes
+
+- **PR #330 with the three flags forced to `"1"` does NOT regress Wi-Fi delivery.** Messages flowed in both directions. No duplicates. No losses. The R3.6 state machine cycled correctly (`WsActive → REST_ACTIVE → WS_CANDIDATE → WS_ACTIVE` via `ws_frame_text_received` then `ws_alive_60s`) — same shape as master HEAD without quiescence flags would produce.
+- **Sprint 2b-C inbound_repair_ok promotion=true works on Wi-Fi.** Seven `pending_fallback_fail` events on each side were all followed by successful `DECRYPT_TRACE inbound_repair_ok ... promotion=true`. Zero `DECRYPT_TRACE fail_mac`, zero `OpkNotFound`, zero `inbound_repair_fail`, zero `action=hold`. This is a positive data point against the K-2 LTE side-finding's "Sprint 2b-C might regress" worry — on Wi-Fi the repair path stays healthy.
+- **Reconnect ratios unchanged vs K-1.** Tecno 33/16 = 2.06× connect attempts per WSS session; emu 33/16 = 2.06×. K-1 baseline: 2.0× both. The PR #330 mechanism neither amplified nor suppressed reconnects — because it was not engaged.
+
+### What this verdict does NOT establish
+
+- **Core PR #330 quiescence chain (sticky → probe → ws_alive_60s recovery) was NOT field-validated.** The four NOT-EXERCISED hypotheses cover the load-bearing claims of the PR #330 mini-lock; none of them were tested by this run.
+- **PR #330 is NOT closer to ship-readiness on the strength of K-6 alone.** Per §11 release / rollout gate: B1-PASS on Wi-Fi (even strict B1-PASS) does not unblock LTE rollout; this K-6 result does not even strictly meet B1-PASS, it meets a non-regression-only sub-class.
+- **`F-Mode1` vs Mode 2 detector boundary on the device side.** K-1 captured 21 F-Mode1 sessions on the same Wi-Fi without firing the detector; K-6 captured 16 sessions of the same shape, also without firing the detector. This is consistent with the F-Mode1 / F-Mode2 distinction in `rc-direct-stability1.md` §1 (Mode 1 = return-path loss with 7-8 pongs / ~150 s; Mode 2 = uplink loss with 0-1 pongs / ~30-45 s). The Mode 2 detector apparently looks for the Mode 2 signature specifically, not the Mode 1 signature. This is by design (PR #328's R3.6 explicitly targets Mode 2), but it means the Wi-Fi class as currently observed is not a venue where the detector can fire.
+
+### Phase B status after K-6
+
+- **B1 acceptance gate: NOT closed.** Per §11's strict reading (all six hypotheses hold), K-6 meets the letter but not the spirit. A future deliverable that exercises the quiescence chain is required before B1 can be honestly declared closed.
+- **K-3 (emu Wi-Fi-only) remains NOT promoted.** It does not change the Mode-2-not-fired situation.
+- **PR #330 stays Draft / HOLD.** No change to RC #330's status. The release / rollout gate from §11 stays in force.
+
+### Forward-pointer — methodology question (NOT scoped here)
+
+The K-6 outcome surfaces a structural validation question that this recon's current scope does not answer: **how do we validate the quiescence mechanism when Wi-Fi does not reproduce Mode 2 (no symptom to suppress) AND Tele2 LTE breaks the REST fallback substrate the mechanism depends on (no working substrate to validate against)?**
+
+Three candidate paths for the operator to decide (NOT promoted from this recon; listed only as the candidate decision set for a future methodology recon if one opens):
+
+- **(a)** Find a third network class that reproduces Mode 2 AND keeps REST fallback alive. Candidates: a different LTE carrier (M-3 from TELE2-LTE-REST-BREAKER-RECON1 was never run), tethered Wi-Fi through a mobile hotspot, a Wi-Fi network with degraded RSSI / packet loss profile. Each is uncertain.
+- **(b)** Use synthetic / instrumentation-only triggers (e.g. a debug-only flag that forces Mode 2 detection state for testing). Carries the risk of false-confidence: "we broke things by hand and quiescence worked" does not prove the mechanism correctly classifies real Mode 2 vs benign noise.
+- **(c)** Accept that field-only validation of the quiescence chain is not possible in current conditions, and validate at a different level (state-machine / integration tests against a fake transport that scripts the Mode 2 surface, or a controlled relay-side reproduction). Carries the risk that the model the tests check is not the model the field actually presents.
+
+A separate facts-first recon (working name `QUIESCENCE-VALIDATION-METHODOLOGY-RECON1`) is the natural place to discriminate among (a), (b), (c). This recon is NOT opened by this PR — it is a forward-pointer for the operator's next decision.
+
+### Side-findings preserved (NOT actioned here)
+
+- **Operator's QR-add → reverse-add warm-up flow** was the same paired-bootstrap pattern as K-1; not a scenario deviation, just the natural first-contact flow.
+- **Receiver-side decrypt counts (Tecno 6, emu 10)** lower than expected for 4 × 2 = 8 scheduled messages plus warm-up plus acks. The discrepancy is likely because some inbound paths logged `inbound_repair_ok` (7 events on each side) rather than `DECRYPT_TRACE ok`; the analysis script's regex counted only the latter. Future K-runs should add `inbound_repair_ok` to the receiver-side delivery count to avoid under-counting deliveries that took the repair path.
+- **Five `mode_switched ... reason=ws_alive_60s` events** (Tecno 4 + emu 1) demonstrate the R3.6 sticky-per-route fast REST degradation flow from PR #328 is working correctly with the three flags forced on. This is a positive data point for the R3.6 baseline, NOT for PR #330's quiescence layer specifically.
