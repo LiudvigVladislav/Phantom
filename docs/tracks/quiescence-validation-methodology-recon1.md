@@ -1,9 +1,10 @@
 # Track: QUIESCENCE-VALIDATION-METHODOLOGY-RECON1
 
 **Type:** Facts-first reconnaissance / methodology design. NOT a code-fix track. NOT a re-investigation of PR #330's quiescence design or RC-RECONNECT-QUIESCENCE1 contract.
-**Status:** Open (mini-lock).
+**Status:** **Closed 2026-06-29 with verdict H-ME** (see §13).
 **Opened:** 2026-06-28 after `direct-wss-mode2-recon1.md` §12 K-6 outcome surfaced a structural validation gap: Wi-Fi did not reproduce Mode 2 (so the quiescence chain never engaged) AND Tele2 LTE breaks the REST fallback substrate (per TELE2-LTE-REST-BREAKER-RECON1 §11 closure). Neither network class available to the operator can field-validate the core PR #330 mechanism.
 **Last known master at open:** PR #344 squash `364a7a48`.
+**Last known master at close:** PR #348 squash `98ee7e09`.
 
 ---
 
@@ -383,3 +384,75 @@ Per §5 the natural follow-on candidates remain N-4 (third-network-class survey)
 The operator decides whether N-4 / N-5 run next, whether to defer further N-x work (park per §7 P-2), or whether sufficient evidence is now on record to pivot the recon toward a closure verdict (per §6). The recon itself does NOT propose any of these. Do NOT auto-start.
 
 Do NOT propose a methodology in any subsequent N-x progress note. Per §9.
+
+## §13 Closure verdict — H-ME (2026-06-29)
+
+After N-1 + N-2 + N-3 the operator opted to close the recon per §6 acceptance gate #2 (H-MD or H-ME combination) rather than promote N-4 or N-5. The chosen combination is **H-ME — state-machine / integration validation (MC) + synthetic in-app trigger (MB) via the L1 lifecycle-event-channel injection point identified in §12**. Council review by four agents (architect / implementation / tests-adversarial / security; durables in `C:\temp\quiescence-h-me-council-2026-06-29\`) confirmed H-ME is the correct closure verdict given the N-1 / N-2 / N-3 evidence, surfaced two BLOCKERS that must precede any L1 implementation, and produced a source-grounded acceptance matrix for the future scope-lock.
+
+### §13.1 Verdict declared
+
+**H-ME selected.** Forwards to `direct-wss-mode2-recon1.md` as the next B1 deliverable, executed as TWO separate items:
+
+- **MC half:** deterministic state-machine / integration validation that asserts gate-invariants directly. Lands as either (a) extensions to the existing on-master `RestStateMachineTest` / `WsActivePollJobLifecycleTest` / `RestFallbackOrchestratorPollLoopTest` infrastructure once PR #330's gate component is in place, or (b) the gate-specific test suite PR #330 itself adds (`WsReconnectGateTest` 1172 LOC, `RestFallbackOrchestratorQuiescenceWiringTest` 184 LOC, `HybridRelayTransportIntegrationTest20` 686 LOC). The MC scope-lock chooses; this closure does NOT pre-decide.
+- **MB half:** L1 synthetic field trigger per §12.4 design sketch, hardened against the security council's two BLOCKERS and the implementation council's race condition. The MB scope-lock is a separate mini-lock PR that opens AFTER this closure merges. It is NOT scoped here.
+
+### §13.2 Evidence basis
+
+- **N-1 (§10):** 0 of 6 Phase B hypotheses FULL-COVERED on master HEAD. Three NOT COVERED (gate component absent). Three PARTIAL (REST-side invariants well-covered but the gate-coordinated quiescence-window flow is not exercised on master).
+- **N-2 (§11):** master HEAD fakes are interface-shaped, not lifecycle-shaped. 3 of 5 §5 dimensions NOT MODELLED (Mode 2 detector input signals / sticky window timing / recovery probe outcome), 1 PARTIAL but bypasses fakes (60s probation — exercised via controllable `now`, not via a fake transport), 1 MIXED (self-reentry / dup / loss — REST-side faithfully modelled, WS-side gate-coordinated halves not).
+- **N-3 (§12):** L1 lifecycle-event-channel injection point identified as the cleanest synthetic-trigger shape under the §5 honesty bar. Six load-bearing honesty constraints documented. L0 infeasible without server coordination; L2 acceptable for state-machine-only validation but loses Consumer B telemetry; L3 / L4 ruled out by the §5 prohibition on parallel test-only paths.
+
+The combination MC + MB is necessary because neither half alone closes B1 honestly: MC alone is model-only (the master fakes cannot honestly model the production lifecycle surface per N-2); MB alone is log-observation without invariant assertions on the gate state machine. Together they cover model correctness and production-dispatch corroboration.
+
+### §13.3 Locks (load-bearing for the future implementation scope-lock)
+
+These constraints are binding on the L1 implementation mini-lock that opens after this closure merges. They are NOT pre-decisions about the implementation — they are gates the scope-lock must satisfy.
+
+- **L-13.3.1 — Both halves required.** Neither MC alone nor MB alone closes B1. The DIRECT-WSS-MODE2-RECON1 §11 B1 acceptance gate is satisfied only when **MC PASS + MB PASS** are both on record. A "MC PASS + MB partial" outcome is permissible only when MB demonstrates at least the `Quiesced → ProbeAvailable → ProbeClaimed` chain end-to-end with confirmed REST delivery and the `CandidateProving → Open` 60s branch is closed by MC.
+- **L-13.3.2 — L1 mandatory, L2 rejected.** The MB half MUST inject at L1 (lifecycle channel `_wsSessionLifecycle.trySend(WsSessionLifecycleEvent.Ended(...))`). L2 (direct `RestStateMachine.submit(Event.WsSessionEnded(...))`) is rejected because it bypasses Consumer B (telemetry detector), which means the field log would not show `WS_DEGRADED_TELEMETRY` for the synthetic episode and the validation could not assert the telemetry path also runs.
+- **L-13.3.3 — Sequential dispatcher order is a load-bearing assumption.** The L1 honesty contract depends on Consumer A (state-machine actuation) and Consumer B (telemetry detector) being sequential in `WsSessionLifecycleDispatcher.dispatch(Ended)`. Any future refactor to parallel fan-out would break the contract WITHOUT a visible test failure. The MC scope-lock MUST include a structural test that asserts the sequential consumption order so the assumption fails loudly on regression.
+- **L-13.3.4 — `closeOrigin = "synthetic"` non-branching discipline.** No `if (event.closeOrigin == "synthetic") { ... }` arms anywhere in the dispatch chain or downstream consumers (dispatcher, state machine, detector, gate). Enforced at code review and at a grep-style negative-presence test in the L1 scope-lock.
+- **L-13.3.5 — `maybeRetryBootstrap()` branch scope gap.** The dispatcher routes to `maybeRetryBootstrap()` when `restCapabilityActiveProvider()` returns false; this branch does not consult the gate. The MC scope-lock MUST either cover this alternative reconnect path explicitly OR document it as an out-of-scope acknowledgment so it is not silently assumed validated.
+- **L-13.3.6 — ProGuard narrowing precondition for MB (BLOCKER per security council).** `apps/android/proguard-rules.pro` line 95 carries `-keep class phantom.core.transport.KtorRelayTransport { *; }` on master HEAD. Adding `debugForceMode2Synthetic` under this wildcard preserves the debug surface in the release APK even with `DEBUG_FORCE_MODE_2_DETECTION = "0"`. The MB scope-lock MUST be gated on either (a) the PR #330 §2 ProGuard-narrowing plan landing first, OR (b) including an equivalent R8-strip-verification step within the MB scope-lock itself. Without one of these, MB implementation MUST NOT start.
+- **L-13.3.7 — S6-style four-layer operator surface for MB (BLOCKER per security council).** Raw `am broadcast` BroadcastReceiver is foreclosed. The MB operator trigger surface MUST follow the `S6BreakerTriggerActivity` four-layer pattern: debug-overlay manifest only / signature-level `android:permission` / runtime `BuildConfig` re-check inside the component / `AppContainer` re-check before reaching `KtorRelayTransport.debugForceMode2Synthetic`. The pattern's precedent (10 review rounds on S6) is a working template; the MB scope-lock copies it, does not invent.
+- **L-13.3.8 — Boolean injection, not provider lambda.** The injected gate parameter on `KtorRelayTransport` is `debugForceMode2Enabled: Boolean = false` (build-time value). The `() -> Boolean` provider alternative sketched in §12.4 is rejected — it serves a runtime-dynamic-evaluation requirement this design does not have.
+- **L-13.3.9 — One-shot per `Connected` session epoch.** The synthetic trigger fires at most once per `Connected` epoch. The latch resets on each new `WsSessionLifecycleEvent.Connected` event. This closes both the check-then-trySend race identified by the implementation council (the state can change between `_state.value is Connected` and `_wsSessionLifecycle.trySend(...)`; the epoch latch prevents the race from producing a duplicate `Ended` with a stale epoch) AND the repeated-trigger DoS surface identified by the security council (an attacker who somehow activates the surface cannot keep the gate Quiesced indefinitely).
+- **L-13.3.10 — Typed `SyntheticTriggerResult` return.** `debugForceMode2Synthetic` returns a typed result, not a `Boolean`: `Fired / RefusedDisabled / RefusedNotConnected / RefusedDurationOutOfRange / RefusedAlreadyFired`. The MB scope-lock specifies the type; this closure pins that the contract is typed, not a success flag.
+- **L-13.3.11 — Acceptance matrix is the test floor, not ceiling.** The tests/adversarial council produced a source-grounded acceptance matrix (durable at `C:\temp\quiescence-h-me-council-2026-06-29\tests.md`, ~1450 words, cites markers and line numbers from PR #330 head `6f49cd89` and master HEAD `98ee7e09`). The MB scope-lock adopts this matrix as the minimum test set; it may add but MUST NOT remove items.
+
+### §13.4 What was rejected and why
+
+- **N-4 (third network class survey):** rejected. No third LTE carrier or controlled-loss Wi-Fi configuration was identified that would reproduce Mode 2 AND keep REST alive within reasonable operator effort. Running N-4 risked burning days on a venue that may not exist. H-MA (and H-MD = MC + MA) is not selected for the same reason.
+- **N-5 (release-gate review against PR #330's user population):** rejected. The recon's job is to discriminate validation methodology, not product-tier rollout. H-MF (release-gate amendment fallback) is not selected — it would have accepted a validation gap rather than validating, which is acceptable only when MA / MB / MC / MD / ME all fail feasibility. They do not.
+- **H-MC alone:** rejected. N-2 showed master HEAD fakes are interface-shaped, not lifecycle-shaped — state-machine tests against existing fakes can validate a model but cannot assert the field's `WsSessionLifecycleEvent.Ended` shape actually arms the gate on a real device. MC is necessary but not sufficient.
+
+### §13.5 Forward-pointer to L1 implementation mini-lock (NOT scoped here)
+
+A separate L1 implementation mini-lock will open as its own docs PR after this closure merges. That mini-lock will:
+
+- Carry forward locks L-13.3.1 through L-13.3.11 as binding constraints.
+- Pick the operator-surface concrete shape (debug-Activity vs am-broadcast — the security council's BLOCKER B-2 narrows to S6-style debug-Activity; the mini-lock confirms).
+- Specify the typed `SyntheticTriggerResult` enum/sealed-class concretely.
+- Bind to the ProGuard narrowing precondition (L-13.3.6) — either stack the implementation on top of PR #330's narrowing change, or include equivalent narrowing in the L1 track.
+- Adopt the acceptance matrix at `C:\temp\quiescence-h-me-council-2026-06-29\tests.md` as the test floor.
+
+After the L1 mini-lock merges, the L1 implementation PR can open. After L1 implementation merges AND the MC integration tests are in place, the controlled Wi-Fi smoke run can validate the end-to-end quiescence chain.
+
+This closure does NOT open the L1 mini-lock. That is the next operator decision after this closure merges.
+
+### §13.6 PR #330 and parent recon
+
+**PR #330 status unchanged.** Stays Draft / HOLD. Its B1 gate from `direct-wss-mode2-recon1.md` §11 is unchanged; B1 closes only when **MC PASS + MB PASS** land on record per L-13.3.1. The recon's `Last known master at close` pointer is recorded above; PR #330 head `6f49cd89` is untouched.
+
+DIRECT-WSS-MODE2-RECON1 §11 / §12 unchanged.
+
+### §13.7 Council durables
+
+Council outputs were saved per [[feedback_save_council_outputs_durably]]:
+
+- `C:\temp\quiescence-h-me-council-2026-06-29\architect.md` — architecture / methodology review (H-ME RIGHT WITH CAVEATS; five caveats locked above).
+- `C:\temp\quiescence-h-me-council-2026-06-29\implementation.md` — implementation feasibility (L1 FEASIBLE WITH CAVEATS; one race condition promoted to L-13.3.9).
+- `C:\temp\quiescence-h-me-council-2026-06-29\tests.md` — adversarial acceptance matrix (~1450 words; source-grounded against PR #330 head `6f49cd89`).
+- `C:\temp\quiescence-h-me-council-2026-06-29\security.md` — security / release-surface review (L1 SAFE WITH CONDITIONS; two BLOCKERS promoted to L-13.3.6 and L-13.3.7).
+
+These durables are not in the repo by [[feedback_save_council_outputs_durably]] discipline — they are operator-workstation working notes that supplement the recon's locked summary. The locks in §13.3 are the contract; the durables are the audit trail.
