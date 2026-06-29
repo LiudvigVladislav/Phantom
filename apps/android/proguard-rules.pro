@@ -92,9 +92,56 @@
 # release builds exactly when we need it most.
 # --------------------------------------------------------------------------
 -keep class phantom.core.transport.RelayLog_androidKt { *; }
--keep class phantom.core.transport.KtorRelayTransport { *; }
 -keep class phantom.core.messaging.MessagingLog_androidKt { *; }
 -keep class phantom.core.messaging.DefaultMessagingService { *; }
+
+# --------------------------------------------------------------------------
+# PHANTOM transport — narrowed `KtorRelayTransport` keeps (path-2 step 2)
+# --------------------------------------------------------------------------
+# Previously this file carried `-keep class phantom.core.transport.KtorRelayTransport { *; }`
+# which preserved every member of the class in release. That wildcard is
+# removed so future test seams (`*ForTest`), future debug surfaces
+# (`debugForce*`), and `*Synthetic*` members get stripped from the release
+# APK. R8 strip is verified by the `verifyR8StripsTestSeams` Gradle task
+# wired as `finalizedBy assembleRelease`.
+#
+# The class itself is reached via the production `phantom.core.transport.RelayTransport`
+# interface; R8 keeps interface implementations automatically. The members
+# listed below are accessed BY NAME via the concrete `KtorRelayTransport`
+# type (NOT via the `RelayTransport` interface), so R8 cannot prove they
+# are reachable through interface dispatch and would strip them without
+# an explicit keep.
+#
+# Each entry below cites the call site that needs it. If you add a new
+# entry, justify in the commit message + PR body why R8 cannot reach it
+# on its own. Do NOT collapse this list back to the over-broad shape
+# `class ... { *; }` or `class ... { public *; }` — the structural pin
+# test in `androidUnitTest` will fail.
+-keepclassmembers class phantom.core.transport.KtorRelayTransport {
+    # R3.6 lifecycle channel consumed by `HybridRelayTransport.startWsPassthroughCollectors`
+    # at `apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt:495`
+    # via the concrete `wsTransport.wsSessionLifecycle` flow. Not on `RelayTransport`.
+    public *** wsSessionLifecycle;
+    public *** getWsSessionLifecycle();
+    # PR-D1d ACK-deadline expiry flow consumed by `HybridRelayTransport`
+    # at `HybridRelayTransport.kt:510`. Not on `RelayTransport`.
+    public *** outboundAckDeadlineExpired;
+    public *** getOutboundAckDeadlineExpired();
+    # PR-RECV-DIAG1 inbound stall flow consumed by `HybridRelayTransport`
+    # at `HybridRelayTransport.kt:553`. Not on `RelayTransport`.
+    public *** inboundStalled;
+    public *** getInboundStalled();
+    # PR-D1c snapshot API consumed by `HybridRelayTransport.startRestFallbackMigration`
+    # at `HybridRelayTransport.kt:894`. Returns the WS pending-outbound union;
+    # the WS → REST migration path uses it to drain in encrypt-time order.
+    # Not on `RelayTransport`.
+    public *** snapshotPendingOutbound(...);
+    # PR-D1c mark-accepted API consumed by `HybridRelayTransport` at
+    # `HybridRelayTransport.kt:946` and `:954`. Removes a successfully
+    # REST-fallback-delivered envelope from BOTH WS pending maps so a
+    # later WS reconnect cannot re-flush a duplicate. Not on `RelayTransport`.
+    public *** markPendingOutboundAcceptedByFallback(java.lang.String);
+}
 
 
 # --------------------------------------------------------------------------

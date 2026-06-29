@@ -598,6 +598,57 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · Path-2 step 2 — ProGuard narrowing + verifyR8StripsTestSeams Gradle task + structural pin test (qualifying narrowing commit for L1 Option A)
+
+**Outcome:** First code change in the path-2 sequence after the methodology recon closed with H-ME verdict + the L1 mini-lock opened + the §5.1 Option A amendment. Narrowing-only PR with three artefacts: (a) `apps/android/proguard-rules.pro` removes the over-broad `-keep class phantom.core.transport.KtorRelayTransport { *; }` wildcard and replaces it with five targeted `-keepclassmembers` entries justified per call site / (b) `apps/android/build.gradle.kts` adds the `verifyR8StripsTestSeams` Gradle task wired as `finalizedBy assembleRelease` with deny patterns `*ForTest*` / `debugForce*` / `*Synthetic*` filtered to skip R8-internal `$$ExternalSyntheticLambda` / `$$InternalSyntheticLambda` containers / (c) new `KtorRelayTransportProguardNarrowingPinTest` in `androidUnitTest` structurally pins the wildcard absence + the targeted keep block presence + each of the five required member names. The narrowing-only PR is intended to merge first; the L1 implementation PR then opens under L1 mini-lock §5.1 Option A citing this PR's squash SHA verbatim.
+
+**Five targeted keeps in `proguard-rules.pro` (each member is accessed by name from `HybridRelayTransport` via the concrete `KtorRelayTransport` type, not via the `RelayTransport` interface — R8 cannot prove reachability through interface dispatch alone):**
+
+| Member | Call site | Provenance |
+|---|---|---|
+| `wsSessionLifecycle` | `HybridRelayTransport.kt:495` | R3.6 lifecycle channel |
+| `outboundAckDeadlineExpired` | `HybridRelayTransport.kt:510` | PR-D1d ACK-deadline expiry flow |
+| `inboundStalled` | `HybridRelayTransport.kt:553` | PR-RECV-DIAG1 inbound stall flow |
+| `snapshotPendingOutbound()` | `HybridRelayTransport.kt:894` | PR-D1c WS pending-outbound snapshot |
+| `markPendingOutboundAcceptedByFallback(String)` | `HybridRelayTransport.kt:946 / :954` | PR-D1c mark-accepted API |
+
+Each entry includes the file:line citation and a one-line justification in `proguard-rules.pro` itself; the structural pin test enforces the listed names cannot be silently dropped.
+
+**`verifyR8StripsTestSeams` task design:**
+
+- Reads `apps/android/build/outputs/mapping/release/mapping.txt` after `assembleRelease`.
+- Parses each `phantom.*` class block.
+- Skips R8-internal lambda capture containers (`$$ExternalSyntheticLambda`, `$$InternalSyntheticLambda`) and compiler-synthesised member names (those starting with `$`).
+- For every other phantom member, matches against deny patterns: `*ForTest*` / `debugForce*` / `*Synthetic*`.
+- Fails the release build with the full violation list if any match.
+
+**Verified locally:**
+
+- Structural pin test: `:apps:android:testDebugUnitTest --tests "phantom.android.transport.KtorRelayTransportProguardNarrowingPinTest"` → BUILD SUCCESSFUL.
+- Release build + verifier: `:apps:android:assembleRelease` → `verifyR8StripsTestSeams PASS — no *ForTest* / debugForce* / *Synthetic* members survived on any phantom.* class.` + BUILD SUCCESSFUL.
+- Negative-control attempted (re-add wildcard to file). Result: clean master HEAD has no `*ForTest*` / `debugForce*` / `*Synthetic*` members on `KtorRelayTransport`, so the wildcard alone does not trip the verifier. The verifier is forward-looking — when the L1 implementation PR introduces `debugForceMode2Synthetic` and any `*Synthetic*` companion classes, re-adding the wildcard at THAT point will trip the verifier with surviving members. Documented in the PR body.
+
+**WORKING_RULES rule 8 carve-out (transport-adjacent):** changes are release-only by nature — debug builds are not affected by ProGuard rules. The smoke-test substitute IS the `verifyR8StripsTestSeams` Gradle task itself, which demonstrates the release APK is successfully narrowed. PR body documents the carve-out explicitly.
+
+**What this PR does NOT do:**
+
+- No `KtorRelayTransport` source changes.
+- No BuildConfig flags, no debug Activity, no synthetic-trigger code, no L1 implementation work.
+- No PR #330 changes — Draft / HOLD unchanged.
+- No expansion of deny patterns beyond what the L1 mini-lock locked (`*ForTest*` / `debugForce*` / `*Synthetic*`). Future debug-only naming MUST satisfy one of these patterns OR be stripped by R8 on its own.
+
+**Track status:** L1 implementation mini-lock §5.1 Option A precondition can now point at this PR's eventual squash SHA. Next operator step: open L1 implementation PR under Option A after this narrowing PR merges. NOT auto-started.
+
+**Key PRs:**
+
+- **#TBD (this PR)** — narrowing-only code change (3 files: proguard-rules.pro / build.gradle.kts / new androidUnitTest pin test). Branch `feat/proguard-narrowing-r8-strip-verification`. Off master `e42ca9c2`.
+
+**Follow-ups:**
+
+- Operator opens L1 implementation PR under §5.1 Option A citing this PR's squash SHA verbatim, after this PR merges. NOT auto-started.
+- MC half scope-lock opens separately.
+- Controlled Wi-Fi smoke run opens AFTER both halves merge AND MC PASS + MB PASS land on record.
+
 ### 2026-06-30 · QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK amendment — §5.1 Option A loosened to accept any qualifying narrowing commit (unblocks path-2 separate narrowing-only PR sequence)
 
 **Outcome:** Operator-chosen path-2 sequence (separate narrowing-only PR → L1 implementation PR under Option A) hit a literal-wording blocker in the just-merged mini-lock at PR #350 squash `e6a162d9`: §5.1 Option A said "Stack on already-landed PR #330 narrowing commit", which created an unintended dependency loop — PR #330 stays Draft / HOLD until B1 closes; B1 closes only after MB PASS lands; MB lands only after the implementation PR opens; the implementation PR opens only under Option A or Option B; Option A required PR #330's narrowing. The loop locks all forward motion under Option A.
