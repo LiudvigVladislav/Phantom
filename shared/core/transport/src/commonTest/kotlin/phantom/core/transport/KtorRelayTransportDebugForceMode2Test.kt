@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -142,7 +143,14 @@ class KtorRelayTransportDebugForceMode2Test {
     }
 
     @Test
-    fun one_shot_latch_resets_when_session_epoch_advances() = runTest {
+    fun one_shot_latch_gives_fresh_allowance_on_new_epoch_without_reset() = runTest {
+        // PR #353 round 3 (2026-06-30): production code no longer
+        // resets `oneShotLatchConsumedAtEpoch` on Connected — the
+        // semantic ("one synthetic per Connected epoch") is preserved
+        // purely by the equality check inside
+        // `debugForceMode2Synthetic`. Each new epoch sees a stale
+        // "last consumed epoch" that naturally fails to equal it and
+        // is allowed to fire.
         val transport = connectedTransport(epoch = 1L)
         assertEquals(1L, transport.currentSessionEpoch)
         val first = transport.debugForceMode2Synthetic(45_000L)
@@ -152,14 +160,11 @@ class KtorRelayTransportDebugForceMode2Test {
             SyntheticTriggerResult.RefusedAlreadyFired,
             transport.debugForceMode2Synthetic(45_000L),
         )
-        // Bump to a new epoch (mimics a new Connected after reconnect).
-        // The latch is keyed on the consumed epoch; the new epoch sees
-        // a fresh allowance only after the production latch-reset hook
-        // fires (production: inside the Connected emit; test seam:
-        // resetOneShotLatchForTest).
+        // Bump to a new epoch WITHOUT resetting the latch — this is
+        // what production reconnect-loop does after the round-3 fix.
         val newEpoch = transport.bumpSessionEpochForTest()
         assertEquals(2L, newEpoch)
-        transport.resetOneShotLatchForTest()
+        // Synthetic fires because `currentLatchEpoch (1) != currentEpoch (2)`.
         val second = transport.debugForceMode2Synthetic(45_000L)
         assertSame(SyntheticTriggerResult.Fired, second)
     }
@@ -318,13 +323,74 @@ class KtorRelayTransportDebugForceMode2Test {
                 "RefusedAlreadyFired (atomic latch contention or post-claim " +
                 "epoch match). Results: $results",
         )
-        // The channel must carry exactly one synthetic Ended event for
-        // this epoch (the one Fired call's enqueue).
-        val events = transport.wsSessionLifecycle.take(1).toList()
-        assertEquals(1, events.size)
-        val ended = assertIs<WsSessionLifecycleEvent.Ended>(events[0])
+        // The channel must carry EXACTLY one synthetic Ended event
+        // for this epoch (the one Fired call's enqueue). Read the
+        // first event, then assert the channel has NO second event
+        // waiting via withTimeoutOrNull (round-3 fix: round 2 used
+        // .take(1).toList() which would silently pass if a second
+        // event were also enqueued).
+        val ended = assertIs<WsSessionLifecycleEvent.Ended>(
+            transport.wsSessionLifecycle.first(),
+        )
         assertEquals(13L, ended.sessionEpoch)
         assertEquals("synthetic", ended.closeOrigin)
+        val second = withTimeoutOrNull(timeMillis = 200L) {
+            transport.wsSessionLifecycle.first()
+        }
+        assertNull(
+            second,
+            "Channel MUST carry exactly one synthetic Ended for epoch 13. " +
+                "Found a second event after the Fired one: $second. The atomic " +
+                "latch claim should have prevented the second concurrent call " +
+                "from enqueueing.",
+        )
+    }
+
+    /**
+     * Connected-reset-race test (PR #353 round 3): asserts the
+     * round-3 fix where the production reconnect-loop no longer
+     * resets `oneShotLatchConsumedAtEpoch` on Connected. The
+     * round-2 production code had:
+     *
+     *   ```
+     *   _state.value = Connected; trySend(Connected(mySession));
+     *   oneShotLatchConsumedAtEpoch = null  // ← RACE
+     *   ```
+     *
+     * A synthetic that took the mutex between `trySend(Connected)`
+     * and the reset would atomically set the latch to `mySession`,
+     * then the reset would blow it away, then a SECOND synthetic on
+     * the SAME `mySession` epoch would see latch != epoch and fire
+     * AGAIN — violating the one-shot contract.
+     *
+     * Round-3 fix removes the production reset; the equality check
+     * `latch == epoch` preserves the semantic on its own (each new
+     * Connected brings a new `wsSessionEpoch`).
+     */
+    @Test
+    fun synthetic_claim_survives_test_seam_simulating_connected_emit() = runTest {
+        // Simulate the round-2-race: synthetic fires for epoch N (claim
+        // sets latch = N), THEN a "Connected emit-like" code path
+        // runs that would have, in round 2, cleared the latch.
+        // Round-3 production simply does NOT clear; this test asserts
+        // that absent the clear, a second synthetic on the same epoch
+        // is correctly refused.
+        val transport = connectedTransport(epoch = 21L)
+        val first = transport.debugForceMode2Synthetic(45_000L)
+        assertSame(SyntheticTriggerResult.Fired, first)
+        // NOTE: we deliberately do NOT call `resetOneShotLatchForTest()`
+        // here — the whole point of the round-3 fix is that production
+        // doesn't reset on Connected emit either. The second call on
+        // the SAME epoch MUST be refused.
+        val second = transport.debugForceMode2Synthetic(45_000L)
+        assertSame(
+            SyntheticTriggerResult.RefusedAlreadyFired,
+            second,
+            "After round-3 fix, the production reconnect-loop's Connected " +
+                "emit does NOT reset the one-shot latch. A second synthetic " +
+                "on the SAME epoch (which would happen if the round-2 race " +
+                "had let the reset blow away the claim) MUST be refused.",
+        )
     }
 
     // ── L1 mini-lock §13.3.4 closeOrigin="synthetic" tell shape pin ──────

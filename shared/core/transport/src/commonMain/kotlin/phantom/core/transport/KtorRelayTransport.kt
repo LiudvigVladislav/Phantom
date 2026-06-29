@@ -786,13 +786,25 @@ class KtorRelayTransport(
     }
 
     /**
-     * Test-only seam for the latch-reset coverage cell. Resets
-     * [oneShotLatchConsumedAtEpoch] to `null` so the next
-     * [debugForceMode2Synthetic] call gets a fresh one-shot allowance.
-     * In production the latch is reset by the
-     * [WsSessionLifecycleEvent.Connected] emission inside
-     * `runReconnectLoop`'s `webSocket { ... }` block; tests cannot
-     * easily reach that path without standing up a full WS handshake.
+     * Test-only seam for synthesising a fresh-allowance scenario in
+     * unit tests. Resets [oneShotLatchConsumedAtEpoch] to `null` so
+     * the next [debugForceMode2Synthetic] call sees no prior consumed
+     * epoch and is allowed to fire even if the test did not advance
+     * [wsSessionEpoch].
+     *
+     * NOTE (PR #353 round 3): production code does NOT call this
+     * reset. The one-shot-per-epoch semantic is preserved purely by
+     * the `oneShotLatchConsumedAtEpoch == epoch` equality check
+     * inside [debugForceMode2Synthetic] — each new Connected emission
+     * brings a new [wsSessionEpoch], so a stale "last consumed epoch"
+     * naturally fails to equal the current epoch and a fresh
+     * allowance is implicit. An explicit reset on the Connected emit
+     * was REMOVED in round 3 because it raced against synthetic
+     * claims that had already taken the mutex (Vladislav, PR #353
+     * round 2 review). Tests that want to simulate a "fresh epoch
+     * with old latch state" use [bumpSessionEpochForTest] instead;
+     * this method is kept for the narrow case of asserting the
+     * pre-reset latch behaviour.
      */
     internal fun resetOneShotLatchForTest() {
         oneShotLatchConsumedAtEpoch = null
@@ -1161,13 +1173,21 @@ class KtorRelayTransport(
                             WsSessionLifecycleEvent.Connected(mySession)
                         ).isSuccess
                     ) { "WS lifecycle channel unexpectedly closed (Connected emission epoch=$mySession)" }
-                    // QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §13.3.9 Part A:
-                    // reset the one-shot latch on each new Connected so the next
-                    // session epoch gets a fresh allowance for the L1 synthetic
-                    // trigger. The reset MUST live here — after the Connected
-                    // event is enqueued so the dispatcher cannot observe a
-                    // synthetic before the matching Connected.
-                    oneShotLatchConsumedAtEpoch = null
+                    // QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §13.3.9 Part A
+                    // (round 3 fix): the one-shot latch is NOT reset on
+                    // Connected. The semantic ("one synthetic per
+                    // Connected epoch") is preserved purely by the
+                    // `oneShotLatchConsumedAtEpoch == epoch` equality
+                    // check inside `debugForceMode2Synthetic` — each new
+                    // session brings a new `wsSessionEpoch`, so the
+                    // stored "last consumed epoch" naturally fails to
+                    // equal the new epoch and a fresh allowance is
+                    // implicit. Resetting here would race against a
+                    // synthetic claim that already took the mutex
+                    // (claim sets latch = mySession; this reset blows
+                    // it away; next operator call sees latch != epoch
+                    // and fires AGAIN for the same epoch). Caught in
+                    // PR #353 round 2 review.
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
