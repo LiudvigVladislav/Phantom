@@ -598,6 +598,39 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · Path-2 step 3 — L1 synthetic-trigger implementation (MB half of H-ME; Option A stacked on a28bb1d2)
+
+**Outcome:** Path-2 step 3 — first code PR delivering the MB half of the H-ME closure verdict. Stacks on path-2 step 2 (`a28bb1d2`) under the L1 mini-lock §5.1 Option A precondition so the initial diff is focused on the MB synthetic-trigger surface only (no ProGuard / R8 changes — those are inherited from base).
+
+Implementation closes all eleven L1 mini-lock locks plus the optional 6th `SyntheticTriggerResult` member:
+
+- **§4.6 / §4.7 / §5.1 / §6 / §7 / §8** — all binding constraints satisfied; §5.1 satisfied via Option A.
+- **§5.2 four-layer protected operator surface** — `DebugForceMode2Activity` mirrors `S6BreakerTriggerActivity` verbatim: (1) declared only in `apps/android/src/debug/AndroidManifest.xml`; (2) `android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"`; (3) `onCreate` re-checks `BuildConfig.DEBUG_FORCE_MODE_2_DETECTION == "1"` AND `BuildConfig.DEBUG == true`; (4) `AppContainer.triggerDebugForceMode2()` re-checks BuildConfig + `RestStateMachine.isStickyOrRecoveryActive`, then the `KtorRelayTransport` constructor-injected `debugForceMode2Enabled: Boolean` defaults to `false` in release as the final backstop.
+- **§7.2 D-1 dedup choice** — state-transition guard via `RestStateMachine.onWsSessionEnded`'s `RestActive` arm. Pre-flight analysis (2026-06-30) found `RestStateMachine.lastObservedEpoch` is Connected-side only; the duplicate-`Ended`-for-same-epoch scenario is naturally absorbed because the first `Ended` (synthetic OR real) transitions `WsActive → RestActive` and the second enters the `RestActive` arm where the comment says "Already in REST mode — a WS session close is expected and irrelevant". Sequential dispatcher consumption guarantees state visibility between events. No new dedup code required.
+- **§7.2 D-1 edge case** closed via the 6th `RefusedAlreadyArmed` member of `SyntheticTriggerResult`. Synthetic refuses to fire if `RestStateMachine.isStickyOrRecoveryActive == true` (sticky armed OR recovery in flight) so an operator-initiated trigger does not falsely fail an in-progress recovery candidate.
+
+**Pre-flight performed before greenlight:** §4-§9 mini-lock re-read on master; D-1/D-2/D-3 evaluation (D-1 selected based on state-transition guard analysis, not `lastObservedEpoch` filter); S6BreakerTriggerActivity four-layer pattern verified for verbatim copy; acceptance matrix markers re-verified against current master `a28bb1d2` (`mode_2_signature_matched action=`, `sticky_armed`, `sticky_cleared`, `MODE_2_MIN_DURATION_MS=25_000L`, `MODE_2_MAX_DURATION_MS=65_000L`) and PR #330 head `6f49cd89` (`ws_reconnect_quiesced`, `ws_recovery_probe_granted`, `ws_reconnect_resumed`, `ws_reconnect_open proof=`, plus `ws_recovery_proof_rejected` / `ws_recovery_route_change_revoked` / `ws_recovery_probe_attempt_ignored` / `ws_recovery_probe_attempt_failed` / `ws_recovery_probe_exhausted` for FAIL criteria). Zero marker drift.
+
+**Verified locally on branch head `feat/quiescence-l1-synthetic-trigger`:**
+
+- `:shared:core:transport:jvmTest` (including the new `SyntheticTriggerResultTest` and `KtorRelayTransportDebugForceMode2Test`) → BUILD SUCCESSFUL.
+- `:apps:android:testDebugUnitTest` (including the 3 new androidUnitTest cells) → BUILD SUCCESSFUL.
+- `:apps:android:assembleRelease` → `verifyR8StripsTestSeams self-test PASS — parser handles ranged method lines + class-level deny.` + `verifyR8StripsTestSeams PASS — no *ForTest* / debugForce* / *Synthetic* classes or members survived on any phantom.* class.` + BUILD SUCCESSFUL.
+
+The verifier PASS is the load-bearing release-binary safety guarantee: R8 strips `debugForceMode2Synthetic` / `setStateForTest` / `bumpSessionEpochForTest` / `resetOneShotLatchForTest` / `currentSessionEpoch` getter / `SyntheticTriggerResult` class on standard reachability analysis (no production code calls reach them in release because `DebugForceMode2Activity` is debug-overlay-only AND `AppContainer.triggerDebugForceMode2` short-circuits on `BuildConfig.DEBUG_FORCE_MODE_2_DETECTION != "1"` AND the constructor-injected Boolean is `false`).
+
+**Track status:** L1 mini-lock implementation MB half DELIVERED. RC PR #330 Draft / HOLD unchanged. B1 closure remains gated on the MC half (separate scope-lock; opens separately) AND a controlled Wi-Fi smoke run after both halves merge.
+
+**Key PRs:**
+
+- **#TBD (this PR)** — L1 synthetic-trigger implementation (10 files, ~1300 LOC). Branch `feat/quiescence-l1-synthetic-trigger`. Off master `a28bb1d2`.
+
+**Follow-ups:**
+
+- MC half scope-lock opens separately (NOT this PR's question). Likely extends `RestStateMachineTest` / `WsActivePollJobLifecycleTest` infrastructure or stacks on PR #330's added test files once PR #330's gate component lands.
+- After both halves merge: controlled Wi-Fi smoke run validates the end-to-end quiescence chain.
+- After Wi-Fi smoke PASS: B1 acceptance gate closes; PR #330 may proceed to Ready / smoke retry per its own mini-lock (operator decision).
+
 ### 2026-06-30 · Path-2 step 2 — ProGuard narrowing + verifyR8StripsTestSeams Gradle task + structural pin test (qualifying narrowing commit for L1 Option A)
 
 **Outcome:** First code change in the path-2 sequence after the methodology recon closed with H-ME verdict + the L1 mini-lock opened + the §5.1 Option A amendment. Narrowing-only PR with three artefacts: (a) `apps/android/proguard-rules.pro` removes the over-broad `-keep class phantom.core.transport.KtorRelayTransport { *; }` wildcard and replaces it with five targeted `-keepclassmembers` entries justified per call site / (b) `apps/android/build.gradle.kts` adds the `verifyR8StripsTestSeams` Gradle task wired as `finalizedBy assembleRelease` with deny patterns `*ForTest*` / `debugForce*` / `*Synthetic*` filtered to skip R8-internal `$$ExternalSyntheticLambda` / `$$InternalSyntheticLambda` containers / (c) new `KtorRelayTransportProguardNarrowingPinTest` in `androidUnitTest` structurally pins the wildcard absence + the targeted keep block presence + each of the five required member names. The narrowing-only PR is intended to merge first; the L1 implementation PR then opens under L1 mini-lock §5.1 Option A citing this PR's squash SHA verbatim.

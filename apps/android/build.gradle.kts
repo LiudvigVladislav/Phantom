@@ -447,6 +447,27 @@ android {
                 "\"$s6DebugTriggerEnabled\"",
             )
 
+            // QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK (2026-06-30).
+            // L1 synthetic-trigger debug flag. Wires the optional
+            // `debugForceMode2Enabled: Boolean` constructor parameter on
+            // `phantom.core.transport.KtorRelayTransport` per the L1
+            // mini-lock §4.6 / §5.1. Default `"0"` even on debug — the
+            // operator must explicitly opt in via `-PdebugForceMode2=1`
+            // or `DEBUG_FORCE_MODE_2_DETECTION=1` env. Mirrors the
+            // String "1"/"0" idiom of `MODE_2_FAST_PATH_ENABLED` /
+            // `MODE_2_STICKY_ENABLED` / `S6_DEBUG_TRIGGER_ENABLED`.
+            // Release pin lives in the release-block declaration below.
+            val debugForceMode2Enabled = localOrEnv(
+                "debugForceMode2",
+                "DEBUG_FORCE_MODE_2_DETECTION",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "DEBUG_FORCE_MODE_2_DETECTION",
+                "\"$debugForceMode2Enabled\"",
+            )
+
             // Trek 2 Stage 2B-B Round 12 step 3 — diagnostic toggle
             // that drops BOTH `X-Phantom-Long-Poll` AND
             // `X-Phantom-Padded-Poll` opt-in headers from the
@@ -710,6 +731,15 @@ android {
             // dispatched. Defence-in-depth backstop per the same
             // OQ7 idiom as `LONGPOLL_V2_ENABLED`.
             buildConfigField("String", "S6_DEBUG_TRIGGER_ENABLED", "\"0\"")
+            // QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK (2026-06-30).
+            // Release builds ALWAYS pin the L1 synthetic-trigger debug
+            // flag to `"0"`. The AppContainer wire-up reads this value
+            // and refuses to call `KtorRelayTransport.debugForceMode2Synthetic`;
+            // the constructor-injected Boolean defaults to `false` in
+            // release so even an out-of-band invocation refuses with
+            // `RefusedDisabled`. Defence-in-depth backstop per the
+            // String "1"/"0" idiom of the other release-pinned flags.
+            buildConfigField("String", "DEBUG_FORCE_MODE_2_DETECTION", "\"0\"")
 
             // Trek 2 Stage 2B-B Round 12 step 3 — release pin. The
             // diagnostic LP+PP-strip toggle MUST be off in release

@@ -180,6 +180,35 @@ class RestStateMachine(
     /** R3.6: sticky-recovery lifecycle states. */
     private enum class StickyRecoveryState { None, PendingNewSession, InFlight }
 
+    /**
+     * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §7.2 D-1 edge-case
+     * accessor (2026-06-30). Returns `true` if either (a) the sticky
+     * REST window is currently armed
+     * ([mode2StickyRestActive] == true) or (b) recovery is pending or
+     * in flight ([stickyRecovery] != [StickyRecoveryState.None]).
+     *
+     * Used by the Android-side `AppContainer.triggerDebugForceMode2`
+     * wrapper to refuse an operator-initiated L1 synthetic trigger
+     * while a previous Mode 2 actuation's sticky window or recovery
+     * probation is in flight. Without this check, a synthetic
+     * `WsSessionLifecycleEvent.Ended` enqueued during recovery would
+     * enter the `WsCandidate` arm of [onWsSessionEnded] and falsely
+     * trigger the `sticky_recovery_stale_close` or
+     * `candidate_session_regression` branch, regressing the in-flight
+     * recovery.
+     *
+     * Returns [SyntheticTriggerResult.RefusedAlreadyArmed] when
+     * surfaced as the wrapper's typed result.
+     *
+     * Threading: this is a pure-read accessor returning a snapshot of
+     * the two boolean state fields. The caller (AppContainer) reads it
+     * on the same coroutine context the state machine uses for
+     * mutations.
+     */
+    val isStickyOrRecoveryActive: Boolean
+        get() = mode2StickyRestActive ||
+            stickyRecovery != StickyRecoveryState.None
+
     init {
         // R3.6 build-time invariant: sticky requires fast-path to be enabled.
         require(!(mode2StickyEnabled && !mode2FastPathEnabled)) {

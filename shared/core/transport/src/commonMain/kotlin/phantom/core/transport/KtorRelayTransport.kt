@@ -172,6 +172,19 @@ class KtorRelayTransport(
      * re-instantiation. Null port = direct.
      */
     private val httpClientFactory: (socksProxyPort: Int?) -> HttpClient,
+    /**
+     * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §4.6 (L-13.3.8) gate
+     * for [debugForceMode2Synthetic]. `true` enables the L1 synthetic
+     * trigger path; `false` (default + release pin) causes
+     * [debugForceMode2Synthetic] to return
+     * [SyntheticTriggerResult.RefusedDisabled] without inspecting any
+     * other state and without logging anything that reveals the
+     * synthetic-trigger surface. Wired by Android-side `AppContainer`
+     * reading `phantom.android.BuildConfig.DEBUG_FORCE_MODE_2_DETECTION == "1"`
+     * and passing the Boolean down per the existing `mode2FastPathEnabled`
+     * wiring pattern. `commonMain` never reads `BuildConfig` directly.
+     */
+    private val debugForceMode2Enabled: Boolean = false,
 ) : RelayTransport {
 
     private val json = Json {
@@ -555,6 +568,204 @@ class KtorRelayTransport(
     // gen=3 s=7, the log line `[gen=3 s=5]` reveals the zombie precisely.
     @Volatile private var wsSessionEpoch: Long = 0L
 
+    // ── QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §7 (L-13.3.9) ────────
+    //
+    // One-shot latch for [debugForceMode2Synthetic]. Stores the
+    // `wsSessionEpoch` value at which the synthetic last fired, so a
+    // second call with the SAME epoch returns
+    // [SyntheticTriggerResult.RefusedAlreadyFired]. Reset to `null` on
+    // every observed [WsSessionLifecycleEvent.Connected] emission so a
+    // new session epoch gets a fresh one-shot allowance. Closes the
+    // §13.3.9 Part A repeated-trigger DoS surface identified by the L1
+    // mini-lock security council.
+    //
+    // Neutral name (no `*ForTest*` / `debugForce*` / `*Synthetic*`
+    // substring) so R8 strips the field on standard reachability
+    // analysis when [debugForceMode2Synthetic] is unreachable in
+    // release. The `verifyR8StripsTestSeams` Gradle task is the runtime
+    // backstop for the name's deny patterns.
+    @Volatile private var oneShotLatchConsumedAtEpoch: Long? = null
+
+    /**
+     * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §7.1 accessor — returns
+     * the current `wsSessionEpoch` IF the transport is presently
+     * [TransportState.Connected]; otherwise `null`. Read once at the top
+     * of [debugForceMode2Synthetic] so the synthetic event carries the
+     * snapshot epoch, not a stale re-read after a possible session
+     * death in the check-then-trySend race window.
+     *
+     * Visibility is `internal` — accessible from `commonTest` for the
+     * L1 mini-lock §7.3 adversarial race-window tests but not from
+     * cross-module production code. R8 strips the accessor on standard
+     * reachability analysis when [debugForceMode2Synthetic] is
+     * unreachable in release.
+     */
+    /**
+     * Note on Kotlin visibility: marked `public` because the production
+     * caller is [phantom.android.di.AppContainer] in a separate Gradle
+     * module — Kotlin `internal` is module-scoped and would block the
+     * cross-module read. The L1 mini-lock §7.1 framing of "internal
+     * accessor" is preserved by (a) the neutral name not matching any
+     * `verifyR8StripsTestSeams` deny pattern so R8 standard
+     * reachability analysis strips it from release when
+     * [debugForceMode2Synthetic] is unreachable, and (b) no public
+     * alias being added to documentation. Not part of the
+     * [RelayTransport] interface.
+     */
+    val currentSessionEpoch: Long?
+        get() = if (_state.value is TransportState.Connected) wsSessionEpoch else null
+
+    /**
+     * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §6 + §7 + §13.3.9
+     * synthetic Mode 2 trigger. Enqueues a synthetic
+     * [WsSessionLifecycleEvent.Ended] event into [_wsSessionLifecycle]
+     * so the production dispatcher's two downstream consumers
+     * (state-machine actuation + telemetry detector) run unchanged on
+     * the same code path a real Mode 2 wire-level death would
+     * exercise. Returns a typed [SyntheticTriggerResult] documenting
+     * the outcome.
+     *
+     * Gate order (each refusal short-circuits the next):
+     *
+     *   1. [debugForceMode2Enabled] constructor flag is `false` →
+     *      [SyntheticTriggerResult.RefusedDisabled]. The release-pin
+     *      AppContainer wiring injects `false` so the surface is inert
+     *      in release builds even if the method survives R8 (the
+     *      `verifyR8StripsTestSeams` Gradle task asserts it does NOT
+     *      survive in standard release builds).
+     *   2. [currentSessionEpoch] is `null` (transport not Connected) →
+     *      [SyntheticTriggerResult.RefusedNotConnected]. Closes the
+     *      L1 mini-lock §7.1 Connected-precondition contract.
+     *   3. [durationMs] is outside the Mode 2 signature window
+     *      `MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS` →
+     *      [SyntheticTriggerResult.RefusedDurationOutOfRange] carrying
+     *      the requested value and the bounds.
+     *   4. [oneShotLatchConsumedAtEpoch] equals the snapshot epoch →
+     *      [SyntheticTriggerResult.RefusedAlreadyFired]. The latch
+     *      resets to `null` on each new
+     *      [WsSessionLifecycleEvent.Connected] emission so the next
+     *      session gets a fresh one-shot allowance.
+     *
+     * If all four gates pass: the latch is consumed for the snapshot
+     * epoch, a synthetic [WsSessionLifecycleEvent.Ended] is constructed
+     * with the production constructor (no field overrides), and
+     * `trySend(...)` enqueues it into [_wsSessionLifecycle].
+     * `closeOrigin = "synthetic"` is the L1 mini-lock §13.3.4 telemetry
+     * tell — distinguishes synthetic from real `local / remote / error
+     * / unknown` close origins in post-mortem; the dispatcher and the
+     * state machine do NOT branch on this value (the §13.3.4
+     * non-branching discipline is enforced by a grep-style
+     * negative-presence test in `commonTest`).
+     *
+     * D-1 dedup verdict (L1 mini-lock §7.2): the existing
+     * [RestStateMachine] mode-transition guard absorbs the duplicate
+     * `Ended` for the same epoch — after the first event (synthetic
+     * OR real) moves `WsActive → RestActive`, the second event enters
+     * the `RestActive` arm of [RestStateMachine.onWsSessionEnded] and
+     * is silently absorbed (comment at line 384: "Already in REST mode
+     * — a WS session close is expected and irrelevant"). The
+     * dispatcher's sequential single-consumer-coroutine guarantee
+     * ensures state visibility between events. No new dedup code
+     * required.
+     *
+     * The `RefusedAlreadyArmed` sibling result lives on the AppContainer
+     * wrapper (`triggerDebugForceMode2`) — it consults the
+     * orchestrator's [RestStateMachine.isStickyOrRecoveryActive]
+     * accessor BEFORE calling this method, refusing to fire an
+     * operator-initiated trigger while a previous Mode 2's sticky
+     * window or recovery probation is in flight (would falsely fail
+     * the recovery candidate via the `sticky_recovery_stale_close`
+     * branch).
+     *
+     * Note on Kotlin visibility: marked `public` because the production
+     * caller is [phantom.android.di.AppContainer] in a separate Gradle
+     * module — Kotlin `internal` is module-scoped and would block the
+     * cross-module call. The L1 mini-lock §6 framing of "internal fun"
+     * is preserved by (a) the method's name matching the
+     * `verifyR8StripsTestSeams` `debugForce.*` deny pattern, so a
+     * regression that keeps it in release `mapping.txt` fails the
+     * release build, AND (b) R8 standard reachability analysis strips
+     * it on its own when the production caller (AppContainer) is gated
+     * by `BuildConfig.DEBUG_FORCE_MODE_2_DETECTION = "0"` in release —
+     * the field default `false` short-circuits the AppContainer wrapper
+     * `triggerDebugForceMode2` BEFORE this method is called. Not part
+     * of the [RelayTransport] interface.
+     */
+    fun debugForceMode2Synthetic(durationMs: Long): SyntheticTriggerResult {
+        if (!debugForceMode2Enabled) {
+            return SyntheticTriggerResult.RefusedDisabled
+        }
+        val epoch = currentSessionEpoch
+            ?: return SyntheticTriggerResult.RefusedNotConnected
+        if (durationMs !in RestStateMachine.MODE_2_MIN_DURATION_MS..RestStateMachine.MODE_2_MAX_DURATION_MS) {
+            return SyntheticTriggerResult.RefusedDurationOutOfRange(
+                requestedMs = durationMs,
+                minMs = RestStateMachine.MODE_2_MIN_DURATION_MS,
+                maxMs = RestStateMachine.MODE_2_MAX_DURATION_MS,
+            )
+        }
+        if (oneShotLatchConsumedAtEpoch == epoch) {
+            return SyntheticTriggerResult.RefusedAlreadyFired
+        }
+        oneShotLatchConsumedAtEpoch = epoch
+        val synthetic = WsSessionLifecycleEvent.Ended(
+            durationMs = durationMs,
+            inboundFrames = 0,
+            pendingAcksAtClose = pendingAckCount,
+            closeOrigin = "synthetic",
+            closeError = "DEBUG_FORCE_MODE_2_DETECTION synthetic trigger",
+            okhttpPingTimeoutDetected = true,
+            sessionEpoch = epoch,
+        )
+        _wsSessionLifecycle.trySend(synthetic)
+        return SyntheticTriggerResult.Fired
+    }
+
+    /**
+     * Test-only seam for the L1 mini-lock §7.3 adversarial race-window
+     * tests and the `RefusedNotConnected` / `RefusedDisabled` /
+     * `RefusedDurationOutOfRange` / `RefusedAlreadyFired` /
+     * [SyntheticTriggerResult.Fired] coverage cells. Force-sets
+     * [_state] to the supplied value WITHOUT going through the real
+     * WS handshake / disconnect path; the next reader of [state]
+     * observes the forced value. Pairs with [bumpSessionEpochForTest]
+     * which advances [wsSessionEpoch] without going through the real
+     * reconnect loop.
+     *
+     * Name matches the `*ForTest*` deny pattern; the
+     * `verifyR8StripsTestSeams` Gradle task fails the release build
+     * if this method survives R8.
+     */
+    internal fun setStateForTest(state: TransportState) {
+        _state.value = state
+    }
+
+    /**
+     * Test-only seam for the L1 mini-lock §7.3 adversarial tests and
+     * the latch-reset-on-Connected cell. Advances [wsSessionEpoch] by
+     * one and returns the new value WITHOUT going through the real WS
+     * handshake. Name matches the `*ForTest*` deny pattern; R8 + the
+     * `verifyR8StripsTestSeams` Gradle task strip + assert-strip in
+     * release.
+     */
+    internal fun bumpSessionEpochForTest(): Long {
+        wsSessionEpoch += 1
+        return wsSessionEpoch
+    }
+
+    /**
+     * Test-only seam for the latch-reset coverage cell. Resets
+     * [oneShotLatchConsumedAtEpoch] to `null` so the next
+     * [debugForceMode2Synthetic] call gets a fresh one-shot allowance.
+     * In production the latch is reset by the
+     * [WsSessionLifecycleEvent.Connected] emission inside
+     * `runReconnectLoop`'s `webSocket { ... }` block; tests cannot
+     * easily reach that path without standing up a full WS handshake.
+     */
+    internal fun resetOneShotLatchForTest() {
+        oneShotLatchConsumedAtEpoch = null
+    }
+
     private fun genTag(): String = "[gen=$connectionGeneration s=$wsSessionEpoch]"
 
     private fun genTag(mySession: Long): String =
@@ -918,6 +1129,13 @@ class KtorRelayTransport(
                             WsSessionLifecycleEvent.Connected(mySession)
                         ).isSuccess
                     ) { "WS lifecycle channel unexpectedly closed (Connected emission epoch=$mySession)" }
+                    // QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §13.3.9 Part A:
+                    // reset the one-shot latch on each new Connected so the next
+                    // session epoch gets a fresh allowance for the L1 synthetic
+                    // trigger. The reset MUST live here — after the Connected
+                    // event is enqueued so the dispatcher cannot observe a
+                    // synthetic before the matching Connected.
+                    oneShotLatchConsumedAtEpoch = null
                     attempt = 0 // reset backoff on successful connect
 
                     val transportScope = CoroutineScope(Dispatchers.Default + SupervisorJob())

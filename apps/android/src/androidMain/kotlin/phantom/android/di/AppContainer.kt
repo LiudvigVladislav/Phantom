@@ -183,6 +183,71 @@ class AppContainer(private val context: Context) {
      * refuse and the caller observes the refusal log instead of
      * the trigger log.
      */
+    /**
+     * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §5.2 layer 4 wrapper
+     * (2026-06-30) for the L1 synthetic-trigger debug surface. Routes
+     * an `adb shell am start -n phantom.android/phantom.android.dev.DebugForceMode2Activity`
+     * invocation into [phantom.core.transport.KtorRelayTransport.debugForceMode2Synthetic]
+     * after re-checking the BuildConfig gate AND the orchestrator's
+     * sticky-armed state.
+     *
+     * Defence-in-depth chain (per L1 mini-lock §5.2 four-layer model):
+     *
+     *   1. `phantom.android.dev.DebugForceMode2Activity` is declared
+     *      ONLY in `apps/android/src/debug/AndroidManifest.xml`.
+     *      Release APKs do not carry the manifest entry; the component
+     *      is invisible to `pm list packages -f`.
+     *   2. The debug-only declaration carries
+     *      `android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"`.
+     *      The shell uid (`adb shell am start` runs as 2000) satisfies
+     *      this signature-scoped permission; a co-installed third-party
+     *      app cannot.
+     *   3. The Activity's `onCreate` re-checks the
+     *      `DEBUG_FORCE_MODE_2_DETECTION` BuildConfig field AND the
+     *      build's debug-build classification. Refuses (`finish()`)
+     *      if either is false.
+     *   4. This method re-checks the same BuildConfig field + the
+     *      orchestrator's
+     *      [phantom.core.transport.RestStateMachine.isStickyOrRecoveryActive]
+     *      state. Refuses with [SyntheticTriggerResult.RefusedDisabled]
+     *      or [SyntheticTriggerResult.RefusedAlreadyArmed] before
+     *      reaching the transport. The orchestrator gate is the
+     *      load-bearing inner layer per the L1 mini-lock §5.2
+     *      "AppContainer re-check before reaching
+     *      KtorRelayTransport.debugForceMode2Synthetic" contract.
+     *
+     * Refusal semantics are the typed
+     * [phantom.core.transport.SyntheticTriggerResult] hierarchy from
+     * the L1 mini-lock §6 contract — diagnosis is structural, not
+     * log-pattern-match. See the per-member KDoc on each result for
+     * the failure cause.
+     *
+     * Returns immediately if any gate refuses; returns the transport's
+     * own outcome if all four gates pass.
+     */
+    fun triggerDebugForceMode2(durationMs: Long): phantom.core.transport.SyntheticTriggerResult {
+        if (phantom.android.BuildConfig.DEBUG_FORCE_MODE_2_DETECTION != "1") {
+            android.util.Log.w(
+                "Phantom/DebugForceMode2",
+                "triggerDebugForceMode2() refused: " +
+                    "BuildConfig.DEBUG_FORCE_MODE_2_DETECTION=" +
+                    "${phantom.android.BuildConfig.DEBUG_FORCE_MODE_2_DETECTION}",
+            )
+            return phantom.core.transport.SyntheticTriggerResult.RefusedDisabled
+        }
+        val orch = restOrchestratorRef
+        if (orch != null && orch.stateMachine.isStickyOrRecoveryActive) {
+            android.util.Log.w(
+                "Phantom/DebugForceMode2",
+                "triggerDebugForceMode2() refused: sticky window armed OR " +
+                    "recovery in flight — refusing to disrupt in-progress " +
+                    "Mode 2 actuation (L1 mini-lock §7.2 D-1 edge case)",
+            )
+            return phantom.core.transport.SyntheticTriggerResult.RefusedAlreadyArmed
+        }
+        return wsTransport.debugForceMode2Synthetic(durationMs)
+    }
+
     suspend fun triggerS6BreakerForDebug(): Boolean {
         if (phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED != "1") {
             android.util.Log.w(
@@ -711,7 +776,29 @@ class AppContainer(private val context: Context) {
             phantom.android.BuildConfig.DEBUG
     }
 
-    private val wsTransport = KtorRelayTransport(createHttpClientFactory())
+    // QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §4.6 (L-13.3.8) wiring:
+    // Android-side AppContainer reads `phantom.android.BuildConfig.DEBUG_FORCE_MODE_2_DETECTION`
+    // and passes the resulting Boolean down to `KtorRelayTransport` as the
+    // `debugForceMode2Enabled` constructor parameter. `commonMain` never
+    // reads `BuildConfig` directly. Mirrors the existing `mode2FastPathEnabled`
+    // / `mode2StickyEnabled` injection pattern at lines ~1348-1357.
+    //
+    // Release builds pin the BuildConfig field to `"0"` (see
+    // `apps/android/build.gradle.kts` release block), so this value
+    // resolves to `false` and the synthetic-trigger surface inside
+    // `KtorRelayTransport.debugForceMode2Synthetic` short-circuits with
+    // `SyntheticTriggerResult.RefusedDisabled` without inspecting any
+    // other state. The `verifyR8StripsTestSeams` Gradle task is the
+    // runtime backstop — `debugForceMode2Synthetic` matches the
+    // `debugForce.*` deny pattern so a regression that kept it in
+    // release `mapping.txt` fails the release build.
+    private val debugForceMode2EnabledFromBuildConfig: Boolean =
+        phantom.android.BuildConfig.DEBUG_FORCE_MODE_2_DETECTION == "1"
+
+    private val wsTransport = KtorRelayTransport(
+        httpClientFactory = createHttpClientFactory(),
+        debugForceMode2Enabled = debugForceMode2EnabledFromBuildConfig,
+    )
 
     /**
      * The [HybridRelayTransport] wrapper constructed inside [initMessaging]
