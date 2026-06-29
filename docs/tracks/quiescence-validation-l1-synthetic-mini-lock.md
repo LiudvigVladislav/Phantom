@@ -15,7 +15,7 @@ This mini-lock is the building blueprint that an implementation PR will satisfy.
 
 ## §2 Scope
 
-- Transcribe the eleven binding locks `L-13.3.1` through `L-13.3.11` from the methodology recon's §13.3 verdict as binding constraints on the implementation PR.
+- Bind the implementation PR to all eleven locks `L-13.3.1` through `L-13.3.11` from the methodology recon's §13.3 verdict, split across this mini-lock as follows: §4 carries the non-blocker / non-race locks (L-13.3.1 / L-13.3.2 / L-13.3.3 / L-13.3.4 / L-13.3.5 / L-13.3.8 / L-13.3.10 / L-13.3.11); §5 carries the two BLOCKER locks (L-13.3.6 / L-13.3.7); §7 carries the race-contract lock (L-13.3.9). Together §4 + §5 + §7 bind all eleven locks.
 - Promote the two security council BLOCKERS (`L-13.3.6` ProGuard narrowing, `L-13.3.7` S6-style four-layer operator surface) to formal preconditions that the implementation PR MUST satisfy before any code lands.
 - Formalise the `SyntheticTriggerResult` typed-return contract concretely: enum / sealed members, semantics, downstream caller obligations.
 - Formalise the race contract for the check-then-trySend window (`L-13.3.9` Part B): the epoch-snapshot discipline, the receiving-side dedup mechanism, and the adversarial test cells the implementation PR MUST include.
@@ -33,9 +33,9 @@ This mini-lock is the building blueprint that an implementation PR will satisfy.
 - **`closeOrigin` semantics outside the synthetic discipline.** The `local / remote / error / unknown` taxonomy is unchanged; `"synthetic"` is the additional tell, not a redefinition.
 - **N-4 / N-5.** Rejected by the closure verdict. Not re-opened.
 
-## §4 Binding constraints — transcribed from §13.3
+## §4 Binding constraints — non-blocker / non-race locks transcribed from §13.3
 
-The implementation PR is bound by all eleven locks from the methodology recon's closure verdict. Each is RESTATED here verbatim or near-verbatim with implementation-PR-facing implications added below it. The original §13.3 wording remains the authoritative text; this mini-lock binds the implementation PR to that text.
+The implementation PR is bound by eight locks below. The remaining three locks from §13.3 are bound elsewhere in this mini-lock: §5 carries the two BLOCKER locks (L-13.3.6 / L-13.3.7); §7 carries the race-contract lock (L-13.3.9). Together §4 + §5 + §7 bind all eleven of the methodology recon's closure verdicts. Each lock below is restated verbatim or near-verbatim with implementation-PR-facing implications added below it. The original §13.3 wording remains the authoritative text; this mini-lock binds the implementation PR to that text.
 
 ### §4.1 L-13.3.1 — Both halves required
 
@@ -75,12 +75,12 @@ The implementation PR adopts the matrix at `C:\temp\quiescence-h-me-council-2026
 
 On master HEAD, `apps/android/proguard-rules.pro:95` carries `-keep class phantom.core.transport.KtorRelayTransport { *; }`. This wildcard preserves every member of `KtorRelayTransport` in the release APK. If the implementation PR adds `internal fun debugForceMode2Synthetic(...)` under this wildcard, the method body — including the `_wsSessionLifecycle.trySend(...)` call and the `closeOrigin = "synthetic"` / `closeError = "DEBUG_FORCE_MODE_2_DETECTION"` string literals — survives R8 / ProGuard shrinking in release builds. The injected Boolean prevents actuation at the constructor-argument level, but the method body remains callable from within the same process.
 
-The implementation PR MUST satisfy ONE of:
+The implementation PR may open only if its **initial diff** already satisfies ONE of:
 
-- **Option A — Stack on PR #330's narrowing.** PR #330's mini-lock §2 plans to remove the wildcard and add a `verifyR8StripsTestSeams` Gradle task that fails the release build on any surviving `*ForTest` member. If that plan lands first, the implementation PR opens as a stack on top of PR #330 (or rebases after PR #330 merges). The implementation PR's commit message + body MUST cite the specific commit where the narrowing took effect.
-- **Option B — Include equivalent narrowing in the implementation PR itself.** The implementation PR removes the wildcard, adds a `verifyR8StripsTestSeams`-equivalent Gradle task, and includes a verification step in the PR's test set that asserts the synthetic-trigger method is stripped from the release APK. The PR body documents the narrowing rationale explicitly.
+- **Option A — Stack on already-landed PR #330 narrowing.** PR #330's mini-lock §2 plans to remove the wildcard and add a `verifyR8StripsTestSeams` Gradle task that fails the release build on any surviving `*ForTest` member. If that narrowing has already merged to master at the time the implementation PR opens, the implementation PR opens as a stack on top of that commit (or rebased after it). The implementation PR's commit message + body MUST cite the specific commit where the narrowing took effect. Under Option A, the implementation PR's initial diff does NOT carry ProGuard changes — they are inherited from the base commit.
+- **Option B — Include ProGuard narrowing + R8 verification in the same initial implementation PR diff.** The implementation PR's first commit (or its initial diff if the PR is single-commit) removes the wildcard, adds a `verifyR8StripsTestSeams`-equivalent Gradle task, and includes a verification step in the PR's test set that asserts the synthetic-trigger method is stripped from the release APK. The narrowing changes appear before or alongside any synthetic-trigger code in the diff; the PR body documents the narrowing rationale explicitly. Under Option B, the implementation PR's initial diff DOES carry the ProGuard changes.
 
-The implementation PR MUST NOT open without Option A or Option B satisfied. A PR that adds `debugForceMode2Synthetic` under the current wildcard is rejected at review without exception.
+A PR that adds `debugForceMode2Synthetic` without Option A or Option B in the same initial diff is rejected at review without exception. No code PR may land with the synthetic-trigger method under the wildcard, regardless of how the narrowing is staged.
 
 ### §5.2 L-13.3.7 — S6-style four-layer protected operator surface
 
