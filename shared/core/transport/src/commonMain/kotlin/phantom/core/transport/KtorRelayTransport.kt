@@ -573,11 +573,17 @@ class KtorRelayTransport(
     // One-shot latch for [debugForceMode2Synthetic]. Stores the
     // `wsSessionEpoch` value at which the synthetic last fired, so a
     // second call with the SAME epoch returns
-    // [SyntheticTriggerResult.RefusedAlreadyFired]. Reset to `null` on
-    // every observed [WsSessionLifecycleEvent.Connected] emission so a
-    // new session epoch gets a fresh one-shot allowance. Closes the
-    // §13.3.9 Part A repeated-trigger DoS surface identified by the L1
-    // mini-lock security council.
+    // [SyntheticTriggerResult.RefusedAlreadyFired]. The "fresh
+    // allowance on each new Connected epoch" semantic is implicit:
+    // production code does NOT reset this field on Connected; instead
+    // the equality check inside [debugForceMode2Synthetic] naturally
+    // fails when the stored "last consumed epoch" is from a previous
+    // session because [wsSessionEpoch] advances on each new Connected.
+    // A previous round had an explicit reset that raced against
+    // concurrent synthetic claims (the reset wiped a just-set claim
+    // and let the same epoch fire twice); the no-reset design closes
+    // that race. Closes the §13.3.9 Part A repeated-trigger DoS
+    // surface identified by the L1 mini-lock security council.
     //
     // The check-then-set on this field MUST happen under
     // [oneShotLatchMutex] so a concurrent double-fire (two coroutine
@@ -800,8 +806,8 @@ class KtorRelayTransport(
      * naturally fails to equal the current epoch and a fresh
      * allowance is implicit. An explicit reset on the Connected emit
      * was REMOVED in round 3 because it raced against synthetic
-     * claims that had already taken the mutex (Vladislav, PR #353
-     * round 2 review). Tests that want to simulate a "fresh epoch
+     * claims that had already taken the mutex (operator round-2
+     * review on PR #353). Tests that want to simulate a "fresh epoch
      * with old latch state" use [bumpSessionEpochForTest] instead;
      * this method is kept for the narrow case of asserting the
      * pre-reset latch behaviour.
