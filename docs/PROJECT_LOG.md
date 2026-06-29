@@ -598,6 +598,36 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 N-2 progress — fake-transport surface review on master HEAD
+
+**Outcome:** Second instrument N-2 completed immediately after PR #346 squash `e568d97b`. Source-read only; no operator devices touched; PR #330 untouched. New §11 appended to `docs/tracks/quiescence-validation-methodology-recon1.md` (~110 LOC) catalogues **16 fake-transport test doubles + 3 auxiliary doubles** on master HEAD and assesses each against the five quiescence-surface dimensions named in §5 (Mode 2 detector input signals, sticky window timing, recovery probe outcome, 60s probation / `ws_alive_60s` proof, self-reentry / dup / loss).
+
+Catalogue (16 fake-transport doubles + 3 auxiliary): 11 `RestFallbackTransport` doubles across 8 test files (`RestFallbackOrchestratorTest`, `RestFallbackOrchestratorPollLoopTest`, `WsActivePollJobLifecycleTest`, `AckInboundAndAdvanceCursorTest`, `BodyTimeoutContractTest`, `RestFallbackOrchestratorBreakerTest` × 2, `RestFallbackOrchestratorC6Test`, `RestFallbackOrchestratorVerifyAndPostureTest` × 3); 2 `RelayTransport` doubles (`FakeRelayTransportTest`, `DefaultMessagingServiceTest`); 3 `PreKeyPublishHttpTransport` doubles (`PreKeyApiClientTest`, `PreKeyPublishReliabilityTest`, `PreKeyPublishResnapshotTest`); plus 3 auxiliary (`FakeMediaAuthTokenProvider`, `CapturingTransportManagerLog`, `FakeLastSeenSeqRepository`).
+
+Per-dimension fidelity verdict on master HEAD — two honest counts (both apply):
+
+- **Per §5 framing (5 dimensions): 3 NOT MODELLED / 1 PARTIAL but bypasses fakes / 1 MIXED.**
+  - NOT MODELLED (3 of 5): Mode 2 detector input signals (no `RelayTransport` fake emits `WsSessionLifecycleEvent` — the interface doesn't surface lifecycle events at all). Sticky window timing (gate absent on master). Recovery probe outcome (gate absent).
+  - PARTIAL but bypasses fakes (1 of 5): 60s probation / `ws_alive_60s` proof. `RestStateMachineTest` exercises the numeric on master via controllable `now` driven directly into the production state machine — no fake transport is in the loop. The gate-side invocation of the same numeric is absent.
+  - MIXED (1 of 5): self-reentry / dup / loss — three sub-surfaces with distinct fidelity. WS-side self-reentry NOT MODELLED. WS-side gate-coordinated dup / loss NOT MODELLED (gate absent). REST-side dup / loss FAITHFULLY MODELLED (`Idempotency-Key` plumbing genuinely surfaced; `RestInboundDeduplicator` `Emit / SkipNoAck / ReAck` discipline well-covered; end-to-end FIFO covered via internal test seams on production `KtorRelayTransport`, no fake transport involved).
+- **Per §11.3 row-level table (7 rows splitting the MIXED dimension): 5 NOT MODELLED / 1 PARTIAL / 1 FAITHFULLY MODELLED.**
+
+Structural finding (§11.4): master HEAD fakes are **interface-shaped, not lifecycle-shaped**. Each component is unit-test-scaffolded in isolation (orchestrator via fake, state machine via controllable `now`, detector via virtual state provider). No fake on master HEAD emits the cross-component signals a quiescence-chain integration validation would have to observe. The closest existing lifecycle-shaped pattern is `WsLifecycleCollectorSideEffectsTest` (android, 3 tests) which bypasses transports entirely and drives `WsSessionLifecycleEvent.Ended → toLegacyEndedEvent → feedDegradationDetectorOnWsSessionEnded` against a real `WsDegradationDetector` — but it stops at the detector verdict and does not exercise downstream gate behaviour (because the gate does not exist on master HEAD).
+
+Per §9 hand-off rule: N-2 progress note does NOT propose a methodology. N-2 does NOT decide whether the fakes could be extended into a gate-validating shape (that question presupposes a methodology choice). N-2 does NOT decide whether PR #330's own added test files provide an integration-shaped infrastructure (those are on PR #330's branch only and out of "master HEAD" scope).
+
+**Track status:** QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 still Open. N-1 + N-2 instruments complete. N-3 / N-4 / N-5 candidates remain — operator chooses which (if any) to run next. RC PR #330 Draft / HOLD unchanged. DIRECT-WSS-MODE2-RECON1 §11 / §12 unchanged.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — N-2 progress amendment on `quiescence-validation-methodology-recon1.md` (~110 LOC). Branch `docs/quiescence-validation-n2-fake-surface`. Off master `e568d97b`.
+
+**Follow-ups:**
+
+- Operator decides next instrument (or parks). Candidates per §5: N-3 synthetic-trigger debug-flag design exercise / N-4 third-network-class survey / N-5 release-gate review against PR #330's user population. The recon does NOT recommend any of them.
+- If the operator parks further N-x work, the recon parks per §7 P-2 with the N-1 + N-2 evidence on record.
+- Methodology recommendation is NOT permitted in any N-x progress note per §9. The recon's closure verdict comes after instrument evidence supports one of §6's acceptance gates.
+
 ### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 N-1 progress — existing-test inventory on master HEAD
 
 **Outcome:** First instrument N-1 completed. Source-read only; no operator devices touched; PR #330 untouched. New §10 appended to `docs/tracks/quiescence-validation-methodology-recon1.md` (`+106 LOC`) catalogues 26 relevant test files across `shared/core/transport/src/commonTest` and `apps/android/src/androidUnitTest` and maps per-Phase-B-hypothesis coverage on master HEAD.

@@ -184,3 +184,108 @@ N-2 is operator-scheduled. Do NOT auto-start.
 If the operator chooses to promote a different instrument first (e.g., N-3 synthetic-trigger design exercise, given the structural result that the gate's load-bearing surface is entirely PR #330-introduced), the §5 phrasing "natural instrument order" does not foreclose that choice.
 
 Do NOT promote any methodology in any future N-x progress note. Per §9.
+
+## §11 N-2 progress — fake-transport surface review on master HEAD (2026-06-29)
+
+Operator-greenlit immediately after PR #346 squash `e568d97b`. Source-read only; no operator devices touched; PR #330 untouched. Scope per §5: read the test-only fakes that the existing tests use and assess whether they faithfully model the surface PR #330's quiescence chain interacts with (Mode 2 detector input signals, sticky window timing, recovery probe outcome, 60s probation / `ws_alive_60s` proof, self-reentry / duplicate / loss). NOT a methodology recommendation per §9 hand-off rule.
+
+### §11.1 Fake-transport catalogue on master HEAD
+
+**16 fake-transport doubles across three production-interface groups, plus 3 auxiliary doubles** referenced by the same tests. Each double is either a `private class` inline in its consuming test file or a top-level test-only class.
+
+**`RestFallbackTransport` doubles (11 instances across 8 test files)**
+
+| Location | Name | Surface shape |
+|---|---|---|
+| `RestFallbackOrchestratorTest.kt:42` | `FakeTransport` | Script-driven session / send / poll / ack; tracks call lists (`sendCalls`, `pollCalls`, `ackCalls`) |
+| `RestFallbackOrchestratorPollLoopTest.kt:107` | (inline) | Adds barrier semantics (`pollBarrier`, `firstPollLanded`, `secondPollLanded`, `pollEnterCount`) for concurrent two-poll-loops testing |
+| `WsActivePollJobLifecycleTest.kt:45` | `FakeTransport` | Tracks `pollSinceSeqs`, `pollLongPollOptIns`, `pollReadTimeouts` for B3 M3 / M5 / M6 / M7 lifecycle |
+| `AckInboundAndAdvanceCursorTest.kt:100` | `FakeTransport` | Narrow — `send` and `poll` `fail()` explicitly; only `authSession` + `ackDeliver` are scripted for C3 ack tests |
+| `BodyTimeoutContractTest.kt:425` | (inline) | Tracks `pollCalls`, `authCalls`, `ackCalls`; designed for body-timeout-after-headers scenario |
+| `RestFallbackOrchestratorBreakerTest.kt:2865` | (inline) | Script-by-call-index pattern for breaker scenarios |
+| `RestFallbackOrchestratorBreakerTest.kt:2954` | `RetryAfterTransport` | Script-by-call-index for typed `Retry-After` |
+| `RestFallbackOrchestratorC6Test.kt:1096` | `C6TestTransport` | Script-by-call-index for L10 jitter (`Csprng`) |
+| `RestFallbackOrchestratorVerifyAndPostureTest.kt:180` | `VerifyTransport` | Suspend session script for L2 verify-key publication |
+| `RestFallbackOrchestratorVerifyAndPostureTest.kt:999` | (inline) | Scheduler-aware, `shortCycleCount`-aware for L7 bad-MAC posture |
+| `RestFallbackOrchestratorVerifyAndPostureTest.kt:1831` | `PollLoopCountingTransport` | Counter assertions on poll-loop entry |
+
+**`RelayTransport` doubles (2 instances)**
+
+| Location | Name | Surface shape |
+|---|---|---|
+| `FakeRelayTransportTest.kt:24` | `FakeRelayTransport` | Self-test fixture. `state: MutableStateFlow<TransportState>` (Connected / Disconnected only); `incoming` and `acks` `emptyFlow()`; `lastPongElapsedMs`/`lastInboundFrameElapsedMs` fixed at 0 |
+| `DefaultMessagingServiceTest.kt:316` | `FakeRelayTransport` | Fuller. `incoming` is `MutableSharedFlow` so tests can drive `Deliver`. Adds `sendShouldSucceed` / `sendSuccessLimit` gates for PR-D2b.1 voice send-fail simulation. `acks` still `emptyFlow()`; no `WsSessionLifecycleEvent` channel |
+
+**`PreKeyPublishHttpTransport` doubles (3 instances)**
+
+| Location | Name | Surface shape |
+|---|---|---|
+| `PreKeyApiClientTest.kt:34` | (inline) | Fixed-status-code response double |
+| `PreKeyPublishReliabilityTest.kt:45` | `FakePreKeyPublishHttpTransport` | Script-by-attempt for retry / backoff tests |
+| `PreKeyPublishResnapshotTest.kt:64` | `ThrowThenSucceedPublishTransport` | Captures `bodyBytes` for snapshot diff verification |
+
+**Auxiliary doubles (3 — not transports, but referenced by the same tests)**
+
+| Location | Name | Purpose |
+|---|---|---|
+| `RestMediaAuthTokenProviderTest.kt:71` | `FakeMediaAuthTokenProvider` | Test-only auth provider |
+| `ProbeTraceTransportManagerTest.kt:370` | `CapturingTransportManagerLog` | `TransportManagerLog` capturer for `PROBE_TRACE` assertions |
+| `FakeLastSeenSeqRepository.kt` (top-level, `shared/core/storage/src/commonTest/`) | (top-level class) | Cursor repository test double used by orchestrator tests |
+
+### §11.2 Production interface surface vs the quiescence surface PR #330 introduces
+
+The five quiescence-surface dimensions named in §5 do not all map onto the production interfaces the fakes implement. The gap is structural:
+
+| Quiescence-surface dimension | Where it lives in production | Fakes that could in principle inject it on master HEAD |
+|---|---|---|
+| Mode 2 detector input signals | `WsSessionLifecycleEvent.Ended(reason=...)` emitted by `WsSessionLifecycleDispatcher` (R3.6, on master). The `WsDegradationDetector` consumes this stream, parses the `reason` via `PingTimeoutTextParser`, and computes `Mode2Detected` verdicts | NONE. `RelayTransport` interface has `state: StateFlow<TransportState>` (Connected / Disconnected) and no `WsSessionLifecycleEvent` flow. `FakeRelayTransport` (both flavours) cannot emit a session-end event with a reason text. `RestFallbackTransport` is REST-only and irrelevant to the WS lifecycle |
+| Sticky window timing | `WsReconnectGate.Quiesced` state and its arming logic | NONE. The gate component itself is ABSENT on master per §10. No fake can model a state that does not exist |
+| Recovery probe outcome | `WsReconnectGate.ProbeAvailable / ProbeClaimed` arbitration | NONE. Same reason |
+| 60s probation / `ws_alive_60s` proof | `RestStateMachine.WsCandidate → WsActive` after 60s alive-tick exists on master. Gate-side `CandidateProving → Open` (PR #330) is a different control-structure invocation of the same numeric | The numeric is tested in `RestStateMachineTest` directly without a fake transport — pure state-machine over controllable `now`. `RestFallbackTransport` fakes don't model the 60s timer; the state machine does it itself |
+| self-reentry / duplicate / loss | (a) WS-side "no autonomous spawn" is gate-mediated in PR #330. (b) REST-side dup / loss is covered by `RestInboundDeduplicator` (`Emit / SkipNoAck / ReAck` discipline) and the `Idempotency-Key` contract enforced by `RestFallbackTransport.send` | The REST-side half is FAITHFULLY MODELLED — `RestFallbackTransport` fakes naturally surface the `Idempotency-Key` parameter and let tests assert it's identical across retry attempts (covered by `RestFallbackOrchestratorTest`). The WS-side half is NOT modellable because the gate is absent |
+
+### §11.3 Per-quiescence-dimension fidelity summary
+
+The §5 framing has five dimensions; the last one (self-reentry / duplicate / loss) is split into three rows below because its three sub-surfaces (WS-side self-reentry, WS-side gate-coordinated dup / loss, REST-side dup / loss) have distinct fidelity profiles. **Two counts apply, and both are honest:**
+
+- **Per the §5 framing (5 dimensions): 3 NOT MODELLED (Mode 2 detector input signals, sticky window timing, recovery probe outcome), 1 PARTIAL but bypasses fakes (60s probation / `ws_alive_60s` proof), 1 MIXED (self-reentry / dup / loss — WS-side halves NOT MODELLED, REST-side half FAITHFULLY MODELLED).**
+- **Per the row-level table below (7 rows): 5 NOT MODELLED, 1 PARTIAL, 1 FAITHFULLY MODELLED.**
+
+| Row | Quiescence dimension / sub-surface | Fidelity on master HEAD fakes | Why |
+|---|---|---|---|
+| 1 | Mode 2 detector input signals | **NOT MODELLED** | The detector consumes `WsSessionLifecycleEvent.Ended`, which no production-interface fake on master HEAD emits. The existing detector test (`WsDegradationDetectorTest`) drives the detector directly via a virtual state provider — bypassing transports entirely. Honest for what it tests (detector pure logic); cannot drive a transport-integrated quiescence flow |
+| 2 | Sticky window timing | **NOT MODELLED** | Gate absent on master HEAD per §10.1 |
+| 3 | Recovery probe outcome | **NOT MODELLED** | Gate absent on master HEAD per §10.1 |
+| 4 | 60s probation / `ws_alive_60s` proof | **PARTIAL — but bypasses fakes** | `RestStateMachineTest` uses a controllable `now` function directly on the production `RestStateMachine` instance; no fake transport is in the loop. The numeric is honestly exercised on master, but the test mechanism is "drive the state machine in isolation", not "drive it through a fake transport". The gate-side invocation cannot be exercised because the gate is absent |
+| 5 | self-reentry (sub-surface of §5 dimension 5) | **NOT MODELLED** | The invariant "candidate WS dying does NOT autonomously spawn a new socket" is gate-mediated and gate is absent on master HEAD |
+| 6 | duplicate / loss — REST-side (sub-surface of §5 dimension 5) | **FAITHFULLY MODELLED** | `Idempotency-Key` plumbing is genuinely surfaced by `RestFallbackTransport` fakes; `RestFallbackOrchestratorTest` asserts the same key is used across all retry attempts. `RestInboundDeduplicatorTest` covers the `Emit / SkipNoAck / ReAck` discipline against a pure stub without a transport. End-to-end FIFO across live-send → ack-pending → outbox-requeue is covered by `KtorRelayTransportFifoTest` against the production `KtorRelayTransport` via internal test-only accessors — no fake transport involved |
+| 7 | duplicate / loss — WS-side, gate-coordinated quiescence window (sub-surface of §5 dimension 5) | **NOT MODELLED** | Gate absent on master HEAD |
+
+### §11.4 Structural finding: master HEAD fakes are interface-shaped, not lifecycle-shaped
+
+The master-HEAD fake-transport infrastructure is honest **unit-test scaffolding for each component in isolation** — orchestrator, state machine, detector, deduplicator, transport-FIFO — each driven through its own narrow test fixture. It is NOT integration-shaped: no fake transport on master HEAD emits the cross-component signals (`WsSessionLifecycleEvent`, gate transitions, sticky-armed event lines) that a quiescence-chain validation would have to observe.
+
+This pattern is internally consistent on master HEAD: the components that need a fake transport (orchestrator, breaker, jitter) get one; the components that don't (state machine driven via controllable `now`, detector driven via virtual state provider) do not. Adding a fake transport that drives the gate's input signals would require both (a) the gate to exist as a destination, and (b) extending the `WsSessionLifecycleDispatcher` interaction surface into the fake-transport pattern — neither of which is on master HEAD.
+
+The closest existing pattern is `WsLifecycleCollectorSideEffectsTest` (android, 3 tests) which constructs the chain `WsSessionLifecycleEvent.Ended → toLegacyEndedEvent → feedDegradationDetectorOnWsSessionEnded` against a real `WsDegradationDetector` instance — bypassing `RelayTransport` and `RestFallbackTransport` entirely. This is closer to the surface a quiescence integration test would need, but it stops at the detector verdict and does not exercise downstream gate behaviour (because the gate does not exist on master HEAD).
+
+### §11.5 What N-2 does NOT decide
+
+- N-2 does NOT propose H-MC, H-MD, H-ME, or any other methodology. Per §9 hand-off rule.
+- N-2 does NOT decide whether the fakes-as-currently-shaped could be extended into the gate-validating shape PR #330's hypothetical state-machine validation would need. The "could be extended" question is forward-looking design and would presuppose a methodology choice; that is out of §5 N-2's "models the right surface" framing.
+- N-2 does NOT decide whether PR #330's OWN added test files (eight files inventoried as a side-finding in §10.4) provide an integration-shaped fake infrastructure. They exist on PR #330's branch only and are out of N-2's "master HEAD" scope.
+- N-2 does NOT propose any code change. Per §3.
+
+### §11.6 Hand-off to N-3 / N-4 / N-5
+
+Per §5 the natural follow-on order from N-1 + N-2 to N-3 / N-4 / N-5 is conditional on what N-1 + N-2 surfaced. N-1 surfaced: load-bearing gate component absent on master; 0/6 hypotheses fully covered. N-2 surfaces: master-HEAD fakes are interface-shaped, not lifecycle-shaped; no fake on master HEAD can drive the gate's input signals because the gate is absent and because the WS-lifecycle surface is not modelled by any `RelayTransport` fake. The five §5 dimensions split into:
+
+- **NOT MODELLED (3 of 5 §5 dimensions):** Mode 2 detector input signals, sticky window timing, recovery probe outcome.
+- **PARTIAL but bypasses fakes (1 of 5):** 60s probation — exercised honestly on master but via direct state-machine driving, not via a fake transport.
+- **MIXED (1 of 5):** self-reentry / dup / loss. Per the §11.3 row-level split: WS-side self-reentry NOT MODELLED, WS-side gate-coordinated dup / loss NOT MODELLED, REST-side dup / loss FAITHFULLY MODELLED.
+
+The operator decides which instrument runs next. Candidates per §5 are N-3 (synthetic-trigger debug-flag design exercise — would address the "Mode 2 detector input signals" gap if the synthetic trigger were designed to feed the detector at the lifecycle-event boundary that `WsLifecycleCollectorSideEffectsTest` already exercises), N-4 (third-network-class survey — would address the gap by giving the field a venue where Mode 2 reproduces AND REST survives), N-5 (release-gate review against PR #330's user population — would address whether H-MF release-gate amendment is product-viable as a fallback). The recon does NOT recommend any of them; the operator's call.
+
+If the operator chooses to defer further N-x work, the recon parks per §7 P-2 with the N-1 + N-2 evidence on record.
+
+Do NOT propose a methodology in any subsequent N-x progress note. Per §9.
