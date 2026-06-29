@@ -598,6 +598,26 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK opened — implementation scope-lock for MB half of H-ME
+
+**Outcome:** Operator greenlit opening the MB-half implementation scope-lock immediately after the methodology recon closed with H-ME verdict (PR #349 squash `54f2e50d`). New track-doc at `docs/tracks/quiescence-validation-l1-synthetic-mini-lock.md` (227 lines) formalises the L1 synthetic-trigger implementation contract before any code lands.
+
+The mini-lock transcribes the eleven binding locks `L-13.3.1` through `L-13.3.11` from the methodology recon's §13.3 closure verdict as constraints on the implementation PR (§4); promotes the two security council BLOCKERS to formal preconditions that block PR opening until satisfied (§5 — `L-13.3.6` ProGuard narrowing with Option A "stack on PR #330's narrowing" or Option B "include equivalent narrowing in the implementation PR itself"; `L-13.3.7` S6-style four-layer protected operator surface with four-layer mapping required for any operator-trigger shape, raw `am broadcast` BroadcastReceiver without explicit four-layer mapping forbidden); formalises the `SyntheticTriggerResult` typed-return contract concretely as a sealed class with five required members `Fired / RefusedDisabled / RefusedNotConnected / RefusedDurationOutOfRange / RefusedAlreadyFired` plus the L-13.3.5-derived optional sixth `RefusedNoRestCapability` (§6); resolves the `L-13.3.9` Part B race contract by pinning three implementation-PR-binding requirements — single epoch snapshot at top of method, receiving-side dedup mechanism chosen from D-1 / D-2 / D-3 (rely on RestStateMachine epoch filter / dispatcher tuple dedup / method-level mutex), adversarial race-window tests that force a real session death between guard and `trySend` (§7); binds the implementation PR's test set to the source-grounded acceptance matrix at `C:\temp\quiescence-h-me-council-2026-06-29\tests.md` as test floor not ceiling (§8); specifies the implementation PR's hand-off contract — when it may open, what it must contain, what verdict it must produce (§9); records three park conditions (P-1 PR #330's narrowing plan changes / P-2 operator unavailable / P-3 architectural change in `KtorRelayTransport` or dispatcher); enumerates what is NOT pre-decided so the implementation PR retains design freedom on file naming, signature permission string, exact component name, exact dedup option, Gradle task implementation.
+
+Per §9 hand-off rule of the parent methodology recon and per this mini-lock's own §9: the implementation PR opens ONLY after this mini-lock merges. Pre-merge implementation work is rejected at review. The implementation PR's commit message + body MUST cite this mini-lock's squash SHA + the methodology recon's H-ME verdict SHA (`54f2e50d`) verbatim, and MUST state explicitly that B1 closure requires the MC half ALSO PASS (this PR delivers MB only).
+
+**Track status:** QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK Open. Implementation PR is the next deliverable when operator schedules; do NOT auto-start. RC PR #330 Draft / HOLD unchanged. DIRECT-WSS-MODE2-RECON1 §11 / §12 unchanged. Methodology recon stays Closed with verdict H-ME.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — L1 synthetic-trigger implementation mini-lock (227-line track-doc). Branch `docs/quiescence-validation-l1-synthetic-mini-lock`. Off master `54f2e50d`.
+
+**Follow-ups:**
+
+- Operator schedules the implementation PR. Pre-conditions: §5.1 Option A or Option B chosen (ProGuard narrowing satisfied), §5.2 four-layer operator surface mapping documented and tested, §6 `SyntheticTriggerResult` sealed class specified, §7.2 dedup option D-1 / D-2 / D-3 chosen and §7.3 adversarial tests included, §8 acceptance matrix re-verified against current master at opening, §9 hand-off items satisfied.
+- MC half scope-lock opens separately (NOT this mini-lock's question). Likely stacks on PR #330's added test files or extends on-master test infrastructure once PR #330's gate component lands.
+- Controlled Wi-Fi smoke run procedure opens AFTER both halves merge AND MC PASS + MB PASS land on record.
+
 ### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 closed with H-ME verdict — state-machine integration validation + L1 synthetic field trigger
 
 **Outcome:** Operator pivoted to closure per §6 acceptance gate #2 (combination MC + MB = H-ME) after the three source-read instruments N-1 + N-2 + N-3 produced sufficient evidence. NOT N-4 (no third network class identified within reasonable operator effort). NOT N-5 (release-gate amendment is not validation). NOT H-MC alone (master HEAD fakes are interface-shaped, not lifecycle-shaped per N-2 — state-machine tests alone cannot assert field-shape match). The recon's status flips from Open to **Closed (verdict H-ME, 2026-06-29)** in track-doc §1 + §13. PR #348 squash `98ee7e09` is the last known master at close.
