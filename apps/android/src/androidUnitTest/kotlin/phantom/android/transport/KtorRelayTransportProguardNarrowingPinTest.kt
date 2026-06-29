@@ -86,33 +86,67 @@ class KtorRelayTransportProguardNarrowingPinTest {
         "markPendingOutboundAcceptedByFallback",
     )
 
+    /**
+     * Returns `true` if [directiveLine] is a live ProGuard `-keep`-class
+     * directive (broad scope) that names the `KtorRelayTransport` class.
+     * Returns `false` for the narrow `-keepclassmembers` /
+     * `-keepclassmembernames` directives, which are the permitted shape
+     * path-2 step 2 uses for the targeted keeps.
+     *
+     * The check is intentionally permissive about ProGuard syntax
+     * variants: a line beginning with `-keep`, NOT `-keepclassmembers`
+     * / `-keepclassmembernames`, that mentions
+     * `phantom.core.transport.KtorRelayTransport` is rejected regardless
+     * of brace body shape (`{ *; }`, `{ public *; }`, `{ <init> *; }`,
+     * empty body, no body, etc.) and regardless of attached modifiers
+     * (`-keep,allowobfuscation`, `-keepnames`,
+     * `-keepclasseswithmembers`, etc.).
+     */
+    private fun isForbiddenKtorRelayDirective(directiveLine: String): Boolean {
+        val trimmed = directiveLine.trim()
+        if (!trimmed.startsWith("-keep")) return false
+        if (trimmed.startsWith("-keepclassmembers") ||
+            trimmed.startsWith("-keepclassmembernames")
+        ) {
+            return false
+        }
+        return trimmed.contains("phantom.core.transport.KtorRelayTransport")
+    }
+
     @Test
-    fun proguard_rules_does_not_carry_the_over_broad_ktorrelay_wildcard() {
+    fun proguard_rules_does_not_carry_any_broad_keep_directive_for_ktorrelay() {
         val source = loadProguardRules()
-        // The forbidden wildcard text is allowed to appear inside justification
+        // The wildcard text is allowed to appear inside justification
         // comments — that is how the path-2 narrowing's rationale documents
-        // what it removed. What is forbidden is the wildcard appearing as a
-        // live ProGuard DIRECTIVE: a non-comment line containing the wildcard
-        // shape. Lines starting with `#` are ProGuard comments and ignored by
-        // R8; lines starting with `-keep ... { *; }` are the directive shape
-        // we must reject.
+        // what it removed. What is forbidden is ANY broad `-keep` directive
+        // on the `KtorRelayTransport` class as a live ProGuard rule. Lines
+        // starting with `#` are ProGuard comments and ignored by R8.
         val directiveLines = source.lineSequence()
             .map { it.trimEnd() }
             .filterNot { it.trimStart().startsWith("#") }
             .toList()
-        val offending = directiveLines.firstOrNull { it.trim() == forbiddenWildcardLine }
+        val offending = directiveLines.firstOrNull { isForbiddenKtorRelayDirective(it) }
         assertTrue(
             offending == null,
-            "`apps/android/proguard-rules.pro` MUST NOT carry the wildcard\n" +
-                "  $forbiddenWildcardLine\n" +
-                "as a live directive (commented mentions in justification text are " +
-                "permitted). Found offending line: `$offending`. The wildcard was " +
-                "removed by the path-2 step 2 narrowing so R8 can strip production-test " +
-                "seams (`*ForTest`), future debug surfaces (`debugForce*`), and " +
-                "`*Synthetic*` members from the release APK. Re-introducing the " +
-                "wildcard silently bypasses the entire narrowing — the " +
-                "`verifyR8StripsTestSeams` Gradle task is the runtime catch, but the " +
-                "structural pin here is the source-of-truth catch in code review.",
+            "`apps/android/proguard-rules.pro` MUST NOT carry any broad `-keep` " +
+                "directive that preserves the `KtorRelayTransport` class. Offending " +
+                "line: `$offending`. Forbidden shapes include (but are not limited " +
+                "to):\n" +
+                "  -keep class phantom.core.transport.KtorRelayTransport { *; }\n" +
+                "  -keep class phantom.core.transport.KtorRelayTransport { public *; }\n" +
+                "  -keep,allowobfuscation class phantom.core.transport.KtorRelayTransport ...\n" +
+                "  -keepnames class phantom.core.transport.KtorRelayTransport ...\n" +
+                "  -keepclasseswithmembers class phantom.core.transport.KtorRelayTransport ...\n" +
+                "  -keepclasseswithmembernames class phantom.core.transport.KtorRelayTransport ...\n" +
+                "\n" +
+                "Permitted: `-keepclassmembers` / `-keepclassmembernames` with the " +
+                "targeted-members block path-2 step 2 introduced. Commented mentions " +
+                "in justification text are permitted (those are not directives). The " +
+                "wildcard removal lets R8 strip production-test seams (`*ForTest`), " +
+                "future debug surfaces (`debugForce*`), and `*Synthetic*` members from " +
+                "the release APK. The `verifyR8StripsTestSeams` Gradle task is the " +
+                "runtime catch; this structural pin is the source-of-truth catch in " +
+                "code review.",
         )
     }
 

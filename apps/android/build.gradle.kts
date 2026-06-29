@@ -801,36 +801,178 @@ android {
 // verifyR8StripsTestSeams — path-2 step 2 ProGuard narrowing verifier
 // --------------------------------------------------------------------------
 // Fails the release build if R8's `mapping.txt` shows that a forbidden
-// member pattern survived shrinking on any `phantom.*` class. Wired as
-// `finalizedBy assembleRelease` so the verification runs immediately
-// after the release APK is assembled and before the build is considered
-// successful.
+// CLASS or MEMBER pattern survived shrinking on any `phantom.*` class.
+// Wired as `finalizedBy assembleRelease` so the verification runs
+// immediately after the release APK is assembled and before the build is
+// considered successful.
 //
-// Forbidden member patterns (a member matching any of these in the
-// release `mapping.txt` is a hard failure):
+// Forbidden patterns (a class simple name OR a member name matching any
+// of these is a hard failure):
 //
 //   - `*ForTest*`     — production-test seams (e.g. `submitEventNow_internalForTest`)
 //   - `debugForce*`   — debug-only synthetic triggers (e.g. the future
 //                       `debugForceMode2Synthetic` from the L1 mini-lock)
 //   - `*Synthetic*`   — any class or member name carrying the synthetic
-//                       trigger discipline tell
+//                       trigger discipline tell (e.g. the future
+//                       `SyntheticTriggerResult` sealed class)
 //
 // The patterns are an explicit deny-list, NOT an allow-list. If a future
 // PR introduces a new debug-only surface, the surface MUST be either
 // stripped by R8 (no rule keeps it) or named such that it matches one of
 // the deny patterns above so this verifier catches a regression.
 //
-// Negative control: re-introducing `-keep class phantom.core.transport.KtorRelayTransport { *; }`
-// in `proguard-rules.pro` empirically fails this verifier with violations
-// from the wildcard-preserved test seams. The wildcard removal in this
-// PR's `proguard-rules.pro` change is the load-bearing companion.
+// Forward-looking design: today (path-2 step 2 ship) `KtorRelayTransport`
+// has no surviving `*ForTest*` / `debugForce*` / `*Synthetic*` members
+// on master HEAD, so the wildcard removal alone does not generate
+// violations. The verifier is the load-bearing catch for the FUTURE
+// regression (when the L1 implementation PR introduces
+// `debugForceMode2Synthetic` + `SyntheticTriggerResult`, re-introducing
+// the wildcard would then produce violations the verifier catches). The
+// `KtorRelayTransportProguardNarrowingPinTest` structural check in
+// `androidUnitTest` is today's catch — it asserts the wildcard is not
+// present as a live ProGuard directive in `proguard-rules.pro`.
+//
+// Parser-level self-test: the `doFirst` block exercises the parser with
+// a synthetic mapping fixture that covers (a) ranged R8 method lines
+// like `1:1:void debugForceMode2Synthetic(long):123:123 -> a` whose
+// naive `substringAfterLast(":")` parsing would extract the line number
+// instead of the method name, (b) class-level deny matches against the
+// simple-name segment of a phantom class, and (c) R8-internal class
+// containers (`$$ExternalSyntheticLambda`) which MUST be ignored. The
+// self-test fails the task before the real run if the parser regresses.
+
+/**
+ * Returns `phantom.foo.Bar#memberName` style violation entries for every
+ * member or class header in [mappingLines] whose original name matches
+ * one of [denyPatterns]. R8-internal lambda containers
+ * (`$$ExternalSyntheticLambda` / `$$InternalSyntheticLambda`) are skipped
+ * at the class level. Members whose original names begin with `$`
+ * (compiler-synthesised, e.g., `$r8$classId`, `f$0`) are skipped.
+ *
+ * Class headers themselves are also matched against the deny patterns,
+ * so a future `phantom.foo.SyntheticTriggerResult` surviving R8 trips
+ * the verifier even if none of its members match a deny pattern by
+ * themselves.
+ *
+ * Method names are extracted from the part BEFORE the opening `(` so
+ * ranged R8 method lines like `1:1:void name(args):startLine:endLine`
+ * yield the method's original simple name, not the line-range tail.
+ */
+fun parseMappingForForbiddenSurvivors(
+    mappingLines: Sequence<String>,
+    denyPatterns: List<Regex>,
+): List<String> {
+    val r8SyntheticClassMarker = "\$\$"
+    val compilerSyntheticMemberPrefix = "\$"
+    val violations = mutableListOf<String>()
+    var currentClass: String? = null
+    for (rawLine in mappingLines) {
+        val line = rawLine.trimEnd()
+        if (line.isEmpty() || line.startsWith("#")) {
+            continue
+        }
+        if (!line.startsWith("    ") && line.contains(" -> ")) {
+            // Class header line: `phantom.core.transport.KtorRelayTransport -> a.b.c:`
+            val originalName = line.substringBefore(" -> ").trim()
+            currentClass = originalName.takeIf {
+                it.startsWith("phantom.") &&
+                    !it.contains(r8SyntheticClassMarker)
+            }
+            // Check the class's simple name against deny patterns too. A
+            // surviving class whose simple name matches (e.g.,
+            // `SyntheticTriggerResult`) is a violation independent of
+            // member matches.
+            val simpleName = currentClass?.substringAfterLast('.')
+            if (simpleName != null && denyPatterns.any { it.matches(simpleName) }) {
+                violations += currentClass!!
+            }
+        } else if (currentClass != null && line.startsWith("    ")) {
+            // Member line. Two shapes:
+            //
+            //   Field: `    Type field -> a`
+            //          or `    Type field:line:line -> a`
+            //   Method: `    ReturnType method(args) -> a`
+            //           or `    line:line:ReturnType method(args):line:line -> a`
+            //
+            // Extract the original member name by:
+            //   1. Cut off the ` -> obfuscated` tail.
+            //   2. For methods, cut off the `(args)...` tail by splitting
+            //      on the first `(`.
+            //   3. The member name is the LAST whitespace-delimited token
+            //      in the surviving prefix (for methods: after the return
+            //      type; for fields: after the field type).
+            val beforeArrow = line.trim().substringBefore(" -> ")
+            val beforeParen = beforeArrow.substringBefore("(")
+            val memberName = beforeParen.substringAfterLast(' ')
+            if (memberName.startsWith(compilerSyntheticMemberPrefix)) {
+                continue
+            }
+            if (denyPatterns.any { it.matches(memberName) }) {
+                violations += "$currentClass#$memberName"
+            }
+        }
+    }
+    return violations
+}
+
 val verifyR8StripsTestSeams = tasks.register("verifyR8StripsTestSeams") {
     group = "verification"
     description =
-        "Verifies no `*ForTest*` / `debugForce*` / `*Synthetic*` patterns survive R8 on any `phantom.*` class in the release `mapping.txt`."
+        "Verifies no `*ForTest*` / `debugForce*` / `*Synthetic*` patterns survive R8 on any `phantom.*` class or member in the release `mapping.txt`."
 
     val mappingFile = layout.buildDirectory.file("outputs/mapping/release/mapping.txt")
     inputs.file(mappingFile).withPropertyName("mappingTxt")
+
+    val forbiddenPatterns = listOf(
+        Regex(".*ForTest.*"),
+        Regex("debugForce.*"),
+        Regex(".*Synthetic.*"),
+    )
+
+    doFirst {
+        // Parser self-test: exercise the parser against a synthetic mapping
+        // fixture so a future refactor that breaks the parser is caught
+        // before it silently masks the real run. Covers ranged R8 method
+        // lines (P1 regression), class-level deny matches, and R8-internal
+        // lambda container exclusions.
+        val syntheticMapping = """
+            phantom.core.transport.KtorRelayTransport -> a.a:
+                1:1:void connect():100:120 -> a
+                1:1:void debugForceMode2Synthetic(long):234:240 -> b
+                int submitEventNow_internalForTest -> c
+                java.lang.Object SyntheticTriggerResult -> d
+                kotlinx.coroutines.flow.Flow wsSessionLifecycle -> e
+                kotlinx.coroutines.flow.Flow getWsSessionLifecycle():350:350 -> e
+                int ${'$'}r8${'$'}classId -> f
+            phantom.foo.SyntheticTriggerResult -> b.a:
+                void foo() -> a
+            phantom.foo.SomeForTestHelper -> c.a:
+                void irrelevant() -> a
+            phantom.foo.bar.${'$'}${'$'}ExternalSyntheticLambda0 -> d.a:
+                int ${'$'}r8${'$'}classId -> a
+                java.lang.Object f${'$'}0 -> b
+        """.trimIndent()
+        val actual = parseMappingForForbiddenSurvivors(
+            mappingLines = syntheticMapping.lineSequence(),
+            denyPatterns = forbiddenPatterns,
+        ).toSet()
+        val expected = setOf(
+            // KtorRelayTransport survives but harbours forbidden members:
+            "phantom.core.transport.KtorRelayTransport#debugForceMode2Synthetic",
+            "phantom.core.transport.KtorRelayTransport#submitEventNow_internalForTest",
+            "phantom.core.transport.KtorRelayTransport#SyntheticTriggerResult",
+            // A whole class whose simple name carries a deny pattern:
+            "phantom.foo.SyntheticTriggerResult",
+            "phantom.foo.SomeForTestHelper",
+        )
+        check(actual == expected) {
+            "verifyR8StripsTestSeams parser self-test FAILED.\n" +
+                "  expected violations: $expected\n" +
+                "  actual violations:   $actual\n" +
+                "The parser is broken — the deny patterns will not catch real R8 mapping output."
+        }
+        logger.lifecycle("verifyR8StripsTestSeams self-test PASS — parser handles ranged method lines + class-level deny.")
+    }
 
     doLast {
         val mapping = mappingFile.get().asFile
@@ -838,70 +980,23 @@ val verifyR8StripsTestSeams = tasks.register("verifyR8StripsTestSeams") {
             "Expected R8 mapping at ${mapping.absolutePath} but it does not exist. " +
                 "Is `isMinifyEnabled = true` set on the release buildType?"
         }
-
-        val forbiddenPatterns = listOf(
-            Regex(".*ForTest.*"),
-            Regex("debugForce.*"),
-            Regex(".*Synthetic.*"),
-        )
-
-        // R8 emits its own synthetic lambda capture containers whose class
-        // names contain `$$ExternalSyntheticLambda` or `$$InternalSyntheticLambda`
-        // and whose member names use compiler-synthesised prefixes like
-        // `$r8$classId` or `f$N` (closure captures). These are infrastructure,
-        // not Phantom debug seams, and have no semantic relationship to the
-        // deny patterns we are guarding against. Skip them at the class level
-        // so the deny-list scan only sees Phantom's own type names.
-        val r8SyntheticClassMarker = "\$\$"
-        val compilerSyntheticMemberPrefix = "\$"
-
-        val violations = mutableListOf<String>()
-        var currentClass: String? = null
-        mapping.useLines { lines ->
-            for (rawLine in lines) {
-                val line = rawLine.trimEnd()
-                if (line.isEmpty() || line.startsWith("#")) {
-                    continue
-                }
-                if (!line.startsWith("    ") && line.contains(" -> ")) {
-                    // Class header line: `phantom.core.transport.KtorRelayTransport -> a.b.c:`
-                    val originalName = line.substringBefore(" -> ").trim()
-                    currentClass = originalName.takeIf {
-                        it.startsWith("phantom.") &&
-                            !it.contains(r8SyntheticClassMarker)
-                    }
-                } else if (currentClass != null && line.startsWith("    ")) {
-                    // Member line: `    void connect() -> a` or
-                    //              `    Type field -> a`.
-                    // Extract the member original name — last whitespace-
-                    // delimited token before " -> ", then strip method
-                    // parameter list if present.
-                    val original = line.trim().substringBefore(" -> ")
-                    val memberName = original
-                        .substringAfterLast(" ")
-                        .substringAfterLast(":")
-                        .substringBefore("(")
-                    if (memberName.startsWith(compilerSyntheticMemberPrefix)) {
-                        continue
-                    }
-                    if (forbiddenPatterns.any { it.matches(memberName) }) {
-                        violations += "$currentClass#$memberName"
-                    }
-                }
-            }
+        val violations = mapping.useLines { lines ->
+            parseMappingForForbiddenSurvivors(
+                mappingLines = lines,
+                denyPatterns = forbiddenPatterns,
+            )
         }
-
         if (violations.isNotEmpty()) {
             throw GradleException(
                 buildString {
                     appendLine(
                         "verifyR8StripsTestSeams FAILED — ${violations.size} forbidden " +
-                            "member(s) survived R8 on `phantom.*` classes:",
+                            "class(es) / member(s) survived R8 on `phantom.*` classes:",
                     )
                     violations.forEach { appendLine("  $it") }
                     appendLine()
                     appendLine(
-                        "Either (a) the offending member must be removed from production code, " +
+                        "Either (a) the offending class / member must be removed from production code, " +
                             "(b) `apps/android/proguard-rules.pro` must stop keeping it, or " +
                             "(c) the deny patterns in `verifyR8StripsTestSeams` are stale and " +
                             "must be updated (operator decision, not silent edit).",
@@ -911,7 +1006,7 @@ val verifyR8StripsTestSeams = tasks.register("verifyR8StripsTestSeams") {
         }
         logger.lifecycle(
             "verifyR8StripsTestSeams PASS — no `*ForTest*` / `debugForce*` / " +
-                "`*Synthetic*` members survived on any `phantom.*` class.",
+                "`*Synthetic*` classes or members survived on any `phantom.*` class.",
         )
     }
 }
