@@ -289,3 +289,91 @@ The operator decides which instrument runs next. Candidates per §5 are N-3 (syn
 If the operator chooses to defer further N-x work, the recon parks per §7 P-2 with the N-1 + N-2 evidence on record.
 
 Do NOT propose a methodology in any subsequent N-x progress note. Per §9.
+
+## §12 N-3 progress — synthetic-trigger debug-flag design exercise (2026-06-29)
+
+Operator-greenlit immediately after PR #347 squash `88cf810a`. Source-read + design sketch only; no code change; no operator devices touched; PR #330 untouched. Scope per §5: sketch what a `DEBUG_FORCE_MODE_2_DETECTION` flag would look like — where it injects, what production code path it touches, whether the resulting trigger exercises the SAME path the field would exercise on a real Mode 2 episode, vs. becoming a parallel test-only path that diverges from production. Output per §5: a feasibility note plus the load-bearing honesty constraint. Discriminates H-MB's risk profile. NOT a methodology recommendation per §9.
+
+### §12.1 Mode 2 detection chain on master HEAD (the destination a synthetic trigger would feed)
+
+On master HEAD the chain from "OkHttp WS death" to "sticky window armed" runs through **two parallel paths** that share a single upstream lifecycle event. Both paths matter; the synthetic trigger's injection point determines which paths it exercises.
+
+**Shared upstream:** `KtorRelayTransport` per-session `finally` block (`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/KtorRelayTransport.kt:1029`). Parses the close-error text via `PingTimeoutTextParser.parseSuccessfulPingPongs` to compute `okhttpPingTimeoutDetected: Boolean`. Then `_wsSessionLifecycle.trySend(WsSessionLifecycleEvent.Ended(durationMs, inboundFrames, pendingAcksAtClose, closeOrigin, closeError, okhttpPingTimeoutDetected, sessionEpoch))` (line 1030). The `_wsSessionLifecycle` is a `Channel<WsSessionLifecycleEvent>` (line 210), exposed as `wsSessionLifecycle: Flow` via `receiveAsFlow()` (line 224).
+
+**Path A — `WsDegradationDetector` (telemetry-only on master HEAD).**
+
+1. `WsSessionLifecycleDispatcher.dispatch(Ended)` (`apps/android/src/androidMain/kotlin/phantom/android/transport/WsSessionLifecycleDispatcher.kt:55`) calls `feedDegradationDetector(event.toLegacyEndedEvent())`.
+2. `feedDegradationDetectorOnWsSessionEnded` (`WsDegradationCollectorBindings.kt:50`) routes: if `event.okhttpPingTimeoutDetected` → `detector.recordAndEmit(WsDegradationDetector.Event.PingTimeout, currentKind)`. Always: `detector.emitSessionTotal(durationMs, closeOrigin)`.
+3. `WsDegradationDetector.recordAndEmit` (`WsDegradationDetector.kt:204`) appends to the sliding window, bumps per-session counter, emits `WS_DEGRADED_TELEMETRY counter` line, then emits `WS_DEGRADED detected` on the rising edge.
+4. **Telemetry only.** Per class KDoc (`WsDegradationDetector.kt:55`): "No `markSuspect` action. This detector only logs." The detector takes no actuation on master HEAD.
+
+**Path B — `RestStateMachine.onWsSessionEnded` Mode-2 fast-path actuation (R3.6 / 3.6 Fast REST degradation).**
+
+1. Same dispatcher event. If `restCapabilityActiveProvider()` returns true (`WsSessionLifecycleDispatcher.kt:55`) → `submitStateEvent(event.toRestStateMachineEvent())`.
+2. `RestStateMachine.onWsSessionEnded` (`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestStateMachine.kt:273`) evaluates the 3-condition signature (lines 295-297): `inboundFrames == 0 && okhttpPingTimeoutDetected && durationMs in MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS`.
+3. If signature matches AND `mode2FastPathEnabled` (BuildConfig flag) → emits `mode_2_signature_matched action=fast_path`, calls `transitionToRest("mode_2_fast_path")` (line 307). If additionally `mode2StickyEnabled` → `armSticky()` (line 311), which emits `REST_TRACE sticky_armed gen=N reason=mode_2_fast_path` (line 566).
+4. If signature matches BUT flag off → emits `action=observe_only`, falls through to counter logic.
+
+**PR #330's quiescence chain hooks on top of `armSticky()`** — the `sticky_armed` log line is the entry point. The downstream gate (`WsReconnectGate.Quiesced → ProbeAvailable → ProbeClaimed → CandidateProving → Open`) is what PR #330 adds and is gated by `RECONNECT_QUIESCENCE_ENABLED`. The recovery probe + 60s probation → `transitionToWsActive("ws_alive_60s")` → sticky clear path (`RestStateMachine.kt:589`) already exists on master.
+
+### §12.2 Candidate injection levels (L0–L4)
+
+Each level names a different point in the chain where a synthetic trigger could inject. Levels are ordered upstream-to-downstream; each adds bypass over the previous (higher levels skip MORE production code).
+
+**L0 — Wire-level (manufacture close-text inside a real WS session).** Force a real OkHttp WS session to die with synthesised close-text that the parser would classify as a ping timeout. Two approaches: (a) server-side coordinator that sends a kill-signal close frame after T seconds (out of recon scope, requires relay changes); (b) client-side hook into `KtorRelayTransport`'s ping watchdog or `httpClient.close()` to force-fail with a crafted close-error string.
+
+**L1 — Lifecycle event channel (enqueue a synthetic `WsSessionLifecycleEvent.Ended`).** Add a debug-only entry point on `KtorRelayTransport` that, when `BuildConfig.DEBUG_FORCE_MODE_2_DETECTION == "1"`, calls `_wsSessionLifecycle.trySend(WsSessionLifecycleEvent.Ended(durationMs=…, inboundFrames=0, pendingAcksAtClose=…, closeOrigin="synthetic", closeError="DEBUG_FORCE_MODE_2_DETECTION synthetic trigger", okhttpPingTimeoutDetected=true, sessionEpoch=…))`. Same channel the real wire path uses; same downstream consumers; no production code-path branching.
+
+**L2 — State-machine entry (submit `RestStateMachine.Event.WsSessionEnded` directly).** Debug-only entry point that calls `restStateMachine.submit(Event.WsSessionEnded(…))` with the same 3-condition signature parameters. Bypasses the dispatcher routing and `feedDegradationDetector` Path A; only Path B's actuation runs.
+
+**L3 — State-machine internal (call `armSticky()` directly).** Debug-only entry point that calls `RestStateMachine.armSticky()` (currently private). Bypasses the signature check + the BuildConfig gate logic.
+
+**L4 — Gate-level direct (force the gate state to `Quiesced` directly).** Debug-only entry on PR #330's `WsReconnectGate`. Doesn't exist on master HEAD.
+
+### §12.3 Per-level honesty profile
+
+Honesty here means: "what fraction of the production code path runs unchanged for a synthetic trigger at this level". Risk means: "what could the synthetic trigger MISS that a real Mode 2 episode would catch".
+
+| Level | Production code path coverage | Risk profile |
+|---|---|---|
+| **L0** | 100% (real WS, real parser, real finally block, real lifecycle channel, both downstream paths). | Practically infeasible without server coordination OR a deeply-invasive client-side ping-watchdog hook. The latter would itself be a parallel test-only path inside `KtorRelayTransport`, defeating the purpose. |
+| **L1** | High — bypasses only the OkHttp WS session lifecycle (real connect, real ping watchdog, real close-text parsing) and the `KtorRelayTransport` finally-block event assembly. Both Path A (detector) and Path B (state machine actuation) downstream code runs unchanged. | Gap 1: `PingTimeoutTextParser` is bypassed. Mitigation: parser has 13 dedicated `@Test` cells on master in `PingTimeoutTextParserTest`. Gap 2: `KtorRelayTransport` finally-block assembly is bypassed. The synthetic event must populate the same fields with the same value distribution that a real Mode 2 close would. Honesty constraint enforceable via code-review: the synthetic-trigger code must use the same `WsSessionLifecycleEvent.Ended` constructor with no test-only field overrides. Gap 3: no real WS was active. The dispatcher / state machine assume the WS was at some point connected; the synthetic should fire AFTER a real `Connected` event for the same `sessionEpoch`, simulating death of an active session. |
+| **L2** | Medium — bypasses Path A (detector) entirely. Only Path B (state machine) runs. | The detector's `WS_DEGRADED_TELEMETRY` line never fires for a synthetic Mode 2. Field validation that wants to confirm Path A also runs in production must use L1, not L2. The 3-condition signature check inside `RestStateMachine.onWsSessionEnded` still runs at L2, so `mode_2_signature_matched action=fast_path` and `sticky_armed gen=N` still emit honestly. |
+| **L3** | Low — bypasses the signature check and the `mode2FastPathEnabled` BuildConfig gate. Just arms the sticky window. | Skips the "did we detect Mode 2 correctly" question. The signature check + the BuildConfig branching + the `mode_2_signature_matched action=…` telemetry line ALL get skipped. A field run at L3 cannot validate that real Mode 2 detection would actually arm the gate; it only validates the gate itself given an armed sticky. Closer to a parallel test-only path. |
+| **L4** | Very low — gate-level direct, bypasses signature + arming. Only the gate state machine runs. | Maximum false-confidence. The field validates only the gate's state transitions, not its integration with the detection path. Doesn't exist on master HEAD; would also need PR #330 to land. |
+
+The §5 wording "without becoming a parallel test-only code path that diverges from production" rules out L3 / L4 as honest synthetic triggers and rules out invasive variants of L0. L1 is the cleanest candidate at this design-sketch level; L2 is acceptable for state-machine-only validation but loses Path A coverage.
+
+### §12.4 L1 design surface (sketch only — NOT a proposal)
+
+The minimum-bypass shape on master HEAD looks like:
+
+- **One new BuildConfig flag** — `DEBUG_FORCE_MODE_2_DETECTION` defaulting to `"0"` in release block (mirroring `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` / `RECONNECT_QUIESCENCE_ENABLED` pattern). Debug block uses `localOrEnv(…)` so operators can opt-in via `-PdebugForceMode2=1`. Companion `Mode2DebugForceReleaseBuildConfigPinTest` enforces the release literal stays `"0"` to prevent accidental promotion.
+- **One new public method on `KtorRelayTransport`** — `internal suspend fun debugForceMode2Synthetic(): Boolean` (suggested name) — gated at the top by `BuildConfig.DEBUG_FORCE_MODE_2_DETECTION == "1"`. Builds the synthetic event with fields chosen to satisfy the signature check: `inboundFrames=0`, `okhttpPingTimeoutDetected=true`, `durationMs` within `MODE_2_MIN_DURATION_MS..MODE_2_MAX_DURATION_MS`, `closeOrigin="synthetic"`, `closeError="DEBUG_FORCE_MODE_2_DETECTION"`, `pendingAcksAtClose=0`, `sessionEpoch` = current epoch from the live transport. Calls `_wsSessionLifecycle.trySend(...)` and returns the trySend success Boolean. Should refuse to fire (return `false`) if `_state.value != TransportState.Connected` so the chain assumption "a session was active" holds.
+- **One operator-facing UI hook or adb-shell command** — surface up the synthetic-trigger entry to an operator action (e.g., a debug-only menu option, or an `am broadcast` intent handler in the AndroidManifest debug block). NOT discussed further at this design-sketch level; depends on operator preference.
+
+Honesty constraints (the load-bearing ones a future scope-lock must enforce):
+
+1. **Same constructor, no field overrides.** The synthetic event must use the production `WsSessionLifecycleEvent.Ended(...)` constructor with all fields populated to satisfy the production signature check. No test-only sentinel values that branch downstream behaviour.
+2. **`closeOrigin="synthetic"` discipline.** The string is a telemetry tell so post-mortem can distinguish synthetic from real. The dispatcher / state machine on master HEAD do not branch on `closeOrigin`, but a future change that does would need to whitelist `"synthetic"` symmetrically with `"local" / "remote" / "error" / "unknown"`. Documented invariant.
+3. **No parallel branch in dispatcher or state machine.** The synthetic trigger MUST hit `_wsSessionLifecycle.trySend(...)` and let the SAME consumers process the event. If a future PR adds an `if (event.closeOrigin == "synthetic") { … }` arm anywhere, the honesty bar is breached.
+4. **Only `mode2FastPathEnabled` controls actuation.** The BuildConfig gates `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` / `RECONNECT_QUIESCENCE_ENABLED` continue to govern downstream behaviour exactly as in production. The synthetic-trigger flag is orthogonal — it makes the event happen; it does NOT make the actuation happen. A field run with `DEBUG_FORCE_MODE_2_DETECTION="1"` AND `MODE_2_FAST_PATH_ENABLED="0"` would correctly emit `action=observe_only` and NOT arm sticky.
+5. **`Connected` precondition.** The synthetic fires only when `state == Connected` AND there exists a `sessionEpoch` from the current session. This preserves the chain's implicit precondition (a session must have existed to "die").
+6. **Field-validation scope honesty.** A synthetic-triggered Mode 2 validates everything from `WsSessionLifecycleEvent.Ended` downstream — including Path A telemetry, Path B signature check, sticky arming, gate quiescence (PR #330), recovery probe, 60s probation, sticky clear. It does NOT validate: the OkHttp ping watchdog firing on a real radio death, the `PingTimeoutTextParser` regex against the actual phrase OkHttp emits, the finally-block assembly that builds the production event. The first two have their own unit coverage on master (`PingTimeoutTextParserTest` 13 cells; the watchdog's input semantics are covered by `KtorRelayTransport` integration tests on PR #330's branch but not on master HEAD). The third has no dedicated test but is one block of straight-line code; a structural code-review check that the synthetic populates the SAME fields with the SAME types is sufficient.
+
+### §12.5 What N-3 does NOT decide
+
+- N-3 does NOT propose H-MB, H-ME, or any combination methodology. Per §9 hand-off rule.
+- N-3 does NOT decide whether the L1 shape is the right one — it documents the feasibility and the honesty bar. Picking L1 vs L2 vs another combination presupposes a methodology choice; out of N-3's "discriminates H-MB's risk profile" framing.
+- N-3 does NOT propose code. The §12.4 sketch is design-exercise output per §5 ("sketch what a `DEBUG_FORCE_MODE_2_DETECTION` flag would look like"); it is NOT a scope-lock. If a methodology is chosen that requires a synthetic trigger, the scope-lock for the code is a separate item under that methodology.
+- N-3 does NOT decide whether PR #330's gate (load-bearing for the downstream half of the chain) accepts the L1-injected signal cleanly. The gate exists only on PR #330's branch; verifying it would require either reading PR #330's diff (out of N-3 source-read scope on master HEAD) or running PR #330's CI tests against a hypothetical synthetic input.
+- N-3 does NOT decide whether a field run with L1 wired up would actually exercise quiescence in the operator's hands. Operator-side execution is downstream of the methodology decision.
+- N-3 does NOT touch PR #330 and does NOT touch DIRECT-WSS-MODE2-RECON1 §11 / §12. The release / rollout gate stays in force.
+
+### §12.6 Hand-off
+
+Per §5 the natural follow-on candidates remain N-4 (third-network-class survey) and N-5 (release-gate review against PR #330's user population). The recon's job is to gather evidence sufficient to support one of §6's six acceptance gates; N-1 + N-2 + N-3 surfaced respectively the test-coverage gap (load-bearing gate absent on master), the fake-surface gap (interface-shaped not lifecycle-shaped), and the feasibility + honesty profile of a synthetic-trigger debug flag (L1 the cleanest candidate; L2 acceptable for state-machine-only validation; L3 / L4 ruled out by the §5 "parallel test-only path" prohibition).
+
+The operator decides whether N-4 / N-5 run next, whether to defer further N-x work (park per §7 P-2), or whether sufficient evidence is now on record to pivot the recon toward a closure verdict (per §6). The recon itself does NOT propose any of these. Do NOT auto-start.
+
+Do NOT propose a methodology in any subsequent N-x progress note. Per §9.

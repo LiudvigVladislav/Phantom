@@ -598,6 +598,40 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 N-3 progress — synthetic-trigger debug-flag design exercise
+
+**Outcome:** Third instrument N-3 completed immediately after PR #347 squash `88cf810a`. Source-read + design sketch only; no code change; no operator devices touched; PR #330 untouched. New §12 appended to `docs/tracks/quiescence-validation-methodology-recon1.md` (~150 LOC).
+
+**Mode 2 detection chain on master HEAD (the destination a synthetic trigger would feed):** two parallel paths share a single upstream lifecycle event. Shared upstream: `KtorRelayTransport` per-session `finally` block parses close-error via `PingTimeoutTextParser`, computes `okhttpPingTimeoutDetected`, emits `WsSessionLifecycleEvent.Ended(...)` into `_wsSessionLifecycle: Channel<WsSessionLifecycleEvent>`. Path A (telemetry-only on master): `WsSessionLifecycleDispatcher.dispatch(Ended) → feedDegradationDetectorOnWsSessionEnded → WsDegradationDetector.recordAndEmit(Event.PingTimeout, kind)` → `WS_DEGRADED_TELEMETRY` log lines, no action. Path B (R3.6 actuation): same dispatcher → `submitStateEvent(toRestStateMachineEvent()) → RestStateMachine.onWsSessionEnded` → 3-condition signature check (`inboundFrames == 0 && okhttpPingTimeoutDetected && durationMs in MODE_2_MIN..MAX`) → if `mode2FastPathEnabled` → `transitionToRest("mode_2_fast_path")` + if `mode2StickyEnabled` → `armSticky()` → emits `REST_TRACE sticky_armed gen=N reason=mode_2_fast_path`. PR #330's quiescence chain hooks on top of `armSticky()`.
+
+**Five candidate injection levels (L0–L4) with per-level honesty profile:**
+
+- **L0 wire-level:** 100% production-path coverage. Practically infeasible without server coordination OR deeply-invasive ping-watchdog hook (which would itself be a parallel test-only path inside `KtorRelayTransport`).
+- **L1 lifecycle event channel (`_wsSessionLifecycle.trySend(WsSessionLifecycleEvent.Ended(...))`):** HIGH coverage. Bypasses only OkHttp WS session + parser + finally-block assembly. Both Path A and Path B downstream code runs unchanged. Gap-1 `PingTimeoutTextParser` bypassed (covered by `PingTimeoutTextParserTest` 13 cells on master). Gap-2 finally-block assembly bypassed (mitigated by honesty constraint: synthetic must use same constructor, same field shape, no test-only overrides). Gap-3 no real WS active (mitigated: synthetic refuses to fire unless `state == Connected` with valid `sessionEpoch`).
+- **L2 state-machine entry (`restStateMachine.submit(Event.WsSessionEnded(...))`):** MEDIUM. Bypasses Path A (no `WS_DEGRADED_TELEMETRY` line). Path B signature check + sticky arming still emit honestly.
+- **L3 state-machine internal (`armSticky()` direct):** LOW. Skips signature check + BuildConfig gate logic. Closer to parallel test-only path.
+- **L4 gate-level direct (force `Quiesced` state):** VERY LOW. Maximum false-confidence. Only on PR #330 anyway.
+
+**Verdict per §5 framing** ("can the flag be designed so the synthetic trigger exercises the SAME code path the field would exercise on a real Mode 2 episode, without becoming a parallel test-only code path that diverges from production?"): **L1 is the cleanest candidate; L2 acceptable for state-machine-only validation but loses Path A coverage; L3 / L4 ruled out by the §5 prohibition on parallel test-only paths; L0 ruled out by infeasibility on master HEAD.**
+
+**Six load-bearing honesty constraints** for an L1 design (if a future methodology chose it): (1) same constructor, no field overrides; (2) `closeOrigin="synthetic"` discipline as telemetry tell; (3) no parallel branch in dispatcher/state-machine on closeOrigin; (4) BuildConfig gates remain orthogonal — `DEBUG_FORCE_MODE_2_DETECTION` makes the event happen, does NOT make actuation happen; (5) `Connected` precondition; (6) field-validation scope honesty — synthetic validates everything from `WsSessionLifecycleEvent.Ended` downstream, does NOT validate OkHttp ping watchdog firing on real radio death or parser regex against actual OkHttp phrase (latter has its own coverage on master).
+
+**Sketch of §12.4 L1 surface** (NOT a proposal — §5 design-exercise output only): one new BuildConfig flag `DEBUG_FORCE_MODE_2_DETECTION` defaulting `"0"` in release block (mirroring existing `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` / `RECONNECT_QUIESCENCE_ENABLED` pattern); one new `internal suspend fun debugForceMode2Synthetic()` method on `KtorRelayTransport` gated by the flag, builds the synthetic event satisfying the signature check, calls `_wsSessionLifecycle.trySend(...)`, refuses if `state != Connected`; one operator-facing surface (debug menu OR adb broadcast intent) for triggering — design left open at this sketch level.
+
+Per §9 hand-off rule: N-3 progress note does NOT propose H-MB, H-ME, or any combination methodology. N-3 does NOT decide whether L1 is the right shape (presupposes methodology choice). N-3 does NOT propose code (the §12.4 sketch is design-exercise output, NOT a scope-lock). N-3 does NOT decide whether PR #330's gate accepts the L1-injected signal cleanly (out of "master HEAD" source-read scope).
+
+**Track status:** QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 still Open. N-1 + N-2 + N-3 instruments complete. N-4 / N-5 candidates remain; operator chooses (or parks per §7 P-2). RC PR #330 Draft / HOLD unchanged. DIRECT-WSS-MODE2-RECON1 §11 / §12 unchanged.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — N-3 progress amendment on `quiescence-validation-methodology-recon1.md` (~150 LOC). Branch `docs/quiescence-validation-n3-synthetic-trigger`. Off master `88cf810a`.
+
+**Follow-ups:**
+
+- Operator decides next instrument (or parks). Remaining candidates per §5: N-4 third-network-class survey / N-5 release-gate review against PR #330's user population. The recon does NOT recommend any of them.
+- If the operator parks further N-x work, the recon parks per §7 P-2 with the N-1 + N-2 + N-3 evidence on record.
+- Methodology recommendation is NOT permitted in any N-x progress note per §9. The recon's closure verdict comes after instrument evidence supports one of §6's acceptance gates.
+
 ### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 N-2 progress — fake-transport surface review on master HEAD
 
 **Outcome:** Second instrument N-2 completed immediately after PR #346 squash `e568d97b`. Source-read only; no operator devices touched; PR #330 untouched. New §11 appended to `docs/tracks/quiescence-validation-methodology-recon1.md` (~110 LOC) catalogues **16 fake-transport test doubles + 3 auxiliary doubles** on master HEAD and assesses each against the five quiescence-surface dimensions named in §5 (Mode 2 detector input signals, sticky window timing, recovery probe outcome, 60s probation / `ws_alive_60s` proof, self-reentry / dup / loss).
