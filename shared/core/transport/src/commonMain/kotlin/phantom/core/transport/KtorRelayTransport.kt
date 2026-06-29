@@ -579,12 +579,31 @@ class KtorRelayTransport(
     // §13.3.9 Part A repeated-trigger DoS surface identified by the L1
     // mini-lock security council.
     //
+    // The check-then-set on this field MUST happen under
+    // [oneShotLatchMutex] so a concurrent double-fire (two coroutine
+    // contexts calling [debugForceMode2Synthetic] simultaneously)
+    // cannot both pass the check and both set the field, which would
+    // enqueue two synthetic `Ended` events for the same epoch and
+    // violate the one-shot contract. The `Mutex.tryLock()` pattern
+    // returns [SyntheticTriggerResult.RefusedAlreadyFired] on contention
+    // so the operator-facing semantics ("we politely refuse a
+    // duplicate") hold even under racy callers.
+    //
     // Neutral name (no `*ForTest*` / `debugForce*` / `*Synthetic*`
     // substring) so R8 strips the field on standard reachability
     // analysis when [debugForceMode2Synthetic] is unreachable in
     // release. The `verifyR8StripsTestSeams` Gradle task is the runtime
     // backstop for the name's deny patterns.
     @Volatile private var oneShotLatchConsumedAtEpoch: Long? = null
+
+    /**
+     * Atomic guard for [oneShotLatchConsumedAtEpoch] check-then-set.
+     * `tryLock()` (non-suspend) keeps the synthetic-trigger method
+     * non-suspend so it can be called from any Android dispatcher.
+     * Contention → [SyntheticTriggerResult.RefusedAlreadyFired] (the
+     * conservative outcome that preserves the one-shot contract).
+     */
+    private val oneShotLatchMutex: Mutex = Mutex()
 
     /**
      * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §7.1 accessor — returns
@@ -704,10 +723,23 @@ class KtorRelayTransport(
                 maxMs = RestStateMachine.MODE_2_MAX_DURATION_MS,
             )
         }
-        if (oneShotLatchConsumedAtEpoch == epoch) {
+        // Atomic claim of the one-shot latch. `Mutex.tryLock()` is
+        // non-suspend so the synthetic-trigger method itself stays
+        // non-suspend. Contention with another concurrent caller →
+        // conservative refusal (the other caller will set the latch
+        // for this epoch and proceed; refusing here preserves the
+        // one-shot contract from the operator's perspective).
+        if (!oneShotLatchMutex.tryLock()) {
             return SyntheticTriggerResult.RefusedAlreadyFired
         }
-        oneShotLatchConsumedAtEpoch = epoch
+        try {
+            if (oneShotLatchConsumedAtEpoch == epoch) {
+                return SyntheticTriggerResult.RefusedAlreadyFired
+            }
+            oneShotLatchConsumedAtEpoch = epoch
+        } finally {
+            oneShotLatchMutex.unlock()
+        }
         val synthetic = WsSessionLifecycleEvent.Ended(
             durationMs = durationMs,
             inboundFrames = 0,

@@ -3,13 +3,20 @@
 
 package phantom.core.transport
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertSame
+import kotlin.test.assertTrue
 
 /**
  * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §6 + §7 + §8 contract
@@ -183,6 +190,142 @@ class KtorRelayTransportDebugForceMode2Test {
     }
 
     // ── L1 mini-lock §7.3 adversarial race-window absorption ─────────────
+
+    /**
+     * D-1 dedup mechanism load-bearing test: when two
+     * `Ended(sessionEpoch=N)` events arrive at the state machine
+     * sequentially (the synthetic+real race outcome after both reach
+     * the lifecycle channel), the second event is silently absorbed
+     * by the `RestActive` arm of [RestStateMachine.onWsSessionEnded].
+     * This is the actual D-1 guarantee — the latch atomicity above
+     * preserves the operator-facing one-shot contract, but the state
+     * machine's mode-transition arm is what makes the race itself
+     * benign.
+     */
+    @Test
+    fun rest_state_machine_silently_absorbs_duplicate_ended_for_same_epoch() {
+        var clock = 100L
+        val logs = mutableListOf<String>()
+        val machine = RestStateMachine(
+            now = { clock },
+            log = { logs.add(it) },
+            mode2FastPathEnabled = true,
+            mode2StickyEnabled = true,
+        )
+        // Establish a Connected session at epoch 1.
+        machine.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
+        assertEquals(RestMode.WsActive, machine.current)
+        // First `Ended` for epoch 1 — matches the Mode 2 signature and
+        // drives the state machine through transitionToRest +
+        // armSticky.
+        clock += 30_000L
+        machine.onEvent(
+            RestStateMachine.Event.WsSessionEnded(
+                durationMs = 45_000L,
+                inboundFrames = 0,
+                pendingAcksAtClose = 0,
+                sessionEpoch = 1L,
+                okhttpPingTimeoutDetected = true,
+            ),
+        )
+        assertEquals(
+            RestMode.RestActive,
+            machine.current,
+            "First Ended for epoch 1 (matching Mode 2 signature) MUST drive " +
+                "the state machine to RestActive via the fast-path.",
+        )
+        val stickyArmedAfterFirst =
+            logs.count { it.contains("REST_TRACE sticky_armed gen=") }
+        assertEquals(
+            1,
+            stickyArmedAfterFirst,
+            "First Ended MUST emit exactly one `sticky_armed gen=` log line.",
+        )
+        // Second `Ended` for the SAME epoch 1 — the synthetic+real
+        // race outcome. The state machine is now `RestActive`; the
+        // `RestActive` arm of `onWsSessionEnded` silently absorbs the
+        // duplicate. State stays `RestActive`; no second `armSticky`
+        // fires; no `mode_2_signature_matched` line repeats.
+        val logSizeBeforeSecond = logs.size
+        machine.onEvent(
+            RestStateMachine.Event.WsSessionEnded(
+                durationMs = 45_000L,
+                inboundFrames = 0,
+                pendingAcksAtClose = 0,
+                sessionEpoch = 1L,
+                okhttpPingTimeoutDetected = true,
+            ),
+        )
+        assertEquals(
+            RestMode.RestActive,
+            machine.current,
+            "Second Ended for the SAME epoch 1 MUST be silently absorbed in " +
+                "the RestActive arm — state stays RestActive (D-1 dedup verdict).",
+        )
+        val stickyArmedAfterSecond =
+            logs.count { it.contains("REST_TRACE sticky_armed gen=") }
+        assertEquals(
+            1,
+            stickyArmedAfterSecond,
+            "Second Ended MUST NOT cause a second `armSticky` call — the " +
+                "single `sticky_armed gen=` log line from the first event is " +
+                "the load-bearing single-actuation guarantee.",
+        )
+        val secondPassLogs = logs.subList(logSizeBeforeSecond, logs.size)
+        assertTrue(
+            secondPassLogs.none { it.contains("mode_2_signature_matched") },
+            "Second Ended MUST NOT emit `mode_2_signature_matched` — the " +
+                "signature check sits inside the `WsActive` arm and is not " +
+                "re-reached. Second-pass logs (should be empty): $secondPassLogs",
+        )
+    }
+
+    /**
+     * Atomic latch load-bearing test: two concurrent
+     * [KtorRelayTransport.debugForceMode2Synthetic] calls on the same
+     * epoch MUST produce exactly one [SyntheticTriggerResult.Fired]
+     * and one refusal. The latch's `Mutex.tryLock()` shape (round 2
+     * fix) makes the check-then-set atomic so a concurrent
+     * double-fire cannot enqueue two synthetic `Ended` events for the
+     * same epoch.
+     */
+    @Test
+    fun concurrent_double_fire_yields_exactly_one_fired_result() = runTest {
+        val transport = connectedTransport(epoch = 13L)
+        // Two concurrent invocations on the SAME epoch. The atomic
+        // latch guarantees exactly one wins.
+        val results: List<SyntheticTriggerResult> = coroutineScope {
+            (0 until 2).map {
+                async(Dispatchers.Default) {
+                    transport.debugForceMode2Synthetic(45_000L)
+                }
+            }.awaitAll()
+        }
+        val firedCount = results.count { it is SyntheticTriggerResult.Fired }
+        val alreadyFiredCount = results.count {
+            it is SyntheticTriggerResult.RefusedAlreadyFired
+        }
+        assertEquals(
+            1,
+            firedCount,
+            "Exactly one of the two concurrent calls MUST return Fired. " +
+                "Results: $results",
+        )
+        assertEquals(
+            1,
+            alreadyFiredCount,
+            "Exactly one of the two concurrent calls MUST return " +
+                "RefusedAlreadyFired (atomic latch contention or post-claim " +
+                "epoch match). Results: $results",
+        )
+        // The channel must carry exactly one synthetic Ended event for
+        // this epoch (the one Fired call's enqueue).
+        val events = transport.wsSessionLifecycle.take(1).toList()
+        assertEquals(1, events.size)
+        val ended = assertIs<WsSessionLifecycleEvent.Ended>(events[0])
+        assertEquals(13L, ended.sessionEpoch)
+        assertEquals("synthetic", ended.closeOrigin)
+    }
 
     // ── L1 mini-lock §13.3.4 closeOrigin="synthetic" tell shape pin ──────
 

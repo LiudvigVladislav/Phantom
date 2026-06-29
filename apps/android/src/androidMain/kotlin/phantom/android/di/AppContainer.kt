@@ -236,7 +236,26 @@ class AppContainer(private val context: Context) {
             return phantom.core.transport.SyntheticTriggerResult.RefusedDisabled
         }
         val orch = restOrchestratorRef
-        if (orch != null && orch.stateMachine.isStickyOrRecoveryActive) {
+        if (orch == null) {
+            // Fail-closed when `initMessaging` has not run yet. Without
+            // an orchestrator we cannot read `isStickyOrRecoveryActive`;
+            // the conservative outcome is to refuse rather than skip
+            // the sticky check and risk firing a synthetic during an
+            // in-flight recovery candidate. Mirrors the
+            // `triggerS6BreakerForDebug` precedent above and closes
+            // the L1 mini-lock §5.2 layer-4 contract gap. Reusing
+            // `RefusedNotConnected` keeps the §6 sealed-class
+            // contract from drift — the orchestrator-absent state is
+            // functionally "transport not ready" from the operator's
+            // perspective.
+            android.util.Log.w(
+                "Phantom/DebugForceMode2",
+                "triggerDebugForceMode2() refused: initMessaging has not " +
+                    "run yet — cannot read sticky/recovery state",
+            )
+            return phantom.core.transport.SyntheticTriggerResult.RefusedNotConnected
+        }
+        if (orch.stateMachine.isStickyOrRecoveryActive) {
             android.util.Log.w(
                 "Phantom/DebugForceMode2",
                 "triggerDebugForceMode2() refused: sticky window armed OR " +

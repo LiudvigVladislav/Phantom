@@ -123,6 +123,37 @@ class AppContainerDebugForceMode2WiringTest {
     }
 
     @Test
+    fun trigger_debug_force_mode_2_fails_closed_when_orchestrator_ref_is_null() {
+        val text = source()
+        val methodStart = text.indexOf("fun triggerDebugForceMode2(durationMs: Long)")
+        assertTrue(
+            methodStart >= 0,
+            "triggerDebugForceMode2 must be declared (covered by another test cell).",
+        )
+        val bodySlice = text.substring(methodStart, minOf(text.length, methodStart + 3_500))
+        assertTrue(
+            bodySlice.contains("if (orch == null)"),
+            "triggerDebugForceMode2 MUST explicitly check `if (orch == null)` and " +
+                "return a typed refusal BEFORE delegating to the transport. Without " +
+                "this guard the layer-4 sticky/recovery check is silently skipped " +
+                "when `initMessaging` has not run yet, which could let a synthetic " +
+                "fire during an in-flight recovery candidate. Mirrors the S6 " +
+                "fail-closed precedent (`triggerS6BreakerForDebug` returns `false` " +
+                "when `restOrchestratorRef == null`).",
+        )
+        assertTrue(
+            bodySlice.contains(
+                "phantom.core.transport.SyntheticTriggerResult.RefusedNotConnected",
+            ),
+            "The `orch == null` branch MUST return " +
+                "`SyntheticTriggerResult.RefusedNotConnected` (reusing the existing " +
+                "§6 sealed-class member). Adding a new sealed-class member would " +
+                "drift the §6 contract from the L1 mini-lock; reusing the existing " +
+                "member keeps the contract stable.",
+        )
+    }
+
+    @Test
     fun trigger_debug_force_mode_2_rechecks_buildconfig_before_delegating() {
         val text = source()
         val methodStart = text.indexOf("fun triggerDebugForceMode2(durationMs: Long)")
