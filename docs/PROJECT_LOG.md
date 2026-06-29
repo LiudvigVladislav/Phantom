@@ -598,6 +598,31 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 closed with H-ME verdict — state-machine integration validation + L1 synthetic field trigger
+
+**Outcome:** Operator pivoted to closure per §6 acceptance gate #2 (combination MC + MB = H-ME) after the three source-read instruments N-1 + N-2 + N-3 produced sufficient evidence. NOT N-4 (no third network class identified within reasonable operator effort). NOT N-5 (release-gate amendment is not validation). NOT H-MC alone (master HEAD fakes are interface-shaped, not lifecycle-shaped per N-2 — state-machine tests alone cannot assert field-shape match). The recon's status flips from Open to **Closed (verdict H-ME, 2026-06-29)** in track-doc §1 + §13. PR #348 squash `98ee7e09` is the last known master at close.
+
+Council review by four agents before locking the verdict (durables at `C:\temp\quiescence-h-me-council-2026-06-29\{architect,implementation,tests,security}.md`):
+
+- **Architect:** H-ME RIGHT WITH CAVEATS. Five load-bearing caveats promoted to §13.3 locks: both halves required (L-13.3.1), L1 mandatory not L2 (L-13.3.2), sequential dispatcher order load-bearing (L-13.3.3), `closeOrigin="synthetic"` non-branching discipline (L-13.3.4), `maybeRetryBootstrap()` branch scope gap (L-13.3.5).
+- **Implementation:** L1 FEASIBLE WITH CAVEATS. Three P2 concerns; one (P2-3 check-then-trySend race on `sessionEpoch`) promoted to L-13.3.9 (one-shot-per-`Connected`-epoch latch). Boolean injection over provider promoted to L-13.3.8. Typed `SyntheticTriggerResult` over Boolean return promoted to L-13.3.10.
+- **Tests/adversarial:** Acceptance matrix delivered (~1450 words, source-grounded against PR #330 head `6f49cd89` and master HEAD `98ee7e09`). Cites real markers: `mode_2_signature_matched action=fast_path`, `sticky_armed`, `ws_reconnect_quiesced`, `ws_recovery_probe_granted`, `ws_reconnect_resumed`, `sticky_cleared proof=ws_alive_60s`, `ws_reconnect_open proof=ws_alive_60s`. Negative-presence checks for the parallel-test-only-path prohibition. Mode-2 window pinned `MODE_2_MIN_DURATION_MS=25000` / `MAX=65000` from `RestStateMachine.kt:1732-1747`. Promoted to L-13.3.11 (matrix is test floor, not ceiling).
+- **Security:** L1 SAFE WITH CONDITIONS — **two BLOCKERS**: (B-1) ProGuard wildcard `-keep class phantom.core.transport.KtorRelayTransport { *; }` on master HEAD preserves `debugForceMode2Synthetic` in release APK; (B-2) raw `am broadcast` foreclosed, S6-style four-layer protected operator surface required. Both promoted to L-13.3.6 / L-13.3.7. Five non-blockers (aggregate-counter `closeOrigin` loss, no one-shot semantics, check-then-trySend race, info-disclosure low-risk, CI-compromise bounded).
+
+**Per §13.5 forward-pointer:** a separate **L1 implementation mini-lock PR** opens AFTER this closure PR merges. The mini-lock carries forward locks L-13.3.1 through L-13.3.11, picks the S6-style operator-surface concrete shape, specifies the typed `SyntheticTriggerResult` enum, binds to the ProGuard narrowing precondition (either stack on PR #330's narrowing or include equivalent in L1 track), and adopts the acceptance matrix at `C:\temp\quiescence-h-me-council-2026-06-29\tests.md` as the test floor. The mini-lock is NOT scoped by this closure. The L1 implementation PR opens only after the mini-lock merges.
+
+**Track status:** QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 **CLOSED with verdict H-ME**. RC PR #330 Draft / HOLD unchanged — its B1 gate from `direct-wss-mode2-recon1.md` §11 closes only when **MC PASS + MB PASS** land on record per L-13.3.1. DIRECT-WSS-MODE2-RECON1 §11 / §12 unchanged.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — closure verdict + §13 + status flip (~190 LOC). Branch `docs/quiescence-validation-h-me-closure`. Off master `98ee7e09`.
+
+**Follow-ups:**
+
+- Operator opens the L1 implementation mini-lock PR (separate docs PR) after this closure merges. Carries locks L-13.3.1 through L-13.3.11 as binding constraints. NOT auto-started.
+- After mini-lock merges, the L1 implementation PR can open (code change). NOT auto-started.
+- After L1 implementation merges AND the MC integration tests are in place, the controlled Wi-Fi smoke run can validate the end-to-end quiescence chain. NOT auto-started.
+
 ### 2026-06-29 · QUIESCENCE-VALIDATION-METHODOLOGY-RECON1 N-3 progress — synthetic-trigger debug-flag design exercise
 
 **Outcome:** Third instrument N-3 completed immediately after PR #347 squash `88cf810a`. Source-read + design sketch only; no code change; no operator devices touched; PR #330 untouched. New §12 appended to `docs/tracks/quiescence-validation-methodology-recon1.md` (~150 LOC).
