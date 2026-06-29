@@ -796,3 +796,126 @@ android {
         jniLibs.useLegacyPackaging = true
     }
 }
+
+// --------------------------------------------------------------------------
+// verifyR8StripsTestSeams — path-2 step 2 ProGuard narrowing verifier
+// --------------------------------------------------------------------------
+// Fails the release build if R8's `mapping.txt` shows that a forbidden
+// member pattern survived shrinking on any `phantom.*` class. Wired as
+// `finalizedBy assembleRelease` so the verification runs immediately
+// after the release APK is assembled and before the build is considered
+// successful.
+//
+// Forbidden member patterns (a member matching any of these in the
+// release `mapping.txt` is a hard failure):
+//
+//   - `*ForTest*`     — production-test seams (e.g. `submitEventNow_internalForTest`)
+//   - `debugForce*`   — debug-only synthetic triggers (e.g. the future
+//                       `debugForceMode2Synthetic` from the L1 mini-lock)
+//   - `*Synthetic*`   — any class or member name carrying the synthetic
+//                       trigger discipline tell
+//
+// The patterns are an explicit deny-list, NOT an allow-list. If a future
+// PR introduces a new debug-only surface, the surface MUST be either
+// stripped by R8 (no rule keeps it) or named such that it matches one of
+// the deny patterns above so this verifier catches a regression.
+//
+// Negative control: re-introducing `-keep class phantom.core.transport.KtorRelayTransport { *; }`
+// in `proguard-rules.pro` empirically fails this verifier with violations
+// from the wildcard-preserved test seams. The wildcard removal in this
+// PR's `proguard-rules.pro` change is the load-bearing companion.
+val verifyR8StripsTestSeams = tasks.register("verifyR8StripsTestSeams") {
+    group = "verification"
+    description =
+        "Verifies no `*ForTest*` / `debugForce*` / `*Synthetic*` patterns survive R8 on any `phantom.*` class in the release `mapping.txt`."
+
+    val mappingFile = layout.buildDirectory.file("outputs/mapping/release/mapping.txt")
+    inputs.file(mappingFile).withPropertyName("mappingTxt")
+
+    doLast {
+        val mapping = mappingFile.get().asFile
+        check(mapping.exists()) {
+            "Expected R8 mapping at ${mapping.absolutePath} but it does not exist. " +
+                "Is `isMinifyEnabled = true` set on the release buildType?"
+        }
+
+        val forbiddenPatterns = listOf(
+            Regex(".*ForTest.*"),
+            Regex("debugForce.*"),
+            Regex(".*Synthetic.*"),
+        )
+
+        // R8 emits its own synthetic lambda capture containers whose class
+        // names contain `$$ExternalSyntheticLambda` or `$$InternalSyntheticLambda`
+        // and whose member names use compiler-synthesised prefixes like
+        // `$r8$classId` or `f$N` (closure captures). These are infrastructure,
+        // not Phantom debug seams, and have no semantic relationship to the
+        // deny patterns we are guarding against. Skip them at the class level
+        // so the deny-list scan only sees Phantom's own type names.
+        val r8SyntheticClassMarker = "\$\$"
+        val compilerSyntheticMemberPrefix = "\$"
+
+        val violations = mutableListOf<String>()
+        var currentClass: String? = null
+        mapping.useLines { lines ->
+            for (rawLine in lines) {
+                val line = rawLine.trimEnd()
+                if (line.isEmpty() || line.startsWith("#")) {
+                    continue
+                }
+                if (!line.startsWith("    ") && line.contains(" -> ")) {
+                    // Class header line: `phantom.core.transport.KtorRelayTransport -> a.b.c:`
+                    val originalName = line.substringBefore(" -> ").trim()
+                    currentClass = originalName.takeIf {
+                        it.startsWith("phantom.") &&
+                            !it.contains(r8SyntheticClassMarker)
+                    }
+                } else if (currentClass != null && line.startsWith("    ")) {
+                    // Member line: `    void connect() -> a` or
+                    //              `    Type field -> a`.
+                    // Extract the member original name — last whitespace-
+                    // delimited token before " -> ", then strip method
+                    // parameter list if present.
+                    val original = line.trim().substringBefore(" -> ")
+                    val memberName = original
+                        .substringAfterLast(" ")
+                        .substringAfterLast(":")
+                        .substringBefore("(")
+                    if (memberName.startsWith(compilerSyntheticMemberPrefix)) {
+                        continue
+                    }
+                    if (forbiddenPatterns.any { it.matches(memberName) }) {
+                        violations += "$currentClass#$memberName"
+                    }
+                }
+            }
+        }
+
+        if (violations.isNotEmpty()) {
+            throw GradleException(
+                buildString {
+                    appendLine(
+                        "verifyR8StripsTestSeams FAILED — ${violations.size} forbidden " +
+                            "member(s) survived R8 on `phantom.*` classes:",
+                    )
+                    violations.forEach { appendLine("  $it") }
+                    appendLine()
+                    appendLine(
+                        "Either (a) the offending member must be removed from production code, " +
+                            "(b) `apps/android/proguard-rules.pro` must stop keeping it, or " +
+                            "(c) the deny patterns in `verifyR8StripsTestSeams` are stale and " +
+                            "must be updated (operator decision, not silent edit).",
+                    )
+                },
+            )
+        }
+        logger.lifecycle(
+            "verifyR8StripsTestSeams PASS — no `*ForTest*` / `debugForce*` / " +
+                "`*Synthetic*` members survived on any `phantom.*` class.",
+        )
+    }
+}
+
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy(verifyR8StripsTestSeams)
+}
