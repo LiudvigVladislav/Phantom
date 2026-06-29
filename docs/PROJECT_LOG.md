@@ -598,6 +598,48 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK amendment — §5.1 Option A loosened to accept any qualifying narrowing commit (unblocks path-2 separate narrowing-only PR sequence)
+
+**Outcome:** Operator-chosen path-2 sequence (separate narrowing-only PR → L1 implementation PR under Option A) hit a literal-wording blocker in the just-merged mini-lock at PR #350 squash `e6a162d9`: §5.1 Option A said "Stack on already-landed PR #330 narrowing commit", which created an unintended dependency loop — PR #330 stays Draft / HOLD until B1 closes; B1 closes only after MB PASS lands; MB lands only after the implementation PR opens; the implementation PR opens only under Option A or Option B; Option A required PR #330's narrowing. The loop locks all forward motion under Option A.
+
+This amendment loosens §5.1 Option A's literal text to: "Stack on **any already-landed narrowing commit that provides equivalent ProGuard removal + R8 strip verification**". Defence-in-depth requirement is unchanged — the narrowing commit must (i) remove the `-keep class phantom.core.transport.KtorRelayTransport { *; }` wildcard and (ii) add an R8-strip verification mechanism that fails the release build on any surviving member that should not survive (`verifyR8StripsTestSeams` Gradle task pattern from PR #330's mini-lock §2 is the reference shape, but any equivalent mechanism qualifies). The qualifying narrowing commit MAY come from PR #330 if PR #330 ships its narrowing portion (e.g., as a carved-out independent PR or as part of its eventual merge), OR it MAY come from a separate independent narrowing-only PR opened specifically to unblock this mini-lock.
+
+Amendment scope:
+
+- **§5.1 Option A text** rewritten to accept either source (PR #330's narrowing OR a separate independent narrowing PR), with the defence-in-depth requirement unchanged.
+- **§5.1 inline amendment note** added below Option B paragraph, documenting the original text + the dependency loop + the amendment's defence-in-depth preservation.
+- **§10 P-1 park condition** broadened from "PR #330's narrowing plan changes" to "the landed-narrowing reference changes (whether that source is PR #330 or a separate independent narrowing PR)".
+
+What this amendment does NOT change:
+
+- Option B (include narrowing in the same initial implementation PR diff) is unchanged.
+- The "MUST NOT open without Option A or Option B in initial diff" rule is unchanged.
+- All eleven binding locks L-13.3.1 through L-13.3.11 stay in force.
+- The two BLOCKERS L-13.3.6 + L-13.3.7 remain preconditions for the implementation PR's initial diff.
+- `SyntheticTriggerResult` sealed class, race contract requirements, acceptance matrix floor, S6-style four-layer operator surface — all unchanged.
+
+**Operator-chosen path-2 sequence enabled by this amendment:**
+
+1. This amendment PR merges first (this entry).
+2. **Separate narrowing-only PR** opens next: only `apps/android/proguard-rules.pro` removal of the wildcard + `verifyR8StripsTestSeams`-equivalent Gradle task + R8 strip verification test. NO synthetic-trigger code. Smaller, cleaner diff, separate review surface.
+3. **L1 implementation PR** opens after narrowing-only PR merges: cites the narrowing commit verbatim under Option A, focuses entire initial diff on MB synthetic-trigger code + §6/§7/§8 requirements.
+4. **MC half scope-lock** opens separately (NOT this amendment's question).
+5. **Controlled Wi-Fi smoke run** opens AFTER both halves merge AND MC PASS + MB PASS land on record.
+
+This sequence keeps PR #330 untouched (still Draft / HOLD) and avoids the path-1 risk of mixing release-binary safety with synthetic-trigger code in one large review surface.
+
+**Track status:** QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK Open with §5.1 + §10 amended. Next operator step: open the narrowing-only PR per path-2 step 2 above; do NOT auto-start. RC PR #330 Draft / HOLD unchanged. Methodology recon Closed with verdict H-ME unchanged.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — amendment to §5.1 Option A + §10 P-1 + inline amendment note (~30 LOC). Branch `docs/quiescence-validation-l1-minilock-amendment-option-a`. Off master `e6a162d9`.
+
+**Follow-ups:**
+
+- Operator opens the narrowing-only PR per path-2 step 2 after this amendment merges. Scope: ProGuard removal of `-keep class phantom.core.transport.KtorRelayTransport { *; }` wildcard + `verifyR8StripsTestSeams`-equivalent Gradle task + R8 strip verification test. NO synthetic-trigger code in this narrowing PR. NOT auto-started by this amendment.
+- After narrowing-only PR merges, L1 implementation PR opens under §5.1 Option A citing the narrowing commit verbatim. NOT auto-started.
+- MC half scope-lock opens separately. NOT auto-started.
+
 ### 2026-06-30 · QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK opened — implementation scope-lock for MB half of H-ME
 
 **Outcome:** Operator greenlit opening the MB-half implementation scope-lock immediately after the methodology recon closed with H-ME verdict (PR #349 squash `54f2e50d`). New track-doc at `docs/tracks/quiescence-validation-l1-synthetic-mini-lock.md` (227 lines) formalises the L1 synthetic-trigger implementation contract before any code lands.
