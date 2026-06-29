@@ -132,11 +132,20 @@ class KtorRelayTransportDebugForceMode2Test {
     }
 
     @Test
-    fun one_shot_latch_resets_on_new_epoch_via_test_seam() = runTest {
+    fun test_seam_clears_latch_and_allows_refire_on_same_epoch() = runTest {
+        // Pins the [resetOneShotLatchForTest] seam behaviour: explicit
+        // clear of `oneShotLatchConsumedAtEpoch` allows a second
+        // synthetic on the SAME epoch to fire. Production code does
+        // NOT call this seam — production fresh allowance comes from
+        // the epoch mismatch (new Connected → new wsSessionEpoch →
+        // latch's equality check fails). This cell exists to give the
+        // pre-removed-reset semantic an explicit test seam target so
+        // future tests can opt into the "fresh allowance same epoch"
+        // shape without touching production reconnect-loop code.
         val transport = connectedTransport()
         val first = transport.debugForceMode2Synthetic(45_000L)
         assertSame(SyntheticTriggerResult.Fired, first)
-        // Test-only latch reset (production code resets on Connected emit).
+        // Test-only latch clear; not invoked from production.
         transport.resetOneShotLatchForTest()
         val second = transport.debugForceMode2Synthetic(45_000L)
         assertSame(SyntheticTriggerResult.Fired, second)

@@ -16,9 +16,13 @@ package phantom.core.transport
  *
  *   - [Fired]                          — synthetic event constructed +
  *                                        `_wsSessionLifecycle.trySend(...)` succeeded.
- *                                        Trigger CANNOT fire again until a new
- *                                        [WsSessionLifecycleEvent.Connected] resets
- *                                        the one-shot latch.
+ *                                        Trigger CANNOT fire again for the same
+ *                                        `wsSessionEpoch`. A new
+ *                                        [WsSessionLifecycleEvent.Connected] event
+ *                                        advances `wsSessionEpoch`, and the latch's
+ *                                        equality check (`stored == current`)
+ *                                        naturally fails against the new epoch so a
+ *                                        fresh allowance is implicit.
  *   - [RefusedDisabled]                — `debugForceMode2Enabled` constructor flag is
  *                                        `false`. Exits immediately without inspecting
  *                                        any state and without logging anything that
@@ -99,10 +103,12 @@ public sealed class SyntheticTriggerResult {
 
     /**
      * One-shot latch already consumed for the current `Connected`
-     * session epoch. The latch resets on each new
-     * [WsSessionLifecycleEvent.Connected] event the transport observes.
-     * Closes the L1 mini-lock §13.3.9 Part A repeated-trigger DoS
-     * surface.
+     * session epoch. Each new [WsSessionLifecycleEvent.Connected]
+     * advances `wsSessionEpoch`; the latch's equality check
+     * (`stored last-consumed epoch == current epoch`) naturally fails
+     * against the new epoch, so a fresh allowance is implicit without
+     * an explicit reset of the stored value. Closes the L1 mini-lock
+     * §13.3.9 Part A repeated-trigger DoS surface.
      */
     public object RefusedAlreadyFired : SyntheticTriggerResult() {
         override fun toString(): String = "RefusedAlreadyFired"
