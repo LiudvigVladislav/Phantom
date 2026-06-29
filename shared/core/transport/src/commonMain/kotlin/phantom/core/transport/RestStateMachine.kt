@@ -153,8 +153,14 @@ class RestStateMachine(
      * R3.6: tracks the recovery lifecycle state for the sticky REST window.
      * Set to [StickyRecoveryState.PendingNewSession] by [armSticky] when a
      * Mode-2 fast-path fires and [mode2StickyEnabled] is true.
+     *
+     * `@Volatile` (2026-06-30 round 2) — read from outside the owning
+     * coroutine context via [isStickyOrRecoveryActive]. The annotation
+     * provides JVM memory-visibility guarantees so the cross-thread
+     * reader sees the most recent write. Mutations remain confined to
+     * the owning coroutine per the class-level threading contract.
      */
-    private var stickyRecovery: StickyRecoveryState = StickyRecoveryState.None
+    @Volatile private var stickyRecovery: StickyRecoveryState = StickyRecoveryState.None
 
     /** R3.6: epoch of the WS session currently serving as the recovery candidate. */
     private var recoveryWsEpoch: Long = -1L
@@ -162,8 +168,14 @@ class RestStateMachine(
     /** R3.6: wall-clock ms at which the current recovery attempt started. */
     private var recoveryStartedAtMs: Long = 0L
 
-    /** R3.6: true while sticky REST suppression is active (mode2StickyEnabled && was armed). */
-    private var mode2StickyRestActive: Boolean = false
+    /**
+     * R3.6: true while sticky REST suppression is active
+     * (`mode2StickyEnabled && was armed`).
+     *
+     * `@Volatile` (2026-06-30 round 2) — same cross-thread reader
+     * justification as [stickyRecovery] above.
+     */
+    @Volatile private var mode2StickyRestActive: Boolean = false
 
     /** R3.6: wall-clock ms at which [armSticky] last fired. */
     private var stickyArmedAtMs: Long = 0L
@@ -179,6 +191,51 @@ class RestStateMachine(
 
     /** R3.6: sticky-recovery lifecycle states. */
     private enum class StickyRecoveryState { None, PendingNewSession, InFlight }
+
+    /**
+     * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §7.2 D-1 edge-case
+     * accessor (2026-06-30). Returns `true` if either (a) the sticky
+     * REST window is currently armed
+     * ([mode2StickyRestActive] == true) or (b) recovery is pending or
+     * in flight ([stickyRecovery] != [StickyRecoveryState.None]).
+     *
+     * Used by the Android-side `AppContainer.triggerDebugForceMode2`
+     * wrapper to refuse an operator-initiated L1 synthetic trigger
+     * while a previous Mode 2 actuation's sticky window or recovery
+     * probation is in flight. Without this check, a synthetic
+     * `WsSessionLifecycleEvent.Ended` enqueued during recovery would
+     * enter the `WsCandidate` arm of [onWsSessionEnded] and falsely
+     * trigger the `sticky_recovery_stale_close` or
+     * `candidate_session_regression` branch, regressing the in-flight
+     * recovery.
+     *
+     * Returns [SyntheticTriggerResult.RefusedAlreadyArmed] when
+     * surfaced as the wrapper's typed result.
+     *
+     * Threading: pure-read snapshot accessor. The caller
+     * (AppContainer.triggerDebugForceMode2) reads from the Android
+     * main thread (invoked from `DebugForceMode2Activity.onCreate`)
+     * while the state machine's mutations are confined to a different
+     * coroutine context (the orchestrator's dispatcher). The two
+     * backing fields ([mode2StickyRestActive] and [stickyRecovery])
+     * are annotated `@Volatile` so the cross-thread read sees the
+     * most recent write per the JVM memory model.
+     *
+     * The read is a best-effort snapshot — by the time the caller
+     * acts on the returned Boolean, the underlying state may have
+     * changed. That race is benign: if `true` is returned and recovery
+     * actually just finished, the synthetic refuses with
+     * [SyntheticTriggerResult.RefusedAlreadyArmed]; the operator
+     * retries after the next Connected. If `false` is returned and
+     * sticky armed in the same window, the synthetic's enqueued Ended
+     * still flows through the dispatcher and the state machine's own
+     * sequential consumption (RestActive arm of [onWsSessionEnded])
+     * absorbs any race outcome correctly per the L1 mini-lock §7.2
+     * D-1 verdict.
+     */
+    val isStickyOrRecoveryActive: Boolean
+        get() = mode2StickyRestActive ||
+            stickyRecovery != StickyRecoveryState.None
 
     init {
         // R3.6 build-time invariant: sticky requires fast-path to be enabled.

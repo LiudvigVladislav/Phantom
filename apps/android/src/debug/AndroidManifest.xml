@@ -42,6 +42,43 @@
             android:noHistory="true"
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.NoDisplay" />
+        <!--
+            QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §5.2 (2026-06-30)
+            — manifest-side declaration of the L1 synthetic-trigger
+            debug Activity. Debug-only entry point that routes
+            an `adb shell am start` invocation into the L1 synthetic
+            Mode 2 trigger
+            [phantom.core.transport.KtorRelayTransport.debugForceMode2Synthetic].
+            Identical four-layer S6BreakerTriggerActivity pattern:
+
+              1. Declared ONLY in this debug-variant overlay; release
+                 APKs do not carry the entry.
+              2. Gated on `android.permission.INTERACT_ACROSS_USERS_FULL`
+                 (signature-scoped to system signing cert; shell uid
+                 satisfies, co-installed third-party apps cannot).
+              3. `onCreate` re-checks
+                 `BuildConfig.DEBUG_FORCE_MODE_2_DETECTION == "1"` AND
+                 `BuildConfig.DEBUG == true` and `finish()`es if either
+                 is false.
+              4. `AppContainer.triggerDebugForceMode2()` re-checks the
+                 BuildConfig field + the orchestrator's sticky-armed
+                 state, and the `debugForceMode2Enabled` Boolean
+                 injected into `KtorRelayTransport`'s constructor is
+                 `false` in release as a final backstop.
+
+            Trigger recipe (from connected laptop): use the `am start`
+            command with `-n phantom.android/phantom.android.dev.DebugForceMode2Activity`
+            and optionally pass the `durationMs` extra via the `am`
+            long-extra flag with a value in 25000..65000 (default 45000,
+            the mid-range of the Mode 2 signature window).
+        -->
+        <activity
+            android:name="phantom.android.dev.DebugForceMode2Activity"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
     </application>
 
 </manifest>
