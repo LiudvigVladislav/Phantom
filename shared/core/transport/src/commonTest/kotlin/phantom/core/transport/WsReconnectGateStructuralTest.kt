@@ -201,13 +201,21 @@ class WsReconnectGateStructuralTest {
         // consumed and erased."
         //
         // Data classes auto-derive `toString()` from their declared
-        // properties. Asserting `token=` is absent from
-        // `CandidateProving.toString()` pins the type-level
-        // invariant: adding a `token` property would break this test
-        // before any runtime path can leak a value.
+        // properties. Asserting that no `token`-like substring is
+        // present pins the type-level invariant: adding a property
+        // whose name contains `token` (case-insensitively — `token`,
+        // `Token`, `probeToken`, `recoveryToken`, `TOKEN_VALUE`, …)
+        // would break this test before any runtime path can leak a
+        // value. The case-insensitive check matters because Kotlin
+        // data-class `toString()` prints property names verbatim and
+        // a future contributor adding `val probeToken: ProbeToken`
+        // would NOT be caught by a case-sensitive `contains("token")`.
         val cp = WsReconnectGate.CandidateProving(stickyGen = 1, sessionEpoch = 5L)
         val s = cp.toString()
-        assertTrue(!s.contains("token"), "CandidateProving.toString must NOT carry any `token` substring; got: $s")
+        assertTrue(
+            !s.contains("token", ignoreCase = true),
+            "CandidateProving.toString must NOT carry any token-like substring (case-insensitive); got: $s",
+        )
     }
 
     // ── simpleKind() coverage ────────────────────────────────────────
