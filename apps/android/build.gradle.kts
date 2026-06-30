@@ -468,6 +468,39 @@ android {
                 "\"$debugForceMode2Enabled\"",
             )
 
+            // QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK §13.1 / §13.4
+            // gate-only carve-out (2026-06-30). RC-RECONNECT-QUIESCENCE1
+            // gate-component activation flag. Pinned to "0" in release
+            // (see release block below) — the gate-only carve-out brings
+            // the `phantom.core.transport.WsReconnectGate` type-and-interface
+            // surface to master AHEAD of the MC implementation PR; that
+            // later PR will land the gate's state-transition logic on
+            // `RestStateMachine`, the `WsReconnectGateProvider` /
+            // `RewalkCoordinatorGateProvider` implementations, and the
+            // 1172-LOC `WsReconnectGateTest.kt` integration suite plus
+            // the orchestrator wiring test. Until then there is NO
+            // production reader of this flag; it is reserved for the
+            // forthcoming MC implementation PR's wiring layer. Debug
+            // default `"0"` because (a) the gate code isn't yet wired
+            // into any orchestrator path even on debug builds and (b)
+            // mirrors the canary opt-in idiom of the existing
+            // `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` /
+            // `DEBUG_FORCE_MODE_2_DETECTION` flags. Operator can flip via
+            // `-PreconnectQuiesce=1` (local.properties) or env
+            // `RECONNECT_QUIESCENCE_ENABLED=1` once the MC PR's wiring
+            // lands; on this carve-out the flag is a no-op at runtime
+            // either way.
+            val reconnectQuiesceEnabled = localOrEnv(
+                "reconnectQuiesce",
+                "RECONNECT_QUIESCENCE_ENABLED",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "RECONNECT_QUIESCENCE_ENABLED",
+                "\"$reconnectQuiesceEnabled\"",
+            )
+
             // Trek 2 Stage 2B-B Round 12 step 3 — diagnostic toggle
             // that drops BOTH `X-Phantom-Long-Poll` AND
             // `X-Phantom-Padded-Poll` opt-in headers from the
@@ -740,6 +773,26 @@ android {
             // `RefusedDisabled`. Defence-in-depth backstop per the
             // String "1"/"0" idiom of the other release-pinned flags.
             buildConfigField("String", "DEBUG_FORCE_MODE_2_DETECTION", "\"0\"")
+
+            // QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK §13.1 / §13.4 gate-only
+            // carve-out (2026-06-30). Release builds ALWAYS pin
+            // `RECONNECT_QUIESCENCE_ENABLED` to literal `"0"`. The gate
+            // component (`WsReconnectGate`) shipped by this carve-out is a
+            // pure type-and-interface surface — no production code path
+            // reads this flag yet, and the carve-out adds no orchestrator
+            // wiring. The MC implementation PR will land the gate's
+            // state-transition logic on `RestStateMachine` plus the
+            // `WsReconnectGateProvider` / `RewalkCoordinatorGateProvider`
+            // implementations, at which point an `AppContainer` reader
+            // will gate on `BuildConfig.RECONNECT_QUIESCENCE_ENABLED ==
+            // "1"`. This pin is the load-bearing rollout knob for that
+            // future wiring — promoting RC-RECONNECT-QUIESCENCE1 to
+            // production after Wi-Fi smoke PASS is a deliberate one-line
+            // flip of this literal in a separate named PR. Defence-in-
+            // depth backstop per the same idiom as
+            // `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` /
+            // `DEBUG_FORCE_MODE_2_DETECTION`.
+            buildConfigField("String", "RECONNECT_QUIESCENCE_ENABLED", "\"0\"")
 
             // Trek 2 Stage 2B-B Round 12 step 3 — release pin. The
             // diagnostic LP+PP-strip toggle MUST be off in release

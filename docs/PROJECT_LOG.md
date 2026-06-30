@@ -598,6 +598,65 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK gate-only carve-out from PR #330 (RC-RECONNECT-QUIESCENCE1 gate-component shipped to master ahead of MC implementation PR)
+
+**Outcome:** First gate-only carve-out PR opens against the §13.1 corrected wording (PR #356 squash `d64bef0a`) implementing the §13.4 hand-off contract. Brings the `phantom.core.transport.WsReconnectGate` type-and-interface surface from PR #330 commit `6f49cd89` to master verbatim — `sha256: 64e2d106366e3f737fb287cba170ba5de36854564937da8e16a706094c97b172` byte-identical with the PR #330 source — plus a fresh 508-LOC structural test file (`WsReconnectGateStructuralTest.kt`, 27 cells) covering the gate file's actual surface in pure isolation per §13.1's corrected test-scope wording, plus the `RECONNECT_QUIESCENCE_ENABLED` BuildConfig flag (release-pinned `"0"` per the existing `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` / `DEBUG_FORCE_MODE_2_DETECTION` idiom), plus a 3-cell companion release-pin test (`ReconnectQuiescenceReleaseBuildConfigPinTest`). NO orchestrator wiring stubs (the gate file imposes no compile-time dependency on any existing class per the §13.1 round-2 conditional rule). NO ProGuard discipline extension (the gate file introduces no new `KtorRelayTransport` members). NO `RestStateMachine` modifications. NO `WsReconnectGateTest.kt` (PR #330's 1172-LOC integration suite) and NO `RestFallbackOrchestratorQuiescenceWiringTest.kt` — both integration-scoped per §13.5 and deferred to the MC implementation PR.
+
+**Structural test surface (`WsReconnectGateStructuralTest.kt`):**
+
+- Sealed-class distinctness for the 5 `WsReconnectGate` states (`Open / Quiesced / ProbeAvailable / ProbeClaimed / CandidateProving`) including compile-time exhaustiveness pinning via `when`
+- `ProbeToken.toString()` redaction lock (returns `[REDACTED]`, never the raw `Long` value)
+- `ProbeAvailable.toString()` / `ProbeClaimed.toString()` / `ClaimedProbe.toString()` (all three carry explicit `override fun toString()` in the source) wrap their token via `[REDACTED]` and assert the raw hex/decimal token never leaks through the data-class string interpolation
+- `CandidateProving` type-level absence of `token` field pinned via `!toString().contains("token")` — adding a `token` property to `CandidateProving` breaks this test before any runtime path can leak a value
+- `simpleKind()` extension returns the expected telemetry-safe label (`"Open"` / `"Quiesced"` / `"ProbeAvailable"` / `"ProbeClaimed"` / `"CandidateProving"`) for each of the 5 states
+- `ProbeBudget.MAX_ATTEMPTS_LOCKED == 5` and `ProbeBudget.MAX_ELAPSED_MS_LOCKED == 120_000L` locked-constant pins
+- Sealed-hierarchy distinctness + compile-time `when` exhaustiveness for `WsReconnectPermit` (`OpenPermit / ClaimedProbe / LoopRetired`) / `ClaimResult` (`Claimed / Failure`) / `ProbeIssueResult` (`ProbeIssued / Rejected`) / `RouteChangeOutcome` (`OpenReconnect / StickyRecovery / QuiescencePreserved`)
+- `ProbeIssueResult.ProbeIssued.toString()` redacts token (source line 273 has explicit `override`)
+- Enum exhaustiveness for `ClaimFailureReason` (4 values, order-locked) and `ProbeIssueRejectReason` (3 values, order-locked)
+- Zero instantiation of production classes from outside `WsReconnectGate.kt`
+
+**Release-pin test surface (`ReconnectQuiescenceReleaseBuildConfigPinTest.kt`):**
+
+- Release block of `apps/android/build.gradle.kts` carries the literal `buildConfigField("String", "RECONNECT_QUIESCENCE_ENABLED", "\"0\"")`
+- Debug block does NOT carry the literal pin (mirror-image regression check)
+- Debug block declares `RECONNECT_QUIESCENCE_ENABLED` via `localOrEnv("reconnectQuiesce", "RECONNECT_QUIESCENCE_ENABLED", "0")` for operator opt-in via `-PreconnectQuiesce=1`
+
+**Verification PASSED locally:**
+
+- `:shared:core:transport:jvmTest` — 27 structural cells PASS
+- `:apps:android:testDebugUnitTest --tests 'ReconnectQuiescenceReleaseBuildConfigPinTest'` — 3 cells PASS
+- `:apps:android:assembleRelease` — BUILD SUCCESSFUL
+- `:apps:android:verifyR8StripsTestSeams` — `verifyR8StripsTestSeams PASS — no *ForTest* / debugForce* / *Synthetic* classes or members survived` (the gate-only carve-out introduces no `*ForTest*` / `debugForce*` / `*Synthetic*` seams so the verifier passes trivially with respect to this PR's diff)
+
+**What this PR ships:**
+
+- `shared/core/transport/src/commonMain/kotlin/phantom/core/transport/WsReconnectGate.kt` — 447 LOC, byte-identical with PR #330's source.
+- `shared/core/transport/src/commonTest/kotlin/phantom/core/transport/WsReconnectGateStructuralTest.kt` — 508 LOC fresh structural test.
+- `apps/android/build.gradle.kts` — +53 LOC adding `RECONNECT_QUIESCENCE_ENABLED` flag to debug block (via `localOrEnv("reconnectQuiesce", ...)`) and release block (literal `"0"` pin).
+- `apps/android/src/androidUnitTest/kotlin/phantom/android/transport/ReconnectQuiescenceReleaseBuildConfigPinTest.kt` — 159 LOC release-pin test mirroring `Mode2DebugForceReleaseBuildConfigPinTest`.
+
+**What this PR does NOT ship:**
+
+- No `RestStateMachine` modifications. No `KtorRelayTransport` modifications. No `TransportRewalkCoordinator` modifications. No `RestFallbackOrchestrator` modifications. No `AppContainer` wiring.
+- No `WsReconnectGateProvider` / `RewalkCoordinatorGateProvider` implementations (the gate file declares the interfaces but the production implementation lives on the MC implementation PR alongside the state-transition logic).
+- No `WsReconnectGateTest.kt` (PR #330's 1172-LOC integration suite). No `RestFallbackOrchestratorQuiescenceWiringTest.kt`. Both integration-scoped per §13.5 and deferred to the MC implementation PR.
+- No `KtorRelayTransport` ProGuard discipline extension. The gate file introduces no new `KtorRelayTransport` members so the narrowed keep block at `apps/android/proguard-rules.pro` is unchanged.
+- No activation of the quiescence contract. Release-pinned `"0"`; no production code path reads the flag in this PR's diff.
+
+**Sequencing (per §13.2 of the MC half mini-lock, corrected by §13.5):**
+
+This PR is step (1) of the six-step contract. Next steps:
+
+- Step (2): this PR merges; becomes qualifying base for the MC implementation PR.
+- Step (3): MC implementation PR opens stacked on the landed carve-out, brings `RestStateMachine` state-transition logic + `WsReconnectGateTest.kt` + `RestFallbackOrchestratorQuiescenceWiringTest.kt` + §4.2 + §4.3 + §6 hypothesis assertions per the MC half mini-lock.
+- Step (4): MC PASS + already-landed MB PASS (PR #353 squash `ed3406eb`) satisfies the two H-ME validation halves and UNLOCKS the controlled Wi-Fi smoke run.
+- Step (5): Wi-Fi smoke PASS closes B1 per `direct-wss-mode2-recon1.md` §11.
+- Step (6): PR #330 advances per its own mini-lock contract after B1 closes.
+
+**Key commits:** TBD (squash SHA backfilled in MASTER_TIMELINE on merge).
+
+---
+
 ### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK §13.1 test-scope correction (gate-only carve-out test surface restored to gate-in-isolation)
 
 **Outcome:** Path C corrective amendment. A facts-first read of the test files referenced by §13.1 (PR #330 commit `6f49cd89`), performed by the carve-out implementer BEFORE writing any code, surfaced a scope misreading in the original §13.1 lock: `WsReconnectGateTest.kt` (1172 LOC) is NOT a unit test of `WsReconnectGate.kt` in isolation. Its `newSm()` helper instantiates `RestStateMachine` directly with the new constructor parameters PR #330 adds (`reconnectQuiescenceEnabled`, `currentKindProvider`, `tokenSource`) and its `armSticky()` helper calls `sm.onEvent(RestStateMachine.Event.WsSessionEnded(...))`, exercising gate state-transition logic that lives **inside `RestStateMachine`**, not inside `WsReconnectGate.kt`. The gate file itself is pure type-and-interface declaration: 5 sealed `WsReconnectGate` states, `ProbeToken` value class with `[REDACTED]` `toString()`, `ProbeBudget` with locked constants, four sealed hierarchies for permits / results / outcomes, two abstract provider interfaces, a `simpleKind()` extension — no state-transition, transport-routing, or provider-implementation logic in the file itself (the only runtime code is type-level: `toString()` redaction overrides on `ProbeToken / ProbeAvailable / ProbeClaimed / ClaimedProbe`, plus the `simpleKind()` telemetry-label extension). The two provider interfaces are declared but NOT implemented in this file; their implementations live on `RestStateMachine` outside the carve-out's scope. `RestFallbackOrchestratorQuiescenceWiringTest.kt` is similarly integration-scoped.
