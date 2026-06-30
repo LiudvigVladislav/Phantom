@@ -2,7 +2,7 @@
 
 **Type:** Implementation / methodology scope-lock for the MC half of QUIESCENCE-VALIDATION-METHODOLOGY-RECON1's H-ME verdict. NOT a code change. NOT a re-investigation of the H-ME verdict or PR #330's quiescence contract.
 **Status:** Open (mini-lock).
-**Opened:** 2026-07-01 after the L1 synthetic-trigger implementation (the MB half of H-ME) merged on 2026-06-30 as PR #353 squash `ed3406eb`. The methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) mandates BOTH the MB half (synthetic field trigger — DONE) AND the MC half (deterministic state-machine / integration validation — THIS mini-lock).
+**Opened:** 2026-06-30 immediately after the L1 synthetic-trigger implementation (the MB half of H-ME) merged earlier the same day as PR #353 squash `ed3406eb`. The methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) mandates BOTH the MB half (synthetic field trigger — DONE) AND the MC half (deterministic state-machine / integration validation — THIS mini-lock).
 **Last known master at open:** PR #353 squash `ed3406eb`.
 
 ---

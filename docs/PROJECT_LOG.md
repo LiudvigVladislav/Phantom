@@ -598,9 +598,9 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
-### 2026-07-01 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK opened — implementation scope-lock for MC half of H-ME
+### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK opened — implementation scope-lock for MC half of H-ME
 
-**Outcome:** Path-2 step 4 — methodology scope-lock for the MC half of the H-ME closure verdict. Opens the day after PR #353 (the MB half) merged. Per the methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) lock L-13.3.1 ("both halves required"), B1 closure for `direct-wss-mode2-recon1.md` §11 needs MC PASS + MB PASS on record. MB landed in PR #353 squash `ed3406eb`; MC is the remaining deliverable.
+**Outcome:** Path-2 step 4 — methodology scope-lock for the MC half of the H-ME closure verdict. Opens immediately after PR #353 (the MB half) merged earlier the same day. Per the methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) lock L-13.3.1 ("both halves required"), B1 closure for `direct-wss-mode2-recon1.md` §11 needs MC PASS + MB PASS on record. MB landed in PR #353 squash `ed3406eb`; MC is the remaining deliverable.
 
 New track-doc at `docs/tracks/quiescence-validation-mc-half-mini-lock.md` (168 lines) scopes the MC implementation. The mini-lock binds carried-forward locks from the methodology recon's §13.3 closure verdict that apply to the MC half: L-13.3.1 both halves required (§4.1) / L-13.3.3 sequential dispatcher order load-bearing (§4.2) / L-13.3.4 closeOrigin="synthetic" non-branching discipline (§4.3) / L-13.3.5 maybeRetryBootstrap() branch scope gap (§4.4) / L-13.3.11 acceptance matrix is test floor (§4.5). Locks that govern only the MB half (L-13.3.2 / L-13.3.6 / L-13.3.7 / L-13.3.8 / L-13.3.9 / L-13.3.10) are NOT re-bound — PR #353 satisfied them and they stay in force on their own.
 
