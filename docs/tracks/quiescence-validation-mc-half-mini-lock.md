@@ -1,7 +1,7 @@
 # Track: QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK
 
 **Type:** Implementation / methodology scope-lock for the MC half of QUIESCENCE-VALIDATION-METHODOLOGY-RECON1's H-ME verdict. NOT a code change. NOT a re-investigation of the H-ME verdict or PR #330's quiescence contract.
-**Status:** Open (mini-lock); **§5 Strategy 1 locked 2026-06-30 — see §13**.
+**Status:** Open (mini-lock); **§5 Strategy 1 locked 2026-06-30 — see §13**; **§13.1 test-scope correction landed 2026-06-30 — see §13.5**.
 **Opened:** 2026-06-30 immediately after the L1 synthetic-trigger implementation (the MB half of H-ME) merged earlier the same day as PR #353 squash `ed3406eb`. The methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) mandates BOTH the MB half (synthetic field trigger — DONE) AND the MC half (deterministic state-machine / integration validation — THIS mini-lock).
 **Last known master at open:** PR #353 squash `ed3406eb`.
 **Last known master at Strategy 1 amendment:** PR #354 squash `b9e979f2`.
@@ -181,7 +181,7 @@ The gate-only carve-out PR extracts a deliberately-narrow subset of PR #330's di
 **MUST be in the carve-out's initial diff:**
 
 - **`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/WsReconnectGate.kt`** — the gate state machine (`Open / Quiesced / ProbeAvailable / ProbeClaimed / CandidateProving`) plus its public API. The implementation PR may bring this file verbatim from PR #330's branch (commit `6f49cd89`) OR may re-author it; either way the carve-out's body MUST cite the source.
-- **Targeted unit tests for the gate** — at minimum `WsReconnectGateTest.kt` (PR #330's 1172 LOC) brought across verbatim or re-authored against the carved gate. The full test file may be brought even if some assertions inside it depend on integration wiring that the carve-out chooses to NOT include — those assertions then either remain as `@Ignore` with a forward-pointer to the MC implementation PR or are extracted to the MC implementation PR's surface. The implementation PR decides per-cell which shape applies.
+- **Fresh structural unit tests for the gate types** — a new test file (e.g., `WsReconnectGateStructuralTest.kt`) covering the surface that `WsReconnectGate.kt` ITSELF defines: sealed-class distinctness across the 5 `WsReconnectGate` states (`Open / Quiesced / ProbeAvailable / ProbeClaimed / CandidateProving`) including compile-time exhaustiveness pinning via `when` over the sealed hierarchy; `ProbeToken.toString()` redaction lock (returns `[REDACTED]`, never the underlying `value`); `CandidateProving` type-level absence of a `token` field (the "token erased on Connected" invariant pinned at the type level); `simpleKind()` extension returns the expected label for each of the 5 cases; `ProbeBudget.MAX_ATTEMPTS_LOCKED == 5` and `MAX_ELAPSED_MS_LOCKED == 120_000L` constant pins; sealed-hierarchy distinctness for `WsReconnectPermit` (`OpenPermit` / `ClaimedProbe` / `LoopRetired`), `ClaimResult` (`Claimed` / `Failure`), `ProbeIssueResult` (`ProbeIssued` / `Rejected`), `RouteChangeOutcome` (`OpenReconnect` / `StickyRecovery` / `QuiescencePreserved`); enum exhaustiveness for `ClaimFailureReason` and `ProbeIssueRejectReason`. These tests exercise the gate file's surface in pure isolation — they instantiate ZERO production classes from outside `WsReconnectGate.kt`. PR #330's `WsReconnectGateTest.kt` (1172 LOC) is integration-scoped (see MUST NOT below) and lands on the MC implementation PR, NOT the carve-out.
 - **A new Android-side BuildConfig flag** — `RECONNECT_QUIESCENCE_ENABLED` defaulting to `"0"` in the release block (mirrors the existing `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` / `DEBUG_FORCE_MODE_2_DETECTION` patterns); debug-block `localOrEnv("reconnectQuiesce", "RECONNECT_QUIESCENCE_ENABLED", "0")` so operator can opt in via `-PreconnectQuiesce=1`.
 - **A companion release-pin test** — `ReconnectQuiescenceReleaseBuildConfigPinTest` (or equivalent name) in `androidUnitTest` mirroring `Mode2FastPathReleaseBuildConfigPinTest` / `Mode2DebugForceReleaseBuildConfigPinTest`. Three cells: release pin literal `"0"` present, debug block does NOT carry the literal pin, debug block declares the flag via `localOrEnv(...)` for the opt-in.
 - **Minimal wiring stubs** sufficient to make the gate compileable and unit-testable in isolation. This means: any constructor parameters the gate exposes to its surrounding orchestrator code (e.g., a `reconnectQuiescenceEnabled: Boolean = false` constructor parameter, mirroring the L1 MB pattern) AND the AppContainer-side wire-up reading the BuildConfig and injecting the Boolean. The wire-up MUST default to `false` in release and MUST NOT change the runtime behaviour of any existing transport code path when the flag is `false`.
@@ -195,6 +195,8 @@ The gate-only carve-out PR extracts a deliberately-narrow subset of PR #330's di
 - **Changes to PR #330's contract.** PR #330's mini-lock + RC-RECONNECT-QUIESCENCE1 contract are NOT amended by this carve-out. The gate component lands as the structurally same shape PR #330 intends; PR #330's full integration + activation are a separate concern that happens at PR #330's own eventual merge.
 - **Synthetic-trigger code.** PR #353 already shipped the MB half. The carve-out does NOT re-touch any L1 synthetic-trigger surface.
 - **MC test cells beyond the gate's own unit tests.** §4.2 sequential-dispatcher-order test, §4.3 negative-presence test on `closeOrigin`, and the §6 hypothesis assertions are the MC implementation PR's scope, NOT the carve-out's.
+- **PR #330's `WsReconnectGateTest.kt` (1172 LOC) — integration-scoped, defers to MC PR.** A facts-first read of the file (see §13.5) shows it instantiates `RestStateMachine` directly with new constructor parameters (`reconnectQuiescenceEnabled`, `tokenSource`, `currentKindProvider`) and exercises gate state-transition logic that lives **inside `RestStateMachine`**, not inside `WsReconnectGate.kt`. Bringing this test verbatim would force importing PR #330's `RestStateMachine` modifications — explicitly forbidden by the MUST NOT bullet above. The file lands on the MC implementation PR alongside the `RestStateMachine` integration.
+- **PR #330's `RestFallbackOrchestratorQuiescenceWiringTest.kt` — integration-scoped, defers to MC PR.** The test name itself states it exercises the orchestrator's wiring to the gate; that wiring requires production changes outside the gate file. Lands on the MC implementation PR.
 
 ### §13.2 Sequencing
 
@@ -230,4 +232,29 @@ The gate-only carve-out PR opens AFTER this amendment merges. The carve-out PR:
 
 After the carve-out PR merges, the MC implementation PR's preconditions per §8 are satisfied; the MC implementation PR opens as the next step.
 
-Do NOT open the gate-only carve-out PR with the activation flag pinned to `"1"`. Do NOT skip the companion release-pin test. Do NOT touch any production transport runtime path when the flag is `"0"`. Do NOT pre-empt the MC implementation PR's scope — the §4 / §6 / §7 requirements live on the MC implementation PR, not on the carve-out.
+Do NOT open the gate-only carve-out PR with the activation flag pinned to `"1"`. Do NOT skip the companion release-pin test. Do NOT touch any production transport runtime path when the flag is `"0"`. Do NOT pre-empt the MC implementation PR's scope — the §4 / §6 / §7 requirements live on the MC implementation PR, not on the carve-out. Do NOT bring `WsReconnectGateTest.kt` or `RestFallbackOrchestratorQuiescenceWiringTest.kt` into the carve-out — those are integration-scoped per §13.1 / §13.5 and land on the MC implementation PR.
+
+### §13.5 Test scope correction (recon finding)
+
+A facts-first reading of the test files referenced by §13.1 — performed pre-coding by the carve-out implementer — surfaced a scope misreading from the original §13.1 lock:
+
+- `WsReconnectGateTest.kt` (PR #330 commit `6f49cd89`, 1172 LOC) is NOT a unit test of `WsReconnectGate.kt` in isolation. Its `newSm()` helper at line 26-41 instantiates `RestStateMachine` directly with the new constructor parameters `reconnectQuiescenceEnabled: Boolean`, `currentKindProvider: () -> TransportKind?`, and `tokenSource: () -> Long` that PR #330 adds. Its `armSticky()` helper at line 44-54 calls `sm.onEvent(RestStateMachine.Event.WsSessionEnded(...))` and asserts on `sm.gate.value` — exercising state-transition logic that lives **inside `RestStateMachine`**, not inside `WsReconnectGate.kt`.
+- `WsReconnectGate.kt` (PR #330 commit `6f49cd89`, 447 LOC) is, by contrast, a pure type-and-interface declaration file: 5 sealed `WsReconnectGate` states; `ProbeToken` value class with `[REDACTED]` `toString()`; `ProbeBudget` data class with locked constants; the `WsReconnectPermit / ClaimResult / ProbeIssueResult / RouteChangeOutcome` sealed hierarchies; the `WsReconnectGateProvider / RewalkCoordinatorGateProvider` abstract interfaces; a `simpleKind()` extension. The file contains ZERO production runtime logic and ZERO implementation of the provider interfaces.
+- `RestFallbackOrchestratorQuiescenceWiringTest.kt` (PR #330 commit `6f49cd89`) likewise tests integration wiring between `RestFallbackOrchestrator` and the gate, which requires `RestStateMachine` modifications outside `WsReconnectGate.kt`.
+
+Bringing either `WsReconnectGateTest.kt` or `RestFallbackOrchestratorQuiescenceWiringTest.kt` into the gate-only carve-out would force importing PR #330's `RestStateMachine` (and orchestrator) modifications — which §13.1 MUST NOT bullet 3 explicitly forbids ("Only the gate component compiles + unit-tests; the larger production-behaviour rewrites stay on PR #330's branch").
+
+§13.1's original "at minimum `WsReconnectGateTest.kt` brought across" wording reflected an unverified assumption that the file was gate-in-isolation. §13.1 is corrected in this amendment to defer both integration tests to the MC implementation PR (where the `RestStateMachine` modifications land) and to instead require fresh structural unit tests scoped to the gate file's actual surface — sealed-class distinctness, type-level invariants like `ProbeToken` redaction, `simpleKind()` coverage, locked-constant pins, and enum exhaustiveness.
+
+This is a test-scope wording-alignment fix. The amendment does NOT change:
+
+- §1-§12 of the mini-lock.
+- The §4 binding constraints (L-13.3.1 / .3 / .4 / .5 / .11) — these remain binding on the MC implementation PR exactly as before.
+- The §6 load-bearing hypotheses — binding on the MC implementation PR exactly as before.
+- The §7 acceptance-gate criteria for MC PASS / MC PARTIAL / MC FAIL.
+- §13.2 sequencing — the six-step contract still runs gate-carve-out → MC implementation PR → Wi-Fi smoke → B1 closure.
+- §13.3 carry-forward statement.
+- §13.4 hand-off contract — gate-only carve-out PR still scopes per §13.1, now reading the corrected test-scope wording.
+- Strategy 1 lock from §13 amendment proper (PR #355 squash `ca12a98c`).
+- PR #330's contract. PR #353 (MB half). The methodology recon's H-ME verdict.
+- The L1 mini-lock + L1 §5.1 Option A amendment + path-2 step 2 narrowing PR.
