@@ -227,13 +227,13 @@ class KtorRelayTransportDebugForceMode2Test {
             mode2StickyEnabled = true,
         )
         // Establish a Connected session at epoch 1.
-        machine.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
+        machine.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
         assertEquals(RestMode.WsActive, machine.current)
         // First `Ended` for epoch 1 — matches the Mode 2 signature and
         // drives the state machine through transitionToRest +
         // armSticky.
         clock += 30_000L
-        machine.onEvent(
+        machine.onEventNow(
             RestStateMachine.Event.WsSessionEnded(
                 durationMs = 45_000L,
                 inboundFrames = 0,
@@ -261,7 +261,7 @@ class KtorRelayTransportDebugForceMode2Test {
         // duplicate. State stays `RestActive`; no second `armSticky`
         // fires; no `mode_2_signature_matched` line repeats.
         val logSizeBeforeSecond = logs.size
-        machine.onEvent(
+        machine.onEventNow(
             RestStateMachine.Event.WsSessionEnded(
                 durationMs = 45_000L,
                 inboundFrames = 0,

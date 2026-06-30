@@ -598,6 +598,64 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK MC-1 — RestStateMachine gate state-transition logic + provider implementations + WsReconnectGateTest integration suite (MC stack part 1 of 3)
+
+**Outcome:** First of the three-PR MC stack opened against §13.2 step 3 of the MC half mini-lock. Lands the `WsReconnectGate` state-transition logic on `RestStateMachine` + the two provider implementations (`WsReconnectGateProvider` / `RewalkCoordinatorGateProvider`) + the PR #330 1172-LOC integration test `WsReconnectGateTest.kt`. Stacked on PR #357 squash `daee9645` (gate-only carve-out). **MC PASS verdict is NOT declared by this PR alone** — only after MC-3 lands the full stack does MC PASS get on record per §7 of the mini-lock; the operator-greenlit stack discipline pins this explicitly in every PR body.
+
+**Three-PR MC stack shape (operator-locked):**
+
+- **MC-1 (this PR):** RestStateMachine core + provider implementations + WsReconnectGateTest + unavoidable suspend ripple through `RestFallbackOrchestrator.submitEvent`.
+- **MC-2:** RelayTransport interface fan-out (`suspend fun disconnectAndJoin`) + KtorRelayTransport permit flow + NonCancellable + `cleanupCap = 8` cleanupScope + the four PR #330 KtorRelayTransport tests (DisconnectAndJoinTest, RunReconnectLoopTest, PendingOutboundTest modifications, InternalTestSeams).
+- **MC-3:** TransportRewalkCoordinator + AppContainer + HybridRelayTransport + WsSessionLifecycleDispatcher wiring + fresh §4.2 sequential-dispatcher-order test + fresh §4.3 `closeOrigin = "synthetic"` non-branching grep test + §4.4 `maybeRetryBootstrap()` explicit deferral note + reinforcement cells for H-330-Preserves-REST + H-330-No-Message-Loss-Or-Dups + final MC PASS ledger.
+
+**What MC-1 ships:**
+
+- **`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestStateMachine.kt`** (+1004/-77, net +927, 902 → 1829 LOC) — cherry-picked from PR #330 commit `6f49cd89` source onto master. Brought: 3 new ctor params (`reconnectQuiescenceEnabled: Boolean = false`, `currentKindProvider: () -> TransportKind? = { null }`, `tokenSource: () -> Long = { 0L }`) with build-time invariant `reconnectQuiescenceEnabled ⇒ mode2StickyEnabled`; new private state (`_gate: MutableStateFlow<WsReconnectGate>`, `routeEpoch`, `connectionGenerationCounter`, `gateLock: Mutex`, `probeAttemptCount`); two provider implementations covering 11 gate API methods total (`gate / allocateConnectionGeneration / awaitReconnectPermit / validatePermitAfterAuth / recordProbeAttemptFailed` from `WsReconnectGateProvider`; `beginRouteChange / revokeRouteChange / issueProbeAfterRewalk / revokeProbe` from `RewalkCoordinatorGateProvider`; plus `awaitAndClaimProbe / currentRouteEpoch / currentConnectionGenerationCounter`); 2 internal test seams (`setResidualProbeStateForTest` + `probeAttemptCountForTest`); all `onEvent(...)` arms become `suspend` for `gateLock.withLock { }`; new `armSticky()` Direct-only fence; refactored `transitionToWsActive()` with sealed `ProofOutcome` (Committed / Rejected / NotApplicable). PR #353 surface explicitly **preserved** (cherry-pick discipline, NOT copy-paste): the `@Volatile` markers on `stickyRecovery` + `mode2StickyRestActive` AND the public `val isStickyOrRecoveryActive: Boolean` accessor stay on the file with KDoc explaining how they coexist with the new `gateLock` discipline (defence-in-depth for the lockless cross-thread reader path the L1 synthetic-trigger surface relies on via `AppContainer.triggerDebugForceMode2`).
+
+- **`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackOrchestrator.kt`** (+11, -2) — `fun submitEvent(...)` becomes `suspend fun submitEvent(...)`. Unavoidable mechanical signature change since `RestStateMachine.onEvent` is now `suspend`. KDoc explains the ripple is plumbing, NOT quiescence runtime activation. The 4 other production call-sites of `stateMachine.onEvent` inside `RestFallbackOrchestrator` (`aliveTickLoop`, `recordRestFailure`, `handle410`, `forceBreakerTripForS6TestTrigger`) are already inside `suspend fun` methods on master and compile without change.
+
+- **`apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt`** — 2 production call-sites of `orchestrator.submitEvent(...)` (lines 767 + 812) verified already inside `suspend fun` methods (`submitStateEvent` + `submitStateEvents`) on master. NO file change required.
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/WsReconnectGateTest.kt`** (1172 LOC new) — byte-identical with PR #330 commit `6f49cd89` source (git-blob SHA `3780d1ca1c73f4d6bfa2251cae6852b5146c0776f4a805daa37adfbd16707acc`). 34 test cells across 15 domains: Direct-only fence / probe atomicity & currency / route-epoch staleness / token type-level absence / state-transition paths / budget exhaustion (attempt + wall-clock) / permit lifecycle / revocation idempotency / ABA cycle / gate-bypass protection / failure-path recovery / stale tick rejection / full lifecycle / budget reset / token redaction. Zero production classes from outside `phantom.core.transport.*` instantiated.
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/RestStateMachineTestHelpers.kt`** (31 LOC new) — byte-identical with PR #330 source. Defines two `internal fun` extensions (`RestStateMachine.onEventNow(event)` + `RestFallbackOrchestrator.submitEventNow(event)`) that wrap `runBlocking { onEvent(event) }` for non-coroutine `@Test` methods. The convention pinned in the helper KDoc: tests already inside `runTest` / `runBlocking` call `.onEvent(...)` directly; pre-2026-06-22 plain `@Test` cells call `.onEventNow(...)`.
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/RestStateMachineTest.kt`** — bulk replace `sm.onEvent(` → `sm.onEventNow(` (143 sites). No semantic change; the helper preserves call semantics via `runBlocking`.
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/RestFallbackOrchestratorPollLoopTest.kt`** (1 line) — `orch.submitEvent(` → `orch.submitEventNow(` in the `driveStateToRestActive` helper (only call-site of `submitEvent` outside a `runTest` block in the existing tests).
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/KtorRelayTransportDebugForceMode2Test.kt`** (3 sites) — `machine.onEvent(` → `machine.onEventNow(` in the round-2 D-1 dedup test cell `rest_state_machine_silently_absorbs_duplicate_ended_for_same_epoch`. PR #353 L1 surface contract preserved.
+
+**Verification PASSED locally:**
+
+- `:shared:core:transport:jvmTest` — BUILD SUCCESSFUL (includes new `WsReconnectGateTest` 34 cells + async-refactored `RestStateMachineTest` + all PR #353 L1 cells still PASS via `onEventNow` helper).
+- `:apps:android:testDebugUnitTest` — BUILD SUCCESSFUL.
+- `:apps:android:assembleRelease` — BUILD SUCCESSFUL.
+- `:apps:android:verifyR8StripsTestSeams` — `PASS — no *ForTest* / debugForce* / *Synthetic* classes or members survived on any phantom.* class.` MC-1 adds two new `*ForTest` seams on `RestStateMachine` (`setResidualProbeStateForTest`, `probeAttemptCountForTest`) — the existing deny-pattern discipline strips both from release.
+
+**What MC-1 does NOT ship (defers to MC-2 / MC-3):**
+
+- No `KtorRelayTransport` `runReconnectLoop` permit-flow refactor. No `disconnectAndJoin` method. No NonCancellable cleanupScope. No `RelayTransport` interface fan-out. (→ MC-2.)
+- No `TransportRewalkCoordinator` gate-transaction logic. No `AppContainer` BuildConfig wiring or late-binding of `gateProvider`. No `HybridRelayTransport` `disconnectAndJoin` pass-through. No `WsSessionLifecycleDispatcher` `connectionGeneration` field on `WsSessionConnected`. (→ MC-3.)
+- No fresh §4.2 sequential-dispatcher-order test. No fresh §4.3 `closeOrigin = "synthetic"` non-branching grep test. No §4.4 `maybeRetryBootstrap()` disposition note. No reinforcement cells for H-330-Preserves-REST + H-330-No-Message-Loss-Or-Dups. (→ MC-3.)
+- No MC PASS ledger. MC-1 alone does NOT close §6 — only the full three-PR stack does.
+
+**Cherry-pick discipline (PR #353 + PR #357 surface preservation):**
+
+PR #330 was forked before PR #353 (MB half) merged. Naïve copy-paste of PR #330's RestStateMachine would have deleted PR #353's L1 surface. Cherry-pick approach preserved on master:
+
+- `RestStateMachine.isStickyOrRecoveryActive: Boolean` accessor — restored verbatim with extended KDoc explaining the coexistence with `gateLock`.
+- `@Volatile` on `stickyRecovery` and `mode2StickyRestActive` — restored with KDoc updated to describe gate-coexistence semantics.
+- `apps/android/build.gradle.kts` `DEBUG_FORCE_MODE_2_DETECTION` + `RECONNECT_QUIESCENCE_ENABLED` flags — both stay (PR #353 + PR #357 contracts).
+- L1 release-pin tests + S6 manifest contract test + DebugForceMode2 wiring test + L1 synthetic-trigger Kotlin sources — all stay; no touch.
+- Carve-out `WsReconnectGate.kt` + `WsReconnectGateStructuralTest.kt` + `ReconnectQuiescenceReleaseBuildConfigPinTest.kt` (PR #357) — all stay; this PR layers MC-1 on top.
+
+**Follow-up:** MC-2 opens AFTER this PR merges, stacked on MC-1's squash. MC-3 opens AFTER MC-2 merges, stacked on MC-2's squash. MC PASS ledger is the final paragraph of MC-3's body; only then can the controlled Wi-Fi smoke run open as a separate operator-scheduled item.
+
+**Key commits:** TBD (squash SHA backfilled on merge).
+
+---
+
 ### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK gate-only carve-out from PR #330 (RC-RECONNECT-QUIESCENCE1 gate-component shipped to master ahead of MC implementation PR)
 
 **Outcome:** First gate-only carve-out PR opens against the §13.1 corrected wording (PR #356 squash `d64bef0a`) implementing the §13.4 hand-off contract. Brings the `phantom.core.transport.WsReconnectGate` type-and-interface surface from PR #330 commit `6f49cd89` to master verbatim — `sha256: 64e2d106366e3f737fb287cba170ba5de36854564937da8e16a706094c97b172` byte-identical with the PR #330 source — plus a fresh 508-LOC structural test file (`WsReconnectGateStructuralTest.kt`, 27 cells) covering the gate file's actual surface in pure isolation per §13.1's corrected test-scope wording, plus the `RECONNECT_QUIESCENCE_ENABLED` BuildConfig flag (release-pinned `"0"` per the existing `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` / `DEBUG_FORCE_MODE_2_DETECTION` idiom), plus a 3-cell companion release-pin test (`ReconnectQuiescenceReleaseBuildConfigPinTest`). NO orchestrator wiring stubs (the gate file imposes no compile-time dependency on any existing class per the §13.1 round-2 conditional rule). NO ProGuard discipline extension (the gate file introduces no new `KtorRelayTransport` members). NO `RestStateMachine` modifications. NO `WsReconnectGateTest.kt` (PR #330's 1172-LOC integration suite) and NO `RestFallbackOrchestratorQuiescenceWiringTest.kt` — both integration-scoped per §13.5 and deferred to the MC implementation PR.

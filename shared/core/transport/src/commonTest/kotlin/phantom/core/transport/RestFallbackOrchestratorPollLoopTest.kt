@@ -270,7 +270,7 @@ class RestFallbackOrchestratorPollLoopTest {
      */
     private fun driveStateToRestActive(orch: RestFallbackOrchestrator) {
         repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
+            orch.submitEventNow(
                 RestStateMachine.Event.WsSessionEnded(
                     durationMs = 1000L,
                     inboundFrames = 0,
