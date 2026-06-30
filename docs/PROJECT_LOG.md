@@ -607,7 +607,7 @@ when an entry mentions a rejected approach.
 - Sealed-class distinctness for the 5 `WsReconnectGate` states (`Open / Quiesced / ProbeAvailable / ProbeClaimed / CandidateProving`) including compile-time exhaustiveness pinning via `when`
 - `ProbeToken.toString()` redaction lock (returns `[REDACTED]`, never the raw `Long` value)
 - `ProbeAvailable.toString()` / `ProbeClaimed.toString()` / `ClaimedProbe.toString()` (all three carry explicit `override fun toString()` in the source) wrap their token via `[REDACTED]` and assert the raw hex/decimal token never leaks through the data-class string interpolation
-- `CandidateProving` type-level absence of `token` field pinned via `!toString().contains("token")` — adding a `token` property to `CandidateProving` breaks this test before any runtime path can leak a value
+- `CandidateProving` type-level absence of any token-like field pinned via `!toString().contains("token", ignoreCase = true)` — case-insensitive so adding `val probeToken: ProbeToken` / `val recoveryToken: ...` / `TOKEN_VALUE` / any other token-named property to `CandidateProving` breaks this test before any runtime path can leak a value
 - `simpleKind()` extension returns the expected telemetry-safe label (`"Open"` / `"Quiesced"` / `"ProbeAvailable"` / `"ProbeClaimed"` / `"CandidateProving"`) for each of the 5 states
 - `ProbeBudget.MAX_ATTEMPTS_LOCKED == 5` and `ProbeBudget.MAX_ELAPSED_MS_LOCKED == 120_000L` locked-constant pins
 - Sealed-hierarchy distinctness + compile-time `when` exhaustiveness for `WsReconnectPermit` (`OpenPermit / ClaimedProbe / LoopRetired`) / `ClaimResult` (`Claimed / Failure`) / `ProbeIssueResult` (`ProbeIssued / Rejected`) / `RouteChangeOutcome` (`OpenReconnect / StickyRecovery / QuiescencePreserved`)
