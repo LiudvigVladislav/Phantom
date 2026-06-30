@@ -938,8 +938,17 @@ class RestFallbackOrchestrator(
         }
     }
 
-    /** Forward an event into the state machine. */
-    fun submitEvent(event: RestStateMachine.Event) {
+    /**
+     * Forward an event into the state machine.
+     *
+     * `suspend` (PR #330 RC-RECONNECT-QUIESCENCE1 ripple via MC-1):
+     * [RestStateMachine.onEvent] became `suspend` because the gate-aware
+     * arms (`armSticky` Direct-only fence, `transitionToWsActive`
+     * proof-validation, candidate-death flip) acquire the gate's
+     * `Mutex`. Mechanical signature change at this seam — no logic
+     * change, no scheduling change.
+     */
+    suspend fun submitEvent(event: RestStateMachine.Event) {
         stateMachine.onEvent(event)
     }
 
