@@ -110,7 +110,7 @@ MC SHOULD reinforce the gate-coordinated aspects of the hypotheses N-1 identifie
 
 MC closure (handing off to the controlled Wi-Fi smoke step) opens when the matrix supports:
 
-1. **MC PASS** — all six gate-mediated assertions in §6 hold; the structural assertion in §4.2 (sequential dispatcher order) PASSES; the negative-presence test in §4.3 (`closeOrigin` non-branching) PASSES; the `maybeRetryBootstrap()` disposition from §4.4 is documented; the test floor from §4.5 is included. Disposition: combined with the already-landed MB PASS, B1 acceptance gate from `direct-wss-mode2-recon1.md` §11 closes; the controlled Wi-Fi smoke can open as a separate operator-scheduled item.
+1. **MC PASS** — all six gate-mediated assertions in §6 hold; the structural assertion in §4.2 (sequential dispatcher order) PASSES; the negative-presence test in §4.3 (`closeOrigin` non-branching) PASSES; the `maybeRetryBootstrap()` disposition from §4.4 is documented; the test floor from §4.5 is included. Disposition: combined with the already-landed MB PASS, the two H-ME validation halves are satisfied and the controlled Wi-Fi smoke run UNLOCKS as a separate operator-scheduled item. B1 acceptance gate from `direct-wss-mode2-recon1.md` §11 closes only after Wi-Fi smoke PASS — MC PASS + MB PASS on their own do NOT close B1.
 2. **MC PARTIAL** — some §6 assertions hold; others surface honest model-level failures. Disposition: the recon closes with a verdict listing exactly which assertions failed; the implementation PR for the failing pieces is a separate scope-lock; PR #330 stays Draft / HOLD; B1 stays open.
 3. **MC FAIL** — none or only one §6 assertion holds. Disposition: PR #330's gate design has a model-level defect that MC surfaced. The disposition is a re-design discussion, not a test-fix. The mini-lock closes inconclusive and the next step is operator-led on PR #330's mini-lock contract.
 
@@ -211,7 +211,7 @@ The gate-only carve-out PR extracts a deliberately-narrow subset of PR #330's di
 - Strategy 2 and Strategy 3 from §5 are NOT carried forward (Strategy 1 explicitly chosen).
 - The §4 binding constraints (L-13.3.1 / .3 / .4 / .5 / .11) remain binding on the MC implementation PR.
 - The §6 load-bearing hypotheses remain binding on the MC implementation PR.
-- The §7 acceptance gates remain unchanged.
+- The §7 acceptance-gate criteria for MC PASS / MC PARTIAL / MC FAIL remain unchanged. The §7.1 MC PASS *disposition* wording was corrected in this amendment to match the §13.2 sequencing — MC PASS + MB PASS unlocks the controlled Wi-Fi smoke run; B1 closes only after Wi-Fi smoke PASS. This is a wording-alignment fix; the underlying B1 closure semantics already locked in §9 / §12 are unchanged.
 - PR #330's contract is NOT amended. PR #353 (MB half) is NOT amended. The methodology recon's H-ME verdict is NOT amended.
 - The L1 mini-lock + the L1 §5.1 Option A amendment + the path-2 step 2 narrowing PR stay in force.
 
