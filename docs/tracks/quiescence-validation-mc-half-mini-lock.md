@@ -189,7 +189,7 @@ The gate-only carve-out PR extracts a deliberately-narrow subset of PR #330's di
 
 **MUST NOT be in the carve-out's initial diff:**
 
-- **Activation of the quiescence contract.** The `RECONNECT_QUIESCENCE_ENABLED` flag is release-pinned `"0"`; the constructor-injected Boolean defaults to `false` in release. Production transport behaviour is byte-identical to current master HEAD when the flag is off.
+- **Activation of the quiescence contract.** The `RECONNECT_QUIESCENCE_ENABLED` flag is release-pinned `"0"`; the constructor-injected Boolean defaults to `false` in release. There is NO observable production transport behaviour change when the flag is off — the gate component sits dormant; existing reconnect / dispatch / state-machine code paths execute exactly as on current master HEAD. The bytecode itself differs (new class files, new constructor parameters, new BuildConfig field) but no production code path observes a different runtime behaviour while the flag is `"0"`.
 - **Runtime behaviour changes in unrelated transport paths.** The carve-out is structural: it lands the gate component as a compileable, unit-testable unit. It does NOT change the dispatcher's routing of real `WsSessionLifecycleEvent.Ended` events to the gate when the flag is off.
 - **PR #330's full RestStateMachine / KtorRelayTransport / TransportRewalkCoordinator modifications.** The carve-out brings ONLY what the gate state machine needs to compile + be unit-tested in isolation. The larger production-behaviour rewrites from PR #330 stay on PR #330's branch and ship with the eventual full PR #330 merge.
 - **Changes to PR #330's contract.** PR #330's mini-lock + RC-RECONNECT-QUIESCENCE1 contract are NOT amended by this carve-out. The gate component lands as the structurally same shape PR #330 intends; PR #330's full integration + activation are a separate concern that happens at PR #330's own eventual merge.
@@ -198,12 +198,12 @@ The gate-only carve-out PR extracts a deliberately-narrow subset of PR #330's di
 
 ### §13.2 Sequencing
 
-1. **Gate-only carve-out PR** opens. Initial diff matches §13.1. Verified locally: gate's unit tests PASS; `assembleRelease` + `verifyR8StripsTestSeams` PASS; production transport behaviour unchanged (because the BuildConfig flag is `"0"` in release).
+1. **Gate-only carve-out PR** opens. Initial diff matches §13.1. Verified locally: gate's unit tests PASS; `assembleRelease` + `verifyR8StripsTestSeams` PASS; no observable production transport behaviour change (because the BuildConfig flag is `"0"` in release and the constructor-injected Boolean defaults to `false`).
 2. **Gate-only carve-out PR merges on master.** The carve-out commit becomes the qualifying base for the MC implementation PR per §13's contract.
 3. **MC implementation PR** opens, stacked on the landed gate code. Carries forward all §4 / §6 / §7 / §9 requirements; adopts §4.5 acceptance matrix as test floor; cites the gate-only carve-out's squash SHA verbatim in body.
-4. **MC PASS verdict** on the MC implementation PR (per §7) combined with the already-landed MB PASS verdict (PR #353 squash `ed3406eb`) closes the B1 gate per L-13.3.1.
-5. **Controlled Wi-Fi smoke run** opens as a separate operator-scheduled item AFTER MC PASS lands. Validates the end-to-end quiescence chain on a real device.
-6. **PR #330** advances per its own mini-lock contract AFTER both halves PASS + Wi-Fi smoke PASS. The carve-out from §13.1 reduces PR #330's effective diff (the gate component is already on master), simplifying PR #330's eventual integration.
+4. **MC PASS verdict** on the MC implementation PR (per §7) combined with the already-landed MB PASS verdict (PR #353 squash `ed3406eb`) **satisfies the two H-ME validation halves**. Per the §9 and §12 contract these halves UNLOCK the controlled Wi-Fi smoke run — they do NOT close B1 on their own. B1 closure remains gated on the Wi-Fi smoke per §9 / §12.
+5. **Controlled Wi-Fi smoke run** opens as a separate operator-scheduled item after step 4 lands. Validates the end-to-end quiescence chain on a real device. **Wi-Fi smoke PASS is what closes the B1 acceptance gate** from `direct-wss-mode2-recon1.md` §11 — the smoke is the final field-shape check per §9 / §12 of this mini-lock and is NOT skipped by step 4's MC + MB combination.
+6. **PR #330** advances per its own mini-lock contract AFTER B1 has closed (i.e., after MC PASS + MB PASS unlocked the smoke AND the smoke itself PASSed). The carve-out from §13.1 reduces PR #330's effective diff (the gate component is already on master), simplifying PR #330's eventual integration.
 
 ### §13.3 What this amendment does NOT change
 
@@ -225,7 +225,7 @@ The gate-only carve-out PR opens AFTER this amendment merges. The carve-out PR:
 - Documents the BuildConfig flag wiring + release pin.
 - Includes the companion release-pin test.
 - Includes the narrowed ProGuard discipline extension (if any new keep entries are needed) + structural pin test updates.
-- States explicitly that the carve-out is structural — production transport behaviour is byte-identical to master HEAD when the flag is `"0"`.
+- States explicitly that the carve-out is structural — no observable production transport behaviour change when the flag is `"0"` (the bytecode itself differs because new class files and BuildConfig field are added, but no production code path observes a different runtime behaviour while the flag is off).
 - States that PR #330's contract is NOT amended; that the MB half (PR #353) is NOT amended; that the L1 mini-lock + L1 §5.1 Option A amendment + path-2 step 2 narrowing PR stay in force.
 
 After the carve-out PR merges, the MC implementation PR's preconditions per §8 are satisfied; the MC implementation PR opens as the next step.
