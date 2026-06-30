@@ -598,6 +598,47 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK opened — implementation scope-lock for MC half of H-ME
+
+**Outcome:** Path-2 step 4 — methodology scope-lock for the MC half of the H-ME closure verdict. Opens immediately after PR #353 (the MB half) merged earlier the same day. Per the methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) lock L-13.3.1 ("both halves required"), B1 closure for `direct-wss-mode2-recon1.md` §11 needs MC PASS + MB PASS on record. MB landed in PR #353 squash `ed3406eb`; MC is the remaining deliverable.
+
+New track-doc at `docs/tracks/quiescence-validation-mc-half-mini-lock.md` (168 lines) scopes the MC implementation. The mini-lock binds carried-forward locks from the methodology recon's §13.3 closure verdict that apply to the MC half: L-13.3.1 both halves required (§4.1) / L-13.3.3 sequential dispatcher order load-bearing (§4.2) / L-13.3.4 closeOrigin="synthetic" non-branching discipline (§4.3) / L-13.3.5 maybeRetryBootstrap() branch scope gap (§4.4) / L-13.3.11 acceptance matrix is test floor (§4.5). Locks that govern only the MB half (L-13.3.2 / L-13.3.6 / L-13.3.7 / L-13.3.8 / L-13.3.9 / L-13.3.10) are NOT re-bound — PR #353 satisfied them and they stay in force on their own.
+
+**§5 strategy discrimination** — the gate component (`WsReconnectGate`) is introduced by PR #330 and does NOT exist on master HEAD. Three strategies for where MC tests live, each with honesty profile:
+
+- **Strategy 1** — carve a gate-only PR out of PR #330 (mirror of path-2 step 2's narrowing carve-out pattern), land gate code on master without activating the quiescence contract, then MC tests stack on the landed gate. HIGH honesty profile; ~1-2 PR sequencing; mirrors the path-2 step 2 narrowing PR's risk shape.
+- **Strategy 2** — MC tests added as commits ON PR #330's branch; MC PASS = PR #330's CI green. MEDIUM honesty; zero new PRs; couples MC to PR #330's review cycle.
+- **Strategy 3** — MC deferred until after PR #330 merges; B1 conditionally closes on MB-only with explicit deferral amendment to `direct-wss-mode2-recon1.md` §11. LOW honesty (violates L-13.3.1); zero immediate PRs; fallback only if Strategies 1 + 2 fail feasibility.
+
+The mini-lock does NOT pre-decide the strategy. Operator picks via amendment or implementation PR body.
+
+**§6 load-bearing hypotheses** — MC MUST close the gate-mediated Phase B hypotheses N-1 identified as NOT COVERED on master HEAD (H-330-Quiesces-Storm / H-330-Single-Probe-Per-RouteChange / H-330-No-Self-Reentry) and SHOULD reinforce the gate-coordinated layer of PARTIAL ones (H-330-Preserves-REST / H-330-Probe-Lives-60s / H-330-No-Message-Loss-Or-Dups).
+
+**§7 acceptance gates** — three closure dispositions (MC PASS / MC PARTIAL / MC FAIL) with explicit B1 closure semantics. MC PASS combined with the already-landed MB PASS closes B1; MC PARTIAL surfaces specific failures and leaves PR #330 Draft / HOLD; MC FAIL means PR #330's gate design has a model-level defect and the next step is operator-led re-design.
+
+**§8 preconditions** — implementation PR opens only after strategy is locked + MB is on record (already satisfied at this mini-lock's open).
+
+**§9 hand-off** — implementation PR cites this mini-lock + the H-ME verdict + the MB half; documents the chosen strategy; covers the §4 + §6 + §7 requirements. After MC PASS the controlled Wi-Fi smoke run opens as a separate operator-scheduled item. After smoke PASS, B1 closes.
+
+**§10 park conditions** — P-1 all strategies fail feasibility / P-2 operator unavailable / P-3 PR #330's gate component design changes materially.
+
+**§11 what's NOT pre-decided** — the chosen strategy; exact test files; whether PARTIAL-hypothesis coverage is "thorough enough"; numeric values for gate constants; any change to PR #330's mini-lock or H-ME verdict or L1 mini-lock; the Wi-Fi smoke procedure.
+
+Per §9 hand-off rule: the implementation PR's commit message + body MUST cite this mini-lock's squash SHA verbatim and document the chosen §5 strategy. Pre-merge implementation work without a strategy choice is rejected at review.
+
+**Track status:** QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK Open. MC implementation is the next deliverable when operator schedules. RC PR #330 Draft / HOLD unchanged. Methodology recon stays Closed with verdict H-ME unchanged. L1 mini-lock + MB half unchanged.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — MC half mini-lock (168-line track-doc). Branch `docs/quiescence-validation-mc-half-mini-lock`. Off master `ed3406eb`.
+
+**Follow-ups:**
+
+- Operator picks a §5 strategy. If Strategy 1: opens the gate-only carve-out PR next (mirror of path-2 step 2). If Strategy 2: the MC commits go on PR #330's branch. If Strategy 3: opens an amendment to `direct-wss-mode2-recon1.md` §11 first.
+- MC implementation PR follows the chosen strategy.
+- After MC PASS: controlled Wi-Fi smoke run procedure mini-lock opens.
+- After smoke PASS: B1 closes; PR #330's own mini-lock allows it to advance.
+
 ### 2026-06-30 · Path-2 step 3 — L1 synthetic-trigger implementation (MB half of H-ME; Option A stacked on a28bb1d2)
 
 **Outcome:** Path-2 step 3 — first code PR delivering the MB half of the H-ME closure verdict. Stacks on path-2 step 2 (`a28bb1d2`) under the L1 mini-lock §5.1 Option A precondition so the initial diff is focused on the MB synthetic-trigger surface only (no ProGuard / R8 changes — those are inherited from base).
