@@ -1,9 +1,10 @@
 # Track: QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK
 
 **Type:** Implementation / methodology scope-lock for the MC half of QUIESCENCE-VALIDATION-METHODOLOGY-RECON1's H-ME verdict. NOT a code change. NOT a re-investigation of the H-ME verdict or PR #330's quiescence contract.
-**Status:** Open (mini-lock).
+**Status:** Open (mini-lock); **§5 Strategy 1 locked 2026-06-30 — see §13**.
 **Opened:** 2026-06-30 immediately after the L1 synthetic-trigger implementation (the MB half of H-ME) merged earlier the same day as PR #353 squash `ed3406eb`. The methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) mandates BOTH the MB half (synthetic field trigger — DONE) AND the MC half (deterministic state-machine / integration validation — THIS mini-lock).
 **Last known master at open:** PR #353 squash `ed3406eb`.
+**Last known master at Strategy 1 amendment:** PR #354 squash `b9e979f2`.
 
 ---
 
@@ -109,7 +110,7 @@ MC SHOULD reinforce the gate-coordinated aspects of the hypotheses N-1 identifie
 
 MC closure (handing off to the controlled Wi-Fi smoke step) opens when the matrix supports:
 
-1. **MC PASS** — all six gate-mediated assertions in §6 hold; the structural assertion in §4.2 (sequential dispatcher order) PASSES; the negative-presence test in §4.3 (`closeOrigin` non-branching) PASSES; the `maybeRetryBootstrap()` disposition from §4.4 is documented; the test floor from §4.5 is included. Disposition: combined with the already-landed MB PASS, B1 acceptance gate from `direct-wss-mode2-recon1.md` §11 closes; the controlled Wi-Fi smoke can open as a separate operator-scheduled item.
+1. **MC PASS** — all six gate-mediated assertions in §6 hold; the structural assertion in §4.2 (sequential dispatcher order) PASSES; the negative-presence test in §4.3 (`closeOrigin` non-branching) PASSES; the `maybeRetryBootstrap()` disposition from §4.4 is documented; the test floor from §4.5 is included. Disposition: combined with the already-landed MB PASS, the two H-ME validation halves are satisfied and the controlled Wi-Fi smoke run UNLOCKS as a separate operator-scheduled item. B1 acceptance gate from `direct-wss-mode2-recon1.md` §11 closes only after Wi-Fi smoke PASS — MC PASS + MB PASS on their own do NOT close B1.
 2. **MC PARTIAL** — some §6 assertions hold; others surface honest model-level failures. Disposition: the recon closes with a verdict listing exactly which assertions failed; the implementation PR for the failing pieces is a separate scope-lock; PR #330 stays Draft / HOLD; B1 stays open.
 3. **MC FAIL** — none or only one §6 assertion holds. Disposition: PR #330's gate design has a model-level defect that MC surfaced. The disposition is a re-design discussion, not a test-fix. The mini-lock closes inconclusive and the next step is operator-led on PR #330's mini-lock contract.
 
@@ -166,3 +167,67 @@ If this mini-lock merges and the operator does NOT immediately open the implemen
 If this mini-lock merges and the operator opens the implementation PR same-session: the implementation PR's commit message + body cite this mini-lock's squash SHA verbatim and document the chosen §5 strategy.
 
 Do NOT propose changes to PR #330's contract from inside this mini-lock or the implementation PR. Do NOT amend the H-ME verdict. Do NOT skip the controlled Wi-Fi smoke step after MC PASS — the smoke is the final field-shape check before B1 closes.
+
+## §13 Strategy 1 lock — gate-only carve-out from PR #330 (2026-06-30)
+
+Operator-chosen §5 Strategy 1. The MC implementation now follows a two-PR sequence: (a) a gate-only carve-out PR that lands the `WsReconnectGate` source + targeted unit tests on master without activating the quiescence contract; (b) a follow-on MC implementation PR that stacks on the landed gate code and adds any remaining MC tests + the structural / negative-presence assertions required by §4.2 / §4.3.
+
+Rationale for Strategy 1 over the alternatives is captured in the operator's review (recorded in PROJECT_LOG): the carved-out path is HIGH honesty profile, mirrors the path-2 step 2 narrowing carve-out pattern that already worked (PR #352 squash `a28bb1d2`), preserves L-13.3.1, and avoids coupling the MC verdict to PR #330's review lifecycle (which Strategy 2 would do) or weakening the "both halves required" lock (which Strategy 3 would do). Strategies 2 and 3 are NOT carried forward.
+
+### §13.1 Gate-only carve-out scope
+
+The gate-only carve-out PR extracts a deliberately-narrow subset of PR #330's diff. The implementation PR designs the file-level shape; this amendment pins what MUST be in and what MUST stay out.
+
+**MUST be in the carve-out's initial diff:**
+
+- **`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/WsReconnectGate.kt`** — the gate state machine (`Open / Quiesced / ProbeAvailable / ProbeClaimed / CandidateProving`) plus its public API. The implementation PR may bring this file verbatim from PR #330's branch (commit `6f49cd89`) OR may re-author it; either way the carve-out's body MUST cite the source.
+- **Targeted unit tests for the gate** — at minimum `WsReconnectGateTest.kt` (PR #330's 1172 LOC) brought across verbatim or re-authored against the carved gate. The full test file may be brought even if some assertions inside it depend on integration wiring that the carve-out chooses to NOT include — those assertions then either remain as `@Ignore` with a forward-pointer to the MC implementation PR or are extracted to the MC implementation PR's surface. The implementation PR decides per-cell which shape applies.
+- **A new Android-side BuildConfig flag** — `RECONNECT_QUIESCENCE_ENABLED` defaulting to `"0"` in the release block (mirrors the existing `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` / `DEBUG_FORCE_MODE_2_DETECTION` patterns); debug-block `localOrEnv("reconnectQuiesce", "RECONNECT_QUIESCENCE_ENABLED", "0")` so operator can opt in via `-PreconnectQuiesce=1`.
+- **A companion release-pin test** — `ReconnectQuiescenceReleaseBuildConfigPinTest` (or equivalent name) in `androidUnitTest` mirroring `Mode2FastPathReleaseBuildConfigPinTest` / `Mode2DebugForceReleaseBuildConfigPinTest`. Three cells: release pin literal `"0"` present, debug block does NOT carry the literal pin, debug block declares the flag via `localOrEnv(...)` for the opt-in.
+- **Minimal wiring stubs** sufficient to make the gate compileable and unit-testable in isolation. This means: any constructor parameters the gate exposes to its surrounding orchestrator code (e.g., a `reconnectQuiescenceEnabled: Boolean = false` constructor parameter, mirroring the L1 MB pattern) AND the AppContainer-side wire-up reading the BuildConfig and injecting the Boolean. The wire-up MUST default to `false` in release and MUST NOT change the runtime behaviour of any existing transport code path when the flag is `false`.
+- **The narrowed ProGuard discipline** — if the carve-out introduces new `KtorRelayTransport` members that need to survive R8 (e.g., a gate-mediated accessor accessed by name from `HybridRelayTransport` via the concrete type), the carve-out PR extends the narrowed keep block at `apps/android/proguard-rules.pro` with justified entries AND extends `KtorRelayTransportProguardNarrowingPinTest` to assert the new member names are listed. If the carve-out's new members are reachable purely through `RelayTransport` interface dispatch, no keep changes are needed. The `verifyR8StripsTestSeams` Gradle task remains the runtime backstop.
+
+**MUST NOT be in the carve-out's initial diff:**
+
+- **Activation of the quiescence contract.** The `RECONNECT_QUIESCENCE_ENABLED` flag is release-pinned `"0"`; the constructor-injected Boolean defaults to `false` in release. There is NO observable production transport behaviour change when the flag is off — the gate component sits dormant; existing reconnect / dispatch / state-machine code paths execute exactly as on current master HEAD. The bytecode itself differs (new class files, new constructor parameters, new BuildConfig field) but no production code path observes a different runtime behaviour while the flag is `"0"`.
+- **Runtime behaviour changes in unrelated transport paths.** The carve-out is structural: it lands the gate component as a compileable, unit-testable unit. It does NOT change the dispatcher's routing of real `WsSessionLifecycleEvent.Ended` events to the gate when the flag is off.
+- **PR #330's full RestStateMachine / KtorRelayTransport / TransportRewalkCoordinator modifications.** The carve-out brings ONLY what the gate state machine needs to compile + be unit-tested in isolation. The larger production-behaviour rewrites from PR #330 stay on PR #330's branch and ship with the eventual full PR #330 merge.
+- **Changes to PR #330's contract.** PR #330's mini-lock + RC-RECONNECT-QUIESCENCE1 contract are NOT amended by this carve-out. The gate component lands as the structurally same shape PR #330 intends; PR #330's full integration + activation are a separate concern that happens at PR #330's own eventual merge.
+- **Synthetic-trigger code.** PR #353 already shipped the MB half. The carve-out does NOT re-touch any L1 synthetic-trigger surface.
+- **MC test cells beyond the gate's own unit tests.** §4.2 sequential-dispatcher-order test, §4.3 negative-presence test on `closeOrigin`, and the §6 hypothesis assertions are the MC implementation PR's scope, NOT the carve-out's.
+
+### §13.2 Sequencing
+
+1. **Gate-only carve-out PR** opens. Initial diff matches §13.1. Verified locally: gate's unit tests PASS; `assembleRelease` + `verifyR8StripsTestSeams` PASS; no observable production transport behaviour change (because the BuildConfig flag is `"0"` in release and the constructor-injected Boolean defaults to `false`).
+2. **Gate-only carve-out PR merges on master.** The carve-out commit becomes the qualifying base for the MC implementation PR per §13's contract.
+3. **MC implementation PR** opens, stacked on the landed gate code. Carries forward all §4 / §6 / §7 / §9 requirements; adopts §4.5 acceptance matrix as test floor; cites the gate-only carve-out's squash SHA verbatim in body.
+4. **MC PASS verdict** on the MC implementation PR (per §7) combined with the already-landed MB PASS verdict (PR #353 squash `ed3406eb`) **satisfies the two H-ME validation halves**. Per the §9 and §12 contract these halves UNLOCK the controlled Wi-Fi smoke run — they do NOT close B1 on their own. B1 closure remains gated on the Wi-Fi smoke per §9 / §12.
+5. **Controlled Wi-Fi smoke run** opens as a separate operator-scheduled item after step 4 lands. Validates the end-to-end quiescence chain on a real device. **Wi-Fi smoke PASS is what closes the B1 acceptance gate** from `direct-wss-mode2-recon1.md` §11 — the smoke is the final field-shape check per §9 / §12 of this mini-lock and is NOT skipped by step 4's MC + MB combination.
+6. **PR #330** advances per its own mini-lock contract AFTER B1 has closed (i.e., after MC PASS + MB PASS unlocked the smoke AND the smoke itself PASSed). The carve-out from §13.1 reduces PR #330's effective diff (the gate component is already on master), simplifying PR #330's eventual integration.
+
+### §13.3 What this amendment does NOT change
+
+- §1-§12 of this mini-lock stay in force.
+- Strategy 2 and Strategy 3 from §5 are NOT carried forward (Strategy 1 explicitly chosen).
+- The §4 binding constraints (L-13.3.1 / .3 / .4 / .5 / .11) remain binding on the MC implementation PR.
+- The §6 load-bearing hypotheses remain binding on the MC implementation PR.
+- The §7 acceptance-gate criteria for MC PASS / MC PARTIAL / MC FAIL remain unchanged. The §7.1 MC PASS *disposition* wording was corrected in this amendment to match the §13.2 sequencing — MC PASS + MB PASS unlocks the controlled Wi-Fi smoke run; B1 closes only after Wi-Fi smoke PASS. This is a wording-alignment fix; the underlying B1 closure semantics already locked in §9 / §12 are unchanged.
+- PR #330's contract is NOT amended. PR #353 (MB half) is NOT amended. The methodology recon's H-ME verdict is NOT amended.
+- The L1 mini-lock + the L1 §5.1 Option A amendment + the path-2 step 2 narrowing PR stay in force.
+
+### §13.4 Hand-off to the gate-only carve-out PR
+
+The gate-only carve-out PR opens AFTER this amendment merges. The carve-out PR:
+
+- Cites this amendment's squash SHA in its body.
+- Cites PR #330's gate-source provenance (`6f49cd89:shared/core/transport/src/commonMain/kotlin/phantom/core/transport/WsReconnectGate.kt`).
+- States the carve-out scope per §13.1 explicitly (what's in, what's not).
+- Documents the BuildConfig flag wiring + release pin.
+- Includes the companion release-pin test.
+- Includes the narrowed ProGuard discipline extension (if any new keep entries are needed) + structural pin test updates.
+- States explicitly that the carve-out is structural — no observable production transport behaviour change when the flag is `"0"` (the bytecode itself differs because new class files and BuildConfig field are added, but no production code path observes a different runtime behaviour while the flag is off).
+- States that PR #330's contract is NOT amended; that the MB half (PR #353) is NOT amended; that the L1 mini-lock + L1 §5.1 Option A amendment + path-2 step 2 narrowing PR stay in force.
+
+After the carve-out PR merges, the MC implementation PR's preconditions per §8 are satisfied; the MC implementation PR opens as the next step.
+
+Do NOT open the gate-only carve-out PR with the activation flag pinned to `"1"`. Do NOT skip the companion release-pin test. Do NOT touch any production transport runtime path when the flag is `"0"`. Do NOT pre-empt the MC implementation PR's scope — the §4 / §6 / §7 requirements live on the MC implementation PR, not on the carve-out.

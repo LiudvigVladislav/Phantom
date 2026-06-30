@@ -598,6 +598,29 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK §13 amendment — Strategy 1 lock (gate-only carve-out from PR #330)
+
+**Outcome:** Operator locked §5 Strategy 1 — carve a gate-only PR out of PR #330 — with rationale: HIGH honesty profile, mirrors path-2 step 2 narrowing carve-out pattern (PR #352 squash `a28bb1d2`), preserves L-13.3.1, avoids coupling MC verdict to PR #330's review lifecycle (Strategy 2 cost) or weakening "both halves required" lock (Strategy 3 cost). Strategies 2 and 3 are NOT carried forward.
+
+Amendment appends §13 to `docs/tracks/quiescence-validation-mc-half-mini-lock.md` (~95 LOC) and updates the §1 status line. §13 has four subsections:
+
+- **§13.1 Gate-only carve-out scope** — pins what MUST be in the carve-out's initial diff (`WsReconnectGate.kt` from PR #330's commit `6f49cd89` brought verbatim or re-authored / targeted unit tests `WsReconnectGateTest.kt` / new BuildConfig flag `RECONNECT_QUIESCENCE_ENABLED` defaulting `"0"` in release block with debug `localOrEnv` / companion `ReconnectQuiescenceReleaseBuildConfigPinTest` / minimal wiring stubs to make the gate compileable + unit-testable in isolation / narrowed ProGuard discipline extension if new `KtorRelayTransport` members are introduced) and what MUST stay out (activation of the quiescence contract — flag stays `"0"` / runtime behaviour changes in unrelated transport paths / PR #330's full RestStateMachine + KtorRelayTransport + TransportRewalkCoordinator modifications / changes to PR #330's contract / synthetic-trigger code from PR #353 / MC test cells beyond gate's own unit tests).
+- **§13.2 Sequencing** — six steps from carve-out PR open through B1 closure, consistent with the §9 / §12 "Wi-Fi smoke is the final field-shape check before B1 closes" contract: (1) gate-only carve-out PR opens / (2) merges on master, becomes qualifying base for MC implementation PR / (3) MC implementation PR opens stacked on landed gate / (4) MC PASS + already-landed MB PASS satisfies the two H-ME validation halves and UNLOCKS the controlled Wi-Fi smoke run — does NOT close B1 on its own / (5) Wi-Fi smoke run opens as separate operator-scheduled item; Wi-Fi smoke PASS is what closes B1 per `direct-wss-mode2-recon1.md` §11 / (6) PR #330 advances per its own mini-lock contract after B1 closes (i.e., after MC PASS + MB PASS unlocked the smoke AND the smoke itself PASSed). Carve-out reduces PR #330's effective diff (gate already on master), simplifying eventual integration.
+- **§13.3 What this amendment does NOT change** — §1-§12 stay in force; Strategy 2/3 NOT carried forward; §4 binding constraints remain binding on MC implementation PR; §6 hypotheses remain binding; §7 acceptance-gate criteria for MC PASS / PARTIAL / FAIL unchanged (the §7.1 MC PASS disposition *wording* aligned to the §13.2 sequencing — MC + MB unlocks Wi-Fi smoke; B1 closes only after smoke PASS — matching the §9 / §12 contract already in force); PR #330's contract NOT amended; PR #353 NOT amended; H-ME verdict NOT amended; L1 mini-lock + L1 §5.1 Option A amendment + path-2 step 2 narrowing PR all stay in force.
+- **§13.4 Hand-off to the gate-only carve-out PR** — opens AFTER this amendment merges; cites this amendment SHA + PR #330's gate-source provenance; states carve-out scope per §13.1 explicitly; documents BuildConfig flag wiring + release pin; includes companion release-pin test; includes narrowed ProGuard extension if needed; states explicitly that carve-out is structural — no observable production transport behaviour change when flag is `"0"` (bytecode itself differs due to new class files + BuildConfig field, but no production code path observes a different runtime behaviour); states that PR #330 contract NOT amended; that MB half NOT amended; that L1 mini-lock + path-2 step 2 narrowing all stay in force. After carve-out merges, MC implementation PR's preconditions per §8 are satisfied. Do NOT open carve-out with flag pinned `"1"`. Do NOT skip companion release-pin test. Do NOT touch production runtime path when flag is `"0"`. Do NOT pre-empt MC implementation PR scope.
+
+**Track status:** QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK Open; §5 Strategy 1 locked. Next deliverable: gate-only carve-out PR per §13.4 hand-off contract. RC PR #330 Draft / HOLD unchanged. Methodology recon stays Closed with verdict H-ME unchanged. L1 mini-lock + MB half (PR #353) + path-2 step 2 narrowing (PR #352) unchanged.
+
+**Key PRs:**
+
+- **#TBD (this docs PR)** — Strategy 1 lock amendment to MC half mini-lock (~95 LOC §13 append + 2-line status header update). Branch `docs/quiescence-validation-mc-strategy1-lock`. Off master `b9e979f2`.
+
+**Follow-ups:**
+
+- Operator opens the gate-only carve-out PR per §13.4 after this amendment merges. NOT auto-started.
+- After carve-out merges: MC implementation PR opens stacked on the landed gate commit.
+- After MC PASS + the already-landed MB PASS: the Wi-Fi smoke run mini-lock opens (the smoke is the final field-shape check per §9 / §12 of the MC half mini-lock). B1 closes after Wi-Fi smoke PASS, NOT after MC + MB alone.
+
 ### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK opened — implementation scope-lock for MC half of H-ME
 
 **Outcome:** Path-2 step 4 — methodology scope-lock for the MC half of the H-ME closure verdict. Opens immediately after PR #353 (the MB half) merged earlier the same day. Per the methodology recon's H-ME verdict (PR #349 squash `54f2e50d`) lock L-13.3.1 ("both halves required"), B1 closure for `direct-wss-mode2-recon1.md` §11 needs MC PASS + MB PASS on record. MB landed in PR #353 squash `ed3406eb`; MC is the remaining deliverable.
@@ -614,7 +637,7 @@ The mini-lock does NOT pre-decide the strategy. Operator picks via amendment or 
 
 **§6 load-bearing hypotheses** — MC MUST close the gate-mediated Phase B hypotheses N-1 identified as NOT COVERED on master HEAD (H-330-Quiesces-Storm / H-330-Single-Probe-Per-RouteChange / H-330-No-Self-Reentry) and SHOULD reinforce the gate-coordinated layer of PARTIAL ones (H-330-Preserves-REST / H-330-Probe-Lives-60s / H-330-No-Message-Loss-Or-Dups).
 
-**§7 acceptance gates** — three closure dispositions (MC PASS / MC PARTIAL / MC FAIL) with explicit B1 closure semantics. MC PASS combined with the already-landed MB PASS closes B1; MC PARTIAL surfaces specific failures and leaves PR #330 Draft / HOLD; MC FAIL means PR #330's gate design has a model-level defect and the next step is operator-led re-design.
+**§7 acceptance gates** — three closure dispositions (MC PASS / MC PARTIAL / MC FAIL). MC PASS combined with the already-landed MB PASS satisfies the two H-ME validation halves and unlocks the controlled Wi-Fi smoke run as a separate operator-scheduled item; B1 closes only after Wi-Fi smoke PASS. MC PARTIAL surfaces specific failures and leaves PR #330 Draft / HOLD; MC FAIL means PR #330's gate design has a model-level defect and the next step is operator-led re-design.
 
 **§8 preconditions** — implementation PR opens only after strategy is locked + MB is on record (already satisfied at this mini-lock's open).
 
