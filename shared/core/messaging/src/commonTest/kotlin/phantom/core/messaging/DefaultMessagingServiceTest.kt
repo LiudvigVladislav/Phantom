@@ -366,6 +366,7 @@ private class FakeRelayTransport : RelayTransport {
     override val lastInboundFrameElapsedMs: Long get() = 0L
     override val pendingAckCount: Int get() = 0
     override suspend fun forceReconnect() {}
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean = true
     suspend fun deliver(d: RelayMessage.Deliver) { _incoming.emit(d) }
 }
 
@@ -5784,6 +5785,7 @@ private class ManualIncomingTransport : phantom.core.transport.RelayTransport {
     override val lastInboundFrameElapsedMs: Long get() = 0L
     override val pendingAckCount: Int get() = 0
     override suspend fun forceReconnect() {}
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean = true
     suspend fun deliver(d: phantom.core.transport.RelayMessage.Deliver) { _incoming.emit(d) }
 }
 

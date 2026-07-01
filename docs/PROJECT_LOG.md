@@ -598,6 +598,59 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-07-01 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK MC-2 — Ktor permit flow + RelayTransport.disconnectAndJoin fan-out + NonCancellable cleanupCap=8 discipline (MC stack part 2 of 3)
+
+**Outcome:** Second of the three-PR MC stack per §13.2 step 3. Stacked on PR #358 squash `91745acd` (MC-1). Lands the `KtorRelayTransport` reconnect-loop permit-flow consumer of the two provider interfaces already delivered by MC-1, plus the new `suspend fun disconnectAndJoin(timeoutMs)` interface method with `NonCancellable` critical region + `cleanupCap = 8` bounded cleanup scope, plus the four PR #330 `KtorRelayTransport`-side test files. **MC PASS is NOT declared by this PR alone** — the MC PASS ledger lands on MC-3 after §4.2 + §4.3 + §4.4 disposition + §4.5 floor + reinforcement cells per §7.
+
+**What MC-2 ships:**
+
+- **`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/KtorRelayTransport.kt`** (+1024 / -116) — cherry-picked from PR #330 commit `6f49cd89` preserving PR #353 L1 surface. New: `initialGateProvider: WsReconnectGateProvider? = null` ctor param + `@Volatile var gateProvider` for late-binding by AppContainer in MC-3; `runReconnectLoop` consumes `awaitReconnectPermit` / `validatePermitAfterAuth` / `recordProbeAttemptFailed` (`OpenPermit` → normal reconnect, `ClaimedProbe` → recovery, `LoopRetired` → break); per-loop `ownerGeneration` allocated via `gateProvider.allocateConnectionGeneration()`; `WsSessionLifecycleEvent.Connected` extended with `connectionGeneration: Long = 0L` (intrinsic — Lifecycle events live inline in this file); `disconnectAndJoin(timeoutMs: Long): Boolean` override with `NonCancellable` critical region cancelling reconnect job + queueing session/client cleanup to `cleanupScope` (Dispatchers.IO + SupervisorJob); `cleanupCap = 8` slots refuse further work on exhaustion (WARN log, ref abandoned) — this is a load-bearing constant documented in-source, the bound is required because blocking `close()` calls cannot be interrupted by cooperative cancellation and the alternative is unbounded off-scope leakage. PR #353 surface fully preserved verbatim: `debugForceMode2Enabled` ctor param + `debugForceMode2Synthetic` method + `currentSessionEpoch` accessor + `oneShotLatchConsumedAtEpoch` field + `oneShotLatchMutex` + 3 `*ForTest*` seams (`setStateForTest` / `bumpSessionEpochForTest` / `resetOneShotLatchForTest`).
+
+- **`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RelayTransport.kt`** (+65) — new `suspend fun disconnectAndJoin(timeoutMs: Long = 10_000L): Boolean` interface member with `NonCancellable`-critical-region + bounded-join contract documented in the KDoc.
+
+- **`apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt`** (+17) — pass-through override delegating to `wsTransport.disconnectAndJoin(timeoutMs)`. No REST-side teardown of its own; the inner `KtorRelayTransport` owns the reconnect loop and cleanup discipline.
+
+- **Fan-out stubs** for the 3 inline test `RelayTransport` impls (all `= true` since test doubles have no real reconnect job to wait on): `shared/core/transport/.../FakeRelayTransportTest.kt.FakeRelayTransport` (+2), `shared/core/messaging/.../Alpha0IntegrationTest.kt.BufferingRelayTransport` (+2), `shared/core/messaging/.../DefaultMessagingServiceTest.kt.FakeRelayTransport` + `.ManualIncomingTransport` (+4 total across two classes).
+
+- **`apps/android/build.gradle.kts`** (+11) — `implementation(kotlin("reflect"))` added to `androidUnitTest` source set. Required by the new `KtorRelayTransportInternalTestSeams.kt` which reaches `shared:core:transport` `internal` seams via `kotlin.reflect.full.callSuspend`. Reflection stays confined to `androidUnitTest` (excluded from any APK); seams stay `internal` (not widened to Kotlin source-level API).
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/KtorRelayTransportRunReconnectLoopTest.kt`** (480 LOC new) — byte-identical with PR #330 commit `6f49cd89` source, `sha256: 55035841473049d4e89f1e686147737c370d782bb8486da8cd5dd1d3390c6931`.
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/KtorRelayTransportDisconnectAndJoinTest.kt`** (848 LOC new) — byte-identical, `sha256: 3e1e6b6abd56ee8491fc0d5b024b1129a746f28920a40451dc67a70eeea36439`.
+
+- **`apps/android/src/androidUnitTest/kotlin/phantom/android/transport/KtorRelayTransportInternalTestSeams.kt`** (153 LOC new) — byte-identical, `sha256: de8cb66596b20a78e72e0cd01ab0ef1c199f0d8e8d8d55f9511fc0d62738c28c`. Reflection bridge for `androidUnitTest` callers to reach `internal` seams on `KtorRelayTransport` (`closeForTest`, `cleanupInflightForTest`) that live in the sibling `shared:core:transport` module.
+
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/KtorRelayTransportPendingOutboundTest.kt`** — byte-replaced with PR #330 version (+238 net, 426 → 662 LOC, `sha256: 9157a67bf1b382857a5cf09ac73e54219222efa39bbc61fd1aa4f6799ebff0e7`).
+
+**Verification PASSED locally:**
+
+- `:shared:core:transport:jvmTest` PASS ×3 iterations at ~40s each after single-file isolated baselines (BodyTimeoutContractTest 34s / RunReconnectLoopTest 38s / DisconnectAndJoinTest 34s / PendingOutboundTest 37s).
+- `:apps:android:testDebugUnitTest` PASS.
+- `:apps:android:assembleRelease` PASS.
+- `:apps:android:verifyR8StripsTestSeams PASS — no *ForTest* / debugForce* / *Synthetic* classes or members survived on any phantom.* class.` All PR #353 L1 seams + all new MC-2 `*ForTest` seams stripped from release by existing deny-pattern discipline.
+
+**Transient hang note:** the first background `:shared:core:transport:jvmTest` on MC-2 head hung 24 minutes with 0-byte output before being killed with `taskkill`. NOT reproducible after killing — 8/8 subsequent runs PASS at ~40s each; production code alone (baseline `BodyTimeoutContractTest`) passes on MC-2 HEAD. Suspected transient Gradle daemon / JVM lock state during in-flight file edits, no code fix issued for it. If it recurs on CI it will be treated the same way as the PR #358 24-minute cancel: single rerun on the same head; only a second recurrence would escalate to fix-round on `KtorRelayTransport` teardown / dangling coroutine cleanup.
+
+**What MC-2 does NOT ship (defers to MC-3):**
+
+- No `TransportRewalkCoordinator` 7-step gate transaction (`beginRouteChange` → branch → `disconnectAndJoin` → release → `issueProbeAfterRewalk` → `requestServiceRestart`).
+- No `AppContainer` BuildConfig wiring or late-binding `gateProvider` assignment.
+- No `WsSessionLifecycleDispatcher.connectionGeneration` field-carry.
+- No `RestFallbackOrchestrator` new ctor params for `currentKindProvider` + `tokenSource`.
+- No `RestFallbackOrchestratorQuiescenceWiringTest`.
+- No fresh §4.2 sequential-dispatcher-order test.
+- No fresh §4.3 `closeOrigin = "synthetic"` non-branching grep test.
+- No §4.4 `maybeRetryBootstrap()` disposition note.
+- No reinforcement cells for H-330-Preserves-REST + H-330-No-Message-Loss-Or-Dups.
+- No MC PASS ledger.
+- No Wi-Fi smoke opening.
+
+**Follow-up:** MC-3 opens AFTER this PR merges, stacked on MC-2's squash. MC PASS ledger + Wi-Fi smoke open only after MC-3 lands.
+
+**Key commits:** TBD (squash SHA backfilled in MASTER_TIMELINE on merge).
+
+---
+
 ### 2026-06-30 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK MC-1 — RestStateMachine gate state-transition logic + provider implementations + WsReconnectGateTest integration suite (MC stack part 1 of 3)
 
 **Outcome:** First of the three-PR MC stack opened against §13.2 step 3 of the MC half mini-lock. Lands the `WsReconnectGate` state-transition logic on `RestStateMachine` + the two provider implementations (`WsReconnectGateProvider` / `RewalkCoordinatorGateProvider`) + the PR #330 1172-LOC integration test `WsReconnectGateTest.kt`. Stacked on PR #357 squash `daee9645` (gate-only carve-out). **MC PASS verdict is NOT declared by this PR alone** — only after MC-3 lands the full stack does MC PASS get on record per §7 of the mini-lock; the operator-greenlit stack discipline pins this explicitly in every PR body.

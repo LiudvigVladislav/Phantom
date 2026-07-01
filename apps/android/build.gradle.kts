@@ -52,6 +52,17 @@ kotlin {
         val androidUnitTest by getting {
             dependencies {
                 implementation(kotlin("test"))
+                // RC-RECONNECT-QUIESCENCE1 MC-2 (2026-07-01) — reflection
+                // bridge for `androidUnitTest`-side callers reaching
+                // `internal` seams that live on `shared:core:transport`
+                // (`KtorRelayTransport.closeForTest` +
+                // `cleanupInflightForTest` + related helpers). The
+                // seams stay `internal` so they are not reachable as
+                // Kotlin source-level API from a sibling module —
+                // reflection bypasses source-level visibility, but the
+                // reflection bridge file lives only in `androidUnitTest`,
+                // which is excluded from any APK.
+                implementation(kotlin("reflect"))
                 implementation(project(":shared:core:transport"))
             }
         }
