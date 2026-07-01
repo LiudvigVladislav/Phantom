@@ -20,8 +20,31 @@ interface RelayTransport {
 
     /**
      * Open the WebSocket and run the reconnect loop until [disconnect] is
-     * called. Idempotent at the call-site level — calling `connect` twice
-     * cancels the prior reconnect job before starting a new one.
+     * called. Idempotent at the call-site level with two disjoint cases:
+     *
+     *   1. **No live reconnect loop** (fresh cold start OR after a prior
+     *      [disconnect] / [disconnectAndJoin] that fully drained the
+     *      loop): the new call-site args (`relayUrl`, `identityPublicKeyHex`,
+     *      `signingPublicKeyHex`, `signChallenge`, `socksProxyPort`) are
+     *      written under the connection-lifecycle mutex and a fresh
+     *      reconnect loop is launched.
+     *   2. **Live reconnect loop still running or draining** (e.g. after
+     *      a [disconnectAndJoin] timed out without a full drain and left
+     *      the previous job's ref alive): the new call-site args are
+     *      IGNORED to prevent config corruption of the live loop
+     *      mid-auth or mid-handshake. The existing job is reused — the
+     *      call returns join semantics equivalent to awaiting the live
+     *      loop. Callers that need to change `relayUrl` / identity /
+     *      signing / socks MUST first invoke [disconnect] or
+     *      [disconnectAndJoin] and confirm the drain completed.
+     *
+     * Rationale for case 2: an earlier shape wrote the args
+     * unconditionally, which permitted a parallel `connect` to overwrite
+     * an in-flight loop's `relayUrl` / identity mid-handshake — a
+     * silent data race that produced connect-to-wrong-relay
+     * regressions. The mutex+refuse discipline is a Review-amendment-P2
+     * lock; the KDoc here mirrors it so callers know what a repeated
+     * `connect` really does.
      *
      * Per F11 + F26 fix the relay no longer accepts a shared `?token=`. Each
      * (re)connect performs a per-user signed-challenge handshake:

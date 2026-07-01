@@ -1669,15 +1669,42 @@ class KtorRelayTransport(
                         "${genTag(mySession)} Generation scope cancelAndJoin timed out (>5s) — proceeding anyway",
                     )
                 }
-                runCatching { generationClient.close() }
-                    .onFailure {
-                        relayLog(
-                            RelayLogLevel.WARN,
-                            "${genTag(mySession)} generationClient.close() threw: ${it::class.simpleName}: ${it.message}",
-                        )
-                    }
+                // RC-RECONNECT-QUIESCENCE1 MC-2 round-2 P1 fix (2026-07-01).
+                // Ownership check BEFORE synchronous close. If
+                // [disconnectAndJoin] has already detached this client
+                // (`currentGenerationClient` no longer identity-equals the
+                // local `generationClient` because teardown nulled it and
+                // queued `close()` onto [cleanupScope]), doing the close
+                // synchronously here would block the reconnect job's
+                // completion — the same completion that
+                // [disconnectAndJoin]'s bounded `job.join()` is waiting
+                // on. A hung blocking `HttpClient.close()` inside this
+                // finally would then time out the join, return `false`,
+                // and cause [connect] / [forceReconnect] on the same
+                // instance to fall into the "reconnect loop already
+                // alive" branch (line ~1223) indefinitely. That is
+                // exactly the class of hangs [cleanupScope] +
+                // [cleanupCap] were introduced to prevent.
+                //
+                // Normal iteration path (no teardown in flight):
+                // `currentGenerationClient === generationClient` still
+                // holds, so we close synchronously as before + null the
+                // field ourselves. Teardown path: teardown owns the
+                // close via [cleanupScope]; we skip.
                 if (currentGenerationClient === generationClient) {
+                    runCatching { generationClient.close() }
+                        .onFailure {
+                            relayLog(
+                                RelayLogLevel.WARN,
+                                "${genTag(mySession)} generationClient.close() threw: ${it::class.simpleName}: ${it.message}",
+                            )
+                        }
                     currentGenerationClient = null
+                } else {
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "${genTag(mySession)} Skipping synchronous generationClient.close() — teardown detached and queued the close onto cleanupScope.",
+                    )
                 }
                 relayLog(
                     RelayLogLevel.INFO,
