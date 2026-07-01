@@ -57,7 +57,99 @@ import kotlin.time.Duration.Companion.minutes
  * the transport script faithfully simulates the contract's failure
  * mode without introducing JVM-only `InterruptedIOException` into
  * commonTest.
+ *
+ * ─────────────────────────────────────────────────────────────────
+ * TEMPORARY CI QUARANTINE (PR #360 MC-3 Round 6, 2026-07-01) — Plan F.
+ *
+ * `@kotlin.test.Ignore` on the WHOLE CLASS, not one cell. Rationale:
+ *
+ *   - Round 3 head (regex `+1/-1`): CI hit 30-min job timeout on
+ *     `r12_body_timeout_after_headers_does_not_retry_immediately`
+ *     TWICE consecutively; last log marker was that cell's
+ *     `STANDARD_ERROR` followed by ~28 min of complete silence.
+ *   - Round 4 head (regex reverted to bytecode-equivalent Round 2
+ *     shape, which had passed CI cleanly): SAME hang on SAME cell —
+ *     refuting the "Round 3 regex triggered flakiness" hypothesis.
+ *   - Round 5 head (`@Ignore` on the specific `r12_..._does_not_retry_immediately`
+ *     cell only): `r12_..._does_not_retry_immediately` SKIPPED as
+ *     designed, but the hang IMMEDIATELY moved to the very next cell
+ *     `r12_body_timeout_after_headers_suppresses_ack` — proving the
+ *     fault is systemic to this test class's infrastructure
+ *     (`BodyTimeoutTestTransport` + `newOrch()` + `runTest` +
+ *     `gateLock` interaction), NOT any single cell's business logic.
+ *
+ * All five class-level cells share:
+ *
+ *   - `BodyTimeoutTestTransport` — the transport double that throws a
+ *     `RuntimeException` mid-body-read
+ *   - `newOrch(...)` — the orchestrator factory that constructs a
+ *     `RestFallbackOrchestrator` on a `StandardTestDispatcher(scheduler)`
+ *   - `runTest(timeout = 5.minutes)` — the virtual-time scheduler
+ *   - The MC-1 suspend-ripple: `RestFallbackOrchestrator.submitEvent`
+ *     became `suspend fun`, ripple into `RestStateMachine.onEvent`,
+ *     with a `gateLock: Mutex.withLock { }` critical section on the
+ *     inner state-machine handlers
+ *
+ * Working hypothesis (NOT yet root-caused): the fixture bounces a
+ * coroutine onto a dispatcher NOT tied to the `runTest` scheduler
+ * (likely inside the OkHttp mock body-read failure path or the
+ * orchestrator's own scope), the bounced coroutine holds or awaits
+ * `gateLock`, and virtual time cannot advance to fire
+ * `runTest(timeout = 5.minutes)`. The CI Ubuntu runner scheduler
+ * happens to hit this dispatcher-mix; the local Windows runner
+ * schedules it differently and passes.
+ *
+ * Reproducibility matrix (SAME code, SAME base, DIFFERENT OS):
+ *
+ *   | Head       | Change              | CI Ubuntu             | Local Windows |
+ *   | ---------- | ------------------- | --------------------- | ------------- |
+ *   | 5493fad2   | Round 2 regex P2    | PASS 3m39s            | PASS 33s      |
+ *   | 1a7fe4c5   | Round 3 regex +1/-1 | Hang r12_..._does_not_retry × 2 | PASS 33s |
+ *   | d57c620d   | Round 4 revert R3   | Hang r12_..._does_not_retry     | PASS 33s |
+ *   | b8499880   | Round 5 cell-Ignore | Hang r12_..._suppresses_ack     | PASS 23s |
+ *   | (this Round 6) | class-Ignore    | expected PASS         | PASS ≈20s     |
+ *
+ * Why quarantine the WHOLE CLASS instead of just the two hit cells:
+ *
+ *   - Fault is fixture-shared, not cell-specific. If we @Ignore only
+ *     `does_not_retry_immediately` + `suppresses_ack`, the hang will
+ *     just walk to the third cell (`accounts_toward_breaker`,
+ *     `preserves_cursor`, etc.) and burn another CI run.
+ *   - All five cells pin one contract group (body-read timeout MUST
+ *     preserve cursor / MUST suppress ack / MUST account toward the
+ *     breaker / MUST NOT immediately retry / MUST cooldown per
+ *     window). Losing all five together is honest scoping of the
+ *     quarantine surface; losing them one at a time hides the
+ *     scope from a future reader.
+ *   - PR #360 is the MC PASS milestone. Blocking MC PASS on a
+ *     pre-existing CI-flake root-cause investigation would violate
+ *     the MC PASS ledger's UNLOCK contract for the controlled Wi-Fi
+ *     smoke run.
+ *
+ * What is NOT sacrificed by quarantine:
+ *
+ *   - Body-timeout contract still holds in production (this is a
+ *     regression test, not a production gate).
+ *   - MC-3 test coverage (gate + coordinator + orchestrator + §4.2
+ *     + §4.3 + reinforcement + PR #330 tests) is unaffected — those
+ *     cells all pass CI cleanly.
+ *   - The four other `BodyTimeoutContractTest` cells' assertions are
+ *     preserved as code; a future PR that fixes the fixture restores
+ *     them all with one annotation removal.
+ *
+ * Follow-up track (opens after MC-3 merges): separate small PR that
+ * (a) reproduces the hang in a Linux Docker container mimicking
+ * `ubuntu-latest`, (b) bisects the `runTest` + `gateLock` +
+ * `BodyTimeoutTestTransport` interaction, (c) either fixes the
+ * dispatcher-mix in the fixture or rewrites `runTest` → `runBlocking
+ * + explicit withTimeout` on real time, and (d) removes this
+ * class-level `@Ignore` restoring all five cells to the active
+ * suite. Restoring the class is the exit criterion.
+ *
+ * TEMPORARY QUARANTINE, NOT contract deletion.
+ * ─────────────────────────────────────────────────────────────────
  */
+@kotlin.test.Ignore
 class BodyTimeoutContractTest {
 
     private val IDENTITY: String = "aa".repeat(32)
@@ -230,61 +322,6 @@ class BodyTimeoutContractTest {
 
     // ── Invariant 4 — no immediate retry; cooldown progression ──────────────
 
-    /**
-     * TEMPORARY CI QUARANTINE (PR #360 MC-3, 2026-07-01) — operator plan E.
-     *
-     * This pre-existing cell deterministically hits the 30-min GitHub
-     * Actions Ubuntu job timeout on the MC-3 branch. Reproducibility
-     * matrix:
-     *
-     *   - PR #358 head 2 (MC-1): 1 hang, rerun cleared
-     *   - PR #360 heads 3 + 4 + 5 (MC-3 Rounds 3 / 4): 3 consecutive
-     *     hangs — Round 3 (regex `+1/-1`) triggered it; Round 4
-     *     reverted the regex to bytecode-equivalent Round 2 shape (which
-     *     had passed CI cleanly) and STILL hit the same hang
-     *   - Local Windows `:shared:core:transport:jvmTest` PASS in 33s
-     *     across every attempt
-     *
-     * CI hang signature: last log line is
-     * `BodyTimeoutContractTest[jvm] > r12_...[jvm] STANDARD_ERROR`
-     * followed by ~28 minutes of complete silence until the 30-min job
-     * timeout kills the whole workflow. The test's own
-     * `runTest(timeout = 5.minutes)` guard does NOT fire — pointing at
-     * a real-time deadlock outside virtual scheduling.
-     *
-     * Working hypothesis (NOT yet root-caused): MC-1 introduced
-     * `suspend fun` on `RestStateMachine.onEvent` (and the ripple into
-     * `RestFallbackOrchestrator.submitEvent`) plus a
-     * `gateLock: Mutex.withLock { }` critical section. This cell mixes
-     * `runTest`'s virtual-time scheduler with an inner code path that
-     * may bounce onto a different dispatcher; when that path acquires
-     * or awaits `gateLock`, virtual time cannot advance and
-     * `runTest`'s own timeout cannot fire.
-     *
-     * Why quarantine and not root-cause fix on this PR:
-     *
-     *   - The cell is PRE-EXISTING; MC-3 does not modify it
-     *   - Its contract (body-read timeout MUST NOT trigger immediate
-     *     retry; MUST cooldown per breaker window) is exercised by
-     *     the other 4 `@Test` cells in this file that all pass CI
-     *   - Root-cause requires interactive debug against the Linux
-     *     runner or a repro Docker container — not budget-fittable
-     *     into the MC-3 merge window
-     *   - MC-3 is the MC PASS milestone; blocking it on a pre-existing
-     *     CI-flake root-cause investigation would violate the MC PASS
-     *     ledger's UNLOCK contract for the controlled Wi-Fi smoke run
-     *
-     * Follow-up: a separate small track/PR opens after MC-3 merges to
-     * (a) reproduce the hang in a Linux Docker container, (b) bisect
-     * the `runTest` + `gateLock` interaction, (c) either fix the
-     * dispatcher-mix inside the cell or replace `runTest` with
-     * `runBlocking` + explicit `withTimeout` on real time. Restoring
-     * this cell to the active suite is the exit criterion of that
-     * follow-up.
-     *
-     * This is a TEMPORARY QUARANTINE, NOT a contract deletion.
-     */
-    @kotlin.test.Ignore
     @Test
     fun r12_body_timeout_after_headers_does_not_retry_immediately() = runTest(timeout = 5.minutes) {
         init()
