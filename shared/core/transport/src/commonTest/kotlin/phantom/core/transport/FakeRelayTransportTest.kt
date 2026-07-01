@@ -78,6 +78,8 @@ class FakeRelayTransportTest {
             _state.value = TransportState.Disconnected
             _state.value = TransportState.Connected
         }
+
+        override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean = true
     }
 
     @Test

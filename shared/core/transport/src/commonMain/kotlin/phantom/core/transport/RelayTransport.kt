@@ -62,6 +62,71 @@ interface RelayTransport {
         socksProxyPort: Int? = null,
     )
     suspend fun disconnect()
+
+    /**
+     * RC-RECONNECT-QUIESCENCE1 (2026-06-21) — disconnect variant that
+     * ALSO `cancelAndJoin`s the per-transport reconnect loop with a
+     * bounded wait. Locked default timeout 10_000 ms (longer than the
+     * existing 5 s `finally`-block teardown inside `runReconnectLoop`
+     * so the outer wait does not race the inner one). Returns `true`
+     * if the reconnect-loop coroutine completed within [timeoutMs];
+     * `false` if the wait timed out (in which case cancellation has
+     * already been requested but the body has not yet exited).
+     *
+     * **Strict bound:** the [timeoutMs] hard-bound covers ONLY
+     * `job.join()`. `job.cancel()` and the ping/ACK/per-generation
+     * scope cancels run inside an uninterruptible critical region
+     * (atomic under caller cancellation) and are completed before the
+     * bounded join is entered. `session.close()` and `HttpClient.close()`
+     * are dispatched fire-and-forget to a dedicated cleanup scope and
+     * bounded by a hard in-flight cap — a cooperative `withTimeoutOrNull`
+     * cannot interrupt a truly blocking close, so the cap is the honest
+     * bound. The closes still happen best-effort, but may complete after
+     * this method returns.
+     *
+     * **Outbox flush policy:** `disconnectAndJoin` does NOT flush the
+     * pending outbox or pending ACKs. Pending stores are LEFT INTACT so
+     * the downstream PR-D1c REST migration in `HybridRelayTransport` can
+     * pick them up on the subsequent non-RestActive → RestActive
+     * transition. AckDelivery entries are out-of-scope of D1c (snapshot
+     * filter); their loss is tolerated by the relay's existing
+     * redelivery semantics and the H2b idempotent envelope ledger
+     * dedupes at the application layer. The legacy [disconnect] entry
+     * point (logout / shutdown) DOES perform a bounded best-effort flush
+     * before teardown — that is a property of `disconnect`, not of
+     * `disconnectAndJoin`.
+     *
+     * **Transport state:** implementations MUST publish
+     * [phantom.core.transport.TransportState.Disconnected] IMMEDIATELY
+     * when teardown begins (before the strict-bound body), so external
+     * observers (`isConnected()`, REST orchestrator, UI banner) see a
+     * disconnected transport even if a close path hangs or the caller
+     * is cancelled mid-teardown.
+     *
+     * **forceReconnect interaction:** while `disconnectRequested == true`
+     * OR `reconnectJob.isCancelled && !isCompleted` (post-timeout drain),
+     * `forceReconnect()` MUST be a no-op. Otherwise it would overwrite
+     * the still-draining old job reference that a subsequent
+     * `disconnectAndJoin()` needs to re-await.
+     *
+     * **Relationship to legacy `disconnect()`:** the legacy [disconnect]
+     * now delegates to the same private teardown impl with the flush
+     * policy enabled, so both entry points share the locked, bounded,
+     * ref-preserving teardown semantics. Their flush behaviour differs.
+     *
+     * Implementations MUST serialise this call with `connect()` /
+     * `forceReconnect()` via the same lifecycle mutex so a parallel
+     * `connect()` cannot observe a half-torn-down state. The
+     * `reconnectJob` reference MUST NOT be nulled when the captured job
+     * is still alive (post-timeout drain) — nulling it would let a
+     * concurrent `connect()` see `reconnectJob == null` and launch a
+     * fresh loop while the old one is still in teardown.
+     *
+     * Implementations MUST propagate [kotlinx.coroutines.CancellationException]
+     * from the wait without swallowing it (structured concurrency).
+     */
+    suspend fun disconnectAndJoin(timeoutMs: Long = 10_000L): Boolean
+
     suspend fun send(message: RelayMessage.Send): Boolean
 
     /**

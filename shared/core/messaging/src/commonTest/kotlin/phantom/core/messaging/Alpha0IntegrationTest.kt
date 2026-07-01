@@ -105,6 +105,8 @@ private class BufferingRelayTransport : RelayTransport {
     override val pendingAckCount: Int get() = 0
     override suspend fun forceReconnect() {}
 
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean = true
+
     /** Flush all queued messages into the incoming flow. */
     suspend fun deliverQueued() {
         val pending = queue.toList()

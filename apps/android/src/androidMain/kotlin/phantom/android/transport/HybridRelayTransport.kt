@@ -242,6 +242,23 @@ class HybridRelayTransport(
 
     override suspend fun disconnect() = wsTransport.disconnect()
 
+    /**
+     * RC-RECONNECT-QUIESCENCE1 MC-2 (2026-07-01) — pass-through to
+     * [wsTransport]. The inner [KtorRelayTransport] owns the reconnect
+     * loop and the `NonCancellable` cleanup discipline; the hybrid
+     * wrapper has no additional teardown of its own beyond the WS
+     * path. The REST-side state machine + orchestrator do not need
+     * disconnect-and-join handling because they run inside the
+     * caller's coroutine scope and stop when that scope cancels.
+     *
+     * Bounded-join contract is delegated to [KtorRelayTransport.disconnectAndJoin]:
+     * returns `true` if the inner reconnect job exits within
+     * [timeoutMs]; `false` if the timeout expires and the inner ref
+     * is retained for a subsequent call to re-await.
+     */
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean =
+        wsTransport.disconnectAndJoin(timeoutMs)
+
     override suspend fun forceReconnect() = wsTransport.forceReconnect()
 
     override suspend fun sendTyping(toPubKeyHex: String): Boolean =
