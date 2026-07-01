@@ -213,7 +213,7 @@ class HybridRelayTransport(
     // [TransportManager] or [ManagerState] types directly.
     private val wsDegradationDetector: WsDegradationDetector? = null,
     private val degradationCurrentKindProvider: () -> TransportKind? = { null },
-) : RelayTransport {
+) : RelayTransport, RewalkHybridFacade {
 
     // ── Delegated RelayTransport surface ─────────────────────────────────────
 
@@ -652,6 +652,29 @@ class HybridRelayTransport(
     }
 
     /**
+     * Integration Test 20 seam (2026-06-22). Force-set the
+     * `restCapabilityActive` flag WITHOUT going through the real
+     * `activateRestCollectors` path. Used by tests that need to
+     * observe pending-outbox migration behaviour under the
+     * REST-active branch without spinning up the real orchestrator.
+     * Internal so production callers cannot reach it; the flag's
+     * production-side write-once contract is unchanged.
+     */
+    internal fun setRestCapabilityActiveForTest(active: Boolean) {
+        restCapabilityActive = active
+    }
+
+    /**
+     * Integration Test 20 seam (2026-06-22). Awaits the migration
+     * coroutine spawned by [maybeArmMigrationLocked] so the test can
+     * synchronously observe the post-migration state of the WS
+     * pending stores.
+     */
+    internal suspend fun awaitMigrationDoneForTest() {
+        migrationJob?.join()
+    }
+
+    /**
      * Switch the wrapper into REST-fallback-aware mode. Idempotent — safe
      * to call from a retry path.
      *
@@ -805,7 +828,7 @@ class HybridRelayTransport(
      * Short-circuits on `restCapabilityActive=false` like the rest of the
      * `submitStateEvent` family.
      */
-    suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
+    override suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
         submitStateEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = clearsMode2Sticky))
     }
 
