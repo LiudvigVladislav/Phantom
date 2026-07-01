@@ -67,13 +67,29 @@ class CloseOriginSyntheticNonBranchingGrepTest {
      * below.
      */
     private val branchPatterns: List<Regex> = listOf(
-        // `if (... closeOrigin == "synthetic" ...)` in any bracketing.
-        Regex("""if\s*\([^)]*closeOrigin\s*==\s*"synthetic"[^)]*\)"""),
+        // `closeOrigin == "synthetic"` (both orders) OR `closeOrigin !=
+        // "synthetic"` (both orders) — any of the four covers the same
+        // branching semantic (`if`, ternary-style conditional, guard
+        // clause, boolean expression fed into a `when` subject, etc.).
+        // The token-level match catches every location where the
+        // branch decision is made, regardless of the surrounding
+        // control-flow keyword.
+        Regex("""closeOrigin\s*(?:==|!=)\s*"synthetic""""),
+        Regex(""""synthetic"\s*(?:==|!=)\s*closeOrigin"""),
         // `when (closeOrigin) { ... "synthetic" -> ... }` — the when
-        // subject is `closeOrigin`.
-        Regex("""when\s*\(\s*(?:event\.)?closeOrigin\s*\)"""),
-        // `event.closeOrigin.equals("synthetic")` calls.
-        Regex("""closeOrigin\.equals\s*\(\s*"synthetic""""),
+        // subject is `closeOrigin` (with optional `event.` / `it.` /
+        // `this.` receiver). The right-hand `"synthetic"` arm branches
+        // even when the LHS uses referential match rather than `==`.
+        Regex("""when\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?closeOrigin\s*\)"""),
+        // `closeOrigin.equals("synthetic")` and reversed
+        // `"synthetic".equals(closeOrigin)` calls (with optional
+        // null-safe `?.` and optional negation prefix on the callable).
+        Regex("""closeOrigin\??\.equals\s*\(\s*"synthetic""""),
+        Regex(""""synthetic"\.equals\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_.]*\.)?closeOrigin"""),
+        // `closeOrigin?.contains("synthetic")` — Kotlin string API
+        // hits the same branching semantic when its Boolean result is
+        // consumed by an `if` / `when`.
+        Regex("""closeOrigin\??\.contains\s*\(\s*"synthetic""""),
     )
 
     /**
