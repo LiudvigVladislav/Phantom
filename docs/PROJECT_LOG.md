@@ -598,6 +598,69 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-07-01 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK MC-3 — Coordinator + AppContainer + Dispatcher + Orchestrator wiring + §4.2 + §4.3 + reinforcement + MC PASS ledger (MC stack part 3 of 3)
+
+**Outcome:** Third and final PR of the three-PR MC stack per §13.2 step 3. Stacked on PR #359 squash `7bcf2d04` (MC-2). Lands the `TransportRewalkCoordinator` 7-step gate transaction + `AppContainer` gate wiring (BuildConfig read + shared `currentKindProvider` lambda + late-binding `gateProvider` + `gateCoordinator`) + `WsSessionLifecycleDispatcher.connectionGeneration` field-carry + `RestFallbackOrchestrator` 3 new ctor params forwarded to `RestStateMachine` + PR #330 tests (`RestFallbackOrchestratorQuiescenceWiringTest` + `TransportRewalkCoordinatorTransactionTest` + `HybridRelayTransportIntegrationTest20`) + fresh §4.2 sequential-dispatcher-order structural test + fresh §4.3 `closeOrigin = "synthetic"` non-branching grep test + one reinforcement cell for H-330-Preserves-REST at state-machine layer.
+
+**MC PASS ledger:**
+
+- **§6 NOT COVERED hypotheses (MUST-close):** all three CLOSED across the MC stack:
+  - `H-330-Quiesces-Storm` — closed by `WsReconnectGateTest` (MC-1, 34 cells: Direct-only fence + probe atomicity + budget exhaustion) + `KtorRelayTransportRunReconnectLoopTest` (MC-2, permit refusal cells)
+  - `H-330-Single-Probe-Per-RouteChange` — closed by `WsReconnectGateTest` NetworkChanged cells (MC-1) + `TransportRewalkCoordinatorTransactionTest` (MC-3, 7-step transaction)
+  - `H-330-No-Self-Reentry` — closed by `WsReconnectGateTest` candidate-death cells `CandidateProving → Quiesced` (MC-1)
+- **§6 PARTIAL hypotheses (SHOULD-reinforce):** all three REINFORCED via layered coverage:
+  - `H-330-Preserves-REST` — reinforced by `RestFallbackOrchestratorQuiescenceWiringTest` ctor-forwarding cells (MC-3, 3 cells: Direct-fence engagement + null-safe skip + token forwarding) + NEW `GateQuiescenceRestPreservationReinforcementTest` state-machine cell (MC-3, 1 cell, ~65 LOC) pinning that `RestActive` state survives duplicate `WsSessionEnded` events across the Quiesced window
+  - `H-330-Probe-Lives-60s` — reinforced by `WsReconnectGateTest` `WsAliveTickElapsed` cells (MC-1, 4 uses covering the 60s probation gate transition)
+  - `H-330-No-Message-Loss-Or-Dups` — reinforced by `KtorRelayTransportPendingOutboundTest` (MC-2, byte-replaced with PR #330 version, +238 net covering gate-coordinated pending-outbound FIFO across transitions)
+- **§4.2 sequential dispatcher order structural test (L-13.3.3):** NEW `WsSessionLifecycleDispatcherSequentialOrderTest` (MC-3, 3 cells covering Ended-REST-active branch / Ended-REST-inactive-bootstrap-retry branch / Connected single-consumer shape) — PASS.
+- **§4.3 `closeOrigin = "synthetic"` non-branching grep test (L-13.3.4):** NEW `CloseOriginSyntheticNonBranchingGrepTest` (MC-3, 1 cell walking source under `shared/core/transport/src/commonMain`, `shared/core/transport/src/androidMain`, `apps/android/src/androidMain`, `apps/android/src/debug` for `if (...closeOrigin == "synthetic"...)` / `when (closeOrigin)` / `closeOrigin.equals("synthetic")` patterns; assignment-side `closeOrigin = "synthetic"` in the L1 producer allowed via explicit assignment-only allow-list) — PASS with zero violations.
+- **§4.4 `maybeRetryBootstrap()` disposition (L-13.3.5):** EXPLICIT DEFERRAL — bootstrap-alt-path is a narrow recovery alternative that the L1 mini-lock §5.1 already fences (synthetic refuses when `restCapabilityActive == false`); MC does NOT add a dedicated cell for the bootstrap-arm gate posture because the L1 fence + the §4.2 branch coverage already assert the correct dispatcher-side dispatch of the bootstrap path.
+- **§4.5 acceptance matrix (L-13.3.11):** included via `WsReconnectGateTest` (MC-1) which is byte-identical with PR #330 commit `6f49cd89` source (`sha256: 3780d1ca1c73f4d6bfa2251cae6852b5146c0776f4a805daa37adfbd16707acc`).
+
+Therefore **MC PASS** per §7. Combined with the already-landed MB PASS (PR #353 squash `ed3406eb`), the two H-ME validation halves are satisfied and the controlled Wi-Fi smoke run UNLOCKS as a separate operator-scheduled item. **B1 acceptance gate from `direct-wss-mode2-recon1.md` §11 closes only after Wi-Fi smoke PASS** — MC PASS + MB PASS on their own do NOT close B1 per the mini-lock §7 wording amendment.
+
+**What MC-3 ships:**
+
+- **`apps/android/src/androidMain/kotlin/phantom/android/transport/TransportRewalkCoordinator.kt`** — cherry-picked verbatim from PR #330 commit `6f49cd89` (`sha256: 5b0cc9185b928b6c01bac6cc0a285a6c65699a6ad5ad3f15b654963181ee3308`), master 319 LOC → 592 LOC (+321/-48, net +273). Implements 7-step gate transaction (`beginRouteChange` → branch on `RouteChangeOutcome.OpenReconnect / StickyRecovery / QuiescencePreserved` → `disconnectAndJoin(10_000ms)` → `releaseTransport` → `issueProbeAfterRewalk` → `requestServiceRestart`) with `NonCancellable` revoke discipline at every substep. New `internal interface RewalkHybridFacade` with 3 methods (`submitNetworkChangedEvent` / `disconnect` / `disconnectAndJoin`). `gateCoordinator: RewalkCoordinatorGateProvider?` nullable ctor param — when null, coordinator falls back to legacy pre-quiescence sequence.
+- **`apps/android/src/androidMain/kotlin/phantom/android/di/AppContainer.kt`** (+142/-8) — cherry-picked from PR #330 preserving PR #353 `triggerDebugForceMode2` block (~85 LOC restored verbatim) + PR #353 `debugForceMode2Enabled` ctor-arg wiring on the `wsTransport = KtorRelayTransport(...)` call. Adds `sharedCurrentKindProvider` single-source-of-truth lambda (shared with `HybridRelayTransport`), `RECONNECT_QUIESCENCE_ENABLED` BuildConfig direct read (no `BuildConfig.DEBUG` conjunction — release-pin is the rollout knob), late-binding `wsTransport.gateProvider = restOrchestrator.stateMachine` after `initMessaging`, `gateCoordinator = restOrchestrator.stateMachine` wired into `TransportRewalkCoordinator`. `runCatching { startService() }` swallow removed — treats `startService() == null` as `IllegalStateException` so rewalk coordinator's revoke path fires.
+- **`apps/android/src/androidMain/kotlin/phantom/android/transport/WsSessionLifecycleDispatcher.kt`** (+3/-1) — cherry-picked from PR #330. Carries `connectionGeneration = event.connectionGeneration` into `RestStateMachine.Event.WsSessionConnected(...)` ctor call.
+- **`shared/core/transport/src/commonMain/kotlin/phantom/core/transport/RestFallbackOrchestrator.kt`** (+40/-6) — cherry-picked from PR #330. Three new ctor params (`reconnectQuiescenceEnabled: Boolean = false` / `currentKindProvider: () -> TransportKind? = { null }` / `tokenSource: () -> Long = { 0L }`) with KDoc; all three forwarded to `RestStateMachine` ctor. Defaults preserve legacy semantics (gate never engages when quiescence is off).
+- **`apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt`** (+27/-2) — MC-3 layered add: `class HybridRelayTransport : RelayTransport, RewalkHybridFacade` (new interface impl), `override` modifier on `submitNetworkChangedEvent` (interface member), plus PR #330 test seams `setRestCapabilityActiveForTest` + `awaitMigrationDoneForTest` (Integration Test 20 requirement).
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/RestFallbackOrchestratorQuiescenceWiringTest.kt`** (184 LOC new) — byte-identical with PR #330 (`sha256: 2dbdc44ce1b753dcd678a4dc8e568f3d9b30f22e848a5d659ba4f15927f27460`). 3 cells covering orchestrator → state-machine ctor wiring for `currentKindProvider` + `tokenSource`.
+- **`apps/android/src/androidUnitTest/kotlin/phantom/android/transport/TransportRewalkCoordinatorTransactionTest.kt`** (667 LOC new) — byte-identical with PR #330 (`sha256: fec689c789bf8b96c17e9807b6ba50ab588e8ad24bd47f598631626112ec6aac`). Coordinator 7-step transaction cells.
+- **`apps/android/src/androidUnitTest/kotlin/phantom/android/transport/HybridRelayTransportIntegrationTest20.kt`** (686 LOC new) — byte-identical (`sha256: 9b7e4791a27320c818b0997d3a78d97ff543f1fd8defd85db3528be4205c3366`). Higher-level hybrid integration.
+- **`apps/android/src/androidUnitTest/kotlin/phantom/android/transport/WsSessionLifecycleDispatcherSequentialOrderTest.kt`** (MC-3 authored ~150 LOC) — 3 cells pinning §4.2 sequential-order contract.
+- **`shared/core/transport/src/jvmTest/kotlin/phantom/core/transport/CloseOriginSyntheticNonBranchingGrepTest.kt`** (MC-3 authored ~140 LOC) — 1 cell walking source tree for `if/when` branches on `closeOrigin == "synthetic"`; assignment-side `closeOrigin = "synthetic"` in the L1 producer allowed via explicit allow-list.
+- **`shared/core/transport/src/commonTest/kotlin/phantom/core/transport/GateQuiescenceRestPreservationReinforcementTest.kt`** (MC-3 authored ~90 LOC) — 1 cell asserting `RestActive` state survives duplicate `WsSessionEnded` events + stray `WsAliveTickElapsed` under `reconnectQuiescenceEnabled = true` + Direct fence.
+
+**Verification PASSED locally:**
+
+- `:shared:core:transport:jvmTest` BUILD SUCCESSFUL (includes all new MC-3 tests + all PR #330 tests + all PR #353 L1 cells).
+- `:apps:android:testDebugUnitTest` BUILD SUCCESSFUL (includes `AppContainerDebugForceMode2WiringTest` PR #353 cells after `debugForceMode2Enabled` wiring restored on the `wsTransport = KtorRelayTransport(...)` call — L1 wiring test caught the initial cherry-pick omission).
+- `:apps:android:assembleRelease` BUILD SUCCESSFUL.
+- `:apps:android:verifyR8StripsTestSeams PASS — no *ForTest* / debugForce* / *Synthetic* classes or members survived on any phantom.* class.` (All L1 + MC-1/MC-2/MC-3 test seams stripped from release by existing deny-pattern discipline.)
+
+**Cherry-pick discipline (PR #353 + PR #357 + PR #358 + PR #359 surface preservation):**
+
+`AppContainer.kt` PR #330 cherry-pick would have naïvely deleted:
+
+- PR #353's `triggerDebugForceMode2` KDoc + method (~85 LOC restored)
+- PR #353's `debugForceMode2Enabled` ctor-arg wiring on `wsTransport = KtorRelayTransport(...)` — the L1 wiring test `AppContainerDebugForceMode2WiringTest` caught this: initial cherry-pick failed the test; restoring the wiring pattern fixed both cells
+
+`HybridRelayTransport.kt` layered surface restored:
+
+- MC-2's `override suspend fun disconnectAndJoin` — unchanged
+- New `RewalkHybridFacade` impl (MC-3 addition — 3 interface members already existed as `suspend fun submitNetworkChangedEvent` / `disconnect` / `disconnectAndJoin`; just add `RewalkHybridFacade` to the class header + `override` modifier on `submitNetworkChangedEvent`)
+- New `setRestCapabilityActiveForTest` + `awaitMigrationDoneForTest` seams (Integration Test 20 requirement)
+
+RC PR #330 Draft / HOLD unchanged. Methodology recon stays Closed with verdict H-ME unchanged. L1 mini-lock + MB half (PR #353 `ed3406eb`) + path-2 step 2 narrowing (PR #352 `a28bb1d2`) + Strategy 1 lock (PR #355 `ca12a98c`) + §13.1 test-scope correction (PR #356 `d64bef0a`) + gate-only carve-out (PR #357 `daee9645`) + MC-1 (PR #358 `91745acd`) + MC-2 (PR #359 `7bcf2d04`) all in force.
+
+**Follow-up after MC-3 merges:** controlled Wi-Fi smoke run opens as a separate operator-scheduled item. After Wi-Fi smoke PASS, B1 acceptance gate from `direct-wss-mode2-recon1.md` §11 closes. PR #330 then advances per its own mini-lock contract.
+
+**Key commits:** TBD (squash SHA backfilled on merge).
+
+---
+
 ### 2026-07-01 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK MC-2 — Ktor permit flow + RelayTransport.disconnectAndJoin fan-out + NonCancellable cleanupCap=8 discipline (MC stack part 2 of 3)
 
 **Outcome:** Second of the three-PR MC stack per §13.2 step 3. Stacked on PR #358 squash `91745acd` (MC-1). Lands the `KtorRelayTransport` reconnect-loop permit-flow consumer of the two provider interfaces already delivered by MC-1, plus the new `suspend fun disconnectAndJoin(timeoutMs)` interface method with `NonCancellable` critical region + `cleanupCap = 8` bounded cleanup scope, plus the four PR #330 `KtorRelayTransport`-side test files. **MC PASS is NOT declared by this PR alone** — the MC PASS ledger lands on MC-3 after §4.2 + §4.3 + §4.4 disposition + §4.5 floor + reinforcement cells per §7.

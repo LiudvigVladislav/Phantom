@@ -1267,6 +1267,24 @@ class AppContainer(private val context: Context) {
             // `"0"`; the trigger helper short-circuits with the
             // `breaker_test_trigger_refused` log.
             val s6DebugEnabled = phantom.android.BuildConfig.S6_DEBUG_TRIGGER_ENABLED == "1"
+
+            // RC-RECONNECT-QUIESCENCE1 commit 2e fix-round-4 P2 NEW-2 (2026-06-23).
+            // The same `currentKindProvider` lambda must reach BOTH the
+            // `RestFallbackOrchestrator` (so `armSticky`'s Direct fence
+            // sees the right transport kind) AND the `HybridRelayTransport`
+            // degradation detector (so its kind-aware verdict matches).
+            // The previous shape declared the same expression at two
+            // separate ctor sites — the Kotlin compiler had no way to
+            // verify they reduced to identical reads, leaving a refactor
+            // hazard where one site could drift and produce observation
+            // skew between orchestrator and hybrid. Extracting a single
+            // shared lambda makes the single-source-of-truth invariant
+            // structural.
+            val sharedCurrentKindProvider: () -> phantom.core.transport.TransportKind? = {
+                (transportManager.state.value
+                    as? phantom.core.transport.ManagerState.Connected)?.kind
+            }
+
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
@@ -1460,7 +1478,60 @@ class AppContainer(private val context: Context) {
                 // Build-time invariant: requires MODE_2_FAST_PATH_ENABLED == "1".
                 mode2StickyEnabled =
                     phantom.android.BuildConfig.MODE_2_STICKY_ENABLED == "1",
+                // RC-RECONNECT-QUIESCENCE1 commit 2d (2026-06-22).
+                // Gate reads BuildConfig.RECONNECT_QUIESCENCE_ENABLED
+                // directly — NO BuildConfig.DEBUG conjunction. Release
+                // builds pin to literal "0"; a separate named PR flips
+                // to "1" after Tecno Tele2 LTE smoke PASS. Build-time
+                // invariant: requires MODE_2_STICKY_ENABLED == "1".
+                //
+                // The flag controls THREE independent wirings:
+                //   1. RestStateMachine's internal gate transitions
+                //      (this ctor param: gate STAYS Open when off).
+                //   2. KtorRelayTransport's gateProvider (constructed
+                //      below — passed as null when off so the
+                //      reconnect loop runs the legacy unconditional
+                //      while loop).
+                //   3. TransportRewalkCoordinator's gateCoordinator
+                //      (passed as null when off so the coordinator's
+                //      legacy fallback runs `hybrid.disconnect()` +
+                //      restart, bypassing the typed RouteChangeOutcome
+                //      transaction entirely).
+                reconnectQuiescenceEnabled =
+                    phantom.android.BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1",
+                // Commit 2d second-round amend (2026-06-22): wire the
+                // currentKindProvider so `armSticky`'s Direct fence
+                // fires correctly. Single-source-of-truth lambda shared
+                // with HybridRelayTransport — see [sharedCurrentKindProvider]
+                // declaration above (fix-round-4 NEW-2 2026-06-23).
+                currentKindProvider = sharedCurrentKindProvider,
+                // Commit 2d second-round amend (2026-06-22): wire the
+                // CSPRNG-backed token source so issued probe tokens
+                // are unguessable. The orchestrator already relies on
+                // `LibsodiumCsprng` for jitter draws (Trek 2 Stage 2A
+                // A5+A7); using the same source here keeps the CSPRNG
+                // dependency single-instance.
+                tokenSource = {
+                    phantom.core.crypto.LibsodiumCsprng.uniformLong(Long.MAX_VALUE)
+                },
             )
+            // Commit 2d (2026-06-22): assign the late-wired
+            // `gateProvider` on the bare `wsTransport` ONLY when
+            // `RECONNECT_QUIESCENCE_ENABLED == "1"`. The field is
+            // mutable (`@Volatile var`) precisely so AppContainer can
+            // construct `wsTransport` eagerly at class-init time
+            // (before this `restOrchestrator` exists) and then wire
+            // the provider after `RestFallbackOrchestrator` is built.
+            // The first `runReconnectLoop` snapshots the field once on
+            // entry; the late assignment is observed by the first
+            // `awaitReconnectPermit` call because `connect()` runs
+            // STRICTLY AFTER this line.
+            wsTransport.gateProvider =
+                if (phantom.android.BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1") {
+                    restOrchestrator.stateMachine
+                } else {
+                    null
+                }
             // Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence)
             // — wire the freshly-constructed orchestrator into the
             // class-level reference so the S6 breaker trigger
@@ -1572,10 +1643,13 @@ class AppContainer(private val context: Context) {
                 processedEnvelopeRepository = processedEnvelopeRepo,
                 scope = appScope,
                 wsDegradationDetector = wsDegradationDetector,
-                degradationCurrentKindProvider = {
-                    (transportManager.state.value
-                        as? phantom.core.transport.ManagerState.Connected)?.kind
-                },
+                // Single-source-of-truth lambda shared with the
+                // RestFallbackOrchestrator's currentKindProvider — see
+                // [sharedCurrentKindProvider] declaration further up
+                // (fix-round-4 NEW-2 2026-06-23). Same lambda instance
+                // reaches both consumers so a future refactor cannot
+                // produce observation skew.
+                degradationCurrentKindProvider = sharedCurrentKindProvider,
             )
             hybridTransport = hybrid
             // Async REST bootstrap — never blocks AppContainer init. On failure
@@ -1605,8 +1679,35 @@ class AppContainer(private val context: Context) {
             val rewalkCoordinator = phantom.android.transport.TransportRewalkCoordinator(
                 scope = appScope,
                 transportPreferences = transportPreferences,
-                transportManager = transportManager,
+                releaseTransport = { transportManager.release() },
                 hybridTransportProvider = { hybridTransport },
+                // RC-RECONNECT-QUIESCENCE1 commit 2c (2026-06-22): wire
+                // the [RestStateMachine] instance owned by
+                // [RestFallbackOrchestrator] as the typed gate
+                // coordinator. The cast is safe — `RestStateMachine`
+                // implements `RewalkCoordinatorGateProvider` (commit 2c
+                // surface addition). Production effect: the rewalk
+                // sequence runs as the transaction documented on
+                // `TransportRewalkCoordinator.performRewalk`. Tests that
+                // don't wire this fall back to the legacy
+                // pre-quiescence sequence.
+                // Commit 2d (2026-06-22): wire the state-machine instance
+                // as the typed gate coordinator ONLY when
+                // `RECONNECT_QUIESCENCE_ENABLED == "1"`. When the flag is
+                // off, `null` triggers the byte-for-byte legacy fallback
+                // path in `TransportRewalkCoordinator.performRewalk`
+                // (sticky-pref clear + submitNetworkChangedEvent +
+                // `hybrid.disconnect()` + release + restart, unconditional
+                // `lastRewalkAtMs` bump). Passing the state-machine
+                // unconditionally would engage the typed
+                // `OpenReconnect` transaction whose `disconnectAndJoin`
+                // is functionally different from the legacy `disconnect`
+                // — a regression risk for the flag-off case.
+                gateCoordinator = if (phantom.android.BuildConfig.RECONNECT_QUIESCENCE_ENABLED == "1") {
+                    restOrchestrator.stateMachine
+                } else {
+                    null
+                },
                 requestServiceRestart = { reason ->
                     val intent = android.content.Intent(
                         context.applicationContext,
@@ -1621,15 +1722,28 @@ class AppContainer(private val context: Context) {
                             reason.name,
                         )
                     }
-                    runCatching { context.applicationContext.startService(intent) }
-                        .onFailure { e ->
-                            android.util.Log.w(
-                                "PhantomHybrid",
-                                "NETWORK_TRACE service_restart_intent_failed " +
-                                    "errorClass=${e::class.simpleName} " +
-                                    "message=${e.message?.take(120)}",
-                            )
-                        }
+                    // RC-RECONNECT-QUIESCENCE1 commit 2c second-round amend
+                    // (2026-06-22): do NOT swallow startService failures.
+                    // The coordinator needs to see them so its
+                    // catch-and-revoke path fires (revokeProbe /
+                    // revokeRouteChange) and `lastRewalkAtMs` stays
+                    // un-bumped. Pre-amend behaviour swallowed
+                    // SecurityException / IllegalStateException etc. via
+                    // `runCatching` so the coordinator saw a false
+                    // success: gate stuck at ProbeAvailable, no
+                    // reconnect-loop launched, and the next recovery
+                    // attempt hit the rate-limit.
+                    //
+                    // Also treat `startService(intent) == null` as a
+                    // failure: per Android docs, null means "no matching
+                    // service component was found" — equivalent to the
+                    // service refusing to start.
+                    val component = context.applicationContext.startService(intent)
+                    if (component == null) {
+                        throw IllegalStateException(
+                            "startService returned null — PhantomMessagingService component not resolved",
+                        )
+                    }
                 },
             )
             transportRewalkCoordinator = rewalkCoordinator
