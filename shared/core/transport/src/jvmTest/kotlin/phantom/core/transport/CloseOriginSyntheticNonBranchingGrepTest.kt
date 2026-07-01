@@ -75,7 +75,7 @@ class CloseOriginSyntheticNonBranchingGrepTest {
         // branch decision is made, regardless of the surrounding
         // control-flow keyword.
         Regex("""closeOrigin\s*(?:==|!=)\s*"synthetic""""),
-        Regex(""""synthetic"\s*(?:==|!=)\s*closeOrigin"""),
+        Regex(""""synthetic"\s*(?:==|!=)\s*(?:[A-Za-z_][A-Za-z0-9_.]*\.)?closeOrigin"""),
         // `when (closeOrigin) { ... "synthetic" -> ... }` — the when
         // subject is `closeOrigin` (with optional `event.` / `it.` /
         // `this.` receiver). The right-hand `"synthetic"` arm branches
