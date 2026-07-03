@@ -59,6 +59,16 @@ kotlin {
             // test classpath transitively — we add them here explicitly.
             implementation(libs.libsodium.bindings)
         }
+        jvmTest.dependencies {
+            // Diagnostic seam for BodyTimeoutContractTest hang investigation
+            // per PR #362 Option D verdict (30-min job timeout on CI Ubuntu
+            // from commonTest source-set, PASS from jvmTest source-set).
+            // Provides `DebugProbes.dumpCoroutines()` invoked from the
+            // JVM actual of `beginHangDiagnostic` / `endHangDiagnostic` in
+            // `HangDiagnostic.jvm.kt`. Not consumed by any production or
+            // Android compilation path.
+            implementation(libs.kotlinx.coroutines.debug)
+        }
     }
 }
 

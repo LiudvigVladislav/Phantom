@@ -147,12 +147,73 @@ import kotlin.time.Duration.Companion.minutes
  * suite. Restoring the class is the exit criterion.
  *
  * TEMPORARY QUARANTINE, NOT contract deletion.
+ *
+ * ─────────────────────────────────────────────────────────────────
+ * DIAGNOSTIC PR — Option E (2026-07-03). Branch
+ * `diagnostic/body-timeout-hang-dump-commontest`. NOT FOR MERGE.
+ *
+ * Prior diagnostic PR #362 established via four CI Ubuntu runs on
+ * various probes:
+ *
+ *   - `jvmTest` verbatim duplicate of this class (byte-for-byte
+ *     identical cell bodies, fixture, and `runTest(timeout = 5.minutes)`)
+ *     PASSES 6/6 on CI Ubuntu.
+ *   - Removing this `@kotlin.test.Ignore` on the ORIGINAL commonTest
+ *     class with ZERO other change causes CI Ubuntu `build-and-test`
+ *     to CANCEL at the 30-minute GitHub Actions job timeout on
+ *     current master head `fe14c977`.
+ *
+ * Conclusion: the race is source-set sensitive (`commonTest` hangs,
+ * `jvmTest` passes) and still live on current master (MC-1/2/3 did
+ * not close it retroactively). To root-cause the wedge we need a
+ * suspended-coroutine + JVM-thread stack dump from within the
+ * hanging `commonTest` compilation itself, not from a `jvmTest`
+ * duplicate that no longer reproduces.
+ *
+ * This branch removes the `@kotlin.test.Ignore` and wraps each
+ * `@Test` cell with the `beginHangDiagnostic(cellName)` /
+ * `endHangDiagnostic()` expect-fun seam declared in
+ * `HangDiagnostic.kt`. The JVM actual (`HangDiagnostic.jvm.kt`)
+ * runs a real-time daemon thread that dumps
+ * `DebugProbes.dumpCoroutines()` + `Thread.getAllStackTraces()` to
+ * stderr every 60 s of wall clock. The Android actual
+ * (`HangDiagnostic.android.kt`) is a no-op (Android unit tests have
+ * not reproduced the hang).
+ *
+ * Expected outcome on CI Ubuntu: `build-and-test` hangs on one of
+ * the exception cells. Watchdog dumps land in stderr at
+ * ≥ 60 / 120 / 180 / 240 s inside the `runTest(timeout = 5.minutes)`
+ * real-time cap, giving the wedged coroutine and thread state for
+ * post-mortem. Then a targeted point-fix + this class's proper
+ * unquarantine land in a separate production PR.
+ *
+ * NOT for merge. This branch will be closed after the dump is
+ * captured and the follow-up fix PR opens.
  * ─────────────────────────────────────────────────────────────────
  */
-@kotlin.test.Ignore
 class BodyTimeoutContractTest {
 
     private val IDENTITY: String = "aa".repeat(32)
+
+    // Option E diagnostic wrapper. Wraps each `@Test` cell's body with
+    // begin/end of the `HangDiagnostic` expect-fun seam. On JVM the
+    // actual starts a real-time daemon thread that dumps
+    // `DebugProbes.dumpCoroutines()` + `Thread.getAllStackTraces()`
+    // to stderr every 60 s of wall clock while the block is running.
+    // On Android unit tests the actual is a no-op.
+    //
+    // The `runTest(timeout = 5.minutes)` inside `block` supplies its
+    // own real-time cap, so a wedge exits the block before the CI
+    // Ubuntu job hits its 30-minute timeout — after which the
+    // watchdog stops itself in the `finally` clause below.
+    private inline fun diagCell(cellName: String, block: () -> Unit) {
+        beginHangDiagnostic(cellName)
+        try {
+            block()
+        } finally {
+            endHangDiagnostic()
+        }
+    }
 
     // Round 13 follow-up — the previous version of this fence read the
     // KDoc literally ("no libsodium primitive is invoked along this path")
@@ -174,7 +235,7 @@ class BodyTimeoutContractTest {
     // ── Invariant 1 — cursor preserved ──────────────────────────────────────
 
     @Test
-    fun r12_body_timeout_after_headers_preserves_cursor() = runTest(timeout = 5.minutes) {
+    fun r12_body_timeout_after_headers_preserves_cursor() = diagCell("r12_body_timeout_after_headers_preserves_cursor") { runTest(timeout = 5.minutes) {
         init()
         val cursor = RecordingCursorRepo(initialStored = 7L)
         val transport = BodyTimeoutTestTransport(
@@ -219,12 +280,12 @@ class BodyTimeoutContractTest {
         )
         orch.stop()
         runCurrent()
-    }
+    } }
 
     // ── Invariant 2 — no ack call ───────────────────────────────────────────
 
     @Test
-    fun r12_body_timeout_after_headers_suppresses_ack() = runTest(timeout = 5.minutes) {
+    fun r12_body_timeout_after_headers_suppresses_ack() = diagCell("r12_body_timeout_after_headers_suppresses_ack") { runTest(timeout = 5.minutes) {
         init()
         val transport = BodyTimeoutTestTransport(
             pollScript = { _ ->
@@ -259,12 +320,12 @@ class BodyTimeoutContractTest {
         )
         orch.stop()
         runCurrent()
-    }
+    } }
 
     // ── Invariant 3 — breaker accounting ────────────────────────────────────
 
     @Test
-    fun r12_body_timeout_after_headers_accounts_toward_breaker() = runTest(timeout = 5.minutes) {
+    fun r12_body_timeout_after_headers_accounts_toward_breaker() = diagCell("r12_body_timeout_after_headers_accounts_toward_breaker") { runTest(timeout = 5.minutes) {
         init()
         val transport = BodyTimeoutTestTransport(
             pollScript = { _ ->
@@ -318,12 +379,12 @@ class BodyTimeoutContractTest {
         )
         orch.stop()
         runCurrent()
-    }
+    } }
 
     // ── Invariant 4 — no immediate retry; cooldown progression ──────────────
 
     @Test
-    fun r12_body_timeout_after_headers_does_not_retry_immediately() = runTest(timeout = 5.minutes) {
+    fun r12_body_timeout_after_headers_does_not_retry_immediately() = diagCell("r12_body_timeout_after_headers_does_not_retry_immediately") { runTest(timeout = 5.minutes) {
         init()
         val transport = BodyTimeoutTestTransport(
             pollScript = { _ ->
@@ -380,12 +441,12 @@ class BodyTimeoutContractTest {
         )
         orch.stop()
         runCurrent()
-    }
+    } }
 
     // ── Round 12 step 2 — hold_secs structured field on poll_call ──────────
 
     @Test
-    fun r12_poll_call_log_includes_hold_secs_field() = runTest(timeout = 5.minutes) {
+    fun r12_poll_call_log_includes_hold_secs_field() = diagCell("r12_poll_call_log_includes_hold_secs_field") { runTest(timeout = 5.minutes) {
         // Per Round 12 step 2 instrumentation: the legacy `pollLoop`
         // poll_call log line carries the server-advertised
         // `pollHoldSecs` as a structured field. The S6 council on
@@ -450,10 +511,10 @@ class BodyTimeoutContractTest {
         )
         orch.stop()
         runCurrent()
-    }
+    } }
 
     @Test
-    fun r12_ws_active_poll_call_log_includes_hold_secs_field() = runTest(timeout = 5.minutes) {
+    fun r12_ws_active_poll_call_log_includes_hold_secs_field() = diagCell("r12_ws_active_poll_call_log_includes_hold_secs_field") { runTest(timeout = 5.minutes) {
         // Mirror of the legacy-loop test for the parallel
         // `wsActivePollLoop` poll_call site. Both poll origins MUST
         // carry the same `hold_secs` field so a single grep covers
@@ -502,7 +563,7 @@ class BodyTimeoutContractTest {
         )
         orch.stop()
         runCurrent()
-    }
+    } }
 
     // ── Test infrastructure (inline, single-file scope) ─────────────────────
 
