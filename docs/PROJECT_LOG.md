@@ -606,7 +606,7 @@ when an entry mentions a rejected approach.
 
 **Fix-candidate APK.** Built from master `fd435c93` (MC-3 merged head) with four flags forced to `"1"` via `-P` gradle properties on the release-flavor `assembleRelease` task: `RECONNECT_QUIESCENCE_ENABLED` + `MODE_2_FAST_PATH_ENABLED` + `MODE_2_STICKY_ENABLED` + `DEBUG_FORCE_MODE_2_DETECTION`. Sideloaded to Tecno BF7-12 (`adb serial 103603734A004351`) + emu pair. APK size 202 MB, `sha256: 5d3de3790b999f957e667d63dcf93539ecbb0015867de7ef3703b2161ade304e`. Build was the docs author's responsibility, not the operator's.
 
-**Wi-Fi smoke — run 2 (PASS).** After full state reset on both devices (`pm clear phantom.android` + fresh onboarding + pairing) to clean any prior crypto-store contamination, the smoke exercised the complete quiescence chain via synthetic Mode 2 trigger. Marker chronology on Tecno wall clock, all 11 events ordered:
+**Wi-Fi smoke — run 2 (PASS).** After full state reset on both devices (`pm clear phantom.android` + fresh onboarding + pairing) to clean any prior crypto-store contamination, the smoke exercised the complete quiescence chain via synthetic Mode 2 trigger. Marker chronology on Tecno wall clock (13 ordered log lines: 8 required quiescence-chain markers per §7 acceptance + 2 `ws_reconnect_quiesced` occurrences from the initial arm and the `route_change_invalidates_probe` re-quiesce + 3 `mode_switched` context lines showing the state transitions the chain drives):
 
 ```
 17:34:53.781  mode_2_signature_matched action=fast_path duration_ms=45000
