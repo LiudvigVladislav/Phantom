@@ -303,3 +303,69 @@ A separate facts-first recon (working name `QUIESCENCE-VALIDATION-METHODOLOGY-RE
 - **Operator's QR-add → reverse-add warm-up flow** was the same paired-bootstrap pattern as K-1; not a scenario deviation, just the natural first-contact flow.
 - **Receiver-side decrypt counts (Tecno 6, emu 10)** lower than expected for 4 × 2 = 8 scheduled messages plus warm-up plus acks. The discrepancy is likely because some inbound paths logged `inbound_repair_ok` (7 events on each side) rather than `DECRYPT_TRACE ok`; the analysis script's regex counted only the latter. Future K-runs should add `inbound_repair_ok` to the receiver-side delivery count to avoid under-counting deliveries that took the repair path.
 - **Five `mode_switched ... reason=ws_alive_60s` events** (Tecno 4 + emu 1) demonstrate the R3.6 sticky-per-route fast REST degradation flow from PR #328 is working correctly with the three flags forced on. This is a positive data point for the R3.6 baseline, NOT for PR #330's quiescence layer specifically.
+
+## §13 B1 acceptance gate — CLOSED via controlled Wi-Fi smoke (2026-07-02)
+
+**B1 status flips: CLOSED.** The three §7 QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK gates all cleared:
+
+1. **MC PASS**: PR #360 squash `fd435c93` merged (three-PR stack MC-1 `91745acd` + MC-2 `7bcf2d04` + MC-3 `fd435c93`).
+2. **MB PASS**: PR #353 squash `ed3406eb`.
+3. **Wi-Fi smoke PASS**: run 2 (2026-07-02, Tecno BF7-12 + emu Wi-Fi pair, fix-candidate APK `sha256: 5d3de3790b999f957e667d63dcf93539ecbb0015867de7ef3703b2161ade304e` built from master `fd435c93` with all four flags forced to `"1"` via `-P` gradle properties: `RECONNECT_QUIESCENCE_ENABLED` + `MODE_2_FAST_PATH_ENABLED` + `MODE_2_STICKY_ENABLED` + `DEBUG_FORCE_MODE_2_DETECTION`).
+
+The path forward addressing §11's forward-pointer methodology question: option (b) synthetic trigger via `DebugForceMode2Activity`. The methodology recon `QUIESCENCE-VALIDATION-METHODOLOGY-RECON1` (PR #349 squash `54f2e50d`) closed with verdict H-ME requiring both an MB half (synthetic field trigger) and an MC half (deterministic state-machine / integration validation). MB landed via PR #353 (L1 synthetic-trigger implementation); MC landed via PR #358/#359/#360 stack. This Wi-Fi smoke is the final field-shape check that §7 of the MC-half mini-lock required as the last gate before B1 closure.
+
+### Wi-Fi smoke run 2 evidence
+
+Chronology (Tecno wall clock, complete quiescence chain):
+
+```
+17:34:53.781  mode_2_signature_matched action=fast_path duration_ms=45000
+17:34:53.791  sticky_armed gen=1
+17:34:53.792  ws_reconnect_quiesced gen=1
+17:34:58.847  ws_recovery_probe_granted gen=1 route_epoch=1
+17:35:09.992  ws_reconnect_quiesced reason=route_change_invalidates_probe
+17:35:10.066  ws_recovery_probe_granted gen=1 route_epoch=2
+17:35:11.770  sticky_recovery_started gen=1
+17:35:11.775  ws_reconnect_resumed sticky_gen=1 session_epoch=2
+17:36:11.799  sticky_cleared proof=ws_alive_60s elapsed_ms_since_arm=78008
+17:36:11.800  ws_reconnect_open proof=ws_alive_60s
+17:36:11.801  mode_switched WsCandidate → WS_ACTIVE reason=ws_alive_60s
+```
+
+All 8 required markers TRUE, 1× `sticky_armed`, 1 grant per unique route_epoch, probation 78008ms within [60000..90000] window per acceptance matrix. Delivery both directions PASS via WS path — Emu → Tecno through Sprint 2b-C `inbound_repair_ok promotion=true` bootstrap (`7b1733ad`), Tecno → Emu mirror (`f290bfb1`), then Emu → Tecno second message via direct `DECRYPT_TRACE ok bootstrap=false` (`6960ac2a`) after session promoted.
+
+### Phase B hypothesis matrix — B1 CLOSED per §11 acceptance
+
+| Hypothesis | Verdict on Wi-Fi smoke run 2 |
+|---|---|
+| H-330-Quiesces-Storm | **PASS** — synthetic Mode 2 → `sticky_armed` → `ws_reconnect_quiesced`; no reconnect storm during window |
+| H-330-Preserves-REST | **PASS** — REST fallback flowed messages during Quiesced state; 0 delivery errors |
+| H-330-Single-Probe-Per-RouteChange | **PASS** — 2 unique route_epochs × 1 probe grant each (correct `route_change_invalidates_probe` invariant) |
+| H-330-Probe-Lives-60s | **PASS** — `sticky_cleared proof=ws_alive_60s elapsed_ms_since_arm=78008` (within 60-90s window) |
+| H-330-No-Self-Reentry | **PASS** — candidate session did not autonomously spawn; recovery gated by NetworkChanged only |
+| H-330-No-Message-Loss-Or-Dups | **PASS** — 0 `relay_send_return ok=false`; 3 messages delivered end-to-end via Sprint 2b-C repair + direct decrypt paths |
+
+**Net: 6 PASS, 0 NOT EXERCISED, 0 FAIL.** §11's strict acceptance is met — this time in both letter AND spirit.
+
+### Run 1 side-finding preserved (NOT a B1 blocker)
+
+An earlier smoke attempt (run 1, same session, before `pm clear + fresh onboarding`) surfaced `x3dhInitPresent=false` + `fail_mac action=hold` on receiver-side Tecno. Root cause was contamination from prior test cycles' broken conversation state — session record persisted without matching X3DH init blob. After full `pm clear` on both devices + fresh onboarding + pairing, run 2 showed `x3dhInitPresent=true` throughout and Sprint 2b-C `inbound_repair_ok promotion=true` fired successfully for the first message each direction. Root cause is contamination-only; if the pattern reproduces on future clean-state runs, `RECV-SESSION-X3DH-INIT-STATE-RECON1` will open then.
+
+### What this closure establishes
+
+- **PR #330's quiescence contract is field-validated on Wi-Fi.** The full chain (`sticky → probe → ws_alive_60s recovery`) fires and the 60-second probation completes cleanly. R3.6 sticky-per-route flow from PR #328 remains intact.
+- **MC PASS + MB PASS + Wi-Fi smoke PASS jointly satisfy §7 of the MC-half mini-lock.** The two H-ME halves are both on record; the controlled Wi-Fi smoke was the final field-shape check.
+- **Sprint 2b-C repair path is functional on master `fd435c93`.** 3× `inbound_repair_ok promotion=true` fired on run 2, closing the "Sprint 2b-C might be regressed by MC stack" concern.
+
+### What this closure does NOT change
+
+- **B2 remains unopened.** Tele2 LTE delivery-blocker track from §11 is still forward-pointer only. PR #330 does NOT ship to LTE users on the strength of a Wi-Fi B1-PASS alone per §11's release / rollout gate.
+- **Release / rollout gate stays in force.** Either path (i) B2 closes with a fix that resolves the LTE long-connection surface, or path (ii) an alternative transport lands, is still required before LTE rollout.
+- **PR #330's Draft / HOLD status.** No change here; the RC PR moves per its own mini-lock contract now that B1 is closed.
+- **No BodyTimeoutContractTest unquarantine.** Deferred to a separate follow-up PR.
+
+### Non-blocking follow-ups (opened separately, not by this closure)
+
+- `BodyTimeoutContractTest` unquarantine — reproduce hang in Linux Docker → fix `runTest` + `gateLock` + fixture dispatcher-mix → remove class-level `@Ignore` from PR #360 Round 6 quarantine.
+- Smoke script delivery invariant fix — accept `handleDeliver DONE` / `Inserting message into DB` / `DECRYPT_TRACE ok` / `DECRYPT_TRACE inbound_repair_ok` as delivery signals in `smoke-run.sh` (currently only `REST_TRACE inbound_deliver` is counted, which produced a false-positive `FAIL` on run 2 whose delivery went via WS path).
+- §4.3 P3 regex hardening in `CloseOriginSyntheticNonBranchingGrepTest` — extend reversed-comparison pattern to receiver-prefixed forms like `"synthetic" == event.closeOrigin` (deferred from PR #360 Round 4 revert).

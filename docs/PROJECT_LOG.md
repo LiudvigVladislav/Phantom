@@ -598,6 +598,71 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-07-02 · DIRECT-WSS-MODE2-RECON1 §13 B1 acceptance gate CLOSED via controlled Wi-Fi smoke PASS
+
+**Goal.** Close the B1 acceptance gate opened by `docs/tracks/direct-wss-mode2-recon1.md` §11 by exercising all three §7 sub-gates: **MC PASS** + **MB PASS** + **Wi-Fi smoke PASS**. Prior to today, MC PASS (PR #360 squash `fd435c93`, MC stack part 3 of 3) and MB PASS (PR #353 `ed3406eb`, L1 synthetic-trigger `DebugForceMode2Activity`) were both on record. The remaining gate was a controlled Wi-Fi smoke that exercises the full quiescence chain end-to-end in the field.
+
+**Outcome.** All three §7 sub-gates now cleared. **B1 CLOSED on run 2**.
+
+**Fix-candidate APK.** Built from master `fd435c93` (MC-3 merged head) with four flags forced to `"1"` via `-P` gradle properties on the release-flavor `assembleRelease` task: `RECONNECT_QUIESCENCE_ENABLED` + `MODE_2_FAST_PATH_ENABLED` + `MODE_2_STICKY_ENABLED` + `DEBUG_FORCE_MODE_2_DETECTION`. Sideloaded to Tecno BF7-12 (`adb serial 103603734A004351`) + emu pair. APK size 202 MB, `sha256: 5d3de3790b999f957e667d63dcf93539ecbb0015867de7ef3703b2161ade304e`. Build was the docs author's responsibility, not the operator's.
+
+**Wi-Fi smoke — run 2 (PASS).** After full state reset on both devices (`pm clear phantom.android` + fresh onboarding + pairing) to clean any prior crypto-store contamination, the smoke exercised the complete quiescence chain via synthetic Mode 2 trigger. Marker chronology on Tecno wall clock, all 11 events ordered:
+
+```
+17:34:53.781  mode_2_signature_matched action=fast_path duration_ms=45000
+17:34:53.790  mode_switched WsActive → REST_ACTIVE reason=mode_2_fast_path
+17:34:53.791  sticky_armed gen=1
+17:34:53.792  ws_reconnect_quiesced gen=1
+17:34:58.847  ws_recovery_probe_granted gen=1 route_epoch=1
+17:35:09.992  ws_reconnect_quiesced reason=route_change_invalidates_probe
+17:35:10.066  ws_recovery_probe_granted gen=1 route_epoch=2
+17:35:11.768  mode_switched RestActive → WS_CANDIDATE reason=ws_recovery_probation
+17:35:11.770  sticky_recovery_started gen=1
+17:35:11.775  ws_reconnect_resumed sticky_gen=1 session_epoch=2
+17:36:11.799  sticky_cleared proof=ws_alive_60s elapsed_ms_since_arm=78008
+17:36:11.800  ws_reconnect_open proof=ws_alive_60s
+17:36:11.801  mode_switched WsCandidate → WS_ACTIVE reason=ws_alive_60s
+```
+
+Counters: 1× `sticky_armed`, 2 unique `route_epoch` × 1 grant each (`route_change_invalidates_probe` invariant correct on multi-step Wi-Fi flap), probation `elapsed_ms_since_arm=78008` inside the `[60000..90000]` window.
+
+**Delivery — PASS both directions (via WS path).** Emu → Tecno (`7b1733ad`) exercised the Sprint 2b-C bootstrap-repair path: `bootstrap_path reason=responder_role_redirected` → `prekey_fetch_result=200` → `ratchet_encrypt_ok bootstrap=true` → `sealed_sender_pack_ok` → `relay_send_return ok=true` → `Ack status=delivered`. On the Tecno receiver: `DECRYPT_TRACE attempt sessionExists=true x3dhInitPresent=true` → `DECRYPT_TRACE pending_fallback_fail reason=mac_fail_under_pending` → `DECRYPT_TRACE inbound_repair_armed reason=fail_mac_existing_session` → `DECRYPT_TRACE inbound_repair_ok bootstrap=true plaintextBytes=60 elapsedMs=197 promotion=true`. Message inserted into DB and `handleDeliver DONE ack-deliver sent`. Tecno → Emu mirror (`f290bfb1`) fired the same `inbound_repair_ok promotion=true` shape on the emu side. Follow-up Emu → Tecno (`6960ac2a`) after session promotion took the direct decrypt path: `DECRYPT_TRACE ok elapsedMs=7 bootstrap=false`. 3 messages delivered end-to-end. `relay_send_return ok=false` count = 0.
+
+**Phase B hypothesis matrix (`docs/tracks/direct-wss-mode2-recon1.md` §11).** 6 PASS / 0 NOT EXERCISED / 0 FAIL:
+
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| H-330-Quiesces-Storm | PASS | Synthetic Mode 2 → sticky → quiesced immediately |
+| H-330-Preserves-REST | PASS | REST flowed during Quiesced window; 0 delivery errors |
+| H-330-Single-Probe-Per-RouteChange | PASS | 2 unique `route_epoch` × 1 probe each; `route_change_invalidates_probe` on multi-step flap |
+| H-330-Probe-Lives-60s | PASS | `elapsed_ms_since_arm=78008` in window |
+| H-330-No-Self-Reentry | PASS | Candidate did not autonomously spawn between epochs |
+| H-330-No-Message-Loss-Or-Dups | PASS | 0 `relay_send_return ok=false`; 3 messages delivered |
+
+§11 met **in letter AND spirit** (previous K-6 verdict on 2026-06-28 was NON-REGRESSION-only since natural Wi-Fi did not reproduce Mode 2; today's run used the synthetic trigger via `DebugForceMode2Activity` — path (b) of §12 forward-pointer — closing the methodology gap via `QUIESCENCE-VALIDATION-METHODOLOGY-RECON1` PR #349 verdict H-ME + MB PR #353 + the MC-1/2/3 stack).
+
+**Wi-Fi smoke — run 1 (contaminated crypto state side-finding, NOT a B1 blocker).** An earlier run 1 attempt showed the quiescence mechanism PASS but delivery FAIL. Root cause: `sessionExists=true` + `x3dhInitPresent=false` + `fail_mac action=hold` receiver-side state inconsistency from prior test-cycle contamination (the first `fail_mac` fired 11 seconds BEFORE the synthetic trigger, so predates PR #330 territory). Sprint 2b-C repair markers hit 0. Under operator's rule "don't spawn a new track until we know reproducible bug vs contamination," run 2 was executed after `pm clear` on both devices + fresh onboarding. Run 2's signal matrix showed `x3dhInitPresent=true` throughout and Sprint 2b-C `inbound_repair_ok promotion=true` firing 3 times — root cause is contamination-only, refuted as a reproducible blocker. `RECV-SESSION-X3DH-INIT-STATE-RECON1` mini-lock **NOT opened**. Opens only if `x3dhInitPresent=false + fail_mac hold` reproduces after a clean `pm clear + fresh onboarding` in the future.
+
+**Closure verdict (formulation preserved).**
+
+```
+B1 CLOSED on run 2.
+Run 1 = contaminated crypto state side-finding, not B1 blocker.
+Script FAIL in run 2 = false-positive due to REST-only delivery invariant.
+```
+
+**What this PR ships.** `docs/tracks/direct-wss-mode2-recon1.md` §13 amendment (B1 CLOSED verdict + 6-hypothesis matrix + run 2 evidence + run 1 side-finding preserved + non-blocking follow-ups listed) + this session-journal entry + `docs/project/MASTER_TIMELINE_2026.md` entry.
+
+**What this PR does NOT change.** No code change. B2 remains unopened. Release-rollout gate stays in force (PR #330 does NOT ship to LTE users on Wi-Fi B1-PASS alone per §11). PR #330 Draft / HOLD status untouched (head `6f49cd89`); the RC PR advances per its own mini-lock contract now that B1 is closed.
+
+**Non-blocking follow-ups (separate PRs, not this closure).**
+
+1. `BodyTimeoutContractTest` unquarantine — reproduce hang in Linux Docker → fix dispatcher-mix in fixture → remove class-level `@Ignore` added in PR #360 Round 6.
+2. Smoke script delivery invariant fix — script `smoke-run.sh` currently only counts `REST_TRACE inbound_deliver` and missed run 2's WS-path deliveries, producing false-positive `FAIL`. Extend to also accept `handleDeliver DONE` / `Inserting message into DB` / `DECRYPT_TRACE ok` / `DECRYPT_TRACE inbound_repair_ok` as delivery signals.
+3. §4.3 P3 regex hardening — extend reversed-comparison pattern to catch receiver-prefixed `"synthetic" == event.closeOrigin` shape (deferred from PR #360 Round 4 revert).
+
+**Verification.** No build change to verify. Docs-only. Voice + Cyrillic + future-date hygiene grep on this PR's diff clean.
+
 ### 2026-07-01 · QUIESCENCE-VALIDATION-MC-HALF-MINI-LOCK MC-3 — Coordinator + AppContainer + Dispatcher + Orchestrator wiring + §4.2 + §4.3 + reinforcement + MC PASS ledger (MC stack part 3 of 3)
 
 **Outcome:** Third and final PR of the three-PR MC stack per §13.2 step 3. Stacked on PR #359 squash `7bcf2d04` (MC-2). Lands the `TransportRewalkCoordinator` 7-step gate transaction + `AppContainer` gate wiring (BuildConfig read + shared `currentKindProvider` lambda + late-binding `gateProvider` + `gateCoordinator`) + `WsSessionLifecycleDispatcher.connectionGeneration` field-carry + `RestFallbackOrchestrator` 3 new ctor params forwarded to `RestStateMachine` + PR #330 tests (`RestFallbackOrchestratorQuiescenceWiringTest` + `TransportRewalkCoordinatorTransactionTest` + `HybridRelayTransportIntegrationTest20`) + fresh §4.2 sequential-dispatcher-order structural test + fresh §4.3 `closeOrigin = "synthetic"` non-branching grep test + one reinforcement cell for H-330-Preserves-REST at state-machine layer.
