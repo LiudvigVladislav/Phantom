@@ -147,9 +147,35 @@ import kotlin.time.Duration.Companion.minutes
  * suite. Restoring the class is the exit criterion.
  *
  * TEMPORARY QUARANTINE, NOT contract deletion.
+ *
+ * ─────────────────────────────────────────────────────────────────
+ * DIAGNOSTIC PR #362 Option D test-of-truth (2026-07-03) — class-
+ * level `@Ignore` temporarily removed on the diagnostic branch to ask
+ * one question against current master head fe14c977:
+ *
+ *   Does the hang documented in the Round 3-5 reproducibility matrix
+ *   above still fire on current master, or has some intervening merge
+ *   (MC-1 91745acd, MC-2 7bcf2d04, MC-3 fd435c93, or an earlier
+ *   change) closed the race retroactively?
+ *
+ * The `BodyTimeoutHangReproTest.kt` jvmTest verbatim duplicate on
+ * this same branch passed CI Ubuntu 6/6. That leaves the source-set
+ * (commonTest vs jvmTest) as the untested variable. Removing `@Ignore`
+ * here — with NO other code change — asks the question directly.
+ *
+ * Interpretation:
+ *   PASS on CI: race is closed on current master; no fix needed;
+ *     production PR = drop this `@Ignore` and this diagnostic block.
+ *   HANG on CI: race still fires from commonTest source-set on
+ *     current master; next step is Option E (add JVM-only diagnostic
+ *     seam via expect/actual) or a considered permanent move to
+ *     jvmTest.
+ *
+ * NOT for merge to master via this branch. This branch is
+ * `diagnostic/body-timeout-hang-probe`; PR #362 stays Draft +
+ * `[NOT FOR MERGE]`.
  * ─────────────────────────────────────────────────────────────────
  */
-@kotlin.test.Ignore
 class BodyTimeoutContractTest {
 
     private val IDENTITY: String = "aa".repeat(32)
