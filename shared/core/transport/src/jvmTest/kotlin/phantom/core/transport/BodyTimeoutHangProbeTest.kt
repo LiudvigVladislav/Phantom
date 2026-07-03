@@ -66,12 +66,14 @@ class BodyTimeoutHangProbeTest {
         }
     }
 
+    // ── v1 cells — already CI-green (baseline; kept as sanity that watchdog fires as expected) ──
+
     @Test
-    fun probe_stop_returns_after_repeated_body_timeout() = runTest(timeout = 8.minutes) {
+    fun probe_v1_single_stop_returns_after_repeated_body_timeout() = runTest(timeout = 8.minutes) {
         ensureLibsodium()
         DebugProbes.install()
         try {
-            withWatchdog(cellName = "probe_stop_returns_after_repeated_body_timeout") {
+            withWatchdog(cellName = "probe_v1_single_stop_returns_after_repeated_body_timeout") {
                 driveOneCycle(label = "cycle-1", advanceTotalMs = 300_000L)
             }
         } finally {
@@ -80,16 +82,213 @@ class BodyTimeoutHangProbeTest {
     }
 
     @Test
-    fun probe_two_back_to_back_cycles_both_stop_cleanly() = runTest(timeout = 8.minutes) {
+    fun probe_v1_two_back_to_back_cycles_both_stop_cleanly() = runTest(timeout = 8.minutes) {
         ensureLibsodium()
         DebugProbes.install()
         try {
-            withWatchdog(cellName = "probe_two_back_to_back_cycles_both_stop_cleanly") {
+            withWatchdog(cellName = "probe_v1_two_back_to_back_cycles_both_stop_cleanly") {
                 driveOneCycle(label = "cycle-A", advanceTotalMs = 60_000L)
                 driveOneCycle(label = "cycle-B", advanceTotalMs = 60_000L)
             }
         } finally {
             DebugProbes.uninstall()
+        }
+    }
+
+    // ── v2 cells — mirror BodyTimeoutContractTest failing-cell shapes verbatim ──
+    //
+    // v2 differences from v1:
+    //   * watchdog + DebugProbes wrap the WHOLE @Test method (outside `runTest`)
+    //     so runTest's implicit-cleanup + advanceUntilIdle at cell exit gets
+    //     covered too
+    //   * NO `withTimeout(30.seconds)` around `orch.stop()` — original tests
+    //     don't have that either; a silent hang propagates to runTest's 8-min
+    //     real-time cap
+    //   * time-advance patterns match original cells verbatim (POLL_ACTIVE_MS =
+    //     2_000L per const val; advance sizes 30_000L / 60_000L / three-step
+    //     POLL_ACTIVE_MS+100 → 1_000L → 10_000L)
+
+    @Test
+    fun probe_v2_preserves_cursor_shape() {
+        runV2WithWatchdog(cellName = "probe_v2_preserves_cursor_shape") {
+            driveCellShape(label = "preserves_cursor") { advanceTimeBy(30_000L) }
+        }
+    }
+
+    @Test
+    fun probe_v2_suppresses_ack_shape() {
+        runV2WithWatchdog(cellName = "probe_v2_suppresses_ack_shape") {
+            driveCellShape(label = "suppresses_ack") { advanceTimeBy(30_000L) }
+        }
+    }
+
+    @Test
+    fun probe_v2_accounts_toward_breaker_shape() {
+        runV2WithWatchdog(cellName = "probe_v2_accounts_toward_breaker_shape") {
+            driveCellShape(label = "accounts_toward_breaker") { advanceTimeBy(60_000L) }
+        }
+    }
+
+    @Test
+    fun probe_v2_does_not_retry_immediately_shape() {
+        runV2WithWatchdog(cellName = "probe_v2_does_not_retry_immediately_shape") {
+            driveCellShape(label = "does_not_retry_immediately") {
+                advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+                runCurrent()
+                advanceTimeBy(1_000L)
+                runCurrent()
+                advanceTimeBy(10_000L)
+            }
+        }
+    }
+
+    // ── v3 cells — same shapes but WITHOUT DebugProbes, as a control for observer effect ──
+
+    @Test
+    fun probe_v3_no_debug_probes_does_not_retry_immediately_shape() {
+        val watchdog = startExternalWatchdog(cellName = "probe_v3_no_debug_probes_does_not_retry_immediately_shape")
+        try {
+            runTest(timeout = 8.minutes) {
+                ensureLibsodium()
+                driveCellShape(label = "v3_does_not_retry_immediately") {
+                    advanceTimeBy(RestFallbackOrchestrator.POLL_ACTIVE_MS + 100L)
+                    runCurrent()
+                    advanceTimeBy(1_000L)
+                    runCurrent()
+                    advanceTimeBy(10_000L)
+                }
+            }
+        } finally {
+            watchdog.done.set(true)
+            watchdog.thread.interrupt()
+        }
+    }
+
+    private fun runV2WithWatchdog(cellName: String, block: suspend kotlinx.coroutines.test.TestScope.() -> Unit) {
+        val watchdog = startExternalWatchdog(cellName = cellName)
+        try {
+            DebugProbes.install()
+            try {
+                runTest(timeout = 8.minutes) {
+                    ensureLibsodium()
+                    block()
+                }
+            } finally {
+                DebugProbes.uninstall()
+            }
+        } finally {
+            watchdog.done.set(true)
+            watchdog.thread.interrupt()
+        }
+    }
+
+    private suspend fun kotlinx.coroutines.test.TestScope.driveCellShape(
+        label: String,
+        advanceScript: suspend kotlinx.coroutines.test.TestScope.() -> Unit,
+    ) {
+        val transport = HangProbeTransport(
+            pollScript = { _ ->
+                throw RuntimeException("$label: simulated body-read timeout")
+            },
+        )
+        val orch = RestFallbackOrchestrator(
+            baseUrl = "https://relay.test",
+            identityHex = IDENTITY,
+            signingPubkeyHex = "bb".repeat(32),
+            getChallenge = { _ -> "cc".repeat(32) },
+            signChallenge = { _ -> ByteArray(64) { 0xDD.toByte() } },
+            transport = transport,
+            now = { 0L },
+            log = { },
+            longPollEnabled = false,
+            cursorRepository = HangProbeCursor(),
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        val caps = orch.bootstrap()
+        check(caps.restFallback) { "$label: bootstrap did not report restFallback capability" }
+        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
+            orch.submitEvent(
+                RestStateMachine.Event.WsSessionEnded(
+                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
+                    sessionEpoch = 0L,
+                ),
+            )
+        }
+        check(orch.stateMachine.state.value == RestMode.RestActive) {
+            "$label: expected RestActive after fail-threshold submits, got ${orch.stateMachine.state.value}"
+        }
+        orch.start()
+        runCurrent()
+        advanceScript()
+        runCurrent()
+        // NO `withTimeout(30.seconds)` here — v2 lets stop() hang naturally so runTest's 8-min cap + watchdog capture the wedge shape.
+        orch.stop()
+        runCurrent()
+    }
+
+    private data class WatchdogHandle(
+        val thread: Thread,
+        val done: AtomicBoolean,
+    )
+
+    private fun startExternalWatchdog(cellName: String): WatchdogHandle {
+        val done = AtomicBoolean(false)
+        val startWallMs = System.currentTimeMillis()
+        val thread = Thread {
+            var iter = 0
+            while (!done.get()) {
+                try {
+                    Thread.sleep(60_000L)
+                } catch (t: InterruptedException) {
+                    return@Thread
+                }
+                if (done.get()) return@Thread
+                iter += 1
+                dumpAllThreadStates(iter, cellName, startWallMs, includeCoroutineDebugProbes = true)
+            }
+        }.apply {
+            isDaemon = true
+            name = "BodyTimeoutHangProbeTest-Watchdog-Outer"
+        }
+        thread.start()
+        return WatchdogHandle(thread, done)
+    }
+
+    private fun dumpAllThreadStates(
+        iter: Int,
+        cellName: String,
+        startWallMs: Long,
+        includeCoroutineDebugProbes: Boolean,
+    ) {
+        val elapsedS = (System.currentTimeMillis() - startWallMs) / 1000L
+        val err: PrintStream = System.err
+        synchronized(err) {
+            err.println()
+            err.println("╔══════════════════════════════════════════════════════════════════════════════")
+            err.println("║ WATCHDOG FIRE #$iter  cell=$cellName  wall_clock_elapsed_s=$elapsedS")
+            err.println("╚══════════════════════════════════════════════════════════════════════════════")
+            if (includeCoroutineDebugProbes) {
+                err.println("─── Kotlin coroutine dump (DebugProbes.dumpCoroutines) ───")
+                try {
+                    DebugProbes.dumpCoroutines(err)
+                } catch (t: Throwable) {
+                    err.println("  (DebugProbes.dumpCoroutines threw: ${t.javaClass.simpleName}: ${t.message})")
+                }
+                err.println()
+            } else {
+                err.println("─── (DebugProbes disabled for this cell — observer-effect control) ───")
+            }
+            err.println("─── JVM thread stack traces (Thread.getAllStackTraces) ───")
+            val stacks = Thread.getAllStackTraces()
+            for ((thread, frames) in stacks) {
+                err.println()
+                err.println("Thread \"${thread.name}\" state=${thread.state} daemon=${thread.isDaemon}")
+                for (frame in frames) {
+                    err.println("  at $frame")
+                }
+            }
+            err.println("─── end watchdog dump #$iter ───")
+            err.println()
         }
     }
 
@@ -181,7 +380,7 @@ class BodyTimeoutHangProbeTest {
                     val stacks = Thread.getAllStackTraces()
                     for ((thread, frames) in stacks) {
                         err.println()
-                        err.println("Thread \"${thread.name}\" state=${thread.state} daemon=${thread.isDaemon} id=${thread.id}")
+                        err.println("Thread \"${thread.name}\" state=${thread.state} daemon=${thread.isDaemon}")
                         for (frame in frames) {
                             err.println("  at $frame")
                         }
