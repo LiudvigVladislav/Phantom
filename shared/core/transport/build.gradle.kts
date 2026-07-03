@@ -59,6 +59,14 @@ kotlin {
             // test classpath transitively — we add them here explicitly.
             implementation(libs.libsodium.bindings)
         }
+        jvmTest.dependencies {
+            // Diagnostic reproduction of BodyTimeoutContractTest CI hang.
+            // JVM-only DebugProbes surface for `dumpCoroutines()`; used by
+            // BodyTimeoutHangProbeTest's real-time watchdog to snapshot
+            // suspended coroutine stacks when the test class hangs on CI
+            // Ubuntu. Not consumed by any production code path.
+            implementation(libs.kotlinx.coroutines.debug)
+        }
     }
 }
 
