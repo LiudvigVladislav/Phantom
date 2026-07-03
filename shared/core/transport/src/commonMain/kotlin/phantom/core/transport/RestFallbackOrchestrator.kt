@@ -10,6 +10,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -1523,7 +1524,20 @@ class RestFallbackOrchestrator(
         // refresh it or CAS-reuse what a concurrent caller already
         // refreshed. No more direct writes to sessionToken from here.
         var staleToken: String? = null
-        while (scope.isActive) {
+        // Fix (2026-07-04): PR #363 Option E dump captured pollJob RUNNING
+        // at pollLoop:1568 with `_breakerTimerJob` regeneration at ~6,400/sec
+        // real time on Ubuntu CI. `scope` here is
+        // `CoroutineScope(SupervisorJob() + dispatcher)` — the SupervisorJob()
+        // has no parent, so `pollJob.cancel()` from `onModeChanged(WsActive)`
+        // or `stop()` cancels only the pollJob child, not the enclosing
+        // scope. `scope.isActive` therefore stays `true` even when this
+        // coroutine has been cancelled; the loop relies on `delay(...)`
+        // throwing `CancellationException` as its sole cancellation-exit
+        // path, which is a stale invariant. Correct check reads the
+        // current coroutine's own Job via
+        // `kotlinx.coroutines.currentCoroutineContext()` inside this
+        // suspend fun.
+        while (currentCoroutineContext().isActive) {
             val mode = stateMachine.state.value
             if (mode == RestMode.WsActive) break
 
@@ -1834,7 +1848,11 @@ class RestFallbackOrchestrator(
     }
 
     private suspend fun aliveTickLoop() {
-        while (scope.isActive) {
+        // Fix (2026-07-04): same orphan-`scope`-Job issue as `pollLoop` — see
+        // the extended comment on `pollLoop`'s `while (currentCoroutineContext().isActive)`
+        // line above. `aliveTickJob.cancel()` from `onModeChanged` (RestActive
+        // branch, WsActive branch) cannot exit this loop via `scope.isActive`.
+        while (currentCoroutineContext().isActive) {
             delay(CANDIDATE_TICK_MS)
             stateMachine.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
             if (stateMachine.state.value != RestMode.WsCandidate) break
@@ -1874,7 +1892,11 @@ class RestFallbackOrchestrator(
      */
     private suspend fun wsActivePollLoop() {
         var staleToken: String? = null
-        while (scope.isActive) {
+        // Fix (2026-07-04): same orphan-`scope`-Job issue as `pollLoop` — see
+        // the extended comment on `pollLoop`'s `while (currentCoroutineContext().isActive)`
+        // line above. `wsActivePollJob.cancel()` from `stop()` cannot exit
+        // this loop via `scope.isActive`.
+        while (currentCoroutineContext().isActive) {
             val token = acquireOrRefreshToken(
                 reason = if (staleToken != null) "ws_active_poll_401" else "ws_active_poll",
                 staleToken = staleToken,

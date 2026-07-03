@@ -147,9 +147,67 @@ import kotlin.time.Duration.Companion.minutes
  * suite. Restoring the class is the exit criterion.
  *
  * TEMPORARY QUARANTINE, NOT contract deletion.
+ *
+ * ─────────────────────────────────────────────────────────────────
+ * UNQUARANTINE ATTEMPT (2026-07-04) — Path X fix candidate.
+ *
+ * PR #362 established via four CI Ubuntu runs that the hang STILL
+ * fires on current master head `fe14c977`. PR #363 Option E added a
+ * JVM-only `expect/actual` `HangDiagnostic` seam (60-second wall-clock
+ * watchdog dumping `DebugProbes.dumpCoroutines()` +
+ * `Thread.getAllStackTraces()` to stderr) and captured 54 dumps
+ * across the 30-min job timeout on head `5ff972f9`.
+ *
+ * What the dump showed on `r12_body_timeout_after_headers_accounts_toward_breaker`:
+ *
+ *   - `coroutine#113` (the `pollJob = scope.launch { pollLoop() }`
+ *     from `RestFallbackOrchestrator.kt:1502`) caught state `RUNNING`
+ *     at `pollLoop:1568` or `pollLoop:1570` on every fire.
+ *   - `_breakerTimerJob` coroutines (spawned inside
+ *     `transitionToOpenUnderMutex()` — `scope.launch { delay(cooldownMs);
+ *     withLock { ... } }` at line 2618) regenerated at ~6,400 launches
+ *     per second real time. Over the 30-minute cancelled run
+ *     ≈ 11.5 million timer coroutines were created.
+ *   - Test worker thread state `RUNNABLE`, spinning inside
+ *     `TestCoroutineScheduler.advanceUntilIdleOr`.
+ *
+ * Static code read (see `C:/temp/body-timeout-hang-dump-2026-07-03/SUMMARY.md`
+ * for full walk):
+ *
+ *   - The `pollLoop` / `wsActivePollLoop` / `aliveTickLoop` while-conditions
+ *     read `while (scope.isActive)` where `scope` is
+ *     `CoroutineScope(SupervisorJob() + dispatcher)` — the `SupervisorJob()`
+ *     has NO parent, so `pollJob.cancel()` from `onModeChanged(WsActive)`
+ *     or from `stop()` cancels the pollJob child only. `scope.isActive`
+ *     therefore stays `true` even when the current coroutine has been
+ *     cancelled; the loops rely solely on `delay(...)` throwing
+ *     `CancellationException` as their cancellation-exit path.
+ *   - This is a stale-invariant bug regardless of the CI hang: correct
+ *     cancellation semantics require reading the CURRENT coroutine's
+ *     own Job via `currentCoroutineContext().isActive`.
+ *
+ * This PR:
+ *
+ *   1. Replaces `while (scope.isActive)` →
+ *      `while (currentCoroutineContext().isActive)` in
+ *      `RestFallbackOrchestrator.pollLoop`, `wsActivePollLoop`,
+ *      `aliveTickLoop`. No other production code change.
+ *   2. Removes this class-level `@kotlin.test.Ignore`.
+ *
+ * If Ubuntu CI now passes 6/6 cells, the `scope.isActive` bug WAS the
+ * root cause (or a sufficient trigger) and the quarantine is genuinely
+ * closed. This PR merges; PR #363 closes without merge.
+ *
+ * If Ubuntu CI still hangs, the `scope.isActive` fix is still correct
+ * (it removes the stale cancellation invariant) but is not by itself
+ * sufficient. In that case: this PR does NOT merge as a CI-fix; the
+ * three-line orchestrator change gets extracted to a smaller follow-up
+ * PR, and the diagnostic goes to Path Y (richer instrumentation:
+ * `_breakerFailCount` + `_breakerState` + `_breakerCurrentCooldownMs`
+ * + `_breakerEpoch` + pollLoop iteration counter dumped inside the
+ * watchdog fire).
  * ─────────────────────────────────────────────────────────────────
  */
-@kotlin.test.Ignore
 class BodyTimeoutContractTest {
 
     private val IDENTITY: String = "aa".repeat(32)
