@@ -598,6 +598,32 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-07-04 · DIRECT-WSS-MODE2-B2-LTE-RECON1 §12 Fable 5 architectural review + K10 → K9 → K8 sequencing (follow-up to PR #366)
+
+**Goal.** Land the Fable 5 external architectural review pass on `direct-wss-mode2-b2-lte-recon1.md` as a durable §12 amendment. The review received the §11 Run 1 evidence closure (PR #366 `0c92d1df`) + the constraints from `C:\temp\b2-k1-k4-recon-2026-07-04\fable5-fix-family-prompt.md` and returned a ranked fix-family recommendation + two evidence-weight findings that reshape §4 and §5. This closure captures both without opening a fix-track scope-lock — that stays behind K10 + K9 + K8 gates per §12 sequencing.
+
+**Outcome.** §4 causal hypothesis renamed `H-B2-WS-Frames-Blocked-Post-Upgrade` → **`H-B2-WS-Uplink-Frames-Blocked-Post-Upgrade`** with an explicit "downlink UNDETERMINED, pending B2-K9" clause (Fable 5 Finding 2). §5 adds three new diagnostic instruments: **B2-K8** (client-driven short-poll hold-threshold discrimination), **B2-K9** (WS server-initiated downlink probe), **B2-K10** (Caddy regression audit). §6 adds **PASS-E** acceptance gate for the post-K8 short-poll fix-candidate path (G1-G4). §9 adds calls-media (WebRTC / TURN) on Tele2 as an explicit "does NOT decide" item — future track candidate. **New §12** section captures Fable 5 review verbatim highlights: two evidence-weight findings (temporal contradiction with 2026-06-17 voice PASS + WS uplink-vs-bidirectional gap), ranked top-3 (short-poll #1, LTE route policy #2, alt-endpoint recon #3), ranked-out candidates (Reality parked / QUIC probe-only / TURN-only rejected as standalone), required K-instrument sequencing (**K10 → K9 → K8 → fix-track**), open questions carried forward, and a rollout pointer (rollout order is informational only; the actual scope-lock is authored by the future fix-track mini-lock, not by §12).
+
+**Ranked fix-family per Fable 5 (informational; no scope-lock).** №1: client-driven short-hold poll (`/relay/poll?hold=N`, client-side, relay honours without server-side network detection; Matrix `/sync?timeout=` prior art). №2: client-side network-class route policy layered atop №1. №3: alt-endpoint / SNI / TLS-profile recon on a second VPS in a different ASN. Rejected: Reality (Arm G park), QUIC / H3 (deserves 1-day probe only), TURN-only (violates Constraint 1 — doesn't cover text).
+
+**Required K-instrument sequencing.** Load-bearing per §12 Findings 1 + 2:
+
+- **B2-K10** — Caddy regression audit (`phantom-caddy` image + Caddyfile `flush_interval` diff between 2026-06-17 voice PASS and 2026-07-04 Run 1). Zero-field, ~15-30 min desk audit. If a Caddy regression fell between those two dates, the REST plane of `FAIL-Wider-Issue` retracts.
+- **B2-K9** — WS server-initiated downlink probe. Relay in diagnostic mode emits an unsolicited Ping or small data frame from the server side immediately after WS Upgrade completes. Closes the uplink-vs-bidirectional gap in `H-B2-WS-Uplink-Frames-Blocked-Post-Upgrade`.
+- **B2-K8** — hold-threshold discrimination matrix (`hold ∈ {0, 2, 5, 10, 20, 30}` seconds × ~10-15 min per step) on the same Run 1 stand. Diagnostic-only; both relay-side param and client-side knob behind debug flags. Gate PASS-E if G1 (`hold=0` produces ≥ 95 % `body_eof=1`, zero `InterruptedIOException`, breaker stays in first tier) + G2 (emu → Tecno delivery lands) + G3 (threshold-curve data captured) + G4 (voice blob download PASSes).
+
+**Fix-track mini-lock opens only after B2-K8 PASS-E lands.** If G1 fails at `hold=0`, verdict hardens to "Tele2 breaks even short GET responses" and rank re-orders toward Fable 5's #3 + QUIC reachability probe. Fable 5's ranked list is an INPUT to the future fix-track's own facts-first scope-lock, not a substitute for it.
+
+**Open questions carried forward.** (1) Caddy image / config diff 06-17 vs 07-04 (closed by K10). (2) Setup context of 06-17 voice PASS (same SIM / cell / tariff / relay digest as Run 1?). (3) FCM push status on Tecno / Tele2. (4) Calls media (WebRTC / TURN) on Tele2 — known unknown, not covered by short-poll. (5) `conn_id ↔ poll_call` 9 vs 25 reconciliation — belongs to the future fix-track's idempotency-gate design, not to B2 verdict closure.
+
+**What this closure ships (docs-only).** `docs/tracks/direct-wss-mode2-b2-lte-recon1.md`: §4 rename + downlink UNDETERMINED clause; §5 adds K8 / K9 / K10; §6 adds PASS-E; §9 adds calls media out-of-scope; new §12 "Fable 5 architectural review + follow-up K-instrument sequencing" (~120 lines). `docs/PROJECT_LOG.md`: this entry above the §11 Run 1 evidence closure entry from earlier the same day. `docs/project/MASTER_TIMELINE_2026.md`: new entry for this PR.
+
+**What this closure does NOT change.** No code change. Not a fix-track scope-lock (§3 restated; §12 restates). Not an override of Fable 5's ranking — the future fix-track's own mini-lock re-derives it from evidence in force at that time. No change to `direct-wss-mode2-recon1.md` §11 release / rollout gate. No re-open of PR #330. No invalidation of B1 Wi-Fi closure. Release-flag posture unchanged.
+
+**In-force lineage.** All prior lineage from the previous same-day entry stays in force. Additionally: B2 §11 Run 1 evidence closure (PR #366 `0c92d1df`) + Fable 5 external review (this closure).
+
+**Verification.** No build change to verify. Docs-only. Voice + Cyrillic + future-date hygiene grep on diff clean.
+
 ### 2026-07-04 · DIRECT-WSS-MODE2-B2-LTE-RECON1 §11 Run 1 evidence closure — K1 + K4-natural + K6 → FAIL-Wider-Issue verdict candidate
 
 **Goal.** Close the B2 mini-lock's first-deliverable evidence loop from `direct-wss-mode2-b2-lte-recon1.md` §7 with the K1 + K4-natural + K6 corpus, and amend §4 hypothesis matrix with the verdicts the evidence supports. Not a fix-track scope-lock; the mini-lock explicitly forbids that in §3. Facts-first per WORKING_RULES rule 3.
