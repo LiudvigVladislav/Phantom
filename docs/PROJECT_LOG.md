@@ -598,6 +598,45 @@ Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above
 when an entry mentions a rejected approach.
 
+### 2026-07-04 · DIRECT-WSS-MODE2-B2-LTE-RECON1 §11 Run 1 evidence closure — K1 + K4-natural + K6 → FAIL-Wider-Issue verdict candidate
+
+**Goal.** Close the B2 mini-lock's first-deliverable evidence loop from `direct-wss-mode2-b2-lte-recon1.md` §7 with the K1 + K4-natural + K6 corpus, and amend §4 hypothesis matrix with the verdicts the evidence supports. Not a fix-track scope-lock; the mini-lock explicitly forbids that in §3. Facts-first per WORKING_RULES rule 3.
+
+**Outcome.** §4 amended: **`H-B2-WS-Frames-Blocked-Post-Upgrade`** added as a NEW causal candidate (STRONGLY SUPPORTED); **`H-B2-Config-Mismatch`** REFUTED; **`H-B2-Carrier-NAT-Idle`** / **`H-B2-Byte-Freeze`** / **`H-B2-Age-Kill`** REFUTED as sole causes; **`H-B2-Doze-OEM`** UNSUPPORTED; **`H-B2-REST-Survives-WSS-Fails`** REFUTED; **`H-B2-REST-LongPoll-Separate-Fault`** SUPPORTED; **`H-B2-Both-Fail`** SUPPORTED (main fault-scope verdict). §11 evidence-closure section added with per-run data + durable-artefact pointers. §6 verdict candidate = **`FAIL-Wider-Issue`**.
+
+**Run 1 window.** `2026-07-04T12:09:28Z → 12:58:00Z UTC`. Tecno BF7-12 on Tele2 LTE, emu peer on Wi-Fi. APK from master `7207593b` debug build (`sha256 fa77a24e177167bb98f1f72e66db2ba688d3c774e1c3e49ae736f87b79ecf6c9`). Release-flag posture unchanged.
+
+**K1 — WSS baseline.** 89 WSS `session_summary` records on Tecno client-side during the 45-min soak. Every record: `duration_ms ≈ 31000`, `pings_sent=0` (app-level dead counter — real OkHttp Ping fires per the `thrown` message body), `pongs_received=0`, `inbound_frames=0`, `okhttp_successful_ping_pongs=0`, `since_last_pong_ms=-1`, `thrown='SocketTimeoutException: sent ping but didn't receive pong within 15000ms (after 0 successful ping/pongs)'`. Rhythm: WS Upgrade → OkHttp WS Ping at 15 s → 15 s wait for Pong → timeout at ~30 s → close → reconnect, 89 iterations.
+
+**K4-natural — REST long-poll.** Mode switch to REST fired at `12:10:59.962` (90 s into soak). 9 × `REST_TRACE poll_call`, 9 × `REST_TRACE poll_fail reason=InterruptedIOException elapsedMs=~35025`, 100 % failure at ~35 s. Body arrival on Tecno: `body_chunk=95`, `body_eof=0`. Breaker cascades 21 × through cooldown ceiling.
+
+**K6 — relay-side discrimination (smoking gun).** SSH from Windows PowerShell to `phantom-relay-01` (Git Bash's key set rejected — used PowerShell's ssh-agent-registered key). Pulled 4 slices via `docker logs --timestamps --since ... --until ...`: `phantom-relay-full-window.log` (943 lines), `phantom-relay-tecno.log` (297 lines, filtered on identity prefix `d95a9d5a3fc31afd`), `phantom-caddy-full-window.log` (617 lines), `phantom-caddy-tecno-endpoints.log` (447 lines). **WS side:** relay recorded 84 Tecno `event="session_summary"` records; every single one shows `pings_received=0 pongs_sent=0 inbound_frames=0 outbound_frames=0 echo_frames_received=0 echo_frames_sent=0 close_origin="error" close_code=0 close_error="ws_read: WebSocket protocol error: Connection reset without closing handshake" duration_ms ≈ 153000` (one outlier at 1 025 580 ms). Cross-reference: **0 hits** on `ws_protocol_ping_received` OR `ws_protocol_pong_sent` across all 92 Tecno `conn_id` values in the full-window log (marker fires 440 times for other users in the same window at the same relay). Delta 31 s (client) vs 153 s (relay) reconciled: client OkHttp fires at its 30 s ping-timeout; relay's `ws_read` remains blocked ~120 s more until the underlying TCP flow expires (Linux keepalive or Tele2 carrier drops the flow) and returns a raw RST from below. **REST side (supporting, not fully dug):** Caddy access log records Tecno `/relay/poll` as HTTP `200`, `Content-Length: 4608`, `duration: 30.9 s`; relay emits 25 × `event="rest_poll_returned"` for Tecno (vs client's 9 `poll_call` — volume reconciliation deferred). Emu → Tecno delivery-exercise message `5cc3e70b` appears in one `rest_poll_returned` with `envelope_id=5cc3e70b more=true chunked_flush=true` — relay tried to deliver, Tecno never processed.
+
+**Interpretation.** Something between Tecno's uplink and the relay's `ws_read` loop drops or fails to route ALL WebSocket application-layer frames from Tecno after the WS Upgrade handshake succeeds. NOT selective for the WS Ping opcode — 0 frames of ANY opcode observed relay-side. Broader than the informal "Control-Frame-Filter" placeholder from `run1-analysis.md`; renamed `H-B2-WS-Frames-Blocked-Post-Upgrade` in the §4 amendment.
+
+**Durable evidence bundle at `C:\temp\b2-k1-k4-recon-2026-07-04\`:**
+- `run1-analysis.md` (client-side reconstruction, 122 lines)
+- `k6-analysis.md` (relay-side discrimination, 161 lines)
+- `k6-stage/` (raw relay-side log slices, 4 files, ~1.6 MB total)
+- `b2-k1-k4-run.sh` (runner patched for two script bugs found during Run 1 — regex `to=RestActive` widened to `to=(RestActive|REST_ACTIVE)` for SCREAMING_SNAKE log-writer output; `grep -c ... || echo 0` multi-line quirk replaced with `count_matches()` helper. Neither bug affected substantive findings; coarse verdict bucket manually corrected to `OBSERVED_WSS_FAILED_REST_ALSO_STRUGGLED`.)
+
+**What this closure ships.** Docs-only. `docs/tracks/direct-wss-mode2-b2-lte-recon1.md` §4 hypothesis matrix amended inline with per-hypothesis verdicts (bold-marked citations to §11). New §11 "Run 1 evidence closure" section (~80 lines) containing per-K1/K4/K6 evidence + main verdict + hypothesis-matrix delta + explicit "what this closure does NOT do" fence + fix-family pointers for a later architectural review. `docs/PROJECT_LOG.md` new session-journal entry (this one). `docs/project/MASTER_TIMELINE_2026.md` new entry + backfill of previously-`#TBD` B2 mini-lock entry to `#365 7207593b`.
+
+**What this closure does NOT do.**
+- Not a fix-track scope-lock. Mini-lock §3 explicitly forbids that; §11 restates.
+- Not a locator of the specific carrier / middlebox component. Simultaneous packet capture at both endpoints would be required, and that is beyond B2's remit.
+- Not a change to `direct-wss-mode2-recon1.md` §11 release / rollout gate. LTE rollout gate stays in force.
+- Not a re-open of PR #330 (closed superseded 2026-07-04).
+- Not an invalidation of B1's Wi-Fi closure (different network class, different failure surface).
+
+**Next step (operator-locked).** Prepare a canonical prompt for an architectural review pass (Fable 5 / council) that receives Run 1 evidence + constraints and produces a ranked fix-family recommendation covering the whole Direct WSS realtime surface (text messages + voice notes + calls + delivery / ack + reconnect / route-change + push / fallback). The follow-on fix-track mini-lock opens only after (2) is on record. Prompt authorship in progress at `C:\temp\b2-k1-k4-recon-2026-07-04\fable5-fix-family-prompt.md`.
+
+**Non-blocking follow-ups (unchanged).** `smoke-run.sh` delivery-invariant fix already landed 2026-07-04 (see `C:\temp\wi-fi-smoke-mc-pass-2026-07-01\INVARIANT-FIX-2026-07-04.md`). `§4.3 P3 regex hardening` still deferred from PR #360 Round 4 revert.
+
+**In-force lineage.** L1 mini-lock + MB half (PR #353 `ed3406eb`) + MC-1 (PR #358 `91745acd`) + MC-2 (PR #359 `7bcf2d04`) + MC-3 (PR #360 `fd435c93`) + B1 closure (PR #361 `fe14c977`) + PR #364 (`bbf0cfff`) + B2 mini-lock (PR #365 `7207593b`) all in force. Methodology recon (PR #349 `54f2e50d`) stays Closed with verdict H-ME. `direct-wss-mode2-recon1.md` §11 amendment (parent) unchanged.
+
+**Verification.** No build change to verify. Docs-only. Voice + Cyrillic + future-date hygiene grep on diff clean.
+
 ### 2026-07-04 · DIRECT-WSS-MODE2-B2-LTE-RECON1 mini-lock opened + Track C (BodyTimeoutContractTest unquarantine) + Track A (PR #330 close-out)
 
 **Goal.** Close the transport-track batch that opened after B1 landed on 2026-07-02: (a) unquarantine `BodyTimeoutContractTest` on `commonTest` after PR #360 MC-3 Round 6 quarantined it against a CI Ubuntu 30-minute-job hang, (b) administratively close PR #330 as superseded by MC-1/2/3 + PR #364, (c) open the B2 Tele2 LTE delivery-blocker recon mini-lock as the next facts-first product-track. Each of (a) / (b) / (c) is on its own scope; combining them here as one session-journal entry only for calendar-day durability.
