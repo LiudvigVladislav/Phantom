@@ -206,6 +206,46 @@ pub struct RelayConfig {
     /// bytes — the `Clone` derive on `RelayConfig` becomes refcount work
     /// rather than a memcpy of secret material.
     pub seq_mac_key: Arc<SeqMacRootKey>,
+
+    // ── B2-K9 WS downlink probe (DIRECT-WSS-MODE2-B2-LTE-RECON1 §5) ───────────
+
+    /// When `true`, `handle_socket` sends an unsolicited WebSocket Ping
+    /// frame (opcode 0x9, empty payload) immediately after WS Upgrade
+    /// completes — before the envelope re-flush loop — and, on the paired
+    /// receive side, splits the previously-generic `Some(Ok(_))` catch-all
+    /// so client Pong frames land in an explicit `Message::Pong(_)` arm that
+    /// emits `event="ws_diag_downlink_probe_pong_observed"` at most once per
+    /// session.
+    ///
+    /// Purpose: discriminate WS uplink-only failure from bidirectional
+    /// failure on Tele2 LTE per B2-K9 (see
+    /// `docs/tracks/direct-wss-mode2-b2-lte-recon1.md` §5). K9 answers
+    /// whether relay-initiated frames survive downlink even when
+    /// client-initiated frames do not survive uplink per B2 §11 K6.
+    ///
+    /// Default `false`. Set by env var `RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED=1`
+    /// exactly; any other value (including `"true"` / `"yes"` / empty / unset)
+    /// fails closed. Same strict-parse discipline as
+    /// `heartbeat_echo_enabled` / `slow_post_diag_enabled` / `t2_diag_enabled`
+    /// / `poll_chunked_flush`.
+    ///
+    /// This is a diagnostic path only. There is no fix-track scope-lock
+    /// associated with this flag. The flag is intended to be turned on for
+    /// a bounded operator-scheduled recon window (~15-30 min) and then
+    /// turned off; docker-compose.yml in the git-tracked repo does NOT
+    /// ship the env var.
+    ///
+    /// Locked design in `C:\temp\b2-k1-k4-recon-2026-07-04\k9-design-note.md`.
+    pub diag_ws_k9_downlink_probe_enabled: bool,
+}
+
+/// Strict-parse helper for `RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED`.
+/// Exposed at module scope so the parse contract can be pinned by unit
+/// tests without touching process env vars (which race under parallel
+/// cargo tests). `None` → `false` (unset), `Some("1")` → `true`, every
+/// other value → `false` (`"true"`, `"yes"`, `"0"`, empty, whitespace).
+fn parse_k9_diag_probe_flag(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
 }
 
 impl RelayConfig {
@@ -255,6 +295,10 @@ impl RelayConfig {
             // value; this default of `[0u8; 32]` is the universal
             // "no real secret" placeholder.
             seq_mac_key: Arc::new(SeqMacRootKey::from_bytes([0u8; 32])),
+            // B2-K9 WS downlink probe off in tests by default; tests that
+            // exercise the probe path construct a config with this set to
+            // `true`.
+            diag_ws_k9_downlink_probe_enabled: false,
         }
     }
 
@@ -356,6 +400,17 @@ impl RelayConfig {
             // Generate with `openssl rand -hex 32` and provision in the
             // VPS `.env` BEFORE redeploying the Stage 1.x relay image.
             seq_mac_key: Arc::new(load_seq_mac_root_key_from_env()),
+            // B2-K9 WS downlink probe: strict `"1"` parse, fails closed on
+            // any other value. Mirrors heartbeat_echo_enabled /
+            // slow_post_diag_enabled / t2_diag_enabled / poll_chunked_flush
+            // gate pattern. Route via the pure helper `parse_k9_diag_probe_flag`
+            // so the parse contract is unit-testable without touching
+            // process env vars.
+            diag_ws_k9_downlink_probe_enabled: parse_k9_diag_probe_flag(
+                std::env::var("RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
         }
     }
 }
@@ -480,11 +535,57 @@ impl std::fmt::Debug for RelayConfig {
             .field("t2_diag_enabled", &self.t2_diag_enabled)
             .field("poll_chunked_flush", &self.poll_chunked_flush)
             .field("poll_hold_secs", &self.poll_hold_secs)
+            .field(
+                "diag_ws_k9_downlink_probe_enabled",
+                &self.diag_ws_k9_downlink_probe_enabled,
+            )
             // `seq_mac_key` carries its own `[REDACTED]` Debug impl from
             // `SeqMacRootKey`, but we still elide the wrapping `Arc` here
             // so a stray operator never sees the field in startup logs
             // even if the inner impl ever changed.
             .field("seq_mac_key", &"[REDACTED]")
             .finish()
+    }
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B2-K9 — pins the strict-`"1"` parse contract for the K9 diagnostic
+    // flag. Uses the pure helper so the test does NOT touch process env
+    // vars (which race under parallel cargo tests) and does NOT need
+    // `serial_test` scaffolding. If a future refactor changes the parse
+    // behaviour of the flag, this test catches it.
+
+    #[test]
+    fn k9_diag_probe_flag_defaults_off_when_env_absent() {
+        assert!(!parse_k9_diag_probe_flag(None));
+    }
+
+    #[test]
+    fn k9_diag_probe_flag_off_when_env_is_zero() {
+        assert!(!parse_k9_diag_probe_flag(Some("0")));
+    }
+
+    #[test]
+    fn k9_diag_probe_flag_on_when_env_is_one() {
+        assert!(parse_k9_diag_probe_flag(Some("1")));
+    }
+
+    #[test]
+    fn k9_diag_probe_flag_off_for_common_truthy_lookalikes() {
+        // `"true"` / `"yes"` / capitalisations / whitespace are all silent
+        // false — same discipline as heartbeat_echo_enabled et al. If an
+        // operator typos the env var value, the diagnostic stays off.
+        for v in ["", " ", "true", "TRUE", "yes", "on", "1 ", " 1", "1\n"] {
+            assert!(
+                !parse_k9_diag_probe_flag(Some(v)),
+                "expected {:?} → false under strict-1 parse",
+                v
+            );
+        }
     }
 }

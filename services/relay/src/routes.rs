@@ -423,6 +423,25 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
     let mut close_reason_str: Option<String> = None;
     let mut close_error_str: Option<String> = None;
 
+    // B2-K9 diagnostic (docs/tracks/direct-wss-mode2-b2-lte-recon1.md §5,
+    // C:\temp\b2-k1-k4-recon-2026-07-04\k9-design-note.md). Per-session
+    // state used by the K9 downlink probe. Both fields stay at their
+    // default values on every session unless `state.config.diag_ws_k9_
+    // downlink_probe_enabled == true` at process start; when the flag is
+    // off, the two per-session locals cost one bool + one Option<u128>
+    // stack slot each and are never read after initialisation.
+    //
+    //   • `k9_probe_sent_ts_ms` — `Some(ts)` once the send site below has
+    //      successfully written the diagnostic Ping frame. Read by the
+    //      explicit `Message::Pong(_)` arm further down to compute
+    //      `elapsed_ms_since_probe_sent`.
+    //   • `k9_pong_observed_this_session` — one-shot latch preventing
+    //      the pong-observed marker from firing more than once per
+    //      session (a client that Pings us multiple times would emit
+    //      multiple Pongs; K9's verdict cares only about the first one).
+    let mut k9_probe_sent_ts_ms: Option<u128> = None;
+    let mut k9_pong_observed_this_session: bool = false;
+
     // Helper to compute UNIX-epoch ms at the moment a frame is observed.
     // Cheaper than `Instant::now()` for the "wall-clock per-frame timestamp"
     // use case because we only call it on event-loop wakeups, not in any
@@ -446,6 +465,52 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
             ts_ms   = ts,
             "metadata"
         );
+
+        // B2-K9 diagnostic — WS downlink probe. Gated by env-var
+        // `RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED=1` at process start.
+        // When off (default), this block is one boolean read and no work.
+        //
+        // When on: send exactly one server-initiated WebSocket Ping
+        // (opcode 0x9) with empty payload BEFORE the envelope re-flush
+        // loop, so K9 tests the "first server → client frame after WS
+        // Upgrade" surface. Standard-compliant clients auto-respond with
+        // Pong (0xA); the pong observation is logged separately from the
+        // explicit `Message::Pong(_)` arm inside the read loop below,
+        // completing the round-trip verdict from server logs alone.
+        //
+        // Locked design in `C:\temp\b2-k1-k4-recon-2026-07-04\k9-design-note.md`.
+        if state.config.diag_ws_k9_downlink_probe_enabled {
+            let probe_payload: Vec<u8> = Vec::new();
+            let probe_ts = now_ms();
+            match socket.send(Message::Ping(probe_payload.clone().into())).await {
+                Ok(_) => {
+                    outbound_frames += 1;
+                    k9_probe_sent_ts_ms = Some(probe_ts);
+                    tracing::info!(
+                        event        = "ws_diag_downlink_probe_sent",
+                        conn_id      = conn_id,
+                        key          = %&identity[..identity.len().min(16)],
+                        ts_ms        = probe_ts,
+                        payload_kind = "ping",
+                        payload_len  = probe_payload.len(),
+                        send_result  = "ok",
+                        "diag"
+                    );
+                }
+                Err(e) => {
+                    // k9_probe_sent_ts_ms stays None — the receive arm
+                    // will not fire the pong-observed marker for a session
+                    // where the send never got out on the wire.
+                    tracing::warn!(
+                        event       = "ws_diag_downlink_probe_sent",
+                        conn_id     = conn_id,
+                        ts_ms       = probe_ts,
+                        send_result = %format!("err:{}", e),
+                        "diag"
+                    );
+                }
+            }
+        }
 
         // Re-flush every envelope the store still holds for this recipient.
         // We deliberately do NOT drain the queue here — envelopes stay in the
@@ -727,9 +792,47 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
                         }
                         break;
                     }
+                    Some(Ok(Message::Pong(_payload))) => {
+                        // Explicit Pong arm split out from the previously-
+                        // generic `Some(Ok(_))` catch-all so B2-K9 can
+                        // record client Pong arrival while the K9 downlink
+                        // probe flag is on. The pre-existing accounting
+                        // (`inbound_frames + last_inbound_at_ms`) is
+                        // preserved byte-for-byte from the old catch-all
+                        // so any grepped-log invariant that depended on
+                        // Pongs bumping `inbound_frames` still holds.
+                        inbound_frames += 1;
+                        last_inbound_at_ms = now_ms();
+                        // K9 pong-observed marker — fires AT MOST once per
+                        // session AND only when the send site above
+                        // successfully wrote the probe Ping (so
+                        // `k9_probe_sent_ts_ms.is_some()`). This ensures a
+                        // Pong that arrives on a session where the K9 flag
+                        // is off, OR where the probe send failed, does not
+                        // count toward the K9 verdict.
+                        if state.config.diag_ws_k9_downlink_probe_enabled
+                            && !k9_pong_observed_this_session
+                        {
+                            if let Some(probe_ts) = k9_probe_sent_ts_ms {
+                                k9_pong_observed_this_session = true;
+                                let now = now_ms();
+                                let elapsed = (now as i128 - probe_ts as i128) as i64;
+                                tracing::info!(
+                                    event   = "ws_diag_downlink_probe_pong_observed",
+                                    conn_id = conn_id,
+                                    key     = %&identity[..identity.len().min(16)],
+                                    ts_ms   = now,
+                                    elapsed_ms_since_probe_sent = elapsed,
+                                    "diag"
+                                );
+                            }
+                        }
+                    }
                     Some(Ok(_)) => {
-                        // Pong/Binary: ignored payload-wise but still
-                        // counts as inbound activity.
+                        // Binary (and any future opcodes the WS library
+                        // may add): ignored payload-wise but still counts
+                        // as inbound activity. Pong was moved to its own
+                        // explicit arm above so B2-K9 can hook into it.
                         inbound_frames += 1;
                         last_inbound_at_ms = now_ms();
                     }
