@@ -377,9 +377,17 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         // negotiated hold time short.
         val effectiveReadMs = readTimeoutOverrideMs ?: readTimeoutMs
         val effectiveCallMs = if (readTimeoutOverrideMs != null) readTimeoutOverrideMs else callTimeoutMs
+        // ConnectionPool is captured in a local so the B2-K8
+        // Connection: close interceptor (below) can call
+        // `pool.evictAll()` after every response is returned. The
+        // existing `ConnectionPool(0, 1ms)` config makes eviction
+        // largely redundant on healthy calls, but the K8 diagnostic
+        // wants deterministic teardown independent of pool config
+        // drift for the recon window.
+        val pool = ConnectionPool(0, 1, TimeUnit.MILLISECONDS)
         return OkHttpClient.Builder()
             .protocols(listOf(Protocol.HTTP_1_1))
-            .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
+            .connectionPool(pool)
             .retryOnConnectionFailure(false)
             .callTimeout(effectiveCallMs, TimeUnit.MILLISECONDS)
             .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
@@ -446,6 +454,39 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
                             correlationKey = correlationKey,
                         ),
                     )
+                }
+            }
+            .also { builder ->
+                // B2-K8 diagnostic — Connection: close + evictAll()
+                // interceptor. Attached ONLY when both conditions
+                // hold:
+                //   (1) op == "poll" — narrow scope; send / ack /
+                //       auth clients unaffected regardless of the
+                //       K8 provider.
+                //   (2) k8ConnectionCloseProvider?.invoke() == true —
+                //       resolves to shared-prefs first, then
+                //       BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1".
+                //       Release APK hardpins the BuildConfig to "0"
+                //       AND the Settings-Diagnostics UI that would
+                //       flip the prefs key is absent from the release
+                //       compilation unit, so the provider returns
+                //       `false` in release builds and the interceptor
+                //       is never constructed. R8 dead-code eliminates
+                //       the K8DebugConnectionCloseInterceptor class
+                //       entirely from release (verified by
+                //       verifyR8StripsTestSeams deny-list entry
+                //       `K8Debug.*` in checkpoint 6).
+                //
+                // Interaction with buildPollRequest():
+                // buildPollRequest already sets the `Connection: close`
+                // header on /relay/poll — the interceptor overwrites
+                // (does not append) so duplication is harmless. The
+                // distinguishing behaviour is the post-response
+                // `pool.evictAll()` call, guaranteeing the next poll
+                // opens a fresh TCP+TLS connection independently of
+                // ConnectionPool config drift.
+                if (op == "poll" && k8ConnectionCloseProvider?.invoke() == true) {
+                    builder.addInterceptor(K8DebugConnectionCloseInterceptor(pool))
                 }
             }
             .build()
