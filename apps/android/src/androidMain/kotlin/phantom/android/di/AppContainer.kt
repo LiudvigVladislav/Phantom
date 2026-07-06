@@ -1285,6 +1285,48 @@ class AppContainer(private val context: Context) {
                     as? phantom.core.transport.ManagerState.Connected)?.kind
             }
 
+            // B2-K8 client-side hold-override diagnostic providers
+            // (design note §2.3 + §3.1, 2026-07-06). Read shared-prefs
+            // at each `/relay/poll` request build so the operator can
+            // change the hold value between polls in the runner without
+            // rebuilding the APK.
+            //
+            // The read is inline (no reference to `K8HoldOverride`
+            // which lives in `apps/android/src/debug/kotlin`) because
+            // AppContainer is `androidMain` and cannot import from the
+            // debug source set. The K8HoldOverride helper still exists
+            // for test-callable resolver logic (the pure
+            // `resolveHoldOverride` function) and future
+            // Settings-Diagnostics UI mounting.
+            //
+            // Prefs file `phantom_prefs` is the app-wide shared
+            // preferences container (existing: ADR-020 privacy-mode,
+            // last-working-transport hint, chat-list UI state,
+            // `debug_media_chunk_size`); adding a new file for K8
+            // alone would introduce a storage abstraction the
+            // codebase does not otherwise use.
+            val k8Prefs: android.content.SharedPreferences =
+                context.getSharedPreferences(
+                    "phantom_prefs",
+                    android.content.Context.MODE_PRIVATE,
+                )
+            val k8HoldOverrideProvider: () -> Int = {
+                val prefsValue = k8Prefs.getInt("debug_k8_hold_override_seconds", -1)
+                if (prefsValue != -1) {
+                    prefsValue
+                } else {
+                    phantom.android.BuildConfig.DEBUG_K8_HOLD_OVERRIDE_SECONDS
+                        .toIntOrNull() ?: -1
+                }
+            }
+            val k8ConnectionCloseProvider: () -> Boolean = {
+                if (k8Prefs.contains("debug_k8_connection_close")) {
+                    k8Prefs.getBoolean("debug_k8_connection_close", false)
+                } else {
+                    phantom.android.BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1"
+                }
+            }
+
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
@@ -1373,6 +1415,40 @@ class AppContainer(private val context: Context) {
                     // never fire. Mirrors the discipline of
                     // debugBodyLogging above.
                     httpPhaseLogging = phantom.android.BuildConfig.DEBUG,
+                    // B2-K8 client-side hold-override diagnostic
+                    // (design note §2.3 + §9.3, 2026-07-06). Reads at
+                    // each /relay/poll build so the operator can flip
+                    // the shared-prefs key
+                    // `debug_k8_hold_override_seconds` between polls in
+                    // the runner session without rebuilding the APK.
+                    //
+                    // Resolution order per invocation:
+                    //   (1) prefs `debug_k8_hold_override_seconds` (Int)
+                    //       — wins if present AND != -1 sentinel.
+                    //   (2) BuildConfig.DEBUG_K8_HOLD_OVERRIDE_SECONDS
+                    //       — String parsed to Int; fails safe to -1.
+                    //   (3) `-1` sentinel → the composePollUrl helper
+                    //       skips the `?hold` param and the URL is
+                    //       byte-identical to pre-K8.
+                    //
+                    // Release APK hardpins DEBUG_K8_HOLD_OVERRIDE_SECONDS
+                    // = "-1" and the Settings-Diagnostics UI that would
+                    // set the prefs key is absent from the release
+                    // compilation unit — R8 dead-code-eliminates the
+                    // K8HoldOverride helper. Companion to relay PR
+                    // #370 squash c5e077db; without the relay-side env
+                    // `RELAY_DIAG_WS_K8_CLIENT_HOLD_OVERRIDE_ENABLED=1`,
+                    // the relay ignores `?hold=N` (server-side gate).
+                    k8HoldOverrideProvider = k8HoldOverrideProvider,
+                    // B2-K8 companion — Connection: close interceptor
+                    // + connectionPool.evictAll() gate. Same read-per
+                    // -invocation discipline; production wiring reads
+                    // `debug_k8_connection_close` (Boolean) from
+                    // `phantom_prefs` first, then falls back to
+                    // BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1".
+                    // Narrow scope to op == "poll" only — send / ack
+                    // / auth OkHttp clients unaffected.
+                    k8ConnectionCloseProvider = k8ConnectionCloseProvider,
                 ),
                 log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
                 onModeSwitched = { _, _, reason ->
