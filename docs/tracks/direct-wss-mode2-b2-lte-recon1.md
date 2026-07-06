@@ -60,7 +60,8 @@ The hypotheses split into two levels. Levels are orthogonal: a session's verdict
 - **H-B2-Age-Kill** — Carrier or intermediate middlebox explicitly terminates long-lived connections by age, independent of traffic pattern or byte volume. Discriminator: does the same failure fire at a fixed wall-clock age across independent B2-K1 sessions with different byte / ping profiles? — **REFUTED as sole cause per §11 K1.** Sessions die at ~31 s of client wall clock (OkHttp ping-timeout), not at an age threshold; every session across 89 iterations dies at the same ~31 s regardless of position in the soak.
 - **H-B2-Doze-OEM** — Tecno / Android Doze-mode standby OR Tecno-specific OEM battery-management kill sockets / coroutine timers / process background when the screen goes off or the app moves to background. Client-side cause; carrier not involved. Discriminator: B2-K5 matrix (screen-on / screen-off / battery-optimisation-on / battery-optimisation-off) — does failure reproduce only under specific screen-state combinations? — **UNSUPPORTED per §11 K1 shape.** Screen ON, charger plugged in, `phantom.android` on battery-optimisation whitelist throughout the soak; failure is uniform across the whole soak, not gated on any Doze-lifecycle event.
 - **H-B2-Config-Mismatch** — Client OkHttp / Ktor timeout config OR relay hold-policy config produces spurious disconnection that reads as "connection died on Tele2" but is actually a config-race artefact. Discriminator: relay-side logs + tcpdump (B2-K6) — is the observed close reason initiated by client, by relay, or by network? — **REFUTED per §11 K6.** Relay side records `close_error="Connection reset without closing handshake"` on 84/84 Tecno sessions, `close_origin="error"`. Relay is idle-blocked on `ws_read`, not initiating anything; the underlying TCP flow expires and delivers a raw reset from below.
-- **H-B2-WS-Uplink-Frames-Blocked-Post-Upgrade** — Tele2 LTE path permits the WS Upgrade handshake (TLS handshake succeeds, HTTP `Upgrade: websocket` completes, relay's `event="connect"` fires) but drops or fails to route all subsequent WebSocket application-layer frames **from Tecno's uplink direction (client → relay)** — Pings, application-data frames, Close frames. Broader than the original informal "Control-Frame-Filter" sketch: it is NOT selective for the WS Ping opcode (0x9), it is uniform for all opcodes emitted from the Tecno uplink side after the handshake completes. **Downlink direction (relay → Tecno) is UNDETERMINED by Run 1 evidence** — relay's own `outbound_frames=0` on all 84 Tecno sessions means the relay never attempted to send anything after the initial WS Upgrade, so no frame was emitted server-side to test the return path. Renamed from the earlier informal `H-B2-WS-Frames-Blocked-Post-Upgrade` after Fable 5 architectural review (§12) flagged the uplink-vs-bidirectional gap. Discriminator: relay-side observation of `inbound_frames` per session across a soak (B2-K6, already SUPPORTED); for the return-direction — B2-K9 (server-initiated downlink probe, new). — **STRONGLY SUPPORTED for uplink per §11 K6.** 0 hits on `ws_protocol_ping_received` OR `ws_protocol_pong_sent` across 92 Tecno `conn_id` values in the Run 1 window; 84/84 session_summary records show `pings_received=0 inbound_frames=0 outbound_frames=0`. Client's own `SocketTimeoutException` body asserts that OkHttp did send a Ping on the wire. **Return-path verdict pending B2-K9.**
+- **H-B2-WS-Uplink-Frames-Blocked-Post-Upgrade** — Tele2 LTE path permits the WS Upgrade handshake (TLS handshake succeeds, HTTP `Upgrade: websocket` completes, relay's `event="connect"` fires) but drops or fails to route all subsequent WebSocket application-layer frames **from Tecno's uplink direction (client → relay)** — Pings, application-data frames, Close frames. Broader than the original informal "Control-Frame-Filter" sketch: it is NOT selective for the WS Ping opcode (0x9), it is uniform for all opcodes emitted from the Tecno uplink side after the handshake completes. Renamed from the earlier informal `H-B2-WS-Frames-Blocked-Post-Upgrade` after the §12 architectural review flagged the uplink-vs-bidirectional gap. Discriminator: relay-side observation of `inbound_frames` per session across a soak (B2-K6, already SUPPORTED). — **STRONGLY SUPPORTED for uplink per §11 K6** and retained here as a COMPONENT finding. **SUPERSEDED-as-family-label per §13:** no longer the verdict-family label; the widened family label after K9 FAIL is `H-B2-WS-PostUpgrade-Frame-RoundTrip-Broken` (below).
+- **H-B2-WS-PostUpgrade-Frame-RoundTrip-Broken** — post-WS-Upgrade, at least one leg of the WS control-frame round trip (server → client Ping OR client → server Pong OR both) fails to complete across the Tele2 LTE path, breaking OkHttp's ping keep-alive and every downstream WS liveness assumption. This is the widened family label after B2-K9's FAIL verdict. Discriminator: relay-side server-initiated Ping probe (B2-K9, SUPPORTED via Run 3 cumulative). — **STRONGLY SUPPORTED per §13 K9 evidence.** Run 3 relay-side: `send_result="ok"` on 49 / 49 Tele2 socket writes; 0 / 49 `ws_diag_downlink_probe_pong_observed` on the same 49 sends. Cumulative Tele2 across Runs 1 + 3: 50 sent / 1 pong = 0.020 rate (`n = 50 ≥ 10`, rate `≤ 0.10` triggers the §5 K9 FAIL band). Emu Wi-Fi peer baseline 14 / 14 in Run 3 rules out the K9 harness itself as the cause. Explicit caveat: downlink Ping arrival on Tecno's wire is UNATTRIBUTED (OkHttp does not expose server-Ping receive as a client-side marker); downlink data frames (opcode 0x2) survive the same path is UNTESTED (K9 exercises only opcode 0x9 empty Ping). The verdict does NOT overclaim bidirectional data-frame blocking; a cheap follow-on discriminator is scoped as B2-K9b in §13. The COMPONENT hypothesis `H-B2-WS-Uplink-Frames-Blocked-Post-Upgrade` above remains STRONGLY SUPPORTED on its own K6 evidence and is preserved as the uplink leg of this widened family.
 
 ### Fault-scope hypotheses — WHICH transport is affected
 
@@ -283,3 +284,108 @@ Ranked-out candidates and why (from Fable 5's review):
 ### Where the fix-family lands after B2-K8 PASS-E (informational, not scope-locked)
 
 Fable 5's proposed rollout is captured here as a pointer only; the actual scope-lock is authored by the future fix-track mini-lock. Order of landing: (1) relay `hold` parameter (inert until any client sends `?hold=...`); (2) client flag `LTE_SHORT_POLL_ENABLED="0"` (code in master, behaviour off); (3) internal canary on Tecno / Tele2 with the flag on; (4) beta ring with `body_eof`-rate + breaker-tier telemetry; (5) prod flag-flip in a SEPARATE PR only after §11 release-rollout gate criteria are met. Rollback at any step = flag off. Existing three RC quiescence release flags stay `"0"` throughout — not touched.
+
+---
+
+## §13 B2-K9 field verdict — FAIL-K9 across Runs 1 + 3 and hypothesis widening (2026-07-06)
+
+Field execution of the B2-K9 server-initiated downlink probe against Tecno on Tele2 LTE. Relay-side instrumentation from the K9 diag-only harness landed in master `80bd6695`. Client APK unchanged from that commit. Release-flag posture per §11 unchanged (`RECONNECT_QUIESCENCE_ENABLED` / `MODE_2_FAST_PATH_ENABLED` / `MODE_2_STICKY_ENABLED` = `"0"`). K9 flag toggled ON on relay for the duration of each window and reverted immediately after.
+
+Durable evidence bundle held on the operator workstation outside the repo; the substantive artefacts referenced below are:
+
+- `k9-runs-tracker.md` — cumulative accumulator across Runs 1 + 2 + 3.
+- `k9-run-3-analysis-FAIL.md` — Run 3 relay + client reconstruction (the substantive closure artefact).
+- `k9-run-1-analysis.md` — Run 1 single-session note carried over from §12 sequencing.
+
+### Run accumulator
+
+**Run 1** — `2026-07-05T16:32:03Z → 16:55:00Z UTC`. Tecno DUT `key=d95a9d5a3fc31afd`, Emu Wi-Fi peer `key=4c12b78570d6fdd7`. Single Tele2 session (`conn_id=12`). Result: Tele2 1 sent / 1 pong (elapsed 112 ms); Emu 12 / 12 baseline. Formally INCONCLUSIVE-K9 alone (`n = 1` under the §5 `n ≥ 10` gate). Counted forward.
+
+**Run 2** — `2026-07-06T03:47:52Z → 04:11:28Z UTC`. **LOST from the K9 accumulator.** The runner script's Phase 8 (revert) executed `docker compose up -d --force-recreate` BEFORE Phase 9 (extract), destroying the old container's log stream. Relay-side K9 markers unrecoverable. Client-side observations preserved for the record (44 Tele2 sessions on Tecno, 0 `inbound_frames`, full Emu → Tecno delivery blackout) but NOT scored — the K9 pass/fail counters cannot be reconstructed without the relay log. Runner script patched (Phase 8 = extract; Phase 9 = revert) before Run 3.
+
+**Run 3** — `2026-07-06T05:53:53Z → 06:19:45Z UTC`. Patched runner ran cleanly. Result:
+
+| identity | sent (`ws_diag_downlink_probe_sent send_result="ok"`) | pong (`ws_diag_downlink_probe_pong_observed`) | rate |
+|---|---|---|---|
+| Tecno DUT `d95a9d5a3fc31afd` (Tele2 LTE) | 49 | 0 | 0.000 |
+| Emu peer `4c12b78570d6fdd7` (Wi-Fi) | 14 | 14 | 1.000 |
+| aggregate | 63 | 14 | 0.222 |
+
+The Emu peer being 14 / 14 confirms the K9 instrumentation itself is emitting and correlating markers correctly — Tecno's 49 / 0 is a network-side result, not a marker-emission bug.
+
+**Cumulative Tele2 across Runs 1 + 3 (Run 2 excluded):** 50 sent, 1 pong, cumulative rate **0.020**. `n = 50 ≥ 10`; rate `0.020 ≤ 0.10` per the §5 K9 pass/fail band. **Verdict: FAIL-K9 formal.**
+
+### Delivery-exercise outcomes in Run 3
+
+Two delivery exercises per direction, correlated across Emu / Tecno client logs and relay logs:
+
+- **Emu → Tecno** (`7fe5aba2`, `df836881`). Emu logged `relay_send_return ok=true`; relay logged `rest_send_accepted to=d95a...`. Tecno logcat recorded 0 `Received envelope` events for either message ID. Transport blackout on the Tecno inbound path — the delivery-side signature aligns with the FAIL-K9 verdict on the same session.
+- **Tecno → Emu** (`db68da1d`, `90ffb19c`). Tecno sent, relay accepted, Emu received the envelope. Emu decrypt then failed with `x3dhInitPresent=false → pending_fallback_fail → fail_mac action=hold`. This is Sprint 2b-C crypto (OPK / ratchet) territory, **NOT** a B2 transport verdict target. Logged as a side-finding against the Sprint 2b track, held out of the K9 accumulator.
+
+The same class of side-finding occurred in Run 1: message `b916012c` reached Emu ≥ 3 times but Emu's `inbound_repair_fail errorClass=OpkNotFound` blocked delivery. Sprint 2b track, not B2.
+
+### Hypothesis matrix update — narrow uplink label is no longer sufficient
+
+§12 Finding 2 renamed the family hypothesis to `H-B2-WS-Uplink-Frames-Blocked-Post-Upgrade` on the grounds that only uplink was proven blocked. K9 was the cheap discriminator that would close the return-path unknown. K9 has now closed it — but in doing so, the evidence surfaced that a narrow-uplink label is TOO NARROW to describe the fix-family surface.
+
+K9 probed with the WS Ping opcode (0x9, empty payload). The evidence factors:
+
+| claim | verdict from K9 + K6 evidence |
+|---|---|
+| WS frames blocked on Tecno's uplink (client → relay) | PROVEN (K6, §11) |
+| Server-initiated Ping written to socket on relay side | PROVEN — `send_result="ok"` on 49 / 49 Tele2 attempts in Run 3 |
+| Pong return path reached relay | REFUTED — 0 / 49 `ws_diag_downlink_probe_pong_observed` on the same 49 sends |
+| Downlink Ping reached Tecno wire | UNATTRIBUTED — OkHttp does not expose server-Ping receive as a client-side marker; Pong absence is consistent with either "Ping never arrived at Tecno" OR "Ping arrived, Pong lost on return" |
+| Downlink data frames (opcode 0x2) survive the same path | UNTESTED — K9 exercises only opcode 0x9 empty Ping |
+
+The K9 evidence proves the WS post-Upgrade **round trip** is broken on Tele2 LTE, without proving that both directions of arbitrary data frames are individually blocked. The correct verdict-family label is therefore the round-trip framing.
+
+### Hypothesis matrix delta this closure lands in §4
+
+- **NEW candidate added:** **`H-B2-WS-PostUpgrade-Frame-RoundTrip-Broken`** (STRONGLY SUPPORTED). Wording: post-WS-Upgrade, at least one leg of the WS control-frame round trip (server → client Ping OR client → server Pong OR both) fails to complete across the Tele2 LTE path, breaking OkHttp's ping keep-alive and every downstream WS liveness assumption.
+- **Marked SUPERSEDED-as-verdict-family, retained as component finding:** `H-B2-WS-Uplink-Frames-Blocked-Post-Upgrade`. The uplink-blackout claim remains STRONGLY SUPPORTED on its own K6 evidence and is preserved in §4 as a component of the wider round-trip failure — but it is no longer the verdict-family label the fix-track receives. §4 lists both entries side by side: the wider round-trip hypothesis as the family label; the uplink-blackout as its K6-supported component.
+- **Explicit caveat carried forward:** downlink data frames (opcode 0x2) survival is UNTESTED. The verdict does NOT overclaim bidirectional data-frame blocking. A cheap follow-on discriminator is scoped below as **B2-K9b**.
+
+### K9b — optional cheap discriminator (candidate, NOT scheduled)
+
+**B2-K9b — server-initiated Binary data frame after Upgrade.** After WS Upgrade completes on the relay side, relay writes a small opcode 0x2 payload (e.g. a diag-only `{"type":"k9b_probe","id":<uuid>}`) to Tecno's WS session. Client emits a marker on receive (`ws_diag_k9b_probe_received id=...`). Discriminates:
+
+- If client receives the data frame ⇒ downlink data survives, only WS control frames (Ping / Pong) are affected. Narrows the fix-family to keep-alive semantics (server-emitted unsolicited Pongs, disabled OkHttp ping, application-level heartbeat).
+- If client does not receive the data frame ⇒ post-Upgrade downlink is broken for all WS frame types. Widens confidence that WS-on-LTE is unsalvageable and shifts weight toward the §12 fix-family candidates that treat WS-on-LTE as unavailable (proactive REST short-poll on adversarial classes; alternative endpoint / SNI recon).
+
+K9b is diag-only, flag-gated, cheap to implement (mirrors K9's harness), and can run before or alongside B2-K8. **NOT gating B2-K8.** NOT scheduled by §13.
+
+### K10 → K9 → K8 sequencing status
+
+Per §12, the required order is K10 → K9 → K8 before any fix-track opens. K10's Caddy-side desk audit was executed and cleared prior to K9 field runs. K9 is now closed with FAIL-K9. **K8 is next**, per §12's ordering — §13 does NOT preempt K8. K8's carrier-plane REST verdict remains the outstanding gate before the fix-family scope-locks.
+
+### What §13 does NOT do
+
+- Does NOT open a fix-track scope-lock. §3 out-of-scope constraint remains in force.
+- Does NOT preempt B2-K8. K8 is the next K-instrument; its REST-plane verdict is still required.
+- Does NOT schedule B2-K9b. K9b is a candidate discriminator for later consideration, not a commitment.
+- Does NOT re-attribute Run 1's `b916012c` or Run 3's `db68da1d` / `90ffb19c` to B2. Those are Sprint 2b-C crypto side-findings, held out of the K9 accumulator and logged separately.
+- Does NOT count Run 2 toward any K9 counter. The relay-side markers were destroyed by the pre-patch runner and cannot be reconstructed.
+- Does NOT change §11 release / rollout gate. LTE rollout gate stays in force.
+- Does NOT invalidate B1's Wi-Fi closure.
+
+### Run 3 script bugs found and fixed (non-blocking)
+
+Two bugs in the runner script's Phase 10 (verdict emission) surfaced during Run 3 analysis and were patched inline. Neither bug affected the substantive counts — an independent grep re-parse of the raw log slices against the same identity prefixes reproduced the 49 / 0 and 14 / 14 counters. Both fixes verified against the Run 3 corpus:
+
+- `docker logs` output contains ANSI color escape codes (`[3msend_result[0m[2m=[0m"ok"`). The Phase 10 regex `.*send_result="ok"` failed because the literal `="ok"` byte sequence never appears in the raw log stream — the color codes break the run of matched characters. Fix: strip ANSI via `sed -r 's/\x1B\[[0-9;]*m//g'` before every grep in Phase 10.
+- `grep -c "..." || echo 0` produced multi-line `"0\n0"` counter values, because `grep -c` prints `0` on stdout AND exits non-zero when there are zero matches, so `|| echo 0` fires and doubles the output. This is the same class of bug as §11's `count_matches()` failure but on a different code path in a different runner script. Fix: replace `|| echo 0` with `|| true` on every `grep -c` in Phase 10.
+
+Neither bug affects the K9 substantive findings — the coarse OBSERVED_ bucket the runner wrote (malformed) was corrected by hand to `OBSERVED_K9_FAIL` in the durable analysis.
+
+### Related artefacts
+
+- §11 — K1 + K4-natural + K6 evidence (uplink blackout closure and the original narrow-hypothesis wording).
+- §12 — architectural review + K10 → K9 → K8 sequencing; the reason K9 exists as a return-path discriminator.
+
+### Next step
+
+1. Land this closure in repo (this PR). §4 hypothesis matrix updated in the same PR to reflect the SUPERSEDED / NEW entries above.
+2. Log the Sprint 2b-C crypto side-findings (`b916012c` Run 1; `db68da1d`, `90ffb19c` Run 3) against the Sprint 2b track as a separate durable note. Not blocking B2.
+3. Proceed to B2-K8 per §12 sequencing. K8's charter unchanged: attribute the REST long-poll plane to the carrier layer (or refute it) now that K10 has cleared the Caddy-side infrastructure and K9 has closed the WS return-path unknown.
+4. Hold B2-K9b as a candidate follow-on discriminator. Decision to run K9b or defer is made after B2-K8's verdict lands, informed by whether the fix-family ranking shifts weight toward keep-alive-semantics fixes or toward transport-substitution fixes.
