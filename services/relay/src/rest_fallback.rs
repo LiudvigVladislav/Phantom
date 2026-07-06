@@ -1084,6 +1084,35 @@ pub(crate) fn resolve_effective_hold(
     }
 }
 
+/// Combines the long-poll opt-in gate with the K8 hold resolution.
+///
+/// The K8 recon window uses `?hold=N` to sweep hold DURATION for clients
+/// that are ALREADY opted in to long-poll via `X-Phantom-Long-Poll: 1`.
+/// Without that opt-in the client has explicitly asked NOT to hold at all,
+/// so `?hold=N` must NOT force a hold on them — even under the K8 flag —
+/// or K8 would silently upgrade unopted traffic to long-poll and
+/// contaminate the recon window (and consume relay hold slots on the
+/// unopted call path).
+///
+/// Contract:
+///
+/// * `long_poll_opt_in == false` → `raw_hold` is stripped BEFORE
+///   `resolve_effective_hold` sees it, so the resolver falls through to
+///   `(base_hold_secs, false, None)` regardless of `flag_on` and
+///   regardless of `raw_hold`.
+/// * `long_poll_opt_in == true` → `raw_hold` is forwarded unchanged and
+///   the plain resolver contract applies (flag-off short-circuit, clamp
+///   `[0, 30]` on parse-ok, fall-through to base on parse-fail).
+pub(crate) fn resolve_effective_hold_with_opt_in(
+    flag_on: bool,
+    long_poll_opt_in: bool,
+    raw_hold: Option<&str>,
+    base_hold_secs: u32,
+) -> (u32, bool, Option<u32>) {
+    let gated_raw = if long_poll_opt_in { raw_hold } else { None };
+    resolve_effective_hold(flag_on, gated_raw, base_hold_secs)
+}
+
 #[derive(Serialize)]
 pub struct PollEnvelope {
     pub id: String,
@@ -2199,13 +2228,21 @@ pub async fn rest_poll(
     //                 `.parse::<u32>().ok()` collapses it to `None`.
     //
     // The `long_poll_opt_in` gate above still applies: without the
-    // `X-Phantom-Long-Poll: 1` header the client has not opted in to a
-    // hold at all, so `base_hold_secs` is already 0 and the override is
-    // effectively 0 as well. K8 exists to sweep hold DURATION on
-    // opted-in clients, not to force hold on unopted clients.
+    // `X-Phantom-Long-Poll: 1` header the client has NOT opted in to a
+    // hold at all, so `?hold=N` MUST NOT force a hold on them — the
+    // opt-in gate is applied inside `resolve_effective_hold_with_opt_in`
+    // BEFORE the K8 resolver sees the raw hold, so an unopted client
+    // with `?hold=10` stays at `base_hold_secs = 0` and no override
+    // marker fires. K8 exists to sweep hold DURATION on opted-in
+    // clients, not to force hold on unopted clients.
     let k8_flag_on = state.config.diag_ws_k8_client_hold_override_enabled;
     let (effective_hold_secs, hold_override_applied, hold_requested_secs) =
-        resolve_effective_hold(k8_flag_on, q.hold.as_deref(), base_hold_secs);
+        resolve_effective_hold_with_opt_in(
+            k8_flag_on,
+            long_poll_opt_in,
+            q.hold.as_deref(),
+            base_hold_secs,
+        );
     if hold_override_applied {
         // K8 tokenised marker — grep-friendly emission for the recon
         // window. Emitted ONLY when the flag is on AND a valid `?hold=N`
@@ -2571,6 +2608,88 @@ mod tests {
         // marker. Mirrors the pre-K8 shape when no client supplies the
         // param during a recon window.
         let (effective, applied, requested) = resolve_effective_hold(true, None, BASE_HOLD);
+        assert_eq!(effective, BASE_HOLD);
+        assert!(!applied);
+        assert!(requested.is_none());
+    }
+
+    // ── B2-K8 resolve_effective_hold_with_opt_in — opt-in gate ─────────────
+    //
+    // The opt-in wrapper strips the raw `?hold=N` BEFORE the K8 resolver
+    // sees it whenever the client has not sent `X-Phantom-Long-Poll: 1`.
+    // These tests pin the gate so a future refactor cannot silently
+    // regress it: an unopted client with `?hold=10` under the K8 flag
+    // must NEVER be upgraded to a long-poll hold.
+
+    #[test]
+    fn k8_resolve_effective_hold_with_opt_in_denies_unopted_client_with_query() {
+        // Recon-critical case: K8 flag ON, client unopted (no
+        // `X-Phantom-Long-Poll: 1`), `?hold=10` in query. Contract:
+        // the opt-in gate strips `?hold` before the resolver, effective
+        // stays at base (0), override NOT applied.
+        let (effective, applied, requested) = resolve_effective_hold_with_opt_in(
+            /* flag_on         */ true,
+            /* long_poll_opt_in */ false,
+            /* raw_hold        */ Some("10"),
+            /* base_hold_secs  */ 0,
+        );
+        assert_eq!(effective, 0);
+        assert!(!applied);
+        assert!(requested.is_none());
+    }
+
+    #[test]
+    fn k8_resolve_effective_hold_with_opt_in_allows_opted_client() {
+        // K8 flag ON + client opted in + parse-ok `?hold=10` → clamp
+        // (10 ≤ 30) + apply + report requested value for correlation.
+        let (effective, applied, requested) = resolve_effective_hold_with_opt_in(
+            /* flag_on         */ true,
+            /* long_poll_opt_in */ true,
+            /* raw_hold        */ Some("10"),
+            /* base_hold_secs  */ 0,
+        );
+        assert_eq!(effective, 10);
+        assert!(applied);
+        assert_eq!(requested, Some(10));
+    }
+
+    #[test]
+    fn k8_resolve_effective_hold_with_opt_in_flag_off_ignores_everything() {
+        // K8 flag OFF: opt-in status and `?hold` both irrelevant — base
+        // wins across the cartesian product. Preserves byte-identical
+        // pre-K8 behaviour when the recon flag is not set.
+        for &(opt_in, raw) in &[
+            (true,  Some("10")),
+            (false, Some("10")),
+            (true,  Some("abc")),
+            (false, Some("abc")),
+            (true,  None),
+            (false, None),
+        ] {
+            let (effective, applied, requested) = resolve_effective_hold_with_opt_in(
+                /* flag_on         */ false,
+                opt_in,
+                raw,
+                /* base_hold_secs  */ 15,
+            );
+            assert_eq!(effective, 15, "opt_in={opt_in} raw={raw:?}");
+            assert!(!applied, "opt_in={opt_in} raw={raw:?}");
+            assert!(requested.is_none(), "opt_in={opt_in} raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn k8_resolve_effective_hold_with_opt_in_opted_client_no_query() {
+        // K8 flag ON + client opted in + no `?hold` param → fall
+        // through to base (whatever long_poll gate set it to), no
+        // override. Mirrors an opted client that isn't part of the K8
+        // sweep this iteration.
+        let (effective, applied, requested) = resolve_effective_hold_with_opt_in(
+            /* flag_on         */ true,
+            /* long_poll_opt_in */ true,
+            /* raw_hold        */ None,
+            /* base_hold_secs  */ BASE_HOLD,
+        );
         assert_eq!(effective, BASE_HOLD);
         assert!(!applied);
         assert!(requested.is_none());
