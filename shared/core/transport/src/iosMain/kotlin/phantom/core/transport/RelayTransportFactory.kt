@@ -51,6 +51,8 @@ actual fun createRestFallbackTransport(
     @Suppress("UNUSED_PARAMETER") debugBodyLogging: Boolean,
     @Suppress("UNUSED_PARAMETER") pollSkipLpAndPpProvider: () -> Boolean,
     @Suppress("UNUSED_PARAMETER") httpPhaseLogging: Boolean,
+    @Suppress("UNUSED_PARAMETER") k8HoldOverrideProvider: (() -> Int)?,
+    @Suppress("UNUSED_PARAMETER") k8ConnectionCloseProvider: (() -> Boolean)?,
 ): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is not implemented for iOS. " +

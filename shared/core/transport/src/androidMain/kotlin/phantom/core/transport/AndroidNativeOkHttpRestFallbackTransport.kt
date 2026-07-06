@@ -124,6 +124,46 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
      * shape.
      */
     private val pollSkipLpAndPpProvider: () -> Boolean = { false },
+    /**
+     * B2-K8 client-side hold-override diagnostic (design note §2.2 +
+     * §2.3, 2026-07-06). Provider evaluated at every `poll(...)` call
+     * so shared-prefs runtime override is observed on the next request
+     * without any APK rebuild. A non-negative integer causes the URL
+     * builder to append `?hold=N`; the sentinel `-1` (or a null
+     * provider, the default) skips the `?hold` param entirely and the
+     * URL is byte-identical to pre-K8. Server-side (relay PR #370)
+     * clamps to `[0, 30]`; the client sends the raw integer without
+     * pre-clamp so the discrimination "did the client or the server
+     * enforce the clamp" question remains testable in the field.
+     *
+     * Default `null` preserves byte-identical behaviour for every
+     * existing call site. Production wiring (Android, `AppContainer`)
+     * injects a lambda that reads `debug_k8_hold_override_seconds`
+     * from `phantom_prefs` first (wins if non-sentinel), then falls
+     * back to `BuildConfig.DEBUG_K8_HOLD_OVERRIDE_SECONDS` parsed to
+     * Int, then falls back to `-1`.
+     */
+    private val k8HoldOverrideProvider: (() -> Int)? = null,
+    /**
+     * B2-K8 companion — provider evaluated at OkHttp client
+     * construction time for the `/relay/poll` client. When it returns
+     * `true`, the client-builder wires an interceptor that injects a
+     * `Connection: close` header AND evicts the client's connection
+     * pool after every response, forcing fresh TCP+TLS on every poll.
+     * Narrow scope to `op == "poll"` only — send / ack / auth OkHttp
+     * clients are unaffected regardless of this provider's return.
+     *
+     * Default `null` preserves byte-identical behaviour. Production
+     * wiring (Android, `AppContainer`) injects a lambda that reads
+     * `debug_k8_connection_close` from `phantom_prefs` first (contains
+     * -key wins with its boolean value), then falls back to
+     * `BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1"`. Release APK
+     * hardpins `BuildConfig.DEBUG_K8_CONNECTION_CLOSE = "0"` so the
+     * provider returns `false` unless prefs override — and the
+     * Settings-Diagnostics UI that would set that prefs key is absent
+     * from the release compilation unit (dead-code-eliminated by R8).
+     */
+    private val k8ConnectionCloseProvider: (() -> Boolean)? = null,
 ) : RestFallbackTransport {
 
     private val jsonCodec = Json {
@@ -170,7 +210,16 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         longPollOptIn: Boolean,
         readTimeoutMs: Long?,
     ): RestFallbackResponse<PollResponse> = withContext(Dispatchers.IO) {
-        val fullUrl = if (sinceSeq != null) "$url?since_seq=$sinceSeq" else url
+        // B2-K8 client-side hold-override (design note §2.2). Read the
+        // provider on each poll so an operator can flip
+        // `debug_k8_hold_override_seconds` between polls in the runner
+        // without restarting the app. A non-negative value causes the
+        // URL builder to append `?hold=N`; the sentinel `-1` (or a
+        // null provider) skips the `?hold` param and the URL is
+        // byte-identical to pre-K8. Server (PR #370) clamps `[0, 30]`;
+        // the client sends the raw value.
+        val holdOverride = k8HoldOverrideProvider?.invoke() ?: -1
+        val fullUrl = composeK8PollUrl(url, sinceSeq, holdOverride)
         // Round 12 step 3 — evaluate the provider once per poll
         // iteration so a runtime PrivacyMode change is reflected on
         // the very next request (Standard → Ghost atomically turns
@@ -328,9 +377,17 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         // negotiated hold time short.
         val effectiveReadMs = readTimeoutOverrideMs ?: readTimeoutMs
         val effectiveCallMs = if (readTimeoutOverrideMs != null) readTimeoutOverrideMs else callTimeoutMs
+        // ConnectionPool is captured in a local so the B2-K8
+        // Connection: close interceptor (below) can call
+        // `pool.evictAll()` after every response is returned. The
+        // existing `ConnectionPool(0, 1ms)` config makes eviction
+        // largely redundant on healthy calls, but the K8 diagnostic
+        // wants deterministic teardown independent of pool config
+        // drift for the recon window.
+        val pool = ConnectionPool(0, 1, TimeUnit.MILLISECONDS)
         return OkHttpClient.Builder()
             .protocols(listOf(Protocol.HTTP_1_1))
-            .connectionPool(ConnectionPool(0, 1, TimeUnit.MILLISECONDS))
+            .connectionPool(pool)
             .retryOnConnectionFailure(false)
             .callTimeout(effectiveCallMs, TimeUnit.MILLISECONDS)
             .connectTimeout(connectTimeoutMs, TimeUnit.MILLISECONDS)
@@ -397,6 +454,39 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
                             correlationKey = correlationKey,
                         ),
                     )
+                }
+            }
+            .also { builder ->
+                // B2-K8 diagnostic — Connection: close + evictAll()
+                // interceptor. Attached ONLY when both conditions
+                // hold:
+                //   (1) op == "poll" — narrow scope; send / ack /
+                //       auth clients unaffected regardless of the
+                //       K8 provider.
+                //   (2) k8ConnectionCloseProvider?.invoke() == true —
+                //       resolves to shared-prefs first, then
+                //       BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1".
+                //       Release APK hardpins the BuildConfig to "0"
+                //       AND the Settings-Diagnostics UI that would
+                //       flip the prefs key is absent from the release
+                //       compilation unit, so the provider returns
+                //       `false` in release builds and the interceptor
+                //       is never constructed. R8 dead-code eliminates
+                //       the K8DebugConnectionCloseInterceptor class
+                //       entirely from release (verified by
+                //       verifyR8StripsTestSeams deny-list entry
+                //       `K8Debug.*` in checkpoint 6).
+                //
+                // Interaction with buildPollRequest():
+                // buildPollRequest already sets the `Connection: close`
+                // header on /relay/poll — the interceptor overwrites
+                // (does not append) so duplication is harmless. The
+                // distinguishing behaviour is the post-response
+                // `pool.evictAll()` call, guaranteeing the next poll
+                // opens a fresh TCP+TLS connection independently of
+                // ConnectionPool config drift.
+                if (op == "poll" && k8ConnectionCloseProvider?.invoke() == true) {
+                    builder.addInterceptor(K8DebugConnectionCloseInterceptor(pool))
                 }
             }
             .build()
