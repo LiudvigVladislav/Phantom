@@ -511,10 +511,14 @@ actual fun createRestFallbackTransport(
     debugBodyLogging: Boolean,
     pollSkipLpAndPpProvider: () -> Boolean,
     httpPhaseLogging: Boolean,
+    k8HoldOverrideProvider: (() -> Int)?,
+    k8ConnectionCloseProvider: (() -> Boolean)?,
 ): RestFallbackTransport =
     AndroidNativeOkHttpRestFallbackTransport(
         socksProxyPort = socksProxyPort,
         debugBodyLogging = debugBodyLogging,
         pollSkipLpAndPpProvider = pollSkipLpAndPpProvider,
         httpPhaseLogging = httpPhaseLogging,
+        k8HoldOverrideProvider = k8HoldOverrideProvider,
+        k8ConnectionCloseProvider = k8ConnectionCloseProvider,
     )

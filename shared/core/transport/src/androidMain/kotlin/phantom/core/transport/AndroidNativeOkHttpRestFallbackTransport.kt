@@ -124,6 +124,46 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
      * shape.
      */
     private val pollSkipLpAndPpProvider: () -> Boolean = { false },
+    /**
+     * B2-K8 client-side hold-override diagnostic (design note §2.2 +
+     * §2.3, 2026-07-06). Provider evaluated at every `poll(...)` call
+     * so shared-prefs runtime override is observed on the next request
+     * without any APK rebuild. A non-negative integer causes the URL
+     * builder to append `?hold=N`; the sentinel `-1` (or a null
+     * provider, the default) skips the `?hold` param entirely and the
+     * URL is byte-identical to pre-K8. Server-side (relay PR #370)
+     * clamps to `[0, 30]`; the client sends the raw integer without
+     * pre-clamp so the discrimination "did the client or the server
+     * enforce the clamp" question remains testable in the field.
+     *
+     * Default `null` preserves byte-identical behaviour for every
+     * existing call site. Production wiring (Android, `AppContainer`)
+     * injects a lambda that reads `debug_k8_hold_override_seconds`
+     * from `phantom_prefs` first (wins if non-sentinel), then falls
+     * back to `BuildConfig.DEBUG_K8_HOLD_OVERRIDE_SECONDS` parsed to
+     * Int, then falls back to `-1`.
+     */
+    private val k8HoldOverrideProvider: (() -> Int)? = null,
+    /**
+     * B2-K8 companion — provider evaluated at OkHttp client
+     * construction time for the `/relay/poll` client. When it returns
+     * `true`, the client-builder wires an interceptor that injects a
+     * `Connection: close` header AND evicts the client's connection
+     * pool after every response, forcing fresh TCP+TLS on every poll.
+     * Narrow scope to `op == "poll"` only — send / ack / auth OkHttp
+     * clients are unaffected regardless of this provider's return.
+     *
+     * Default `null` preserves byte-identical behaviour. Production
+     * wiring (Android, `AppContainer`) injects a lambda that reads
+     * `debug_k8_connection_close` from `phantom_prefs` first (contains
+     * -key wins with its boolean value), then falls back to
+     * `BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1"`. Release APK
+     * hardpins `BuildConfig.DEBUG_K8_CONNECTION_CLOSE = "0"` so the
+     * provider returns `false` unless prefs override — and the
+     * Settings-Diagnostics UI that would set that prefs key is absent
+     * from the release compilation unit (dead-code-eliminated by R8).
+     */
+    private val k8ConnectionCloseProvider: (() -> Boolean)? = null,
 ) : RestFallbackTransport {
 
     private val jsonCodec = Json {
@@ -170,7 +210,16 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         longPollOptIn: Boolean,
         readTimeoutMs: Long?,
     ): RestFallbackResponse<PollResponse> = withContext(Dispatchers.IO) {
-        val fullUrl = if (sinceSeq != null) "$url?since_seq=$sinceSeq" else url
+        // B2-K8 client-side hold-override (design note §2.2). Read the
+        // provider on each poll so an operator can flip
+        // `debug_k8_hold_override_seconds` between polls in the runner
+        // without restarting the app. A non-negative value causes the
+        // URL builder to append `?hold=N`; the sentinel `-1` (or a
+        // null provider) skips the `?hold` param and the URL is
+        // byte-identical to pre-K8. Server (PR #370) clamps `[0, 30]`;
+        // the client sends the raw value.
+        val holdOverride = k8HoldOverrideProvider?.invoke() ?: -1
+        val fullUrl = composePollUrl(url, sinceSeq, holdOverride)
         // Round 12 step 3 — evaluate the provider once per poll
         // iteration so a runtime PrivacyMode change is reflected on
         // the very next request (Standard → Ghost atomically turns
@@ -403,6 +452,38 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
     }
 
     companion object {
+        /**
+         * B2-K8 client-side URL composer for `/relay/poll` (design note
+         * §2.2 + §5.1). Extracted as an `internal` pure helper so unit
+         * tests can pin the URL contract without booting OkHttp / the
+         * Android runtime.
+         *
+         * Contract:
+         *  * `sinceSeq == null && holdOverride < 0` → `baseUrl` verbatim,
+         *    byte-identical to pre-K8.
+         *  * `sinceSeq != null && holdOverride < 0` → `"$baseUrl?since_seq=$s"`.
+         *  * `holdOverride >= 0` → appends `hold=$h` after `since_seq`
+         *    (both params joined by `&`, always `?since_seq=...` first
+         *    when present so log-grepper regexes anchored to that
+         *    prefix keep matching).
+         *
+         * The client sends the raw `holdOverride` integer without any
+         * clamp — the relay clamps `[0, 30]` server-side (PR #370
+         * squash `c5e077db`). Sending `hold=100` reaches the relay
+         * verbatim so the "did the client or the server enforce the
+         * clamp" discrimination is testable in the field.
+         */
+        internal fun composePollUrl(baseUrl: String, sinceSeq: Long?, holdOverride: Int): String {
+            val hasSince = sinceSeq != null
+            val hasHold = holdOverride >= 0
+            return when {
+                hasSince && hasHold -> "$baseUrl?since_seq=$sinceSeq&hold=$holdOverride"
+                hasSince -> "$baseUrl?since_seq=$sinceSeq"
+                hasHold -> "$baseUrl?hold=$holdOverride"
+                else -> baseUrl
+            }
+        }
+
         /**
          * Per-call ceilings for the short relay paths (`/relay/send`,
          * `/relay/poll`, `/relay/ack-deliver`, `/auth/session`).

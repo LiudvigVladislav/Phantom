@@ -196,6 +196,50 @@ expect fun createRestFallbackTransport(
      * the parameter but ignore it.
      */
     httpPhaseLogging: Boolean = false,
+    /**
+     * B2-K8 client-side hold-override diagnostic (design note §2.2 +
+     * §2.3, 2026-07-06). Provider evaluated at every `/relay/poll`
+     * request build so shared-prefs runtime overrides picked up between
+     * polls without APK rebuild. Returns the effective override value:
+     * a non-negative integer causes the poll builder to append
+     * `?hold=N` to the URL; the sentinel `-1` (or a null provider,
+     * default) skips the `?hold` param entirely and the URL is
+     * byte-identical to pre-K8. Server-side clamps to `[0, 30]`; the
+     * client sends the raw integer without pre-clamp.
+     *
+     * Wiring contract (Android): `AppContainer` resolves prefs +
+     * BuildConfig at each invocation via
+     * `K8HoldOverride.currentHoldOverride(prefs)`. iOS / JVM actuals
+     * accept the parameter but ignore it — they throw
+     * [NotImplementedError] regardless, identical to the existing
+     * `socksProxyPort` posture.
+     *
+     * Default `null` preserves byte-identical behaviour for every
+     * existing call site.
+     */
+    k8HoldOverrideProvider: (() -> Int)? = null,
+    /**
+     * B2-K8 companion — provider evaluated at OkHttp client construction
+     * time for the `/relay/poll` client. When it returns `true`, a
+     * `Connection: close` header interceptor is attached AND the
+     * client's connection pool is evicted after every response, forcing
+     * fresh TCP+TLS on every poll. Narrow scope to `op == "poll"` only
+     * — send/ack/auth OkHttp clients are unaffected regardless of this
+     * provider's return.
+     *
+     * Wiring contract (Android): `AppContainer` resolves prefs +
+     * BuildConfig at each invocation via
+     * `K8HoldOverride.currentConnectionClose(prefs)`. Release APK has
+     * `BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "0"` hardpinned so the
+     * provider returns `false` unless prefs override, and release
+     * prefs cannot be set from the Settings-Diagnostics UI which is
+     * absent from the release compilation unit — dead-code-eliminated
+     * by R8. iOS / JVM actuals accept the parameter but ignore it.
+     *
+     * Default `null` preserves byte-identical behaviour for every
+     * existing call site.
+     */
+    k8ConnectionCloseProvider: (() -> Boolean)? = null,
 ): RestFallbackTransport
 
 /**
