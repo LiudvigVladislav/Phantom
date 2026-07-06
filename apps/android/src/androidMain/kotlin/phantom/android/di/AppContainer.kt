@@ -1291,11 +1291,28 @@ class AppContainer(private val context: Context) {
             // change the hold value between polls in the runner without
             // rebuilding the APK.
             //
-            // The read is inline (no reference to `K8HoldOverride`
-            // which lives in `apps/android/src/debug/kotlin`) because
-            // AppContainer is `androidMain` and cannot import from the
-            // debug source set. The K8HoldOverride helper still exists
-            // for test-callable resolver logic (the pure
+            // Load-bearing release-safety guard: BOTH providers
+            // short-circuit to the flag-off value when
+            // `BuildConfig.DEBUG == false`. Without this guard a
+            // release APK would still read the shared-prefs keys and
+            // — if the keys were somehow planted (planted APK in a
+            // hostile scenario; a debug-flavour SharedPreferences file
+            // rolled forward from a prior sideload; a
+            // Settings-Diagnostics UI that leaks into release via a
+            // future refactor) — override the release BuildConfig
+            // hardpin (`"-1"` / `"0"`). The design-note §2.5 claim
+            // "no `if (BuildConfig.DEBUG)` guard needed because the
+            // K8 code sits in the debug source set" applied only to
+            // `K8HoldOverride.kt` (which is in `src/debug/kotlin`);
+            // these provider lambdas are in `androidMain` (present in
+            // release), so the guard IS needed here.
+            //
+            // The prefs read remains inline (no reference to
+            // `K8HoldOverride` which lives in
+            // `apps/android/src/debug/kotlin`) because AppContainer is
+            // `androidMain` and cannot import from the debug source
+            // set. The K8HoldOverride helper still exists for
+            // test-callable resolver logic (the pure
             // `resolveHoldOverride` function) and future
             // Settings-Diagnostics UI mounting.
             //
@@ -1311,19 +1328,40 @@ class AppContainer(private val context: Context) {
                     android.content.Context.MODE_PRIVATE,
                 )
             val k8HoldOverrideProvider: () -> Int = {
-                val prefsValue = k8Prefs.getInt("debug_k8_hold_override_seconds", -1)
-                if (prefsValue != -1) {
-                    prefsValue
+                if (!phantom.android.BuildConfig.DEBUG) {
+                    // Release short-circuit — the release
+                    // BuildConfig hardpin (`"-1"`) is the surface
+                    // contract, and shared-prefs MUST NOT be able to
+                    // override it. Returning the sentinel here means
+                    // the URL composer skips `?hold=N` entirely on
+                    // every release-APK poll. This is the load-
+                    // bearing gate: without it, the release-safety
+                    // claims in the PR body would be false.
+                    -1
                 } else {
-                    phantom.android.BuildConfig.DEBUG_K8_HOLD_OVERRIDE_SECONDS
-                        .toIntOrNull() ?: -1
+                    val prefsValue = k8Prefs.getInt("debug_k8_hold_override_seconds", -1)
+                    if (prefsValue != -1) {
+                        prefsValue
+                    } else {
+                        phantom.android.BuildConfig.DEBUG_K8_HOLD_OVERRIDE_SECONDS
+                            .toIntOrNull() ?: -1
+                    }
                 }
             }
             val k8ConnectionCloseProvider: () -> Boolean = {
-                if (k8Prefs.contains("debug_k8_connection_close")) {
-                    k8Prefs.getBoolean("debug_k8_connection_close", false)
+                if (!phantom.android.BuildConfig.DEBUG) {
+                    // Release short-circuit — mirrors the
+                    // hold-override provider. The interceptor is
+                    // never attached on release; the K8Debug* class
+                    // is dead-code-eliminated by R8 (verified by
+                    // `verifyR8StripsTestSeams`).
+                    false
                 } else {
-                    phantom.android.BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1"
+                    if (k8Prefs.contains("debug_k8_connection_close")) {
+                        k8Prefs.getBoolean("debug_k8_connection_close", false)
+                    } else {
+                        phantom.android.BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1"
+                    }
                 }
             }
 

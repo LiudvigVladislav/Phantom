@@ -177,4 +177,87 @@ class AppContainerK8WiringTest {
                 "list slice:\n$args",
         )
     }
+
+    /**
+     * P1 release-safety guard tests (post-review 2026-07-07).
+     *
+     * The load-bearing invariant every K8 debug flag must satisfy: a
+     * release APK MUST behave as if the K8 recon does not exist, even
+     * if a shared-prefs key with the K8 name is somehow present on
+     * disk (planted APK; a debug-flavour SharedPreferences file rolled
+     * forward from a prior sideload; a future Settings-Diagnostics
+     * refactor that leaks a writer into release).
+     *
+     * The mechanism: BOTH provider lambdas MUST short-circuit to the
+     * flag-off value when `BuildConfig.DEBUG == false`. Without the
+     * guard, `k8Prefs.getInt("debug_k8_hold_override_seconds", -1)`
+     * runs unconditionally on every poll on every release build, and
+     * a planted prefs value overrides the release BuildConfig
+     * hardpin — the PR-body release-safety claim would be false.
+     *
+     * The tests are structural (source-text) rather than runtime
+     * because we cannot stand up a release-flavour AppContainer in
+     * `testDebugUnitTest`; a runtime test would need to build the
+     * release variant and instantiate it, which is scope-out here.
+     * A future refactor that drops the guard would fail these grep
+     * assertions before shipping.
+     */
+    @Test
+    fun k8_hold_override_provider_guards_on_buildconfig_debug() {
+        val text = source()
+        val providerStart = text.indexOf("val k8HoldOverrideProvider")
+        assertTrue(
+            providerStart >= 0,
+            "k8HoldOverrideProvider declaration must exist (covered by another cell).",
+        )
+        // Take a slice covering the lambda body. The provider block
+        // is ~15 lines; 2_500 chars is a generous ceiling that stops
+        // before the next `val` declaration.
+        val bodySlice = text.substring(
+            providerStart,
+            minOf(text.length, providerStart + 2_500),
+        )
+        val guardExpr = "if (!phantom.android.BuildConfig.DEBUG)"
+        assertTrue(
+            bodySlice.contains(guardExpr),
+            "k8HoldOverrideProvider lambda MUST short-circuit on " +
+                "`$guardExpr` and return `-1` (the sentinel) as its first " +
+                "action. Without this guard, a release APK would still " +
+                "read the `debug_k8_hold_override_seconds` shared-prefs key " +
+                "on every poll, and a planted prefs value would override the " +
+                "release BuildConfig hardpin (`\"-1\"`) — falsifying the PR " +
+                "release-safety claim that a release APK never appends " +
+                "`?hold=N`. Design note §2.5 originally said no guard was " +
+                "needed because K8 code sits in the debug source set; that " +
+                "was true for `K8HoldOverride.kt` but NOT for this provider " +
+                "lambda which sits in `androidMain` (present in release). " +
+                "Provider body slice:\n$bodySlice",
+        )
+    }
+
+    @Test
+    fun k8_connection_close_provider_guards_on_buildconfig_debug() {
+        val text = source()
+        val providerStart = text.indexOf("val k8ConnectionCloseProvider")
+        assertTrue(
+            providerStart >= 0,
+            "k8ConnectionCloseProvider declaration must exist (covered by another cell).",
+        )
+        val bodySlice = text.substring(
+            providerStart,
+            minOf(text.length, providerStart + 2_500),
+        )
+        val guardExpr = "if (!phantom.android.BuildConfig.DEBUG)"
+        assertTrue(
+            bodySlice.contains(guardExpr),
+            "k8ConnectionCloseProvider lambda MUST short-circuit on " +
+                "`$guardExpr` and return `false` as its first action. " +
+                "Without this guard, a release APK would still consult the " +
+                "`debug_k8_connection_close` shared-prefs key, and a planted " +
+                "`true` value would install the K8DebugConnectionCloseInterceptor " +
+                "on `/relay/poll` — falsifying the PR release-safety claim " +
+                "that the interceptor is never attached in release. " +
+                "Provider body slice:\n$bodySlice",
+        )
+    }
 }

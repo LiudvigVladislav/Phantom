@@ -207,12 +207,18 @@ expect fun createRestFallbackTransport(
      * byte-identical to pre-K8. Server-side clamps to `[0, 30]`; the
      * client sends the raw integer without pre-clamp.
      *
-     * Wiring contract (Android): `AppContainer` resolves prefs +
-     * BuildConfig at each invocation via
-     * `K8HoldOverride.currentHoldOverride(prefs)`. iOS / JVM actuals
-     * accept the parameter but ignore it — they throw
-     * [NotImplementedError] regardless, identical to the existing
-     * `socksProxyPort` posture.
+     * Wiring contract (Android): `AppContainer` short-circuits on
+     * `BuildConfig.DEBUG == false` (returns `-1` unconditionally on
+     * release, load-bearing P1 release-safety guard) and otherwise
+     * inlines the resolution — reads the `debug_k8_hold_override_seconds`
+     * shared-prefs key first, then falls back to `BuildConfig.DEBUG_K8_HOLD_OVERRIDE_SECONDS`
+     * parsed to Int, then falls back to `-1`. The resolver's pure
+     * logic is mirrored by `K8HoldOverride.resolveHoldOverride(prefsValue, buildConfigValue)`
+     * for test-callability but NOT called from the production DI path;
+     * `K8HoldOverride` lives in the debug source set which `androidMain`
+     * cannot import. iOS / JVM actuals accept the parameter but ignore
+     * it — they throw [NotImplementedError] regardless, identical to
+     * the existing `socksProxyPort` posture.
      *
      * Default `null` preserves byte-identical behaviour for every
      * existing call site.
@@ -227,14 +233,18 @@ expect fun createRestFallbackTransport(
      * — send/ack/auth OkHttp clients are unaffected regardless of this
      * provider's return.
      *
-     * Wiring contract (Android): `AppContainer` resolves prefs +
-     * BuildConfig at each invocation via
-     * `K8HoldOverride.currentConnectionClose(prefs)`. Release APK has
-     * `BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "0"` hardpinned so the
-     * provider returns `false` unless prefs override, and release
-     * prefs cannot be set from the Settings-Diagnostics UI which is
-     * absent from the release compilation unit — dead-code-eliminated
-     * by R8. iOS / JVM actuals accept the parameter but ignore it.
+     * Wiring contract (Android): `AppContainer` short-circuits on
+     * `BuildConfig.DEBUG == false` (returns `false` unconditionally on
+     * release, load-bearing P1 release-safety guard) and otherwise
+     * inlines the resolution — reads the `debug_k8_connection_close`
+     * shared-prefs key first (contains-key semantics: explicit-`true`
+     * vs explicit-`false` both defer to the stored value), then falls
+     * back to `BuildConfig.DEBUG_K8_CONNECTION_CLOSE == "1"`. The
+     * release BuildConfig is hardpinned to `"0"` so the fallback
+     * returns `false`, and the debug-source-set short-circuit above
+     * makes the prefs read a no-op on release regardless of what a
+     * planted prefs value would say. iOS / JVM actuals accept the
+     * parameter but ignore it.
      *
      * Default `null` preserves byte-identical behaviour for every
      * existing call site.
