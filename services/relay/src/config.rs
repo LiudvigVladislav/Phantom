@@ -237,6 +237,45 @@ pub struct RelayConfig {
     ///
     /// Locked design in `C:\temp\b2-k1-k4-recon-2026-07-04\k9-design-note.md`.
     pub diag_ws_k9_downlink_probe_enabled: bool,
+
+    // ── B2-K8 REST poll hold override (DIRECT-WSS-MODE2-B2-LTE-RECON1 §K8) ────
+
+    /// When `true`, the `/relay/poll` handler honours an optional `?hold=N`
+    /// query parameter that overrides the per-request effective hold time.
+    /// `N` is parsed as `u32` seconds and clamped to `[0, 30]`; parse
+    /// failures (non-integer, negative, out-of-range) fall through to the
+    /// hardcoded default and the request continues normally. Parse-
+    /// fallthrough is achieved by declaring `PollQuery.hold` as
+    /// `Option<String>` and parsing inside the handler with
+    /// `.parse::<u32>().ok()` — a typed `Option<u32>` would make axum's
+    /// `Query` extractor reject malformed values with HTTP 400 before
+    /// the flag is even consulted, which would violate both the flag-off
+    /// inertness contract and the parse-fallthrough contract.
+    ///
+    /// When `false`, the `?hold=N` query is IGNORED — the existing
+    /// `RelayConfig.poll_hold_secs` value applies unchanged (production
+    /// path preserved verbatim).
+    ///
+    /// Default `false`. Set by env var
+    /// `RELAY_DIAG_WS_K8_CLIENT_HOLD_OVERRIDE_ENABLED=1` exactly; any
+    /// other value (including `"true"` / `"yes"` / empty / unset) fails
+    /// closed. Same strict-parse discipline as
+    /// `diag_ws_k9_downlink_probe_enabled` (see K9 comment above).
+    ///
+    /// Purpose: give the K8 field probe a way to sweep per-request hold
+    /// durations from a fixed client build without redeploying the relay
+    /// with a new `RELAY_POLL_HOLD_SECS` value. K8 answers whether
+    /// short-hold vs long-hold poll cycles change the Tele2 LTE Mode 2
+    /// arrival latency distribution per B2 §K8 design note.
+    ///
+    /// This is a diagnostic path only. There is no fix-track scope-lock
+    /// associated with this flag. The flag is intended to be turned on
+    /// for a bounded operator-scheduled recon window and then turned
+    /// off; docker-compose.yml in the git-tracked repo does NOT ship
+    /// the env var.
+    ///
+    /// Locked design in `C:\temp\b2-k1-k4-recon-2026-07-04\k8-design-note.md` §1.
+    pub diag_ws_k8_client_hold_override_enabled: bool,
 }
 
 /// Strict-parse helper for `RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED`.
@@ -245,6 +284,16 @@ pub struct RelayConfig {
 /// cargo tests). `None` → `false` (unset), `Some("1")` → `true`, every
 /// other value → `false` (`"true"`, `"yes"`, `"0"`, empty, whitespace).
 fn parse_k9_diag_probe_flag(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
+}
+
+/// Strict-parse helper for `RELAY_DIAG_WS_K8_CLIENT_HOLD_OVERRIDE_ENABLED`.
+/// Same strict-`"1"` contract as `parse_k9_diag_probe_flag`. Exposed at
+/// module scope so the parse contract can be pinned by unit tests
+/// without touching process env vars (which race under parallel cargo
+/// tests). `None` → `false` (unset), `Some("1")` → `true`, every other
+/// value → `false` (`"true"`, `"yes"`, `"0"`, empty, whitespace).
+fn parse_k8_hold_override_flag(raw: Option<&str>) -> bool {
     matches!(raw, Some("1"))
 }
 
@@ -299,6 +348,10 @@ impl RelayConfig {
             // exercise the probe path construct a config with this set to
             // `true`.
             diag_ws_k9_downlink_probe_enabled: false,
+            // B2-K8 REST poll hold override off in tests by default; tests
+            // that exercise the `?hold=N` override path construct a config
+            // with this set to `true`.
+            diag_ws_k8_client_hold_override_enabled: false,
         }
     }
 
@@ -408,6 +461,16 @@ impl RelayConfig {
             // process env vars.
             diag_ws_k9_downlink_probe_enabled: parse_k9_diag_probe_flag(
                 std::env::var("RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            // B2-K8 REST poll hold override: strict `"1"` parse, fails
+            // closed on any other value. Mirrors
+            // `diag_ws_k9_downlink_probe_enabled` gate pattern. Route via
+            // the pure helper `parse_k8_hold_override_flag` so the parse
+            // contract is unit-testable without touching process env vars.
+            diag_ws_k8_client_hold_override_enabled: parse_k8_hold_override_flag(
+                std::env::var("RELAY_DIAG_WS_K8_CLIENT_HOLD_OVERRIDE_ENABLED")
                     .ok()
                     .as_deref(),
             ),
@@ -539,6 +602,10 @@ impl std::fmt::Debug for RelayConfig {
                 "diag_ws_k9_downlink_probe_enabled",
                 &self.diag_ws_k9_downlink_probe_enabled,
             )
+            .field(
+                "diag_ws_k8_client_hold_override_enabled",
+                &self.diag_ws_k8_client_hold_override_enabled,
+            )
             // `seq_mac_key` carries its own `[REDACTED]` Debug impl from
             // `SeqMacRootKey`, but we still elide the wrapping `Arc` here
             // so a stray operator never sees the field in startup logs
@@ -583,6 +650,36 @@ mod tests {
         for v in ["", " ", "true", "TRUE", "yes", "on", "1 ", " 1", "1\n"] {
             assert!(
                 !parse_k9_diag_probe_flag(Some(v)),
+                "expected {:?} → false under strict-1 parse",
+                v
+            );
+        }
+    }
+
+    // B2-K8 — pins the strict-`"1"` parse contract for the K8 REST poll
+    // hold override flag. Same discipline as the K9 tests above: pure
+    // helper only, no `std::env::set_var`, no `serial_test`.
+
+    #[test]
+    fn k8_hold_override_flag_defaults_false_when_env_unset() {
+        assert!(!parse_k8_hold_override_flag(None));
+    }
+
+    #[test]
+    fn parses_k8_hold_override_flag_from_env_strict_1() {
+        assert!(parse_k8_hold_override_flag(Some("1")));
+    }
+
+    #[test]
+    fn k8_hold_override_flag_rejects_non_strict_1() {
+        // `"0"` / `"true"` / `"yes"` / whitespace variants must all map
+        // to `false`. If an operator typos the env var value, the
+        // diagnostic stays off — same fail-closed discipline as K9.
+        for v in [
+            "0", "", " ", "true", "TRUE", "yes", "on", "1 ", " 1", "1\n",
+        ] {
+            assert!(
+                !parse_k8_hold_override_flag(Some(v)),
                 "expected {:?} → false under strict-1 parse",
                 v
             );

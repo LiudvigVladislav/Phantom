@@ -1016,6 +1016,72 @@ pub struct RestSendRequest {
 #[derive(Deserialize)]
 pub struct PollQuery {
     pub since_seq: Option<u64>,
+    /// B2-K8 diagnostic — per-request hold override.
+    ///
+    /// Only honoured when `RelayConfig.diag_ws_k8_client_hold_override_enabled`
+    /// is `true`. When the flag is `false`, this field is IGNORED and the
+    /// existing `RelayConfig.poll_hold_secs` value applies unchanged
+    /// (production path preserved verbatim).
+    ///
+    /// Declared as `Option<String>` (not `Option<u32>`) so that malformed
+    /// values (non-integer, negative, out-of-range) DO NOT cause the
+    /// axum `Query` extractor to reject the request with HTTP 400.
+    /// Instead the raw string is carried into the handler and parsed
+    /// there with `.parse::<u32>().ok()`; parse failures collapse to
+    /// `None` and the request falls through to the hardcoded default
+    /// per K8 design-note §1.2. `#[serde(default)]` covers the absent
+    /// case. When the flag is on, the parsed value is clamped to
+    /// `K8_HOLD_OVERRIDE_MAX_SECS` (30 s) at the handler.
+    #[serde(default)]
+    pub hold: Option<String>,
+}
+
+/// B2-K8 diagnostic — maximum per-request `?hold=N` value permitted
+/// when the K8 hold-override flag is active. Values above this cap are
+/// clamped to this value; the parse itself is best-effort so a request
+/// carrying `?hold=999999` receives a 30 s hold rather than a 400.
+///
+/// Intentionally much smaller than `MAX_POLL_HOLD_SECS_CAP` (480 s) —
+/// K8 is a short-window field probe, not a mechanism for wedging poll
+/// requests open for the full production ceiling.
+pub const K8_HOLD_OVERRIDE_MAX_SECS: u32 = 30;
+
+/// B2-K8 diagnostic — pure resolver for the per-request effective hold
+/// value. Extracted from `rest_poll` so the clamp + parse-fallback +
+/// flag-off contract can be pinned by unit tests without spinning an
+/// axum `TestServer`.
+///
+/// Contract per K8 design-note §1.2:
+///   * `flag_on == false` → `(base_hold_secs, false, None)` regardless
+///     of `raw_hold`. The `?hold=N` query is IGNORED (production path
+///     preserved verbatim).
+///   * `flag_on == true`, `raw_hold` parses as `u32` → clamp to
+///     `[0, K8_HOLD_OVERRIDE_MAX_SECS]`, return `(clamped, true,
+///     Some(requested))`.
+///   * `flag_on == true`, `raw_hold` is `None` OR fails to parse as
+///     `u32` (non-integer, negative, empty, out-of-range) → fall
+///     through to `(base_hold_secs, false, None)`; the request
+///     continues.
+///
+/// Returned tuple is `(effective_hold_secs, override_applied,
+/// requested_secs)`. `requested_secs` is `Some(_)` only when the
+/// override was applied — the tokenised log emits it as the raw
+/// pre-clamp value for correlation with `hold_effective`.
+pub(crate) fn resolve_effective_hold(
+    flag_on: bool,
+    raw_hold: Option<&str>,
+    base_hold_secs: u32,
+) -> (u32, bool, Option<u32>) {
+    if !flag_on {
+        return (base_hold_secs, false, None);
+    }
+    match raw_hold.and_then(|s| s.parse::<u32>().ok()) {
+        Some(requested) => {
+            let clamped = requested.min(K8_HOLD_OVERRIDE_MAX_SECS);
+            (clamped, true, Some(requested))
+        }
+        None => (base_hold_secs, false, None),
+    }
 }
 
 #[derive(Serialize)]
@@ -2109,11 +2175,56 @@ pub async fn rest_poll(
     // padded posture so the on-wire footprint stays canonical while
     // the breaker is open.
     let padded_opt_in = long_poll_opt_in || padded_poll_opt_in;
-    let effective_hold_secs = if long_poll_opt_in {
+    let base_hold_secs = if long_poll_opt_in {
         state.config.poll_hold_secs
     } else {
         0
     };
+
+    // B2-K8 diagnostic — per-request hold override via `?hold=N`.
+    //
+    // Contract per K8 design-note §1.2 (see `resolve_effective_hold`
+    // doc-comment for the full contract enumeration):
+    //   * Flag off  → `?hold=N` IGNORED, hardcoded `base_hold_secs` applies
+    //                 (production path preserved verbatim).
+    //   * Flag on   → `?hold=N` parsed as `u32` seconds, clamped to
+    //                 `[0, K8_HOLD_OVERRIDE_MAX_SECS]`, used INSTEAD of
+    //                 `base_hold_secs` for this one request.
+    //   * Parse fail (non-integer / negative / absent / empty) → fall
+    //                 through to `base_hold_secs`; the request continues.
+    //                 Because `PollQuery.hold` is `Option<String>` (not
+    //                 `Option<u32>`), a malformed value does NOT make
+    //                 axum reject the request at the extractor with a
+    //                 400 — the raw string reaches the handler and
+    //                 `.parse::<u32>().ok()` collapses it to `None`.
+    //
+    // The `long_poll_opt_in` gate above still applies: without the
+    // `X-Phantom-Long-Poll: 1` header the client has not opted in to a
+    // hold at all, so `base_hold_secs` is already 0 and the override is
+    // effectively 0 as well. K8 exists to sweep hold DURATION on
+    // opted-in clients, not to force hold on unopted clients.
+    let k8_flag_on = state.config.diag_ws_k8_client_hold_override_enabled;
+    let (effective_hold_secs, hold_override_applied, hold_requested_secs) =
+        resolve_effective_hold(k8_flag_on, q.hold.as_deref(), base_hold_secs);
+    if hold_override_applied {
+        // K8 tokenised marker — grep-friendly emission for the recon
+        // window. Emitted ONLY when the flag is on AND a valid `?hold=N`
+        // was applied, to keep prod logs quiet by default.
+        //
+        // `hold_requested` is the raw pre-clamp value, `hold_effective`
+        // the clamped applied value. When they differ the request hit
+        // `K8_HOLD_OVERRIDE_MAX_SECS`.
+        tracing::info!(
+            event             = "k8_diag_hold_override",
+            identity          = %&recipient_identity[..8.min(recipient_identity.len())],
+            flag_on           = true,
+            hold_requested    = hold_requested_secs.unwrap_or(0),
+            hold_effective    = effective_hold_secs,
+            base_hold_secs    = base_hold_secs,
+            long_poll_opt_in  = long_poll_opt_in,
+            "diag",
+        );
+    }
 
     // Trek 2 Stage 1 — long-poll hold. `poll_hold_loop` returns
     // immediately if `effective_hold_secs == 0` (kill switch OR client
@@ -2168,16 +2279,36 @@ pub async fn rest_poll(
         && long_poll_opt_in
         && padded_poll_opt_in;
 
-    tracing::info!(
-        event              = "rest_poll_returned",
-        identity           = %&recipient_identity[..8.min(recipient_identity.len())],
-        envelope_id        = %envelope_id_log,
-        more               = more,
-        hold_secs          = effective_hold_secs,
-        long_poll_opt_in   = long_poll_opt_in,
-        padded_poll_opt_in = padded_poll_opt_in,
-        chunked_flush      = chunked_flush_opt_in,
-    );
+    // B2-K8 — the `hold_override_applied` / `hold_requested` fields are
+    // additive on the `rest_poll_returned` log line but ONLY when the K8
+    // flag is on, so prod (flag-off) log shape stays byte-identical to
+    // master. Mirrors the K9 discipline where diag markers only emit
+    // while the flag is on.
+    if k8_flag_on {
+        tracing::info!(
+            event                 = "rest_poll_returned",
+            identity              = %&recipient_identity[..8.min(recipient_identity.len())],
+            envelope_id           = %envelope_id_log,
+            more                  = more,
+            hold_secs             = effective_hold_secs,
+            long_poll_opt_in      = long_poll_opt_in,
+            padded_poll_opt_in    = padded_poll_opt_in,
+            chunked_flush         = chunked_flush_opt_in,
+            hold_override_applied = hold_override_applied,
+            hold_requested        = ?q.hold,
+        );
+    } else {
+        tracing::info!(
+            event                 = "rest_poll_returned",
+            identity              = %&recipient_identity[..8.min(recipient_identity.len())],
+            envelope_id           = %envelope_id_log,
+            more                  = more,
+            hold_secs             = effective_hold_secs,
+            long_poll_opt_in      = long_poll_opt_in,
+            padded_poll_opt_in    = padded_poll_opt_in,
+            chunked_flush         = chunked_flush_opt_in,
+        );
+    }
 
     // Trek 2 Stage 1.x Lock-2 — response shape is gated by
     // `padded_opt_in = long_poll_opt_in || padded_poll_opt_in`, NOT by
@@ -2362,6 +2493,88 @@ fn now_ms_i64() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── B2-K8 resolve_effective_hold (§1.3) ──────────────────────────────────
+    //
+    // Pins the flag-off, clamp-boundary, and parse-fallback contract for
+    // the K8 hold override per design-note §1.3. Pure helper only; no
+    // env-var mutation and no `TestServer` boot — same discipline as the
+    // K9 parse-flag tests in `config.rs`.
+
+    const BASE_HOLD: u32 = 90;
+
+    #[test]
+    fn k8_resolve_effective_hold_flag_off_ignores_query() {
+        // Spec §1.3 bullet 2: with the flag off, `?hold=N` is ignored
+        // and the hardcoded hold applies. Must hold for a well-formed
+        // `Some("10")`, a malformed `Some("abc")`, and an absent `None`.
+        for raw in [None, Some("10"), Some("abc"), Some("-1"), Some("")] {
+            let (effective, applied, requested) =
+                resolve_effective_hold(false, raw, BASE_HOLD);
+            assert_eq!(effective, BASE_HOLD, "flag-off must preserve base for {:?}", raw);
+            assert!(!applied, "flag-off must not report override for {:?}", raw);
+            assert!(requested.is_none(), "flag-off must not surface requested for {:?}", raw);
+        }
+    }
+
+    #[test]
+    fn k8_resolve_effective_hold_clamp_boundaries() {
+        // Spec §1.3 bullet 3: hold=0 → 0; hold=30 → 30; hold=31 → 30;
+        // hold=999999 → 30. Also pin the max-u32 corner.
+        let cases: &[(&str, u32)] = &[
+            ("0", 0),
+            ("1", 1),
+            ("29", 29),
+            ("30", K8_HOLD_OVERRIDE_MAX_SECS),
+            ("31", K8_HOLD_OVERRIDE_MAX_SECS),
+            ("999999", K8_HOLD_OVERRIDE_MAX_SECS),
+            ("4294967295", K8_HOLD_OVERRIDE_MAX_SECS), // u32::MAX
+        ];
+        for (raw, expected) in cases {
+            let (effective, applied, requested) =
+                resolve_effective_hold(true, Some(*raw), BASE_HOLD);
+            assert_eq!(effective, *expected, "hold={:?} clamp mismatch", raw);
+            assert!(applied, "hold={:?} must report override applied", raw);
+            let parsed: u32 = raw.parse().expect("test input parses");
+            assert_eq!(requested, Some(parsed), "hold={:?} requested surface", raw);
+        }
+    }
+
+    #[test]
+    fn k8_resolve_effective_hold_parse_fallback() {
+        // Spec §1.3 bullet 3 tail: negative / non-integer / empty /
+        // out-of-range-u32 must fall through to the hardcoded default;
+        // the request continues (represented here by returning
+        // `(BASE_HOLD, false, None)`).
+        for raw in [
+            "abc",
+            "",
+            " ",
+            "-1",
+            "1.5",
+            "999999999999999999999", // > u32::MAX
+            "4294967296",             // u32::MAX + 1
+            "10 ",                    // trailing whitespace — .parse::<u32>() rejects
+            " 10",                    // leading whitespace — .parse::<u32>() rejects
+        ] {
+            let (effective, applied, requested) =
+                resolve_effective_hold(true, Some(raw), BASE_HOLD);
+            assert_eq!(effective, BASE_HOLD, "parse fallback must yield base for {:?}", raw);
+            assert!(!applied, "parse fallback must not report override for {:?}", raw);
+            assert!(requested.is_none(), "parse fallback must not surface requested for {:?}", raw);
+        }
+    }
+
+    #[test]
+    fn k8_resolve_effective_hold_absent_query_with_flag_on() {
+        // Flag on but `?hold` absent → fall through to base, no override
+        // marker. Mirrors the pre-K8 shape when no client supplies the
+        // param during a recon window.
+        let (effective, applied, requested) = resolve_effective_hold(true, None, BASE_HOLD);
+        assert_eq!(effective, BASE_HOLD);
+        assert!(!applied);
+        assert!(requested.is_none());
+    }
 
     // ── sequence_ts quantization (Q5) ────────────────────────────────────────
 
