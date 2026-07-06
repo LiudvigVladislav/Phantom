@@ -648,6 +648,60 @@ android {
                 "\"$modeSticky\"",
             )
 
+            // B2-K8 client-side hold-override diagnostic (2026-07-06).
+            // Companion to relay-side PR #370 squash `c5e077db`. When
+            // this field is a non-sentinel non-negative integer, the
+            // Android /relay/poll builder appends `?hold=N` (server
+            // clamps [0, 30]; the client sends the raw value). The
+            // relay MUST have `RELAY_DIAG_WS_K8_CLIENT_HOLD_OVERRIDE_ENABLED=1`
+            // set in its .env for the parameter to be honoured; both
+            // ends default to off so bare debug builds are byte-identical
+            // to pre-K8. Encoded as the file-wide String idiom (mirror
+            // of `MODE_2_STICKY_ENABLED` / `DEBUG_FORCE_MODE_2_DETECTION`);
+            // the debug reader parses back to Int at request-build time.
+            // Sentinel `"-1"` = "no override, no ?hold param appended".
+            // Debug default `"-1"` so operator opts in explicitly via
+            // `-PdebugK8HoldOverrideSeconds=10` or
+            // `DEBUG_K8_HOLD_OVERRIDE_SECONDS=10` env. A shared-prefs
+            // key (`debug_k8_hold_override_seconds`, Int) is read
+            // FIRST at each poll build so the operator can change the
+            // hold value between polls without rebuilding the APK;
+            // BuildConfig is the fallback when prefs is absent OR
+            // sentinel. Release pin lives in the release block below.
+            val debugK8HoldOverrideSeconds = localOrEnv(
+                "debugK8HoldOverrideSeconds",
+                "DEBUG_K8_HOLD_OVERRIDE_SECONDS",
+                "-1",
+            )
+            buildConfigField(
+                "String",
+                "DEBUG_K8_HOLD_OVERRIDE_SECONDS",
+                "\"$debugK8HoldOverrideSeconds\"",
+            )
+
+            // B2-K8 companion — force `Connection: close` on /relay/poll
+            // + `ConnectionPool.evictAll()` after each poll. Narrow scope
+            // to the poll path only (send/ack/auth unaffected). Default
+            // `"0"` on debug — operator opts in explicitly via
+            // `-PdebugK8ConnectionClose=1` or env DEBUG_K8_CONNECTION_CLOSE=1.
+            // Prefs key `debug_k8_connection_close` (Boolean) overrides
+            // when present. Release pins to literal `"0"` below. The
+            // wire behaviour matches the existing `Connection: close`
+            // request header at `buildPollRequest` — the interceptor
+            // is idempotent for the header (overwrite, not append) and
+            // additionally forces `pool.evictAll()` post-response so
+            // the next poll opens a fresh TCP+TLS connection.
+            val debugK8ConnectionClose = localOrEnv(
+                "debugK8ConnectionClose",
+                "DEBUG_K8_CONNECTION_CLOSE",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "DEBUG_K8_CONNECTION_CLOSE",
+                "\"$debugK8ConnectionClose\"",
+            )
+
         }
         release {
             isMinifyEnabled = true
@@ -848,6 +902,25 @@ android {
             // deliberate one-line flip in a separate named PR after smoke PASS.
             // Requires MODE_2_FAST_PATH_ENABLED="1" (build-time invariant).
             buildConfigField("String", "MODE_2_STICKY_ENABLED", "\"0\"")
+
+            // B2-K8 client-side hold-override diagnostic (2026-07-06).
+            // Release builds ALWAYS pin the K8 override to the sentinel
+            // literal `"-1"` so a release APK can never append `?hold=N`
+            // to /relay/poll. The AppContainer wire-up also gates the
+            // provider on the debug-source-set helper class which is
+            // absent from the release compilation unit; the release pin
+            // here is the defence-in-depth backstop against a corrupted
+            // local.properties / env leak into a release BuildConfig.
+            // Mirrors the release-pin idiom of `DEBUG_FORCE_MODE_2_DETECTION`
+            // / `MODE_2_STICKY_ENABLED`.
+            buildConfigField("String", "DEBUG_K8_HOLD_OVERRIDE_SECONDS", "\"-1\"")
+
+            // B2-K8 companion — release builds ALWAYS pin the
+            // `Connection: close` + `evictAll()` interceptor flag to
+            // literal `"0"`. Release APK never installs the interceptor
+            // (provider path returns `false` under this pin AND the
+            // absence of prefs override AND `BuildConfig.DEBUG == false`).
+            buildConfigField("String", "DEBUG_K8_CONNECTION_CLOSE", "\"0\"")
 
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
