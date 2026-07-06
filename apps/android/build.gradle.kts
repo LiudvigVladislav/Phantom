@@ -1094,6 +1094,15 @@ val verifyR8StripsTestSeams = tasks.register("verifyR8StripsTestSeams") {
         Regex(".*ForTest.*"),
         Regex("debugForce.*"),
         Regex(".*Synthetic.*"),
+        // B2-K8 diagnostic (2026-07-06): the K8DebugConnectionCloseInterceptor
+        // class (androidMain, PR #<pending>) must strip from release. The
+        // interceptor is behind a provider gate that always returns false in
+        // release (BuildConfig.DEBUG_K8_CONNECTION_CLOSE hardpinned to "0" +
+        // no Settings-Diagnostics UI to flip the prefs key), so R8 dead-code
+        // elimination removes the class. This deny pattern is the release
+        // -APK verification backstop against a code path that accidentally
+        // holds a live reference to the class.
+        Regex("K8Debug.*"),
     )
 
     doFirst {

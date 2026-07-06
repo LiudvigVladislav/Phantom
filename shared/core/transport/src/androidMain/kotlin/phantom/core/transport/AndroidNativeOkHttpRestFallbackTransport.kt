@@ -219,7 +219,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         // byte-identical to pre-K8. Server (PR #370) clamps `[0, 30]`;
         // the client sends the raw value.
         val holdOverride = k8HoldOverrideProvider?.invoke() ?: -1
-        val fullUrl = composePollUrl(url, sinceSeq, holdOverride)
+        val fullUrl = composeK8PollUrl(url, sinceSeq, holdOverride)
         // Round 12 step 3 — evaluate the provider once per poll
         // iteration so a runtime PrivacyMode change is reflected on
         // the very next request (Standard → Ghost atomically turns
@@ -493,38 +493,6 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
     }
 
     companion object {
-        /**
-         * B2-K8 client-side URL composer for `/relay/poll` (design note
-         * §2.2 + §5.1). Extracted as an `internal` pure helper so unit
-         * tests can pin the URL contract without booting OkHttp / the
-         * Android runtime.
-         *
-         * Contract:
-         *  * `sinceSeq == null && holdOverride < 0` → `baseUrl` verbatim,
-         *    byte-identical to pre-K8.
-         *  * `sinceSeq != null && holdOverride < 0` → `"$baseUrl?since_seq=$s"`.
-         *  * `holdOverride >= 0` → appends `hold=$h` after `since_seq`
-         *    (both params joined by `&`, always `?since_seq=...` first
-         *    when present so log-grepper regexes anchored to that
-         *    prefix keep matching).
-         *
-         * The client sends the raw `holdOverride` integer without any
-         * clamp — the relay clamps `[0, 30]` server-side (PR #370
-         * squash `c5e077db`). Sending `hold=100` reaches the relay
-         * verbatim so the "did the client or the server enforce the
-         * clamp" discrimination is testable in the field.
-         */
-        internal fun composePollUrl(baseUrl: String, sinceSeq: Long?, holdOverride: Int): String {
-            val hasSince = sinceSeq != null
-            val hasHold = holdOverride >= 0
-            return when {
-                hasSince && hasHold -> "$baseUrl?since_seq=$sinceSeq&hold=$holdOverride"
-                hasSince -> "$baseUrl?since_seq=$sinceSeq"
-                hasHold -> "$baseUrl?hold=$holdOverride"
-                else -> baseUrl
-            }
-        }
-
         /**
          * Per-call ceilings for the short relay paths (`/relay/send`,
          * `/relay/poll`, `/relay/ack-deliver`, `/auth/session`).
