@@ -172,6 +172,35 @@ pub fn router(state: Arc<AppState>) -> Router {
         http_routes
     };
 
+    // ── B2-K11 §5B poll-shape echo diagnostic ─────────────────────────────
+    //
+    // Conditional route registration: same gating idiom as the two diag
+    // routes above. With `RELAY_DIAG_POLL_SHAPE_ECHO_ENABLED=0` (production
+    // default, "fails closed") the path returns 404; the operator opts in
+    // by flipping `RELAY_DIAG_POLL_SHAPE_ECHO_ENABLED=1` on the VPS `.env`.
+    //
+    // The route is mounted AFTER the 30 s `TimeoutLayer` so pathological
+    // parameter combinations (e.g. `size=16384 chunk=1 pause_ms=1000`) do
+    // not fire 408 mid-response. This is a diagnostic path; the operator
+    // controls both the env flag and the query parameters.
+    //
+    // Purpose: K11 §5B discriminator — isolate whether Tele2 LTE drops
+    // Round 14 `/relay/poll` responses due to raw HTTP/2 body size alone
+    // (refuted 2026-07-09 by 21/21 PASS on stunnel-served static files
+    // 2048–16384 bytes) or due to the specific response *shape* (padded
+    // 4608 bytes emitted as 4 × 1152 chunks with 300 ms pauses).
+    //
+    // Locked design in `C:\temp\direct-wss-fix-family-2026-07-08\
+    // k11-design-note.md` §5B.
+    let http_routes = if state.config.diag_poll_shape_echo_enabled {
+        http_routes.route(
+            "/diag/poll-shape",
+            get(crate::diag_poll_shape::diag_poll_shape_echo),
+        )
+    } else {
+        http_routes
+    };
+
     // Trek 2 Stage 1 Q3 — `/relay/poll` carved out of the 30 s
     // `TimeoutLayer` that wraps `http_routes`. Mounted on its own
     // sub-router with a 60 s timeout so the server-side long-poll hold
