@@ -237,6 +237,47 @@ class RestFallbackOrchestrator(
      * from `AppContainer`.
      */
     private val tokenSource: () -> Long = { 0L },
+    /**
+     * B2-K11 §5C (2026-07-09). Debug-only observer fired inside
+     * [acquireOrRefreshToken]'s `tokenMutex` critical section immediately
+     * after a fresh session token has been cached (i.e. after
+     * `sessionToken = response.token`). Passes the raw token string and
+     * the derived `expiresInMs` — same values the surrounding sanitised
+     * log line reports without the token content.
+     *
+     * Purpose: give the K11 §5C authenticated poll-clone probe a way to
+     * extract the live session token from a debug APK without a MITM
+     * proxy, without touching production log discipline, and without
+     * exposing a persistent token on disk. The observer is a one-shot
+     * fire-and-forget seam — a single grep-friendly `K11_5C_TOKEN_DEBUG`
+     * marker to logcat, R8-stripped in release by the double-gate
+     * discipline described below.
+     *
+     * Default `null` — every existing test and call-site stays
+     * source-compatible; existing behaviour is byte-identical.
+     *
+     * Production safety:
+     *
+     *  * The observer is constructed at the `AppContainer` wire-up ONLY
+     *    when `phantom.android.BuildConfig.DEBUG &&
+     *    BuildConfig.DEBUG_K11_5C_TOKEN_LOG_ENABLED == "1"`. Both gates
+     *    must be true; either short-circuits to `null` and this
+     *    parameter takes its default no-op path.
+     *  * The `DEBUG_K11_5C_TOKEN_LOG_ENABLED` `buildConfigField` is
+     *    hard-pinned to `"0"` in the `release { ... }` block of
+     *    `apps/android/build.gradle.kts` — defence in depth alongside
+     *    the outer `BuildConfig.DEBUG` gate. Same double-gate discipline
+     *    as `s6DebugTriggerEnabled`, `k8HoldOverrideProvider`, and the
+     *    other Android-side debug-only diagnostic seams.
+     *  * The token itself has a 1-hour TTL server-side
+     *    (`TOKEN_TTL_MS = 3_600_000` in `services/relay/src/rest_fallback.rs`).
+     *    The exposure surface is a debug APK on a device the operator
+     *    physically owns.
+     *
+     * Locked design in `C:/temp/direct-wss-fix-family-2026-07-09/
+     * k11-5c-authenticated-poll-clone-mini-lock.md` §1.5 + §2.3.
+     */
+    private val debugSessionTokenObserver: ((token: String, expiresInMs: Long) -> Unit)? = null,
 ) {
 
     /**
@@ -2296,6 +2337,14 @@ class RestFallbackOrchestrator(
         }
         sessionToken = response.token
         tokenExpiresAt = response.expiresAt
+        // B2-K11 §5C (2026-07-09). Debug-only observer fires inside the
+        // `tokenMutex` critical section so a concurrent reader in
+        // `acquireOrRefreshToken` cannot see a partially updated token.
+        // Guarded solely by non-null observer construction at the
+        // `AppContainer` wire-up (see the kdoc on the constructor
+        // parameter). Default null → no-op; identical wire behaviour to
+        // pre-5C for every path that did not opt in.
+        debugSessionTokenObserver?.invoke(response.token, response.expiresAt - now())
         _capabilities.value = response.toCapabilities()
         // Trek 2 Stage 2B-A (B3, L5) — cache the session-scoped
         // `seq_mac_verify_key` for Stage 2B-B to read without

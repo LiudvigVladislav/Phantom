@@ -1628,6 +1628,46 @@ class AppContainer(private val context: Context) {
                 tokenSource = {
                     phantom.core.crypto.LibsodiumCsprng.uniformLong(Long.MAX_VALUE)
                 },
+                // B2-K11 §5C debug-only session-token observer (2026-07-09).
+                // Fires from inside `acquireOrRefreshToken`'s `tokenMutex`
+                // critical section right after a fresh token is cached.
+                // Emits ONE `K11_5C_TOKEN_DEBUG token=... expiresInMs=...`
+                // line per refresh so the K11 §5C probe can extract the
+                // live bearer token from `adb logcat` and hand it to
+                // `k11curl` for a real /relay/poll authenticated fetch —
+                // discriminates whether Tele2 LTE body-loss is OkHttp/TLS-
+                // fingerprint-bound or authenticated-route-bound
+                // (5B refuted response shape as sole culprit —
+                // [[project_k11_5b_poll_shape_pass_2026_07_09]]).
+                //
+                // Double-gate discipline (mirrors k8HoldOverrideProvider
+                // above and s6DebugTriggerEnabled below):
+                //   (1) `BuildConfig.DEBUG` — release builds always fail.
+                //   (2) `BuildConfig.DEBUG_K11_5C_TOKEN_LOG_ENABLED == "1"`
+                //       — release block hardpins to "0" in
+                //       `apps/android/build.gradle.kts`; debug default is
+                //       also "0", operator opts in with
+                //       `-PdebugK11_5cTokenLogEnabled=1` or the env var.
+                //
+                // Either gate false → observer is `null` and the ctor
+                // param takes its default no-op path; wire behaviour is
+                // byte-identical to pre-5C.
+                //
+                // Locked design in `C:/temp/direct-wss-fix-family-2026-07-09/
+                // k11-5c-authenticated-poll-clone-mini-lock.md` §1.5 + §2.3.
+                debugSessionTokenObserver =
+                    if (phantom.android.BuildConfig.DEBUG &&
+                        phantom.android.BuildConfig.DEBUG_K11_5C_TOKEN_LOG_ENABLED == "1"
+                    ) {
+                        { token, expiresInMs ->
+                            android.util.Log.i(
+                                "PhantomHybrid",
+                                "K11_5C_TOKEN_DEBUG token=$token expiresInMs=$expiresInMs",
+                            )
+                        }
+                    } else {
+                        null
+                    },
             )
             // Commit 2d (2026-06-22): assign the late-wired
             // `gateProvider` on the bare `wsTransport` ONLY when
