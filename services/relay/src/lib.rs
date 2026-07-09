@@ -20,3 +20,4 @@ pub mod routes;
 pub mod seq_mac;
 pub mod state;
 pub mod t2_diag;
+pub mod diag_poll_shape;

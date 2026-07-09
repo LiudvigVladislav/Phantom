@@ -276,6 +276,42 @@ pub struct RelayConfig {
     ///
     /// Locked design in `C:\temp\b2-k1-k4-recon-2026-07-04\k8-design-note.md` §1.
     pub diag_ws_k8_client_hold_override_enabled: bool,
+
+    // ── B2-K11 5B poll-shape echo (DIRECT-WSS-MODE2-B2-LTE-RECON1 §K11 5B) ────
+
+    /// When `true`, the relay mounts the `GET /diag/poll-shape` diagnostic
+    /// endpoint. The endpoint returns a deterministic octet-stream body
+    /// whose size, chunk stride, and inter-chunk pause are chosen by the
+    /// caller via `?size=&chunk=&pause_ms=` query parameters (clamped to
+    /// safe ranges — see `crate::diag_poll_shape` for exact bounds).
+    ///
+    /// Purpose: discriminate whether the Tele2 LTE downlink drops the
+    /// Phantom `/relay/poll` response due to (a) raw HTTP/2 body size
+    /// alone, or (b) the specific response *shape* Round 14 produces —
+    /// padded 4608 bytes emitted as 4 × 1152 chunks with 300 ms pauses.
+    /// K11 v1 field probe showed 24/24 body loss on Tele2 LTE against
+    /// production `/relay/poll`, while a 20-hour-later probe against
+    /// stunnel-served static files showed 21/21 PASS across 2048–16384
+    /// bytes — refuting a naive byte-cutoff and pointing at shape (or
+    /// TLS fingerprint / app request signature) as the surviving axis.
+    /// This endpoint isolates shape from all three other axes.
+    ///
+    /// Default `false`. Set by env var
+    /// `RELAY_DIAG_POLL_SHAPE_ECHO_ENABLED=1` exactly; any other value
+    /// (including `"true"` / `"yes"` / empty / unset) fails closed. Same
+    /// strict-parse discipline as `diag_ws_k9_downlink_probe_enabled` /
+    /// `diag_ws_k8_client_hold_override_enabled`.
+    ///
+    /// This is a diagnostic path only. No `/relay/poll` production
+    /// behaviour changes. No queue mutation. No cursor mutation. No
+    /// delivery state. No authentication. The flag is intended to be
+    /// turned on for a bounded operator-scheduled recon window and then
+    /// turned off; docker-compose.yml in the git-tracked repo does NOT
+    /// ship the env var.
+    ///
+    /// Locked design in `C:\temp\direct-wss-fix-family-2026-07-08\
+    /// k11-design-note.md` §5B.
+    pub diag_poll_shape_echo_enabled: bool,
 }
 
 /// Strict-parse helper for `RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED`.
@@ -294,6 +330,16 @@ fn parse_k9_diag_probe_flag(raw: Option<&str>) -> bool {
 /// tests). `None` → `false` (unset), `Some("1")` → `true`, every other
 /// value → `false` (`"true"`, `"yes"`, `"0"`, empty, whitespace).
 fn parse_k8_hold_override_flag(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
+}
+
+/// Strict-parse helper for `RELAY_DIAG_POLL_SHAPE_ECHO_ENABLED`.
+/// Same strict-`"1"` contract as `parse_k8_hold_override_flag`. Exposed
+/// at module scope so the parse contract can be pinned by unit tests
+/// without touching process env vars. `None` → `false` (unset),
+/// `Some("1")` → `true`, every other value → `false` (`"true"`, `"yes"`,
+/// `"0"`, empty, whitespace).
+fn parse_poll_shape_echo_flag(raw: Option<&str>) -> bool {
     matches!(raw, Some("1"))
 }
 
@@ -352,6 +398,10 @@ impl RelayConfig {
             // that exercise the `?hold=N` override path construct a config
             // with this set to `true`.
             diag_ws_k8_client_hold_override_enabled: false,
+            // B2-K11 5B poll-shape echo off in tests by default; tests that
+            // exercise the `/diag/poll-shape` endpoint construct a config
+            // with this set to `true`.
+            diag_poll_shape_echo_enabled: false,
         }
     }
 
@@ -471,6 +521,16 @@ impl RelayConfig {
             // contract is unit-testable without touching process env vars.
             diag_ws_k8_client_hold_override_enabled: parse_k8_hold_override_flag(
                 std::env::var("RELAY_DIAG_WS_K8_CLIENT_HOLD_OVERRIDE_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            // B2-K11 5B poll-shape echo: strict `"1"` parse, fails closed
+            // on any other value. Mirrors `diag_ws_k8_client_hold_override_enabled`
+            // gate pattern. Route via the pure helper `parse_poll_shape_echo_flag`
+            // so the parse contract is unit-testable without touching
+            // process env vars.
+            diag_poll_shape_echo_enabled: parse_poll_shape_echo_flag(
+                std::env::var("RELAY_DIAG_POLL_SHAPE_ECHO_ENABLED")
                     .ok()
                     .as_deref(),
             ),
@@ -606,6 +666,10 @@ impl std::fmt::Debug for RelayConfig {
                 "diag_ws_k8_client_hold_override_enabled",
                 &self.diag_ws_k8_client_hold_override_enabled,
             )
+            .field(
+                "diag_poll_shape_echo_enabled",
+                &self.diag_poll_shape_echo_enabled,
+            )
             // `seq_mac_key` carries its own `[REDACTED]` Debug impl from
             // `SeqMacRootKey`, but we still elide the wrapping `Arc` here
             // so a stray operator never sees the field in startup logs
@@ -680,6 +744,36 @@ mod tests {
         ] {
             assert!(
                 !parse_k8_hold_override_flag(Some(v)),
+                "expected {:?} → false under strict-1 parse",
+                v
+            );
+        }
+    }
+
+    // B2-K11 5B — pins the strict-`"1"` parse contract for the poll-shape
+    // echo diagnostic flag. Same discipline as the K8/K9 tests above:
+    // pure helper only, no `std::env::set_var`, no `serial_test`.
+
+    #[test]
+    fn poll_shape_echo_flag_defaults_false_when_env_unset() {
+        assert!(!parse_poll_shape_echo_flag(None));
+    }
+
+    #[test]
+    fn parses_poll_shape_echo_flag_from_env_strict_1() {
+        assert!(parse_poll_shape_echo_flag(Some("1")));
+    }
+
+    #[test]
+    fn poll_shape_echo_flag_rejects_non_strict_1() {
+        // `"0"` / `"true"` / `"yes"` / whitespace variants must all map
+        // to `false`. If an operator typos the env var value, the
+        // diagnostic stays off — same fail-closed discipline as K8/K9.
+        for v in [
+            "0", "", " ", "true", "TRUE", "yes", "on", "1 ", " 1", "1\n",
+        ] {
+            assert!(
+                !parse_poll_shape_echo_flag(Some(v)),
                 "expected {:?} → false under strict-1 parse",
                 v
             );
