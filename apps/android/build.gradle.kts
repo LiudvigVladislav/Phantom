@@ -702,6 +702,32 @@ android {
                 "\"$debugK8ConnectionClose\"",
             )
 
+            // B2-K11 §5C debug-only session-token observer (2026-07-09).
+            // When flipped to `"1"` on a debug build, the AppContainer
+            // wire-up constructs a `debugSessionTokenObserver` that emits
+            // one `K11_5C_TOKEN_DEBUG token=... expiresInMs=...` line to
+            // logcat immediately after each fresh session token is cached
+            // by `RestFallbackOrchestrator.acquireOrRefreshToken`. Purpose:
+            // let the K11 §5C probe extract the live bearer token without
+            // MITM (which would replace the OkHttp TLS ClientHello that
+            // 5C is designed to preserve) and without persisting the
+            // token on disk. Default `"0"` — operator opts in explicitly
+            // via `-PdebugK11_5cTokenLogEnabled=1` or
+            // `DEBUG_K11_5C_TOKEN_LOG_ENABLED=1` env. Release pin lives
+            // in the release block below. Locked design in
+            // `C:/temp/direct-wss-fix-family-2026-07-09/
+            // k11-5c-authenticated-poll-clone-mini-lock.md` §1.5 + §2.3.
+            val debugK11_5cTokenLogEnabled = localOrEnv(
+                "debugK11_5cTokenLogEnabled",
+                "DEBUG_K11_5C_TOKEN_LOG_ENABLED",
+                "0",
+            )
+            buildConfigField(
+                "String",
+                "DEBUG_K11_5C_TOKEN_LOG_ENABLED",
+                "\"$debugK11_5cTokenLogEnabled\"",
+            )
+
         }
         release {
             isMinifyEnabled = true
@@ -921,6 +947,17 @@ android {
             // (provider path returns `false` under this pin AND the
             // absence of prefs override AND `BuildConfig.DEBUG == false`).
             buildConfigField("String", "DEBUG_K8_CONNECTION_CLOSE", "\"0\"")
+
+            // B2-K11 §5C debug-only session-token observer (2026-07-09).
+            // Release builds ALWAYS pin the flag to `"0"` so a release
+            // APK can never construct the debug observer even if the
+            // outer `BuildConfig.DEBUG` gate is bypassed by a mistake
+            // upstream. The AppContainer double-gate
+            // (`BuildConfig.DEBUG && DEBUG_K11_5C_TOKEN_LOG_ENABLED == "1"`)
+            // short-circuits to `null` under this pin. Locked design in
+            // `C:/temp/direct-wss-fix-family-2026-07-09/
+            // k11-5c-authenticated-poll-clone-mini-lock.md` §1.5 + §2.3.
+            buildConfigField("String", "DEBUG_K11_5C_TOKEN_LOG_ENABLED", "\"0\"")
 
             // ADR-020 Phase 2: USE_TOR / USE_XRAY BuildConfig flags removed
             // for release as well — outer transport is selected at runtime by
