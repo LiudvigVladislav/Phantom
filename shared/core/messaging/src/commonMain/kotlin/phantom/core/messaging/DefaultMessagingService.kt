@@ -749,7 +749,13 @@ class DefaultMessagingService(
                             "elapsedMs=$elapsed budgetMs=$PREKEY_BUNDLE_FETCH_TIMEOUT_MS " +
                             "endpoint=$endpointPath — message will WAIT for retry",
                     )
-                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                    throw PeerBundleMissingException(
+                        recipientPublicKeyHex,
+                        PeerBundleMissingException.Reason.Timeout(
+                            elapsedMs = elapsed,
+                            budgetMs = PREKEY_BUNDLE_FETCH_TIMEOUT_MS,
+                        ),
+                    )
                 } catch (e: BundleFetchException.RateLimited) {
                     val elapsed = Clock.System.now().toEpochMilliseconds() - fetchStartMs
                     messagingLog(
@@ -757,7 +763,10 @@ class DefaultMessagingService(
                         "SEND_TRACE prekey_fetch_result=429 recipient=$recipientTag… " +
                             "elapsedMs=$elapsed endpoint=$endpointPath — message will WAIT for retry",
                     )
-                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                    throw PeerBundleMissingException(
+                        recipientPublicKeyHex,
+                        PeerBundleMissingException.Reason.RateLimited(elapsedMs = elapsed),
+                    )
                 } catch (e: BundleFetchException.Unexpected) {
                     val elapsed = Clock.System.now().toEpochMilliseconds() - fetchStartMs
                     messagingLog(
@@ -765,7 +774,13 @@ class DefaultMessagingService(
                         "SEND_TRACE prekey_fetch_result=http${e.httpStatus} recipient=$recipientTag… " +
                             "elapsedMs=$elapsed endpoint=$endpointPath — message will WAIT for retry",
                     )
-                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                    throw PeerBundleMissingException(
+                        recipientPublicKeyHex,
+                        PeerBundleMissingException.Reason.HttpError(
+                            elapsedMs = elapsed,
+                            status = e.httpStatus,
+                        ),
+                    )
                 } ?: run {
                     val elapsed = Clock.System.now().toEpochMilliseconds() - fetchStartMs
                     messagingLog(
@@ -773,7 +788,10 @@ class DefaultMessagingService(
                         "SEND_TRACE prekey_fetch_result=404 recipient=$recipientTag… " +
                             "elapsedMs=$elapsed endpoint=$endpointPath — peer has not published yet",
                     )
-                    throw PeerBundleMissingException(recipientPublicKeyHex)
+                    throw PeerBundleMissingException(
+                        recipientPublicKeyHex,
+                        PeerBundleMissingException.Reason.NotPublished,
+                    )
                 }
                 val elapsedOk = Clock.System.now().toEpochMilliseconds() - fetchStartMs
                 messagingLog(
@@ -1594,9 +1612,10 @@ class DefaultMessagingService(
             )
             messagingLog(
                 MessagingLogLevel.INFO,
-                "send DEFERRED: peer ${e.recipientPubKeyHex.take(16)}… has no bundle " +
-                    "(404 from /prekeys/bundle). Message saved with WAITING status; " +
-                    "retryWaitingMessages() will retry on next reconnect / ticker tick.",
+                "send DEFERRED: peer ${e.recipientPubKeyHex.take(16)}… " +
+                    "reason=${e.reason.toLogTag()} ${e.reason.toLogDetails()}. " +
+                    "Message saved with WAITING status; retryWaitingMessages() " +
+                    "will retry on next reconnect / ticker tick.",
             )
             return@runCatching Unit
         }
@@ -4799,17 +4818,117 @@ private fun hexToBytes(hex: String): ByteArray =
     ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
 
 /**
- * Thrown by [DefaultMessagingService.encryptUnderLock] when the peer
- * has no published prekey bundle on the relay (404 from
- * [phantom.core.transport.PreKeyApi.fetchBundle]). The send path catches
- * this distinctly and stores the message with [phantom.core.storage.MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE]
+ * Thrown by [DefaultMessagingService.encryptUnderLock] when the peer's
+ * prekey bundle could not be obtained from the relay and the send path
+ * cannot proceed to encryption. Historically this covered ONLY the
+ * `/prekeys/bundle` 404 case ("peer has not published yet") — hence the
+ * legacy default reason [Reason.NotPublished] and the frozen-shape
+ * primary constructor.
+ *
+ * The 2026-07-10 diagnostic pass ([[project_prekey_bootstrap_contamination_2026_07_10]])
+ * showed that the four try/catch branches at the fetch site were ALL
+ * throwing this exception with the same hard-coded downstream log message
+ * ("has no bundle (404 from /prekeys/bundle)"), so a `WAITING`-DEFERRED
+ * message caused by a `TimeoutCancellationException` or a `429 rate
+ * limit` still logged as if the peer had never published. The DEFERRED
+ * log line was actively misleading during field diagnostics and cost
+ * hours of misdirected investigation.
+ *
+ * Fix: add a discriminated [Reason] carrier so the exception preserves
+ * the actual reason all the way to the DEFERRED log line. Every existing
+ * caller and test that constructed `PeerBundleMissingException(hex)`
+ * without a reason keeps compiling — the default `Reason.NotPublished`
+ * preserves the pre-fix wire.
+ *
+ * The send path catches this distinctly and stores the message with
+ * [phantom.core.storage.MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE]
  * for later retry. Other encrypt failures (signature verify, malformed
  * bundle, signing-key mismatch) bubble through as the original
  * SessionBootstrapException variants. PR C-followup-3.
  */
 class PeerBundleMissingException(
     val recipientPubKeyHex: String,
-) : Exception(
-    "peer ${recipientPubKeyHex.take(16)}… has no published prekey bundle " +
-        "(404 from /prekeys/bundle). Message will retry on reconnect.",
-)
+    val reason: Reason = Reason.NotPublished,
+) : Exception(reason.buildExceptionMessage(recipientPubKeyHex)) {
+
+    /**
+     * Discriminated cause of the bundle fetch failure. Each variant
+     * carries the numeric context (elapsed / budget / http status) that
+     * the DEFERRED log line needs to reflect reality instead of a
+     * hard-coded "404" string.
+     *
+     * Preserved contract: the DEFERRED handler cares ONLY that the
+     * bundle is unavailable — it stores the message with `WAITING`
+     * status and returns. The reason field is diagnostic only; no
+     * production behaviour branches on it.
+     */
+    sealed class Reason {
+        /**
+         * Relay returned HTTP 404 (or the fetch API returned `null`) —
+         * the peer identity has no published bundle. The message should
+         * retry when the peer publishes.
+         */
+        object NotPublished : Reason()
+
+        /**
+         * The local `withTimeout(PREKEY_BUNDLE_FETCH_TIMEOUT_MS)` guard
+         * fired before the relay replied. Distinct from `NotPublished`
+         * because retry semantics AND likely root cause differ — a
+         * timeout points at network / connection-pool / DNS state, not
+         * at peer publish state.
+         */
+        data class Timeout(val elapsedMs: Long, val budgetMs: Long) : Reason()
+
+        /** Relay returned HTTP 429 (rate limited). */
+        data class RateLimited(val elapsedMs: Long) : Reason()
+
+        /**
+         * Relay returned some other unexpected HTTP status. The status
+         * value is preserved so log grep can spot recurring codes.
+         */
+        data class HttpError(val elapsedMs: Long, val status: Int) : Reason()
+
+        /**
+         * Short grep-friendly tag for the DEFERRED log line. Kept stable
+         * across future refactors so a log-scraper regex anchored to
+         * `reason=<tag>` keeps matching.
+         */
+        fun toLogTag(): String = when (this) {
+            is NotPublished -> "no_published_prekeys"
+            is Timeout -> "prekey_fetch_timeout"
+            is RateLimited -> "prekey_fetch_rate_limited"
+            is HttpError -> "prekey_fetch_http_error"
+        }
+
+        /**
+         * Numeric detail fields for the DEFERRED log line, formatted so
+         * they compose cleanly after the `reason=<tag>` prefix.
+         */
+        fun toLogDetails(): String = when (this) {
+            is NotPublished -> "status=404"
+            is Timeout -> "elapsedMs=$elapsedMs budgetMs=$budgetMs"
+            is RateLimited -> "elapsedMs=$elapsedMs status=429"
+            is HttpError -> "elapsedMs=$elapsedMs status=$status"
+        }
+
+        internal fun buildExceptionMessage(recipientPubKeyHex: String): String {
+            val hexTag = recipientPubKeyHex.take(16)
+            return when (this) {
+                is NotPublished ->
+                    "peer $hexTag… has no published prekey bundle " +
+                        "(404 from /prekeys/bundle). Message will retry on reconnect."
+                is Timeout ->
+                    "peer $hexTag… prekey bundle fetch timed out after " +
+                        "${elapsedMs}ms (budget=${budgetMs}ms). " +
+                        "Message will retry on reconnect."
+                is RateLimited ->
+                    "peer $hexTag… prekey bundle fetch was rate-limited " +
+                        "by the relay (HTTP 429) after ${elapsedMs}ms. " +
+                        "Message will retry on reconnect."
+                is HttpError ->
+                    "peer $hexTag… prekey bundle fetch returned HTTP $status " +
+                        "after ${elapsedMs}ms. Message will retry on reconnect."
+            }
+        }
+    }
+}
