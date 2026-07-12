@@ -10,14 +10,19 @@
 //!    that contains the current SPK and ATOMICALLY consumes one OPK from the
 //!    pool (or returns an empty OPK slot for the 3-DH fallback path)
 //!
-//! ## Storage shape (Alpha-2 in-memory, ADR-018 will graduate to SQL)
+//! ## Storage shape (Alpha-2 in-memory + JSONL journal, ADR-018 will graduate to SQL)
 //!
 //! Two `HashMap`s under `RwLock`, mirroring the existing relay state pattern
-//! (`AppState::store`, `AppState::reports`). Persistence to disk is optional
-//! and append-only via JSONL — same approach as `reports.jsonl` and
-//! `blocklist.txt`. A relay restart loses the state cleanly: clients
-//! re-publish on next online session. This is deliberate Alpha-2 scope:
-//! upgrading to a proper transactional store is its own ADR.
+//! (`AppState::store`, `AppState::reports`). Persistence to disk is append-only
+//! via JSONL at `{RelayConfig.state_dir}/prekeys.jsonl` (RC-RELAY-STATE-DIR-
+//! REPAIR PR-1a §4.1) — same approach as `reports.jsonl`, `blocklist.txt`,
+//! and `push_tokens.jsonl`. Boot-time `PreKeyStore::new` replays the file
+//! into RAM so restart preserves state; PR-1a preserves the pre-fix
+//! `if let Ok(mut f) = OpenOptions::new()...open(path)` silent-swallow shape,
+//! so a filesystem error (EROFS, EACCES) still no-ops the write — the
+//! fail-loud flip and per-tier failure policy (§4.2: HTTP 500 with persist-
+//! first / rollback-on-failure atomicity for the correctness tier) lands in
+//! PR-1b. Upgrading to a proper transactional store is a separate ADR.
 //!
 //! ## Security boundaries
 //!

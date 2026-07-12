@@ -8,10 +8,11 @@
 //! handler → PreKeyStore → response. Distinct from `prekeys::tests` which
 //! exercise the store in isolation.
 //!
-//! Tests share the same on-disk `prekeys.jsonl` because the store
-//! persists silently. Each test uses freshly-generated identities so
-//! cross-test contamination is structurally impossible (no two random
-//! Ed25519 keys collide).
+//! Each test owns its own `tempfile::TempDir` used as `RelayConfig
+//! .state_dir`, so parallel-running tests cannot see each other's
+//! `prekeys.jsonl` (RC-RELAY-STATE-DIR-REPAIR PR-1a §7.1). The
+//! `state_dir_config_not_env` meta-test in `state_persistence.rs`
+//! guards this positive-injection contract against regression.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -19,15 +20,23 @@ use ed25519_dalek::{Signer, Signature, SigningKey};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 const SPK_DOMAIN_LABEL: &[u8] = b"phantom-spk-v1";
 
-/// Build a fresh AppState + Router pair for one test.
-fn build_app() -> axum::Router {
-    let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+/// Build a fresh AppState + Router pair for one test rooted at a
+/// dedicated `tempfile::TempDir`. Callers MUST bind BOTH returned values
+/// (`let (app, _tmp) = build_app();`) so the `TempDir` handle stays
+/// alive for the duration of the test — dropping it early removes the
+/// state files mid-run and breaks the persistence contract we exercise.
+fn build_app() -> (axum::Router, TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir for state_dir");
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.state_dir = tmp.path().to_path_buf();
     let state = Arc::new(phantom_relay::state::AppState::new(cfg));
-    phantom_relay::routes::router(state)
+    let router = phantom_relay::routes::router(state);
+    (router, tmp)
 }
 
 fn sign_spk_payload(
@@ -57,7 +66,7 @@ fn synthetic_identity_hex(seed: u8) -> String {
 
 #[tokio::test]
 async fn publish_then_fetch_round_trip_via_http() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
 
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
@@ -143,7 +152,7 @@ async fn publish_then_fetch_round_trip_via_http() {
 
 #[tokio::test]
 async fn bad_signature_returns_400() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
     let identity_hex = synthetic_identity_hex(21);
@@ -178,7 +187,7 @@ async fn bad_signature_returns_400() {
 
 #[tokio::test]
 async fn empty_pool_bundle_omits_opk() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
     let identity_hex = synthetic_identity_hex(22);
@@ -227,7 +236,7 @@ async fn empty_pool_bundle_omits_opk() {
 
 #[tokio::test]
 async fn publish_rate_limit_returns_429_after_quota() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
     let identity_hex = synthetic_identity_hex(23);
@@ -279,7 +288,7 @@ async fn publish_rate_limit_returns_429_after_quota() {
 
 #[tokio::test]
 async fn fetch_unpublished_identity_returns_404() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let identity_hex = synthetic_identity_hex(24);
     let res = app
         .oneshot(
@@ -299,7 +308,7 @@ async fn signing_key_rotation_returns_409_conflict() {
     // Once an X25519 identity registers an Ed25519 signing key, a subsequent
     // publish for the same X25519 with a DIFFERENT Ed25519 must be rejected
     // with 409 Conflict (relay enforces 1:1 binding).
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let identity_hex = synthetic_identity_hex(25);
 
     let kp_a = SigningKey::generate(&mut OsRng);

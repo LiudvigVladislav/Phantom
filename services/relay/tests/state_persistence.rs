@@ -325,9 +325,27 @@ async fn write_then_reload_round_trip() {
     );
 }
 
-// ── Test 2: env-var route ban meta-test ───────────────────────────────────────
+// ── Test 2: meta-tests for the injection contract ────────────────────────────
 
-/// PR-1a §7.1 meta-test — enumerates every `.rs` file under
+/// Files that exercise handlers writing to the persistence family
+/// (reports.jsonl, blocklist.txt, push_tokens.jsonl, prekeys.jsonl).
+/// Each entry MUST inject its own `tempfile::TempDir` via
+/// `RelayConfig.state_dir` — the negative check bans `env::set_var
+/// ("RELAY_STATE_DIR", ...)`, the positive check requires both a
+/// `tempfile::tempdir` construction and a `state_dir` field assignment
+/// in the same file so parallel test workers cannot share on-disk
+/// state (mini-lock §7.1).
+///
+/// Adding a new file that publishes prekeys, submits abuse reports,
+/// blocks keys, or registers push tokens? Add it here AND wire it into
+/// its own `tempfile::TempDir` fixture before the test suite catches
+/// the regression at CI.
+const PERSISTENCE_TIER_TEST_FILES: &[&str] = &[
+    "state_persistence.rs",
+    "prekey_endpoints.rs",
+];
+
+/// PR-1a §7.1 meta-test (negative) — enumerates every `.rs` file under
 /// `services/relay/tests/` and asserts none of them uses
 /// `env::set_var("RELAY_STATE_DIR")` (or the compound `std::env::set_var`
 /// form). Persistence-tier tests MUST inject through
@@ -376,5 +394,53 @@ fn state_dir_config_not_env() {
          — that shape races between parallel cargo test workers. \
          Offenders:\n  {}",
         offenders.join("\n  ")
+    );
+}
+
+/// PR-1a §7.1 meta-test (positive) — every file in
+/// `PERSISTENCE_TIER_TEST_FILES` MUST include both a
+/// `tempfile::tempdir` construction AND a `state_dir` field
+/// assignment. This is the load-bearing contract: without the
+/// positive-injection shape, a `from_env_for_test()` call falls back
+/// to `PathBuf::from(".")` and the parallel-worker race on the
+/// workspace `./prekeys.jsonl` reintroduces the pre-fix flake.
+///
+/// The check is textual, not semantic, so a contributor that
+/// SPECIFICALLY tries to bypass it (e.g. via macro indirection)
+/// could subvert this. But the check catches the shape any honest
+/// migration produces, which is the point.
+#[test]
+fn persistence_tier_tests_inject_state_dir_via_tempdir() {
+    let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut missing: Vec<String> = Vec::new();
+    for file in PERSISTENCE_TIER_TEST_FILES {
+        let path = tests_dir.join(file);
+        let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {} (add it to PERSISTENCE_TIER_TEST_FILES only \
+                 when the file actually exists): {}",
+                path.display(),
+                e
+            )
+        });
+        // Both tokens must appear at least once in the file body. A
+        // brand-new persistence-tier test that only exercises the READ
+        // path could technically get by without either; add it here
+        // only when it writes.
+        let has_tempdir = content.contains("tempfile::tempdir");
+        let has_state_dir_assign = content.contains("state_dir");
+        if !(has_tempdir && has_state_dir_assign) {
+            missing.push(format!(
+                "{}: tempfile::tempdir={}, state_dir={}",
+                file, has_tempdir, has_state_dir_assign
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "persistence-tier test files MUST inject `RelayConfig.state_dir` \
+         from a per-fixture `tempfile::tempdir()` (positive contract). \
+         Files missing the shape:\n  {}",
+        missing.join("\n  ")
     );
 }

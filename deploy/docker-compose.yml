@@ -71,8 +71,17 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # Read-only rootfs. The relay writes abuse-report logs to /var/phantom
-    # (see state.rs `append_report_to_disk`), so that path is a writable volume.
+    # Read-only rootfs. The relay writes its four append-log state files
+    # to /var/phantom (RC-RELAY-STATE-DIR-REPAIR PR-1a):
+    #   reports.jsonl       — abuse reports submitted via /report
+    #   blocklist.txt       — admin-blocked identity prefixes
+    #   push_tokens.jsonl   — UnifiedPush topic URL per identity (ADR-016)
+    #   prekeys.jsonl       — X3DH SPK / OPK bundle journal (ADR-009)
+    # That path is the only writable mount besides /tmp (tmpfs 16m). The
+    # relay resolves each file against RELAY_STATE_DIR (env below); the
+    # deploy-lint CI gate at .github/workflows/deploy-lint.yml enforces
+    # read_only:true + this volume target + the env value + the
+    # Dockerfile WORKDIR in-sync (Inv-1..Inv-4).
     read_only: true
     tmpfs:
       - /tmp:size=16m
@@ -384,9 +393,13 @@ networks:
     driver: bridge
 
 volumes:
-  # Relay abuse-report log. Persists across container restarts so admin reports
-  # are preserved. Relay stores ONLY cleartext abuse metadata here — never
-  # message ciphertexts, never plaintext messages.
+  # Relay state directory. Persists across container restarts so the four
+  # append-log files (reports.jsonl, blocklist.txt, push_tokens.jsonl,
+  # prekeys.jsonl) survive redeploys — see the `read_only` block on the
+  # `relay:` service above and RC-RELAY-STATE-DIR-REPAIR PR-1a. Relay
+  # stores ONLY cleartext abuse metadata + published prekey bundle
+  # journal + UnifiedPush topic URLs + admin blocklist here; NEVER
+  # message ciphertexts, NEVER plaintext messages, NEVER private keys.
   phantom-reports:
   # Caddy persists issued certificates here — losing this volume triggers
   # re-issuance and risks Let's Encrypt rate limits (50 certs/week/domain).

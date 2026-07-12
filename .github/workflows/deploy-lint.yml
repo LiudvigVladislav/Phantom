@@ -236,16 +236,38 @@ jobs:
                   "load-bearing rootfs posture the state-dir fix depends on."
               )
 
-          # Invariant 2 — phantom-reports:/var/phantom named-volume mount.
-          # The volume target must match the RELAY_STATE_DIR env value below.
-          # Splitting them lands writes back on the read-only rootfs (Inv-1).
+          # Invariant 2 — writable volume mount whose CONTAINER TARGET is
+          # exactly /var/phantom (not a superstring like /var/phantom_bak).
+          # Splitting the target from RELAY_STATE_DIR (Inv-3) lands writes
+          # back on the read-only rootfs (Inv-1).
           volumes = relay.get("volumes", []) or []
-          mounts = [str(v) for v in volumes]
-          has_var_phantom_mount = any(":/var/phantom" in m for m in mounts)
-          if not has_var_phantom_mount:
+          def _mount_target(entry):
+              if isinstance(entry, dict):
+                  # docker-compose long form: {"target": "/var/phantom", ...}
+                  return entry.get("target")
+              if isinstance(entry, str):
+                  s = entry.strip()
+                  # Split at LAST colon so bind-mount modes like ":ro" attach
+                  # after the target; standard short form is
+                  # `[SOURCE:]TARGET[:MODE]`. Iterate suffix modes off:
+                  parts = s.split(":")
+                  if len(parts) >= 2:
+                      # Drop trailing MODE tokens (e.g. "ro", "rw") if any.
+                      modes = {"ro", "rw", "z", "Z", "shared", "slave", "private",
+                               "rshared", "rslave", "rprivate"}
+                      while parts and parts[-1] in modes:
+                          parts.pop()
+                      if len(parts) >= 2:
+                          # Target is the last remaining segment.
+                          return parts[-1]
+              return None
+          mount_targets = [_mount_target(v) for v in volumes]
+          if "/var/phantom" not in mount_targets:
               failures.append(
                   "Inv-2 (volume mount) — relay service must mount a writable "
-                  "volume at `/var/phantom` (e.g. `phantom-reports:/var/phantom`)."
+                  "volume with container TARGET exactly `/var/phantom` "
+                  "(e.g. `phantom-reports:/var/phantom`). Observed targets: "
+                  f"{[t for t in mount_targets if t]!r}."
               )
 
           # Invariant 3 — RELAY_STATE_DIR: /var/phantom env var.
@@ -261,14 +283,32 @@ jobs:
                   f"{state_dir_env!r}."
               )
 
-          # Invariant 4 — Dockerfile WORKDIR /var/phantom defence-in-depth.
-          # Stage 2 must declare WORKDIR /var/phantom so a future refactor
-          # that reintroduces a relative-path write still lands inside the
-          # writable volume instead of `/` on the read-only rootfs.
-          if "WORKDIR /var/phantom" not in dockerfile:
+          # Invariant 4 — Dockerfile WORKDIR /var/phantom defence-in-depth,
+          # anchored to an ACTUAL DIRECTIVE (not text inside a comment).
+          # Stage 2 must declare `WORKDIR /var/phantom` so a future
+          # refactor that reintroduces a relative-path write still lands
+          # inside the writable volume instead of `/` on the read-only
+          # rootfs.
+          def _has_workdir_directive(source: str, target: str) -> bool:
+              for raw in source.splitlines():
+                  # Strip leading whitespace; a Dockerfile directive starts
+                  # in column 0 or after indentation, but never after `#`
+                  # (which begins a comment for the rest of the line).
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  # Support single or double-space between directive and arg.
+                  if line == f"WORKDIR {target}" or line.startswith(
+                      f"WORKDIR {target} "
+                  ) or line.startswith(f"WORKDIR {target}\t"):
+                      return True
+              return False
+          if not _has_workdir_directive(dockerfile, "/var/phantom"):
               failures.append(
                   "Inv-4 (Dockerfile WORKDIR) — services/relay/Dockerfile "
-                  "must declare `WORKDIR /var/phantom` in its runtime stage."
+                  "must declare an uncommented `WORKDIR /var/phantom` "
+                  "directive in its runtime stage. A `WORKDIR /var/phantom` "
+                  "token appearing only inside a `#` comment does NOT count."
               )
 
           if failures:
