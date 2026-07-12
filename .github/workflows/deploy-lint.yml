@@ -236,13 +236,19 @@ jobs:
                   "load-bearing rootfs posture the state-dir fix depends on."
               )
 
-          # Invariant 2 — WRITABLE volume mount whose CONTAINER TARGET is
-          # exactly /var/phantom (not a superstring like /var/phantom_bak).
-          # Splitting the target from RELAY_STATE_DIR (Inv-3) lands writes
-          # back on the read-only rootfs (Inv-1). A `:ro` short-form mount
-          # or a long-form dict with `read_only: true` is REJECTED — the
-          # relay writes there, so a read-only bind produces EACCES on
-          # every append.
+          # Invariant 2 — DURABLE NAMED-VOLUME mount that Path A can repair:
+          # the docker-compose named volume `phantom-reports` MUST be
+          # attached to container TARGET exactly `/var/phantom`, WRITABLE,
+          # with volume type `volume` (or unspecified — Docker's default).
+          # A tmpfs mount at the same target would silently discard state
+          # every restart; a bind mount would side-step the operator
+          # sidecar in mini-lock §5.3 Path A which specifically repairs
+          # the Docker-managed `deploy_phantom-reports` volume. A `:ro`
+          # short-form or `read_only: true` long-form is REJECTED because
+          # the relay writes there and read-only produces EACCES on every
+          # append.
+          EXPECTED_VOLUME_SOURCE = "phantom-reports"
+          EXPECTED_VOLUME_TARGET = "/var/phantom"
           volumes = relay.get("volumes", []) or []
           # Modes that keep the mount writable but may appear as trailing
           # tokens. `ro` is intentionally OMITTED here — its presence
@@ -253,46 +259,89 @@ jobs:
               "rshared", "rslave", "rprivate",
               "consistent", "cached", "delegated",
           }
-          def _writable_mount_target(entry):
+          def _is_expected_named_volume_mount(entry):
               """
-              Return the CONTAINER TARGET path if the mount is writable at
-              that target, else None. Rejects read-only mounts (short-form
-              `:ro`, comma-separated `:ro,z`, or long-form `read_only: true`).
+              Return True iff `entry` describes the docker-compose named
+              volume `phantom-reports` attached WRITABLY to the container
+              path `/var/phantom` with volume type `volume` (or
+              unspecified). Rejects everything else — different source,
+              different target, tmpfs / bind type, read-only mode.
               """
               if isinstance(entry, dict):
-                  # docker-compose long form:
-                  # {"source": ..., "target": "/var/phantom", "read_only": bool}
+                  # docker-compose long form.
                   if entry.get("read_only") is True:
-                      return None
-                  return entry.get("target")
+                      return False
+                  vol_type = entry.get("type")
+                  # `type` unspecified → Docker's default is `volume`.
+                  if vol_type not in (None, "volume"):
+                      return False
+                  return (
+                      entry.get("source") == EXPECTED_VOLUME_SOURCE
+                      and entry.get("target") == EXPECTED_VOLUME_TARGET
+                  )
               if isinstance(entry, str):
                   s = entry.strip()
-                  # Short form: `[SOURCE:]TARGET[:MODE[,MODE...]]`.
+                  # Short form: `SOURCE:TARGET[:MODE[,MODE...]]`.
                   parts = s.split(":")
                   if len(parts) < 2:
-                      return None
+                      return False
                   # If the last segment is a mode-list (all tokens known),
                   # check for `ro` inside and pop off.
                   last = parts[-1]
                   last_tokens = last.split(",")
                   if all(tok in WRITABLE_MODES or tok == "ro" for tok in last_tokens):
                       if "ro" in last_tokens:
-                          return None
+                          return False
                       parts.pop()
-                      if len(parts) < 2:
-                          return None
-                  return parts[-1]
-              return None
-          writable_targets = [_writable_mount_target(v) for v in volumes]
-          if "/var/phantom" not in writable_targets:
+                  if len(parts) != 2:
+                      # `TARGET` alone (bare bind at container path) or an
+                      # unrecognised shape — neither is our named volume.
+                      return False
+                  source, target = parts
+                  return (
+                      source == EXPECTED_VOLUME_SOURCE
+                      and target == EXPECTED_VOLUME_TARGET
+                  )
+              return False
+          if not any(_is_expected_named_volume_mount(v) for v in volumes):
               failures.append(
-                  "Inv-2 (volume mount) — relay service must mount a "
-                  "WRITABLE volume with container TARGET exactly "
-                  "`/var/phantom` (e.g. `phantom-reports:/var/phantom`). "
-                  "A `:ro` short-form or `read_only: true` long-form mount "
-                  "at this target does NOT satisfy the invariant — the relay "
-                  "writes reports/blocklist/push_tokens/prekeys there. "
-                  f"Observed writable targets: {[t for t in writable_targets if t]!r}."
+                  "Inv-2 (durable named-volume mount) — relay service must "
+                  f"mount the docker-compose named volume "
+                  f"`{EXPECTED_VOLUME_SOURCE}` at container TARGET exactly "
+                  f"`{EXPECTED_VOLUME_TARGET}`, WRITABLE, with volume type "
+                  "`volume` (or unspecified). A different source (bind or "
+                  "differently-named volume), a `:ro` short-form, a "
+                  "`read_only: true` long-form, or `type: tmpfs` at the "
+                  "target does NOT satisfy the invariant. The operator "
+                  "sidecar in `docs/tracks/rc-relay-state-dir-repair.md` "
+                  "§5.3 Path A specifically repairs the Docker-managed "
+                  f"`deploy_{EXPECTED_VOLUME_SOURCE}` volume; a rename or "
+                  "type-swap here side-steps that runbook."
+              )
+
+          # Invariant 2b — tmpfs mount MUST NOT shadow /var/phantom.
+          # `tmpfs: [/var/phantom]` on the relay service would silently
+          # discard state every restart even though Inv-2 above passes,
+          # because Docker layers tmpfs mounts on top of volume mounts.
+          # LOCKED at mini-lock §3.2 (only /tmp is tmpfs).
+          tmpfs_entries = relay.get("tmpfs", []) or []
+          if isinstance(tmpfs_entries, (str, dict)):
+              tmpfs_entries = [tmpfs_entries]
+          def _tmpfs_target(entry):
+              if isinstance(entry, str):
+                  return entry.split(":", 1)[0]
+              if isinstance(entry, dict):
+                  return entry.get("target")
+              return None
+          tmpfs_targets = [_tmpfs_target(e) for e in tmpfs_entries]
+          if EXPECTED_VOLUME_TARGET in tmpfs_targets:
+              failures.append(
+                  f"Inv-2b (tmpfs conflict) — relay.tmpfs must NOT include "
+                  f"`{EXPECTED_VOLUME_TARGET}`. A tmpfs mount at that path "
+                  "silently discards the four state files every restart, "
+                  "reintroducing the pre-fix silent-loss even though the "
+                  f"named volume `{EXPECTED_VOLUME_SOURCE}` is present. "
+                  f"Observed tmpfs targets: {[t for t in tmpfs_targets if t]!r}."
               )
 
           # Invariant 3 — RELAY_STATE_DIR: /var/phantom env var.

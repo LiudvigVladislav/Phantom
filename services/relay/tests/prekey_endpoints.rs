@@ -370,3 +370,84 @@ async fn signing_key_rotation_returns_409_conflict() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CONFLICT);
 }
+
+// ── PR-1a §7.1 behavioral gate on the state_dir injection ────────────────────
+
+/// Publish a valid prekey bundle and assert that `prekeys.jsonl` lands
+/// INSIDE the `TempDir` produced by `build_app()` — not in the workspace
+/// CWD or anywhere else. This is the load-bearing positive-injection
+/// contract from PR-1a §7.1, enforced behaviorally rather than
+/// textually: if `build_app()` regresses and stops setting
+/// `cfg.state_dir = tmp.path().to_path_buf()`, the write lands in
+/// workspace `./prekeys.jsonl` and this assertion fires. The prior
+/// textual meta-test in `state_persistence.rs` was removed in round 4
+/// because a string literal like `"cfg.state_dir = tmp.path();"` inside
+/// a helper unit-test could satisfy the pattern check independently of
+/// whether the real call still existed.
+#[tokio::test]
+async fn publish_lands_in_configured_state_dir() {
+    let (app, tmp) = build_app();
+
+    // Reuse the shape from `publish_then_fetch_round_trip_via_http`; the
+    // point here is not to exercise every field but to trigger ONE
+    // successful `POST /prekeys/publish` so the write hits disk.
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+    let identity_hex = synthetic_identity_hex(30); // seed 30 — distinct
+    let spk_pub = [0xCEu8; 32];
+    let created_at_ms: i64 = 1_700_000_100_000;
+    let sig = sign_spk_payload(&signing_kp, &spk_pub, created_at_ms);
+
+    let publish_body = json!({
+        "identity_pubkey_hex": identity_hex,
+        "signing_pubkey_hex": signing_hex,
+        "signed_pre_key": {
+            "key_id": 42,
+            "public_key_hex": hex::encode(spk_pub),
+            "created_at_ms": created_at_ms,
+            "signature_hex": hex::encode(sig),
+        },
+        "one_time_pre_keys": [
+            {
+                "key_id_hex": "1a2b3c4d5e6f70819293a4b5c6d7e8f9",
+                "public_key_hex": hex::encode([0xB1u8; 32]),
+            }
+        ],
+    });
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/prekeys/publish")
+                .header("content-type", "application/json")
+                .body(Body::from(publish_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "publish must succeed");
+
+    // Behavioral contract: the file MUST live under the injected
+    // `TempDir`, not in workspace CWD or process temp default. If a
+    // future refactor of `build_app()` drops the `cfg.state_dir =
+    // tmp.path().to_path_buf()` assignment, the write goes elsewhere
+    // and this fires.
+    let target = tmp.path().join("prekeys.jsonl");
+    let meta = std::fs::metadata(&target).unwrap_or_else(|e| {
+        panic!(
+            "expected {} to exist after a successful /prekeys/publish — \
+             this indicates build_app() no longer injects the tempdir into \
+             RelayConfig.state_dir (regression against PR-1a §7.1). \
+             Underlying error: {}",
+            target.display(),
+            e
+        )
+    });
+    assert!(
+        meta.len() > 0,
+        "{} exists but is empty — the write path reached the file but wrote \
+         nothing, which points at a broken persist step in prekeys.rs",
+        target.display()
+    );
+}
