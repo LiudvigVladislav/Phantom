@@ -153,12 +153,28 @@ Rejected:
   `{"error":"prekey_persist_failed","reason":"<eio_shape>"}` plus
   tracing/metric hooks.
 - Applies to both `publish_prekeys` and `fetch_bundle` consume path.
+- **Atomicity requirement (LOCKED).** A persist failure on either
+  path MUST leave zero observable in-memory mutation. Two shapes are
+  acceptable; PR-1b picks one and pins it in a code comment:
+  - `fetch_bundle` consume — either **persist-first** (compute the
+    post-consume snapshot without touching RAM; persist; on Ok pop
+    the OPK under the write lock and return the bundle; on Err drop
+    the lock without mutation and return 500), OR **rollback-on-
+    failure** (snapshot RAM under the write lock; pop; try persist;
+    on Err restore the snapshot before dropping the lock; on Ok
+    drop and return). Concretely: no code path may return 500 with
+    an OPK already popped from RAM — otherwise a caller retry loop
+    burns the whole pool without any peer receiving a bundle.
+  - `publish_prekeys` — either persist-first over the intended new
+    `StoredPreKeyState` OR rollback-on-failure that restores the
+    identity's prior state (or removes the identity entry entirely
+    when there was no prior state) before dropping the lock.
 - Rationale: prekey persistence is load-bearing for OPK "no double-
   serve across restart" invariant (Sprint 2b-C correctness). Silent-
   swallow here is the direct upstream of observed `OpkNotFound` and
-  TOFU regression classes. Consuming an OPK from RAM that cannot be
-  journaled is worse than not consuming at all — it hands out an OPK
-  the relay cannot remember.
+  TOFU regression classes. A 500 without atomic rollback is worse
+  than the pre-fix silent-swallow — retries burn the pool faster than
+  silent-swallow ever could.
 
 Applies uniformly in PR-1b. Neither behaviour ships in PR-1a (§6).
 
@@ -382,6 +398,21 @@ PR diff. `.gitignore` grep confirms `push_tokens.jsonl` covered.
   loader returns valid + skipped-count metric fires.
 - `prekey_write_failure_returns_500` — inject persist error, assert
   HTTP 500 with structured JSON body.
+- `prekey_consume_persist_failure_preserves_opk` — pins the §4.2
+  atomicity requirement. Publish a bundle with a known OPK `K`;
+  inject persist error on the consume path; call
+  `GET /prekeys/bundle/:identity` and assert HTTP 500; call again
+  with the persist error cleared and assert the returned OPK's
+  `key_id_hex` equals `K`'s (i.e. `K` was NOT popped from RAM by
+  the failed call).
+- `prekey_publish_persist_failure_preserves_previous_state` — pins
+  the §4.2 atomicity requirement for publish. Publish state `S1`
+  successfully; inject persist error and publish state `S2`; assert
+  HTTP 500; clear the persist error and call
+  `GET /prekeys/bundle/:identity`; assert the returned bundle
+  matches `S1` (not `S2`, not 404). Companion no-prior-state case:
+  first-ever publish with persist error → subsequent fetch returns
+  404 (identity NOT partially inserted).
 - `report_write_failure_preserves_2xx_and_logs_error` — audit tier
   path: 2xx preserved, `tracing::error!` fired, counter incremented.
 
@@ -484,7 +515,9 @@ after restart) is subsumed by `RC-RELAY-QUEUE-DURABILITY` via
 10. No `rest_store` persistence without ADR entry acknowledging at-rest
     metadata expansion + security-reviewer sign-off.
 11. No silent-swallow of state write errors in PR-1b. Audit tier
-    logs+metric; correctness tier fails closed.
+    logs+metric; correctness tier fails closed AND leaves zero
+    observable in-memory mutation on persist Err (§4.2 atomicity
+    requirement — persist-first or rollback-on-failure).
 12. No `docker volume rm` witness on the prod `phantom-reports` volume
     — that gate is staging/local/disposable-VPS only.
 13. No manual mutation of prod docker-compose for `:ro` simulated-
