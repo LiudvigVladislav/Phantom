@@ -371,10 +371,21 @@ PR body MUST include outputs of the following against the VPS AFTER
 - `docker exec phantom-relay id` — expect uid=10001(phantom).
 - `docker exec phantom-relay stat -c "%U:%G:%a" /var/phantom` — expect
   `phantom:phantom:750`.
-- `docker exec phantom-relay ls -la /var/phantom` — after at least one
-  publish + report + push_register, expect non-zero-size files.
+- After driving **all four** persistence-family writes (one each of
+  `POST /prekeys/publish`, `POST /report`, `POST /admin/block`,
+  `POST /push/register` — the four handlers are the only writers of
+  the four state files), `docker exec phantom-relay test -s
+  /var/phantom/prekeys.jsonl && test -s /var/phantom/reports.jsonl &&
+  test -s /var/phantom/blocklist.txt && test -s
+  /var/phantom/push_tokens.jsonl` — MUST exit 0 (all four present
+  and non-empty). A `publish + report + push_register` alone would
+  only cover 3 of the 4 files; the missing `admin/block` is
+  load-bearing because `blocklist.txt` is the only file the other
+  three writes never touch.
+- `docker exec phantom-relay ls -la /var/phantom` — list all four
+  files with sizes and mtimes for the reviewer.
 - `docker exec phantom-relay ls / | grep -Ei "\.jsonl|blocklist"` —
-  MUST be empty (no relative-path spill).
+  MUST be empty (no relative-path spill onto the read-only rootfs).
 
 Path A sidecar invocation output (§5.3) MUST also appear in the PR
 body, timestamped before the `up -d --force-recreate` step.
