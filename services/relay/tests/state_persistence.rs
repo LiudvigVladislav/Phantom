@@ -397,18 +397,69 @@ fn state_dir_config_not_env() {
     );
 }
 
+/// Strip `//` line comments (including `///` doc comments) from Rust
+/// source so the meta-test's positive-injection check does NOT match a
+/// pattern that appears only inside a comment. Block comments
+/// (`/* ... */`) are best-effort — a mention inside them still counts,
+/// but block comments are uncommon in Phantom's test files (the house
+/// style is `///` for docs and `//` for inline), so the false-positive
+/// risk is negligible.
+///
+/// A `//` inside a string literal (e.g. `"https://example.com"`) also
+/// truncates the line — a limitation of the simple line-based scan.
+/// Persistence-tier test files control their own shape and can avoid
+/// this by not embedding `//`-containing strings on the same line as
+/// the injection call.
+fn strip_rust_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| match line.split_once("//") {
+            Some((before, _)) => before,
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Return true if the (comment-stripped) line contains a real
+/// `.state_dir` field assignment: `.state_dir` followed by `=` after
+/// optional whitespace, and NOT `==` (which would be a comparison).
+/// Handles multiple occurrences per line so a chain like
+/// `let cfg = { ..cfg, state_dir = p };` still matches.
+fn line_has_state_dir_assign(line: &str) -> bool {
+    let needle = ".state_dir";
+    let mut cursor = 0usize;
+    while let Some(rel) = line[cursor..].find(needle) {
+        let end = cursor + rel + needle.len();
+        let after = line[end..].trim_start();
+        if after.starts_with("==") {
+            cursor = end;
+            continue;
+        }
+        if after.starts_with('=') {
+            return true;
+        }
+        cursor = end;
+    }
+    false
+}
+
 /// PR-1a §7.1 meta-test (positive) — every file in
-/// `PERSISTENCE_TIER_TEST_FILES` MUST include both a
-/// `tempfile::tempdir` construction AND a `state_dir` field
-/// assignment. This is the load-bearing contract: without the
-/// positive-injection shape, a `from_env_for_test()` call falls back
-/// to `PathBuf::from(".")` and the parallel-worker race on the
-/// workspace `./prekeys.jsonl` reintroduces the pre-fix flake.
+/// `PERSISTENCE_TIER_TEST_FILES` MUST contain BOTH a real
+/// `tempfile::tempdir(` call AND a real `.state_dir = ...` field
+/// assignment, both appearing in ACTUAL CODE (not inside `//`
+/// comments). This is the load-bearing contract: without the
+/// positive-injection shape, `from_env_for_test()` falls back to
+/// `PathBuf::from(".")` and the parallel-worker race on the workspace
+/// `./prekeys.jsonl` reintroduces the pre-fix flake — and a
+/// substring check that accepts documentation mentions could silently
+/// stop enforcing the contract if a contributor deletes the real
+/// call while leaving the doc comment in place.
 ///
 /// The check is textual, not semantic, so a contributor that
-/// SPECIFICALLY tries to bypass it (e.g. via macro indirection)
-/// could subvert this. But the check catches the shape any honest
-/// migration produces, which is the point.
+/// SPECIFICALLY tries to bypass it (e.g. via macro indirection) could
+/// subvert this. But the check catches the shape any honest migration
+/// produces, which is the point.
 #[test]
 fn persistence_tier_tests_inject_state_dir_via_tempdir() {
     let tests_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
@@ -423,24 +474,76 @@ fn persistence_tier_tests_inject_state_dir_via_tempdir() {
                 e
             )
         });
-        // Both tokens must appear at least once in the file body. A
-        // brand-new persistence-tier test that only exercises the READ
-        // path could technically get by without either; add it here
-        // only when it writes.
-        let has_tempdir = content.contains("tempfile::tempdir");
-        let has_state_dir_assign = content.contains("state_dir");
-        if !(has_tempdir && has_state_dir_assign) {
+        // Strip line comments so `///` KDoc mentions and `//` inline
+        // comments do NOT count toward the positive contract.
+        let code = strip_rust_line_comments(&content);
+        // Real function-call shape: `tempfile::tempdir(` with opening
+        // paren — a bare `use tempfile::tempdir;` import does not count.
+        let has_tempdir_call = code.contains("tempfile::tempdir(");
+        // Real field-assignment shape: `.state_dir` followed by a single
+        // `=` (rejecting `==`).
+        let has_state_dir_assign =
+            code.lines().any(line_has_state_dir_assign);
+        if !(has_tempdir_call && has_state_dir_assign) {
             missing.push(format!(
-                "{}: tempfile::tempdir={}, state_dir={}",
-                file, has_tempdir, has_state_dir_assign
+                "{}: tempfile::tempdir(...) call in code={}, \
+                 .state_dir = ... assignment in code={}",
+                file, has_tempdir_call, has_state_dir_assign
             ));
         }
     }
     assert!(
         missing.is_empty(),
         "persistence-tier test files MUST inject `RelayConfig.state_dir` \
-         from a per-fixture `tempfile::tempdir()` (positive contract). \
-         Files missing the shape:\n  {}",
+         from a per-fixture `tempfile::tempdir()` call. Both the tempdir \
+         function call AND the `.state_dir =` assignment MUST appear in \
+         actual code, not inside `//` comments — otherwise a contributor \
+         can silently regress the shape by deleting the real call and \
+         relying on the doc mention. Files missing the shape:\n  {}",
         missing.join("\n  ")
     );
+}
+
+/// Sanity check on the two helpers so a refactor of them cannot silently
+/// weaken the positive meta-test. If these ever fail, the meta-test
+/// itself is broken and cannot be trusted.
+#[test]
+fn strip_rust_line_comments_helper_is_correct() {
+    // No comments — line passes through unchanged.
+    assert_eq!(strip_rust_line_comments("let x = 1;"), "let x = 1;");
+    // Trailing `//` comment stripped (whitespace before `//` preserved).
+    assert_eq!(strip_rust_line_comments("let x = 1; // comment"), "let x = 1; ");
+    // `///` doc comment on its own line becomes empty; a code line on
+    // the following line is preserved intact.
+    assert_eq!(
+        strip_rust_line_comments("/// doc\nlet x = tempfile::tempdir();"),
+        "\nlet x = tempfile::tempdir();"
+    );
+    // A comment-only line reduces to empty text.
+    assert_eq!(strip_rust_line_comments("// only comment"), "");
+    // A `//` inside code (e.g. a URL string) also truncates the line —
+    // this is the acknowledged limitation of the simple line-scan and
+    // the reason persistence-tier files avoid URL literals on the same
+    // line as the injection call.
+    assert_eq!(strip_rust_line_comments("let u = \"http://a\";"), "let u = \"http:");
+}
+
+#[test]
+fn line_has_state_dir_assign_helper_is_correct() {
+    // Canonical Rust field-access-plus-assignment shapes match.
+    assert!(line_has_state_dir_assign("cfg.state_dir = tmp.path();"));
+    assert!(line_has_state_dir_assign("something.state_dir=x"));
+    assert!(line_has_state_dir_assign("cfg.state_dir  =  path"));
+    // `==` is a comparison, not an assignment.
+    assert!(!line_has_state_dir_assign("if cfg.state_dir == tmp {"));
+    // A mention without any `=` after is not an assignment.
+    assert!(!line_has_state_dir_assign("cfg.state_dir.push(\"file\");"));
+    // The word `state_dir` alone (no leading dot) is not the field-
+    // access shape we require — the helper looks specifically for
+    // `.state_dir` to distinguish struct-field assignment from a
+    // local-variable binding that happens to be called `state_dir`.
+    assert!(!line_has_state_dir_assign("let state_dir = tmp;"));
+    // Whitespace between the dot and the field name is NOT valid Rust
+    // for field access — the helper does not (and should not) accept it.
+    assert!(!line_has_state_dir_assign("cfg . state_dir = tmp;"));
 }

@@ -236,38 +236,63 @@ jobs:
                   "load-bearing rootfs posture the state-dir fix depends on."
               )
 
-          # Invariant 2 — writable volume mount whose CONTAINER TARGET is
+          # Invariant 2 — WRITABLE volume mount whose CONTAINER TARGET is
           # exactly /var/phantom (not a superstring like /var/phantom_bak).
           # Splitting the target from RELAY_STATE_DIR (Inv-3) lands writes
-          # back on the read-only rootfs (Inv-1).
+          # back on the read-only rootfs (Inv-1). A `:ro` short-form mount
+          # or a long-form dict with `read_only: true` is REJECTED — the
+          # relay writes there, so a read-only bind produces EACCES on
+          # every append.
           volumes = relay.get("volumes", []) or []
-          def _mount_target(entry):
+          # Modes that keep the mount writable but may appear as trailing
+          # tokens. `ro` is intentionally OMITTED here — its presence
+          # anywhere in the mode list disqualifies the mount.
+          WRITABLE_MODES = {
+              "rw", "z", "Z",
+              "shared", "slave", "private",
+              "rshared", "rslave", "rprivate",
+              "consistent", "cached", "delegated",
+          }
+          def _writable_mount_target(entry):
+              """
+              Return the CONTAINER TARGET path if the mount is writable at
+              that target, else None. Rejects read-only mounts (short-form
+              `:ro`, comma-separated `:ro,z`, or long-form `read_only: true`).
+              """
               if isinstance(entry, dict):
-                  # docker-compose long form: {"target": "/var/phantom", ...}
+                  # docker-compose long form:
+                  # {"source": ..., "target": "/var/phantom", "read_only": bool}
+                  if entry.get("read_only") is True:
+                      return None
                   return entry.get("target")
               if isinstance(entry, str):
                   s = entry.strip()
-                  # Split at LAST colon so bind-mount modes like ":ro" attach
-                  # after the target; standard short form is
-                  # `[SOURCE:]TARGET[:MODE]`. Iterate suffix modes off:
+                  # Short form: `[SOURCE:]TARGET[:MODE[,MODE...]]`.
                   parts = s.split(":")
-                  if len(parts) >= 2:
-                      # Drop trailing MODE tokens (e.g. "ro", "rw") if any.
-                      modes = {"ro", "rw", "z", "Z", "shared", "slave", "private",
-                               "rshared", "rslave", "rprivate"}
-                      while parts and parts[-1] in modes:
-                          parts.pop()
-                      if len(parts) >= 2:
-                          # Target is the last remaining segment.
-                          return parts[-1]
+                  if len(parts) < 2:
+                      return None
+                  # If the last segment is a mode-list (all tokens known),
+                  # check for `ro` inside and pop off.
+                  last = parts[-1]
+                  last_tokens = last.split(",")
+                  if all(tok in WRITABLE_MODES or tok == "ro" for tok in last_tokens):
+                      if "ro" in last_tokens:
+                          return None
+                      parts.pop()
+                      if len(parts) < 2:
+                          return None
+                  return parts[-1]
               return None
-          mount_targets = [_mount_target(v) for v in volumes]
-          if "/var/phantom" not in mount_targets:
+          writable_targets = [_writable_mount_target(v) for v in volumes]
+          if "/var/phantom" not in writable_targets:
               failures.append(
-                  "Inv-2 (volume mount) — relay service must mount a writable "
-                  "volume with container TARGET exactly `/var/phantom` "
-                  "(e.g. `phantom-reports:/var/phantom`). Observed targets: "
-                  f"{[t for t in mount_targets if t]!r}."
+                  "Inv-2 (volume mount) — relay service must mount a "
+                  "WRITABLE volume with container TARGET exactly "
+                  "`/var/phantom` (e.g. `phantom-reports:/var/phantom`). "
+                  "A `:ro` short-form or `read_only: true` long-form mount "
+                  "at this target does NOT satisfy the invariant — the relay "
+                  "writes reports/blocklist/push_tokens/prekeys there. "
+                  f"Observed writable targets: {[t for t in writable_targets if t]!r}."
               )
 
           # Invariant 3 — RELAY_STATE_DIR: /var/phantom env var.
@@ -284,31 +309,57 @@ jobs:
               )
 
           # Invariant 4 — Dockerfile WORKDIR /var/phantom defence-in-depth,
-          # anchored to an ACTUAL DIRECTIVE (not text inside a comment).
-          # Stage 2 must declare `WORKDIR /var/phantom` so a future
-          # refactor that reintroduces a relative-path write still lands
-          # inside the writable volume instead of `/` on the read-only
-          # rootfs.
-          def _has_workdir_directive(source: str, target: str) -> bool:
-              for raw in source.splitlines():
-                  # Strip leading whitespace; a Dockerfile directive starts
-                  # in column 0 or after indentation, but never after `#`
-                  # (which begins a comment for the rest of the line).
+          # anchored to an ACTUAL DIRECTIVE (not text inside a comment)
+          # AND scoped to the `AS runtime` stage (not the builder). A
+          # WORKDIR in Stage 1 only affects the build image; a runtime
+          # container that inherits from `AS runtime` sees the default
+          # `/` CWD unless the runtime stage itself sets WORKDIR. So a
+          # `WORKDIR /var/phantom` present only inside `AS builder`
+          # would silently reintroduce the pre-fix bug.
+          def _has_workdir_directive_in_stage(source: str, target: str, stage: str) -> bool:
+              lines = source.splitlines()
+              # Find the FROM ... AS <stage> line (case-insensitive on the
+              # directive keywords, case-sensitive on the stage name because
+              # Docker is case-insensitive on FROM/AS keywords but treats
+              # the alias itself as its literal string).
+              stage_start = None
+              for i, raw in enumerate(lines):
                   line = raw.split("#", 1)[0].strip()
                   if not line:
                       continue
-                  # Support single or double-space between directive and arg.
+                  parts = line.split()
+                  if (
+                      len(parts) >= 4
+                      and parts[0].upper() == "FROM"
+                      and parts[-2].upper() == "AS"
+                      and parts[-1] == stage
+                  ):
+                      stage_start = i
+                      break
+              if stage_start is None:
+                  return False
+              # Scan every subsequent line until the next FROM (which starts
+              # a new stage) or EOF.
+              for raw in lines[stage_start + 1:]:
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  parts = line.split()
+                  if parts and parts[0].upper() == "FROM":
+                      break  # entered a new stage
                   if line == f"WORKDIR {target}" or line.startswith(
                       f"WORKDIR {target} "
                   ) or line.startswith(f"WORKDIR {target}\t"):
                       return True
               return False
-          if not _has_workdir_directive(dockerfile, "/var/phantom"):
+          if not _has_workdir_directive_in_stage(dockerfile, "/var/phantom", "runtime"):
               failures.append(
                   "Inv-4 (Dockerfile WORKDIR) — services/relay/Dockerfile "
                   "must declare an uncommented `WORKDIR /var/phantom` "
-                  "directive in its runtime stage. A `WORKDIR /var/phantom` "
-                  "token appearing only inside a `#` comment does NOT count."
+                  "directive INSIDE the `FROM ... AS runtime` stage. "
+                  "A `WORKDIR /var/phantom` token in a `#` comment does NOT "
+                  "count, and a WORKDIR directive in the builder stage does "
+                  "NOT satisfy the runtime CWD invariant."
               )
 
           if failures:
