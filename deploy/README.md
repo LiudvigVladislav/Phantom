@@ -51,9 +51,32 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw allow 443/udp   # HTTP/3 (QUIC)
 
-# 5. Give Caddy a directory for report logs — the relay container writes
-#    abuse reports here.
-sudo mkdir -p /var/phantom && sudo chown 10001:10001 /var/phantom
+# 5. State persistence (RC-RELAY-STATE-DIR-REPAIR PR-1a).
+#
+#    The relay writes four append-log files (reports.jsonl, blocklist.txt,
+#    push_tokens.jsonl, prekeys.jsonl) to the directory named by the
+#    RELAY_STATE_DIR env var (default /var/phantom, set by deploy/docker-
+#    compose.yml). The compose file bind-mounts the named volume
+#    phantom-reports at that path, and the relay's Dockerfile stage 2
+#    seeds the in-image `/var/phantom` with `phantom:phantom 0750` so
+#    writes succeed on a FRESH deploy.
+#
+#    An EXISTING production `phantom-reports` volume created before this
+#    fix is owned root:root — Docker only seeds ownership on the first
+#    mount to an empty volume. Before `docker compose up -d
+#    --force-recreate relay` on an existing deploy, run the one-shot
+#    sidecar (docs/tracks/rc-relay-state-dir-repair.md §5.3 Path A):
+#
+#      docker run --rm \
+#        -v deploy_phantom-reports:/d \
+#        alpine:3.20 \
+#        sh -c 'chown -R 10001:10001 /d && chmod 750 /d'
+#
+#    The pre-fix host-side `sudo mkdir -p /var/phantom && sudo chown
+#    10001:10001 /var/phantom` line was misleading — Docker stores the
+#    named volume under `/var/lib/docker/volumes/deploy_phantom-reports/
+#    _data`, not `/var/phantom` on the host, so the chmod had no effect.
+#    Do NOT reintroduce it.
 ```
 
 ---

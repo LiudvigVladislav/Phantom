@@ -53,7 +53,28 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --shell /usr/sbin/nologin phantom
 
+# RC-RELAY-STATE-DIR-REPAIR PR-1a §5.1: seed the state-file directory the
+# relay writes reports.jsonl / blocklist.txt / push_tokens.jsonl /
+# prekeys.jsonl to. Owned by uid 10001 (phantom) with 750 so writes from
+# the running container succeed against the volume mounted at this path
+# by deploy/docker-compose.yml. The chown/chmod only take effect on the
+# FIRST mount to an empty named volume — an already-populated production
+# volume requires the operator sidecar in
+# `docs/tracks/rc-relay-state-dir-repair.md` §5.3 Path A before deploy.
+RUN mkdir -p /var/phantom \
+    && chown phantom:phantom /var/phantom \
+    && chmod 750 /var/phantom
+
 COPY --from=builder /build/target/release/phantom-relay /usr/local/bin/phantom-relay
+
+# RC-RELAY-STATE-DIR-REPAIR PR-1a §5.1: WORKDIR /var/phantom is
+# defence-in-depth against a future refactor reintroducing a bare
+# relative-path write. The canonical resolution path is via
+# `RelayConfig.state_dir` (env `RELAY_STATE_DIR`, default `/var/phantom`)
+# so a code-side change is the primary contract; WORKDIR is a belt-and-
+# suspenders backstop that keeps a stray relative write inside the
+# writable volume instead of landing at `/` on the read-only rootfs.
+WORKDIR /var/phantom
 
 USER phantom
 EXPOSE 8080

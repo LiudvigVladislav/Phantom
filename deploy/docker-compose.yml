@@ -77,11 +77,22 @@ services:
     tmpfs:
       - /tmp:size=16m
     volumes:
+      # RC-RELAY-STATE-DIR-REPAIR PR-1a: this mount pairs with
+      # `RELAY_STATE_DIR: /var/phantom` in `environment:` below. A rename
+      # of either side without the other reintroduces the pre-fix silent-
+      # EROFS bug — the deploy-lint CI gate asserts both are present
+      # in-sync. See `docs/tracks/rc-relay-state-dir-repair.md` §5.2 and
+      # §7.2.
       - phantom-reports:/var/phantom
     # Default ntfy URL inside the docker network — overridable via .env if
     # the operator runs ntfy outside the compose stack.
     environment:
       RELAY_NTFY_URL: ${RELAY_NTFY_URL:-http://ntfy:80}
+      # RC-RELAY-STATE-DIR-REPAIR PR-1a §5.2: base directory the relay
+      # writes reports.jsonl / blocklist.txt / push_tokens.jsonl /
+      # prekeys.jsonl to. MUST match the volume target above. See
+      # `docs/tracks/rc-relay-state-dir-repair.md` §5.2.
+      RELAY_STATE_DIR: /var/phantom
 
   caddy:
     image: caddy:2.8-alpine

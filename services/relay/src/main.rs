@@ -79,6 +79,7 @@ async fn main() {
         rate_limit = cfg.rate_limit_per_window,
         admin_token_set = cfg.secret_token.is_some(),
         ws_auth = "signed-challenge (Ed25519)",
+        state_dir = %cfg.state_dir.display(),
         "phantom-relay starting"
     );
 

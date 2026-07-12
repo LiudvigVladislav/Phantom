@@ -49,6 +49,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
@@ -84,10 +85,20 @@ const MAX_OPKS_PER_PUBLISH: usize = 100;
 /// publishes a single identity must not be able to grow its pool past this.
 const MAX_OPKS_PER_IDENTITY: usize = 200;
 
-/// JSONL file the relay appends every publish/rotate/consume event to.
-/// Rebuilt on startup (best-effort) by replaying the file. Same pattern as
-/// `reports.jsonl` in `state.rs`.
-const PREKEYS_FILE: &str = "prekeys.jsonl";
+/// Basename of the JSONL file the relay appends every publish/rotate/consume
+/// event to. Full path is `state_dir.join(PREKEYS_FILENAME)` — see
+/// `PreKeyStore::new`. Rebuilt on startup (best-effort) by replaying the file.
+/// Same pattern as `reports.jsonl` in `state.rs`.
+///
+/// RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1: the write-target was previously a
+/// bare relative filename that resolved against the container CWD (`/` on the
+/// runtime image), so every append silently `EROFS`'d against the read-only
+/// rootfs. The basename is now joined with `RelayConfig.state_dir` at
+/// construction so writes land in the writable named volume mounted at
+/// `/var/phantom`. The `if let Ok(mut f) = OpenOptions::new()...open(path)`
+/// swallow-shape is intentionally preserved in this PR — the fail-loud flip
+/// belongs to PR-1b (§4.2 tiered policy + §5.1a atomicity).
+pub(crate) const PREKEYS_FILENAME: &str = "prekeys.jsonl";
 
 // ── Wire types ──────────────────────────────────────────────────────────────
 
@@ -185,6 +196,12 @@ pub struct PreKeyStore {
     rate: RwLock<HashMap<String, RateBucket>>,
     /// Monotonic disk write counter for testing the persistence path.
     pub disk_writes: AtomicU64,
+    /// Full path to the `prekeys.jsonl` append-log. Computed at construction
+    /// as `state_dir.join(PREKEYS_FILENAME)` — see `PreKeyStore::new`. Every
+    /// `append_to_disk` and boot-time `load_from_disk` resolves against this
+    /// path. Empty (`PathBuf::new()`) inside test-only `PreKeyStore::empty`
+    /// so writes silent-fail without hitting the workspace filesystem.
+    prekeys_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -193,29 +210,34 @@ pub struct RateBucket {
     pub window_start: std::time::Instant,
 }
 
-impl Default for PreKeyStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PreKeyStore {
-    pub fn new() -> Self {
+    /// Construct a store rooted at `state_dir`. Reads
+    /// `state_dir.join(PREKEYS_FILENAME)` (best-effort — missing / corrupt
+    /// files yield an empty map, per the pre-fix behaviour preserved for
+    /// PR-1a scope). Every subsequent `publish` / `consume` / `delete_opk`
+    /// call appends to the same joined path.
+    pub fn new(state_dir: &Path) -> Self {
+        let prekeys_file = state_dir.join(PREKEYS_FILENAME);
         Self {
-            inner: RwLock::new(load_from_disk()),
+            inner: RwLock::new(load_from_disk(&prekeys_file)),
             rate: RwLock::new(HashMap::new()),
             disk_writes: AtomicU64::new(0),
+            prekeys_file,
         }
     }
 
-    /// Test-only constructor that skips disk replay. Real production paths
-    /// always go through [`new`] which seeds from `prekeys.jsonl`.
+    /// Test-only constructor that skips disk replay AND uses an empty path
+    /// so any subsequent write silent-fails (the pre-fix `if let Ok(f)`
+    /// swallow-shape catches the `EINVAL` on an empty path). Real
+    /// production paths always go through [`new`] which seeds from
+    /// `state_dir.join(PREKEYS_FILENAME)`.
     #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
             rate: RwLock::new(HashMap::new()),
             disk_writes: AtomicU64::new(0),
+            prekeys_file: PathBuf::new(),
         }
     }
 
@@ -289,7 +311,7 @@ impl PreKeyStore {
         map.insert(identity_pubkey_hex.to_string(), stored.clone());
         drop(map);
         // Persist outside the lock so the disk write doesn't block readers.
-        append_to_disk(&stored);
+        append_to_disk(&self.prekeys_file, &stored);
         self.disk_writes.fetch_add(1, Ordering::Relaxed);
         Ok(count)
     }
@@ -316,7 +338,7 @@ impl PreKeyStore {
         // Persist the post-consume state so a relay restart doesn't
         // hand out the same OPK twice.
         if one_time.is_some() {
-            append_to_disk(&snapshot);
+            append_to_disk(&self.prekeys_file, &snapshot);
             self.disk_writes.fetch_add(1, Ordering::Relaxed);
         }
         Some(bundle)
@@ -400,7 +422,7 @@ impl PreKeyStore {
         }
         let snapshot = entry.clone();
         drop(map);
-        append_to_disk(&snapshot);
+        append_to_disk(&self.prekeys_file, &snapshot);
         self.disk_writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -648,13 +670,14 @@ pub fn random_opk_id_hex() -> String {
 
 // ── Persistence ─────────────────────────────────────────────────────────────
 
-/// Best-effort load of the prekey store from disk. Each line is a JSON
+/// Best-effort load of the prekey store from `path`. Each line is a JSON
 /// snapshot of one identity's [`StoredPreKeyState`]; the most recent line
 /// for a given identity wins (replay-style). If the file is missing or
 /// corrupt the relay starts empty — same forgiving behavior as
-/// `state::load_reports_from_disk`.
-fn load_from_disk() -> HashMap<String, StoredPreKeyState> {
-    let Ok(content) = std::fs::read_to_string(PREKEYS_FILE) else {
+/// `state::load_reports_from_disk`. `path` is the joined
+/// `state_dir/prekeys.jsonl` — see `PreKeyStore::new`.
+fn load_from_disk(path: &Path) -> HashMap<String, StoredPreKeyState> {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return HashMap::new();
     };
     let mut map: HashMap<String, StoredPreKeyState> = HashMap::new();
@@ -666,12 +689,12 @@ fn load_from_disk() -> HashMap<String, StoredPreKeyState> {
     map
 }
 
-fn append_to_disk(state: &StoredPreKeyState) {
+fn append_to_disk(path: &Path, state: &StoredPreKeyState) {
     if let Ok(line) = serde_json::to_string(state) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(PREKEYS_FILE)
+            .open(path)
         {
             let _ = writeln!(f, "{}", line);
         }

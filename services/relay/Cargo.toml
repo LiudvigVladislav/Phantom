@@ -37,3 +37,8 @@ socket2 = { version = "0.5", features = ["all"] }
 tokio-test = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
+# RC-RELAY-STATE-DIR-REPAIR PR-1a §7.1: integration tests inject a
+# tempdir into RelayConfig.state_dir rather than reaching for env::set_var,
+# which races between parallel test workers. Restricted to dev-dependencies
+# so the runtime binary never links tempfile.
+tempfile = "3"

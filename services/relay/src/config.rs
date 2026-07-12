@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 Willen LLC
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::seq_mac::SeqMacRootKey;
@@ -312,6 +313,40 @@ pub struct RelayConfig {
     /// Locked design in `C:\temp\direct-wss-fix-family-2026-07-08\
     /// k11-design-note.md` §5B.
     pub diag_poll_shape_echo_enabled: bool,
+
+    // ── State directory (RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1) ──────────────
+    //
+    /// Base directory the relay writes its four persistent state files to
+    /// (`reports.jsonl`, `blocklist.txt`, `push_tokens.jsonl`,
+    /// `prekeys.jsonl`). Sourced from `RELAY_STATE_DIR` env var; default
+    /// `/var/phantom` matches the compose volume mount at
+    /// `deploy/docker-compose.yml`. Threaded into `AppState::new` and
+    /// `PreKeyStore::new` so every loader / writer resolves paths against
+    /// this root instead of the process CWD.
+    ///
+    /// Prior to this change every write resolved against the container
+    /// CWD (`/` on the runtime image, no `WORKDIR` in `Dockerfile` Stage 2)
+    /// while `deploy/docker-compose.yml` mounted `phantom-reports` at
+    /// `/var/phantom` and set `read_only: true` on the rootfs — every
+    /// write therefore silently failed with `EROFS` under the
+    /// `if let Ok(mut f) = OpenOptions::new()...open(FILE)` swallow-shape
+    /// still preserved for the PR-1a scope. See
+    /// `docs/tracks/rc-relay-state-dir-repair.md` §3.1-§3.6 for the code-
+    /// recon.
+    ///
+    /// PR-1a intentionally does NOT flip the swallow-shape; that lands in
+    /// PR-1b together with a boot-time writable preflight, `fs2` singleton
+    /// lock, and the per-tier failure policy from §4.2. Deploying PR-1a to
+    /// the existing production volume also requires the operator one-shot
+    /// sidecar in `docs/tracks/rc-relay-state-dir-repair.md` §5.3 Path A
+    /// to fix the volume's `root:root` seeding first — the Dockerfile
+    /// `chown` in §5.1 only affects fresh volumes.
+    ///
+    /// Tests inject a `tempfile::tempdir()` path here rather than calling
+    /// `env::set_var("RELAY_STATE_DIR")` — the env-var route races between
+    /// parallel test workers (see the §7.1 `state_dir_config_not_env`
+    /// meta-test).
+    pub state_dir: PathBuf,
 }
 
 /// Strict-parse helper for `RELAY_DIAG_WS_K9_DOWNLINK_PROBE_ENABLED`.
@@ -402,6 +437,14 @@ impl RelayConfig {
             // exercise the `/diag/poll-shape` endpoint construct a config
             // with this set to `true`.
             diag_poll_shape_echo_enabled: false,
+            // RC-RELAY-STATE-DIR-REPAIR PR-1a: workspace CWD for test-fixture
+            // config. Tests that exercise state-file persistence override
+            // this field explicitly with a `tempfile::tempdir()` path; the
+            // `state_dir_config_not_env` meta-test asserts none of them
+            // reaches for `env::set_var("RELAY_STATE_DIR")` (races between
+            // parallel workers). See `docs/tracks/rc-relay-state-dir-repair.md`
+            // §7.1.
+            state_dir: PathBuf::from("."),
         }
     }
 
@@ -534,6 +577,17 @@ impl RelayConfig {
                     .ok()
                     .as_deref(),
             ),
+            // RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1: base directory the relay
+            // writes its four state files to. Default `/var/phantom` matches
+            // the compose volume mount and the Dockerfile `WORKDIR`; the env
+            // var lets the operator override in staging without rebuilding
+            // the image. See `docs/tracks/rc-relay-state-dir-repair.md` §4.1
+            // for why this is env-driven (not an absolute const) and §4.1's
+            // rejection of `PHANTOM_STATE_DIR` in favour of the `RELAY_*`
+            // convention.
+            state_dir: std::env::var("RELAY_STATE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/var/phantom")),
         }
     }
 }
