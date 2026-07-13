@@ -28,6 +28,7 @@ on:
     branches: [master]
     paths:
       - 'deploy/docker-compose.yml'
+      - 'services/relay/Dockerfile'
       - '.github/workflows/deploy-lint.yml'
   pull_request:
     branches: [master]
@@ -62,12 +63,13 @@ jobs:
             head="${{ github.event.pull_request.head.sha }}"
             if git diff --name-only "$base" "$head" -- \
                 'deploy/docker-compose.yml' \
+                'services/relay/Dockerfile' \
                 '.github/workflows/deploy-lint.yml' \
                 | grep -q .; then
               echo "relevant=true" >> "$GITHUB_OUTPUT"
             else
               echo "relevant=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::No deploy/docker-compose.yml or workflow changes — skipping loopback check."
+              echo "::notice::No deploy/docker-compose.yml / Dockerfile / workflow changes — skipping deploy-lint gates."
             fi
           else
             echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -152,3 +154,354 @@ jobs:
 
           print("All relay port bindings are loopback-only. PASS.")
           PYEOF
+
+  # RC-RELAY-STATE-DIR-REPAIR PR-1a §7.2 — assert that the relay service's
+  # state-file persistence contract is intact end-to-end across compose and
+  # Dockerfile. All FOUR checks below must hold, else prod ships the pre-fix
+  # silent-EROFS regression (docs/tracks/rc-relay-state-dir-repair.md §3.1-6).
+  relay-state-dir-invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect state-dir-lint-relevant changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$base" "$head" -- \
+                'deploy/docker-compose.yml' \
+                'services/relay/Dockerfile' \
+                '.github/workflows/deploy-lint.yml' \
+                | grep -q .; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No compose or Dockerfile changes — skipping state-dir invariants."
+            fi
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install PyYAML
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          python3 -m pip install --quiet --user PyYAML
+          python3 -c "import yaml; print(f'PyYAML {yaml.__version__}')"
+
+      - name: Verify relay state-dir persistence invariants
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import sys
+          import yaml
+
+          COMPOSE = "deploy/docker-compose.yml"
+          DOCKERFILE = "services/relay/Dockerfile"
+
+          try:
+              with open(COMPOSE, "r", encoding="utf-8") as f:
+                  doc = yaml.safe_load(f)
+          except FileNotFoundError:
+              print(f"::error file={COMPOSE}::compose file missing")
+              sys.exit(2)
+
+          try:
+              with open(DOCKERFILE, "r", encoding="utf-8") as f:
+                  dockerfile = f.read()
+          except FileNotFoundError:
+              print(f"::error file={DOCKERFILE}::Dockerfile missing")
+              sys.exit(2)
+
+          services = (doc or {}).get("services", {}) or {}
+          relay = services.get("relay", {}) or {}
+
+          failures = []
+
+          # Invariant 1 — read_only:true on the relay rootfs.
+          # If this regresses the pre-fix silent-EROFS bug becomes silently
+          # invisible again (writes might succeed against a writable rootfs
+          # depending on other config), which reintroduces the observability
+          # gap the fix closes. LOCKED at mini-lock §3.2.
+          if relay.get("read_only") is not True:
+              failures.append(
+                  "Inv-1 (read_only:true) — relay service must set "
+                  "`read_only: true` at deploy/docker-compose.yml. This is the "
+                  "load-bearing rootfs posture the state-dir fix depends on."
+              )
+
+          # Invariant 2 — DURABLE NAMED-VOLUME mount that Path A can repair:
+          # the docker-compose named volume `phantom-reports` MUST be
+          # attached to container TARGET exactly `/var/phantom`, WRITABLE,
+          # with volume type `volume` (or unspecified — Docker's default).
+          # A tmpfs mount at the same target would silently discard state
+          # every restart; a bind mount would side-step the operator
+          # sidecar in mini-lock §5.3 Path A which specifically repairs
+          # the Docker-managed `deploy_phantom-reports` volume. A `:ro`
+          # short-form or `read_only: true` long-form is REJECTED because
+          # the relay writes there and read-only produces EACCES on every
+          # append.
+          EXPECTED_VOLUME_SOURCE = "phantom-reports"
+          EXPECTED_VOLUME_TARGET = "/var/phantom"
+          volumes = relay.get("volumes", []) or []
+          # Modes that keep the mount writable but may appear as trailing
+          # tokens. `ro` is intentionally OMITTED here — its presence
+          # anywhere in the mode list disqualifies the mount.
+          WRITABLE_MODES = {
+              "rw", "z", "Z",
+              "shared", "slave", "private",
+              "rshared", "rslave", "rprivate",
+              "consistent", "cached", "delegated",
+          }
+          def _is_expected_named_volume_mount(entry):
+              """
+              Return True iff `entry` describes the docker-compose named
+              volume `phantom-reports` attached WRITABLY to the container
+              path `/var/phantom` with volume type `volume` (or
+              unspecified). Rejects everything else — different source,
+              different target, tmpfs / bind type, read-only mode.
+              """
+              if isinstance(entry, dict):
+                  # docker-compose long form.
+                  if entry.get("read_only") is True:
+                      return False
+                  vol_type = entry.get("type")
+                  # `type` unspecified → Docker's default is `volume`.
+                  if vol_type not in (None, "volume"):
+                      return False
+                  return (
+                      entry.get("source") == EXPECTED_VOLUME_SOURCE
+                      and entry.get("target") == EXPECTED_VOLUME_TARGET
+                  )
+              if isinstance(entry, str):
+                  s = entry.strip()
+                  # Short form: `SOURCE:TARGET[:MODE[,MODE...]]`.
+                  parts = s.split(":")
+                  if len(parts) < 2:
+                      return False
+                  # If the last segment is a mode-list (all tokens known),
+                  # check for `ro` inside and pop off.
+                  last = parts[-1]
+                  last_tokens = last.split(",")
+                  if all(tok in WRITABLE_MODES or tok == "ro" for tok in last_tokens):
+                      if "ro" in last_tokens:
+                          return False
+                      parts.pop()
+                  if len(parts) != 2:
+                      # `TARGET` alone (bare bind at container path) or an
+                      # unrecognised shape — neither is our named volume.
+                      return False
+                  source, target = parts
+                  return (
+                      source == EXPECTED_VOLUME_SOURCE
+                      and target == EXPECTED_VOLUME_TARGET
+                  )
+              return False
+          if not any(_is_expected_named_volume_mount(v) for v in volumes):
+              failures.append(
+                  "Inv-2 (durable named-volume mount) — relay service must "
+                  f"mount the docker-compose named volume "
+                  f"`{EXPECTED_VOLUME_SOURCE}` at container TARGET exactly "
+                  f"`{EXPECTED_VOLUME_TARGET}`, WRITABLE, with volume type "
+                  "`volume` (or unspecified). A different source (bind or "
+                  "differently-named volume), a `:ro` short-form, a "
+                  "`read_only: true` long-form, or `type: tmpfs` at the "
+                  "target does NOT satisfy the invariant. The operator "
+                  "sidecar in `docs/tracks/rc-relay-state-dir-repair.md` "
+                  "§5.3 Path A specifically repairs the Docker-managed "
+                  f"`deploy_{EXPECTED_VOLUME_SOURCE}` volume; a rename or "
+                  "type-swap here side-steps that runbook."
+              )
+
+          # Invariant 2b — tmpfs mount MUST NOT shadow /var/phantom.
+          # `tmpfs: [/var/phantom]` on the relay service would silently
+          # discard state every restart even though Inv-2 above passes,
+          # because Docker layers tmpfs mounts on top of volume mounts.
+          # LOCKED at mini-lock §3.2 (only /tmp is tmpfs).
+          tmpfs_entries = relay.get("tmpfs", []) or []
+          if isinstance(tmpfs_entries, (str, dict)):
+              tmpfs_entries = [tmpfs_entries]
+          def _tmpfs_target(entry):
+              if isinstance(entry, str):
+                  return entry.split(":", 1)[0]
+              if isinstance(entry, dict):
+                  return entry.get("target")
+              return None
+          tmpfs_targets = [_tmpfs_target(e) for e in tmpfs_entries]
+          if EXPECTED_VOLUME_TARGET in tmpfs_targets:
+              failures.append(
+                  f"Inv-2b (tmpfs conflict) — relay.tmpfs must NOT include "
+                  f"`{EXPECTED_VOLUME_TARGET}`. A tmpfs mount at that path "
+                  "silently discards the four state files every restart, "
+                  "reintroducing the pre-fix silent-loss even though the "
+                  f"named volume `{EXPECTED_VOLUME_SOURCE}` is present. "
+                  f"Observed tmpfs targets: {[t for t in tmpfs_targets if t]!r}."
+              )
+
+          # Invariant 3 — RELAY_STATE_DIR: /var/phantom env var.
+          # The path MUST match the volume target above (Inv-2). Also
+          # matches the Dockerfile WORKDIR (Inv-4).
+          env = relay.get("environment", {}) or {}
+          state_dir_env = env.get("RELAY_STATE_DIR") if isinstance(env, dict) else None
+          if state_dir_env != "/var/phantom":
+              failures.append(
+                  "Inv-3 (RELAY_STATE_DIR env) — relay service must set "
+                  "`RELAY_STATE_DIR: /var/phantom` under `environment:` at "
+                  "deploy/docker-compose.yml. Current value: "
+                  f"{state_dir_env!r}."
+              )
+
+          # Invariant 4 — Dockerfile WORKDIR /var/phantom defence-in-depth,
+          # anchored to an ACTUAL DIRECTIVE (not text inside a comment)
+          # AND scoped to the `AS runtime` stage (not the builder). A
+          # WORKDIR in Stage 1 only affects the build image; a runtime
+          # container that inherits from `AS runtime` sees the default
+          # `/` CWD unless the runtime stage itself sets WORKDIR. So a
+          # `WORKDIR /var/phantom` present only inside `AS builder`
+          # would silently reintroduce the pre-fix bug.
+          def _has_workdir_directive_in_stage(source: str, target: str, stage: str) -> bool:
+              lines = source.splitlines()
+              # Find the FROM ... AS <stage> line (case-insensitive on the
+              # directive keywords, case-sensitive on the stage name because
+              # Docker is case-insensitive on FROM/AS keywords but treats
+              # the alias itself as its literal string).
+              stage_start = None
+              for i, raw in enumerate(lines):
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  parts = line.split()
+                  if (
+                      len(parts) >= 4
+                      and parts[0].upper() == "FROM"
+                      and parts[-2].upper() == "AS"
+                      and parts[-1] == stage
+                  ):
+                      stage_start = i
+                      break
+              if stage_start is None:
+                  return False
+              # Scan every subsequent line until the next FROM (which starts
+              # a new stage) or EOF.
+              for raw in lines[stage_start + 1:]:
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  parts = line.split()
+                  if parts and parts[0].upper() == "FROM":
+                      break  # entered a new stage
+                  if line == f"WORKDIR {target}" or line.startswith(
+                      f"WORKDIR {target} "
+                  ) or line.startswith(f"WORKDIR {target}\t"):
+                      return True
+              return False
+          if not _has_workdir_directive_in_stage(dockerfile, "/var/phantom", "runtime"):
+              failures.append(
+                  "Inv-4 (Dockerfile WORKDIR) — services/relay/Dockerfile "
+                  "must declare an uncommented `WORKDIR /var/phantom` "
+                  "directive INSIDE the `FROM ... AS runtime` stage. "
+                  "A `WORKDIR /var/phantom` token in a `#` comment does NOT "
+                  "count, and a WORKDIR directive in the builder stage does "
+                  "NOT satisfy the runtime CWD invariant."
+              )
+
+          # Invariant 5 — explicit groupadd + useradd with pinned uid AND
+          # gid = 10001 INSIDE the runtime stage. Round-6 amendment: the
+          # pre-round-6 shape used bare `useradd --system --uid 10001`
+          # which let Debian's `useradd` pick the next available system
+          # gid (999 on debian:bookworm-slim), producing `/var/phantom`
+          # owned `10001:999:750`. The mini-lock §7.3 witness expects
+          # `phantom:phantom:750` == `10001:10001:750`; a drifted gid
+          # trips the witness (as it did in the 2026-07-13 field run —
+          # `witness_exit=4` before any writes landed, rollback clean).
+          # Both directives are required and both scoped to the runtime
+          # stage.
+          def _stage_lines(source: str, stage: str) -> list:
+              lines = source.splitlines()
+              out = []
+              in_stage = False
+              for raw in lines:
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  parts = line.split()
+                  if len(parts) >= 1 and parts[0].upper() == "FROM":
+                      in_stage = (
+                          len(parts) >= 4
+                          and parts[-2].upper() == "AS"
+                          and parts[-1] == stage
+                      )
+                      continue
+                  if in_stage:
+                      out.append(line)
+              return out
+          runtime_body = "\n".join(_stage_lines(dockerfile, "runtime"))
+          if "groupadd --gid 10001 phantom" not in runtime_body:
+              failures.append(
+                  "Inv-5a (Dockerfile groupadd) — services/relay/Dockerfile "
+                  "runtime stage must contain `groupadd --gid 10001 phantom` "
+                  "so the group id is pinned across base-image upgrades. A "
+                  "bare `useradd` without a matching groupadd lets Debian "
+                  "pick the next system gid (999 on bookworm), producing "
+                  "`/var/phantom` owned `10001:999` — trips the mini-lock "
+                  "§7.3 `10001:10001:750` witness contract."
+              )
+          if "useradd --uid 10001 --gid 10001" not in runtime_body:
+              failures.append(
+                  "Inv-5b (Dockerfile useradd) — services/relay/Dockerfile "
+                  "runtime stage must contain `useradd --uid 10001 --gid "
+                  "10001` so uid AND gid are both pinned. Any other form "
+                  "(e.g. `useradd --system --uid 10001` without `--gid`) "
+                  "delegates gid selection to Debian's `useradd` default, "
+                  "which drifts across base-image upgrades."
+              )
+
+          if failures:
+              print("::error::RC-RELAY-STATE-DIR-REPAIR PR-1a state-dir invariants violated:")
+              for f in failures:
+                  print(f"::error::  {f}")
+              print()
+              print("See docs/tracks/rc-relay-state-dir-repair.md §5 for the")
+              print("full contract; §7.2 for these exact assertions.")
+              sys.exit(1)
+
+          print("All five state-dir invariants hold. PASS.")
+          PYEOF
+
+      # Image-level smoke — build the runtime image and assert the
+      # phantom user actually resolves to uid=10001 AND gid=10001 inside
+      # it. The Inv-5 Dockerfile-text check catches the pre-round-6
+      # shape, but a future refactor that introduces the directives in
+      # a different order or via an intermediate group could still let
+      # the assertion drift. Building and running `id` is the only
+      # ground-truth check.
+      - name: Image-level smoke — phantom uid/gid pinned at 10001
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          docker build \
+            --file services/relay/Dockerfile \
+            --target runtime \
+            --tag phantom-relay:lint-smoke \
+            .
+          ACTUAL_UID=$(docker run --rm --entrypoint id phantom-relay:lint-smoke -u phantom)
+          ACTUAL_GID=$(docker run --rm --entrypoint id phantom-relay:lint-smoke -g phantom)
+          echo "phantom uid=$ACTUAL_UID gid=$ACTUAL_GID"
+          [ "$ACTUAL_UID" = "10001" ] || { echo "::error::phantom uid=$ACTUAL_UID, expected 10001"; exit 1; }
+          [ "$ACTUAL_GID" = "10001" ] || { echo "::error::phantom gid=$ACTUAL_GID, expected 10001 (round-6 field finding)"; exit 1; }
+          # Also assert the /var/phantom directory seeded by the runtime
+          # stage carries the pinned ownership + mode. This is what the
+          # in-container `stat` would return on a fresh mount (before
+          # the compose volume shadows it) — it is the invariant the
+          # sidecar in Path A repairs on an already-populated volume.
+          ACTUAL_STATE=$(docker run --rm --entrypoint stat phantom-relay:lint-smoke -c '%u:%g:%a' /var/phantom)
+          echo "/var/phantom = $ACTUAL_STATE"
+          [ "$ACTUAL_STATE" = "10001:10001:750" ] \
+            || { echo "::error::/var/phantom = $ACTUAL_STATE, expected 10001:10001:750"; exit 1; }
+          echo "OK: image-level smoke passed"

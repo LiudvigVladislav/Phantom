@@ -86,6 +86,7 @@ target/
 services/relay/prekeys.jsonl
 services/relay/reports.jsonl
 services/relay/blocklist.txt
+services/relay/push_tokens.jsonl
 
 # Logs
 *.log

@@ -71,17 +71,40 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # Read-only rootfs. The relay writes abuse-report logs to /var/phantom
-    # (see state.rs `append_report_to_disk`), so that path is a writable volume.
+    # Read-only rootfs. The relay writes its four append-log state files
+    # to /var/phantom (RC-RELAY-STATE-DIR-REPAIR PR-1a):
+    #   reports.jsonl       — abuse reports submitted via /report
+    #   blocklist.txt       — admin-blocked identity prefixes
+    #   push_tokens.jsonl   — UnifiedPush topic URL per identity (ADR-016)
+    #   prekeys.jsonl       — X3DH SPK / OPK bundle journal (ADR-009)
+    # That path is the only writable mount besides /tmp (tmpfs 16m). The
+    # relay resolves each file against RELAY_STATE_DIR (env below);
+    # /var/phantom is seeded by the Dockerfile runtime stage as
+    # phantom:phantom (uid=10001, gid=10001) with mode 750. The deploy-
+    # lint CI gate at .github/workflows/deploy-lint.yml enforces
+    # read_only:true + this volume target + the env value + the
+    # Dockerfile WORKDIR in-sync + the explicit groupadd/useradd shape
+    # so the runtime gid stays pinned at 10001 (Inv-1..Inv-5).
     read_only: true
     tmpfs:
       - /tmp:size=16m
     volumes:
+      # RC-RELAY-STATE-DIR-REPAIR PR-1a: this mount pairs with
+      # `RELAY_STATE_DIR: /var/phantom` in `environment:` below. A rename
+      # of either side without the other reintroduces the pre-fix silent-
+      # EROFS bug — the deploy-lint CI gate asserts both are present
+      # in-sync. See `docs/tracks/rc-relay-state-dir-repair.md` §5.2 and
+      # §7.2.
       - phantom-reports:/var/phantom
     # Default ntfy URL inside the docker network — overridable via .env if
     # the operator runs ntfy outside the compose stack.
     environment:
       RELAY_NTFY_URL: ${RELAY_NTFY_URL:-http://ntfy:80}
+      # RC-RELAY-STATE-DIR-REPAIR PR-1a §5.2: base directory the relay
+      # writes reports.jsonl / blocklist.txt / push_tokens.jsonl /
+      # prekeys.jsonl to. MUST match the volume target above. See
+      # `docs/tracks/rc-relay-state-dir-repair.md` §5.2.
+      RELAY_STATE_DIR: /var/phantom
 
   caddy:
     image: caddy:2.8-alpine
@@ -373,9 +396,13 @@ networks:
     driver: bridge
 
 volumes:
-  # Relay abuse-report log. Persists across container restarts so admin reports
-  # are preserved. Relay stores ONLY cleartext abuse metadata here — never
-  # message ciphertexts, never plaintext messages.
+  # Relay state directory. Persists across container restarts so the four
+  # append-log files (reports.jsonl, blocklist.txt, push_tokens.jsonl,
+  # prekeys.jsonl) survive redeploys — see the `read_only` block on the
+  # `relay:` service above and RC-RELAY-STATE-DIR-REPAIR PR-1a. Relay
+  # stores ONLY cleartext abuse metadata + published prekey bundle
+  # journal + UnifiedPush topic URLs + admin blocklist here; NEVER
+  # message ciphertexts, NEVER plaintext messages, NEVER private keys.
   phantom-reports:
   # Caddy persists issued certificates here — losing this volume triggers
   # re-issuance and risks Let's Encrypt rate limits (50 certs/week/domain).

@@ -1579,7 +1579,7 @@ async fn submit_report(
         "report received"
     );
 
-    append_report_to_disk(&report);
+    append_report_to_disk(&state.state_paths.reports, &report);
     state.reports.write().await.push(report);
 
     (StatusCode::OK, Json(serde_json::json!({ "status": "received" })))
@@ -1625,7 +1625,7 @@ async fn admin_block_key(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "key required" })));
     }
     tracing::warn!(event = "admin_block", key = %&req.key[..req.key.len().min(16)], "key blocked by admin");
-    append_block_to_disk(&req.key);
+    append_block_to_disk(&state.state_paths.blocklist, &req.key);
     state.blocklist.write().await.insert(req.key.clone());
     (StatusCode::OK, Json(serde_json::json!({ "blocked": req.key })))
 }
@@ -1711,7 +1711,7 @@ async fn register_push_token(
         let mut tokens = state.push_tokens.write().await;
         tokens.insert(rec.identity.clone(), rec.topic_url.clone());
     }
-    append_push_token_to_disk(&rec);
+    append_push_token_to_disk(&state.state_paths.push_tokens, &rec);
 
     tracing::info!(
         identity_prefix = %&rec.identity[..rec.identity.len().min(8)],

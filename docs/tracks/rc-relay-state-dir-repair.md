@@ -182,22 +182,43 @@ Applies uniformly in PR-1b. Neither behaviour ships in PR-1a (§6).
 
 ### §5.1 Dockerfile changes (PR-1a)
 
-`services/relay/Dockerfile` Stage 2. Between `useradd` at line 54 and
-`COPY --from=builder` at line 56, add:
+`services/relay/Dockerfile` Stage 2 (`FROM debian:bookworm-slim AS
+runtime`) requires FOUR pinned directives:
 
-```dockerfile
-RUN mkdir -p /var/phantom \
-    && chown phantom:phantom /var/phantom \
-    && chmod 750 /var/phantom
-```
+1. Explicit **groupadd** with pinned gid, THEN useradd binding to it:
+   ```dockerfile
+   RUN apt-get update \
+       && apt-get install -y --no-install-recommends ca-certificates wget \
+       && rm -rf /var/lib/apt/lists/* \
+       && groupadd --gid 10001 phantom \
+       && useradd --uid 10001 --gid 10001 \
+           --no-create-home --shell /usr/sbin/nologin phantom
+   ```
+   The bare `useradd --system --uid 10001` shape (pre-round-6) let
+   Debian's `useradd` pick the next available system gid — `999` on
+   `debian:bookworm-slim` — which drifted the state-dir ownership to
+   `10001:999` and tripped the §7.3 witness on 2026-07-13.
 
-After the `COPY`, add: `WORKDIR /var/phantom`.
+2. **`mkdir + chown + chmod`** seeding the state dir with `10001:10001`
+   ownership and `750` mode:
+   ```dockerfile
+   RUN mkdir -p /var/phantom \
+       && chown phantom:phantom /var/phantom \
+       && chmod 750 /var/phantom
+   ```
+   Now that group `phantom` is pinned at gid `10001`, `chown
+   phantom:phantom` resolves to `10001:10001` deterministically.
 
-Rationale: `mkdir + chown + chmod` seeds the volume with correct
-ownership/permission on FIRST mount to an empty volume (fresh-VPS
-bootstrap). `WORKDIR` is defence-in-depth against future refactor
-reintroducing relative-path write. Both are inert on already-populated
-volumes (§5.3).
+3. **`WORKDIR /var/phantom`** after `COPY --from=builder`, as defence-
+   in-depth against a future refactor reintroducing a relative-path
+   write.
+
+4. **`USER phantom`** (already present pre-round-6, unchanged).
+
+All four directives seed correctly on FIRST mount to an empty named
+volume. On an already-populated production volume, the ownership from
+the image layer does NOT propagate — the operator sidecar in §5.3
+Path A is the only way to fix an existing volume.
 
 ### §5.2 docker-compose changes (PR-1a)
 
@@ -371,10 +392,21 @@ PR body MUST include outputs of the following against the VPS AFTER
 - `docker exec phantom-relay id` — expect uid=10001(phantom).
 - `docker exec phantom-relay stat -c "%U:%G:%a" /var/phantom` — expect
   `phantom:phantom:750`.
-- `docker exec phantom-relay ls -la /var/phantom` — after at least one
-  publish + report + push_register, expect non-zero-size files.
+- After driving **all four** persistence-family writes (one each of
+  `POST /prekeys/publish`, `POST /report`, `POST /admin/block`,
+  `POST /push/register` — the four handlers are the only writers of
+  the four state files), `docker exec phantom-relay test -s
+  /var/phantom/prekeys.jsonl && test -s /var/phantom/reports.jsonl &&
+  test -s /var/phantom/blocklist.txt && test -s
+  /var/phantom/push_tokens.jsonl` — MUST exit 0 (all four present
+  and non-empty). A `publish + report + push_register` alone would
+  only cover 3 of the 4 files; the missing `admin/block` is
+  load-bearing because `blocklist.txt` is the only file the other
+  three writes never touch.
+- `docker exec phantom-relay ls -la /var/phantom` — list all four
+  files with sizes and mtimes for the reviewer.
 - `docker exec phantom-relay ls / | grep -Ei "\.jsonl|blocklist"` —
-  MUST be empty (no relative-path spill).
+  MUST be empty (no relative-path spill onto the read-only rootfs).
 
 Path A sidecar invocation output (§5.3) MUST also appear in the PR
 body, timestamped before the `up -d --force-recreate` step.

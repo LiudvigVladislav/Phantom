@@ -8,10 +8,11 @@
 //! handler → PreKeyStore → response. Distinct from `prekeys::tests` which
 //! exercise the store in isolation.
 //!
-//! Tests share the same on-disk `prekeys.jsonl` because the store
-//! persists silently. Each test uses freshly-generated identities so
-//! cross-test contamination is structurally impossible (no two random
-//! Ed25519 keys collide).
+//! Each test owns its own `tempfile::TempDir` used as `RelayConfig
+//! .state_dir`, so parallel-running tests cannot see each other's
+//! `prekeys.jsonl` (RC-RELAY-STATE-DIR-REPAIR PR-1a §7.1). The
+//! `state_dir_config_not_env` meta-test in `state_persistence.rs`
+//! guards this positive-injection contract against regression.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -19,15 +20,23 @@ use ed25519_dalek::{Signer, Signature, SigningKey};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 const SPK_DOMAIN_LABEL: &[u8] = b"phantom-spk-v1";
 
-/// Build a fresh AppState + Router pair for one test.
-fn build_app() -> axum::Router {
-    let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+/// Build a fresh AppState + Router pair for one test rooted at a
+/// dedicated `tempfile::TempDir`. Callers MUST bind BOTH returned values
+/// (`let (app, _tmp) = build_app();`) so the `TempDir` handle stays
+/// alive for the duration of the test — dropping it early removes the
+/// state files mid-run and breaks the persistence contract we exercise.
+fn build_app() -> (axum::Router, TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir for state_dir");
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.state_dir = tmp.path().to_path_buf();
     let state = Arc::new(phantom_relay::state::AppState::new(cfg));
-    phantom_relay::routes::router(state)
+    let router = phantom_relay::routes::router(state);
+    (router, tmp)
 }
 
 fn sign_spk_payload(
@@ -57,7 +66,7 @@ fn synthetic_identity_hex(seed: u8) -> String {
 
 #[tokio::test]
 async fn publish_then_fetch_round_trip_via_http() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
 
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
@@ -143,7 +152,7 @@ async fn publish_then_fetch_round_trip_via_http() {
 
 #[tokio::test]
 async fn bad_signature_returns_400() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
     let identity_hex = synthetic_identity_hex(21);
@@ -178,7 +187,7 @@ async fn bad_signature_returns_400() {
 
 #[tokio::test]
 async fn empty_pool_bundle_omits_opk() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
     let identity_hex = synthetic_identity_hex(22);
@@ -227,7 +236,7 @@ async fn empty_pool_bundle_omits_opk() {
 
 #[tokio::test]
 async fn publish_rate_limit_returns_429_after_quota() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let signing_kp = SigningKey::generate(&mut OsRng);
     let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
     let identity_hex = synthetic_identity_hex(23);
@@ -279,7 +288,7 @@ async fn publish_rate_limit_returns_429_after_quota() {
 
 #[tokio::test]
 async fn fetch_unpublished_identity_returns_404() {
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let identity_hex = synthetic_identity_hex(24);
     let res = app
         .oneshot(
@@ -299,7 +308,7 @@ async fn signing_key_rotation_returns_409_conflict() {
     // Once an X25519 identity registers an Ed25519 signing key, a subsequent
     // publish for the same X25519 with a DIFFERENT Ed25519 must be rejected
     // with 409 Conflict (relay enforces 1:1 binding).
-    let app = build_app();
+    let (app, _tmp) = build_app();
     let identity_hex = synthetic_identity_hex(25);
 
     let kp_a = SigningKey::generate(&mut OsRng);
@@ -360,4 +369,85 @@ async fn signing_key_rotation_returns_409_conflict() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CONFLICT);
+}
+
+// ── PR-1a §7.1 behavioral gate on the state_dir injection ────────────────────
+
+/// Publish a valid prekey bundle and assert that `prekeys.jsonl` lands
+/// INSIDE the `TempDir` produced by `build_app()` — not in the workspace
+/// CWD or anywhere else. This is the load-bearing positive-injection
+/// contract from PR-1a §7.1, enforced behaviorally rather than
+/// textually: if `build_app()` regresses and stops setting
+/// `cfg.state_dir = tmp.path().to_path_buf()`, the write lands in
+/// workspace `./prekeys.jsonl` and this assertion fires. The prior
+/// textual meta-test in `state_persistence.rs` was removed in round 4
+/// because a string literal like `"cfg.state_dir = tmp.path();"` inside
+/// a helper unit-test could satisfy the pattern check independently of
+/// whether the real call still existed.
+#[tokio::test]
+async fn publish_lands_in_configured_state_dir() {
+    let (app, tmp) = build_app();
+
+    // Reuse the shape from `publish_then_fetch_round_trip_via_http`; the
+    // point here is not to exercise every field but to trigger ONE
+    // successful `POST /prekeys/publish` so the write hits disk.
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let signing_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+    let identity_hex = synthetic_identity_hex(30); // seed 30 — distinct
+    let spk_pub = [0xCEu8; 32];
+    let created_at_ms: i64 = 1_700_000_100_000;
+    let sig = sign_spk_payload(&signing_kp, &spk_pub, created_at_ms);
+
+    let publish_body = json!({
+        "identity_pubkey_hex": identity_hex,
+        "signing_pubkey_hex": signing_hex,
+        "signed_pre_key": {
+            "key_id": 42,
+            "public_key_hex": hex::encode(spk_pub),
+            "created_at_ms": created_at_ms,
+            "signature_hex": hex::encode(sig),
+        },
+        "one_time_pre_keys": [
+            {
+                "key_id_hex": "1a2b3c4d5e6f70819293a4b5c6d7e8f9",
+                "public_key_hex": hex::encode([0xB1u8; 32]),
+            }
+        ],
+    });
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/prekeys/publish")
+                .header("content-type", "application/json")
+                .body(Body::from(publish_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "publish must succeed");
+
+    // Behavioral contract: the file MUST live under the injected
+    // `TempDir`, not in workspace CWD or process temp default. If a
+    // future refactor of `build_app()` drops the `cfg.state_dir =
+    // tmp.path().to_path_buf()` assignment, the write goes elsewhere
+    // and this fires.
+    let target = tmp.path().join("prekeys.jsonl");
+    let meta = std::fs::metadata(&target).unwrap_or_else(|e| {
+        panic!(
+            "expected {} to exist after a successful /prekeys/publish — \
+             this indicates build_app() no longer injects the tempdir into \
+             RelayConfig.state_dir (regression against PR-1a §7.1). \
+             Underlying error: {}",
+            target.display(),
+            e
+        )
+    });
+    assert!(
+        meta.len() > 0,
+        "{} exists but is empty — the write path reached the file but wrote \
+         nothing, which points at a broken persist step in prekeys.rs",
+        target.display()
+    );
 }

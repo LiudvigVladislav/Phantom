@@ -9,6 +9,7 @@ use crate::prekeys::PreKeyStore;
 use crate::rest_fallback::{IdempotencyCache, RestEnvelope, RestTokenStore, SeqCounter, SessionChallengeCache};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
@@ -176,16 +177,52 @@ pub struct AppState {
     /// POST /media/upload-chunk. Keyed by opaque `media_id` capability token.
     /// Relay never inspects ciphertext content — only stores and serves blobs.
     pub media_store: MediaStore,
+
+    // ── State-file paths (RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1) ───────────────
+
+    /// Absolute paths (or workspace-relative under `from_env_for_test`) that
+    /// each of the three `state.rs`-owned append-log files resolves against.
+    /// Computed once at `AppState::new` from `cfg.state_dir`; route handlers
+    /// read these to pass into `append_report_to_disk` / `append_block_to_disk`
+    /// / `append_push_token_to_disk`.
+    ///
+    /// `prekeys.jsonl` is NOT surfaced here — it lives inside `PreKeyStore`
+    /// so the store owns the full path just like it owns its in-memory map.
+    /// See `docs/tracks/rc-relay-state-dir-repair.md` §3.2 / §4.1.
+    pub state_paths: StatePaths,
+}
+
+/// Joined absolute paths for the three `state.rs`-owned append-log files.
+/// Computed from `cfg.state_dir` at `AppState::new`. `prekeys.jsonl` lives
+/// on `PreKeyStore` instead of here.
+#[derive(Clone, Debug)]
+pub struct StatePaths {
+    pub reports: PathBuf,
+    pub blocklist: PathBuf,
+    pub push_tokens: PathBuf,
+}
+
+impl StatePaths {
+    pub fn from_state_dir(state_dir: &Path) -> Self {
+        Self {
+            reports: state_dir.join(REPORTS_FILENAME),
+            blocklist: state_dir.join(BLOCKLIST_FILENAME),
+            push_tokens: state_dir.join(PUSH_TOKENS_FILENAME),
+        }
+    }
 }
 
 impl AppState {
     pub fn new(config: RelayConfig) -> Self {
+        // RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1: compute state-file paths
+        // from the injected `state_dir` before spinning up sub-stores.
+        let state_paths = StatePaths::from_state_dir(&config.state_dir);
         // Load persisted reports from disk
-        let persisted = load_reports_from_disk();
+        let persisted = load_reports_from_disk(&state_paths.reports);
         // Load persisted blocklist from disk
-        let blocked = load_blocklist_from_disk();
+        let blocked = load_blocklist_from_disk(&state_paths.blocklist);
         // Load persisted push tokens from disk
-        let tokens = load_push_tokens_from_disk();
+        let tokens = load_push_tokens_from_disk(&state_paths.push_tokens);
         // HTTP client for outbound UnifiedPush wake-ups. 5s timeout is
         // generous — ntfy distributor is on the same Docker network in
         // production. On error we log and move on; envelope delivery
@@ -195,6 +232,7 @@ impl AppState {
             .user_agent("phantom-relay/0.1")
             .build()
             .expect("reqwest::Client::build with default rustls should not fail");
+        let prekeys = PreKeyStore::new(&config.state_dir);
         Self {
             config,
             store: RwLock::new(HashMap::new()),
@@ -203,7 +241,7 @@ impl AppState {
             rate_limiter: RwLock::new(HashMap::new()),
             reports: RwLock::new(persisted),
             blocklist: RwLock::new(blocked),
-            prekeys: PreKeyStore::new(),
+            prekeys,
             push_tokens: RwLock::new(tokens),
             http,
             auth_challenges: ChallengeStore::new(),
@@ -219,6 +257,7 @@ impl AppState {
             ack_rate_limiter: RwLock::new(HashMap::new()),
             // Media upload (PR-M1r)
             media_store: MediaStore::new(),
+            state_paths,
         }
     }
 
@@ -293,9 +332,14 @@ impl AppState {
     }
 }
 
-const REPORTS_FILE: &str = "reports.jsonl";
-const BLOCKLIST_FILE: &str = "blocklist.txt";
-const PUSH_TOKENS_FILE: &str = "push_tokens.jsonl";
+/// Basenames of the three `state.rs`-owned append-log files. Full paths
+/// are computed at `AppState::new` via `StatePaths::from_state_dir` — see
+/// the doc comment on `AppState::state_paths` (RC-RELAY-STATE-DIR-REPAIR
+/// PR-1a §4.1). Kept public within the crate so the `state_persistence`
+/// integration test can assert file names without duplicating literals.
+pub(crate) const REPORTS_FILENAME: &str = "reports.jsonl";
+pub(crate) const BLOCKLIST_FILENAME: &str = "blocklist.txt";
+pub(crate) const PUSH_TOKENS_FILENAME: &str = "push_tokens.jsonl";
 
 /// On-disk record for a single /push/register call. `identity` is the
 /// recipient's hex public key; `topic_url` is the ntfy URL the client
@@ -306,38 +350,38 @@ pub struct PushTokenRecord {
     pub topic_url: String,
 }
 
-pub fn load_reports_from_disk() -> Vec<AbuseReport> {
-    let Ok(content) = std::fs::read_to_string(REPORTS_FILE) else { return vec![] };
+pub fn load_reports_from_disk(path: &Path) -> Vec<AbuseReport> {
+    let Ok(content) = std::fs::read_to_string(path) else { return vec![] };
     content.lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
 }
 
-pub fn load_blocklist_from_disk() -> std::collections::HashSet<String> {
-    let Ok(content) = std::fs::read_to_string(BLOCKLIST_FILE) else {
+pub fn load_blocklist_from_disk(path: &Path) -> std::collections::HashSet<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return std::collections::HashSet::new()
     };
     content.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
-pub fn append_report_to_disk(report: &AbuseReport) {
+pub fn append_report_to_disk(path: &Path, report: &AbuseReport) {
     if let Ok(line) = serde_json::to_string(report) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(REPORTS_FILE) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{}", line);
         }
     }
 }
 
-pub fn append_block_to_disk(key: &str) {
+pub fn append_block_to_disk(path: &Path, key: &str) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(BLOCKLIST_FILE) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{}", key);
     }
 }
 
-pub fn load_push_tokens_from_disk() -> HashMap<String, String> {
-    let Ok(content) = std::fs::read_to_string(PUSH_TOKENS_FILE) else {
+pub fn load_push_tokens_from_disk(path: &Path) -> HashMap<String, String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return HashMap::new();
     };
     // Replay JSONL line by line. Last write wins per identity — matches
@@ -352,10 +396,10 @@ pub fn load_push_tokens_from_disk() -> HashMap<String, String> {
     map
 }
 
-pub fn append_push_token_to_disk(rec: &PushTokenRecord) {
+pub fn append_push_token_to_disk(path: &Path, rec: &PushTokenRecord) {
     use std::io::Write;
     if let Ok(line) = serde_json::to_string(rec) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(PUSH_TOKENS_FILE) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{}", line);
         }
     }
