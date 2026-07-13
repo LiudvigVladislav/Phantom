@@ -2,14 +2,32 @@
 
 Static site for **phntm.pro**. Four pages, bilingual (EN/RU, auto-detect
 browser language + manual switcher with localStorage persistence),
-no build tooling required at runtime — pure HTML/CSS/JS.
+no build tooling — pure HTML/CSS/JS.
 
 Each `*.html` is fully self-contained: CSS and JS are inlined into
 the `<style>` and `<script>` blocks so the page renders without any
 extra HTTP requests beyond CDN fonts (Inter, JetBrains Mono via
-Google Fonts; Geist via jsdelivr). The standalone `styles.css` and
-`site.js` files are kept as **source-of-truth** for maintenance —
-edit them, then regenerate the HTML via `.build/build_*.py`.
+Google Fonts; Geist via jsdelivr).
+
+**Source of truth: the four `*.html` files themselves.** Edit them
+directly with any text editor and the change is live after the next
+deploy.
+
+The old Python generator scripts under `.build/build_*.py` were
+removed on 2026-06-02 because their template had drifted about two
+months behind the actual HTML (missing `<link rel="canonical">`,
+Open Graph tags, Twitter Card tags, JSON-LD structured data, and
+the inline `<style>` / `<script>` blocks) and their output path was
+hardcoded to a Claude Desktop sandbox directory (`/home/claude/site_build/`).
+They were never wired into any build or deploy pipeline, and
+re-running them would have produced broken HTML that also broke
+the SEO markup landed in PR-SEO-PASS-1 (#267).
+
+The standalone `styles.css` and `site.js` files at the root of this
+directory are retained as readable reference copies of the current
+design system — useful as a workspace when developing larger visual
+changes. They are NOT executed at runtime — production reads only
+the inlined copies in each HTML page.
 
 ## Layout
 
@@ -19,15 +37,13 @@ site/
 ├── about.html              About (mission, how it's built, who builds it)
 ├── roadmap.html            Roadmap (Shipped / In progress / Planned)
 ├── donate.html             Support (donation channels + crypto copy-buttons)
-├── styles.css              Shared design system (source-of-truth; inlined in HTML)
-├── site.js                 Lang switcher + mobile menu + scroll-reveal + clipboard
-├── static/                 Static assets — DO NOT rename to "assets/"
-│   └── phantom-logo.jpg    Logo (also embedded as base64 in HTML for inline render)
-├── .build/                 Python regen scripts (dot-prefix; Caddy file_server hides)
-│   ├── build_index.py
-│   ├── build_about.py
-│   ├── build_roadmap.py
-│   └── build_donate.py
+├── sitemap.xml             SEO sitemap (4 URLs, matches the four pages)
+├── robots.txt              Crawler rules (allow search + AI grounding, deny training)
+├── styles.css              Reference copy of design tokens + layout (NOT executed at runtime)
+├── site.js                 Reference copy of lang switcher + scroll-reveal (NOT executed at runtime)
+├── static/
+│   ├── favicon.png         512×512, browser tab / bookmark / home-screen / JSON-LD org logo
+│   └── og-image.png        1200×630, social share preview (og:image + twitter:image)
 └── README.md               This file
 ```
 
@@ -38,12 +54,6 @@ proxies to `/srv/legal/assets/` (for the legal pages `/terms` and
 `/privacy`). If this site used `assets/` for its own files, any
 `<img src="assets/...">` reference would silently 404 because Caddy
 would intercept it. `static/` avoids that namespace collision.
-
-This is currently invisible because every HTML embeds the logo as a
-base64 data URI rather than loading it via `<img src="static/...">`.
-But the build scripts already write `static/phantom-logo.jpg` so any
-future build that decides to use external images instead of base64
-will work without surprise.
 
 ## Deploy
 
@@ -124,30 +134,16 @@ Then `cd /home/phantom/Phantom/deploy && docker compose up -d --force-recreate c
 
 ## Editing the site
 
-### Direct HTML edit
-
 Each page is self-contained, so you can edit `index.html` / `about.html`
 / `roadmap.html` / `donate.html` directly with any text editor and the
-change is live after the next deploy. This is the path you want for
-small fixes — typos, wording, link updates.
+change is live after the next deploy. This is the whole workflow —
+there is no build step and no code generator.
 
-### Regenerate from source (`.build/build_*.py`)
-
-If you change the shared design system (`styles.css`) or the shared
-JavaScript (`site.js`), the inlined copies inside each HTML page go
-stale. Regenerate them:
-
-```bash
-cd site
-python3 .build/build_index.py    > index.html
-python3 .build/build_about.py    > about.html
-python3 .build/build_roadmap.py  > roadmap.html
-python3 .build/build_donate.py   > donate.html
-```
-
-(Each `build_*.py` reads `styles.css` + `site.js` + its own page-specific
-body markup + base64-embeds `static/phantom-logo.jpg`, then prints a
-single HTML file. The Python scripts have zero external dependencies.)
+For larger visual changes you may prefer to iterate first on the reference
+`styles.css` / `site.js` files (they are cleaner to edit than the inlined
+copies), then copy the updated content back into each HTML page's
+`<style>` and `<script>` blocks. Take care to keep all four HTML pages in
+sync when doing this — there is no automation.
 
 ## What NOT to lose on the next deploy
 
