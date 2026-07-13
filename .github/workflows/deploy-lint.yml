@@ -411,6 +411,57 @@ jobs:
                   "NOT satisfy the runtime CWD invariant."
               )
 
+          # Invariant 5 — explicit groupadd + useradd with pinned uid AND
+          # gid = 10001 INSIDE the runtime stage. Round-6 amendment: the
+          # pre-round-6 shape used bare `useradd --system --uid 10001`
+          # which let Debian's `useradd` pick the next available system
+          # gid (999 on debian:bookworm-slim), producing `/var/phantom`
+          # owned `10001:999:750`. The mini-lock §7.3 witness expects
+          # `phantom:phantom:750` == `10001:10001:750`; a drifted gid
+          # trips the witness (as it did in the 2026-07-13 field run —
+          # `witness_exit=4` before any writes landed, rollback clean).
+          # Both directives are required and both scoped to the runtime
+          # stage.
+          def _stage_lines(source: str, stage: str) -> list:
+              lines = source.splitlines()
+              out = []
+              in_stage = False
+              for raw in lines:
+                  line = raw.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  parts = line.split()
+                  if len(parts) >= 1 and parts[0].upper() == "FROM":
+                      in_stage = (
+                          len(parts) >= 4
+                          and parts[-2].upper() == "AS"
+                          and parts[-1] == stage
+                      )
+                      continue
+                  if in_stage:
+                      out.append(line)
+              return out
+          runtime_body = "\n".join(_stage_lines(dockerfile, "runtime"))
+          if "groupadd --gid 10001 phantom" not in runtime_body:
+              failures.append(
+                  "Inv-5a (Dockerfile groupadd) — services/relay/Dockerfile "
+                  "runtime stage must contain `groupadd --gid 10001 phantom` "
+                  "so the group id is pinned across base-image upgrades. A "
+                  "bare `useradd` without a matching groupadd lets Debian "
+                  "pick the next system gid (999 on bookworm), producing "
+                  "`/var/phantom` owned `10001:999` — trips the mini-lock "
+                  "§7.3 `10001:10001:750` witness contract."
+              )
+          if "useradd --uid 10001 --gid 10001" not in runtime_body:
+              failures.append(
+                  "Inv-5b (Dockerfile useradd) — services/relay/Dockerfile "
+                  "runtime stage must contain `useradd --uid 10001 --gid "
+                  "10001` so uid AND gid are both pinned. Any other form "
+                  "(e.g. `useradd --system --uid 10001` without `--gid`) "
+                  "delegates gid selection to Debian's `useradd` default, "
+                  "which drifts across base-image upgrades."
+              )
+
           if failures:
               print("::error::RC-RELAY-STATE-DIR-REPAIR PR-1a state-dir invariants violated:")
               for f in failures:
@@ -420,5 +471,37 @@ jobs:
               print("full contract; §7.2 for these exact assertions.")
               sys.exit(1)
 
-          print("All four state-dir invariants hold. PASS.")
+          print("All five state-dir invariants hold. PASS.")
           PYEOF
+
+      # Image-level smoke — build the runtime image and assert the
+      # phantom user actually resolves to uid=10001 AND gid=10001 inside
+      # it. The Inv-5 Dockerfile-text check catches the pre-round-6
+      # shape, but a future refactor that introduces the directives in
+      # a different order or via an intermediate group could still let
+      # the assertion drift. Building and running `id` is the only
+      # ground-truth check.
+      - name: Image-level smoke — phantom uid/gid pinned at 10001
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          docker build \
+            --file services/relay/Dockerfile \
+            --target runtime \
+            --tag phantom-relay:lint-smoke \
+            .
+          ACTUAL_UID=$(docker run --rm --entrypoint id phantom-relay:lint-smoke -u phantom)
+          ACTUAL_GID=$(docker run --rm --entrypoint id phantom-relay:lint-smoke -g phantom)
+          echo "phantom uid=$ACTUAL_UID gid=$ACTUAL_GID"
+          [ "$ACTUAL_UID" = "10001" ] || { echo "::error::phantom uid=$ACTUAL_UID, expected 10001"; exit 1; }
+          [ "$ACTUAL_GID" = "10001" ] || { echo "::error::phantom gid=$ACTUAL_GID, expected 10001 (round-6 field finding)"; exit 1; }
+          # Also assert the /var/phantom directory seeded by the runtime
+          # stage carries the pinned ownership + mode. This is what the
+          # in-container `stat` would return on a fresh mount (before
+          # the compose volume shadows it) — it is the invariant the
+          # sidecar in Path A repairs on an already-populated volume.
+          ACTUAL_STATE=$(docker run --rm --entrypoint stat phantom-relay:lint-smoke -c '%u:%g:%a' /var/phantom)
+          echo "/var/phantom = $ACTUAL_STATE"
+          [ "$ACTUAL_STATE" = "10001:10001:750" ] \
+            || { echo "::error::/var/phantom = $ACTUAL_STATE, expected 10001:10001:750"; exit 1; }
+          echo "OK: image-level smoke passed"

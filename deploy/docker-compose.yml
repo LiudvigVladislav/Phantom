@@ -78,10 +78,13 @@ services:
     #   push_tokens.jsonl   — UnifiedPush topic URL per identity (ADR-016)
     #   prekeys.jsonl       — X3DH SPK / OPK bundle journal (ADR-009)
     # That path is the only writable mount besides /tmp (tmpfs 16m). The
-    # relay resolves each file against RELAY_STATE_DIR (env below); the
-    # deploy-lint CI gate at .github/workflows/deploy-lint.yml enforces
+    # relay resolves each file against RELAY_STATE_DIR (env below);
+    # /var/phantom is seeded by the Dockerfile runtime stage as
+    # phantom:phantom (uid=10001, gid=10001) with mode 750. The deploy-
+    # lint CI gate at .github/workflows/deploy-lint.yml enforces
     # read_only:true + this volume target + the env value + the
-    # Dockerfile WORKDIR in-sync (Inv-1..Inv-4).
+    # Dockerfile WORKDIR in-sync + the explicit groupadd/useradd shape
+    # so the runtime gid stays pinned at 10001 (Inv-1..Inv-5).
     read_only: true
     tmpfs:
       - /tmp:size=16m

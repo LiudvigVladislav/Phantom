@@ -48,19 +48,38 @@ RUN cargo build --release --package phantom-relay \
 FROM debian:bookworm-slim AS runtime
 
 # ca-certificates needed if the relay ever makes outbound HTTPS (e.g. FCM).
+#
+# `groupadd --gid 10001` is EXPLICIT (not implicit-via-useradd) so the
+# gid is pinned to 10001 regardless of what the base image's
+# /etc/group already contains. The pre-round-6 shape used a bare
+# `useradd --system --uid 10001` which delegated group creation to
+# Debian's `useradd`, which picks the next available system gid
+# (`999` on `debian:bookworm-slim`) — that produced `/var/phantom`
+# owned `10001:999:750` in production, tripping the RC-RELAY-STATE-
+# DIR-REPAIR PR-1a §5.3 Path A witness (which expects
+# `phantom:phantom:750` == `10001:10001:750`). Field-caught by the
+# witness runbook 2026-07-13; see the round-6 amendment on PR #376.
+#
+# `--no-create-home` because the relay is a long-running daemon that
+# never touches $HOME. `useradd --system` implied no home directory
+# in the pre-round-6 shape; making it explicit here after dropping
+# `--system` keeps the same behaviour.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --shell /usr/sbin/nologin phantom
+    && groupadd --gid 10001 phantom \
+    && useradd --uid 10001 --gid 10001 \
+        --no-create-home --shell /usr/sbin/nologin phantom
 
 # RC-RELAY-STATE-DIR-REPAIR PR-1a §5.1: seed the state-file directory the
 # relay writes reports.jsonl / blocklist.txt / push_tokens.jsonl /
-# prekeys.jsonl to. Owned by uid 10001 (phantom) with 750 so writes from
-# the running container succeed against the volume mounted at this path
-# by deploy/docker-compose.yml. The chown/chmod only take effect on the
-# FIRST mount to an empty named volume — an already-populated production
-# volume requires the operator sidecar in
-# `docs/tracks/rc-relay-state-dir-repair.md` §5.3 Path A before deploy.
+# prekeys.jsonl to. Owned by uid 10001 (phantom) with gid 10001 (phantom)
+# and mode 750 so writes from the running container succeed against the
+# volume mounted at this path by deploy/docker-compose.yml. The
+# chown/chmod only take effect on the FIRST mount to an empty named
+# volume — an already-populated production volume requires the operator
+# sidecar in `docs/tracks/rc-relay-state-dir-repair.md` §5.3 Path A
+# before deploy.
 RUN mkdir -p /var/phantom \
     && chown phantom:phantom /var/phantom \
     && chmod 750 /var/phantom
