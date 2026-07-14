@@ -229,7 +229,7 @@ A commercial dual-licensing option is available for white-label or B2B deploymen
 - **Source code:** [GitHub](https://github.com/LiudvigVladislav/Phantom) · [Codeberg mirror](https://codeberg.org/VladislavLiudvig/Phantom) (non-US, AGPL-aligned host)
 - **GitHub Issues:** https://github.com/LiudvigVladislav/Phantom/issues
 - **Author:** Vladislav Liudvig
-- **Company:** Willen LLC (Delaware, USA)
+- **Company:** Willen LLC (Wyoming, USA)
 
 ### Email routing
 
