@@ -25,26 +25,28 @@ PHANTOM is being built as an open-source project with a values-driven mission: t
 
 ## Status
 
-**Current stage:** Alpha 2 (mid-sprint as of 2026-05-08).
-**Tagged release:** `v0.1.0-alpha.1` (2026-04-27).
-**Latest production milestone:** Stage 5E (Xray VLESS+REALITY censorship resistance) shipped 2026-05-07 and validated end-to-end on a Tecno phone connected through Russia's MTS network — text and voice messages flow through PHANTOM without any VPN, Orbot, or third-party app installed. See [ADR-019](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md) for the full architectural rationale.
+**Current stage:** Alpha 2, active development.
+**Tagged release:** `v0.1.0-alpha.1` (2026-04-27). Alpha 2 has not been tagged — the project ships when specific claims have been verified on real hardware, not to a calendar date.
+**Production relay:** [`relay.phntm.pro`](https://relay.phntm.pro) (Hetzner, EU jurisdiction), Rust/axum + Caddy edge, ciphertext-only.
 
 **What works today:**
-- End-to-end encrypted one-on-one messaging between Android devices (Double Ratchet, Sealed Sender envelopes)
-- **Censorship circumvention via Xray VLESS+REALITY** — masquerades the wire traffic as a TLS handshake to `www.microsoft.com`, bypassing Russia's TSPU 16-kilobyte curtain
-- Production relay deployed at `relay.phntm.pro` (Hetzner, EU jurisdiction) with a Tor v3 onion service as fallback
-- Voice messages with chunked transport (~55 KB envelopes per chunk, delivered through the Xray tunnel)
-- Trust Tier flow (first messages from unknowns land in Message Requests)
-- QR code contact exchange
-- Store-and-forward delivery (messages queue when recipient is offline)
+- **End-to-end encrypted 1:1 messaging** between Android devices — Double Ratchet + X3DH handshake + Sealed Sender envelopes; identity keys ED25519, generated on device
+- **Censorship-resistant transport (Xray VLESS+REALITY, [ADR-019](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md))** — masquerades wire traffic as a TLS handshake to `www.microsoft.com`; validated end-to-end on Tecno + Russian carrier without VPN, Orbot, or any third-party app (2026-05-07)
+- **Adaptive transport selection ([ADR-020](docs/adr/ADR-020-Adaptive-Transport-Selection.md))** — runtime probe-and-pick between Direct WSS, Xray/REALITY, and Tor, with sticky per-network preference (shipped in three phases 2026-05-09)
+- **REST short-poll fallback** — when a middlebox silently drops WebSocket frames on hostile cellular networks (observed on Russian Tele2 LTE), text delivery routes through short-poll REST endpoints instead of hanging (shipped 2026-05-16-17, PR-D0r/D1/D1b/D1c/D1d)
+- **Voice notes as encrypted media** — record → AEAD-encrypt (XChaCha20-Poly1305) → chunk → upload → manifest via ratchet → durable receiver reassembly; production-validated on Tele2 LTE (shipped 2026-05-18, PR-M1w)
+- **Per-user signed-challenge auth ([ADR-027](docs/adr/ADR-027-Per-User-Signed-Challenge-Auth.md))** — the WS relay authenticates each session with a per-identity Ed25519 signature, replacing the earlier shared token (shipped 2026-05-08)
+- **Tor v3 onion** reachable as text-only emergency fallback ([ADR-016](docs/adr/ADR-016-tor-unified-push-hybrid-transport.md); post-pivot 2026-05-15 the Tor path is scoped to text-only — WebRTC calls remain on Direct/Xray)
+- Trust Tier flow, QR code contact exchange, disappearing messages, message edit + delete, per-conversation mute + pin, store-and-forward delivery when the recipient is offline
 
 **Roadmap, by realistic horizon:**
 
-- **Alpha 2 (next release):** Group chats foundation (state machine + Sender Keys crypto already present in shared core, surface work pending), ADR-020 *Adaptive Transport Selection* — runtime probe-and-pick between direct WSS, Xray, Tor (today's choice is a build-time flag), encrypted attachments (photos and files via the encrypted MinIO design in the ADR backlog).
-- **Beta:** Voice and video calls (call-signalling already exists in shared core; UI wiring in active development), ADR-021 *Multi-server Xray fan-out* — closes the single-point-of-failure on the current Hetzner endpoint, iOS app (XCFramework via Compose Multiplatform; ADR-022), additional pluggable transports (obfs4, Snowflake) joining today's Tor + Xray pair.
-- **Post-Beta research:** Wi-Fi Direct + Bluetooth Mesh nearby modes for offline-first delivery (Briar-class), Kademlia DHT P2P routing as a fallback to the central relay, post-quantum migration of the cryptographic primitives.
+- **Next feature releases:** stable **groups** with Sender Keys and re-verify on member change (state machine + crypto already in shared core, [ADR-026](docs/adr/ADR-026-Group-Control-Messages-E2EE.md); surface still partial); **encrypted attachments** (photos + files) reusing the M1r media pipeline that already ships for voice; **first-message bootstrap fast path** (PR-D1e) to close the residual yellow-dot delay when adding a new contact on cellular; production stability observation continues on Direct WSS / REALITY / REST across multiple carriers.
+- **Beta:** **1:1 voice and video calls** over WebRTC on Direct/Xray (signalling shipped end-to-end sealed; UI + Tele2-class realtime hardening in progress — calls remain marked experimental until real-network stability holds); **desktop client** (Compose Multiplatform JVM target); **additional pluggable transports** — obfs4 client-side and Snowflake broker discovery imports (already validated against RU carriers via Briar's `bridges-s-ru` set); hardened **multi-device identity** (linked-device trust, no shared key).
+- **v1.0:** **iOS client** (Compose Multiplatform iOS target); **public channels** (read-only broadcast with per-channel sender keys); hosted **username directory** with rate-limited lookup; **self-hosted relay kit** for organisations; **third-party security audit** — budget earmarked for Cure53 or Trail of Bits.
+- **Post-v1.0 research:** BLE + Wi-Fi Direct **offline mesh** transport (Briar-class); Kademlia DHT P2P routing as a decentralised fallback to the central relay; post-quantum migration of the ratchet primitives.
 
-See [RELEASE_NOTES.md](RELEASE_NOTES.md) for full Alpha 1 details, [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for current limitations, and [docs/PROJECT_LOG.md](docs/PROJECT_LOG.md) for the running development journal.
+See [ROADMAP.md](ROADMAP.md) for the milestone breakdown, [RELEASE_NOTES.md](RELEASE_NOTES.md) for Alpha 1 detail, [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for current limitations, and [docs/PROJECT_LOG.md](docs/PROJECT_LOG.md) for the running development journal.
 
 ---
 
