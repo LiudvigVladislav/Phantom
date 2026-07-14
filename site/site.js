@@ -1,39 +1,19 @@
-// PHANTOM site — language + nav
+// PHANTOM site — nav + interactions
+//
+// Reference copy of the JS inlined into each of the 8 HTML pages
+// (/ /about.html /roadmap.html /donate.html + /ru/ mirror).
+//
+// This file is NOT loaded at runtime — production reads the inlined <script>
+// block inside each HTML page. This copy is kept as a readable single-source
+// for maintenance: when you change interaction logic, edit here first, then
+// copy-paste into each of the 8 HTML pages' inline <script> block.
+//
+// Language switching lives in real <a> links (see .lang in nav), not JS.
+// The whole "auto-detect + localStorage + toggle" model was removed on
+// 2026-07-15 when the site switched to a /ru/ URL tree (Phase 3 SEO work).
+
 (function(){
-  // Determine language: saved choice > browser language > default 'en'
-  function pickLang(){
-    try{
-      var saved = localStorage.getItem('phantom_lang');
-      if(saved === 'en' || saved === 'ru') return saved;
-    }catch(e){}
-    var nav = (navigator.language || navigator.userLanguage || 'en').toLowerCase();
-    return nav.indexOf('ru') === 0 ? 'ru' : 'en';
-  }
-  function applyLang(lang){
-    document.documentElement.setAttribute('data-lang', lang);
-    document.documentElement.setAttribute('lang', lang);
-    try{ localStorage.setItem('phantom_lang', lang); }catch(e){}
-    // update toggle buttons
-    document.querySelectorAll('.lang button').forEach(function(b){
-      b.classList.toggle('active', b.getAttribute('data-set-lang') === lang);
-    });
-    // update <title> if alt provided
-    var t = document.querySelector('title');
-    if(t){
-      var alt = t.getAttribute('data-'+lang);
-      if(alt) document.title = alt;
-    }
-  }
-  // expose
-  window.setLang = function(lang){ applyLang(lang); };
-  // init ASAP
-  applyLang(pickLang());
   document.addEventListener('DOMContentLoaded', function(){
-    applyLang(document.documentElement.getAttribute('data-lang') || pickLang());
-    // wire toggle
-    document.querySelectorAll('.lang button').forEach(function(b){
-      b.addEventListener('click', function(){ applyLang(b.getAttribute('data-set-lang')); });
-    });
     // mobile menu
     var mb = document.querySelector('.menu-btn');
     var links = document.querySelector('.nav-links');
@@ -61,24 +41,24 @@
         });
       }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
       revealEls.forEach(function(el){ io.observe(el); });
-      // safety net: force-reveal anything still hidden after 2s (covers edge cases)
+      // safety net: force-reveal anything still hidden after 2s
       setTimeout(function(){
         revealEls.forEach(function(el){ if(!el.classList.contains('in')) el.classList.add('in'); });
       }, 2000);
     }
 
     // copy-to-clipboard for donation addresses
+    var lang = document.documentElement.lang || 'en';
     document.querySelectorAll('[data-copy]').forEach(function(btn){
+      var original = btn.textContent;
       btn.addEventListener('click', function(){
         var val = btn.getAttribute('data-copy');
         var done = function(){
-          var lang = document.documentElement.getAttribute('data-lang') || 'en';
-          var prev = btn.getAttribute('data-label-' + lang) || btn.textContent;
           btn.classList.add('copied');
           btn.textContent = (lang === 'ru') ? 'Скопировано ✓' : 'Copied ✓';
           setTimeout(function(){
             btn.classList.remove('copied');
-            btn.textContent = btn.getAttribute('data-label-' + (document.documentElement.getAttribute('data-lang')||'en')) || prev;
+            btn.textContent = original;
           }, 1600);
         };
         if(navigator.clipboard && navigator.clipboard.writeText){

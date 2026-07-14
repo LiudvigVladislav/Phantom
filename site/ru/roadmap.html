@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Roadmap — PHANTOM development plan and shipped features</title>
-<meta name="description" content="What is shipped, in progress, and planned in PHANTOM. We tag releases only when claims are tested on real devices.">
+<title>Дорожная карта — План развития PHANTOM и реализованные функции</title>
+<meta name="description" content="Что уже работает, что в разработке и что запланировано в PHANTOM. Релизы выходят только после проверки на реальных устройствах.">
 <meta name="robots" content="index,follow">
-<link rel="canonical" href="https://phntm.pro/roadmap.html">
+<link rel="canonical" href="https://phntm.pro/ru/roadmap.html">
 <link rel="alternate" hreflang="en" href="https://phntm.pro/roadmap.html">
 <link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/roadmap.html">
 <link rel="alternate" hreflang="x-default" href="https://phntm.pro/roadmap.html">
@@ -17,20 +17,20 @@
 
 <!-- Open Graph -->
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://phntm.pro/roadmap.html">
-<meta property="og:title" content="Roadmap — PHANTOM development plan and shipped features">
-<meta property="og:description" content="What is shipped, in progress, and planned in PHANTOM. We tag releases only when claims are tested on real devices.">
+<meta property="og:url" content="https://phntm.pro/ru/roadmap.html">
+<meta property="og:title" content="Дорожная карта — План развития PHANTOM и реализованные функции">
+<meta property="og:description" content="Что уже работает, что в разработке и что запланировано в PHANTOM.">
 <meta property="og:image" content="https://phntm.pro/static/og-image.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:site_name" content="PHANTOM">
-<meta property="og:locale" content="en_US">
-<meta property="og:locale:alternate" content="ru_RU">
+<meta property="og:locale" content="ru_RU">
+<meta property="og:locale:alternate" content="en_US">
 
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Roadmap — PHANTOM development plan and shipped features">
-<meta name="twitter:description" content="What is shipped, in progress, and planned in PHANTOM.">
+<meta name="twitter:title" content="Дорожная карта — План развития PHANTOM и реализованные функции">
+<meta name="twitter:description" content="Что уже работает, что в разработке и что запланировано в PHANTOM.">
 <meta name="twitter:image" content="https://phntm.pro/static/og-image.png">
 
 <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -254,115 +254,156 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
   <a href="index.html" class="nav-logo"><img src="/static/favicon.png" alt="PHANTOM logo"><span>PHANTOM</span></a>
   <button class="menu-btn" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
   <div class="nav-links">
-    <a href="index.html">Home</a>    <a href="about.html">About</a>    <a href="roadmap.html" class="active">Roadmap</a>    <a href="donate.html">Support</a>    <div class="lang"><a href="/roadmap.html" class="active" hreflang="en">EN</a><a href="/ru/roadmap.html" hreflang="ru">RU</a></div>
+    <a href="index.html">Главная</a>
+    <a href="about.html">О проекте</a>
+    <a href="roadmap.html" class="active">Дорожная карта</a>
+    <a href="donate.html">Поддержать</a>
+    <div class="lang"><a href="/roadmap.html" hreflang="en">EN</a><a href="/ru/roadmap.html" class="active" hreflang="ru">RU</a></div>
   </div>
 </nav><header class="rm-hero">
   <div class="wrap">
-    <h1>Roadmap</h1>    <p>An honest view of what works today, what's being built, and what's ahead. We tag a release only when the claim has been tested on real devices.</p>
-      </div>
+    <h1>Дорожная карта</h1>
+        <p>Честная картина того, что работает сегодня, что в разработке и что впереди. Мы выпускаем релиз только когда заявленное протестировано на реальных устройствах.</p>
+  </div>
 </header>
 <div class="rm-note">
   <div class="box">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-    <p>PHANTOM is in active <strong style="color:var(--tp)">Alpha 2</strong>, Android. This page reflects the real state of the code — not a marketing wishlist. Features are labelled by what actually works.</p>
-      </div>
+        <p>PHANTOM находится в активной стадии <strong style="color:var(--tp)">Alpha 2</strong>, Android. Эта страница отражает реальное состояние кода, а не маркетинговые обещания. Возможности отмечены по тому, что действительно работает.</p>
+  </div>
 </div><div class="rm-wrap">
   <div class="rm-cols">
     <div class="rm-col done reveal">
-      <div class="rm-col-head"><span class="dot"></span><h3>Shipped</h3></div>
+      <div class="rm-col-head"><span class="dot"></span><h3>Готово</h3></div>
       <div class="rm-list"><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>End-to-end encryption</h4>        <p>Double Ratchet over libsodium, ED25519 identity keys, X3DH session setup.</p>      </div>
+        <h4>Сквозное шифрование</h4>
+        <p>Double Ratchet поверх libsodium, ключи ED25519, установка сессии X3DH.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>Sealed sender</h4>        <p>Every message and read receipt hides the sender from the relay.</p>      </div>
+        <h4>Sealed sender</h4>
+        <p>Каждое сообщение и отметка о прочтении скрывают отправителя от сервера.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>Text messaging (1:1)</h4>        <p>Reliable across Direct WSS, REALITY and REST fallback. Idempotent delivery.</p>      </div>
+        <h4>Текстовые сообщения (1:1)</h4>
+        <p>Надёжно через Direct WSS, REALITY и REST fallback. Защита от дублей.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>REALITY transport</h4>        <p>VLESS+REALITY validated through Russia's TSPU in production.</p>      </div>
+        <h4>Транспорт REALITY</h4>
+        <p>VLESS+REALITY проверен против российской TSPU в production.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>Voice notes</h4>        <p>Encrypted media upload with chunked delivery.</p>      </div>
+        <h4>Голосовые сообщения</h4>
+        <p>Шифрованная загрузка медиа с разбивкой на части.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>Contact verification</h4>        <p>Mutual ED25519 fingerprint check, with QR exchange.</p>      </div>
+        <h4>Проверка контактов</h4>
+        <p>Взаимная сверка отпечатка ED25519, обмен по QR.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>Production relay</h4>        <p>Rust relay live in Helsinki, with Tor onion + WebTunnel bridge.</p>      </div>
+        <h4>Relay в production</h4>
+        <p>Rust-relay работает в Хельсинки, с Tor onion и WebTunnel-мостом.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg></div>
       <div class="txt">
-        <h4>Security hardening</h4>        <p>Multiple P1 cryptographic findings resolved: prekey wrap, ratchet state wrap, signed-challenge authentication.</p>      </div>
+        <h4>Усиление безопасности</h4>
+        <p>Закрыты P1-находки по криптографии: оборачивание prekey, оборачивание состояния ratchet, подписанная аутентификация.</p>
+      </div>
     </div></div>
     </div>
     <div class="rm-col prog reveal">
-      <div class="rm-col-head"><span class="dot"></span><h3>In progress</h3></div>
+      <div class="rm-col-head"><span class="dot"></span><h3>В работе</h3></div>
       <div class="rm-list"><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg></div>
       <div class="txt">
-        <h4>Android stabilization</h4>        <p>Session-repair, chat-list lifecycle, reconnect reliability on hostile OEMs.</p>      </div>
+        <h4>Стабилизация Android</h4>
+        <p>Восстановление сессий, жизненный цикл списка чатов, надёжность переподключения.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg></div>
       <div class="txt">
-        <h4>Group chats</h4>        <p>Core group messaging through Double Ratchet + Sealed Sender. Hardening pending.</p>      </div>
+        <h4>Групповые чаты</h4>
+        <p>Базовый групповой обмен через Double Ratchet + Sealed Sender. Усиление впереди.</p>
+      </div>
     </div></div>
     </div>
     <div class="rm-col plan reveal">
-      <div class="rm-col-head"><span class="dot"></span><h3>Planned</h3></div>
+      <div class="rm-col-head"><span class="dot"></span><h3>В планах</h3></div>
       <div class="rm-list"><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
       <div class="txt">
-        <h4>Voice calls</h4>        <p>Experimental today; reliability work for restrictive mobile networks.</p>      </div>
+        <h4>Голосовые звонки</h4>
+        <p>Сейчас экспериментальны; работа над надёжностью в ограничивающих сетях.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
       <div class="txt">
-        <h4>iOS port</h4>        <p>Shared core is iOS-ready — the remaining work is the native Swift shell.</p>      </div>
+        <h4>Порт на iOS</h4>
+        <p>Общее ядро готово к iOS — остаётся нативная Swift-оболочка.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
       <div class="txt">
-        <h4>Attachments</h4>        <p>Photos and files via an encrypted media store.</p>      </div>
+        <h4>Вложения</h4>
+        <p>Фото и файлы через шифрованное медиа-хранилище.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
       <div class="txt">
-        <h4>Adaptive transport</h4>        <p>Runtime transport selection and multi-server fan-out.</p>      </div>
+        <h4>Адаптивный транспорт</h4>
+        <p>Выбор транспорта в реальном времени и распределение по серверам.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
       <div class="txt">
-        <h4>Username directory</h4>        <p>Discoverable usernames via the relay namespace.</p>      </div>
+        <h4>Каталог имён</h4>
+        <p>Поиск по именам пользователей через пространство имён relay.</p>
+      </div>
     </div><div class="rm-item">
       <div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
       <div class="txt">
-        <h4>Offline mesh</h4>        <p>Peer-to-peer transport without infrastructure. Research stage.</p>      </div>
+        <h4>Офлайн-меш</h4>
+        <p>P2P-транспорт без инфраструктуры. Стадия исследования.</p>
+      </div>
     </div></div>
     </div>
   </div>
 </div><div class="rm-blocker">
   <div class="box reveal">
-    <div class="label">Why iOS comes next</div>    <p>The shared core was deliberately built for cross-platform reuse — one Double Ratchet, one storage schema, one transport layer. That means the <strong>iOS port is largely a matter of building the native Swift shell</strong> on top of a core that already works, rather than rewriting the cryptography. It's a priority for the next stage of development — and the kind of milestone your support helps reach sooner.</p>
-      </div>
+    <div class="label">Почему iOS — следующий шаг</div>
+        <p>Общее ядро специально создано для повторного использования на разных платформах — один Double Ratchet, одна схема хранения, один транспортный слой. Это значит, что <strong>порт на iOS — во многом вопрос сборки нативной Swift-оболочки</strong> поверх уже работающего ядра, а не переписывания криптографии. Это приоритет следующего этапа разработки и та веха, которую ваша поддержка помогает достичь быстрее.</p>
+  </div>
 </div>
 <div class="rm-cta">
-  <a href="donate.html" class="btn btn-primary">Support the project</a></div><footer>
+  <a href="donate.html" class="btn btn-primary">Поддержать проект</a>
+</div><footer>
   <div class="foot-inner">
     <div>
       <div class="foot-brand">PHANTOM</div>
       <div class="foot-meta">
-        <span>Maintained by Willen LLC · Wyoming, USA<br>AGPL-3.0-or-later · No metadata, no compromise.</span>
-              </div>
+                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Без метаданных, без компромиссов.</span>
+      </div>
     </div>
     <div class="foot-links">
       <a href="https://github.com/LiudvigVladislav/Phantom">GitHub</a>
       <a href="https://codeberg.org/VladislavLiudvig/Phantom">Codeberg</a>
-      <a href="donate.html">Donate</a>      <a href="index.html">Home</a>    </div>
+      <a href="donate.html">Поддержать</a>
+      <a href="index.html">Главная</a>
+    </div>
   </div>
 </footer>
 </body>
