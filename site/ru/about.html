@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>About PHANTOM — Independent privacy messenger</title>
-<meta name="description" content="Why PHANTOM is being built: private, censorship-resistant communication that should answer to no one but its users.">
+<title>О проекте PHANTOM — Независимый приватный мессенджер</title>
+<meta name="description" content="Зачем создаётся PHANTOM: приватная связь, устойчивая к цензуре и подотчётная только своим пользователям.">
 <meta name="robots" content="index,follow">
-<link rel="canonical" href="https://phntm.pro/about.html">
+<link rel="canonical" href="https://phntm.pro/ru/about.html">
 <link rel="alternate" hreflang="en" href="https://phntm.pro/about.html">
 <link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/about.html">
 <link rel="alternate" hreflang="x-default" href="https://phntm.pro/about.html">
@@ -17,20 +17,20 @@
 
 <!-- Open Graph -->
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://phntm.pro/about.html">
-<meta property="og:title" content="About PHANTOM — Independent privacy messenger">
-<meta property="og:description" content="Why PHANTOM is being built: private, censorship-resistant communication that should answer to no one but its users.">
+<meta property="og:url" content="https://phntm.pro/ru/about.html">
+<meta property="og:title" content="О проекте PHANTOM — Независимый приватный мессенджер">
+<meta property="og:description" content="Зачем создаётся PHANTOM: приватная связь, устойчивая к цензуре и подотчётная только своим пользователям.">
 <meta property="og:image" content="https://phntm.pro/static/og-image.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:site_name" content="PHANTOM">
-<meta property="og:locale" content="en_US">
-<meta property="og:locale:alternate" content="ru_RU">
+<meta property="og:locale" content="ru_RU">
+<meta property="og:locale:alternate" content="en_US">
 
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="About PHANTOM — Independent privacy messenger">
-<meta name="twitter:description" content="Why PHANTOM is being built: private, censorship-resistant communication that should answer to no one but its users.">
+<meta name="twitter:title" content="О проекте PHANTOM — Независимый приватный мессенджер">
+<meta name="twitter:description" content="Зачем создаётся PHANTOM: приватная связь, устойчивая к цензуре и подотчётная только своим пользователям.">
 <meta name="twitter:image" content="https://phntm.pro/static/og-image.png">
 
 <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -246,59 +246,79 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
   <a href="index.html" class="nav-logo"><img src="/static/favicon.png" alt="PHANTOM logo"><span>PHANTOM</span></a>
   <button class="menu-btn" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
   <div class="nav-links">
-    <a href="index.html">Home</a>    <a href="about.html" class="active">About</a>    <a href="roadmap.html">Roadmap</a>    <a href="donate.html">Support</a>    <div class="lang"><a href="/about.html" class="active" hreflang="en">EN</a><a href="/ru/about.html" hreflang="ru">RU</a></div>
+    <a href="index.html">Главная</a>
+    <a href="about.html" class="active">О проекте</a>
+    <a href="roadmap.html">Дорожная карта</a>
+    <a href="donate.html">Поддержать</a>
+    <div class="lang"><a href="/about.html" hreflang="en">EN</a><a href="/ru/about.html" class="active" hreflang="ru">RU</a></div>
   </div>
 </nav><header class="about-hero">
   <div class="wrap">
     <div class="mark"><span class="r"></span><span class="r"></span><span class="r"></span><img src="/static/favicon.png" alt="PHANTOM logo"></div>
-    <h1>About PHANTOM</h1>    <div class="tag">The right to communicate, by design</div>
-      </div>
+    <h1>О проекте PHANTOM</h1>
+        <div class="tag">Право на общение — заложено в основу</div>
+  </div>
 </header><div class="about-body">
   <div class="about-block lede reveal">
-    <div class="label">Mission</div>    <p>Communication has become constant and essential — and at the same time increasingly restricted, filtered, and watched. PHANTOM is being built so that people can stay in contact and speak freely regardless of circumstances, limitations, or borders. Access to private communication should never depend on permission.</p>
-      </div>
+    <div class="label">Миссия</div>
+        <p>Общение стало постоянным и необходимым — и одновременно всё более ограниченным, фильтруемым и поднадзорным. PHANTOM создаётся для того, чтобы люди могли оставаться на связи и свободно общаться независимо от обстоятельств, ограничений и границ. Доступ к приватному общению не должен зависеть от чьего-либо разрешения.</p>
+  </div>
 
   <div class="about-block reveal">
-    <div class="label">How it's built</div>    <h2>Built assuming the network is hostile.</h2>
-        <p>Messages are end-to-end encrypted with a custom Double Ratchet implementation over libsodium, using <strong>ED25519 identity keys generated on your device</strong>. A sealed-sender design keeps the relay from learning who is talking to whom.</p>
-        <p>To stay reachable under censorship, the app routes through several transports — including traffic that is indistinguishable from ordinary HTTPS — and falls back automatically when a route is blocked. Everything is open-source under <strong>AGPL-3.0</strong>.</p>
-        <p style="color:var(--ts);font-size:0.88rem;margin-top:6px">The assumptions, adversaries, and out-of-scope cases are written down in full — <a href="https://github.com/LiudvigVladislav/Phantom/blob/master/docs/threat-model/Threat_Model_v0.md" style="color:var(--cyan);text-decoration:none">read the threat model →</a></p>
-        <div class="principles">
+    <div class="label">Как это устроено</div>
+        <h2>Построен из допущения, что сеть враждебна.</h2>
+        <p>Сообщения защищены сквозным шифрованием — собственной реализацией Double Ratchet поверх libsodium, с <strong>ключами личности ED25519, которые генерируются на устройстве</strong>. Технология sealed sender не даёт серверу-ретранслятору узнать, кто с кем общается.</p>
+        <p>Чтобы оставаться доступным под цензурой, приложение использует несколько транспортов — включая трафик, неотличимый от обычного HTTPS, — и автоматически переключается, когда маршрут блокируется. Весь код открыт под лицензией <strong>AGPL-3.0</strong>.</p>
+        <p style="color:var(--ts);font-size:0.88rem;margin-top:6px">Допущения, противники и то, что вне модели угроз, зафиксированы отдельно — <a href="https://github.com/LiudvigVladislav/Phantom/blob/master/docs/threat-model/Threat_Model_v0.md" style="color:var(--cyan);text-decoration:none">полная модель угроз →</a></p>
+    <div class="principles">
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
-        <h4>On-device keys</h4>        <p>Identity keys never leave your phone.</p>      </div>
+        <h4>Ключи на устройстве</h4>
+        <p>Ключи личности не покидают телефон.</p>
+      </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L3 6v6c0 5 3.5 8 9 10 5.5-2 9-5 9-10V6z"/></svg></div>
-        <h4>No metadata graph</h4>        <p>Sealed sender hides who talks to whom.</p>      </div>
+        <h4>Без графа метаданных</h4>
+        <p>Sealed sender скрывает, кто с кем общается.</p>
+      </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" opacity="0.5"/></svg></div>
-        <h4>Routes around blocks</h4>        <p>Multiple transports, automatic fallback.</p>      </div>
+        <h4>Обходит блокировки</h4>
+        <p>Несколько транспортов, авто-переключение.</p>
+      </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></div>
-        <h4>Open & auditable</h4>        <p>AGPL-3.0. No hidden components.</p>      </div>
+        <h4>Открыт и проверяем</h4>
+        <p>AGPL-3.0. Без скрытых компонентов.</p>
+      </div>
     </div>
   </div>
 
   <div class="about-block reveal">
-    <div class="label">Who builds it</div>    <h2>One developer. No investors. No compromise.</h2>
-        <p>PHANTOM is built by a single independent developer, operating through <strong>Willen LLC (Wyoming, USA)</strong>. It is not a startup chasing growth and takes no venture funding.</p>
-        <p>The project is driven by a simple conviction: that private, censorship-resistant communication is infrastructure people deserve to have — and that it should be open, auditable, and answerable to no one but its users.</p>
-      </div>
+    <div class="label">Кто его делает</div>
+        <h2>Один разработчик. Без инвесторов. Без компромиссов.</h2>
+        <p>PHANTOM делает один независимый разработчик под <strong>Willen LLC (Вайоминг, США)</strong>. Это не стартап в погоне за ростом, и проект не привлекает венчурных денег.</p>
+        <p>Им движет простое убеждение: приватное, устойчивое к цензуре общение — это инфраструктура, которую люди заслуживают иметь, и она должна быть открытой, проверяемой и подотчётной только своим пользователям.</p>
+  </div>
 
   <div class="about-cta">
-    <a href="roadmap.html" class="btn btn-ghost">See the roadmap →</a>    <a href="donate.html" class="btn btn-primary" style="margin-left:10px">Support the project</a>  </div>
+    <a href="roadmap.html" class="btn btn-ghost">Дорожная карта →</a>
+    <a href="donate.html" class="btn btn-primary" style="margin-left:10px">Поддержать проект</a>
+  </div>
 </div><footer>
   <div class="foot-inner">
     <div>
       <div class="foot-brand">PHANTOM</div>
       <div class="foot-meta">
-        <span>Maintained by Willen LLC · Wyoming, USA<br>AGPL-3.0-or-later · No metadata, no compromise.</span>
-              </div>
+                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Без метаданных, без компромиссов.</span>
+      </div>
     </div>
     <div class="foot-links">
       <a href="https://github.com/LiudvigVladislav/Phantom">GitHub</a>
       <a href="https://codeberg.org/VladislavLiudvig/Phantom">Codeberg</a>
-      <a href="donate.html">Donate</a>      <a href="index.html">Home</a>    </div>
+      <a href="donate.html">Поддержать</a>
+      <a href="index.html">Главная</a>
+    </div>
   </div>
 </footer>
 </body>

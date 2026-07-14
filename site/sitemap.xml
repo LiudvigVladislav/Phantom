@@ -1,22 +1,67 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:xhtml="http://www.w3.org/1999/xhtml">
   <url>
     <loc>https://phntm.pro/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/"/>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://phntm.pro/ru/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/"/>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
   <url>
     <loc>https://phntm.pro/about.html</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/about.html"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/about.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/about.html"/>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://phntm.pro/ru/about.html</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/about.html"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/about.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/about.html"/>
     <changefreq>monthly</changefreq>
     <priority>0.8</priority>
   </url>
   <url>
     <loc>https://phntm.pro/roadmap.html</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/roadmap.html"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/roadmap.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/roadmap.html"/>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://phntm.pro/ru/roadmap.html</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/roadmap.html"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/roadmap.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/roadmap.html"/>
     <changefreq>weekly</changefreq>
     <priority>0.9</priority>
   </url>
   <url>
     <loc>https://phntm.pro/donate.html</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/donate.html"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/donate.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/donate.html"/>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://phntm.pro/ru/donate.html</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/donate.html"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/donate.html"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/donate.html"/>
     <changefreq>monthly</changefreq>
     <priority>0.7</priority>
   </url>

@@ -1,8 +1,15 @@
 # PHANTOM — phntm.pro site
 
-Static site for **phntm.pro**. Four pages, bilingual (EN/RU, auto-detect
-browser language + manual switcher with localStorage persistence),
+Static site for **phntm.pro**. Four pages, mirrored in two languages
+(English at the tree root, Russian at `/ru/`), each page single-language,
 no build tooling — pure HTML/CSS/JS.
+
+Language switching is done by real `<a>` links between the two trees
+(see `.lang` in the nav). There is no JavaScript language auto-detect,
+no `localStorage` toggle, no client-side content swap — a page has
+exactly one language and its URL declares which. This structure was
+introduced on 2026-07-15 in the Phase 3 SEO work to make hreflang
+targeting effective for both Google and Yandex.
 
 Each `*.html` embeds its CSS and JS directly in the `<style>` and
 `<script>` blocks. The brand logo is served as a small image from
@@ -18,9 +25,27 @@ bytes into the HTML that had to travel before first render. That was
 removed on 2026-06-02 (index / about ~83–89% smaller; roadmap / donate
 ~77% smaller). The logo is now fetched once and cached.
 
-**Source of truth: the four `*.html` files themselves.** Edit them
+**Source of truth: the eight `*.html` files themselves.** Edit them
 directly with any text editor and the change is live after the next
 deploy.
+
+**Two-tree maintenance model.** The EN tree (`site/*.html`) and the RU
+tree (`site/ru/*.html`) are maintained independently — a content edit
+that should appear in both languages must be applied to both files.
+There is no generator; the initial RU tree was produced once by a
+throwaway Python script at split time and both trees are hand-edited
+from that point on. Rationale: PR #377 already deleted a class of stale
+build tooling that had drifted from the HTML it was supposed to
+generate; a live generator would just re-introduce the same drift risk.
+Four pages × 2 languages is small enough to maintain by hand.
+
+Each EN/RU pair carries a reciprocal `hreflang` cluster
+(`en` / `ru` / `x-default`) plus a self-referencing `canonical`, so a
+search engine that crawls one variant discovers the other and
+associates them correctly. `sitemap.xml` lists all 8 URLs with the
+same alternate annotations. Do not break the pairing: if a page is
+renamed, both files must be renamed and both hreflang blocks + the
+sitemap entry must be updated in the same commit.
 
 The old Python generator scripts under `.build/build_*.py` were
 removed on 2026-06-02 because their template had drifted about two
@@ -42,11 +67,16 @@ the inlined copies in each HTML page.
 
 ```
 site/
-├── index.html              Home (hero, features, privacy modes, transports, status)
-├── about.html              About (mission, how it's built, who builds it)
-├── roadmap.html            Roadmap (Shipped / In progress / Planned)
-├── donate.html             Support (donation channels + crypto copy-buttons)
-├── sitemap.xml             SEO sitemap (4 URLs, matches the four pages)
+├── index.html              Home — EN     (URL: /)
+├── about.html              About — EN    (URL: /about.html)
+├── roadmap.html            Roadmap — EN  (URL: /roadmap.html)
+├── donate.html             Support — EN  (URL: /donate.html)
+├── ru/
+│   ├── index.html          Home — RU     (URL: /ru/)
+│   ├── about.html          About — RU    (URL: /ru/about.html)
+│   ├── roadmap.html        Roadmap — RU  (URL: /ru/roadmap.html)
+│   └── donate.html         Support — RU  (URL: /ru/donate.html)
+├── sitemap.xml             SEO sitemap (8 URLs with xhtml:link alternate annotations)
 ├── robots.txt              Crawler rules (allow search + AI grounding, deny training)
 ├── styles.css              Reference copy of design tokens + layout (NOT executed at runtime)
 ├── site.js                 Reference copy of lang switcher + scroll-reveal (NOT executed at runtime)
