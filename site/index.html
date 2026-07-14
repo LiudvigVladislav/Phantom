@@ -355,7 +355,7 @@ html[data-lang="ru"] div[data-lang-ru],html[data-lang="ru"] p[data-lang-ru],html
 .hero-main{position:relative;z-index:2;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:130px 0 80px}
 .hero-main .wrap{display:flex;flex-direction:column;align-items:center}
 .hero-mark{display:flex;justify-content:center;margin-bottom:8px;animation:fade 1s ease both}
-.hero-mark .hr-logo{width:240px;height:auto;display:block}
+.hero-mark .hr-logo{width:clamp(150px, 42vw, 240px);height:auto;display:block}
 .hero-word{font-family:var(--geist);font-weight:500;letter-spacing:0.46em;text-indent:0.46em;font-size:clamp(1.8rem,4.6vw,2.9rem);color:var(--tp);margin-bottom:8px;animation:fade 1s ease .1s both;text-shadow:0 0 40px rgba(0,212,255,0.15)}
 .hero-word::after{content:'';display:block;width:60px;height:1px;margin:18px auto 0;background:linear-gradient(90deg,transparent,var(--cyan),transparent);opacity:0.7}
 .badge-row{display:flex;gap:9px;justify-content:center;margin:22px 0 26px;flex-wrap:wrap;animation:fade 1s ease .2s both}
