@@ -354,13 +354,8 @@ html[data-lang="ru"] div[data-lang-ru],html[data-lang="ru"] p[data-lang-ru],html
 /* HERO main */
 .hero-main{position:relative;z-index:2;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:130px 0 80px}
 .hero-main .wrap{display:flex;flex-direction:column;align-items:center}
-.hero-mark{position:relative;width:180px;height:180px;display:flex;align-items:center;justify-content:center;margin-bottom:8px;animation:fade 1s ease both}
-.hero-mark .hr-logo{width:108px;height:108px;border-radius:26px;position:relative;z-index:3;box-shadow:0 0 50px rgba(123,107,240,0.4)}
-.hr-ring{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);border:1px solid rgba(0,212,255,0.4);border-radius:50%;animation:hr-pulse 3.4s ease-out infinite}
-.hr-ring:nth-child(1){width:120px;height:120px;animation-delay:0s}
-.hr-ring:nth-child(2){width:150px;height:150px;animation-delay:0.5s}
-.hr-ring:nth-child(3){width:180px;height:180px;animation-delay:1s}
-@keyframes hr-pulse{0%{opacity:0.55;transform:translate(-50%,-50%) scale(0.8)}70%{opacity:0}100%{opacity:0;transform:translate(-50%,-50%) scale(1.25)}}
+.hero-mark{display:flex;justify-content:center;margin-bottom:8px;animation:fade 1s ease both}
+.hero-mark .hr-logo{width:clamp(150px, 42vw, 240px);height:auto;display:block}
 .hero-word{font-family:var(--geist);font-weight:500;letter-spacing:0.46em;text-indent:0.46em;font-size:clamp(1.8rem,4.6vw,2.9rem);color:var(--tp);margin-bottom:8px;animation:fade 1s ease .1s both;text-shadow:0 0 40px rgba(0,212,255,0.15)}
 .hero-word::after{content:'';display:block;width:60px;height:1px;margin:18px auto 0;background:linear-gradient(90deg,transparent,var(--cyan),transparent);opacity:0.7}
 .badge-row{display:flex;gap:9px;justify-content:center;margin:22px 0 26px;flex-wrap:wrap;animation:fade 1s ease .2s both}
@@ -372,7 +367,7 @@ html[data-lang="ru"] div[data-lang-ru],html[data-lang="ru"] p[data-lang-ru],html
 .status-box .btn{margin-top:24px;display:none}
 html[data-lang="en"] .status-box a.btn[data-lang-en]{display:inline-flex}
 html[data-lang="ru"] .status-box a.btn[data-lang-ru]{display:inline-flex}
-@media(prefers-reduced-motion:reduce){.hr-ring{animation:none;opacity:0.3}.hero-mark,.hero-word,.badge-row,.hero-main h1,.hero-sub,.hero-cta{animation:none}}
+@media(prefers-reduced-motion:reduce){.hero-mark,.hero-word,.badge-row,.hero-main h1,.hero-sub,.hero-cta{animation:none}}
 </style>
 </head>
 <body>
@@ -391,8 +386,7 @@ html[data-lang="ru"] .status-box a.btn[data-lang-ru]{display:inline-flex}
 </nav><header class="hero-main">
   <div class="wrap">
     <div class="hero-mark">
-      <span class="hr-ring"></span><span class="hr-ring"></span><span class="hr-ring"></span>
-      <img src="/static/favicon.png" alt="PHANTOM logo" class="hr-logo">
+      <img src="/static/logo-mark.png" alt="PHANTOM logo" class="hr-logo">
     </div>
     <div class="hero-word">PHANTOM</div>
     <div class="badge-row">
