@@ -195,5 +195,5 @@ In rough order of importance:
 ## Contact
 
 - GitHub: https://github.com/LiudvigVladislav/Phantom
-- Author: WladislaW (Willen LLC, Wyoming)
+- Author: Vladislav (Willen LLC, Wyoming)
 - Project status: Active development, Alpha stage
