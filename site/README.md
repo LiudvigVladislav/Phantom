@@ -4,10 +4,19 @@ Static site for **phntm.pro**. Four pages, bilingual (EN/RU, auto-detect
 browser language + manual switcher with localStorage persistence),
 no build tooling — pure HTML/CSS/JS.
 
-Each `*.html` is fully self-contained: CSS and JS are inlined into
-the `<style>` and `<script>` blocks so the page renders without any
-extra HTTP requests beyond CDN fonts (Inter, JetBrains Mono via
-Google Fonts; Geist via jsdelivr).
+Each `*.html` embeds its CSS and JS directly in the `<style>` and
+`<script>` blocks. The brand logo is served as a small image from
+`/static/favicon.png` (~57 KB, same-origin, cached across pages and
+reused for the browser tab icon — so the `<img>` reference costs zero
+new network requests). CDN fonts (Inter and JetBrains Mono via Google
+Fonts, Geist via jsdelivr) are the only external requests.
+
+Earlier revisions of these HTML files embedded the brand logo as a
+base64 data URI directly inside every `<img>` tag — six ~82 KB copies
+of the same JPEG across the four pages, pushing ~660 KB of duplicated
+bytes into the HTML that had to travel before first render. That was
+removed on 2026-06-02 (index / about ~83–89% smaller; roadmap / donate
+~77% smaller). The logo is now fetched once and cached.
 
 **Source of truth: the four `*.html` files themselves.** Edit them
 directly with any text editor and the change is live after the next
@@ -42,7 +51,8 @@ site/
 ├── styles.css              Reference copy of design tokens + layout (NOT executed at runtime)
 ├── site.js                 Reference copy of lang switcher + scroll-reveal (NOT executed at runtime)
 ├── static/
-│   ├── favicon.png         512×512, browser tab / bookmark / home-screen / JSON-LD org logo
+│   ├── favicon.png         512×512, browser tab / bookmark / home-screen
+│   │                       / JSON-LD org logo / on-page brand logo (nav + hero)
 │   └── og-image.png        1200×630, social share preview (og:image + twitter:image)
 └── README.md               This file
 ```
