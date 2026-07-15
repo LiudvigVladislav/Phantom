@@ -313,6 +313,21 @@ phntm.pro, www.phntm.pro {
         file_server
     }
 
+    # Phase 4 (2026-07-15): self-hosted web fonts under /static/fonts/*.
+    # These are immutable assets — if the visual design ever needs a different
+    # font file, the filename would change (content-hashing convention). So
+    # aggressive year-long caching is safe. Also blocks Cloudflare from
+    # counting these as visitor-traffic since browsers hit disk cache after
+    # first fetch. Placed BEFORE the catch-all so /static/fonts/*.woff2 gets
+    # the immutable Cache-Control header rather than the default file_server
+    # cache treatment from the catch-all.
+    handle /static/fonts/* {
+        root * /srv/landing
+        header Cache-Control "public, max-age=31536000, immutable"
+        header Access-Control-Allow-Origin "*"
+        file_server
+    }
+
     # Static site for phntm.pro served from `site/` bind-mount.
     # `try_files {path} {path}/index.html =404` serves real 404 for unknown URLs
     # instead of soft-404 falling back to index.html (which was causing every
