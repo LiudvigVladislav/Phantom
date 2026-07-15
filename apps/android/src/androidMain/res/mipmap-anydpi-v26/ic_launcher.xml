@@ -1,9 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive icon (Android 8+ / API 26+).
+  Refreshed 2026-07-16 to the new brandmark (silver P + keyhole + motion lines).
+
+  foreground candidates committed in drawable/:
+    ic_phantom_fg_safe  — full mark inside 66dp safe zone (no clipping on any mask)
+    ic_phantom_fg_bold  — larger, motion lines may clip on circle masks
+
+  To switch to the bold variant, change the foreground android:drawable below
+  to @drawable/ic_phantom_fg_bold. Padding is baked into the PNG at generation
+  time (see scratchpad/android_icon_pipeline.py); no <inset> wrapper needed.
+
+  monochrome layer added — Android 13+ themed icons (Material You) will tint
+  the P+keyhole silhouette to match the user's system theme. Motion lines are
+  dropped from the monochrome variant for legibility at small tint sizes.
+-->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background"/>
-    <foreground>
-        <inset
-            android:drawable="@drawable/phantom_logo"
-            android:inset="20%"/>
-    </foreground>
+    <foreground android:drawable="@drawable/ic_phantom_fg_safe"/>
+    <monochrome android:drawable="@drawable/ic_phantom_mono"/>
 </adaptive-icon>

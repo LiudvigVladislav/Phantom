@@ -1041,8 +1041,11 @@ class PhantomMessagingService : Service() {
     private fun buildNotification(statusText: String) = NotificationCompat.Builder(this, CHANNEL_ID)
         .setContentTitle("PHANTOM")
         .setContentText(statusText)
-        // ic_launcher_foreground is a vector layer, not a standalone icon — use system placeholder.
-        // Replace with a dedicated monochrome status-bar icon (24dp, white-on-transparent) in Beta.
+        // TODO(Beta): replace with a dedicated monochrome status-bar icon
+        // (24dp, white-on-transparent). Android status-bar icons must be
+        // pure-white silhouettes with alpha; @drawable/ic_phantom_mono is
+        // 432dp and full-mark shaped, not suited to 24dp. Using system
+        // placeholder until the small status-bar variant ships.
         .setSmallIcon(android.R.drawable.ic_dialog_info)
         .setOngoing(true)
         .setSilent(true)
