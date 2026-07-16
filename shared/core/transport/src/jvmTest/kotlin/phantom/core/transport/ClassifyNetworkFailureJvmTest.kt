@@ -94,6 +94,43 @@ class ClassifyNetworkFailureJvmTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // T12d (round-1 review, TLS priority) — terminal TLS ALWAYS wins over a
+    // transient class deeper in the same chain. Binding doc D5 mandates
+    // two-pass cause-chain recognition: first the whole chain is scanned
+    // for TLS-terminal classes, then only if none are found the chain is
+    // scanned for transient classes. Without this ordering an SSLException
+    // whose real cause is a cert failure but which was itself wrapped over
+    // a SocketTimeoutException could yield RetryableTransient (from the
+    // deeper socket-timeout) — masking the terminal cert failure.
+    //
+    // Failure mode this regression catches: if the classifier switches
+    // back to a single-pass walk that returns the first match, it will
+    // return RetryableTransient here (from cause[1] = SocketTimeout) and
+    // the terminal SSLPeerUnverifiedException at cause[0] will be masked.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun classifyNetworkFailure_mixedChainTerminalTlsBeforeTransient_returnsTerminalTls() {
+        val deepestTransient = SocketTimeoutException("read timed out")
+        val terminalTls = SSLPeerUnverifiedException("cert unverified")
+        // Cause chain:
+        //   [0] outer SSLException
+        //   [1] SSLPeerUnverifiedException  ← terminal TLS
+        //   [2] SocketTimeoutException      ← would classify transient if scanned first
+        (terminalTls as Throwable).initCause(deepestTransient)
+        val t = SSLException("outer", terminalTls)
+
+        val decision = classifyNetworkFailure(t)
+
+        assertEquals(
+            RetryDecision.TerminalTls, decision,
+            "mixed chain (TLS terminal + deeper transient) MUST classify as " +
+                "TerminalTls — single-pass first-match walk would incorrectly " +
+                "return RetryableTransient (regression guard for two-pass ordering)",
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // T-F11c — external cancellation propagates as CancellationException;
     // MUST NOT be converted to FetchStatusDeadlineExceededException.
     // ═══════════════════════════════════════════════════════════════════════

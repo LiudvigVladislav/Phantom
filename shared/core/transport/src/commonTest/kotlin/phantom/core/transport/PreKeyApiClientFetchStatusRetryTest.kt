@@ -776,16 +776,28 @@ class PreKeyApiClientFetchStatusRetryTest {
     @Test
     fun requestAndBodyReadPaths_produceIdenticalRetryDecision_viaSharedClassifier() =
         runBlocking<Unit> {
+            // OPAQUE_SENTINEL contains NONE of TRANSIENT_MESSAGE_SIGNALS —
+            // no "timeout", "timed out", "connection reset", "connection closed",
+            // "broken pipe", "stream closed", "closed connection",
+            // "unexpected end of stream", "eof". The classifier's IOException
+            // message-keyword fallback CANNOT rescue this exception; only
+            // the cause-chain walk at the transient-class recognition
+            // pass can classify it as RetryableTransient. If the chain
+            // walk is removed or narrowed to top-level-only, this test
+            // must fail with 1 GET and the exception surfacing on
+            // attempt 1 through the TerminalOther fall-through.
+            val opaqueSentinel = "opaque-body-sentinel"
+
             // ── Variant 1: request-read path — engine handler THROWS the
             // transient class directly at request time. Top-level throwable
-            // is the bare SocketTimeoutException.
+            // is the bare SocketTimeoutException with opaque message.
             var reqCall = 0
             val reqMarkers = mutableListOf<String>()
             val reqClient = HttpClient(MockEngine) {
                 engine {
                     addHandler {
                         reqCall++
-                        throw java.net.SocketTimeoutException("request-read timeout")
+                        throw java.net.SocketTimeoutException(opaqueSentinel)
                     }
                 }
             }
@@ -805,9 +817,11 @@ class PreKeyApiClientFetchStatusRetryTest {
 
             // ── Variant 2: body-read path — engine handler returns a
             // ByteReadChannel that raises the SAME transient class via
-            // cancel(cause). Ktor wraps the cause in IOException-of-
-            // IOException, but the classifier's cause-chain walk sees
-            // the original SocketTimeoutException at cause depth 2.
+            // cancel(cause) with the SAME opaque message. Ktor wraps
+            // the cause in IOException(cause=IOException(cause=<real>))
+            // via CloseToken + DoubleReceivePlugin; the surfaced
+            // top-level IS NOT a SocketTimeoutException. Only the
+            // cause-chain walk can classify it as RetryableTransient.
             var bodyCall = 0
             val bodyMarkers = mutableListOf<String>()
             val bodyClient = HttpClient(MockEngine) {
@@ -815,7 +829,7 @@ class PreKeyApiClientFetchStatusRetryTest {
                     addHandler {
                         bodyCall++
                         val throwingChannel = ByteChannel(autoFlush = true).apply {
-                            cancel(java.net.SocketTimeoutException("body-read timeout"))
+                            cancel(java.net.SocketTimeoutException(opaqueSentinel))
                         }
                         respond(
                             content = throwingChannel,
@@ -873,12 +887,44 @@ class PreKeyApiClientFetchStatusRetryTest {
                 bodyMarkers.any { it.contains("verify_retry_exhausted") },
                 "body-read must fire verify_retry_exhausted after cap",
             )
-            // Both variants throw AFTER the retry loop exhausts (rather
-            // than terminating early on attempt 1). Concrete top-level
-            // classes differ (Ktor wrapping is a version artefact) — what
-            // matters is the classifier's decision is symmetric.
             assertNotNull(reqException, "request-read must throw after cap")
             assertNotNull(bodyException, "body-read must throw after cap")
+
+            // ── Structural proof that the body-read path relied on the
+            // cause-chain walk, not on top-level recognition. Ktor 3.0.3
+            // wraps the SocketTimeoutException in
+            // IOException(cause=IOException(cause=SocketTimeoutException))
+            // via CloseToken + ByteChannelReplay. The surfaced top-level
+            // MUST NOT be a SocketTimeoutException — otherwise this test
+            // would degenerate into "top-level recognition also works".
+            assertFalse(
+                bodyException is java.net.SocketTimeoutException,
+                "body-read top-level MUST be a Ktor-wrapper, not the bare " +
+                    "SocketTimeoutException — otherwise classification would " +
+                    "not require the cause-chain walk (got ${bodyException!!::class.qualifiedName})",
+            )
+            // The original SocketTimeoutException must be reachable
+            // through the cause chain (within the classifier's bounded
+            // depth 5). If nested transient recognition is removed from
+            // the classifier, retries stop firing → the retry-count
+            // assertion above fails.
+            var cur: Throwable? = bodyException?.cause
+            var depth = 0
+            var foundNestedSocketTimeout = false
+            while (cur != null && depth < 5) {
+                if (cur is java.net.SocketTimeoutException) {
+                    foundNestedSocketTimeout = true
+                    break
+                }
+                cur = cur.cause
+                depth++
+            }
+            assertTrue(
+                foundNestedSocketTimeout,
+                "body-read cause chain (depth ≤5) must contain the original " +
+                    "SocketTimeoutException — this is what the classifier's " +
+                    "cause-chain walk recognises",
+            )
         }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1021,6 +1067,71 @@ class PreKeyApiClientFetchStatusRetryTest {
         assertEquals(
             1, exhaustedDeadlineMarkers,
             "expected 1 verify_retry_exhausted marker with attempt_deadline; markers=$markers",
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Round-1 review (D8 secret-sentinel non-leak) — prove that a
+    // throwable's `message` never reaches PREKEY_TRACE markers. The test
+    // wraps a secret sentinel inside a top-level exception message,
+    // triggers the classifier's `verify_terminal_shortcut` code path in
+    // fetchStatus, captures every marker via `logObserver`, and asserts
+    // no marker contains the secret. Also asserts the marker DOES
+    // contain the exception CLASS name (positive-shape guarantee).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    fun fetchStatusMarkers_neverContainThrowableMessage_secretSentinelNotLeaked() = runBlocking<Unit> {
+        val secretSentinel = "S3CRET-D8-SENTINEL-9f8e7d6c5b4a"
+        val client = HttpClient(MockEngine) {
+            engine {
+                addHandler {
+                    // Non-retryable, non-TLS throwable so the classifier
+                    // returns TerminalOther and fetchStatus emits
+                    // `verify_terminal_shortcut` on attempt 1 — the primary
+                    // marker that would embed a `.message` if the D8
+                    // discipline slipped.
+                    throw IllegalArgumentException(
+                        "opaque-terminal-sentinel-with-secret:$secretSentinel",
+                    )
+                }
+            }
+        }
+        val markers = mutableListOf<String>()
+        val api = PreKeyApiClient(
+            httpClient = client,
+            relayBaseUrl = baseUrl,
+            jitter = { 0L },
+            logObserver = { markers.add(it) },
+        )
+        try {
+            api.fetchStatus("aa".repeat(32))
+            fail("expected IllegalArgumentException from handler")
+        } catch (t: Throwable) {
+            // expected; content asserted below
+        }
+
+        assertTrue(markers.isNotEmpty(), "logObserver must capture at least one marker")
+
+        // 1. NO marker anywhere in the captured stream may contain the
+        //    secret sentinel — that would prove `.message` leaked.
+        val leaked = markers.filter { secretSentinel in it }
+        assertTrue(
+            leaked.isEmpty(),
+            "PREKEY_TRACE markers leaked throwable message content — D8 violation. " +
+                "Leaked markers: $leaked",
+        )
+
+        // 2. Positive shape: the terminal-shortcut marker MUST contain
+        //    the exception CLASS name (`reason=IllegalArgumentException`)
+        //    — proves the class-only marker path IS being emitted.
+        assertTrue(
+            markers.any {
+                it.contains("verify_terminal_shortcut") &&
+                    it.contains("reason=IllegalArgumentException")
+            },
+            "expected class-only verify_terminal_shortcut marker with " +
+                "reason=IllegalArgumentException; got $markers",
         )
     }
 }

@@ -169,8 +169,7 @@ class PreKeyLifecycleService(
     suspend fun bootstrapForNewIdentity(): Result<Unit> = runCatching {
         if (signedPreKeyRepository.get() != null) {
             // Already done — onboarding ran on a previous launch.
-            messagingLog(
-                MessagingLogLevel.INFO,
+            trace(
                 "PREKEY_TRACE bootstrap_skip_existing_spk — local SPK already present, no publish",
             )
             return Result.success(Unit)
@@ -181,10 +180,7 @@ class PreKeyLifecycleService(
             ?: throw MigrationException.NoIdentity
 
         val identityTag = identity.publicKeyHex.take(16)
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "PREKEY_TRACE bootstrap_start identity=$identityTag…",
-        )
+        trace("PREKEY_TRACE bootstrap_start identity=$identityTag…")
         val spkEntity = generateAndPersistSpk(signing)
         generateAndPersistOpks(REFILL_BATCH_SIZE, replaceExisting = true)
         // Sprint 2b L1: even on the bootstrap path, the publish helper
@@ -195,10 +191,7 @@ class PreKeyLifecycleService(
         // never the stale 40-OPK snapshot. The scope-lock rejects a
         // bootstrap-path exception (see L1 + M-2bA-5).
         publishBundle(identity.publicKeyHex, signing, spkEntity) { oneTimePreKeyRepository.getAll() }
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "PREKEY_TRACE bootstrap_done identity=$identityTag…",
-        )
+        trace("PREKEY_TRACE bootstrap_done identity=$identityTag…")
     }
 
     /**
@@ -562,9 +555,9 @@ class PreKeyLifecycleService(
         // PreKeyApiClient.publishWithRetry's prekey_publish_start lines,
         // each reflecting the L1 re-snapshot at the start of that attempt.
         val preflightOpkCount = opksProvider().size
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "PREKEY_TRACE upload_start identity=$identityTag… opks=$preflightOpkCount spk_key_id=${spk.keyId}",
+        trace(
+            "PREKEY_TRACE upload_start identity=$identityTag… " +
+                "opks=$preflightOpkCount spk_key_id=${spk.keyId}",
         )
 
         val signingPubHex = signing.publicKey.bytes.toHex()

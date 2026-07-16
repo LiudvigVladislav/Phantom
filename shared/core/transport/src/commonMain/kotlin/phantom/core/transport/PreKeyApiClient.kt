@@ -263,10 +263,7 @@ class PreKeyApiClient(
         // timeline.
         if (!publishMutex.tryLock()) {
             if (!forceJoinInFlight) {
-                relayLog(
-                    RelayLogLevel.INFO,
-                    "PREKEY_TRACE prekey_publish_debounced",
-                )
+                trace("PREKEY_TRACE prekey_publish_debounced")
                 // Honest result: NOT stored. The in-flight publish may yet
                 // fail. Callers that need a guaranteed publish must retry
                 // with `forceJoinInFlight = true`.
@@ -280,19 +277,10 @@ class PreKeyApiClient(
             // load-bearing one — without it the bundle stays missing from
             // the relay). The two states are indistinguishable from the
             // mutex alone, so we always re-publish on the force path.
-            relayLog(
-                RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_debounced force_join=true",
-            )
-            relayLog(
-                RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_force_join_wait",
-            )
+            trace("PREKEY_TRACE prekey_publish_debounced force_join=true")
+            trace("PREKEY_TRACE prekey_publish_force_join_wait")
             publishMutex.lock()
-            relayLog(
-                RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_force_join_acquired",
-            )
+            trace("PREKEY_TRACE prekey_publish_force_join_acquired")
         }
 
         // Lock acquired via tryLock() OR via the force-join lock() above.
@@ -364,13 +352,14 @@ class PreKeyApiClient(
             // ByteArray via okio.Buffer.writeAll() without any streaming.
             val bodyBytes = bodyJson.encodeToByteArray()
             if (bodyBytes.size >= 7800) {
-                relayLog(
+                trace(
+                    "PREKEY_TRACE prekey_publish_body_near_carrier_limit " +
+                        "bodyBytes=${bodyBytes.size} threshold=7800 attempt=$attempt " +
+                        "note=may_hit_tele2_8192_byte_cut",
                     RelayLogLevel.WARN,
-                    "PREKEY_TRACE prekey_publish_body_near_carrier_limit bodyBytes=${bodyBytes.size} threshold=7800 attempt=$attempt note=may_hit_tele2_8192_byte_cut",
                 )
             }
-            relayLog(
-                RelayLogLevel.INFO,
+            trace(
                 "PREKEY_TRACE prekey_publish_start native=true identity=$identityTag… " +
                     "opks=${request.one_time_pre_keys.size} " +
                     "spk_key_id=${request.signed_pre_key.key_id} " +
@@ -429,23 +418,21 @@ class PreKeyApiClient(
                 }
                 if (attempt < PUBLISH_MAX_ATTEMPTS && t.isRetryableForPublish()) {
                     val nextDelay = jitter(PUBLISH_RETRY_DELAYS_MS[attempt - 1])
-                    relayLog(
-                        RelayLogLevel.WARN,
+                    trace(
                         "PREKEY_TRACE prekey_publish_retry identity=$identityTag… " +
                             "reason=${t::class.simpleName} attempt=$attempt " +
                             "next_delay_ms=$nextDelay elapsedMs=$elapsed",
-                        t,
+                        RelayLogLevel.WARN,
                     )
                     delay(nextDelay)
                     continue
                 } else {
                     val totalElapsed = Clock.System.now().toEpochMilliseconds() - totalStartMs
-                    relayLog(
-                        RelayLogLevel.WARN,
+                    trace(
                         "PREKEY_TRACE prekey_publish_fail_giving_up identity=$identityTag… " +
                             "total_elapsedMs=$totalElapsed attempts=$attempt " +
-                            "last_exception=${t::class.simpleName}: ${t.message ?: "<null>"}",
-                        t,
+                            "last_exception=${t::class.simpleName}",
+                        RelayLogLevel.WARN,
                     )
                     throw t
                 }
@@ -479,11 +466,11 @@ class PreKeyApiClient(
             // narrowed contract; publish uses only the constant fallback).
             if (statusValue == 429 && attempt < PUBLISH_MAX_ATTEMPTS) {
                 val nextDelay = jitter(RATE_LIMIT_FALLBACK_MS)
-                relayLog(
-                    RelayLogLevel.WARN,
+                trace(
                     "PREKEY_TRACE prekey_publish_retry identity=$identityTag… " +
                         "reason=http429 attempt=$attempt " +
                         "next_delay_ms=$nextDelay elapsedMs=$elapsed",
+                    RelayLogLevel.WARN,
                 )
                 delay(nextDelay)
                 continue
@@ -495,19 +482,18 @@ class PreKeyApiClient(
                 attempt < PUBLISH_MAX_ATTEMPTS
             ) {
                 val nextDelay = jitter(PUBLISH_RETRY_DELAYS_MS[attempt - 1])
-                relayLog(
-                    RelayLogLevel.WARN,
+                trace(
                     "PREKEY_TRACE prekey_publish_retry identity=$identityTag… " +
                         "reason=http$statusValue attempt=$attempt " +
                         "next_delay_ms=$nextDelay elapsedMs=$elapsed",
+                    RelayLogLevel.WARN,
                 )
                 delay(nextDelay)
                 continue
             }
 
             // Non-retryable or final attempt — process the result.
-            relayLog(
-                RelayLogLevel.INFO,
+            trace(
                 "PREKEY_TRACE prekey_publish_ok native=true identity=$identityTag… " +
                     "status=$statusValue elapsedMs=${nativeResp.elapsedMs} attempt=$attempt",
             )
@@ -565,11 +551,11 @@ class PreKeyApiClient(
         // Unreachable: the loop either returns or throws. Satisfy the compiler.
         val totalElapsed = Clock.System.now().toEpochMilliseconds() - totalStartMs
         val ex = lastException ?: IllegalStateException("publishWithRetry exhausted loop without result")
-        relayLog(
-            RelayLogLevel.WARN,
+        trace(
             "PREKEY_TRACE prekey_publish_fail_giving_up identity=$identityTag… " +
                 "total_elapsedMs=$totalElapsed attempts=$PUBLISH_MAX_ATTEMPTS " +
-                "last_exception=${ex::class.simpleName}: ${ex.message ?: "<null>"}",
+                "last_exception=${ex::class.simpleName}",
+            RelayLogLevel.WARN,
         )
         throw ex
     }
