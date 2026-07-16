@@ -429,6 +429,9 @@ class PreKeyPublishReliabilityTest {
             httpClient = unusedKtorClient,
             relayBaseUrl = "https://relay.test",
             publishTransport = transport,
+            // CLIENT-PREKEY-SELFHEAL: identity jitter so the elapsed
+            // virtual-time equals the raw delay sum (no ±30% variance).
+            jitter = { it },
         )
 
         val tBefore = testScheduler.currentTime

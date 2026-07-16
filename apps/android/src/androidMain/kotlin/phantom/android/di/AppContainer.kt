@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
@@ -80,6 +81,15 @@ import phantom.core.xray.createXrayService
 class AppContainer(private val context: Context) {
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * CLIENT-PREKEY-SELFHEAL D2 trigger 3: 15-minute cadence for the
+     * periodic verify tick. Short enough to close the yellow-dot
+     * bundle-gap window quickly after transport recovery; long enough
+     * to avoid material battery / cellular cost. Reset on process
+     * restart (backed by `appScope`).
+     */
+    private val PREKEY_PERIODIC_VERIFY_INTERVAL_MS: Long = 15L * 60L * 1000L
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -2275,27 +2285,61 @@ class AppContainer(private val context: Context) {
         appScope.launch {
             transport.state.collect { st ->
                 if (st !is phantom.core.transport.TransportState.Connected) return@collect
-                runCatching { lifecycleService.verifyBundleOnRelay() }
-                    .onFailure {
-                        android.util.Log.w(
-                            "PreKeyLifecycle",
-                            "verifyBundleOnRelay on reconnect failed: ${it.message}",
-                        )
-                    }
-                runCatching { lifecycleService.maybeReplenishOneTimePreKeys() }
-                    .onFailure {
-                        android.util.Log.w(
-                            "PreKeyLifecycle",
-                            "Replenish on reconnect failed: ${it.message}",
-                        )
-                    }
-                runCatching { lifecycleService.maybeRotateSignedPreKey() }
-                    .onFailure {
-                        android.util.Log.w(
-                            "PreKeyLifecycle",
-                            "Rotate on reconnect failed: ${it.message}",
-                        )
-                    }
+                // CLIENT-PREKEY-SELFHEAL D2/T-F1a/T-F1b: observe the
+                // service's Result.failure directly (no outer runCatching
+                // — that would swallow CancellationException from
+                // fetchStatus). On failure: re-throw CE so structured
+                // concurrency sees the cancel; otherwise log class-only
+                // (no throwable message content per D8).
+                lifecycleService.verifyBundleOnRelay(
+                    phantom.core.messaging.VerifyTrigger.Connected,
+                ).onFailure {
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    android.util.Log.w(
+                        "PreKeyLifecycle",
+                        "verifyBundleOnRelay on reconnect failed: type=${it::class.simpleName}",
+                    )
+                }
+                lifecycleService.maybeReplenishOneTimePreKeys().onFailure {
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    android.util.Log.w(
+                        "PreKeyLifecycle",
+                        "Replenish on reconnect failed: type=${it::class.simpleName}",
+                    )
+                }
+                lifecycleService.maybeRotateSignedPreKey().onFailure {
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    android.util.Log.w(
+                        "PreKeyLifecycle",
+                        "Rotate on reconnect failed: type=${it::class.simpleName}",
+                    )
+                }
+            }
+        }
+
+        // CLIENT-PREKEY-SELFHEAL D2 trigger 3: periodic ticker. Fires
+        // every 15 minutes regardless of transport state, so a
+        // StateFlow-deduplicated Connected value that never re-emits
+        // (root cause of the original bug) can still be checked. The
+        // launch block runs on `appScope` — `isActive` is the scope's
+        // property, so the loop exits automatically when the scope is
+        // cancelled at container teardown. Each tick's failure is
+        // swallowed at the ticker level so the loop survives; the
+        // service's `.onFailure` discipline emits the class-only
+        // marker per D8.
+        appScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(PREKEY_PERIODIC_VERIFY_INTERVAL_MS)
+                try {
+                    lifecycleService.onPeriodicTick()
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    android.util.Log.w(
+                        "PreKeyLifecycle",
+                        "Periodic verify tick threw: type=${t::class.simpleName}",
+                    )
+                }
             }
         }
 

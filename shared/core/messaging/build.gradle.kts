@@ -33,6 +33,40 @@ kotlin {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CLIENT-PREKEY-SELFHEAL F7 / §6.7: single-implementation invariant for the
+// `publishBundle` helper in PreKeyLifecycleService. The refactor consolidates
+// what used to be two separate call surfaces (bootstrap/replenish/rotate vs
+// force-join republish) into ONE helper with a `forceJoinInFlight` parameter
+// and a `PublishExecutionOutcome` return type. This task fails the build if
+// the file ever grows a second `suspend fun publishBundle`, or if the
+// previously-scoped `publishBundleForceJoin` helper name is reintroduced.
+// ─────────────────────────────────────────────────────────────────────────────
+val assertSinglePublishBundleImplementation by tasks.registering {
+    val serviceFile = file(
+        "src/commonMain/kotlin/phantom/core/messaging/PreKeyLifecycleService.kt",
+    )
+    inputs.file(serviceFile)
+    doLast {
+        val text = serviceFile.readText()
+        val matches = text.lineSequence()
+            .filter { it.matches(Regex("^\\s*(private\\s+)?suspend\\s+fun\\s+publishBundle\\b.*")) }
+            .toList()
+        check(matches.size == 1) {
+            "CLIENT-PREKEY-SELFHEAL F7 invariant: expected exactly one " +
+                "`publishBundle` implementation in PreKeyLifecycleService.kt, " +
+                "found ${matches.size}:\n${matches.joinToString("\n")}"
+        }
+        check(!text.contains("publishBundleForceJoin")) {
+            "CLIENT-PREKEY-SELFHEAL F7 invariant: `publishBundleForceJoin` " +
+                "must not exist as a separate function; use " +
+                "PublishExecutionOutcome return type instead."
+        }
+    }
+}
+
+tasks.named("check").configure { dependsOn(assertSinglePublishBundleImplementation) }
+
 android {
     namespace = "phantom.core.messaging"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
