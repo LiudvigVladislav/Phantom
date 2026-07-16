@@ -4,6 +4,13 @@
 package phantom.core.messaging
 
 import com.ionspin.kotlin.crypto.util.LibsodiumRandom
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
 import phantom.core.crypto.SignedPreKeySigner
 import phantom.core.crypto.X3DHProtocol
@@ -13,13 +20,47 @@ import phantom.core.storage.LocalOneTimePreKeyEntity
 import phantom.core.storage.LocalOneTimePreKeyRepository
 import phantom.core.storage.LocalSignedPreKeyEntity
 import phantom.core.storage.LocalSignedPreKeyRepository
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import phantom.core.transport.PreKeyApi
 import phantom.core.transport.PublishRequest
 import phantom.core.transport.PublishResult
 import phantom.core.transport.WireOneTimePreKey
 import phantom.core.transport.WireSignedPreKey
+
+/**
+ * CLIENT-PREKEY-SELFHEAL D2 — trigger source for a `verifyBundleOnRelay`
+ * call. Reported in the `verify_start` marker so the operator can tell
+ * which entry-point drove the call (connected-collector vs periodic
+ * ticker).
+ */
+enum class VerifyTrigger { Connected, Periodic }
+
+/**
+ * CLIENT-PREKEY-SELFHEAL D2 — resolved outcome of one verify pass.
+ * `AlreadyPublished` / `Republished` are the two happy-path exits;
+ * `BudgetExhausted`, `NoLocalSpk`, and `SkippedInFlight` are the
+ * three benign short-circuits that must NOT be logged as failures.
+ * Wrapped by callers in `Result.success` — transport / storage
+ * throwables land as `Result.failure`.
+ */
+sealed class VerifyOutcome {
+    data object AlreadyPublished : VerifyOutcome()
+    data class Republished(val storedOpks: Int) : VerifyOutcome()
+    data object BudgetExhausted : VerifyOutcome()
+    data object NoLocalSpk : VerifyOutcome()
+    data object SkippedInFlight : VerifyOutcome()
+}
+
+/**
+ * CLIENT-PREKEY-SELFHEAL D7 — publish helper return type. Only the two
+ * "known state" branches: `Stored` after a real 201, `Deferred` after
+ * a debounce hit on the non-force path. Any transport / relay failure
+ * is thrown as a typed [MigrationException.*] (see the private
+ * `publishBundle` helper in [PreKeyLifecycleService]).
+ */
+sealed interface PublishExecutionOutcome {
+    data class Stored(val storedOpks: Int) : PublishExecutionOutcome
+    data object Deferred : PublishExecutionOutcome
+}
 
 /**
  * Steady-state lifecycle for the user's own published prekey bundle.
@@ -67,6 +108,14 @@ class PreKeyLifecycleService(
     private val preKeyApi: PreKeyApi,
     private val x3dh: X3DHProtocol,
     private val nowMsProvider: () -> Long = { Clock.System.now().toEpochMilliseconds() },
+    /**
+     * CLIENT-PREKEY-SELFHEAL D8 test seam: optional observer that receives
+     * every PREKEY_TRACE marker emitted by this service. Production is
+     * `null` — the messaging log is the only sink. Tests inject a
+     * `{ list.add(it) }` collector so log ordering can be asserted
+     * without touching the real logger.
+     */
+    private val logObserver: ((String) -> Unit)? = null,
 ) {
 
     // ── RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) ───────────────
@@ -87,6 +136,26 @@ class PreKeyLifecycleService(
     // left to a future app session OR an explicit user action.
     private val forceRepublishBudgetMutex = Mutex()
     private var forceRepublishCount: Int = 0
+
+    /**
+     * CLIENT-PREKEY-SELFHEAL D3 — single-flight guard for verify.
+     * `verifyLocked` runs at most once at a time; concurrent callers
+     * (Connected + Periodic firing within the same window) receive
+     * [VerifyOutcome.SkippedInFlight] via [Mutex.tryLock].
+     */
+    private val verifyMutex = Mutex()
+
+    /**
+     * CLIENT-PREKEY-SELFHEAL D8 — single-hop trace helper. Writes to
+     * both the production log AND the optional test observer seam
+     * ([logObserver]). Accepts NO throwable parameter — every marker
+     * is class-only (see §5 D8). Callers embed the exception class
+     * simpleName inline in the marker string.
+     */
+    private fun trace(marker: String, level: MessagingLogLevel = MessagingLogLevel.INFO) {
+        messagingLog(level, marker)
+        logObserver?.invoke(marker)
+    }
 
     /**
      * Runs the onboarding bootstrap. Returns Result.success if the
@@ -155,7 +224,69 @@ class PreKeyLifecycleService(
      * are read-only HEAD-equivalent traffic. Safe to call on every
      * successful WS reconnect as a defence-in-depth net.
      */
-    suspend fun verifyBundleOnRelay(): Result<Boolean> = runCatching {
+    suspend fun verifyBundleOnRelay(trigger: VerifyTrigger): Result<VerifyOutcome> {
+        // CLIENT-PREKEY-SELFHEAL D3: single-flight. If a verify is already
+        // running (Connected + Periodic overlap, or Periodic re-fires
+        // before the previous cycle finishes), acquire nothing — return
+        // SkippedInFlight so the caller can log it as a benign skip
+        // rather than a failure. `tryLock` is non-blocking; the outer
+        // Result wraps only actual thrown exceptions.
+        if (!verifyMutex.tryLock()) {
+            trace(
+                "PREKEY_TRACE verify_skip_single_flight trigger=$trigger",
+                MessagingLogLevel.INFO,
+            )
+            return Result.success(VerifyOutcome.SkippedInFlight)
+        }
+        return try {
+            runCatching { verifyLocked(trigger) }
+                .also { result ->
+                    result.onFailure { t ->
+                        if (t is CancellationException) {
+                            // Re-throw so structured concurrency
+                            // sees the cancellation.
+                            throw t
+                        }
+                        trace(
+                            "PREKEY_TRACE verify_result_failure trigger=$trigger " +
+                                "type=${t::class.simpleName}",
+                            MessagingLogLevel.WARN,
+                        )
+                    }
+                }
+        } finally {
+            verifyMutex.unlock()
+        }
+    }
+
+    /**
+     * CLIENT-PREKEY-SELFHEAL D2 trigger 3: periodic ticker entry-point.
+     * A tick failure is NOT surfaced to the caller — the AppContainer
+     * ticker loop swallows failures at the boundary. This helper still
+     * routes the trace so the operator sees the tick fire; on failure
+     * the [verifyBundleOnRelay] `.onFailure` closure emits the class-only
+     * marker.
+     */
+    suspend fun onPeriodicTick() {
+        trace("PREKEY_TRACE verify_periodic_tick trigger=periodic")
+        verifyBundleOnRelay(VerifyTrigger.Periodic)
+            .onFailure { t ->
+                if (t is CancellationException) throw t
+                trace(
+                    "PREKEY_TRACE verify_periodic_result_failure " +
+                        "type=${t::class.simpleName}",
+                    MessagingLogLevel.WARN,
+                )
+            }
+    }
+
+    /**
+     * CLIENT-PREKEY-SELFHEAL D2 / D3 body. Guarded by [verifyMutex] via
+     * [verifyBundleOnRelay]. Any transport / storage throwable
+     * propagates so the outer `runCatching` maps it into `Result.failure`.
+     * Every benign skip is a distinct [VerifyOutcome] variant.
+     */
+    private suspend fun verifyLocked(trigger: VerifyTrigger): VerifyOutcome {
         val identity = identityManager.getIdentity()
             ?: throw MigrationException.NoIdentity
         val signing = identityManager.loadSigningKeyPair()
@@ -163,99 +294,104 @@ class PreKeyLifecycleService(
         val identityTag = identity.publicKeyHex.take(16)
         val spkEntity = signedPreKeyRepository.get()
             ?: run {
-                // No local SPK — onboarding has not run yet for this install.
-                // verifyBundleOnRelay is not the right place to drive onboarding;
-                // bootstrapForNewIdentity is. Skip silently.
-                messagingLog(
-                    MessagingLogLevel.INFO,
-                    "PREKEY_TRACE verify_skip_no_local_spk identity=$identityTag…",
+                // No local SPK — onboarding has not run yet for this
+                // install. verifyLocked is not the right place to drive
+                // onboarding; bootstrapForNewIdentity is. Skip silently.
+                trace(
+                    "PREKEY_TRACE verify_skip_no_local_spk " +
+                        "identity=$identityTag… trigger=$trigger",
                 )
-                return Result.success(false)
+                return VerifyOutcome.NoLocalSpk
             }
 
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "PREKEY_TRACE verify_start identity=$identityTag…",
+        trace(
+            "PREKEY_TRACE verify_start identity=$identityTag… trigger=$trigger",
         )
         val status = preKeyApi.fetchStatus(
             identityPubkeyHex = identity.publicKeyHex,
             requesterPubkeyHex = identity.publicKeyHex,
         )
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "PREKEY_TRACE verify_status identity=$identityTag… " +
-                "spk_age_days=${status.signed_prekey_age_days} opks_remaining=${status.remaining_opks}",
+        trace(
+            "PREKEY_TRACE verify_status identity=$identityTag… trigger=$trigger " +
+                "spk_age_days=${status.signed_prekey_age_days} " +
+                "opks_remaining=${status.remaining_opks}",
         )
         // Force-republish trigger is the canonical "no relay record"
         // signal. The relay returns `(signed_prekey_age_days = null,
-        // remaining_opks = 0)` iff and only if no identity record
-        // exists (verified at the source: `services/relay/src/prekeys.rs::status`
-        // — `None => PreKeyStatus { remaining_opks: 0, signed_prekey_age_days: None }`).
+        // remaining_opks = 0)` iff no identity record exists (verified
+        // at the source: `services/relay/src/prekeys.rs::status`).
         //
-        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25) mini-lock §4
-        // Inv-ForcePathOnZeroRecord requires BOTH conditions together,
-        // so we check both explicitly. The two checks are equivalent
-        // at the current relay contract — but defense-in-depth: if
-        // a future relay-side refactor relaxed the equivalence (e.g.
-        // null-age-but-non-zero-OPKs returned during a partial-restore
-        // window), the AND check would correctly NOT force-republish
-        // because the SPK-only fallback already covers session
-        // bootstrap and `maybeReplenishOneTimePreKeys` handles the
-        // pool refill independently.
+        // Inv-ForcePathOnZeroRecord requires BOTH conditions together.
+        // Defense-in-depth against future relay refactors that relax
+        // the equivalence (e.g. null-age-but-non-zero-OPKs during a
+        // partial-restore window).
         if (status.signed_prekey_age_days != null || status.remaining_opks != 0) {
-            return Result.success(false)
+            // Bundle exists on relay. If the SPK age is known AND we
+            // still have prior budget consumption in this session, reset
+            // the budget — the last-known-bad state has clearly healed.
+            if (status.signed_prekey_age_days != null) {
+                forceRepublishBudgetMutex.withLock {
+                    if (forceRepublishCount > 0) {
+                        trace(
+                            "PREKEY_TRACE verify_bundle_confirmed_reset_budget " +
+                                "prior=$forceRepublishCount",
+                        )
+                        forceRepublishCount = 0
+                    }
+                }
+            }
+            return VerifyOutcome.AlreadyPublished
+        }
+
+        // Budget precheck ONLY — mutation happens after a successful
+        // republish, wrapped in NonCancellable (see below). If the
+        // budget is already spent, short-circuit without ever calling
+        // publishBundle.
+        val withinBudget = forceRepublishBudgetMutex.withLock {
+            forceRepublishCount < MAX_FORCE_REPUBLISH_PER_SESSION
+        }
+        if (!withinBudget) {
+            trace(
+                "PREKEY_TRACE verify_republish_budget_exhausted " +
+                    "count=$MAX_FORCE_REPUBLISH_PER_SESSION " +
+                    "— skipping force-republish; bundle gap left to next app session",
+                MessagingLogLevel.WARN,
+            )
+            return VerifyOutcome.BudgetExhausted
         }
 
         // Relay has lost (or never received) our bundle. Republish the
-        // full local state — same wire shape as the onboarding bootstrap
-        // and the steady-state replenish, so the relay's atomic publish
-        // restores us to a known-good state in one round-trip.
-        messagingLog(
+        // full local state via the force-join path so a debounce hit
+        // does NOT silently drop the republish (Inv-ForcePathOnZeroRecord).
+        trace(
+            "PREKEY_TRACE verify_republish_triggered identity=$identityTag… " +
+                "— relay has no record",
             MessagingLogLevel.WARN,
-            "PREKEY_TRACE verify_republish_triggered identity=$identityTag… — relay has no record",
         )
 
-        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25). Inv-NoSpinningRetry:
-        // honour the per-identity per-session budget before running the
-        // force-republish path. Exhaustion logs a structured warning
-        // and returns; the bundle gap is left to a future app session.
-        val withinBudget = forceRepublishBudgetMutex.withLock {
-            if (forceRepublishCount >= MAX_FORCE_REPUBLISH_PER_SESSION) {
-                false
-            } else {
-                forceRepublishCount += 1
-                true
-            }
-        }
-        if (!withinBudget) {
-            messagingLog(
-                MessagingLogLevel.WARN,
-                "PREKEY_TRACE verify_republish_budget_exhausted identity=$identityTag… " +
-                    "count=$MAX_FORCE_REPUBLISH_PER_SESSION " +
-                    "— skipping force-republish; bundle gap left to next app session",
-            )
-            return@runCatching false
-        }
-
-        // Sprint 2b L1: factory lambda — every retry re-reads the OPK
-        // pool from the DB. This second call site (Round 2 security
-        // Blocker 1 / D-R2-2) shares the same publish-snapshot
-        // consistency contract as the bootstrap / replenish / rotate
-        // sites.
-        //
-        // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25). Inv-ForcePathOnZeroRecord:
-        // pass `forceJoinInFlight = true` so a publishMutex hit (an
-        // in-flight publish is already running) does NOT short-circuit
-        // with `PublishResult.Deferred`. The verify path just established
-        // that the relay has zero record for this identity, so the
-        // republish MUST not be silently dropped by the debounce gate.
-        publishBundle(
+        val outcome = publishBundle(
             identity.publicKeyHex,
             signing,
             spkEntity,
             forceJoinInFlight = true,
         ) { oneTimePreKeyRepository.getAll() }
-        true
+        val storedOpks = when (outcome) {
+            is PublishExecutionOutcome.Stored -> outcome.storedOpks
+            PublishExecutionOutcome.Deferred -> throw IllegalStateException(
+                "PublishExecutionOutcome.Deferred on force-join path — invariant violated",
+            )
+        }
+
+        // Non-cancellable budget commit + explicit ensureActive to
+        // restore the cancellation window. This runs only after a
+        // successful republish; a Failure would have thrown, and a
+        // budget-exhausted short-circuit returns above.
+        withContext(NonCancellable) {
+            forceRepublishBudgetMutex.withLock { forceRepublishCount += 1 }
+        }
+        currentCoroutineContext().ensureActive()
+
+        return VerifyOutcome.Republished(storedOpks)
     }
 
     /**
@@ -414,7 +550,7 @@ class PreKeyLifecycleService(
         spk: LocalSignedPreKeyEntity,
         forceJoinInFlight: Boolean = false,
         opksProvider: suspend () -> List<LocalOneTimePreKeyEntity>,
-    ) {
+    ): PublishExecutionOutcome {
         // For onboarding the SPK was just generated in this call; persist
         // it now so a publish failure leaves us with a known-good local
         // state we can republish from later.
@@ -471,24 +607,27 @@ class PreKeyLifecycleService(
                     },
                 )
             }
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (t: Throwable) {
             val elapsed = nowMsProvider() - startMs
-            messagingLog(
-                MessagingLogLevel.WARN,
+            // CLIENT-PREKEY-SELFHEAL D8: class-only marker, no throwable
+            // parameter, no message content.
+            trace(
                 "PREKEY_TRACE upload_fail identity=$identityTag… reason=throwable " +
-                    "type=${t::class.simpleName} elapsedMs=$elapsed message=${t.message ?: "<null>"}",
-                t,
+                    "type=${t::class.simpleName} elapsedMs=$elapsed",
+                MessagingLogLevel.WARN,
             )
             throw t
         }
         val elapsed = nowMsProvider() - startMs
-        when (result) {
+        return when (result) {
             is PublishResult.Stored -> {
-                messagingLog(
-                    MessagingLogLevel.INFO,
+                trace(
                     "PREKEY_TRACE upload_ok identity=$identityTag… " +
                         "stored_opks=${result.storedOpks} elapsedMs=$elapsed",
                 )
+                PublishExecutionOutcome.Stored(result.storedOpks)
             }
             is PublishResult.Deferred -> {
                 // RC-PREKEY-PUBLISH-DEBOUNCE-RACE (2026-06-25). Honest log:
@@ -498,11 +637,11 @@ class PreKeyLifecycleService(
                 // in-flight publish may yet fail, in which case the
                 // verify-driven republish path will pick it up with
                 // `forceJoinInFlight = true`.
-                messagingLog(
-                    MessagingLogLevel.INFO,
+                trace(
                     "PREKEY_TRACE upload_deferred identity=$identityTag… " +
                         "elapsedMs=$elapsed reason=in_flight_publish",
                 )
+                PublishExecutionOutcome.Deferred
             }
             is PublishResult.Failure -> {
                 val reason = result.reason
@@ -512,10 +651,10 @@ class PreKeyLifecycleService(
                     is PublishResult.Reason.BadRequest -> "bad_request"
                     is PublishResult.Reason.Unexpected -> "http${reason.httpStatus}"
                 }
-                messagingLog(
-                    MessagingLogLevel.WARN,
+                trace(
                     "PREKEY_TRACE upload_fail identity=$identityTag… reason=$reasonTag " +
-                        "elapsedMs=$elapsed server=\"${result.serverMessage.take(160)}\"",
+                        "elapsedMs=$elapsed",
+                    MessagingLogLevel.WARN,
                 )
                 throw when (reason) {
                     is PublishResult.Reason.SigningKeyMismatch ->

@@ -113,6 +113,58 @@ tasks.named("preBuild") {
     dependsOn(unpackTorBinaries)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CLIENT-PREKEY-SELFHEAL: identical-body enforcement for the two JVM/Android
+// classifier copies. The `classifyOnJvm` body is duplicated across
+// androidMain and jvmMain source sets because they cannot share a private
+// function without an additional intermediate source set (not configured
+// on this module). The Gradle task below extracts the body of each function
+// and fails the build if they differ, so drift is caught in CI.
+// ─────────────────────────────────────────────────────────────────────────────
+val assertClassifyOnJvmBodiesMatch by tasks.registering {
+    val androidFile = file("src/androidMain/kotlin/phantom/core/transport/RetryClassificationAndroid.kt")
+    val jvmFile = file("src/jvmMain/kotlin/phantom/core/transport/RetryClassificationJvm.kt")
+    inputs.file(androidFile)
+    inputs.file(jvmFile)
+    doLast {
+        fun extractBody(f: java.io.File): String {
+            val text = f.readText()
+            val marker = "internal fun classifyOnJvm(t: Throwable): RetryDecision {"
+            val start = text.indexOf(marker)
+            check(start >= 0) {
+                "CLIENT-PREKEY-SELFHEAL invariant: ${f.name} must contain `internal fun classifyOnJvm(...)`."
+            }
+            // Balance braces from the opening `{` of the function.
+            var depth = 0
+            var i = start + marker.length - 1
+            val opening = i
+            while (i < text.length) {
+                when (text[i]) {
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) {
+                            return text.substring(opening, i + 1)
+                        }
+                    }
+                }
+                i++
+            }
+            error("CLIENT-PREKEY-SELFHEAL invariant: unbalanced braces in ${f.name}::classifyOnJvm.")
+        }
+        val androidBody = extractBody(androidFile)
+        val jvmBody = extractBody(jvmFile)
+        check(androidBody == jvmBody) {
+            "CLIENT-PREKEY-SELFHEAL invariant: `classifyOnJvm` body drift between " +
+                "androidMain and jvmMain source sets. Update both files with identical body.\n" +
+                "  androidMain hash: ${androidBody.hashCode()}\n" +
+                "  jvmMain hash:     ${jvmBody.hashCode()}"
+        }
+    }
+}
+
+tasks.named("check").configure { dependsOn(assertClassifyOnJvmBodiesMatch) }
+
 android {
     namespace = "phantom.core.transport"
     compileSdk = libs.versions.android.compileSdk.get().toInt()

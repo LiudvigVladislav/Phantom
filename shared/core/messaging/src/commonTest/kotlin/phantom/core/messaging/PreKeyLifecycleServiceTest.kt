@@ -210,9 +210,12 @@ class PreKeyLifecycleServiceTest {
 
         // Relay reports the identity is unknown (default
         // FakePreKeyApi.fetchStatusResult). verify must republish.
-        val result = rig.service.verifyBundleOnRelay()
+        val result = rig.service.verifyBundleOnRelay(VerifyTrigger.Connected)
         assertTrue(result.isSuccess, "verify must succeed; got $result")
-        assertTrue(result.getOrNull()!!, "verify must report a republish ran")
+        assertTrue(
+            result.getOrNull() is VerifyOutcome.Republished,
+            "verify must report a republish ran; got ${result.getOrNull()}",
+        )
         assertEquals(1, rig.api.statusCount, "exactly one status probe")
         assertEquals(1, rig.api.publishCount, "exactly one republish")
         // The republished bundle is the existing local pool, not a fresh
@@ -234,9 +237,12 @@ class PreKeyLifecycleServiceTest {
         // verify must NOT republish.
         rig.api.fetchStatusResult = PreKeyStatus(remaining_opks = 50, signed_prekey_age_days = 0)
 
-        val result = rig.service.verifyBundleOnRelay()
+        val result = rig.service.verifyBundleOnRelay(VerifyTrigger.Connected)
         assertTrue(result.isSuccess)
-        assertFalse(result.getOrNull()!!, "verify must NOT report a republish")
+        assertEquals(
+            VerifyOutcome.AlreadyPublished, result.getOrNull(),
+            "verify must NOT report a republish when relay already has bundle",
+        )
         assertEquals(1, rig.api.statusCount, "status probed exactly once")
         assertEquals(0, rig.api.publishCount, "no republish when relay already has bundle")
     }
@@ -248,11 +254,14 @@ class PreKeyLifecycleServiceTest {
         val rig = makeService(identityManager)
 
         // No bootstrapForNewIdentity call: local SPK absent. verify
-        // returns false silently — driving onboarding is
+        // returns NoLocalSpk silently — driving onboarding is
         // bootstrapForNewIdentity's job, not verify's.
-        val result = rig.service.verifyBundleOnRelay()
+        val result = rig.service.verifyBundleOnRelay(VerifyTrigger.Connected)
         assertTrue(result.isSuccess)
-        assertFalse(result.getOrNull()!!, "verify is a no-op when local SPK missing")
+        assertEquals(
+            VerifyOutcome.NoLocalSpk, result.getOrNull(),
+            "verify is a no-op when local SPK missing",
+        )
         assertEquals(0, rig.api.statusCount, "no relay round-trip when local has nothing to verify")
         assertEquals(0, rig.api.publishCount)
     }
@@ -551,9 +560,12 @@ class PreKeyLifecycleServiceTest {
         // record" signal. verify must republish AND must pass the force
         // flag so a publishMutex debounce doesn't short-circuit the
         // republish with `PublishResult.Deferred`.
-        val result = rig.service.verifyBundleOnRelay()
+        val result = rig.service.verifyBundleOnRelay(VerifyTrigger.Connected)
         assertTrue(result.isSuccess, "verify must succeed; got $result")
-        assertTrue(result.getOrNull()!!, "verify must report a republish ran")
+        assertTrue(
+            result.getOrNull() is VerifyOutcome.Republished,
+            "verify must report a republish ran; got ${result.getOrNull()}",
+        )
         assertEquals(1, rig.api.publishCount, "exactly one republish")
         assertTrue(
             rig.api.lastForceJoinInFlight,
@@ -605,11 +617,12 @@ class PreKeyLifecycleServiceTest {
         // reporting zero record (default fetchStatusResult), so each
         // call republishes.
         repeat(max) { i ->
-            val r = rig.service.verifyBundleOnRelay()
+            val r = rig.service.verifyBundleOnRelay(VerifyTrigger.Connected)
             assertTrue(r.isSuccess, "verify call ${i + 1} should succeed; got $r")
             assertTrue(
-                r.getOrNull()!!,
-                "verify call ${i + 1} should report a republish (budget remaining)",
+                r.getOrNull() is VerifyOutcome.Republished,
+                "verify call ${i + 1} should report a republish (budget remaining); " +
+                    "got ${r.getOrNull()}",
             )
         }
         assertEquals(
@@ -624,11 +637,11 @@ class PreKeyLifecycleServiceTest {
         // (max + 1)th call: budget exhausted. Status probe still runs
         // (so the operator can see the relay is still missing the
         // bundle), but no publish.
-        val overflow = rig.service.verifyBundleOnRelay()
+        val overflow = rig.service.verifyBundleOnRelay(VerifyTrigger.Connected)
         assertTrue(overflow.isSuccess, "budget-exhausted call still succeeds (no throw)")
-        assertFalse(
-            overflow.getOrNull()!!,
-            "budget-exhausted call reports false — no republish ran",
+        assertEquals(
+            VerifyOutcome.BudgetExhausted, overflow.getOrNull(),
+            "budget-exhausted call must report VerifyOutcome.BudgetExhausted",
         )
         assertEquals(
             max, rig.api.publishCount,
@@ -667,11 +680,12 @@ class PreKeyLifecycleServiceTest {
         // OPK pool happens to be drained (remaining_opks = 0).
         rig.api.fetchStatusResult = PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = 3)
 
-        val result = rig.service.verifyBundleOnRelay()
+        val result = rig.service.verifyBundleOnRelay(VerifyTrigger.Connected)
         assertTrue(result.isSuccess)
-        assertFalse(
-            result.getOrNull()!!,
-            "verify MUST return false when age is non-null — record exists, no force-republish",
+        assertEquals(
+            VerifyOutcome.AlreadyPublished, result.getOrNull(),
+            "verify MUST report AlreadyPublished when age is non-null — record exists, " +
+                "no force-republish",
         )
         assertEquals(0, rig.api.publishCount, "no publish ran")
         assertEquals(1, rig.api.statusCount, "exactly one status probe")
@@ -812,7 +826,7 @@ class PreKeyLifecycleServiceTest {
         // the publishMutex (held by publish #1) — NOT short-circuit
         // with Deferred (the pre-fix anti-shape).
         val verifyJob = async {
-            service.verifyBundleOnRelay()
+            service.verifyBundleOnRelay(VerifyTrigger.Connected)
         }
         advanceUntilIdle()
         assertTrue(
@@ -859,8 +873,8 @@ class PreKeyLifecycleServiceTest {
             "verify-on-relay must succeed; got $verifyResult",
         )
         assertTrue(
-            verifyResult.getOrNull()!!,
-            "verify must report a republish ran",
+            verifyResult.getOrNull() is VerifyOutcome.Republished,
+            "verify must report a republish ran; got ${verifyResult.getOrNull()}",
         )
         assertTrue(
             bootstrapResult.isFailure,
