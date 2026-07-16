@@ -111,22 +111,34 @@ class ClassifyNetworkFailureJvmTest {
 
     @Test
     fun classifyNetworkFailure_mixedChainTerminalTlsBeforeTransient_returnsTerminalTls() {
-        val deepestTransient = SocketTimeoutException("read timed out")
+        // Cause chain (transient BEFORE terminal — the ordering the
+        // regression must catch):
+        //   [0] outer SSLException                — not TLS-terminal, not transient class
+        //   [1] SocketTimeoutException             — transient (single-pass would stop here)
+        //   [2] SSLPeerUnverifiedException         — terminal TLS (two-pass finds it first)
+        //
+        // Old single-pass first-match walk:
+        //   depth 0 SSLException → skip; depth 1 SocketTimeoutException →
+        //   return RetryableTransient. The terminal TLS at depth 2 is
+        //   NEVER seen. That is the exact regression this test guards.
+        //
+        // New two-pass walk:
+        //   pass 1 (TLS-terminal only): depth 0 skip, depth 1 skip,
+        //   depth 2 SSLPeerUnverifiedException → return TerminalTls
+        //   BEFORE pass 2 (transient) ever runs.
         val terminalTls = SSLPeerUnverifiedException("cert unverified")
-        // Cause chain:
-        //   [0] outer SSLException
-        //   [1] SSLPeerUnverifiedException  ← terminal TLS
-        //   [2] SocketTimeoutException      ← would classify transient if scanned first
-        (terminalTls as Throwable).initCause(deepestTransient)
-        val t = SSLException("outer", terminalTls)
+        val middleTransient = SocketTimeoutException("read timed out")
+        (middleTransient as Throwable).initCause(terminalTls)
+        val t = SSLException("outer", middleTransient)
 
         val decision = classifyNetworkFailure(t)
 
         assertEquals(
             RetryDecision.TerminalTls, decision,
-            "mixed chain (TLS terminal + deeper transient) MUST classify as " +
-                "TerminalTls — single-pass first-match walk would incorrectly " +
-                "return RetryableTransient (regression guard for two-pass ordering)",
+            "mixed chain (transient at depth 1, TLS terminal at depth 2) MUST " +
+                "classify as TerminalTls — old single-pass first-match walk " +
+                "would incorrectly return RetryableTransient from the depth-1 " +
+                "SocketTimeoutException (regression guard for two-pass ordering)",
         )
     }
 
