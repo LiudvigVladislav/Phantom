@@ -373,6 +373,17 @@ fn state_dir_config_not_env() {
         if path.file_name() == Some(std::ffi::OsStr::new("state_persistence.rs")) {
             continue;
         }
+        // PR-0 A-5: config_boot.rs deliberately mutates RELAY_STATE_DIR
+        // to exercise `RelayConfig::from_env` — the WHOLE POINT of that
+        // fixture is that it reads the env var. The persistence-tier
+        // ban does not apply because config_boot.rs never writes state
+        // files; it validates the env-parse contract only. Cross-file
+        // races are contained by `#[serial]` + the file-local
+        // `ENV_LOCK` mutex inside `with_state_dir` (see the file's
+        // docstring).
+        if path.file_name() == Some(std::ffi::OsStr::new("config_boot.rs")) {
+            continue;
+        }
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {} failed: {}", path.display(), e));
         // The literal offending shapes; add more if a future contributor

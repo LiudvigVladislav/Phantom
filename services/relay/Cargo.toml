@@ -42,3 +42,8 @@ ed25519-dalek = { workspace = true, features = ["rand_core"] }
 # which races between parallel test workers. Restricted to dev-dependencies
 # so the runtime binary never links tempfile.
 tempfile = "3"
+# PR-0 A-5: config_boot.rs mutates RELAY_STATE_DIR to exercise the
+# absolute+no-ParentDir validation. `serial_test` serialises those
+# cases across the shared process env — belt-and-braces on top of the
+# file-local Mutex inside `with_state_dir`.
+serial_test = "3"
