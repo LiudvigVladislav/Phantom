@@ -16,7 +16,20 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let cfg = config::RelayConfig::from_env();
+    // PR-0 A-5: from_env() now returns Result<RelayConfig, ConfigError>
+    // so a misconfigured RELAY_STATE_DIR (relative path, `..` component,
+    // empty string) fails FATAL at boot instead of silently landing
+    // state files at an unpredictable location under the read_only
+    // rootfs. Exit code 12 reserved for config-time errors — distinct
+    // from PR-2's exit 10 (replay quarantine) and 11 (tombstone
+    // config error) so an operator can distinguish causes.
+    let cfg = match config::RelayConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("FATAL: relay boot config invalid: {e}");
+            std::process::exit(12);
+        }
+    };
     let app_state = Arc::new(state::AppState::new(cfg.clone()));
     // F11 + F26: rebuild the WS-auth signing-key bindings from the
     // disk-replayed prekey store before serving traffic so a relay restart
