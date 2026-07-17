@@ -997,18 +997,16 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
             }
 
             // Trek 2 Stage 1.x review fix — bound `messageId` byte length
-            // to the `u16-BE` length-prefix capacity used in the canonical
-            // `seq_mac` input. Without this guard a 65 KB-plus messageId
-            // from a malicious WS client would reach
-            // `mirror_envelope_to_rest_store` and used to be a `.expect()`
-            // panic; the helper now logs-and-skips, but rejecting at the
-            // boundary keeps the WS store, mirror store, and live deliver
-            // frame consistent.
+            // PR-0 M-1 — `msg_id` must match the canonical ingress
+            // shape (non-empty, ≤128 bytes, drawn from `[a-zA-Z0-9._-]`).
+            // Rejecting at the boundary keeps the WS store, mirror
+            // store, and live deliver frame consistent + closes
+            // log-injection and idempotency-cache confusion surfaces.
             if !crate::seq_mac::is_valid_envelope_id(&msg_id) {
                 tracing::warn!(
                     msg_id_len = msg_id.len(),
-                    msg_id_max = crate::seq_mac::ENVELOPE_ID_MAX_BYTES,
-                    "send dropped: messageId UTF-8 byte length exceeds 65535"
+                    msg_id_max = crate::seq_mac::ENVELOPE_ID_MAX_PRACTICAL,
+                    "send dropped: messageId failed canonical shape check (1..=128 bytes of [a-zA-Z0-9._-])"
                 );
                 return;
             }

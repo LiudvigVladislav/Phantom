@@ -44,8 +44,23 @@ pub const SEQ_MAC_KEY_DOMAIN_TAG: &[u8] = b"phantom-seq-mac-key-v1\x00";
 
 /// Maximum byte length of `envelope_id` accepted in the canonical MAC
 /// input. Bounded by the `u16-BE` length prefix in the encoding spec.
-/// Production sizes are ~32 bytes; the 65535 ceiling is a defensive cap.
+/// Production sizes are ~32 bytes; the 65535 ceiling is a defensive cap
+/// on the MAC-compute path (kept for compute-layer defense-in-depth).
+///
+/// The ingress-layer validator [`is_valid_envelope_id`] enforces a much
+/// tighter practical ceiling [`ENVELOPE_ID_MAX_PRACTICAL`] (128 bytes)
+/// + canonical character-class shape. This constant remains the outer
+/// bound the encoding format can express; the ingress bound is what
+/// production traffic actually sees.
 pub const ENVELOPE_ID_MAX_BYTES: usize = u16::MAX as usize;
+
+/// PR-0 M-1: ingress-layer practical ceiling for `envelope_id` byte
+/// length. Production real values are ~32 bytes (UUIDs / ULIDs / hex);
+/// 128 bytes is 4× headroom plus defense against payload-abuse. Kept
+/// distinct from [`ENVELOPE_ID_MAX_BYTES`] so the MAC-compute path
+/// (which still tolerates the full u16-BE range for pre-existing
+/// records) is not narrowed by this ingress-only change.
+pub const ENVELOPE_ID_MAX_PRACTICAL: usize = 128;
 
 /// Shape check for a recipient identity-hex used at REST `/relay/send`
 /// and WS Send entry. The recipient flows into the canonical input of
@@ -59,14 +74,39 @@ pub fn is_valid_recipient_identity_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Shape check for an envelope-id / WS messageId at the request
-/// boundary. Bounded by [`ENVELOPE_ID_MAX_BYTES`] (65535) so the value
-/// always fits the `u16-BE` length prefix in the canonical MAC input.
-/// Returns false for empty inputs as well — callers already enforce
-/// non-empty independently, but this helper keeps the boundary check
-/// single-call.
+/// PR-0 M-1: canonical shape check for `envelope_id` / WS `msg_id` at
+/// the request boundary. Rejects everything that could cause harm on
+/// the log-injection, idempotency-cache, or (future PR-2) on-disk
+/// per-envelope-file paths.
+///
+/// True iff `s` is non-empty, at most [`ENVELOPE_ID_MAX_PRACTICAL`]
+/// bytes, and contains only URL-safe ASCII bytes drawn from
+/// `[a-zA-Z0-9._-]` (letters, digits, dot, underscore, hyphen).
+///
+/// Explicitly REJECTED:
+/// - Empty string (unchanged from prior behaviour).
+/// - Length > 128 bytes (tightened from u16::MAX = 65535).
+/// - Any C0 control char (`0x00..=0x1F`) or `DEL` (`0x7F`) — log
+///   injection via `\r\n` / CSI sequences.
+/// - Any high-bit / non-ASCII byte (`0x80..=0xFF`) — bounds every
+///   multi-byte UTF-8 code point; lookalike Unicode idempotency-cache
+///   confusion.
+/// - `/`, `\`, `\0`, whitespace — path separators + null-byte
+///   filesystem edge cases (future PR-2 uses `sha256_hex(envelope_id)`
+///   as an on-disk filename, but the raw id still flows through
+///   idempotency + log paths; keeping the ingress class pure removes
+///   the risk at the source).
+///
+/// Preserves lookup compatibility with the production envelope-id
+/// alphabet (UUID / ULID / hex).
 pub fn is_valid_envelope_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= ENVELOPE_ID_MAX_BYTES
+    if s.is_empty() || s.len() > ENVELOPE_ID_MAX_PRACTICAL {
+        return false;
+    }
+    s.bytes().all(|b| matches!(b,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' |
+        b'.' | b'_' | b'-'
+    ))
 }
 
 /// Fixed-size, zeroized-on-drop wrapper for the relay-side root MAC key.
@@ -491,11 +531,71 @@ mod tests {
         assert!(!is_valid_recipient_identity_hex(&"ё".repeat(32)));
     }
 
+    // PR-0 M-1: pre-existing bounds test rewritten around the tightened
+    // ingress ceiling (128 bytes) + canonical character-class shape.
+    // The old test asserted acceptance up to ENVELOPE_ID_MAX_BYTES
+    // (65535) — under M-1 that ceiling is only the compute-path defense
+    // bound; the ingress ceiling is ENVELOPE_ID_MAX_PRACTICAL (128).
     #[test]
-    fn is_valid_envelope_id_bounds_match_compute_path() {
+    fn is_valid_envelope_id_bounds_match_ingress_ceiling() {
         assert!(is_valid_envelope_id("e"));
-        assert!(is_valid_envelope_id(&"x".repeat(ENVELOPE_ID_MAX_BYTES)));
+        assert!(is_valid_envelope_id(&"x".repeat(ENVELOPE_ID_MAX_PRACTICAL)));
         assert!(!is_valid_envelope_id(""));
-        assert!(!is_valid_envelope_id(&"x".repeat(ENVELOPE_ID_MAX_BYTES + 1)));
+        assert!(!is_valid_envelope_id(&"x".repeat(ENVELOPE_ID_MAX_PRACTICAL + 1)));
+        // Ingress rejects the old compute-path ceiling — proves the two
+        // bounds are intentionally distinct.
+        assert!(!is_valid_envelope_id(&"x".repeat(ENVELOPE_ID_MAX_BYTES)));
+    }
+
+    // PR-0 M-1: canonical character-class shape. Positive alphabet is
+    // [a-zA-Z0-9._-]; everything else rejected at the ingress boundary.
+    #[test]
+    fn is_valid_envelope_id_accepts_canonical_shapes() {
+        // 32-char lowercase hex (typical Alpha-0 shape).
+        assert!(is_valid_envelope_id(&"a".repeat(32)));
+        // 36-char UUID with hyphens.
+        assert!(is_valid_envelope_id("550e8400-e29b-41d4-a716-446655440000"));
+        // 26-char ULID (Crockford base32 alphabet is a subset of [a-zA-Z0-9]).
+        assert!(is_valid_envelope_id("01HZY6BQPWX7ABCDEF0123456K"));
+        // Mixed alphanumeric + dot/underscore/hyphen.
+        assert!(is_valid_envelope_id("my.envelope_id-42"));
+    }
+
+    #[test]
+    fn is_valid_envelope_id_rejects_control_chars() {
+        assert!(!is_valid_envelope_id("a\rb"));
+        assert!(!is_valid_envelope_id("a\nb"));
+        assert!(!is_valid_envelope_id("a\tb"));
+        assert!(!is_valid_envelope_id("a\x00b"));
+        assert!(!is_valid_envelope_id("a\x1fb"));
+        assert!(!is_valid_envelope_id("a\x7fb")); // DEL
+    }
+
+    #[test]
+    fn is_valid_envelope_id_rejects_path_separators() {
+        assert!(!is_valid_envelope_id("foo/bar"));
+        assert!(!is_valid_envelope_id("foo\\bar"));
+        assert!(!is_valid_envelope_id("/absolute"));
+        assert!(!is_valid_envelope_id("../etc/passwd"));
+    }
+
+    #[test]
+    fn is_valid_envelope_id_rejects_whitespace() {
+        assert!(!is_valid_envelope_id("foo bar"));
+        assert!(!is_valid_envelope_id(" leading"));
+        assert!(!is_valid_envelope_id("trailing "));
+    }
+
+    #[test]
+    fn is_valid_envelope_id_rejects_high_bit_and_multibyte() {
+        // Cyrillic ё is 2-byte UTF-8; validator must reject any byte
+        // outside the [a-zA-Z0-9._-] class.
+        assert!(!is_valid_envelope_id("ёlo"));
+        // Isolated high byte through non-canonical construction:
+        // build the string via unchecked conversion so the compiler
+        // does not statically catch the invariant we are testing.
+        // (Safe: we own the bytes and never expose them outside.)
+        let bad = String::from_utf8(vec![b'a', 0xC2, 0xA0, b'b']).unwrap(); // NBSP
+        assert!(!is_valid_envelope_id(&bad));
     }
 }

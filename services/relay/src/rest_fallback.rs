@@ -1918,6 +1918,22 @@ pub async fn rest_send(
         }
     };
 
+    // PR-0 M-1: canonical shape guard on the Idempotency-Key header
+    // BEFORE it reaches the idempotency-cache lookup and the tracing
+    // log lines below (both use `idem_key` as an inline field). The
+    // header/body match enforcement lives further down after the body
+    // parses — we reject invalid shape first because a `\r\n`-laden
+    // header must not reach ANY log/metric channel.
+    if !crate::seq_mac::is_valid_envelope_id(&idem_key) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Idempotency-Key must be 1..=128 bytes of [a-zA-Z0-9._-]"
+            })),
+        )
+            .into_response();
+    }
+
     let body_hash = sha256_hex(&body);
 
     // Idempotency cache lookup.
@@ -1975,16 +1991,33 @@ pub async fn rest_send(
             .into_response();
     }
 
-    // Trek 2 Stage 1.x Lock-1 — bound the UTF-8 byte length of
-    // `envelope_id` to the `u16-BE` length-prefix capacity used in the
-    // canonical `seq_mac` input. Production sizes are ~32 bytes; the
-    // 65535 ceiling is a defensive cap so an oversized id cannot reach
-    // `compute_seq_mac` and force a panic on the store-time MAC path.
+    // PR-0 M-1 — envelope_id must match the canonical ingress shape
+    // (non-empty, ≤128 bytes, drawn from `[a-zA-Z0-9._-]`). The
+    // validator lives in seq_mac.rs; error string kept in sync with
+    // the docstring there.
     if !crate::seq_mac::is_valid_envelope_id(&req.envelope_id) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "envelope_id UTF-8 byte length exceeds 65535"
+                "error": "envelope_id must be 1..=128 bytes of [a-zA-Z0-9._-]"
+            })),
+        )
+            .into_response();
+    }
+
+    // PR-0 M-1: pin Idempotency-Key to envelope_id at first ingest.
+    // Both fields already survive the canonical shape guard (header
+    // above at line ~1920, body a few lines back). Requiring equality
+    // means the idempotency scope (header) and the on-disk /
+    // downstream envelope identity (body) name the same object; a
+    // silent divergence would let one Idempotency-Key gate multiple
+    // distinct envelopes across body substitutions, breaking the
+    // dedup contract operators grep for by envelope_id.
+    if idem_key != req.envelope_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Idempotency-Key must equal envelope_id"
             })),
         )
             .into_response();
