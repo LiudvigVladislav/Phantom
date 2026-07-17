@@ -786,12 +786,15 @@ async fn rest_send_rejects_non_hex_recipient_to() {
         "non-hex 64-char `to` must be rejected before reaching seq_mac path: {:?}",
         v,
     );
+    // PR-0 A-6 sharpened this error string from "64 ASCII-hex" to
+    // "64 lowercase hex characters ([0-9a-f])" to make the case
+    // requirement visible to operators. Assert on the stable prefix.
     assert!(
         v["error"]
             .as_str()
             .unwrap_or("")
-            .contains("64 ASCII-hex"),
-        "error message must mention the 64 hex constraint: {:?}",
+            .contains("64 lowercase hex characters"),
+        "error message must mention the 64 lowercase hex constraint: {:?}",
         v,
     );
 }

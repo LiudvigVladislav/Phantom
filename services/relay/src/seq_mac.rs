@@ -69,9 +69,23 @@ pub const ENVELOPE_ID_MAX_PRACTICAL: usize = 128;
 /// from reaching the MAC path and also keeps short log-prefix slicing
 /// safe.
 ///
-/// True iff `s` is exactly 64 ASCII-hex characters.
+/// PR-0 A-6 — LOWERCASE-STRICT. True iff `s` is exactly 64 characters
+/// drawn from `[0-9a-f]`. Uppercase and mixed case are rejected.
+///
+/// Rationale: `derive_verify_key` at line 118 feeds `identity_hex` bytes
+/// directly into the HMAC-SHA-256 domain input, so two clients addressing
+/// the same identity with different letter case would derive DIFFERENT
+/// `SeqMacVerifyKey`s — breaking MAC verification for whichever party
+/// sent the non-canonical form. Under PR-2's per-recipient sub-directory
+/// layout `<hex[0..2]>/<recipient_hex>/`, the two casings would also
+/// create parallel directories and split-queue the same recipient.
+///
+/// Server-side auto-lowercase (`req.to = req.to.to_ascii_lowercase()`)
+/// was CONSIDERED AND REJECTED — hiding sender bugs behind normalisation
+/// makes the split-queue / MAC-mismatch class hard to observe. Fail-loud
+/// at 400 forces the client to send the canonical form.
 pub fn is_valid_recipient_identity_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// PR-0 M-1: canonical shape check for `envelope_id` / WS `msg_id` at
@@ -500,9 +514,24 @@ mod tests {
         assert!(is_valid_recipient_identity_hex(&test_identity()));
         assert!(is_valid_recipient_identity_hex(&"0".repeat(64)));
         assert!(is_valid_recipient_identity_hex(&"f".repeat(64)));
-        // Lower- and upper-case hex both accepted; canonical form is
-        // lower but the relay does not enforce case at the boundary.
-        assert!(is_valid_recipient_identity_hex(&"A".repeat(64)));
+    }
+
+    // PR-0 A-6: pre-existing test asserted uppercase-64-hex as accepted;
+    // that behaviour was the defect. Under A-6 the validator is strict
+    // lowercase, so the assertion inverts. Kept as a distinct test so
+    // the intent is explicit and the flip is visible in review.
+    #[test]
+    fn is_valid_recipient_identity_hex_rejects_uppercase_and_mixed_case() {
+        // All uppercase.
+        assert!(!is_valid_recipient_identity_hex(&"A".repeat(64)));
+        // All uppercase digits/letters (some digits, some upper letters).
+        assert!(!is_valid_recipient_identity_hex(&"F".repeat(64)));
+        // Mixed case — even ONE uppercase letter must reject.
+        let mut mixed = "a".repeat(63);
+        mixed.push('A');
+        assert!(!is_valid_recipient_identity_hex(&mixed));
+        // Full lowercase hex alphabet remains accepted.
+        assert!(is_valid_recipient_identity_hex(&"0123456789abcdef".repeat(4)));
     }
 
     #[test]

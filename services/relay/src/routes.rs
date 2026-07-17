@@ -984,14 +984,17 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
             // Trek 2 Stage 1.x review fix — `to` is the recipient
             // identity-hex that feeds the canonical input to
             // `compute_seq_mac` inside `mirror_envelope_to_rest_store`.
-            // Validate the shape here (64 ASCII-hex characters) so a
-            // malformed recipient cannot reach the MAC path and so the
-            // log-prefix `&to[..16]` is safe to read.
+            // PR-0 A-6: validate the shape here (64 LOWERCASE hex
+            // characters, `[0-9a-f]`) so a malformed recipient cannot
+            // reach the MAC path and so the log-prefix `&to[..16]` is
+            // safe to read. See seq_mac.rs docstring for why uppercase
+            // is rejected (per-identity verify-key derivation is
+            // case-sensitive).
             if !crate::seq_mac::is_valid_recipient_identity_hex(&to) {
                 tracing::warn!(
                     to_len  = to.len(),
                     sealed  = !sealed_sender.is_empty(),
-                    "send dropped: recipient must be 64 hex chars"
+                    "send dropped: recipient must be 64 lowercase hex characters ([0-9a-f])"
                 );
                 return;
             }

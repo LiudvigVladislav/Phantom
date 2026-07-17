@@ -373,3 +373,80 @@ async fn idem_header_body_match_accepted() {
     let (_app, status, v) = call_send_raw(app, &token, env_id, body.as_bytes()).await;
     assert_eq!(status, StatusCode::CREATED, "expected 201, got {:?} {:?}", status, v);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// A-6 recipient hex ingress tests
+//
+// `identity_hex(seed)` already emits lowercase, so the accept cases
+// exercise the production path. The reject cases build uppercase /
+// mixed-case strings explicitly.
+// ═══════════════════════════════════════════════════════════════════════
+
+async fn assert_rejects_to(app: axum::Router, to: &str) -> axum::Router {
+    let sender_id = identity_hex(60);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let (app, token) = obtain_token(app, &sender_id, &signing_kp).await;
+
+    let envelope_id = "test-a6-reject";
+    let body = send_body(envelope_id, to);
+    let (app, status, v) = call_send_raw(app, &token, envelope_id, body.as_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400 for to={:?}, got status={:?} body={:?}",
+        to, status, v,
+    );
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(
+        err.starts_with("to"),
+        "expected error string starting with `to`, got {:?}",
+        err,
+    );
+    app
+}
+
+#[tokio::test]
+async fn recipient_hex_reject_uppercase_all() {
+    let app = build_app();
+    let _ = assert_rejects_to(app, &"A".repeat(64)).await;
+}
+
+#[tokio::test]
+async fn recipient_hex_reject_mixed_case() {
+    let app = build_app();
+    let _ = assert_rejects_to(app, &"aA".repeat(32)).await;
+}
+
+#[tokio::test]
+async fn recipient_hex_reject_wrong_length_63() {
+    // Regression check: shape rejection still fires when length is
+    // wrong, regardless of case. Pre-existing behaviour preserved.
+    let app = build_app();
+    let _ = assert_rejects_to(app, &"a".repeat(63)).await;
+}
+
+#[tokio::test]
+async fn recipient_hex_accept_lowercase_64_hex() {
+    let app = build_app();
+    let sender_id = identity_hex(70);
+    let recipient_id = identity_hex(71); // already lowercase from hex::encode
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let (app, token) = obtain_token(app, &sender_id, &signing_kp).await;
+    let envelope_id = "test-a6-lower-happy";
+    let body = send_body(envelope_id, &recipient_id);
+    let (_app, status, v) = call_send_raw(app, &token, envelope_id, body.as_bytes()).await;
+    assert_eq!(status, StatusCode::CREATED, "expected 201, got {:?} {:?}", status, v);
+}
+
+#[tokio::test]
+async fn recipient_hex_accept_all_zero_lowercase() {
+    let app = build_app();
+    let sender_id = identity_hex(72);
+    let recipient_id = "0".repeat(64);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let (app, token) = obtain_token(app, &sender_id, &signing_kp).await;
+    let envelope_id = "test-a6-zero-recipient";
+    let body = send_body(envelope_id, &recipient_id);
+    let (_app, status, v) = call_send_raw(app, &token, envelope_id, body.as_bytes()).await;
+    assert_eq!(status, StatusCode::CREATED, "expected 201, got {:?} {:?}", status, v);
+}

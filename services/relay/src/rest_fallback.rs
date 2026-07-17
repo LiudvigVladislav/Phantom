@@ -2023,16 +2023,21 @@ pub async fn rest_send(
             .into_response();
     }
 
-    // Trek 2 Stage 1.x review fix — `req.to` is the recipient identity-hex
-    // that flows into the canonical `compute_seq_mac` input inside
+    // PR-0 A-6 — `req.to` is the recipient identity-hex that flows
+    // into the canonical `compute_seq_mac` input inside
     // `mirror_envelope_to_rest_store`. Validate the shape here (64
-    // ASCII-hex chars) so a malformed recipient cannot reach the MAC
-    // path and so the `&req.to[..8]` log prefix below is safe to read.
+    // LOWERCASE hex chars, `[0-9a-f]`) so:
+    //   (a) a malformed recipient cannot reach the MAC path,
+    //   (b) `&req.to[..8]` log prefix stays safe to read,
+    //   (c) two clients addressing the same identity with different
+    //       case do not derive incompatible verify keys.
+    // Server-side auto-lowercase was rejected — see the seq_mac.rs
+    // docstring for rationale.
     if !crate::seq_mac::is_valid_recipient_identity_hex(&req.to) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "to must be 64 ASCII-hex characters"
+                "error": "to must be 64 lowercase hex characters ([0-9a-f])"
             })),
         )
             .into_response();
