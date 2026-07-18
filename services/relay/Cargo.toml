@@ -32,6 +32,11 @@ base64 = { workspace = true }
 # inherited by accept()ed sockets — this gives us per-connection TCP-
 # level dead-peer detection without restructuring the axum serve loop.
 socket2 = { version = "0.5", features = ["all"] }
+# RC-RELAY-STATE-DIR-REPAIR PR-1b §6.2: singleton state-dir lock file
+# (`state_dir/.lock`, `try_lock_exclusive`). Second-instance boot exits 2
+# instead of racing writes with an already-running relay. Cross-platform:
+# fcntl(F_SETLK) on Unix, LockFileEx on Windows.
+fs2 = "0.4"
 
 [dev-dependencies]
 tokio-test = { workspace = true }

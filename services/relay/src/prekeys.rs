@@ -199,14 +199,30 @@ pub struct PreKeyStore {
     /// Sliding-window publish-rate counters. Distinct from the relay's
     /// per-message rate limiter so a chatty user can still publish prekeys.
     rate: RwLock<HashMap<String, RateBucket>>,
-    /// Monotonic disk write counter for testing the persistence path.
-    pub disk_writes: AtomicU64,
+    /// RC-RELAY-STATE-DIR-REPAIR PR-1b §3.5 — split of the pre-1b
+    /// `disk_writes` counter which counted attempts (the very defect this
+    /// track fixes). `persist_success` fires ONLY after the file write,
+    /// `sync_data`, and parent-directory fsync all return `Ok`. Any Err
+    /// along that chain bumps `persist_failed` instead — the two never
+    /// increment together for the same call.
+    pub persist_success: AtomicU64,
+    pub persist_failed: AtomicU64,
+    /// Boot-time count of malformed lines skipped during `load_from_disk`.
+    /// Emitted as `WARN "state_load_torn_lines"` at load time if non-zero.
+    /// Under PR-1b's fsync-per-line durability contract this should remain
+    /// 0; a non-zero value at boot indicates a crash mid-write on a
+    /// pre-1b relay OR filesystem corruption. Design doc §8 test
+    /// `load_skips_torn_last_line_and_logs` pins the behaviour.
+    pub load_torn_lines_skipped: AtomicU64,
     /// Full path to the `prekeys.jsonl` append-log. Computed at construction
-    /// as `state_dir.join(PREKEYS_FILENAME)` — see `PreKeyStore::new`. Every
-    /// `append_to_disk` and boot-time `load_from_disk` resolves against this
-    /// path. Empty (`PathBuf::new()`) inside test-only `PreKeyStore::empty`
-    /// so writes silent-fail without hitting the workspace filesystem.
+    /// as `state_dir.join(PREKEYS_FILENAME)` — see `PreKeyStore::new`.
     prekeys_file: PathBuf,
+    /// Test-only: keeps the backing `TempDir` alive for the lifetime of
+    /// the store so `PreKeyStore::empty()` (used by unit tests) gets a
+    /// real writable path instead of the pre-1b empty-`PathBuf` silent-
+    /// swallow shape (which PR-1b closes on the production path).
+    #[cfg(test)]
+    _test_tempdir: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,26 +239,38 @@ impl PreKeyStore {
     /// call appends to the same joined path.
     pub fn new(state_dir: &Path) -> Self {
         let prekeys_file = state_dir.join(PREKEYS_FILENAME);
+        let (map, skipped) = load_from_disk(&prekeys_file);
         Self {
-            inner: RwLock::new(load_from_disk(&prekeys_file)),
+            inner: RwLock::new(map),
             rate: RwLock::new(HashMap::new()),
-            disk_writes: AtomicU64::new(0),
+            persist_success: AtomicU64::new(0),
+            persist_failed: AtomicU64::new(0),
+            load_torn_lines_skipped: AtomicU64::new(skipped),
             prekeys_file,
+            #[cfg(test)]
+            _test_tempdir: None,
         }
     }
 
-    /// Test-only constructor that skips disk replay AND uses an empty path
-    /// so any subsequent write silent-fails (the pre-fix `if let Ok(f)`
-    /// swallow-shape catches the `EINVAL` on an empty path). Real
-    /// production paths always go through [`new`] which seeds from
-    /// `state_dir.join(PREKEYS_FILENAME)`.
+    /// Test-only constructor rooted at a fresh `TempDir`. Skips disk replay
+    /// (map starts empty) but every subsequent `publish` / `consume_bundle`
+    /// / `delete_opk` writes to a real writable path and can EXERCISE the
+    /// PR-1b fail-loud + atomicity path — the pre-1b empty-`PathBuf`
+    /// silent-swallow shape is gone (was itself the defect this track
+    /// closes). The `TempDir` is owned by the store and cleaned up when
+    /// the store drops.
     #[cfg(test)]
     pub fn empty() -> Self {
+        let td = tempfile::tempdir().expect("test tempdir");
+        let prekeys_file = td.path().join(PREKEYS_FILENAME);
         Self {
             inner: RwLock::new(HashMap::new()),
             rate: RwLock::new(HashMap::new()),
-            disk_writes: AtomicU64::new(0),
-            prekeys_file: PathBuf::new(),
+            persist_success: AtomicU64::new(0),
+            persist_failed: AtomicU64::new(0),
+            load_torn_lines_skipped: AtomicU64::new(0),
+            prekeys_file,
+            _test_tempdir: Some(td),
         }
     }
 
@@ -273,7 +301,13 @@ impl PreKeyStore {
             validate_opk_shape(opk).map_err(PublishError::BadOpk)?;
         }
 
+        // RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 correctness tier +
+        // §14 rule 11: hold the write guard CONTINUOUSLY from state
+        // selection through persist through RAM commit. Splitting the
+        // lock across persist would let a concurrent consume/publish
+        // see partial state.
         let mut map = self.inner.write().await;
+
         // Bound the X25519 identity to a single Ed25519 signing key. Once a
         // signing key is registered, only its rotation is allowed via the
         // explicit "rotate signing key" path (TBD post-Alpha 2). Rejecting
@@ -286,22 +320,26 @@ impl PreKeyStore {
                 return Err(PublishError::SigningKeyMismatch);
             }
         }
-        let entry = map.get(identity_pubkey_hex).cloned();
-        let stored = match entry {
-            Some(mut prev) => {
+
+        // Compute the intended NEW state without touching the map. If
+        // persist later fails, we simply drop the guard and the map is
+        // byte-for-byte unchanged.
+        let stored: StoredPreKeyState = match map.get(identity_pubkey_hex) {
+            Some(prev) => {
+                let mut next = prev.clone();
                 // Idempotent retry guard: same key_id → no rotation.
-                let rotating = prev.current_spk.key_id != spk.key_id;
+                let rotating = next.current_spk.key_id != spk.key_id;
                 if rotating {
-                    prev.previous_spk = Some(prev.current_spk.clone());
-                    prev.previous_retired_at_ms = Some(now_ms);
+                    next.previous_spk = Some(next.current_spk.clone());
+                    next.previous_retired_at_ms = Some(now_ms);
                 }
-                prev.signing_pubkey_hex = signing_pubkey_hex.to_string();
-                prev.current_spk = spk;
+                next.signing_pubkey_hex = signing_pubkey_hex.to_string();
+                next.current_spk = spk;
                 // OPK pool is REPLACED on each publish, not merged: the
                 // client owns its OPK lifecycle and a publish is the
                 // canonical "here is my current pool" statement.
-                prev.one_time_prekeys = dedup_and_cap_opks(opks);
-                prev
+                next.one_time_prekeys = dedup_and_cap_opks(opks);
+                next
             }
             None => StoredPreKeyState {
                 identity_pubkey_hex: identity_pubkey_hex.to_string(),
@@ -312,12 +350,20 @@ impl PreKeyStore {
                 one_time_prekeys: dedup_and_cap_opks(opks),
             },
         };
+
+        // Persist FIRST (under the still-held write guard). The persisted
+        // snapshot is exactly what we are about to commit to RAM. On Err
+        // we drop the guard without ever mutating the map.
+        if let Err(pf) = persist_prekey_state(&self.prekeys_file, &stored) {
+            self.persist_failed.fetch_add(1, Ordering::Relaxed);
+            return Err(PublishError::PersistFailed(pf));
+        }
+
+        // Persist succeeded. NOW mutate RAM under the same guard, then
+        // bump success and return.
         let count = stored.one_time_prekeys.len();
-        map.insert(identity_pubkey_hex.to_string(), stored.clone());
-        drop(map);
-        // Persist outside the lock so the disk write doesn't block readers.
-        append_to_disk(&self.prekeys_file, &stored);
-        self.disk_writes.fetch_add(1, Ordering::Relaxed);
+        map.insert(identity_pubkey_hex.to_string(), stored);
+        self.persist_success.fetch_add(1, Ordering::Relaxed);
         Ok(count)
     }
 
@@ -325,28 +371,56 @@ impl PreKeyStore {
     /// returns it together with the current SPK. The pop happens inside
     /// the same write-lock critical section so two concurrent fetches
     /// cannot both receive the same OPK — that's the whole point of OPKs.
+    /// PR-1b §4.2 correctness tier: persist-first under continuously-held
+    /// write guard. Peek at the trailing OPK (do NOT pop yet); compute the
+    /// post-consume snapshot; persist; on Ok commit the pop AND return
+    /// the bundle; on Err drop the guard without mutation and return
+    /// `Err(ConsumeError::PersistFailed)`. `Ok(None)` is a legitimate
+    /// "identity has no prekey record at all" → 404.
     pub async fn consume_bundle(
         &self,
         identity_pubkey_hex: &str,
-    ) -> Option<PreKeyBundle> {
+    ) -> Result<Option<PreKeyBundle>, ConsumeError> {
         let mut map = self.inner.write().await;
-        let entry = map.get_mut(identity_pubkey_hex)?;
-        let one_time = entry.one_time_prekeys.pop();
+
+        let entry = match map.get(identity_pubkey_hex) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        // Peek trailing OPK (matches the pre-1b behaviour of popping the
+        // last element). DO NOT mutate `entry.one_time_prekeys` yet.
+        let one_time = entry.one_time_prekeys.last().cloned();
+
         let bundle = PreKeyBundle {
             identity_pubkey_hex: entry.identity_pubkey_hex.clone(),
             signing_pubkey_hex: entry.signing_pubkey_hex.clone(),
             signed_pre_key: entry.current_spk.clone(),
             one_time_pre_key: one_time.clone(),
         };
-        let snapshot = entry.clone();
-        drop(map);
-        // Persist the post-consume state so a relay restart doesn't
-        // hand out the same OPK twice.
-        if one_time.is_some() {
-            append_to_disk(&self.prekeys_file, &snapshot);
-            self.disk_writes.fetch_add(1, Ordering::Relaxed);
+
+        if one_time.is_none() {
+            // No OPK to consume → no state change to persist. `entry`
+            // stays as-is; return the SPK-only bundle. Bump neither
+            // counter — no disk touch occurred.
+            return Ok(Some(bundle));
         }
-        Some(bundle)
+
+        // Compute the post-consume snapshot (state MINUS the trailing OPK)
+        // without touching the map. If persist fails we drop the guard
+        // and RAM is byte-for-byte unchanged.
+        let mut snapshot = entry.clone();
+        snapshot.one_time_prekeys.pop();
+
+        if let Err(pf) = persist_prekey_state(&self.prekeys_file, &snapshot) {
+            self.persist_failed.fetch_add(1, Ordering::Relaxed);
+            return Err(ConsumeError::PersistFailed(pf));
+        }
+
+        // Persist succeeded → commit the pop under the same guard.
+        map.insert(identity_pubkey_hex.to_string(), snapshot);
+        self.persist_success.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(bundle))
     }
 
     /// Snapshot every (identity, signing_pubkey) pair currently in the
@@ -418,17 +492,28 @@ impl PreKeyStore {
         )
         .map_err(DeleteError::BadSignature)?;
 
+        // PR-1b §4.2 correctness tier: hold the write guard from state
+        // selection through persist through RAM commit.
         let mut map = self.inner.write().await;
-        let entry = map.get_mut(identity_pubkey_hex).ok_or(DeleteError::NotFound)?;
+        let entry = map.get(identity_pubkey_hex).ok_or(DeleteError::NotFound)?;
         let before = entry.one_time_prekeys.len();
-        entry.one_time_prekeys.retain(|o| o.key_id_hex != key_id_hex);
-        if entry.one_time_prekeys.len() == before {
+
+        // Compute the post-delete snapshot WITHOUT touching the map.
+        let mut snapshot = entry.clone();
+        snapshot.one_time_prekeys.retain(|o| o.key_id_hex != key_id_hex);
+        if snapshot.one_time_prekeys.len() == before {
             return Err(DeleteError::NotFound);
         }
-        let snapshot = entry.clone();
-        drop(map);
-        append_to_disk(&self.prekeys_file, &snapshot);
-        self.disk_writes.fetch_add(1, Ordering::Relaxed);
+
+        // Persist FIRST. On Err, drop the guard without mutation.
+        if let Err(pf) = persist_prekey_state(&self.prekeys_file, &snapshot) {
+            self.persist_failed.fetch_add(1, Ordering::Relaxed);
+            return Err(DeleteError::PersistFailed(pf));
+        }
+
+        // Persist succeeded → commit the retain-filter under the same guard.
+        map.insert(identity_pubkey_hex.to_string(), snapshot);
+        self.persist_success.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -486,6 +571,25 @@ pub enum PublishError {
     /// prior publish but with a DIFFERENT Ed25519 signing key. The
     /// 1:1 X25519↔Ed25519 binding per identity is enforced server-side.
     SigningKeyMismatch,
+    /// RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 correctness tier:
+    /// disk persist failed. RAM state is byte-for-byte unchanged
+    /// (persist-first shape — we never mutated the map). Caller
+    /// (`publish_prekeys` handler in routes.rs) surfaces 500 with
+    /// the sanitised `PreKeyPersistFailure::shape()` string.
+    PersistFailed(PreKeyPersistFailure),
+}
+
+/// PR-1b: `consume_bundle` was `Option<PreKeyBundle>` in PR-1a — a
+/// "no bundle available" case. PR-1b splits that into a `Result` so a
+/// persist failure surfaces distinctly from a legitimate "identity has
+/// no published prekeys" 404. On persist failure the RAM state is
+/// unchanged (no OPK popped) and the caller returns 500. Legitimate
+/// absence returns `Ok(None)` → 404 as before.
+#[derive(Debug)]
+pub enum ConsumeError {
+    /// Correctness-tier persist failure. RAM byte-for-byte unchanged;
+    /// caller returns 500 with `PreKeyPersistFailure::shape()`.
+    PersistFailed(PreKeyPersistFailure),
 }
 
 #[derive(Debug)]
@@ -494,6 +598,39 @@ pub enum DeleteError {
     BadSignature(&'static str),
     TimestampOutOfWindow,
     NotFound,
+    /// Correctness-tier persist failure. RAM byte-for-byte unchanged.
+    PersistFailed(PreKeyPersistFailure),
+}
+
+/// Sanitised prekey persist failure — carries a short static-string
+/// shape only. NEVER leaks a filesystem path, OS error message, or
+/// per-request debugging data to the HTTP response body. The shape
+/// vocabulary matches the audit-tier `audit_persist_shape` in
+/// `state.rs` so operator dashboards can compare tiers.
+///
+/// Values: `"permission" | "not_found" | "storage_full" | "io"`.
+#[derive(Debug, Clone, Copy)]
+pub struct PreKeyPersistFailure {
+    shape: &'static str,
+}
+
+impl PreKeyPersistFailure {
+    pub fn shape(&self) -> &'static str {
+        self.shape
+    }
+
+    fn from_io(err: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        let shape = match err.kind() {
+            ErrorKind::PermissionDenied => "permission",
+            ErrorKind::NotFound => "not_found",
+            _ => match err.raw_os_error() {
+                Some(28) => "storage_full", // ENOSPC (Unix)
+                _ => "io",
+            },
+        };
+        Self { shape }
+    }
 }
 
 // ── Validation + signature verification ─────────────────────────────────────
@@ -681,29 +818,90 @@ pub fn random_opk_id_hex() -> String {
 /// corrupt the relay starts empty — same forgiving behavior as
 /// `state::load_reports_from_disk`. `path` is the joined
 /// `state_dir/prekeys.jsonl` — see `PreKeyStore::new`.
-fn load_from_disk(path: &Path) -> HashMap<String, StoredPreKeyState> {
+/// Boot-time load of `prekeys.jsonl`. Returns the reconstructed map plus
+/// the count of malformed lines skipped during parse (PR-1b §8 test
+/// `load_skips_torn_last_line_and_logs` — surfaces a torn-tail on
+/// pre-1b relays that crashed mid-`writeln!` under silent-swallow, or
+/// on filesystem corruption). Empty lines are ignored silently and do
+/// NOT count as torn. If any lines were skipped, a structured `WARN`
+/// is emitted so operators see the count in the log stream too.
+fn load_from_disk(path: &Path) -> (HashMap<String, StoredPreKeyState>, u64) {
     let Ok(content) = std::fs::read_to_string(path) else {
-        return HashMap::new();
+        return (HashMap::new(), 0);
     };
     let mut map: HashMap<String, StoredPreKeyState> = HashMap::new();
+    let mut skipped: u64 = 0;
     for line in content.lines() {
-        if let Ok(state) = serde_json::from_str::<StoredPreKeyState>(line) {
-            map.insert(state.identity_pubkey_hex.clone(), state);
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<StoredPreKeyState>(line) {
+            Ok(state) => {
+                map.insert(state.identity_pubkey_hex.clone(), state);
+            }
+            Err(_) => {
+                skipped += 1;
+            }
         }
     }
-    map
+    if skipped > 0 {
+        tracing::warn!(
+            event = "state_load_torn_lines",
+            path = "prekeys.jsonl",
+            skipped = skipped,
+            "skipped malformed lines during prekey state load"
+        );
+    }
+    (map, skipped)
 }
 
-fn append_to_disk(path: &Path, state: &StoredPreKeyState) {
-    if let Ok(line) = serde_json::to_string(state) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(f, "{}", line);
-        }
+/// RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 correctness-tier persist.
+///
+/// Contract:
+///   * On `Ok(())`, the caller MAY commit the corresponding RAM
+///     mutation. The record has been serialised, appended to disk,
+///     `sync_data` on the file completed, and parent-directory fsync
+///     (Unix) completed — the record survives a crash.
+///   * On `Err(PreKeyPersistFailure)`, the caller MUST NOT mutate RAM.
+///     The disk state is either unchanged (`open`/`serialize` failure)
+///     OR contains a partial write that will be dropped by
+///     `load_from_disk`'s line-parse `.ok()` filter on next boot; in
+///     both cases the ONE RAM commit that would have made this record
+///     authoritative is skipped, so the on-disk state converges with
+///     RAM on the next successful persist for the same identity.
+///
+/// The caller MUST hold `PreKeyStore.inner` write-guard from before
+/// computing the intended new state through this call to the RAM
+/// commit — mini-lock §14 rule 11. No drop-and-reacquire is legal.
+fn persist_prekey_state(
+    path: &Path,
+    state: &StoredPreKeyState,
+) -> Result<(), PreKeyPersistFailure> {
+    let line = serde_json::to_string(state).map_err(|_| PreKeyPersistFailure { shape: "io" })?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| PreKeyPersistFailure::from_io(&e))?;
+
+    writeln!(file, "{}", line).map_err(|e| PreKeyPersistFailure::from_io(&e))?;
+
+    file.sync_data()
+        .map_err(|e| PreKeyPersistFailure::from_io(&e))?;
+
+    // Parent-directory fsync — makes the newly-appended file's directory
+    // entry (in the create-on-first-write case) durable. Unix-only; on
+    // Windows the file APIs already guarantee metadata durability for
+    // append writes.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent).map_err(|e| PreKeyPersistFailure::from_io(&e))?;
+        dir.sync_all()
+            .map_err(|e| PreKeyPersistFailure::from_io(&e))?;
     }
+
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -782,6 +980,7 @@ mod tests {
         let bundle = store
             .consume_bundle(&identity_hex)
             .await
+            .expect("consume should not persist-fail")
             .expect("bundle should exist");
         assert_eq!(bundle.identity_pubkey_hex, identity_hex);
         assert_eq!(bundle.signing_pubkey_hex, signing_hex);
@@ -815,8 +1014,8 @@ mod tests {
         let id2 = identity_hex.clone();
 
         let (b1, b2) = tokio::join!(
-            tokio::spawn(async move { s1.consume_bundle(&id1).await.unwrap() }),
-            tokio::spawn(async move { s2.consume_bundle(&id2).await.unwrap() }),
+            tokio::spawn(async move { s1.consume_bundle(&id1).await.unwrap().unwrap() }),
+            tokio::spawn(async move { s2.consume_bundle(&id2).await.unwrap().unwrap() }),
         );
         let b1 = b1.unwrap();
         let b2 = b2.unwrap();
@@ -973,7 +1172,11 @@ mod tests {
             .await
             .unwrap();
 
-        let bundle = store.consume_bundle(&identity_hex).await.unwrap();
+        let bundle = store
+            .consume_bundle(&identity_hex)
+            .await
+            .expect("consume should not persist-fail")
+            .expect("bundle should exist");
         assert!(bundle.one_time_pre_key.is_none());
         assert_eq!(bundle.signed_pre_key.key_id, spk.key_id);
     }

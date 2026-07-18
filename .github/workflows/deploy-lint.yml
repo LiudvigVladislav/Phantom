@@ -29,6 +29,7 @@ on:
     paths:
       - 'deploy/docker-compose.yml'
       - 'services/relay/Dockerfile'
+      - 'services/relay/src/**'
       - '.github/workflows/deploy-lint.yml'
   pull_request:
     branches: [master]
@@ -64,6 +65,7 @@ jobs:
             if git diff --name-only "$base" "$head" -- \
                 'deploy/docker-compose.yml' \
                 'services/relay/Dockerfile' \
+                'services/relay/src/**' \
                 '.github/workflows/deploy-lint.yml' \
                 | grep -q .; then
               echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -177,6 +179,7 @@ jobs:
             if git diff --name-only "$base" "$head" -- \
                 'deploy/docker-compose.yml' \
                 'services/relay/Dockerfile' \
+                'services/relay/src/**' \
                 '.github/workflows/deploy-lint.yml' \
                 | grep -q .; then
               echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -473,6 +476,55 @@ jobs:
 
           print("All five state-dir invariants hold. PASS.")
           PYEOF
+
+      # RC-RELAY-STATE-DIR-REPAIR PR-1b §8 CI grep-gate — the two
+      # silent-swallow shapes that hid EROFS in production for months.
+      # Both patterns MUST return zero hits under services/relay/src/
+      # (tests/ intentionally exempt — some tests deliberately probe
+      # the pre-fix shape to prove PR-1b's fail-loud replacement fires).
+      #
+      # Pattern 1: `if let Ok(mut f) = std::fs::OpenOptions::...open(...)`
+      #            — silently drops Err on the open call, which is exactly
+      #            how EROFS was hidden.
+      # Pattern 2: `let _ = writeln!(...)` — silently drops Err on the
+      #            write itself, so a short-write or EROFS-mid-write goes
+      #            unnoticed.
+      #
+      # ripgrep is preinstalled on ubuntu-latest. `-P` uses PCRE2 so we
+      # can match the compound "if let Ok(...) = (std::)?fs::OpenOptions"
+      # shape robustly against whitespace variance. `--type rust` scopes
+      # to *.rs and `--glob '!tests/**'` excludes the tests tree.
+      - name: PR-1b §8 grep-gate — no silent-swallow persistence writers
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          cd services/relay/src
+
+          patterns=(
+            'if\s+let\s+Ok\s*\([^)]+\)\s*=\s*(std::)?fs::OpenOptions'
+            'let\s+_\s*=\s*writeln!'
+          )
+          fail=0
+          for pat in "${patterns[@]}"; do
+            echo "▸ pattern: $pat"
+            # ripgrep exit codes: 0 = matches, 1 = no matches, 2 = error.
+            # We WANT 1 (no matches) — fail closed on any 0.
+            if rg -P --type rust --glob '!tests/**' "$pat"; then
+              echo "::error::PR-1b §8 grep-gate FAILED — pattern matched: $pat"
+              fail=1
+            else
+              echo "  OK (0 hits)"
+            fi
+            echo
+          done
+          if [ "$fail" -eq 1 ]; then
+            echo "::error::One or more silent-swallow persistence shapes present under services/relay/src/."
+            echo "PR-1b §4.2 requires fail-loud writers: either match on the Err arm"
+            echo "and (audit tier) log+count OR (correctness tier) return an error."
+            echo "See docs/tracks/rc-relay-state-dir-repair.md §4.2 and §8."
+            exit 1
+          fi
+          echo "All PR-1b silent-swallow patterns return zero hits. PASS."
 
       # Image-level smoke — build the runtime image and assert the
       # phantom user actually resolves to uid=10001 AND gid=10001 inside
