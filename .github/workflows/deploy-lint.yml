@@ -490,17 +490,16 @@ jobs:
       #            write itself, so a short-write or EROFS-mid-write goes
       #            unnoticed.
       #
-      # ripgrep is preinstalled on ubuntu-latest. `-P` uses PCRE2 so we
-      # can match the compound "if let Ok(...) = (std::)?fs::OpenOptions"
-      # shape robustly against whitespace variance. `--type rust` scopes
-      # to *.rs and `--glob '!tests/**'` excludes the tests tree.
-      # Round-2 architect P1: ripgrep is NOT preinstalled on ubuntu-24.04
-      # (the pre-round-2 comment claiming it was is factually wrong — the
-      # runner image dropped `rg` at some point). Install it explicitly
-      # with a pinned apt package so the gate below can rely on `rg`
-      # being on PATH. `apt-get install` is faster than `cargo install
-      # ripgrep` (~2s vs 30-60s) and matches the runner's package
-      # manager convention.
+      # ripgrep is NOT preinstalled on ubuntu-24.04 (round-1 CI failed
+      # with `rg: command not found`; the runner image dropped `rg` at
+      # some point). Install it via the runner's apt package feed so
+      # the gate below can rely on `rg` being on PATH. `apt-get
+      # install` is fast (~2s) vs `cargo install ripgrep` (30-60s) and
+      # matches the runner's package-manager convention. `-P` in the
+      # gate below uses PCRE2 so we can match the compound "if let
+      # Ok(...) = (std::)?fs::OpenOptions" shape robustly against
+      # whitespace variance. `--type rust` scopes to *.rs and
+      # `--glob '!tests/**'` excludes the tests tree.
       - name: Install ripgrep for the grep-gate below
         if: steps.changes.outputs.relevant == 'true'
         run: |

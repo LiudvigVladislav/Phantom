@@ -866,12 +866,16 @@ fn load_from_disk(path: &Path) -> (HashMap<String, StoredPreKeyState>, u64) {
 /// line and the next boot's loader either drops the fresh line (both
 /// halves invalid) or admits stale state that RAM never acknowledged.
 ///
-/// Fix: snapshot the file length BEFORE opening; on ANY error after the
-/// open succeeds, roll the file back to `prev_len` via `set_len` +
-/// re-`sync_data` + parent-directory fsync so disk and RAM stay in
+/// Fix: snapshot the pre-op filesystem shape BEFORE opening (`Absent`
+/// vs `Present(len)`); on ANY error after the open succeeds, roll the
+/// file back to that shape (remove-if-absent OR `set_len` +
+/// re-`sync_data` + parent-directory fsync) so disk and RAM stay in
 /// sync (both unchanged). If the rollback ITSELF fails, correctness
-/// state is ambiguous — we panic-loud (`FATAL:` prefix) and fail-stop
-/// rather than continue with a store that may or may not match disk.
+/// state is ambiguous — we `eprintln!("FATAL: …")` + `std::process::
+/// abort()` (round-2 architect P0: `panic!` under the default
+/// `panic = "unwind"` strategy only unwinds the current task and lets
+/// Tokio keep serving other requests; `abort()` terminates the whole
+/// process, which is the mini-lock §14 rule 11 requirement).
 ///
 /// Contract:
 ///   * On `Ok(())`, the caller MAY commit the corresponding RAM
