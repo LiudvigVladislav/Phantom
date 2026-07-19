@@ -11,4 +11,3 @@ liberapay: Phantom-messenger
 # Order matters: most discoverable / human-readable channel first.
 custom:
   - "https://phntm.pro/donate.html"
-  - "https://phntm.pro/funding.json"
