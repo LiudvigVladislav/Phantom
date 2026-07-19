@@ -441,9 +441,78 @@ fn state_dir_config_not_env() {
 //       explicitly gates them with `#[cfg(unix)]`.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use phantom_relay::prekeys::PreKeyStore;
+use phantom_relay::prekeys::{self, PreKeyStore};
 use phantom_relay::state::state_dir_preflight;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex as StdMutex;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+// ── LogCapture: in-memory tracing layer for level assertions ────────────────
+//
+// Round-1 architect P1: assert audit-tier events fire at ERROR level.
+// `tracing-test` was considered but it captures message text only, not
+// level. A custom Layer that stores `(Level, event="…")` tuples is ~30
+// lines and needs no dev-dep bump. The `set_default` guard is scoped
+// to the calling test so no cross-test bleed.
+
+#[derive(Debug, Clone)]
+struct CapturedEvent {
+    level: tracing::Level,
+    event_field: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct LogCapture(Arc<StdMutex<Vec<CapturedEvent>>>);
+
+impl LogCapture {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn events(&self) -> Vec<CapturedEvent> {
+        self.0.lock().unwrap().clone()
+    }
+    fn layer(&self) -> LogCaptureLayer {
+        LogCaptureLayer(self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct LogCaptureLayer(LogCapture);
+
+impl<S> Layer<S> for LogCaptureLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        struct FieldExtractor {
+            event: Option<String>,
+        }
+        impl Visit for FieldExtractor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.event = Some(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "event" {
+                    self.event = Some(format!("{:?}", value).trim_matches('"').to_string());
+                }
+            }
+        }
+        let mut ex = FieldExtractor { event: None };
+        event.record(&mut ex);
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .push(CapturedEvent {
+                level: *event.metadata().level(),
+                event_field: ex.event,
+            });
+    }
+}
 
 /// Replace `target` with an empty directory of the same name. Panics on
 /// any I/O error — tests use this to seed the fail-loud seam and any
@@ -757,7 +826,7 @@ async fn prekey_write_failure_returns_500() {
     );
 }
 
-// ── Test §8.7: audit-tier persist failure preserves 2xx + bumps failure counter
+// ── Test §8.7: audit-tier persist failure preserves 2xx + ERROR-level log ────
 
 #[tokio::test]
 async fn report_write_failure_preserves_2xx_and_logs_error() {
@@ -770,6 +839,14 @@ async fn report_write_failure_preserves_2xx_and_logs_error() {
     std::fs::create_dir(dir.path().join("reports.jsonl"))
         .expect("seed reports.jsonl as a directory");
 
+    // Round-1 architect P1: attach an in-memory subscriber so we can
+    // assert the audit-tier event fires at ERROR level (§4.2 requires
+    // `tracing::error!` — pre-round-1 shape used `warn!`, and the test
+    // named `logs_error` did not verify the level).
+    let capture = LogCapture::new();
+    let subscriber = tracing_subscriber::registry().with(capture.layer());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     let reporter = "aa".repeat(16);
     let reported = "bb".repeat(16);
     let status = post_report(router, &reporter, &reported).await;
@@ -781,7 +858,7 @@ async fn report_write_failure_preserves_2xx_and_logs_error() {
         "audit-tier /report must preserve 2xx even when persist fails"
     );
 
-    // But the failure counter MUST have fired.
+    // Failure counter MUST have fired.
     assert_eq!(
         state.reports_persist_failed.load(Ordering::Relaxed),
         1,
@@ -792,6 +869,25 @@ async fn report_write_failure_preserves_2xx_and_logs_error() {
         0,
         "reports_persist_success must NOT fire when the write failed"
     );
+
+    // The audit-tier event MUST have been emitted at ERROR level.
+    let events = capture.events();
+    let matching: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_field.as_deref() == Some("audit_persist_failed"))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "expected at least one `event=\"audit_persist_failed\"` log; got {:?}",
+        events
+    );
+    assert!(
+        matching.iter().all(|e| e.level == tracing::Level::ERROR),
+        "audit_persist_failed events MUST fire at ERROR level (§4.2 requires \
+         tracing::error!). Observed: {:?}",
+        matching
+    );
+
     // RAM state DOES accept the report because the audit tier is
     // "best-effort persist, always mutate RAM". This is intentional per
     // §4.2 audit tier and distinguishes it from the correctness tier.
@@ -894,3 +990,107 @@ fn make_opk_for_test(seed: u8) -> serde_json::Value {
         "public_key_hex": hex::encode(pk),
     })
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round-1 architect amendments — additional coverage.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── R1-1: HTTP-level consume flow — 500 → restore → 200 with same OPK ────────
+//
+// Round-1 architect P1: the pre-round-1 consume-atomicity test hit the
+// `PreKeyStore` directly, bypassing routes.rs. This test drives
+// GET /prekeys/bundle/{identity} → 500 with sanitised body, then removes
+// the fault, then GET again and asserts the SAME OPK comes back (no
+// burn) — exercising the ConsumeError::PersistFailed → HTTP wiring end-
+// to-end.
+
+#[tokio::test]
+async fn consume_persist_failure_returns_500_then_same_opk_via_http() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = cfg_with_state_dir(dir.path());
+    let (router, _state) = build_router(cfg);
+
+    // Publish a valid bundle with ONE OPK via HTTP so the wire shapes
+    // used in tests exactly match the production ingress.
+    let identity = unique_identity_hex(0x90);
+    let (signing_kp, spk, _created) = build_spk_and_signing_kp();
+    let signing_pubkey_hex = hex::encode(signing_kp.verifying_key().to_bytes());
+    let opk = make_opk_for_test(0xC9);
+    let opk_key_id = opk["key_id_hex"].as_str().unwrap().to_string();
+
+    let publish_body = json!({
+        "identity_pubkey_hex":  identity,
+        "signing_pubkey_hex":   signing_pubkey_hex,
+        "signed_pre_key":       spk,
+        "one_time_pre_keys":    [opk],
+    });
+    let publish_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/prekeys/publish")
+                .header("content-type", "application/json")
+                .body(Body::from(publish_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        publish_res.status().is_success(),
+        "/prekeys/publish setup must succeed, got {}",
+        publish_res.status()
+    );
+
+    // Break the persist path via file-as-directory.
+    replace_file_with_dir(&dir.path().join("prekeys.jsonl"));
+
+    let requester = unique_identity_hex(0x91);
+    let (fail_status, fail_body) =
+        get_prekeys_bundle(router.clone(), &identity, &requester).await;
+    assert_eq!(
+        fail_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "consume under broken persist must surface HTTP 500 via routes.rs, got body={:?}",
+        fail_body
+    );
+    assert_eq!(
+        fail_body["error"].as_str(),
+        Some("prekey_persist_failed"),
+        "500 body carries the stable error tag"
+    );
+    let reason = fail_body["reason"]
+        .as_str()
+        .expect("reason must be present");
+    assert!(
+        matches!(reason, "permission" | "not_found" | "storage_full" | "io"),
+        "sanitised reason, got {:?}",
+        reason
+    );
+    let body_str = fail_body.to_string();
+    assert!(
+        !body_str.contains(&dir.path().display().to_string()),
+        "500 body MUST NOT leak the state_dir path"
+    );
+
+    // Restore the persist path.
+    let _ = std::fs::remove_dir(dir.path().join("prekeys.jsonl"));
+
+    // Second call — the SAME OPK must come back. The failed consume did
+    // NOT pop it from RAM (persist-first atomicity) so a retry sees it.
+    let (ok_status, ok_body) = get_prekeys_bundle(router, &identity, &requester).await;
+    assert_eq!(ok_status, StatusCode::OK, "post-restore consume returns 200");
+    let returned_key_id = ok_body["one_time_pre_key"]["key_id_hex"]
+        .as_str()
+        .expect("returned bundle must carry an OPK");
+    assert_eq!(
+        returned_key_id, opk_key_id,
+        "the SAME OPK must be re-returned after the previous 500 — \
+         the failed consume must not have popped it (§4.2 atomicity)"
+    );
+}
+
+// (fault-injection tests moved to tests/prekey_persist_atomicity.rs so
+// the process-global `test_fault` AtomicU8 seam is not shared with any
+// sibling test in this binary; see that file's module docstring for
+// the rationale.)

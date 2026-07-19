@@ -389,7 +389,7 @@ pub fn load_blocklist_from_disk(path: &Path) -> std::collections::HashSet<String
 }
 
 /// Sanitised shape for audit-tier persist failures. Emitted alongside the
-/// structured `tracing::warn!` so the log stream and the counter agree on
+/// structured `tracing::error!` so the log stream and the counter agree on
 /// what "kind" of failure was observed without ever leaking a path or a
 /// raw OS message. Same taxonomy as the correctness-tier
 /// `PreKeyPersistFailure::shape()` in `prekeys.rs` — kept identical
@@ -435,7 +435,7 @@ fn append_audit_line(
         Ok(f) => f,
         Err(e) => {
             fail_counter.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
+            tracing::error!(
                 event = "audit_persist_failed",
                 tier = kind,
                 stage = "open",
@@ -447,7 +447,7 @@ fn append_audit_line(
     };
     if let Err(e) = writeln!(file, "{}", line) {
         fail_counter.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(
+        tracing::error!(
             event = "audit_persist_failed",
             tier = kind,
             stage = "write",
@@ -458,7 +458,7 @@ fn append_audit_line(
     }
     if let Err(e) = file.sync_data() {
         fail_counter.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(
+        tracing::error!(
             event = "audit_persist_failed",
             tier = kind,
             stage = "sync_data",
@@ -478,7 +478,7 @@ fn append_audit_line(
             Ok(dir) => {
                 if let Err(e) = dir.sync_all() {
                     fail_counter.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
+                    tracing::error!(
                         event = "audit_persist_failed",
                         tier = kind,
                         stage = "sync_parent_dir",
@@ -490,7 +490,7 @@ fn append_audit_line(
             }
             Err(e) => {
                 fail_counter.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
+                tracing::error!(
                     event = "audit_persist_failed",
                     tier = kind,
                     stage = "open_parent_dir",
@@ -516,7 +516,7 @@ pub fn append_report_to_disk(
             // Serialisation failure is a code bug, not a disk error —
             // count it and move on. Handler still returns 2xx.
             fail_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
+            tracing::error!(
                 event = "audit_persist_failed",
                 tier = "reports",
                 stage = "serialize",
@@ -564,7 +564,7 @@ pub fn append_push_token_to_disk(
         Ok(l) => l,
         Err(_) => {
             fail_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
+            tracing::error!(
                 event = "audit_persist_failed",
                 tier = "push_tokens",
                 stage = "serialize",
@@ -643,15 +643,31 @@ pub fn state_dir_preflight(cfg: &RelayConfig) -> std::fs::File {
         ),
     };
 
-    // Step 3 — try_lock_exclusive. Contention → exit(2). Second instance
-    // never touches the state files (no sentinel write, no persistent
-    // state load, no AppState construction).
-    if let Err(_e) = lock_file.try_lock_exclusive() {
-        eprintln!(
-            "FATAL: another relay instance holds {} — refusing to start",
-            lock_path.display()
-        );
-        std::process::exit(2);
+    // Step 3 — try_lock_exclusive. ONLY `ErrorKind::WouldBlock` is
+    // "another process holds the lock" (fs2 maps EAGAIN/EWOULDBLOCK on
+    // Unix and `ERROR_LOCK_VIOLATION` on Windows to `WouldBlock`). Every
+    // OTHER io::Error (EIO on a bad device, EOPNOTSUPP on a filesystem
+    // that doesn't support advisory locks such as some NFS mounts,
+    // permission changes mid-boot) means the LOCK OPERATION itself
+    // failed — treating those as "contention" would mislead the
+    // operator into thinking another relay is running when the real
+    // failure is a boot-preflight defect. Round-1 architect P1.
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!(
+                "FATAL: another relay instance holds {} — refusing to start",
+                lock_path.display()
+            );
+            std::process::exit(2);
+        }
+        Err(e) => panic!(
+            "FATAL: preflight: try_lock_exclusive on {} failed: {} \
+             (this is NOT lock contention — likely EIO or an unsupported \
+             filesystem)",
+            lock_path.display(),
+            e
+        ),
     }
 
     // Step 4 — preflight sentinel: prove the state_dir accepts a

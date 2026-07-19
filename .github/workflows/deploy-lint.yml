@@ -500,6 +500,14 @@ jobs:
           set -euo pipefail
           cd services/relay/src
 
+          # Round-1 architect P1: explicit exit-code switch.
+          #   rc=0  → matches found; pattern violation, fail the gate.
+          #   rc=1  → no matches; the desired PR-1b state.
+          #   rc>=2 → rg itself failed (PCRE2 error, ENOENT on --type,
+          #          I/O failure) — treat as gate failure, NOT as "clean".
+          # Pre-round-1 shape lumped rc=1 and rc>=2 into a single "OK"
+          # else-branch, so a mistyped pattern or missing `rg` would have
+          # printed a green tick to CI.
           patterns=(
             'if\s+let\s+Ok\s*\([^)]+\)\s*=\s*(std::)?fs::OpenOptions'
             'let\s+_\s*=\s*writeln!'
@@ -507,14 +515,23 @@ jobs:
           fail=0
           for pat in "${patterns[@]}"; do
             echo "▸ pattern: $pat"
-            # ripgrep exit codes: 0 = matches, 1 = no matches, 2 = error.
-            # We WANT 1 (no matches) — fail closed on any 0.
-            if rg -P --type rust --glob '!tests/**' "$pat"; then
-              echo "::error::PR-1b §8 grep-gate FAILED — pattern matched: $pat"
-              fail=1
-            else
-              echo "  OK (0 hits)"
-            fi
+            set +e
+            rg -P --type rust --glob '!tests/**' "$pat"
+            rc=$?
+            set -e
+            case "$rc" in
+              0)
+                echo "::error::PR-1b §8 grep-gate FAILED — pattern matched: $pat"
+                fail=1
+                ;;
+              1)
+                echo "  OK (0 hits)"
+                ;;
+              *)
+                echo "::error::PR-1b §8 grep-gate FATAL — ripgrep exited $rc for pattern $pat (invalid regex? missing binary? I/O error?)"
+                exit 3
+                ;;
+            esac
             echo
           done
           if [ "$fail" -eq 1 ]; then

@@ -857,18 +857,32 @@ fn load_from_disk(path: &Path) -> (HashMap<String, StoredPreKeyState>, u64) {
 
 /// RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 correctness-tier persist.
 ///
+/// Round-1 architect verdict on PR #389: bare `writeln! → sync_data →
+/// parent-fsync` is NOT atomic at the file level. A `writeln!` that
+/// fails partway through, OR a fully-written line followed by a failing
+/// `sync_data`, leaves the on-disk JSONL mutated while the caller still
+/// treats the persist as failed and refuses to commit to RAM. On the
+/// next successful append the torn tail concatenates with the fresh
+/// line and the next boot's loader either drops the fresh line (both
+/// halves invalid) or admits stale state that RAM never acknowledged.
+///
+/// Fix: snapshot the file length BEFORE opening; on ANY error after the
+/// open succeeds, roll the file back to `prev_len` via `set_len` +
+/// re-`sync_data` + parent-directory fsync so disk and RAM stay in
+/// sync (both unchanged). If the rollback ITSELF fails, correctness
+/// state is ambiguous — we panic-loud (`FATAL:` prefix) and fail-stop
+/// rather than continue with a store that may or may not match disk.
+///
 /// Contract:
 ///   * On `Ok(())`, the caller MAY commit the corresponding RAM
 ///     mutation. The record has been serialised, appended to disk,
 ///     `sync_data` on the file completed, and parent-directory fsync
 ///     (Unix) completed — the record survives a crash.
-///   * On `Err(PreKeyPersistFailure)`, the caller MUST NOT mutate RAM.
-///     The disk state is either unchanged (`open`/`serialize` failure)
-///     OR contains a partial write that will be dropped by
-///     `load_from_disk`'s line-parse `.ok()` filter on next boot; in
-///     both cases the ONE RAM commit that would have made this record
-///     authoritative is skipped, so the on-disk state converges with
-///     RAM on the next successful persist for the same identity.
+///   * On `Err(PreKeyPersistFailure)`, the caller MUST NOT mutate RAM
+///     AND the on-disk JSONL is byte-for-byte identical to its
+///     pre-call state (either it never entered `open`, or rollback
+///     restored it). Both disk and RAM stay at the pre-call snapshot,
+///     so a retry after the disk pressure clears converges cleanly.
 ///
 /// The caller MUST hold `PreKeyStore.inner` write-guard from before
 /// computing the intended new state through this call to the RAM
@@ -879,16 +893,44 @@ fn persist_prekey_state(
 ) -> Result<(), PreKeyPersistFailure> {
     let line = serde_json::to_string(state).map_err(|_| PreKeyPersistFailure { shape: "io" })?;
 
+    // Snapshot pre-op file length so rollback restores byte-for-byte on
+    // any post-open failure. If the file doesn't yet exist, `prev_len`
+    // is 0 — rollback truncates the freshly-created file back to zero
+    // bytes, which is indistinguishable from "file absent" for the
+    // loader (`load_from_disk` returns an empty map either way).
+    let prev_len: u64 = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| PreKeyPersistFailure::from_io(&e))?;
 
-    writeln!(file, "{}", line).map_err(|e| PreKeyPersistFailure::from_io(&e))?;
+    // TEST-ONLY fault seam (see `test_fault` module docs). Cost in
+    // production: one `AtomicU8::load(SeqCst)` per stage — nanoseconds
+    // and never mutated in prod code paths.
+    if test_fault::take_if(test_fault::AFTER_OPEN) {
+        // Nothing written yet — no rollback required.
+        return Err(PreKeyPersistFailure { shape: "io" });
+    }
 
-    file.sync_data()
-        .map_err(|e| PreKeyPersistFailure::from_io(&e))?;
+    if let Err(e) = writeln!(file, "{}", line) {
+        rollback_or_abort(path, prev_len);
+        return Err(PreKeyPersistFailure::from_io(&e));
+    }
+    if test_fault::take_if(test_fault::AFTER_WRITE) {
+        rollback_or_abort(path, prev_len);
+        return Err(PreKeyPersistFailure { shape: "io" });
+    }
+
+    if let Err(e) = file.sync_data() {
+        rollback_or_abort(path, prev_len);
+        return Err(PreKeyPersistFailure::from_io(&e));
+    }
+    if test_fault::take_if(test_fault::AFTER_SYNC_DATA) {
+        rollback_or_abort(path, prev_len);
+        return Err(PreKeyPersistFailure { shape: "io" });
+    }
 
     // Parent-directory fsync — makes the newly-appended file's directory
     // entry (in the create-on-first-write case) durable. Unix-only; on
@@ -896,12 +938,111 @@ fn persist_prekey_state(
     // append writes.
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        let dir = std::fs::File::open(parent).map_err(|e| PreKeyPersistFailure::from_io(&e))?;
-        dir.sync_all()
-            .map_err(|e| PreKeyPersistFailure::from_io(&e))?;
+        let dir_result = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+        if let Err(e) = dir_result {
+            rollback_or_abort(path, prev_len);
+            return Err(PreKeyPersistFailure::from_io(&e));
+        }
+    }
+    if test_fault::take_if(test_fault::AFTER_PARENT_FSYNC) {
+        rollback_or_abort(path, prev_len);
+        return Err(PreKeyPersistFailure { shape: "io" });
     }
 
     Ok(())
+}
+
+/// Restore `path` to `prev_len` after a mid-persist failure and re-sync
+/// so the rollback survives a crash. On rollback failure at any step,
+/// panic with a `FATAL:` prefix so the process fails-stop rather than
+/// continue with a store whose RAM/disk consistency is ambiguous
+/// (mini-lock §14 rule 11 + round-1 architect P0).
+///
+/// Opens a fresh `write(true)` handle rather than reusing the append
+/// handle from the caller: on Windows an `OpenOptions::append(true)`
+/// handle carries `FILE_APPEND_DATA` only, not `FILE_WRITE_DATA`, so
+/// `set_len` fails with `ERROR_ACCESS_DENIED` (os error 5) on it. A
+/// separate `write(true)` handle carries `GENERIC_WRITE` and truncates
+/// cleanly on both Unix and Windows.
+fn rollback_or_abort(path: &Path, prev_len: u64) {
+    let file = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) => f,
+        Err(e) => panic!(
+            "FATAL: prekey persist rollback (open write handle) failed on {}: {} \
+             — correctness state ambiguous, aborting",
+            path.display(),
+            e
+        ),
+    };
+    if let Err(e) = file.set_len(prev_len) {
+        panic!(
+            "FATAL: prekey persist rollback (set_len {}) failed on {}: {} \
+             — correctness state ambiguous, aborting",
+            prev_len,
+            path.display(),
+            e
+        );
+    }
+    if let Err(e) = file.sync_data() {
+        panic!(
+            "FATAL: prekey persist rollback (sync_data) failed on {}: {} \
+             — correctness state ambiguous, aborting",
+            path.display(),
+            e
+        );
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir_result = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+        if let Err(e) = dir_result {
+            panic!(
+                "FATAL: prekey persist rollback (parent-dir sync) failed on {}: {} \
+                 — correctness state ambiguous, aborting",
+                parent.display(),
+                e
+            );
+        }
+    }
+}
+
+/// TEST-ONLY fault-injection seam for `persist_prekey_state`. Integration
+/// tests in `services/relay/tests/` do NOT see `#[cfg(test)]` on library
+/// items (each integration binary compiles the lib as a normal consumer),
+/// so the seam must be present in every build. Production overhead is
+/// one `AtomicU8::load(SeqCst)` per persist stage — nanoseconds — and
+/// the atomic is never mutated on any production code path. Do NOT call
+/// `inject()` or `clear()` from non-test code.
+pub mod test_fault {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    pub const NONE: u8 = 0;
+    pub const AFTER_OPEN: u8 = 1;
+    pub const AFTER_WRITE: u8 = 2;
+    pub const AFTER_SYNC_DATA: u8 = 3;
+    pub const AFTER_PARENT_FSYNC: u8 = 4;
+
+    static FAULT: AtomicU8 = AtomicU8::new(NONE);
+
+    /// TEST-ONLY. Arm the seam to fail exactly one upcoming persist at
+    /// the given stage. Subsequent persists succeed unless armed again.
+    pub fn inject(kind: u8) {
+        FAULT.store(kind, Ordering::SeqCst);
+    }
+
+    /// TEST-ONLY. Disarm any pending fault. Idempotent.
+    pub fn clear() {
+        FAULT.store(NONE, Ordering::SeqCst);
+    }
+
+    /// Compare-and-swap: if the armed fault matches `stage`, consume it
+    /// (reset to NONE) and return true so the caller triggers the
+    /// failure path. Otherwise return false. Compare-exchange makes the
+    /// fault fire exactly once per `inject` even under contention.
+    pub(super) fn take_if(stage: u8) -> bool {
+        FAULT
+            .compare_exchange(stage, NONE, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
