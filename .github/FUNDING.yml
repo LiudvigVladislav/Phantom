@@ -10,5 +10,5 @@ liberapay: Phantom-messenger
 # Custom URLs — anything else the user might want to read first.
 # Order matters: most discoverable / human-readable channel first.
 custom:
-  - https://github.com/LiudvigVladislav/Phantom/blob/master/funding.json
-  - mailto:hello@phntm.pro
+  - "https://github.com/LiudvigVladislav/Phantom/blob/master/funding.json"
+  - "mailto:hello@phntm.pro"

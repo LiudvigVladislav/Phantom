@@ -1,86 +1,62 @@
 # PHANTOM Roadmap
 
-Public-facing roadmap. For the detailed internal execution map, see
+This is the public roadmap. The [README](README.md) is the source of truth for
+what works today; this file describes direction, not commitments. Horizons do
+not carry target dates unless the work has a real, externally meaningful
+deadline.
+
+For the detailed internal execution map, see
 [`docs/project/Roadmap_2.0_to_Execution_Map.md`](docs/project/Roadmap_2.0_to_Execution_Map.md).
-Dates below are targets, not commitments — we will adjust if a milestone
-demands more time to land safely.
 
 ---
 
-## Alpha 1 — May 2026 · **current phase**
+## Current — Alpha 2
 
-One-to-one text messaging end-to-end, with the core privacy claims
-verifiable by an external reviewer.
+The current public surface is deliberately narrow:
 
-- 1:1 text E2EE (X3DH + Double Ratchet + Sealed Sender)
-- Safety Numbers verification (60-digit fingerprint + QR)
-- Disappearing messages (5 timer presets)
-- Typing indicator, read receipts, message edit & delete
-- Foreground service so messages arrive when the app is backgrounded
-- Deep links (`phantom://invite/…`) and Universal Links
-  (`https://phntm.pro/invite/…`)
-- Relay deployed on `relay.phntm.pro` (Caddy + Rust/axum, ciphertext-only)
-- Key rotation detection with re-verify UI banner
-- Memzero of every transient key material in the ratchet
+- one-to-one encrypted text messaging;
+- direct WSS, embedded Xray VLESS+REALITY, Tor v3 onion for text-only
+  emergency fallback, and REST polling when carrier middleboxes break
+  WebSocket delivery;
+- encrypted voice messages over the media pipeline;
+- X3DH-style prekeys, Double Ratchet sessions, authentication, and encrypted
+  local storage.
 
-First public alpha invites go out during this phase. Feedback window
-is two weeks before we open Alpha 2 planning.
+The boundaries matter: the cryptographic protocol code is custom and has not
+received an independent audit; groups and calls are not production-ready; Tor
+is text-only; and field validation covers specific devices, carriers, routes,
+and dates rather than every network or future DPI policy.
 
----
+## Next
 
-## Alpha 2 — Summer 2026
+- Improve Direct/REST stability across carrier and network changes.
+- Reduce first-contact bootstrap latency and failure modes.
+- Make encrypted groups stable enough for public Alpha use.
+- Ship encrypted attachments through the media pipeline.
 
-Rich content without sacrificing the privacy model.
+## Beta horizon
 
-- Attachments (photos, files) via an encrypted media server (MinIO);
-  content keys stay on the client, the server sees ciphertext blobs.
-- Voice notes as first-class media messages (not the Alpha-1 base64 hack).
-- Stable groups with Sender Keys, re-verify on member changes.
-- Public channels (read-only broadcast) with per-channel sender keys.
-- Hosted username directory with rate-limited lookup by `@username`.
-- **External funding outreach:** see [`funding.json`](funding.json) for the canonical channel list.
+- Harden one-to-one calls over Direct and REALITY transports.
+- Deliver a desktop client with practical text and media parity.
+- Expand the pluggable-transport surface without weakening metadata policy.
+- Add linked-device identity and explicit cross-device trust.
 
----
+## v1 horizon
 
-## Beta — Fall 2026
+- Ship an iOS client.
+- Add public channels with a privacy-preserving moderation model.
+- Add a rate-limited username directory.
+- Publish and support a self-hostable relay distribution.
+- Complete an independent security and cryptographic audit.
 
-Real-time and censorship-resistant transport options.
+## Post-v1 research
 
-- 1:1 voice and video calls over WebRTC signalling through the relay.
-- Pluggable transports beyond WebSocket: `obfs4`, planned Tor bridge.
-- BLE and Wi-Fi Direct local transport for offline / high-risk use
-  cases.
-- Desktop client (Compose Multiplatform JVM target) — parity with the
-  mobile client for text + files + calls.
-- Hardened multi-device identity (linked-device trust, no shared key).
+These are research directions, not promised features:
 
----
-
-## v1.0 — Winter 2026 / early 2027
-
-Public release milestones.
-
-- iOS client (Compose Multiplatform iOS target).
-- Channels with moderation tooling that never requires reading
-  private chats.
-- Self-hosted relay kit for businesses (public sibling of the hosted
-  `relay.phntm.pro`).
-- Third-party security audit — budget earmarked for Cure53 or Trail of
-  Bits, funded from the Kickstarter.
-- Public launch on F-Droid, Google Play, and the Apple App Store.
-
----
-
-## Post-v1.0
-
-Longer-term ideas, explicitly **not** promised for the Kickstarter:
-
-- Federation between independently-run PHANTOM directories.
-- A minimal bot API restricted to the public channel surface (bots
-  cannot read private chats by construction).
-- Phantom for Business — admin console, SSO, SLA-backed hosted relay.
-
----
+- BLE and Wi-Fi Direct local mesh transport.
+- Kademlia-style DHT discovery.
+- Federation between independently operated PHANTOM deployments.
+- Post-quantum migration paths for identity and session establishment.
 
 ## Explicit non-goals
 
@@ -94,17 +70,12 @@ We do not plan to become any of these, even under commercial pressure:
 These are ruled out by the [Product Doctrine](docs/doctrine/Product_Doctrine.md),
 not just by lack of time.
 
----
-
 ## How to influence the roadmap
 
-- **Issues.** File a GitHub issue describing the problem you want
-  solved. Feature requests that conflict with the doctrine will be
-  closed with an explanation; no judgement implied.
-- **Grants.** If you represent a funder interested in a specific item
-  above, reach out via `support@phntm.pro` (general) or
-  `press@phntm.pro` (media / public-facing inquiries).
-- **Security priorities.** Credible threat-model input that would
-  reshuffle priorities is taken very seriously.
-  See [SECURITY.md](SECURITY.md) for the full contact-routing table
-  including `security@`, `privacy@`, `legal@`, and `abuse@`.
+- **Product and feature proposals:** open a GitHub issue describing the user
+  problem, not only the desired implementation. Proposals that conflict with
+  the doctrine may be closed with an explanation.
+- **Funding or collaboration:** write to `hello@phntm.pro`.
+- **Security priorities:** use the private reporting process in
+  [SECURITY.md](SECURITY.md). Never disclose a suspected vulnerability in a
+  public issue.
