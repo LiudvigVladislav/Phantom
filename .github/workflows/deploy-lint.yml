@@ -494,6 +494,23 @@ jobs:
       # can match the compound "if let Ok(...) = (std::)?fs::OpenOptions"
       # shape robustly against whitespace variance. `--type rust` scopes
       # to *.rs and `--glob '!tests/**'` excludes the tests tree.
+      # Round-2 architect P1: ripgrep is NOT preinstalled on ubuntu-24.04
+      # (the pre-round-2 comment claiming it was is factually wrong — the
+      # runner image dropped `rg` at some point). Install it explicitly
+      # with a pinned apt package so the gate below can rely on `rg`
+      # being on PATH. `apt-get install` is faster than `cargo install
+      # ripgrep` (~2s vs 30-60s) and matches the runner's package
+      # manager convention.
+      - name: Install ripgrep for the grep-gate below
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          fi
+          rg --version
+
       - name: PR-1b §8 grep-gate — no silent-swallow persistence writers
         if: steps.changes.outputs.relevant == 'true'
         run: |

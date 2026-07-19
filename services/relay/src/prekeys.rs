@@ -893,12 +893,24 @@ fn persist_prekey_state(
 ) -> Result<(), PreKeyPersistFailure> {
     let line = serde_json::to_string(state).map_err(|_| PreKeyPersistFailure { shape: "io" })?;
 
-    // Snapshot pre-op file length so rollback restores byte-for-byte on
-    // any post-open failure. If the file doesn't yet exist, `prev_len`
-    // is 0 — rollback truncates the freshly-created file back to zero
-    // bytes, which is indistinguishable from "file absent" for the
-    // loader (`load_from_disk` returns an empty map either way).
-    let prev_len: u64 = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // Snapshot pre-op filesystem state so rollback restores byte-for-
+    // byte on ANY post-open failure.
+    //
+    // Round-2 architect P1: pre-round-2 shape collapsed every metadata
+    // error into `prev_len=0`, so a first-create persist that failed
+    // left the freshly-created (empty) file on disk. Post-round-2 we
+    // distinguish `Absent` (only `ErrorKind::NotFound`) from
+    // `Present(len)`; on rollback of an `Absent` snapshot we `remove_file`
+    // instead of `set_len(0)` so the filesystem entry itself goes away.
+    // Any OTHER metadata error (permission, EIO) means we cannot
+    // reason about the pre-op state — surface it as PersistFailed
+    // BEFORE opening for append, because a rollback for an unknown
+    // prev state cannot be sound.
+    let snap = match std::fs::metadata(path) {
+        Ok(m) => PreOpSnapshot::Present(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PreOpSnapshot::Absent,
+        Err(e) => return Err(PreKeyPersistFailure::from_io(&e)),
+    };
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -910,25 +922,29 @@ fn persist_prekey_state(
     // production: one `AtomicU8::load(SeqCst)` per stage — nanoseconds
     // and never mutated in prod code paths.
     if test_fault::take_if(test_fault::AFTER_OPEN) {
-        // Nothing written yet — no rollback required.
+        // AFTER_OPEN implies `OpenOptions::create(true)` MAY have just
+        // materialised the file — if `snap` is `Absent`, the file
+        // exists now and rollback must remove it to restore the
+        // pre-call filesystem state (round-2 P1).
+        rollback_or_abort(path, snap);
         return Err(PreKeyPersistFailure { shape: "io" });
     }
 
     if let Err(e) = writeln!(file, "{}", line) {
-        rollback_or_abort(path, prev_len);
+        rollback_or_abort(path, snap);
         return Err(PreKeyPersistFailure::from_io(&e));
     }
     if test_fault::take_if(test_fault::AFTER_WRITE) {
-        rollback_or_abort(path, prev_len);
+        rollback_or_abort(path, snap);
         return Err(PreKeyPersistFailure { shape: "io" });
     }
 
     if let Err(e) = file.sync_data() {
-        rollback_or_abort(path, prev_len);
+        rollback_or_abort(path, snap);
         return Err(PreKeyPersistFailure::from_io(&e));
     }
     if test_fault::take_if(test_fault::AFTER_SYNC_DATA) {
-        rollback_or_abort(path, prev_len);
+        rollback_or_abort(path, snap);
         return Err(PreKeyPersistFailure { shape: "io" });
     }
 
@@ -940,23 +956,41 @@ fn persist_prekey_state(
     if let Some(parent) = path.parent() {
         let dir_result = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
         if let Err(e) = dir_result {
-            rollback_or_abort(path, prev_len);
+            rollback_or_abort(path, snap);
             return Err(PreKeyPersistFailure::from_io(&e));
         }
     }
     if test_fault::take_if(test_fault::AFTER_PARENT_FSYNC) {
-        rollback_or_abort(path, prev_len);
+        rollback_or_abort(path, snap);
         return Err(PreKeyPersistFailure { shape: "io" });
     }
 
     Ok(())
 }
 
-/// Restore `path` to `prev_len` after a mid-persist failure and re-sync
-/// so the rollback survives a crash. On rollback failure at any step,
-/// panic with a `FATAL:` prefix so the process fails-stop rather than
-/// continue with a store whose RAM/disk consistency is ambiguous
-/// (mini-lock §14 rule 11 + round-1 architect P0).
+/// Pre-persist filesystem snapshot passed into `rollback_or_abort` so
+/// rollback can restore the correct shape:
+///   * `Absent`     — the file did not exist before the failed persist;
+///                    rollback removes it entirely (round-2 P1 contract).
+///   * `Present(n)` — the file existed with length `n`; rollback
+///                    truncates back to `n`.
+#[derive(Clone, Copy)]
+enum PreOpSnapshot {
+    Absent,
+    Present(u64),
+}
+
+/// Restore `path` to its pre-persist filesystem shape (`snap`) and
+/// re-sync so the rollback survives a crash. On rollback failure at any
+/// step, TERMINATE THE PROCESS unconditionally via
+/// `std::process::abort()`. Round-2 architect P0: `panic!` in release
+/// builds compiled with the default `panic = "unwind"` strategy only
+/// unwinds the current thread — a persist call in an axum request
+/// task would unwind ONLY that task while Tokio would catch and log
+/// the panic and keep serving other traffic with a store whose RAM
+/// and disk are out of sync. `abort()` raises SIGABRT / calls the
+/// Windows equivalent and cannot be caught: the whole process
+/// terminates, which is the mini-lock §14 rule 11 requirement.
 ///
 /// Opens a fresh `write(true)` handle rather than reusing the append
 /// handle from the caller: on Windows an `OpenOptions::append(true)`
@@ -964,43 +998,86 @@ fn persist_prekey_state(
 /// `set_len` fails with `ERROR_ACCESS_DENIED` (os error 5) on it. A
 /// separate `write(true)` handle carries `GENERIC_WRITE` and truncates
 /// cleanly on both Unix and Windows.
-fn rollback_or_abort(path: &Path, prev_len: u64) {
-    let file = match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(f) => f,
-        Err(e) => panic!(
-            "FATAL: prekey persist rollback (open write handle) failed on {}: {} \
-             — correctness state ambiguous, aborting",
-            path.display(),
-            e
-        ),
-    };
-    if let Err(e) = file.set_len(prev_len) {
-        panic!(
-            "FATAL: prekey persist rollback (set_len {}) failed on {}: {} \
-             — correctness state ambiguous, aborting",
-            prev_len,
-            path.display(),
-            e
+fn rollback_or_abort(path: &Path, snap: PreOpSnapshot) {
+    // Round-2 test-only seam — deterministically fail the rollback so
+    // the subprocess `abort` contract can be exercised end-to-end.
+    if test_fault::take_rollback_fail() {
+        eprintln!(
+            "FATAL: prekey persist rollback (injected failure) on {} — correctness state ambiguous, aborting",
+            path.display()
         );
+        std::process::abort();
     }
-    if let Err(e) = file.sync_data() {
-        panic!(
-            "FATAL: prekey persist rollback (sync_data) failed on {}: {} \
-             — correctness state ambiguous, aborting",
-            path.display(),
-            e
-        );
+
+    match snap {
+        PreOpSnapshot::Absent => {
+            // The failed persist created the file via `OpenOptions::
+            // create(true)`. Remove it so the on-disk state matches the
+            // pre-call "absent" shape (round-2 P1). `NotFound` on the
+            // remove call means someone else already got there — treat
+            // as success; anything else terminates.
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!(
+                        "FATAL: prekey persist rollback (remove_file) failed on {}: {} \
+                         — correctness state ambiguous, aborting",
+                        path.display(),
+                        e
+                    );
+                    std::process::abort();
+                }
+            }
+        }
+        PreOpSnapshot::Present(prev_len) => {
+            let file = match std::fs::OpenOptions::new().write(true).open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "FATAL: prekey persist rollback (open write handle) failed on {}: {} \
+                         — correctness state ambiguous, aborting",
+                        path.display(),
+                        e
+                    );
+                    std::process::abort();
+                }
+            };
+            if let Err(e) = file.set_len(prev_len) {
+                eprintln!(
+                    "FATAL: prekey persist rollback (set_len {}) failed on {}: {} \
+                     — correctness state ambiguous, aborting",
+                    prev_len,
+                    path.display(),
+                    e
+                );
+                std::process::abort();
+            }
+            if let Err(e) = file.sync_data() {
+                eprintln!(
+                    "FATAL: prekey persist rollback (sync_data) failed on {}: {} \
+                     — correctness state ambiguous, aborting",
+                    path.display(),
+                    e
+                );
+                std::process::abort();
+            }
+        }
     }
+
+    // Parent-directory fsync in BOTH the remove-file and set_len paths
+    // so the directory entry change (or non-change) is durable.
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         let dir_result = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
         if let Err(e) = dir_result {
-            panic!(
+            eprintln!(
                 "FATAL: prekey persist rollback (parent-dir sync) failed on {}: {} \
                  — correctness state ambiguous, aborting",
                 parent.display(),
                 e
             );
+            std::process::abort();
         }
     }
 }
@@ -1013,7 +1090,7 @@ fn rollback_or_abort(path: &Path, prev_len: u64) {
 /// the atomic is never mutated on any production code path. Do NOT call
 /// `inject()` or `clear()` from non-test code.
 pub mod test_fault {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     pub const NONE: u8 = 0;
     pub const AFTER_OPEN: u8 = 1;
@@ -1022,6 +1099,12 @@ pub mod test_fault {
     pub const AFTER_PARENT_FSYNC: u8 = 4;
 
     static FAULT: AtomicU8 = AtomicU8::new(NONE);
+    // Round-2 architect P0: separate one-shot boolean so the subprocess
+    // abort test can arm BOTH a persist-stage trigger AND a rollback
+    // failure at the same time. `inject` consumes on match; this second
+    // atomic survives that consumption and is checked at the top of
+    // `rollback_or_abort`.
+    static ROLLBACK_FAIL: AtomicBool = AtomicBool::new(false);
 
     /// TEST-ONLY. Arm the seam to fail exactly one upcoming persist at
     /// the given stage. Subsequent persists succeed unless armed again.
@@ -1029,9 +1112,20 @@ pub mod test_fault {
         FAULT.store(kind, Ordering::SeqCst);
     }
 
-    /// TEST-ONLY. Disarm any pending fault. Idempotent.
+    /// TEST-ONLY. Disarm any pending fault (both the stage trigger and
+    /// the rollback-failure arm). Idempotent.
     pub fn clear() {
         FAULT.store(NONE, Ordering::SeqCst);
+        ROLLBACK_FAIL.store(false, Ordering::SeqCst);
+    }
+
+    /// TEST-ONLY. Arm the rollback path to fail on its next entry. When
+    /// combined with an `inject(AFTER_*)` call, the persist stage fires,
+    /// the rollback is entered, and it terminates the process via
+    /// `abort()` — exercising the round-2 P0 fail-stop contract
+    /// end-to-end in a subprocess test.
+    pub fn arm_rollback_failure() {
+        ROLLBACK_FAIL.store(true, Ordering::SeqCst);
     }
 
     /// Compare-and-swap: if the armed fault matches `stage`, consume it
@@ -1042,6 +1136,13 @@ pub mod test_fault {
         FAULT
             .compare_exchange(stage, NONE, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
+    }
+
+    /// Compare-and-swap: if a rollback failure was armed, consume it
+    /// (reset to false) and return true so `rollback_or_abort` diverts
+    /// directly to `abort()`.
+    pub(super) fn take_rollback_fail() -> bool {
+        ROLLBACK_FAIL.swap(false, Ordering::SeqCst)
     }
 }
 

@@ -414,7 +414,7 @@ fn audit_persist_shape(err: &std::io::Error) -> &'static str {
 /// on the file, then `sync_all` on the state_dir (parent-dir fsync — makes
 /// the directory entry itself durable, load-bearing for restart-safety on
 /// crash). On any Err at any step: increment `fail_counter`, emit a
-/// structured `WARN` with sanitised `shape`, return without bumping
+/// structured `ERROR` with sanitised `shape`, return without bumping
 /// `success_counter`. Handler HTTP semantics preserved by the caller;
 /// audit-tier failures do NOT surface as 5xx per §4.2.
 ///
