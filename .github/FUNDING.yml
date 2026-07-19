@@ -1,31 +1,11 @@
-# GitHub Sponsor button — appears at the top of the repository page
-# once this file lands on the default branch.
-#
-# Channels listed here are surfaced as direct buttons. Channels that
-# require a third-party registration we have not yet completed are
-# commented out; we'll uncomment them as each provider goes live.
-# Until then, the `custom:` list below catches the user with the
-# canonical funding.json + the operator email so no funding intent
-# is lost on a click-through.
-
 # GitHub Sponsors — direct support channel via GitHub-native billing.
 github: [LiudvigVladislav]
 
 # Buy Me a Coffee — one-time donations of any size.
-buy_me_a_coffee: phantom
-
-# Open Collective — fiscal-host backed transparent budgeting.
-# TODO 2026-05-12: register the collective under the name
-# `phantom-messenger`; uncomment once the page is live.
-# open_collective: phantom-messenger
+buy_me_a_coffee: phantompro
 
 # Liberapay — recurring weekly / monthly donations.
-# TODO 2026-05-12: register as `phantom-messenger`; uncomment once live.
-# liberapay: phantom-messenger
-
-# Polar — subscription support tier with optional milestone bounties.
-# TODO 2026-05-12: register and uncomment.
-# polar: phantom-messenger
+liberapay: Phantom-messenger
 
 # Custom URLs — anything else the user might want to read first.
 # Order matters: most discoverable / human-readable channel first.
