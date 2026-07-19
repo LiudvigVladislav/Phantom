@@ -1,10 +1,20 @@
 # PHANTOM — Known Issues
 
-**Last updated:** 2026-05-21
-**Build:** master at `8f4c68c9` — post-Alpha-1, ongoing development. Alpha-1 baseline (2026-04-27, tag `v0.1.0-alpha.1`) is preserved as historical context within this document; the project has since landed the M1w encrypted-media-upload trilogy, the M2 chunk-size sprint (M2a-M2h.1), the D0r/D1 REST fallback transport, the H1/H2 first-message + reconnect reliability sprint, and the REC recording-panel UX trilogy. There is **no fixed release deadline** as of the 2026-05-14 strategic pivot — see [`docs/project/MASTER_TIMELINE_2026.md`](docs/project/MASTER_TIMELINE_2026.md) for the live tracker.
+**Last updated:** 2026-07-19
+**Build:** `master` at `ea66889f` — current Alpha 2 development baseline. The latest tagged pre-release, `v0.1.0-alpha.2`, is a historical snapshot; development on `master` has moved substantially beyond it. Earlier Alpha 1 investigation remains in this document as historical context. The [README](README.md) is the source of truth for the current public feature surface, and [ROADMAP.md](ROADMAP.md) describes direction without fixed release dates.
 **Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS — Wi-Fi only since 2026-05-14, no SIM card; Pixel emulators API 35 on Windows dev machine), Tele2 LTE Irkutsk Oblast (real-device, second SIM phone pending), MTS Wi-Fi (real-device, no SIM cellular path) Hetzner VPS relay (`relay.phntm.pro`).
 
 ---
+
+## Current snapshot
+
+- Alpha 2 is active development; the Alpha 2 tag records an earlier snapshot.
+- One-to-one text, prekeys, ratchet sessions, and encrypted local state are the stable core.
+- Direct WSS, REALITY, Tor text-only fallback, and REST polling are implemented.
+- Encrypted voice messages have shipped through the media pipeline and are no longer future work.
+- Calls remain experimental, groups are partial, and receiver-side media cancellation is still missing.
+- Carrier behavior and first-contact bootstrap remain active reliability work.
+- The custom cryptographic implementation has not received an independent audit.
 
 ## Overview
 
@@ -228,7 +238,7 @@ For Alpha 2 single-relay Helsinki deployment: in-memory state with JSONL recover
 
 **Earlier (now-superseded) diagnoses.** Original investigation in ADR-010/ADR-011/ADR-013 attributed the cycle to Tecno HiOS firmware Wi-Fi radio parking. That hypothesis explained the Tecno cycle but cannot explain the matching cycle on a Pixel emulator on a stable PC. The 2026-05-04 4-test matrix (`docs/research/transport-investigation-2026-05-04/`) refuted firmware-radio as root cause. ADR-013 should be read as historical record only.
 
-**Mitigations from earlier diagnosis remain useful as defence in depth.** Foreground service WifiLock, WakeLock, MulticastLock, AlarmManager-driven force-reconnect (ADR-011), and generation-based OkHttp engine disposal (ADR-010 updated 2026-05-01) all stay in place. They reduce reconnect latency from 60 s to 1-3 s once the upstream NAT does drop the connection.
+**Mitigations from earlier diagnosis remain useful as defence in depth.** Foreground service WifiLock, WakeLock, MulticastLock, AlarmManager connectivity pokes (not force-reconnect), and generation-based OkHttp engine disposal (ADR-010 updated 2026-05-01) remain in place. Recovery now flows through the inbound-stall event and REST state machine described in ISSUE-001.
 
 **Layer 2 fix (ADR-014, deployed 2026-05-04):**
 
@@ -286,15 +296,15 @@ The `feat/tor-unified-push-transport` branch retained as historical research art
 
 **Recommendation for Alpha users:**
 
-- Use **text** and (when PR 3 lands) **voice messages** for important communication. These deliver reliably under the current transport.
+- Use **text** and **encrypted voice messages** for important communication. These deliver reliably on the validated current paths.
 - Calls are best-effort — work well between two stock-Android devices on Wi-Fi, less reliable when one side is an aggressive-OEM phone.
 
 **Real fix path:**
 
-- **PR 2.6 (post-pivot, no fixed date):** explicit `JavaAudioDeviceModule`, `AudioFocus` request, suppress transport `forceReconnect()` while a call is active, default-on speakerphone for testing. Estimated 2-3 days when picked up. Originally tagged "deferred to post-Phase-5"; Phase 5 was dissolved during the 2026-05-14 pivot so this is now simply queued behind the current voice-recorder UX track.
+- **Call audio hardening (no fixed date):** explicit `JavaAudioDeviceModule`, `AudioFocus` request, and default-on speakerphone for testing. The earlier proposal to suppress `forceReconnect()` during a call is obsolete because stale-inbound recovery no longer invokes `forceReconnect`; calls instead require dedicated transport hardening.
 - **Calls track (PR-C2 / PR-C3):** Reality endpoint pool with a realistic probe (the current `/health` probe does not catch Tele2's silent WS-drop pattern), then a transport that can carry WebRTC on restrictive networks — candidates include TURN-over-TLS on port 443 or a custom Opus-over-Reality envelope. This is the architectural answer that replaces the retired push-based-wakeup plan.
 
-**Scope decision rationale.** PRs #29 and #30 closed the user-visible call-UX bugs that were definitively fixable above the transport layer. Further iteration would require Tecno-specific WebRTC ADM debugging with diminishing returns. The development sprint priority shifted to PR 3 (voice messages over regular transport) which serves the same async-voice need at much higher reliability and is independent of WebRTC.
+**Scope decision rationale.** PRs #29 and #30 closed the user-visible call-UX bugs that were definitively fixable above the transport layer. Further iteration would require Tecno-specific WebRTC ADM debugging with diminishing returns. Development therefore shifted to the now-shipped encrypted voice-message path, which serves the same async-voice need at much higher reliability and is independent of WebRTC.
 
 ---
 
@@ -551,4 +561,4 @@ Both are queued as **PR-MEDIA-CANCEL-PROTOCOL** with no fixed schedule. Once shi
 This list is maintained as a living document. Issues are tracked in GitHub Issues at:
 https://github.com/LiudvigVladislav/Phantom/issues
 
-For external review and Beta planning, this snapshot represents the state of master `8f4c68c9` (2026-05-21). The Alpha-1 baseline snapshot (2026-04-25) is preserved upstream in this file's git history — `git log -p KNOWN_ISSUES.md` will reproduce the original wording for any issue ID.
+For external review and Beta planning, this snapshot represents the state of `master` at `ea66889f` (2026-07-19). The Alpha-1 baseline snapshot is preserved upstream in this file's git history — `git log -p KNOWN_ISSUES.md` will reproduce the original wording for any issue ID.

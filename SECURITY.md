@@ -1,6 +1,6 @@
 # Security Policy
 
-Last updated: 2026-04-27
+Last updated: 2026-07-19
 
 ## Where to write
 
@@ -17,9 +17,19 @@ If a report mixes categories (e.g. a vulnerability that also has privacy implica
 
 ## Supported versions
 
-PHANTOM is pre-release. Only the `master` branch and the most recent
-alpha release receive security fixes. There is no long-term support
-window yet; LTS decisions will be made before the v1.0 public release.
+PHANTOM is pre-release. Security fixes land on `master` first. Tagged alpha
+releases are historical snapshots and do not receive a long-term maintenance
+window.
+
+| Version | Security support |
+|---|---|
+| `master` | Supported; fixes land here first |
+| `v0.1.0-alpha.2` | Limited; latest tagged pre-release snapshot |
+| `v0.1.0-alpha.1` and older | Not supported |
+
+If an issue affects Alpha 2, reporters should still use the private process
+below. Users will be directed to a fixed build or a newer release rather than
+to a patched Alpha 2 tag.
 
 ## Reporting a vulnerability
 
@@ -38,10 +48,9 @@ We commit to:
 
 Encrypted communication:
 
-- **TODO:** PGP key for `security@phntm.pro`. Until published, please
-  keep reports plaintext-short and request an encrypted channel if
-  details are sensitive. Alternative: use Signal at the contact
-  address we will publish next to the PGP key.
+- We do not currently publish an OpenPGP key or Signal contact for this
+  mailbox. Keep an initial email minimal and request an encrypted channel
+  before sending sensitive reproduction details, logs, or exploit material.
 
 ## Scope
 
@@ -68,8 +77,9 @@ Encrypted communication:
   anyone may run their own).
 - Lack of hardening features that are explicitly planned for a
   later milestone (see [ROADMAP.md](ROADMAP.md)).
-- Issues in upstream `libsignal`, `libsodium`, `axum`, or Compose
-  Multiplatform — please report those to the respective projects.
+- Issues confined to upstream dependencies such as `libsodium`, `axum`,
+  Compose Multiplatform, `kmp-tor`, or Xray — please report those to the
+  respective projects.
   We are happy to coordinate on fixes that also affect PHANTOM.
 
 ## Coordinated disclosure
@@ -88,14 +98,15 @@ mastodon/matrix/email contact — reporter's choice.
 
 ## Signature verification
 
-Release APKs are signed with the PHANTOM production keystore. The
+APK assets published by PHANTOM are signed with the PHANTOM production keystore. The
 SHA-256 fingerprint of the signing certificate:
 
 ```
 AA:17:09:48:3E:BD:47:F1:21:CE:0B:D1:46:92:D1:D5:75:FD:28:A0:D6:5C:4B:2E:20:1A:BE:88:2C:AB:1F:02
 ```
 
-You can verify this fingerprint against
+Alpha 2 is currently a tag-and-notes pre-release and does not include an APK
+asset. When an APK is attached to a release, verify its fingerprint against
 `https://phntm.pro/.well-known/assetlinks.json` (served by the
 deployed relay host) or by running:
 
