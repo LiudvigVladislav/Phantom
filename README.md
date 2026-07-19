@@ -1,264 +1,250 @@
+<p align="center"><img src="site/static/logo-mark.png" width="220"></p>
+
 # PHANTOM
 
-> **An end-to-end encrypted messenger that works on Russian mobile carriers without a VPN, without Orbot, without any third-party app.**
-> Built on the Signal protocol. Production-validated through Russia's TSPU deep-packet-inspection on 2026-05-07.
+End-to-end encrypted Android messaging with censorship-resistant transports,
+production-validated against carrier-grade DPI (TSPU) on real Russian mobile networks.
 
 [![Status: Alpha 2](https://img.shields.io/badge/status-alpha%202-orange)](#status)
-[![License: AGPL--3.0--or--later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-android-green)](#platforms)
-[![Mirror: Codeberg](https://img.shields.io/badge/mirror-Codeberg-teal)](https://codeberg.org/VladislavLiudvig/Phantom)
-
----
+[![Release: v0.1.0-alpha.2](https://img.shields.io/badge/release-v0.1.0--alpha.2-orange)](https://github.com/LiudvigVladislav/Phantom/releases/tag/v0.1.0-alpha.2)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+[![Platform: Android](https://img.shields.io/badge/platform-Android-3ddc84)](#building-from-source)
+[![Site: phntm.pro](https://img.shields.io/badge/site-phntm.pro-665cff)](https://phntm.pro)
+[![Mirror: Codeberg](https://img.shields.io/badge/mirror-Codeberg-2185d0)](https://codeberg.org/VladislavLiudvig/Phantom)
 
 ## What is PHANTOM?
 
-PHANTOM is a messenger built for people who cannot trust their network. Journalists working under hostile regimes, activists in countries with internet censorship, dissidents whose communications must not be traceable, and ordinary people who simply believe that private communication is a human right.
+PHANTOM is an open-source messenger for people who cannot assume their network is
+neutral or trustworthy: journalists, activists, dissidents, and anyone who believes private communication is a human right.
 
-It combines two things that have historically been mutually exclusive:
+The project combines a familiar modern messenger experience with explicit
+security and censorship-resistance boundaries:
 
-- **The user experience of Telegram** — fast, modern, beautiful
-- **The security architecture of Signal** — end-to-end encryption, sealed sender, forward secrecy
+- end-to-end encrypted 1:1 messaging and encrypted voice notes;
+- multiple network paths selected at runtime, without requiring a separate VPN or third-party circumvention app;
+- an untrusted store-and-forward relay that handles ciphertext and necessary routing metadata, not message plaintext;
+- public architecture decisions, threat modeling, known issues, and development history.
 
-PHANTOM is being built as an open-source project with a values-driven mission: to provide infrastructure for free communication that works even when networks try to stop it.
-
----
+PHANTOM implements X3DH, Double Ratchet, and Sealed Sender-inspired protocol layers
+over libsodium primitives. This is custom protocol code, not `libsignal-client`,
+and it has not received an independent third-party cryptographic audit.
 
 ## Status
 
-**Current stage:** Alpha 2, active development.
-**Tagged release:** `v0.1.0-alpha.1` (2026-04-27). Alpha 2 has not been tagged — the project ships when specific claims have been verified on real hardware, not to a calendar date.
-**Production relay:** [`relay.phntm.pro`](https://relay.phntm.pro) (Hetzner, EU jurisdiction), Rust/axum + Caddy edge, ciphertext-only.
+**Current stage:** Alpha 2, active development on `master`.
 
-**What works today:**
-- **End-to-end encrypted 1:1 messaging** between Android devices — Double Ratchet + X3DH handshake + Sealed Sender envelopes; identity keys ED25519, generated on device
-- **Censorship-resistant transport (Xray VLESS+REALITY, [ADR-019](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md))** — masquerades wire traffic as a TLS handshake to `www.microsoft.com`; validated end-to-end on Tecno + Russian carrier without VPN, Orbot, or any third-party app (2026-05-07)
-- **Adaptive transport selection ([ADR-020](docs/adr/ADR-020-Adaptive-Transport-Selection.md))** — runtime probe-and-pick between Direct WSS, Xray/REALITY, and Tor, with sticky per-network preference (shipped in three phases 2026-05-09)
-- **REST short-poll fallback** — when a middlebox silently drops WebSocket frames on hostile cellular networks (observed on Russian Tele2 LTE), text delivery routes through short-poll REST endpoints instead of hanging (shipped 2026-05-16-17, PR-D0r/D1/D1b/D1c/D1d)
-- **Voice notes as encrypted media** — record → AEAD-encrypt (XChaCha20-Poly1305) → chunk → upload → manifest via ratchet → durable receiver reassembly; production-validated on Tele2 LTE (shipped 2026-05-18, PR-M1w)
-- **Per-user signed-challenge auth ([ADR-027](docs/adr/ADR-027-Per-User-Signed-Challenge-Auth.md))** — the WS relay authenticates each session with a per-identity Ed25519 signature, replacing the earlier shared token (shipped 2026-05-08)
-- **Tor v3 onion** reachable as text-only emergency fallback ([ADR-016](docs/adr/ADR-016-tor-unified-push-hybrid-transport.md); post-pivot 2026-05-15 the Tor path is scoped to text-only — WebRTC calls remain on Direct/Xray)
-- Trust Tier flow, QR code contact exchange, disappearing messages, message edit + delete, per-conversation mute + pin, store-and-forward delivery when the recipient is offline
+**Latest tagged pre-release:** [`v0.1.0-alpha.2`](https://github.com/LiudvigVladislav/Phantom/releases/tag/v0.1.0-alpha.2).
+The tag is a historical snapshot from 2026-04-30; development on `master` has moved
+substantially beyond it. Both Alpha releases remain on the [Releases page](https://github.com/LiudvigVladislav/Phantom/releases).
 
-**Roadmap, by realistic horizon:**
+**Production relay:** [`relay.phntm.pro`](https://relay.phntm.pro), a Rust/Axum
+service that stores and forwards encrypted envelopes. It can still observe timing,
+size, authenticated sessions, and delivery destinations.
 
-- **Next feature releases:** stable **groups** with Sender Keys and re-verify on member change (state machine + crypto already in shared core, [ADR-026](docs/adr/ADR-026-Group-Control-Messages-E2EE.md); surface still partial); **encrypted attachments** (photos + files) reusing the M1r media pipeline that already ships for voice; **first-message bootstrap fast path** (PR-D1e) to close the residual yellow-dot delay when adding a new contact on cellular; production stability observation continues on Direct WSS / REALITY / REST across multiple carriers.
-- **Beta:** **1:1 voice and video calls** over WebRTC on Direct/Xray (signalling shipped end-to-end sealed; UI + Tele2-class realtime hardening in progress — calls remain marked experimental until real-network stability holds); **desktop client** (Compose Multiplatform JVM target); **additional pluggable transports** — obfs4 client-side and Snowflake broker discovery imports (already validated against RU carriers via Briar's `bridges-s-ru` set); hardened **multi-device identity** (linked-device trust, no shared key).
-- **v1.0:** **iOS client** (Compose Multiplatform iOS target); **public channels** (read-only broadcast with per-channel sender keys); hosted **username directory** with rate-limited lookup; **self-hosted relay kit** for organisations; **third-party security audit** — budget earmarked for Cure53 or Trail of Bits.
-- **Post-v1.0 research:** BLE + Wi-Fi Direct **offline mesh** transport (Briar-class); Kademlia DHT P2P routing as a decentralised fallback to the central relay; post-quantum migration of the ratchet primitives.
+### Working on current `master`
 
-See [ROADMAP.md](ROADMAP.md) for the milestone breakdown, [RELEASE_NOTES.md](RELEASE_NOTES.md) for Alpha 1 detail, [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for current limitations, and [docs/PROJECT_LOG.md](docs/PROJECT_LOG.md) for the running development journal.
+- **End-to-end encrypted 1:1 text** with prekey bootstrap, X3DH, Double Ratchet,
+  Sealed Sender envelopes, Safety Numbers, and QR contact exchange.
+- **Adaptive transport selection** across Direct WSS, embedded Xray VLESS+REALITY,
+  and Tor v3 onion. Tor is deliberately text-only.
+- **REST send/poll fallback** when a carrier passes HTTPS but silently drops or stalls long-lived WebSocket traffic.
+- **Encrypted voice notes:** XChaCha20-Poly1305 encryption, bounded chunk upload,
+  a ratcheted media manifest, and receiver reassembly. The media + REST path has
+  been exercised on Tele2 LTE.
+- **Per-user signed-challenge authentication**, encrypted Android storage
+  (SQLDelight + SQLCipher), store-and-forward delivery, disappearing messages,
+  message edit/delete, and conversation mute/pin.
 
----
+### Honest Alpha boundaries
+
+- The custom cryptographic protocol composition is not independently audited.
+- Groups and calls have code and UI surfaces, but are not yet production-ready release features.
+- Tor is an emergency text path, not a media or realtime-call transport.
+- Field validation proves specific devices, carriers, routes, and dates—not every carrier or future DPI policy.
+
+### Roadmap by horizon
+
+- **Next:** Direct/REST stability hardening across carrier changes, faster first
+  contact bootstrap, stable groups, and encrypted photo/file attachments using
+  the existing media pipeline.
+- **Beta:** harden 1:1 voice/video calls over Direct/REALITY, add a desktop
+  client, expand pluggable transports, and design linked-device identity.
+- **v1.0:** iOS client, public channels, a rate-limited username directory,
+  supported self-hosted relay packaging, and an independent security audit.
+- **Post-v1 research:** BLE/Wi-Fi Direct mesh, Kademlia DHT routing,
+  federation experiments, and post-quantum migration.
+
+See [ROADMAP.md](ROADMAP.md), [KNOWN_ISSUES.md](KNOWN_ISSUES.md), and the
+[development journal](docs/PROJECT_LOG.md) for the detailed state.
 
 ## Architecture
 
-PHANTOM is a 5-layer system:
-
 ```
-┌─────────────────────────────────────────────────────┐
-│  Application Layer                                  │
-│  Chats, contacts, UI, push notifications, settings  │
-├─────────────────────────────────────────────────────┤
-│  Offline Mesh (planned)                             │
-│  Bluetooth, Wi-Fi Direct, mDNS local discovery      │
-├─────────────────────────────────────────────────────┤
-│  P2P Routing (relay today, DHT in Alpha 2)          │
-│  Kademlia DHT, @username discovery, sealed routing  │
-├─────────────────────────────────────────────────────┤
-│  Pluggable Transport                                │
-│  WSS today; planned: 7 censorship-circumvention     │
-│  channels (Tor bridges, domain fronting, more)      │
-├─────────────────────────────────────────────────────┤
-│  Cryptographic Core                                 │
-│  libsodium, Double Ratchet, X25519, XChaCha20-Poly  │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ Application                                                │
+│ Android Compose UI · shared Kotlin Multiplatform core      │
+├────────────────────────────────────────────────────────────┤
+│ Offline mesh — post-v1 research                            │
+│ Bluetooth LE · Wi-Fi Direct · local discovery              │
+├────────────────────────────────────────────────────────────┤
+│ Routing & discovery                                        │
+│ QR/invite exchange · relay prekeys · DHT post-v1           │
+├────────────────────────────────────────────────────────────┤
+│ Shipped transports                                         │
+│ Direct WSS · VLESS+REALITY · Tor text · REST fallback      │
+├────────────────────────────────────────────────────────────┤
+│ Cryptographic core                                         │
+│ Custom X3DH/Double Ratchet over libsodium · media AEAD      │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### Tech stack
 
-- **Kotlin Multiplatform** for shared core (Android, iOS, web from one codebase)
-- **Compose Multiplatform** for UI
-- **libsodium** for cryptography (via [ionspin/kotlin-multiplatform-libsodium](https://github.com/ionspin/kotlin-multiplatform-libsodium))
-- **SQLDelight + SQLCipher** for encrypted local storage
-- **Ktor** for WebSocket client
-- **Rust + Axum** for relay server
-- **Caddy** for TLS termination and reverse proxy
-- **Docker Compose** for relay deployment
+- Kotlin Multiplatform shared core and Compose UI (Android-first)
+- libsodium-backed X25519, XSalsa20-Poly1305, XChaCha20-Poly1305, and hashing
+- SQLDelight + SQLCipher for encrypted Android storage
+- Ktor/OkHttp clients with Direct, Xray/REALITY, Tor, and REST paths
+- Rust + Axum relay, Caddy edge, and Docker Compose deployment
 
-### Documented decisions
-
-Every architectural choice has a public rationale captured as an Architecture Decision Record. Index: [docs/adr/](docs/adr/) (also exported as a short table at the top of [docs/adr/README.md](docs/adr/README.md)). Highlighted entries:
-
-- [ADR-001 (System Boundaries)](docs/adr/ADR-001-System-Boundaries.md) — what PHANTOM is and is not
-- [ADR-006 (Crypto Library Decision)](docs/adr/ADR-006-Crypto-Library-Decision.md) — libsodium-only stack and the AGPL-3.0-or-later licensing rationale
-- [ADR-016 (Tor + UnifiedPush hybrid transport)](docs/adr/ADR-016-tor-unified-push-hybrid-transport.md) — the two-channel data-plane / wakeup-plane architecture
-- [ADR-019 (Xray VLESS+REALITY)](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md) — Stage 5E censorship-resistance rationale, threat model, known limitations
-
----
+Start with [ARCHITECTURE.md](ARCHITECTURE.md) for the short overview and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module and data-flow
+walkthrough. Architectural decisions are indexed in
+[docs/adr/README.md](docs/adr/README.md); especially relevant are
+[ADR-006](docs/adr/ADR-006-Crypto-Library-Decision.md),
+[ADR-016](docs/adr/ADR-016-tor-unified-push-hybrid-transport.md),
+[ADR-019](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md), and
+[ADR-020](docs/adr/ADR-020-Adaptive-Transport-Selection.md).
 
 ## Threat model
 
-PHANTOM has a formal threat model documenting adversary capabilities, asset inventory, security goals, and explicit out-of-scope items. Read it at [docs/threat-model/Threat_Model_v0.md](docs/threat-model/Threat_Model_v0.md) — an English executive summary sits at the top of the file, with the formal model body below in Russian. Headline summary:
+PHANTOM is designed around an untrusted network and an untrusted relay. The
+formal model is in
+[docs/threat-model/Threat_Model_v0.md](docs/threat-model/Threat_Model_v0.md).
 
-PHANTOM is designed to protect against:
+The current design aims to protect against:
 
-- **Mass surveillance** by state-level adversaries on the network path
-- **Compromised relay servers** — relay learns nothing about message content or sender identity
-- **Device seizure** with screen-locked device — local data is encrypted at rest
-- **Network-level censorship** (in progress — pluggable transport in Alpha 2)
-- **Forward secrecy compromise** — past messages remain secure even if current keys are compromised
+- passive network inspection of message content;
+- a compromised relay reading correctly encrypted messages or media;
+- retrospective decryption of earlier traffic after later ratchet-state
+  compromise;
+- endpoint blocking and DPI through production-validated pluggable transport
+  paths;
+- offline extraction from a locked Android device through encrypted local
+  storage and platform-keystore protection.
 
-PHANTOM is **not** designed to protect against:
+It does not claim to protect against:
 
-- A device with the screen unlocked and the user logged in
-- An attacker with root access to the device's memory while the app is running
-- Social engineering or coercion
-- Endpoint compromise via malware
+- an unlocked or malware/root-compromised endpoint;
+- coercion, social engineering, or a malicious conversation partner;
+- a global observer correlating timing and volume at multiple network points;
+- every future censorship technique or every carrier configuration;
+- undiscovered flaws in the unaudited custom protocol implementation.
 
-For the most sensitive use cases, PHANTOM should be combined with operating system hardening (GrapheneOS recommended) and secure operational practices.
-
----
+Direct transport reveals a connection to the relay. REALITY changes the
+observable wire shape but is not an anonymity system. Tor provides the strongest
+current network-origin hiding and is restricted to text. Review
+[SECURITY.md](SECURITY.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md) before relying
+on Alpha software for a high-risk use case.
 
 ## Building from source
 
 ### Prerequisites
 
-- JDK 21 (Gradle and modules target Java 21 bytecode)
-- Android Studio (latest stable)
-- Android SDK — `compileSdk = 35`, `targetSdk = 35`, `minSdk = 26`
-- Rust 1.83+ (for the relay)
+- JDK 21
+- Android Studio Narwhal (2026.1) or later and Android SDK 35
+- Rust 1.83+ for the relay
 - Git
 
-### Clone
+### Clone and select a baseline
 
 ```bash
 git clone https://github.com/LiudvigVladislav/Phantom.git
 cd Phantom
-# Alpha 1 lives on master once the release is tagged:
-git checkout v0.1.0-alpha.1
+
+# Stay on master for the current development state, or use the release snapshot:
+git checkout v0.1.0-alpha.2
 ```
 
-### Build Android APK
+### Build and test
 
 ```bash
-# Debug build (defaults to production relay)
+# Android debug APK
 ./gradlew :apps:android:assembleDebug
 
-# Release build (signed)
-./gradlew :apps:android:assembleRelease
-```
-
-Output APKs:
-- Debug: `apps/android/build/outputs/apk/debug/android-debug.apk`
-- Release: `apps/android/build/outputs/apk/release/android-release.apk`
-
-### Run tests
-
-```bash
-# Crypto integration tests (16 tests) on a connected Android emulator/device.
-# The libsodium loader does not run on plain JVM, so these tests live in
-# androidInstrumentedTest and require an attached device with `adb devices`.
+# Crypto instrumented tests (requires an attached emulator/device)
 ./gradlew :shared:core:crypto:connectedDebugAndroidTest
+
+# Relay tests
+cargo test --manifest-path services/relay/Cargo.toml
 ```
 
-### Run the relay locally
+Run the relay locally with:
 
 ```bash
-cd services/relay
-cargo run --release
+cargo run --release --manifest-path services/relay/Cargo.toml
 ```
 
-The relay listens on `0.0.0.0:8080` by default.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development and validation
+workflow.
 
 ## Deploy your own relay
 
-PHANTOM relays are intentionally simple and designed to be self-hostable. The reference relay is deployed via Docker Compose:
+The repository contains the operator deployment used for PHANTOM's relay,
+including Caddy, Axum, Tor, Xray/REALITY, and supporting services. It is an
+Alpha-stage reference deployment, not yet the supported v1 self-hosting kit.
 
-```bash
-# On your VPS
-git clone https://github.com/LiudvigVladislav/Phantom.git
-cd Phantom/deploy
-# Edit Caddyfile to set your domain
-docker compose up --build -d
-```
-
-Configure your Android client to use your relay by setting `RELAY_URL` in the build configuration.
-
----
+Start with [deploy/README.md](deploy/README.md). Before exposing a relay, replace
+operator-specific domains and credentials, review firewall and persistent-state
+requirements, and build a client configured for your endpoint.
 
 ## Contributing
 
-PHANTOM is in active early-stage development. Contributions are welcome. Areas where help is most needed:
+Contributions and adversarial review are welcome, especially in cryptography,
+transport field testing, Android reliability, threat modeling, accessibility,
+and documentation.
 
-- **Cryptography review** — anyone with formal crypto background, please review the Double Ratchet integration
-- **Censorship circumvention** — pluggable transport implementations
-- **iOS development** — Compose Multiplatform iOS target needs polish
-- **Translations** — English and Russian today; more languages welcome
-- **Threat modeling** — adversarial review and documentation
-- **Documentation** — user guides, deployment guides, FAQ
-
-Before contributing code, please open an issue to discuss the change.
-
----
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. For a
+large feature or trust-boundary change, open an issue first so the design and
+required ADR can be agreed before implementation.
 
 ## Funding
 
-PHANTOM's funding channels and sustainability plans are documented in machine-readable form in [`funding.json`](funding.json) at the repository root. The project accepts donations via Liberapay, Buy Me a Coffee, and cryptocurrency (BTC, XMR, ETH).
+PHANTOM is maintained by Willen LLC and accepts support through:
 
-PHANTOM is maintained by Willen LLC, a company registered in Wyoming, USA.
+- [Liberapay](https://liberapay.com/Phantom-messenger)
+- [Buy Me a Coffee](https://www.buymeacoffee.com/phantompro)
+- BTC, XMR, and ETH addresses published in [`funding.json`](funding.json)
 
----
+The machine-readable funding file also documents current budgets and project
+funding goals. Repository Sponsor links are configured in
+[`.github/FUNDING.yml`](.github/FUNDING.yml).
 
 ## License
 
-PHANTOM is licensed under the **GNU Affero General Public License version 3** (AGPL-3.0-or-later). See [`LICENSE`](LICENSE) for the full text and [`NOTICE`](NOTICE) for third-party attributions.
+PHANTOM is licensed under the
+**GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`). See
+[LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-```
-Copyright (c) 2026 Willen LLC
-Copyright (c) 2026 Vladislav Liudvig
-```
-
-**Why AGPL-3.0.** The relay component is server-side software that users interact with over the network. AGPL-3.0 §13 (Remote Network Interaction) ensures any modified version offered as a network service must publish its source — protecting the project's privacy promises against silently-modified hosted forks. See [ADR-006](docs/adr/ADR-006-Crypto-Library-Decision.md) for the full rationale.
-
-A commercial dual-licensing option is available for white-label or B2B deployments that cannot ship under AGPL terms. Contact `legal@phntm.pro`.
-
----
+AGPL network-source requirements help keep modified hosted relays auditable.
+A commercial dual-license is available for white-label or B2B deployments that
+cannot use the AGPL; contact `legal@phntm.pro`.
 
 ## Contact
 
-- **Source code:** [GitHub](https://github.com/LiudvigVladislav/Phantom) · [Codeberg mirror](https://codeberg.org/VladislavLiudvig/Phantom) (non-US, AGPL-aligned host)
-- **GitHub Issues:** https://github.com/LiudvigVladislav/Phantom/issues
-- **Author:** Vladislav Liudvig
-- **Company:** Willen LLC (Wyoming, USA)
-
-### Email routing
-
-| Purpose | Address |
-|---|---|
-| Security vulnerabilities (responsible disclosure) | `security@phntm.pro` |
-| User support, general questions | `support@phntm.pro` |
-| Privacy / GDPR / data-handling questions | `privacy@phntm.pro` |
-| Legal correspondence, DMCA, lawful-process requests | `legal@phntm.pro` |
-| Abuse reports (RFC 2142 — spam, harassment, illegal content) | `abuse@phntm.pro` |
-| Press / media inquiries | `press@phntm.pro` |
-
-See [SECURITY.md](SECURITY.md) for full security-disclosure terms.
-
----
+- Website: [phntm.pro](https://phntm.pro)
+- Source: [GitHub](https://github.com/LiudvigVladislav/Phantom) ·
+  [Codeberg mirror](https://codeberg.org/VladislavLiudvig/Phantom)
+- Bugs and feature requests: [GitHub Issues](https://github.com/LiudvigVladislav/Phantom/issues)
+- Security disclosures: `security@phntm.pro` — see [SECURITY.md](SECURITY.md)
+- General contact: `hello@phntm.pro`
+- Legal / licensing: `legal@phntm.pro`
 
 ## Acknowledgments
 
-PHANTOM stands on the shoulders of many open-source projects and research efforts. Special recognition to:
+PHANTOM builds on the work of the Signal protocol designers, libsodium, the Tor
+Project, XTLS/Xray-core, Briar and its Android Tor packaging, Kotlin
+Multiplatform, Rust, Axum, Caddy, and the wider open-source privacy-tech
+community. See [NOTICE](NOTICE) for third-party attributions.
 
-- The **Signal** protocol designers (Trevor Perrin, Moxie Marlinspike) — the Double Ratchet and Sealed Sender constructions PHANTOM builds on
-- The **libsodium** project (Frank Denis et al.) — the cryptographic primitives underneath every E2EE operation in the codebase
-- The **Tor Project** — PHANTOM embeds an in-process tor daemon (via [kmp-tor](https://github.com/05nelsonm/kmp-tor) packaging Briar's `onionwrapper` fork) for the onion-service data path; Stage 5A-5C of the transport layer would not exist without their work
-- The **XTLS / Xray-core** maintainers — Stage 5E's REALITY transport (the censorship-resistance path validated through Russia's TSPU) is built on top of their daemon
-- The **Briar** project — the `onionwrapper` Android packaging of Tor that we depend on, plus the broader research on offline mesh delivery that informs our post-Beta direction
-- The wider open-source privacy-tech community whose libraries, research, and review effort make work like this possible
-
----
-
-*"Privacy is necessary for an open society in the electronic age."* — Eric Hughes, A Cypherpunk's Manifesto, 1993
+*“Privacy is necessary for an open society in the electronic age.”*
+— Eric Hughes, *A Cypherpunk's Manifesto* (1993)
