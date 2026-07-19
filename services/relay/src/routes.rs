@@ -7,7 +7,7 @@ use crate::{
     error::RelayError,
     media::{download_chunk, download_chunk_v3, upload_chunk, upload_chunk_v3},
     prekeys::{
-        DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
+        ConsumeError, DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
         SignedPreKeyPublicBundle,
     },
     push::wake_offline_recipient,
@@ -1580,7 +1580,12 @@ async fn submit_report(
         "report received"
     );
 
-    append_report_to_disk(&state.state_paths.reports, &report);
+    append_report_to_disk(
+        &state.state_paths.reports,
+        &report,
+        &state.reports_persist_success,
+        &state.reports_persist_failed,
+    );
     state.reports.write().await.push(report);
 
     (StatusCode::OK, Json(serde_json::json!({ "status": "received" })))
@@ -1626,7 +1631,12 @@ async fn admin_block_key(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "key required" })));
     }
     tracing::warn!(event = "admin_block", key = %&req.key[..req.key.len().min(16)], "key blocked by admin");
-    append_block_to_disk(&state.state_paths.blocklist, &req.key);
+    append_block_to_disk(
+        &state.state_paths.blocklist,
+        &req.key,
+        &state.blocklist_persist_success,
+        &state.blocklist_persist_failed,
+    );
     state.blocklist.write().await.insert(req.key.clone());
     (StatusCode::OK, Json(serde_json::json!({ "blocked": req.key })))
 }
@@ -1712,7 +1722,12 @@ async fn register_push_token(
         let mut tokens = state.push_tokens.write().await;
         tokens.insert(rec.identity.clone(), rec.topic_url.clone());
     }
-    append_push_token_to_disk(&state.state_paths.push_tokens, &rec);
+    append_push_token_to_disk(
+        &state.state_paths.push_tokens,
+        &rec,
+        &state.push_tokens_persist_success,
+        &state.push_tokens_persist_failed,
+    );
 
     tracing::info!(
         identity_prefix = %&rec.identity[..rec.identity.len().min(8)],
@@ -1833,24 +1848,62 @@ async fn publish_prekeys(
 }
 
 fn publish_error_response(e: PublishError) -> axum::response::Response {
-    let (status, msg) = match e {
-        PublishError::BadIdentity(m) => (StatusCode::BAD_REQUEST, m.to_string()),
-        PublishError::BadSigningKey(m) => (StatusCode::BAD_REQUEST, m.to_string()),
-        PublishError::BadSignature(m) => (StatusCode::BAD_REQUEST, m.to_string()),
-        PublishError::BadOpk(m) => (StatusCode::BAD_REQUEST, m.to_string()),
+    match e {
+        PublishError::BadIdentity(m) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": m.to_string() })),
+        )
+            .into_response(),
+        PublishError::BadSigningKey(m) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": m.to_string() })),
+        )
+            .into_response(),
+        PublishError::BadSignature(m) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": m.to_string() })),
+        )
+            .into_response(),
+        PublishError::BadOpk(m) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": m.to_string() })),
+        )
+            .into_response(),
         PublishError::TooManyOpks(n) => (
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("too many OPKs: {} (max 100)", n),
-        ),
+            Json(serde_json::json!({ "error": format!("too many OPKs: {} (max 100)", n) })),
+        )
+            .into_response(),
         // 409 Conflict: a different signing key was previously registered
         // for this X25519 identity. Client should treat as a hard failure
         // (not a retryable transport error).
         PublishError::SigningKeyMismatch => (
             StatusCode::CONFLICT,
-            "signing_pubkey_hex does not match the one registered for this identity_pubkey_hex".to_string(),
-        ),
-    };
-    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+            Json(serde_json::json!({
+                "error": "signing_pubkey_hex does not match the one registered for this identity_pubkey_hex"
+            })),
+        )
+            .into_response(),
+        // RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 correctness tier:
+        // structured 500 with sanitised `reason` — no path, no OS message.
+        // RAM byte-for-byte unchanged per the persist-first contract.
+        PublishError::PersistFailed(pf) => {
+            tracing::error!(
+                event = "prekey_persist_failed",
+                path = "publish",
+                shape = pf.shape(),
+                "prekey publish persist failed — RAM unchanged, returning 500"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "prekey_persist_failed",
+                    "reason": pf.shape(),
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn fetch_bundle(
@@ -1879,7 +1932,7 @@ async fn fetch_bundle(
             .into_response();
     }
     match state.prekeys.consume_bundle(&identity).await {
-        Some(bundle) => {
+        Ok(Some(bundle)) => {
             tracing::info!(
                 event = "prekey_consume",
                 identity = %&identity[..identity.len().min(16)],
@@ -1888,11 +1941,33 @@ async fn fetch_bundle(
             );
             (StatusCode::OK, Json::<PreKeyBundle>(bundle)).into_response()
         }
-        None => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "no published prekeys for this identity" })),
         )
             .into_response(),
+        // RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 correctness tier:
+        // consume persist failed. RAM byte-for-byte unchanged — the OPK
+        // was NOT popped, so a retry after the disk pressure clears
+        // returns the same OPK to the same requester. No OPK is burned
+        // by the failed call (§4.2 atomicity requirement).
+        Err(ConsumeError::PersistFailed(pf)) => {
+            tracing::error!(
+                event = "prekey_persist_failed",
+                path = "consume",
+                shape = pf.shape(),
+                identity = %&identity[..identity.len().min(16)],
+                "prekey consume persist failed — OPK not popped, returning 500"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "prekey_persist_failed",
+                    "reason": pf.shape(),
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1982,6 +2057,27 @@ async fn delete_opk(
                 Json(serde_json::json!({ "error": "opk not found" })),
             )
                 .into_response(),
+            // RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 correctness tier:
+            // delete persist failed. RAM byte-for-byte unchanged — the
+            // OPK was NOT removed, so a retry after the disk pressure
+            // clears succeeds against the same OPK.
+            DeleteError::PersistFailed(pf) => {
+                tracing::error!(
+                    event = "prekey_persist_failed",
+                    path = "delete",
+                    shape = pf.shape(),
+                    identity = %&identity[..identity.len().min(16)],
+                    "prekey delete persist failed — OPK not removed, returning 500"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "prekey_persist_failed",
+                        "reason": pf.shape(),
+                    })),
+                )
+                    .into_response()
+            }
         },
     }
 }

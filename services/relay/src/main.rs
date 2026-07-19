@@ -30,6 +30,21 @@ async fn main() {
             std::process::exit(12);
         }
     };
+
+    // RC-RELAY-STATE-DIR-REPAIR PR-1b — Order B boot preflight:
+    //   validate cfg (done above)
+    //   → ensure state_dir exists
+    //   → open state_dir/.lock and try_lock_exclusive
+    //   → preflight sentinel write+fsync+unlink under the held lock
+    //   → return the locked File; main binds it to `_state_dir_lock`
+    //     so the singleton lock is held for the ENTIRE process lifetime.
+    //
+    // Contention → std::process::exit(2). Preflight failure → panic-loud.
+    // Both are distinct from the config exit=12 above so an operator can
+    // distinguish "config invalid" from "another relay is running" from
+    // "state_dir not writable".
+    let _state_dir_lock = state::state_dir_preflight(&cfg);
+
     let app_state = Arc::new(state::AppState::new(cfg.clone()));
     // F11 + F26: rebuild the WS-auth signing-key bindings from the
     // disk-replayed prekey store before serving traffic so a relay restart

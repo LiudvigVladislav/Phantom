@@ -190,6 +190,23 @@ pub struct AppState {
     /// so the store owns the full path just like it owns its in-memory map.
     /// See `docs/tracks/rc-relay-state-dir-repair.md` §3.2 / §4.1.
     pub state_paths: StatePaths,
+
+    // ── Audit-tier persistence counters (RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2) ──
+    //
+    // Bump on every `append_*_to_disk` outcome from the audit tier. The
+    // paired `_success` counter increments ONLY after `writeln! → sync_data
+    // → parent-dir fsync` all report Ok, so the ratio `_failed / (_failed +
+    // _success)` is a real disk-error rate — not the pre-1b `disk_writes`
+    // shape, which counted attempts. Handler HTTP semantics are unchanged
+    // by the audit tier: a failure logs+counts and the caller still
+    // returns 2xx (§4.2). Correctness-tier prekey counters live on
+    // `PreKeyStore`; see `prekeys.rs`.
+    pub reports_persist_failed: AtomicU64,
+    pub reports_persist_success: AtomicU64,
+    pub blocklist_persist_failed: AtomicU64,
+    pub blocklist_persist_success: AtomicU64,
+    pub push_tokens_persist_failed: AtomicU64,
+    pub push_tokens_persist_success: AtomicU64,
 }
 
 /// Joined absolute paths for the three `state.rs`-owned append-log files.
@@ -258,6 +275,13 @@ impl AppState {
             // Media upload (PR-M1r)
             media_store: MediaStore::new(),
             state_paths,
+            // RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 audit-tier counters.
+            reports_persist_failed: AtomicU64::new(0),
+            reports_persist_success: AtomicU64::new(0),
+            blocklist_persist_failed: AtomicU64::new(0),
+            blocklist_persist_success: AtomicU64::new(0),
+            push_tokens_persist_failed: AtomicU64::new(0),
+            push_tokens_persist_success: AtomicU64::new(0),
         }
     }
 
@@ -364,20 +388,154 @@ pub fn load_blocklist_from_disk(path: &Path) -> std::collections::HashSet<String
     content.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
-pub fn append_report_to_disk(path: &Path, report: &AbuseReport) {
-    if let Ok(line) = serde_json::to_string(report) {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", line);
-        }
+/// Sanitised shape for audit-tier persist failures. Emitted alongside the
+/// structured `tracing::error!` so the log stream and the counter agree on
+/// what "kind" of failure was observed without ever leaking a path or a
+/// raw OS message. Same taxonomy as the correctness-tier
+/// `PreKeyPersistFailure::shape()` in `prekeys.rs` — kept identical
+/// deliberately so operator dashboards can compare across tiers.
+fn audit_persist_shape(err: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::PermissionDenied => "permission",
+        ErrorKind::NotFound => "not_found",
+        // ENOSPC on Unix / ERROR_HANDLE_DISK_FULL on Windows.
+        // `ErrorKind::StorageFull` is nightly-only; match on `raw_os_error`
+        // instead so this stays stable on stable Rust.
+        _ => match err.raw_os_error() {
+            Some(28) => "storage_full",
+            _ => "io",
+        },
     }
 }
 
-pub fn append_block_to_disk(path: &Path, key: &str) {
+/// Audit-tier append with fail-loud semantics (RC-RELAY-STATE-DIR-REPAIR
+/// PR-1b §4.2 audit tier). Writes `line` + '\n' to `path`, then `sync_data`
+/// on the file, then `sync_all` on the state_dir (parent-dir fsync — makes
+/// the directory entry itself durable, load-bearing for restart-safety on
+/// crash). On any Err at any step: increment `fail_counter`, emit a
+/// structured `ERROR` with sanitised `shape`, return without bumping
+/// `success_counter`. Handler HTTP semantics preserved by the caller;
+/// audit-tier failures do NOT surface as 5xx per §4.2.
+///
+/// `success_counter` is incremented ONLY after ALL three durability steps
+/// (write + `sync_data` + parent-dir fsync) complete, matching the mini-
+/// lock rule that "counter increment only after required syncs".
+fn append_audit_line(
+    path: &Path,
+    line: &str,
+    kind: &'static str,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", key);
+    use std::sync::atomic::Ordering;
+
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            fail_counter.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                event = "audit_persist_failed",
+                tier = kind,
+                stage = "open",
+                shape = audit_persist_shape(&e),
+                "state-dir audit-tier persist failed"
+            );
+            return;
+        }
+    };
+    if let Err(e) = writeln!(file, "{}", line) {
+        fail_counter.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            event = "audit_persist_failed",
+            tier = kind,
+            stage = "write",
+            shape = audit_persist_shape(&e),
+            "state-dir audit-tier persist failed"
+        );
+        return;
     }
+    if let Err(e) = file.sync_data() {
+        fail_counter.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            event = "audit_persist_failed",
+            tier = kind,
+            stage = "sync_data",
+            shape = audit_persist_shape(&e),
+            "state-dir audit-tier persist failed"
+        );
+        return;
+    }
+    // Parent-directory fsync so the newly-appended file's directory
+    // entry is durable across a crash. On Windows this is a no-op —
+    // directory-fd fsync semantics differ, so we skip and rely on the
+    // fact that append writes to an existing file don't touch the
+    // directory entry (the durability need is Unix-specific).
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        match std::fs::File::open(parent) {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all() {
+                    fail_counter.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        event = "audit_persist_failed",
+                        tier = kind,
+                        stage = "sync_parent_dir",
+                        shape = audit_persist_shape(&e),
+                        "state-dir audit-tier persist failed"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                fail_counter.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    event = "audit_persist_failed",
+                    tier = kind,
+                    stage = "open_parent_dir",
+                    shape = audit_persist_shape(&e),
+                    "state-dir audit-tier persist failed"
+                );
+                return;
+            }
+        }
+    }
+    success_counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn append_report_to_disk(
+    path: &Path,
+    report: &AbuseReport,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
+    let line = match serde_json::to_string(report) {
+        Ok(l) => l,
+        Err(_) => {
+            // Serialisation failure is a code bug, not a disk error —
+            // count it and move on. Handler still returns 2xx.
+            fail_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                event = "audit_persist_failed",
+                tier = "reports",
+                stage = "serialize",
+                shape = "io",
+                "audit-tier serialization failed"
+            );
+            return;
+        }
+    };
+    append_audit_line(path, &line, "reports", success_counter, fail_counter);
+}
+
+pub fn append_block_to_disk(
+    path: &Path,
+    key: &str,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
+    append_audit_line(path, key, "blocklist", success_counter, fail_counter);
 }
 
 pub fn load_push_tokens_from_disk(path: &Path) -> HashMap<String, String> {
@@ -396,11 +554,196 @@ pub fn load_push_tokens_from_disk(path: &Path) -> HashMap<String, String> {
     map
 }
 
-pub fn append_push_token_to_disk(path: &Path, rec: &PushTokenRecord) {
-    use std::io::Write;
-    if let Ok(line) = serde_json::to_string(rec) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", line);
+pub fn append_push_token_to_disk(
+    path: &Path,
+    rec: &PushTokenRecord,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
+    let line = match serde_json::to_string(rec) {
+        Ok(l) => l,
+        Err(_) => {
+            fail_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                event = "audit_persist_failed",
+                tier = "push_tokens",
+                stage = "serialize",
+                shape = "io",
+                "audit-tier serialization failed"
+            );
+            return;
+        }
+    };
+    append_audit_line(path, &line, "push_tokens", success_counter, fail_counter);
+}
+
+// ── Boot preflight + singleton state-dir lock (RC-RELAY-STATE-DIR-REPAIR PR-1b §6.2) ──
+//
+// Order B (locked by architect + operator sign-off, mini-lock 2026-07-19):
+//
+//   validate cfg          — done in main() before calling this fn
+//   ↓
+//   ensure state_dir exists
+//   ↓
+//   open state_dir/.lock
+//   ↓
+//   fs2::try_lock_exclusive  → exit 2 on contention (no sentinel write,
+//                              no state mutation — second instance never
+//                              races the first over the state files)
+//   ↓
+//   preflight sentinel write + sync_data + parent-dir fsync + unlink
+//                              under the held lock — panic-loud on any Err
+//   ↓
+//   return the locked File; main() binds it to `_state_dir_lock` so the
+//                              lock is held for the ENTIRE process lifetime
+//
+// Distinct exit codes surface distinct failure modes to the operator:
+//   12 → config invalid (RelayConfig::from_env())
+//   2  → another relay is already holding state_dir/.lock
+//   101 → panic (preflight sentinel could not be written / fsynced /
+//          unlinked; state_dir is not writable or its parent isn't fsyncable)
+
+/// Perform the Order B boot-preflight sequence and return the locked
+/// `state_dir/.lock` file. Caller MUST bind the return value in `main`
+/// so the lock stays alive for the process's whole lifetime. Any
+/// unrecoverable step calls `std::process::exit` OR panics — this
+/// function does not return an error.
+pub fn state_dir_preflight(cfg: &RelayConfig) -> std::fs::File {
+    use fs2::FileExt;
+
+    let state_dir = &cfg.state_dir;
+
+    // Step 1 — ensure state_dir exists. Panic-loud on failure; if we
+    // cannot even create the directory, there is no safe way to serve.
+    if let Err(e) = std::fs::create_dir_all(state_dir) {
+        panic!(
+            "FATAL: preflight: cannot create state_dir {}: {}",
+            state_dir.display(),
+            e
+        );
+    }
+
+    // Step 2 — open state_dir/.lock. `create(true)` so a fresh volume
+    // seeds the lock file. `write(true)` (no truncate) so we never wipe
+    // the contents (currently empty, but reserved for a future BOOT
+    // marker without breaking backwards-compat).
+    let lock_path = state_dir.join(".lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => panic!(
+            "FATAL: preflight: cannot open state_dir/.lock {}: {}",
+            lock_path.display(),
+            e
+        ),
+    };
+
+    // Step 3 — try_lock_exclusive. ONLY `ErrorKind::WouldBlock` is
+    // "another process holds the lock" (fs2 maps EAGAIN/EWOULDBLOCK on
+    // Unix and `ERROR_LOCK_VIOLATION` on Windows to `WouldBlock`). Every
+    // OTHER io::Error (EIO on a bad device, EOPNOTSUPP on a filesystem
+    // that doesn't support advisory locks such as some NFS mounts,
+    // permission changes mid-boot) means the LOCK OPERATION itself
+    // failed — treating those as "contention" would mislead the
+    // operator into thinking another relay is running when the real
+    // failure is a boot-preflight defect. Round-1 architect P1.
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!(
+                "FATAL: another relay instance holds {} — refusing to start",
+                lock_path.display()
+            );
+            std::process::exit(2);
+        }
+        Err(e) => panic!(
+            "FATAL: preflight: try_lock_exclusive on {} failed: {} \
+             (this is NOT lock contention — likely EIO or an unsupported \
+             filesystem)",
+            lock_path.display(),
+            e
+        ),
+    }
+
+    // Step 4 — preflight sentinel: prove the state_dir accepts a
+    // write+fsync+unlink cycle right now, under the held lock. This
+    // catches EROFS / EACCES / ENOSPC before AppState::new starts
+    // returning empty maps on silent-EROFS. Any error → panic-loud.
+    let sentinel_path = state_dir.join(".preflight-sentinel");
+    {
+        let mut sentinel = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sentinel_path)
+        {
+            Ok(f) => f,
+            Err(e) => panic!(
+                "FATAL: preflight: cannot create sentinel {}: {}",
+                sentinel_path.display(),
+                e
+            ),
+        };
+        use std::io::Write;
+        if let Err(e) = writeln!(sentinel, "preflight") {
+            panic!(
+                "FATAL: preflight: cannot write sentinel {}: {}",
+                sentinel_path.display(),
+                e
+            );
+        }
+        if let Err(e) = sentinel.sync_data() {
+            panic!(
+                "FATAL: preflight: cannot fsync sentinel {}: {}",
+                sentinel_path.display(),
+                e
+            );
+        }
+    } // sentinel `File` closes here so remove_file can succeed on Windows
+
+    // Parent-directory fsync so the sentinel's directory entry is
+    // durable; matches the audit-tier writer's durability contract.
+    // Unix-only (Windows doesn't expose fsync on directories the same
+    // way; on Linux this is load-bearing for the "state_dir has ever
+    // received a durable write" preflight guarantee).
+    #[cfg(unix)]
+    {
+        match std::fs::File::open(state_dir) {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all() {
+                    panic!(
+                        "FATAL: preflight: cannot fsync state_dir {}: {}",
+                        state_dir.display(),
+                        e
+                    );
+                }
+            }
+            Err(e) => panic!(
+                "FATAL: preflight: cannot open state_dir for fsync {}: {}",
+                state_dir.display(),
+                e
+            ),
         }
     }
+
+    if let Err(e) = std::fs::remove_file(&sentinel_path) {
+        panic!(
+            "FATAL: preflight: cannot unlink sentinel {}: {}",
+            sentinel_path.display(),
+            e
+        );
+    }
+
+    tracing::info!(
+        event = "state_dir_preflight_ok",
+        state_dir = %state_dir.display(),
+        "state_dir preflight OK (writable + fsyncable + lock held)"
+    );
+
+    lock_file
 }
