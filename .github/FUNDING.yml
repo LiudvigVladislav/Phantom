@@ -7,8 +7,6 @@ buy_me_a_coffee: phantompro
 # Liberapay — recurring weekly / monthly donations.
 liberapay: Phantom-messenger
 
-# Custom URLs — anything else the user might want to read first.
-# Order matters: most discoverable / human-readable channel first.
+# Custom URL — human-facing donation page, including crypto options.
 custom:
   - "https://phntm.pro/donate.html"
-  - "https://phntm.pro/funding.json"
