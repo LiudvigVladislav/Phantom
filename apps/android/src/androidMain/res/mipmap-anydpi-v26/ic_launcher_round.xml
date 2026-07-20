@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive icon (round variant) — identical structure to ic_launcher.xml.
+  Android launchers pick this on masks that are strictly circular; the
+  adaptive icon's foreground/background/monochrome layers are the same for
+  both round and square masks (Android applies the mask on top).
+-->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background"/>
-    <foreground>
-        <inset
-            android:drawable="@drawable/phantom_logo"
-            android:inset="20%"/>
-    </foreground>
+    <foreground android:drawable="@drawable/ic_phantom_fg_safe"/>
+    <monochrome android:drawable="@drawable/ic_phantom_mono"/>
 </adaptive-icon>
