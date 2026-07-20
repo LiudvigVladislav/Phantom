@@ -105,6 +105,37 @@ services:
       # prekeys.jsonl to. MUST match the volume target above. See
       # `docs/tracks/rc-relay-state-dir-repair.md` §5.2.
       RELAY_STATE_DIR: /var/phantom
+    # RC-RELAY-STATE-DIR-REPAIR Ops-PR: memory ceiling on the relay
+    # container. Two reasons:
+    #   1. Bounded RAM growth. A hypothetical leak or a large queue
+    #      backlog can no longer swallow all host memory + trigger the
+    #      Linux OOM killer on OTHER containers (caddy, ntfy, tor).
+    #      With this limit the kernel OOM-kills the relay ONLY, and
+    #      the PR-1b `.lock` releases cleanly on process exit — a
+    #      subsequent `docker compose up -d` reacquires the lock.
+    #   2. Prep for PR-2 (RC-RELAY-QUEUE-DURABILITY). PR-2 will pin
+    #      `RELAY_QUEUE_RAM_BUDGET_BYTES` after a staging benchmark;
+    #      this container-level ceiling is the outer bound that budget
+    #      must stay under. Conservative default 512 MiB is chosen
+    #      because current production shows steady-state RSS well
+    #      under 100 MiB — 5× headroom leaves room for transient
+    #      spikes without allowing runaway growth. The staging
+    #      benchmark for PR-2 will either confirm 512 MiB is fine or
+    #      raise it explicitly.
+    # The deploy-lint CI gate at .github/workflows/deploy-lint.yml
+    # (Inv-8) asserts this key stays present AND matches the shape
+    # `^[1-9][0-9]*[MG]$` (positive integer bytes with M or G
+    # suffix). The runtime "triple witness" attestation lives in
+    # `deploy/runbooks/rc-relay-state-dir-repair/rotation.md`
+    # §"Triple witness", which additionally proves compose bytes =
+    # HostConfig.Memory = cgroup memory.max on the running
+    # container. Locked v4.2.3 §3.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 96M
 
   caddy:
     image: caddy:2.8-alpine
