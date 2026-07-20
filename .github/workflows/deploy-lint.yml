@@ -465,16 +465,67 @@ jobs:
                   "which drifts across base-image upgrades."
               )
 
+          # RC-RELAY-STATE-DIR-REPAIR Ops-PR: Inv-8 (relay memory ceiling
+          # + strict value regex). Round-1 architect verdict on Ops PR:
+          # presence-only check accepted `memory: invalid`, `0M`, an
+          # object, or a negative value. Locked v4.2.3 §3 requires the
+          # value to be a positive-integer byte quantity with an M or G
+          # suffix — the regex `^[1-9][0-9]*[MG]$` covers every value
+          # Docker Compose parses into a positive HostConfig.Memory
+          # bytes count, and rejects `0M`, `-1M`, `512`, `1.5G`,
+          # `invalid`, and inline mapping shapes. What Inv-8 gates is
+          # the SHAPE of the field; the exact NUMBER is refined by
+          # PR-2's staging benchmark (which anchors
+          # `RELAY_QUEUE_RAM_BUDGET_BYTES` under the container ceiling).
+          # A deploy-witness in
+          # `deploy/runbooks/rc-relay-state-dir-repair/rotation.md`
+          # §"Triple witness" additionally verifies that the compose
+          # bytes equal `HostConfig.Memory` on the running container
+          # equal the cgroup value — that runtime attestation lives
+          # outside this CI gate.
+          # Round-2 architect P1 #7: `re.match` anchors only at the
+          # beginning; a trailing `\n` slips past `$`. Docker Compose
+          # rejects `"512M\n"` at parse time, so we must too. Use
+          # `fullmatch` — it anchors both ends and refuses any embedded
+          # newline. Self-tests below the regex must include the
+          # trailing-newline case as regression coverage.
+          import re as _re
+          _MEM_RE = _re.compile(r"[1-9][0-9]*[MG]")
+          deploy_block = relay.get("deploy", {}) or {}
+          resources = deploy_block.get("resources", {}) or {}
+          limits = resources.get("limits", {}) or {}
+          memory_limit = limits.get("memory")
+          if not isinstance(memory_limit, str):
+              failures.append(
+                  "Inv-8 (relay memory ceiling shape) — "
+                  "`deploy.resources.limits.memory` must be a STRING "
+                  "matching `^[1-9][0-9]*[MG]$`. Got: "
+                  f"{type(memory_limit).__name__} = {memory_limit!r}."
+              )
+          elif not _MEM_RE.fullmatch(memory_limit):
+              failures.append(
+                  "Inv-8 (relay memory ceiling shape) — "
+                  f"`deploy.resources.limits.memory` = {memory_limit!r} "
+                  "does not fullmatch `^[1-9][0-9]*[MG]$`. Docker Compose "
+                  "would parse `0M`, `-1M`, `1.5G`, `512`, `\"512M\\n\"`, "
+                  "or non-string values into a broken or zero "
+                  "HostConfig.Memory. Locked v4.2.3 §3 requires a "
+                  "positive integer with an M or G suffix and no "
+                  "trailing whitespace (e.g. `512M`, `1G`, `2G`)."
+              )
+
           if failures:
-              print("::error::RC-RELAY-STATE-DIR-REPAIR PR-1a state-dir invariants violated:")
+              print("::error::RC-RELAY-STATE-DIR-REPAIR PR-1a/Ops state-dir invariants violated:")
               for f in failures:
                   print(f"::error::  {f}")
               print()
               print("See docs/tracks/rc-relay-state-dir-repair.md §5 for the")
-              print("full contract; §7.2 for these exact assertions.")
+              print("full contract; §7.2 for these exact assertions;")
+              print("deploy/runbooks/rc-relay-state-dir-repair/README.md for")
+              print("the Ops PR extensions (Inv-8).")
               sys.exit(1)
 
-          print("All five state-dir invariants hold. PASS.")
+          print("All six state-dir invariants hold (PR-1a Inv-1..5 + Ops Inv-8). PASS.")
           PYEOF
 
       # RC-RELAY-STATE-DIR-REPAIR PR-1b §8 CI grep-gate — the two

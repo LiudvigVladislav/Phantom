@@ -1,0 +1,69 @@
+# PR-1b Mac-local integration witness — Compose fixture.
+#
+# Not `deploy/docker-compose.yml`. Not staging. Not VPS. This file is
+# the isolated stack the Mac-local witness launcher (`pr1b-mac-local-
+# witness.sh`) brings up on Docker Desktop for a 2-hour active
+# integration probe of merged PR-1b code (`27a06c8a`).
+#
+# ── Naming (never overlaps production) ──
+# - project:        pr1b-mac-<utc>            (enforced by launcher regex)
+# - service:        relay
+# - container_name: ${PR1B_MAC_CONTAINER_NAME} (stable across recreate
+#                   inside one run; unique per run — force-recreate can
+#                   still resolve the name)
+# - network:        pr1b-mac-net-${PR1B_MAC_NET_SUFFIX}
+# - volume:         phantom-reports (compose-namespaced → the actual
+#                   Docker volume becomes ${project}_phantom-reports)
+#
+# The launcher refuses to run if any of these overlap
+# `deploy_phantom-reports`, `phantom-relay` (production container
+# name), or `deploy` (production project). See the launcher's guard
+# block for the full list.
+#
+# ── Image pin (architect-supplied) ──
+# `phantom-relay:pr1b-27a06c8a` MUST resolve to an image whose `.Id`
+# is `sha256:a07e53098650b6cac3585da3751d72c159b7ddce4d2b6a874078d1f6526198ce`.
+# The launcher verifies this BEFORE `compose up` and refuses to start
+# on any mismatch. The image itself is built from the merged repo
+# commit `27a06c8aa06d15f2a152268e00c606a5cefff828` — the operator is
+# responsible for building it once, `docker image inspect` will
+# confirm the digest.
+#
+# ── Secrets ──
+# `RELAY_SEQ_MAC_KEY` and `RELAY_SECRET_TOKEN` are FIXTURE-only secrets.
+# The launcher generates them once in a persistent secrets directory
+# OUTSIDE evidence (0700 dir + 0600 files), reuses them across reruns
+# (so witness identity stays TOFU-stable), and NEVER copies them into
+# the evidence bundle. They enter the container via compose
+# environment interpolation from the operator's shell env.
+
+services:
+  relay:
+    image: phantom-relay:pr1b-27a06c8a
+    platform: linux/amd64
+    container_name: ${PR1B_MAC_CONTAINER_NAME:?PR1B_MAC_CONTAINER_NAME not set — launcher must export it}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    volumes:
+      - phantom-reports:/var/phantom
+    environment:
+      RELAY_STATE_DIR: /var/phantom
+      RELAY_HOST: 127.0.0.1
+      RELAY_PORT: '18080'
+      RELAY_SEQ_MAC_KEY: ${RELAY_SEQ_MAC_KEY:?RELAY_SEQ_MAC_KEY not set — launcher must export it}
+      RELAY_SECRET_TOKEN: ${RELAY_ADMIN_TOKEN:?RELAY_ADMIN_TOKEN not set — launcher must export it}
+      RUST_LOG: 'phantom_relay=info'
+      NO_COLOR: '1'
+    restart: 'no'
+    # NO `ports:` — witness talks to the relay via
+    # `docker run --network container:${PR1B_MAC_CONTAINER_NAME}`,
+    # never over a host-published port. This guarantees the isolated
+    # stack cannot be reached from anything outside Docker Desktop.
+
+networks:
+  default:
+    name: pr1b-mac-net-${PR1B_MAC_NET_SUFFIX:?PR1B_MAC_NET_SUFFIX not set — launcher must export it}
+
+volumes:
+  phantom-reports: {}
