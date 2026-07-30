@@ -70,6 +70,20 @@ briar-lyrebird = "0.6.2"
 briar-onionwrapper = "0.1.4"
 
 androidx-activity = "1.9.3"
+
+# F2b (android/ui-designv2-foundation-2026-07-30) — Compose semantics tests.
+# Version tracks Compose Multiplatform 1.7.3, which maps to Jetpack Compose
+# 1.7.x for the androidTarget. 1.7.6 is the latest 1.7 minor at the time of
+# writing and is transitively compatible with compose-multiplatform 1.7.3.
+# The ui-test-junit4-android artifact brings Robolectric + the compose-test
+# infrastructure needed to run `createComposeRule()` inside `testDebugUnitTest`.
+androidx-compose-ui-test = "1.7.6"
+
+# F2b — Robolectric backs `createComposeRule()` in `testDebugUnitTest`.
+# 4.14.1 supports compileSdk 35 (the current project pin). Older Robolectric
+# versions (4.11–4.13) cannot host API-35 code paths.
+robolectric = "4.14.1"
+
 zxing-core = "3.5.3"
 camerax = "1.4.1"
 mlkit-barcode = "17.3.0"
@@ -147,6 +161,11 @@ mlkit-barcode = { module = "com.google.mlkit:barcode-scanning", version.ref = "m
 # AndroidX Test — androidInstrumentedTest support
 androidx-test-runner    = { module = "androidx.test:runner",           version.ref = "androidx-test-runner" }
 androidx-test-ext-junit = { module = "androidx.test.ext:junit",        version.ref = "androidx-test-ext-junit" }
+
+# F2b — Compose semantics tests (androidUnitTest, Robolectric-backed).
+androidx-compose-ui-test-junit4  = { module = "androidx.compose.ui:ui-test-junit4-android", version.ref = "androidx-compose-ui-test" }
+androidx-compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest",       version.ref = "androidx-compose-ui-test" }
+robolectric                       = { module = "org.robolectric:robolectric",                 version.ref = "robolectric" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kmp-plugin" }

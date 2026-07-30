@@ -70,6 +70,18 @@ kotlin {
                 // which is excluded from any APK.
                 implementation(kotlin("reflect"))
                 implementation(project(":shared:core:transport"))
+                // F2b (android/ui-designv2-foundation-2026-07-30) —
+                // Compose semantics tests. `ui-test-junit4-android`
+                // enables `createComposeRule()`; it does NOT bring
+                // Robolectric transitively (confirmed by dependency
+                // tree inspection), so Robolectric is added explicitly
+                // to host the JVM test environment. `ui-test-manifest`
+                // provides the manifest merged into the test target.
+                // Scope: ONLY for DesignV2 semantics tests — production
+                // code must never reference these artefacts.
+                implementation(libs.androidx.compose.ui.test.junit4)
+                implementation(libs.androidx.compose.ui.test.manifest)
+                implementation(libs.robolectric)
             }
         }
 
@@ -994,6 +1006,13 @@ android {
         // checkCallCapability (CallManagerGuardTest). Without this, any Log.*
         // invocation throws RuntimeException("Method not mocked").
         unitTests.isReturnDefaultValues = true
+        // F2b (android/ui-designv2-foundation-2026-07-30) — Robolectric-backed
+        // Compose semantics tests need access to Android resources
+        // (AndroidManifest merging, string/plurals resolution, activity theme
+        // lookup). Paparazzi 2.0-alpha05 renders correctly either way but
+        // benefits from the same setting; enabling it here is a net-safe
+        // change for the semantics test infrastructure.
+        unitTests.isIncludeAndroidResources = true
     }
 
     // Required by kmp-tor:resource-noexec-tor 409.x (ADR-016 Stage 2).
@@ -1005,6 +1024,19 @@ android {
     packaging {
         jniLibs.useLegacyPackaging = true
     }
+}
+
+// F2b (android/ui-designv2-foundation-2026-07-30) — the compose-ui-test-manifest
+// artifact must be added at the AGP variant configuration level (`debugImplementation`),
+// NOT inside `kotlin { sourceSets { androidUnitTest { } } }`, so its embedded
+// AndroidManifest.xml — which registers `androidx.activity.ComponentActivity` for
+// Compose-test `createComposeRule()` — participates in the debug variant's manifest
+// merge. Without this, Robolectric-hosted semantics tests fail with
+// "Unable to resolve activity for Intent { cmp=phantom.android/androidx.activity.ComponentActivity }".
+// The artifact is <3 KB, contains only the manifest, and DOES NOT ship in release
+// because release doesn't consume `debugImplementation` configurations.
+dependencies {
+    "debugImplementation"(libs.androidx.compose.ui.test.manifest)
 }
 
 // --------------------------------------------------------------------------

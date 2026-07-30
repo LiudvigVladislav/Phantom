@@ -30,6 +30,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -96,7 +98,17 @@ fun PhantomInput(
 
     val outerShape = RoundedCornerShape(DesignV2Tokens.Radius.input)
 
-    Column(modifier = modifier.alpha(if (enabled) 1f else 0.38f)) {
+    val errorDescription = if (isError) helperText ?: "invalid input" else null
+
+    Column(
+        modifier = modifier
+            .alpha(if (enabled) 1f else 0.38f)
+            .then(
+                if (errorDescription != null) {
+                    Modifier.semantics { error(errorDescription) }
+                } else Modifier
+            ),
+    ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()

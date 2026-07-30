@@ -14,20 +14,19 @@ import androidx.compose.foundation.background
 import org.junit.Rule
 import org.junit.Test
 import phantom.android.ui.designv2.components.PhantomBadge
+import phantom.android.ui.designv2.showcase.ShowcaseBadgeMatrix
 
 /**
- * F0 compatibility spike — Paparazzi + KMP-androidTarget + AGP 9.1.1 +
- * Kotlin 2.2.10 + Compose Multiplatform 1.7.3.
+ * PhantomBadge snapshot goldens.
  *
- * If this test passes and a golden PNG lands under
- * `apps/android/src/androidUnitTest/snapshots/`, the toolchain works and
- * F1/F2 can proceed. If it fails, capture the stack trace and stop —
- * do NOT self-switch to a different snapshot tool (per Vladislav's F0
- * directive).
+ * `badge_with_count_3` is the F0 compatibility spike golden — proves the
+ * Paparazzi + KMP-androidTarget + AGP 9.1.1 + Kotlin 2.2.10 + Compose
+ * Multiplatform 1.7.3 toolchain renders a single-cell composable. It stays
+ * for F1b snapshot-root normalisation regression coverage.
  *
- * The golden itself only proves the pixel output is stable — visual
- * accuracy against the handoff spec requires a separate Vladislav
- * sign-off.
+ * `badge_matrix` is the F2b matrix golden — covers count = 1 / 3 / 12 /
+ * 99 / 250 (99+ overflow) plus dotOnly, so every Badge public surface has
+ * a review PNG.
  */
 class PhantomBadgeSnapshotTest {
 
@@ -47,5 +46,10 @@ class PhantomBadgeSnapshotTest {
                 PhantomBadge(count = 3)
             }
         }
+    }
+
+    @Test
+    fun badge_matrix() {
+        paparazzi.snapshot { ShowcaseBadgeMatrix() }
     }
 }

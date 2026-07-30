@@ -6,12 +6,12 @@ package phantom.android.ui.designv2.components
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -20,8 +20,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.role
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import phantom.android.ui.designv2.DesignV2Tokens
 
@@ -35,6 +33,11 @@ import phantom.android.ui.designv2.DesignV2Tokens
  *
  * Track 44×26 (visual), knob 22×22. 48dp touch target enforced by an outer
  * padding-free wrapper Box sized 48dp — the visual switch sits centred inside.
+ *
+ * Uses `Modifier.toggleable` so the node carries the full ON/OFF semantics
+ * (`ToggleableState`), `Role.Switch`, and click action in one modifier — the
+ * combination TalkBack needs to announce "Switch, on" / "Switch, off" and the
+ * combination Compose-test `assertIsOn()` / `assertIsOff()` matches on.
  */
 @Composable
 fun PhantomToggle(
@@ -63,16 +66,16 @@ fun PhantomToggle(
             .size(48.dp)
             .then(
                 if (onCheckedChange != null) {
-                    Modifier.clickable(
+                    Modifier.toggleable(
+                        value = checked,
                         enabled = enabled,
+                        role = Role.Switch,
                         interactionSource = interaction,
                         indication = null,
-                    ) { onCheckedChange(!checked) }
+                        onValueChange = onCheckedChange,
+                    )
                 } else Modifier
             )
-            .semantics {
-                role = Role.Switch
-            }
             .alpha(if (enabled) 1f else 0.38f),
         contentAlignment = Alignment.Center,
     ) {
