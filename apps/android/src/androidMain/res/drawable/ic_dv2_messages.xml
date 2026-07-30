@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/messages.svg
+    (Lucide-style 24×24 stroke, currentColor). Stroke stays #FFFFFF so
+    Compose Icon(tint=...) applies via SrcIn at the consumer site.
+    Consumers: Icon(painter = painterResource(R.drawable.ic_dv2_messages),
+                    tint = DesignV2Tokens.Colors.<role>).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

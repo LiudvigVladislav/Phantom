@@ -12,32 +12,24 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.ui.designv2.DesignV2Tokens
 
 /**
  * PhantomBadge — DesignV2 unread/count badge.
  *
- * Per handoff `design-system-notes.md` §"Badges / unread counts":
- *   - Cyan fill (#00D4FF), Surface Deep numeral (#08090C).
- *   - lineHeight 1.
+ * Handoff `design-system-notes.md §Badges / unread counts`:
+ *   - Cyan fill, Surface Deep numeral, line-height 1.
  *   - min-width 20pt, circle/pill.
- *   - Plain red dot #ef4444 variant for "activity, no count" (dotOnly = true).
+ *   - Plain red dot (Error) variant for "activity, no count" (dotOnly = true).
  *
- * NOTE: This is the ONLY DesignV2 component in the F0 compatibility spike.
- * It exists to prove the Paparazzi+KMP+Compose Multiplatform toolchain
- * against AGP 9.1.1 / Kotlin 2.2.10. Full component library lands in F2
- * after this spike is signed off. Do NOT reach into `phantom.android.ui.designv2.*`
- * from production screen code until F2 lands.
- *
- * Colors are hardcoded here (not sourced from a DesignV2 token file) —
- * F1 lands the DesignV2Tokens.kt and this file will be updated to
- * reference them then. Isolating the spike to one file keeps the F0
- * change surface small.
+ * The badge is decorative; it carries no touch interaction, so no 48dp
+ * touch-target requirement applies. Callers wrapping this in a clickable
+ * row are responsible for the target size on that row.
  */
 @Composable
 fun PhantomBadge(
@@ -45,8 +37,8 @@ fun PhantomBadge(
     dotOnly: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    val fill = if (dotOnly) Color(0xFFEF4444) else Color(0xFF00D4FF)
-    val textColor = Color(0xFF08090C)
+    val fill = if (dotOnly) DesignV2Tokens.Colors.Error else DesignV2Tokens.Colors.Cyan
+    val numeralColor = DesignV2Tokens.Colors.SurfaceDeep
 
     Box(
         modifier = modifier
@@ -58,13 +50,12 @@ fun PhantomBadge(
         if (!dotOnly && count != null) {
             Text(
                 text = if (count > 99) "99+" else count.toString(),
-                color = textColor,
+                color = numeralColor,
                 style = TextStyle(
                     fontFamily = FontFamily.SansSerif,
                     fontSize = 12.sp,
                     lineHeight = 12.sp,
                     fontWeight = FontWeight.SemiBold,
-                    // lineHeight = fontSize per handoff (line-height:1)
                 ),
             )
         }

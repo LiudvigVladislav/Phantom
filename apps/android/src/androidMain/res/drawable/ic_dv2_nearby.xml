@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/nearby.svg
+    (Lucide-style 24×24 stroke, currentColor). Stroke stays #FFFFFF so
+    Compose Icon(tint=...) applies via SrcIn at the consumer site.
+    Consumers: Icon(painter = painterResource(R.drawable.ic_dv2_nearby),
+                    tint = DesignV2Tokens.Colors.<role>).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M3,12 a9,9 0 1 0 18,0 a9,9 0 1 0 -18,0"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M6,5,12 a5,5,5,5 0 1 0 11,0 a5,5,5,5 0 1 0 -11,0"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M10,25,12 a1,75,1,75 0 1 0 3,5,0 a1,75,1,75 0 1 0 -3,5,0"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

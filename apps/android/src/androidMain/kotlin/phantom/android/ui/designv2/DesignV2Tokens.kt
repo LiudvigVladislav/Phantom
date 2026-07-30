@@ -13,7 +13,7 @@ import androidx.compose.ui.unit.dp
  * `design_handoff_phantom_messenger/design-system-notes.md` +
  * `README.md §Design Tokens`, delivered on 2026-07-30.
  *
- * Colours: 18 total.
+ * Colours: 19 total.
  *   - 15 are the tokens the handoff explicitly enumerates (with the two
  *     dark near-blacks split by usage — hover vs inset — into
  *     SurfaceHover / SurfaceInset, and the two reds split into
@@ -21,6 +21,9 @@ import androidx.compose.ui.unit.dp
  *   - 3 are additional Cyan-family and background tokens the handoff
  *     uses but does not list in its top-level table
  *     (Background, CyanDeepActive, CyanDeepDisabled).
+ *   - 1 is OnCyan (#04222B), the handoff's inline text colour for cyan
+ *     primary buttons; not in the token table but appears verbatim in
+ *     the Buttons component spec (design-system-notes.md).
  *
  * Values are NOT the same as the existing [phantom.android.ui.theme.PhantomTokens]:
  *   - 7 tokens have different hex than PhantomTokens' same-named counterparts
@@ -98,6 +101,13 @@ object DesignV2Tokens {
         //                     Softer, more visually salient at large sizes.
         val Error              = Color(0xFFEF4444)  // Input validation, activity dot
         val Danger             = Color(0xFFFF5C5C)  // Destructive actions, failed states, end call
+
+        // Foreground on cyan primary. Handoff specifies #04222B for primary
+        // button text — a dark cyan-shifted tone that's optically warmer than
+        // SurfaceDeep #08090C on cyan and reads as tinted rather than punched
+        // out. SurfaceDeep is still the correct fill for badge numerals /
+        // toggle knobs where the goal IS a punched-out feel.
+        val OnCyan             = Color(0xFF04222B)  // Text/glyphs on cyan primary fill
     }
 
     // ── SPACING ──────────────────────────────────────────────────────────────
