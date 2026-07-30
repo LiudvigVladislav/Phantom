@@ -134,7 +134,7 @@ fun PhantomInput(
                 if (isError) {
                     Spacer(Modifier.width(8.dp))
                     Icon(
-                        painter = painterResource(R.drawable.ic_dv2_confirm),
+                        painter = painterResource(R.drawable.ic_dv2_alert),
                         contentDescription = null,
                         tint = DesignV2Tokens.Colors.Error,
                         modifier = Modifier.size(18.dp),

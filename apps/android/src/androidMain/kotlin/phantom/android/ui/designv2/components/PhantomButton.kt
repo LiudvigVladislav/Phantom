@@ -8,6 +8,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -36,17 +37,30 @@ import phantom.android.ui.designv2.DesignV2Tokens
  * PhantomButton — DesignV2 button.
  *
  * Handoff `design-system-notes.md §Buttons` (all pill, radius = full):
- *   - Primary  : cyan fill, OnCyan text, focus = 2px cyan-30% ring,
- *                active = CyanDeepActive, disabled = CyanDeepDisabled + muted text.
- *   - Secondary: SurfaceElevated bg, Border 1px, TextPrimary; focus = cyan
- *                border + 8% cyan ring.
- *   - Ghost    : transparent, TextTertiary; hover reveals border stroke.
+ *   - Primary  : cyan fill, OnCyan text.
+ *                focus  = 2px cyan-30% ring.
+ *                active = CyanDeepActive.
+ *                disabled = CyanDeepDisabled + muted text.
+ *   - Secondary: SurfaceElevated bg, Border 1px, TextPrimary.
+ *                focus  = cyan border + 8% cyan ring.
+ *                active = SurfaceHover fill.  (handoff-implied press feedback.)
+ *   - Ghost    : transparent, TextTertiary.
+ *                focus/hover = Border stroke reveal.
+ *                active      = SurfaceHover fill.
  *
- * Sizing: default pill height 48dp (≥ material's 48dp min touch target).
- * Even Ghost variant meets the touch target — the visual chip is smaller
- * than the tappable area only via internal padding, not via a shrunken box.
+ * State priority for visuals: **disabled > pressed > focused > normal.**
+ * pressed always overrides focused when both are true (touch input has both).
+ *
+ * [interactionSource] is exposed as a parameter so tests (Paparazzi matrix
+ * goldens in F2b) can pre-emit `PressInteraction.Press` / `FocusInteraction.Focus`
+ * to render the pressed / focused variants deterministically.
+ *
+ * Sizing: default pill height ≥48dp — visual chip padding shrinks it inside
+ * a 48dp touch box, not by shrinking the box itself.
  */
 enum class PhantomButtonVariant { Primary, Secondary, Ghost }
+
+private enum class ButtonVisualState { Normal, Focused, Pressed, Disabled }
 
 @Composable
 fun PhantomButton(
@@ -55,44 +69,33 @@ fun PhantomButton(
     modifier: Modifier = Modifier,
     variant: PhantomButtonVariant = PhantomButtonVariant.Primary,
     enabled: Boolean = true,
+    interactionSource: MutableInteractionSource = remember { MutableInteractionSource() },
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    val focused by interaction.collectIsFocusedAsState()
+    val focused by interactionSource.collectIsFocusedAsState()
+    val pressed by interactionSource.collectIsPressedAsState()
 
-    val bg: Color
-    val fg: Color
-    val borderColor: Color?
-    val borderWidth = 1.dp
-
-    when (variant) {
-        PhantomButtonVariant.Primary -> {
-            bg = if (!enabled) DesignV2Tokens.Colors.CyanDeepDisabled else DesignV2Tokens.Colors.Cyan
-            fg = if (!enabled) DesignV2Tokens.Colors.TextTertiary else DesignV2Tokens.Colors.OnCyan
-            borderColor = if (focused) DesignV2Tokens.Colors.Cyan else null
-        }
-
-        PhantomButtonVariant.Secondary -> {
-            bg = DesignV2Tokens.Colors.SurfaceElevated
-            fg = if (!enabled) DesignV2Tokens.Colors.TextTertiary else DesignV2Tokens.Colors.TextPrimary
-            borderColor = if (focused) DesignV2Tokens.Colors.Cyan else DesignV2Tokens.Colors.Border
-        }
-
-        PhantomButtonVariant.Ghost -> {
-            bg = Color.Transparent
-            fg = if (!enabled) DesignV2Tokens.Colors.TextQuaternary else DesignV2Tokens.Colors.TextTertiary
-            borderColor = if (focused) DesignV2Tokens.Colors.Border else null
-        }
+    val state = when {
+        !enabled -> ButtonVisualState.Disabled
+        pressed  -> ButtonVisualState.Pressed
+        focused  -> ButtonVisualState.Focused
+        else     -> ButtonVisualState.Normal
     }
+
+    val visuals = buttonVisualsFor(variant, state)
 
     Row(
         modifier = modifier
             .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
             .clip(CircleShape)
-            .background(bg, CircleShape)
-            .then(if (borderColor != null) Modifier.border(borderWidth, borderColor, CircleShape) else Modifier)
+            .background(visuals.background, CircleShape)
+            .then(
+                if (visuals.border != null) {
+                    Modifier.border(1.dp, visuals.border, CircleShape)
+                } else Modifier
+            )
             .clickable(
                 enabled = enabled,
-                interactionSource = interaction,
+                interactionSource = interactionSource,
                 indication = null,
                 onClick = onClick,
             )
@@ -103,7 +106,7 @@ fun PhantomButton(
     ) {
         Text(
             text = text,
-            color = fg,
+            color = visuals.foreground,
             style = TextStyle(
                 fontFamily = DesignV2FontBody,
                 fontSize = 15.sp,
@@ -111,5 +114,38 @@ fun PhantomButton(
                 lineHeight = 20.sp,
             ),
         )
+    }
+}
+
+private data class ButtonVisuals(
+    val background: Color,
+    val foreground: Color,
+    val border: Color?,
+)
+
+private fun buttonVisualsFor(
+    variant: PhantomButtonVariant,
+    state: ButtonVisualState,
+): ButtonVisuals {
+    val c = DesignV2Tokens.Colors
+    return when (variant) {
+        PhantomButtonVariant.Primary -> when (state) {
+            ButtonVisualState.Disabled -> ButtonVisuals(c.CyanDeepDisabled, c.TextTertiary, null)
+            ButtonVisualState.Pressed  -> ButtonVisuals(c.CyanDeepActive,   c.OnCyan,        null)
+            ButtonVisualState.Focused  -> ButtonVisuals(c.Cyan,             c.OnCyan,        c.Cyan)
+            ButtonVisualState.Normal   -> ButtonVisuals(c.Cyan,             c.OnCyan,        null)
+        }
+        PhantomButtonVariant.Secondary -> when (state) {
+            ButtonVisualState.Disabled -> ButtonVisuals(c.SurfaceElevated, c.TextTertiary, c.Border)
+            ButtonVisualState.Pressed  -> ButtonVisuals(c.SurfaceHover,    c.TextPrimary,  c.Border)
+            ButtonVisualState.Focused  -> ButtonVisuals(c.SurfaceElevated, c.TextPrimary,  c.Cyan)
+            ButtonVisualState.Normal   -> ButtonVisuals(c.SurfaceElevated, c.TextPrimary,  c.Border)
+        }
+        PhantomButtonVariant.Ghost -> when (state) {
+            ButtonVisualState.Disabled -> ButtonVisuals(Color.Transparent, c.TextQuaternary, null)
+            ButtonVisualState.Pressed  -> ButtonVisuals(c.SurfaceHover,    c.TextTertiary,   null)
+            ButtonVisualState.Focused  -> ButtonVisuals(Color.Transparent, c.TextTertiary,   c.Border)
+            ButtonVisualState.Normal   -> ButtonVisuals(Color.Transparent, c.TextTertiary,   null)
+        }
     }
 }
