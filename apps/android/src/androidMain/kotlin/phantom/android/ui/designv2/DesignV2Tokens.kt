@@ -11,21 +11,34 @@ import androidx.compose.ui.unit.dp
  *
  * These tokens mirror the palette in
  * `design_handoff_phantom_messenger/design-system-notes.md` +
- * `README.md §Design Tokens`, delivered on 2026-07-30. They are NOT the same
- * as the existing [phantom.android.ui.theme.PhantomTokens] — several hex
- * values differ meaningfully (see the token diff in the F1 handoff report).
+ * `README.md §Design Tokens`, delivered on 2026-07-30.
+ *
+ * Colours: 18 total.
+ *   - 15 are the tokens the handoff explicitly enumerates (with the two
+ *     dark near-blacks split by usage — hover vs inset — into
+ *     SurfaceHover / SurfaceInset, and the two reds split into
+ *     Error / Danger per handoff review).
+ *   - 3 are additional Cyan-family and background tokens the handoff
+ *     uses but does not list in its top-level table
+ *     (Background, CyanDeepActive, CyanDeepDisabled).
+ *
+ * Values are NOT the same as the existing [phantom.android.ui.theme.PhantomTokens]:
+ *   - 7 tokens have different hex than PhantomTokens' same-named counterparts
+ *     (Surface, SurfaceHover, TextSecondary, TextTertiary, CyanDark ⇢ CyanDeepActive,
+ *     Danger, plus TextQuaternary which doesn't exist in PhantomTokens at all).
+ *   - The rest either match or fill roles PhantomTokens lacks.
+ *
+ * Do NOT reference DesignV2Tokens from existing screens or from
+ * PhantomTokens/PhantomTheme itself. Only new DesignV2 components (F2)
+ * may consume this file.
  *
  * Because the existing PhantomTokens has 400+ call-sites through top-level
  * aliases in [phantom.android.ui.theme.PhantomTheme], the migration is
  * INCREMENTAL: DesignV2Tokens ships additively, F2 components reach into
  * it explicitly, and existing screens continue to use PhantomTokens
  * unchanged. There is no plan to auto-migrate the 400+ call-sites.
- *
- * DO NOT reference DesignV2Tokens from existing screens or from
- * PhantomTokens/PhantomTheme itself. Only new DesignV2 components (F2) may
- * consume this file. See project doctrine on additive design-system
- * evolution — a single global switch would ship a 25-screen visual
- * regression in one commit, which is exactly what we are avoiding.
+ * A single global switch would ship a 25-screen visual regression in one
+ * commit, which is exactly what we are avoiding.
  */
 object DesignV2Tokens {
 
@@ -36,16 +49,17 @@ object DesignV2Tokens {
 
         // Surfaces — six layers from app canvas outward.
         //
-        // The two lightest hover variants (SurfaceHover / SurfaceHoverAlt)
-        // are BOTH listed in the handoff. Handoff spec: "Surface Hover
-        // #0c0f14 / #0b0e13". Committed both; F2 components pick per
-        // context (row hover vs pressed state — TBD in F2 review).
+        // The handoff lists two dark near-black tones with distinct usage:
+        //   #0C0F14 — appears only in pointer / row hover states  → SurfaceHover
+        //   #0B0E13 — appears 21× as a nested inset surface     → SurfaceInset
+        // Committed both under their semantic role names so F2 components
+        // can pick unambiguously.
         val Background         = Color(0xFF05060A)  // App canvas (outside the "device" chrome). Not in existing PhantomTokens.
         val SurfaceDeep        = Color(0xFF08090C)  // Screen background
         val Surface            = Color(0xFF12151B)  // Inputs, chips  (differs from existing PhantomTokens.Surface = 0x0E1014)
         val SurfaceElevated    = Color(0xFF161A20)  // Cards, secondary buttons
-        val SurfaceHover       = Color(0xFF0C0F14)  // Row hover
-        val SurfaceHoverAlt    = Color(0xFF0B0E13)  // Alternate hover from the handoff (context TBD in F2)
+        val SurfaceHover       = Color(0xFF0C0F14)  // Pointer hover state on rows / interactive surfaces
+        val SurfaceInset       = Color(0xFF0B0E13)  // Nested inset surface (recessed panels inside cards) — 21 uses in handoff
 
         // Borders
         val Border             = Color(0xFF1F242C)  // Default border for inputs, cards
@@ -73,7 +87,17 @@ object DesignV2Tokens {
 
         // Status
         val Success            = Color(0xFF22C55E)  // Matches existing
-        val Danger             = Color(0xFFFF5C5C)  // Handoff softer red — differs from existing #EF4444
+        //
+        // Two reds, distinct roles per handoff review:
+        //   Error   #EF4444 — input validation errors, "activity, no count"
+        //                     red dot on chips/rows. Neutral-tech red.
+        //                     (Existing PhantomTokens.Danger is #EF4444 —
+        //                     same hex, different role.)
+        //   Danger  #FF5C5C — destructive user actions (Delete for Everyone),
+        //                     failed message ticks, End-call button.
+        //                     Softer, more visually salient at large sizes.
+        val Error              = Color(0xFFEF4444)  // Input validation, activity dot
+        val Danger             = Color(0xFFFF5C5C)  // Destructive actions, failed states, end call
     }
 
     // ── SPACING ──────────────────────────────────────────────────────────────
