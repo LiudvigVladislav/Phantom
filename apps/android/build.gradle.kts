@@ -6,6 +6,12 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
+    // F0 spike (android/ui-designv2-foundation-2026-07-30) — Paparazzi golden
+    // snapshot testing for DesignV2 components. Compatibility with AGP 9.1.1
+    // + Kotlin 2.2.10 + KMP androidTarget is unverified; the spike proves
+    // pass/fail. If Gradle sync/task fails, plugin is removed pending
+    // resolution — do NOT self-switch to a different snapshot tool.
+    alias(libs.plugins.paparazzi)
 }
 
 // Load release signing credentials from keystores/signing.properties (gitignored)
