@@ -1072,89 +1072,174 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 }
             }
 
-            // Build the delivery frame. For sealed messages `from` is empty so
-            // the relay never reveals the sender identity to anyone, including
-            // itself — the recipient decrypts `sealedSender` client-side.
-            let envelope_from = if sealed_sender.is_empty() {
-                from_identity.to_string()
-            } else {
-                String::new()
-            };
+            // ── PR-2 M4-2b atomic activation: dispatch through the runtime ──
+            //
+            // Gate #4 — empty `sealed_sender` is rejected at the
+            // handler layer BEFORE `runtime.try_send`. WS emits an
+            // error frame with `WsErrorKind::Validation` in place
+            // of the pre-M4 unsealed-sender fallback path.
+            if sealed_sender.is_empty() {
+                if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
+                    let frame = crate::m4_adapters::build_ws_error_frame(
+                        &msg_id,
+                        crate::m4_adapters::WsErrorKind::Validation,
+                    )
+                    .to_string();
+                    let _ = sender_tx.send(frame);
+                }
+                return;
+            }
+
+            // For sealed messages, `from` is empty in the deliver
+            // frame so the relay never reveals sender identity.
             let deliver = serde_json::json!({
                 "type":         "deliver",
-                "from":         envelope_from,
+                "from":         "",
                 "sealedSender": sealed_sender,
                 "payload":      payload,
                 "messageId":    msg_id,
             })
             .to_string();
 
-            // Persist FIRST. Live delivery via the in-memory mpsc channel is a
-            // best-effort optimisation; a recipient WS that silently dies
-            // between mpsc.send() and the actual ws_tx.send() must not lose the
-            // envelope. The store is the source of truth — the client removes
-            // an envelope only by sending {"type":"ack-deliver", ...} after
-            // successful decrypt + DB insert. On reconnect the client gets
-            // every envelope still in the store, deduped at the message_id
-            // level on the client side (INSERT OR IGNORE on the messages
-            // table). This keeps the QA-observed loss-after-idle-disconnect
-            // bug from happening again.
-            let envelope = Envelope::new(
-                msg_id.clone(),
-                to.clone(),
-                envelope_from,
-                sealed_sender.clone(),
-                payload.clone(),
-                state.config.envelope_ttl_secs,
-            );
-            let expires_at = envelope.expires_at;
-            {
-                let mut store = state.store.write().await;
-                let queue = store.entry(to.clone()).or_default();
-                queue.retain(|e| !e.is_expired() && e.id != msg_id);
-                if queue.len() < state.config.max_envelopes_per_recipient {
-                    queue.push(envelope);
-                } else {
-                    tracing::warn!(
-                        msg_id = %msg_id,
-                        cap    = state.config.max_envelopes_per_recipient,
-                        "store at capacity — envelope dropped"
-                    );
-                }
-            }
-
-            // PR-D0r review fix (2026-05-16): also mirror this WS-sent
-            // envelope into the REST poll store so a recipient on REST
-            // fallback sees messages from WS senders. Without this mirror,
-            // a Tele2-style client that fell back to REST would silently
-            // miss every message routed via the legacy WS path.
             let sequence_ts_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            // `Option<u64>` — `None` only when the helper's defense-in-depth
-            // length guard fires, which is unreachable after the upstream
-            // `msg_id.len()` check above.
-            let _ws_sent_seq: Option<u64> = crate::rest_fallback::mirror_envelope_to_rest_store(
-                state,
-                &to,
-                &msg_id,
-                &sealed_sender,
-                &payload,
+            let now_epoch_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let candidate = crate::m4_adapters::build_send_candidate(
+                msg_id.clone(),
+                sealed_sender.clone(),
+                payload.clone(),
                 sequence_ts_ms,
-                expires_at,
+                now_epoch_secs,
+                state.config.envelope_ttl_secs,
+            );
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if let Err(e) = state.runtime().try_send(crate::rest_workers::RestOp::Send {
+                recipient: to.clone(),
+                candidate,
+                reply: reply_tx,
+            }) {
+                let kind = match crate::m4_adapters::classify_runtime_send_error(&e) {
+                    crate::m4_adapters::RuntimeSendClassification::BackpressureOrShutdown => {
+                        crate::m4_adapters::WsErrorKind::Backpressure
+                    }
+                    crate::m4_adapters::RuntimeSendClassification::IngressBypass => {
+                        crate::m4_adapters::WsErrorKind::IngressBypass
+                    }
+                    crate::m4_adapters::RuntimeSendClassification::Internal => {
+                        crate::m4_adapters::WsErrorKind::Internal
+                    }
+                };
+                if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
+                    let frame = crate::m4_adapters::build_ws_error_frame(&msg_id, kind).to_string();
+                    let _ = sender_tx.send(frame);
+                }
+                return;
+            }
+            let send_result = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reply_rx,
             )
-            .await;
-            // Trek 2 Stage 1 — wake any /relay/poll long-poll waiter for
-            // this recipient so a WS sender → REST recipient flow has
-            // the same sub-50 ms latency as a REST sender → REST recipient
-            // flow. `sequence_ts` quantization happens inside the mirror
-            // helper itself (Q5), so the WS path already gets the same
-            // reduced-precision timestamp in the stored RestEnvelope as
-            // the REST send path.
-            let _ = state.notify_recipient(&to).await;
+            .await
+            {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => {
+                    if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
+                        let frame = crate::m4_adapters::build_ws_error_frame(
+                            &msg_id,
+                            crate::m4_adapters::WsErrorKind::Internal,
+                        )
+                        .to_string();
+                        let _ = sender_tx.send(frame);
+                    }
+                    return;
+                }
+                Err(_) => {
+                    if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
+                        let frame = crate::m4_adapters::build_ws_error_frame(
+                            &msg_id,
+                            crate::m4_adapters::WsErrorKind::Timeout,
+                        )
+                        .to_string();
+                        let _ = sender_tx.send(frame);
+                    }
+                    return;
+                }
+            };
+            // ── PR-2 M4-2b round-1 REDLINE P1-6: typed error → WsErrorKind ──
+            let send_outcome = match send_result {
+                Ok(o) => o,
+                Err(e) => {
+                    let kind = crate::m4_adapters::send_error_to_ws_kind(&e);
+                    if let Some((_, sender_tx)) =
+                        state.clients.read().await.get(from_identity)
+                    {
+                        let frame =
+                            crate::m4_adapters::build_ws_error_frame(&msg_id, kind).to_string();
+                        let _ = sender_tx.send(frame);
+                    }
+                    return;
+                }
+            };
 
-            // Attempt live delivery — best-effort.
+            // ── PR-2 M4-2b round-3 REDLINE: split replay semantics ──
+            //
+            // Round-1's fix collapsed both replay cases. Round-3
+            // splits them:
+            //
+            //   * TombstoneReplay — recipient already Acked.
+            //     Send the sender a `Relayed` ack so their
+            //     idempotency contract is satisfied, but do NOT
+            //     re-deliver / re-wake.
+            //   * QueuedReplay — record still Queued. Re-run
+            //     notify + live-delivery + wake best-effort so
+            //     an unresponsive earlier handler does not leave
+            //     the recipient permanently un-notified. Ack the
+            //     sender at the end (Delivered / Relayed based
+            //     on whether live-delivery landed).
+            //   * Fresh — first commit. Standard path.
+            match send_outcome.disposition {
+                crate::rest_workers::SendDisposition::TombstoneReplay => {
+                    tracing::info!(
+                        event = "ws_send_tombstone_replay",
+                        msg_id = %msg_id,
+                        conn_id = conn_id,
+                        seq = send_outcome.seq,
+                        "recipient already acked; skipping re-delivery"
+                    );
+                    if let Some((_, sender_tx)) =
+                        state.clients.read().await.get(from_identity)
+                    {
+                        let ack = crate::m4_adapters::build_ws_ack_frame(
+                            &msg_id,
+                            crate::m4_adapters::WsAckStatus::Relayed,
+                        )
+                        .to_string();
+                        let _ = sender_tx.send(ack);
+                    }
+                    return;
+                }
+                crate::rest_workers::SendDisposition::QueuedReplay => {
+                    tracing::info!(
+                        event = "ws_send_queued_replay",
+                        msg_id = %msg_id,
+                        conn_id = conn_id,
+                        seq = send_outcome.seq,
+                        "re-running notify + live-delivery + wake best-effort",
+                    );
+                    // Fall through to the delivery path below.
+                }
+                crate::rest_workers::SendDisposition::Fresh => {
+                    // Fall through to the delivery path below.
+                }
+            }
+
+            // Fresh or QueuedReplay — best-effort live delivery + wake.
+            let _ = state.notify_recipient(&to).await;
             let delivered = {
                 let clients = state.clients.read().await;
                 if let Some((_, recipient_tx)) = clients.get(&to) {
@@ -1163,9 +1248,12 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                     false
                 }
             };
-
             if delivered {
-                tracing::info!(msg_id = %msg_id, conn_id = conn_id, "live delivery dispatched (envelope retained until client ack-deliver)");
+                tracing::info!(
+                    msg_id = %msg_id,
+                    conn_id = conn_id,
+                    "live delivery dispatched (envelope retained until client ack-deliver)"
+                );
             } else {
                 let online_count = state.clients.read().await.len();
                 tracing::info!(
@@ -1173,24 +1261,17 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                     online_count,
                     "recipient offline — queued for next reconnect"
                 );
-
-                // ADR-016 UnifiedPush wake-up. Self-hosted ntfy distributor
-                // at `state.config.ntfy_url`; one-byte payload; fire-and-
-                // forget. The envelope is already durably queued above;
-                // this is a hint to the recipient device that a message
-                // is waiting, not a delivery primitive. See push.rs for
-                // privacy boundary and rationale.
                 wake_offline_recipient(Arc::clone(state), to.clone());
             }
-
-            // Ack back to sender
+            // Ack back to sender — Gate #3 preserves the pre-M4
+            // {type,messageId,status} shape via WsAckStatus.
+            let status = if delivered {
+                crate::m4_adapters::WsAckStatus::Delivered
+            } else {
+                crate::m4_adapters::WsAckStatus::Relayed
+            };
             if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
-                let ack = serde_json::json!({
-                    "type": "ack",
-                    "messageId": msg_id,
-                    "status": if delivered { "delivered" } else { "relayed" },
-                })
-                .to_string();
+                let ack = crate::m4_adapters::build_ws_ack_frame(&msg_id, status).to_string();
                 let _ = sender_tx.send(ack);
             }
         }
@@ -1228,29 +1309,103 @@ async fn handle_message(text: &str, from_identity: &str, conn_id: u64, state: &A
                 key     = %&from_identity[..from_identity.len().min(16)],
                 "ack_deliver_received"
             );
-            let removed = {
-                let mut store = state.store.write().await;
-                if let Some(queue) = store.get_mut(from_identity) {
-                    let before = queue.len();
-                    queue.retain(|e| e.id != msg_id);
-                    before != queue.len()
-                } else {
-                    false
+            // ── PR-2 M4-2b atomic activation: WS Ack ──
+            //
+            // Dispatch through `runtime.try_send(RestOp::Ack)`.
+            // Pre-M4 WS Ack was fire-and-forget with no reply
+            // frame on success; that shape is preserved for
+            // the happy path. Failures (timeout / dropped
+            // oneshot / typed AckError) emit `WsErrorKind`
+            // error frames so the client can react instead of
+            // silently retrying against a broken relay.
+            //
+            // Round-1 REDLINE P1-5: the pre-fix shape
+            // discarded every runtime outcome and always logged
+            // `ack_deliver_dispatched`. The full match below
+            // makes each branch observable.
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if let Err(e) = state.runtime().try_send(crate::rest_workers::RestOp::Ack {
+                recipient: from_identity.to_string(),
+                envelope_id: msg_id.clone(),
+                reply: reply_tx,
+            }) {
+                let kind = match crate::m4_adapters::classify_runtime_send_error(&e) {
+                    crate::m4_adapters::RuntimeSendClassification::BackpressureOrShutdown => {
+                        crate::m4_adapters::WsErrorKind::Backpressure
+                    }
+                    crate::m4_adapters::RuntimeSendClassification::IngressBypass => {
+                        crate::m4_adapters::WsErrorKind::IngressBypass
+                    }
+                    crate::m4_adapters::RuntimeSendClassification::Internal => {
+                        crate::m4_adapters::WsErrorKind::Internal
+                    }
+                };
+                if let Some((_, sender_tx)) = state.clients.read().await.get(from_identity) {
+                    let frame = crate::m4_adapters::build_ws_error_frame(&msg_id, kind).to_string();
+                    let _ = sender_tx.send(frame);
                 }
-            };
-            // PR-D0r review fix (2026-05-16): also clear the REST poll
-            // store so a subsequent /relay/poll from the SAME recipient
-            // does not re-deliver an envelope already acked over WS.
-            let _rest_removed = crate::rest_fallback::remove_envelope_from_rest_store(
-                state,
-                from_identity,
-                &msg_id,
-            )
-            .await;
-            if removed {
-                tracing::info!(msg_id = %msg_id, conn_id = conn_id, "ack_deliver_removed_from_store");
-            } else {
-                tracing::info!(msg_id = %msg_id, conn_id = conn_id, "ack_deliver_no_match (envelope already removed or wrong identity)");
+                return;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+                Ok(Ok(Ok(_ack_outcome))) => {
+                    tracing::info!(
+                        msg_id = %msg_id,
+                        conn_id = conn_id,
+                        "ack_deliver_dispatched"
+                    );
+                }
+                Ok(Ok(Err(e))) => {
+                    let kind = crate::m4_adapters::ack_error_to_ws_kind(&e);
+                    if let Some((_, sender_tx)) =
+                        state.clients.read().await.get(from_identity)
+                    {
+                        let frame =
+                            crate::m4_adapters::build_ws_error_frame(&msg_id, kind).to_string();
+                        let _ = sender_tx.send(frame);
+                    }
+                    tracing::warn!(
+                        msg_id = %msg_id,
+                        conn_id = conn_id,
+                        error = ?e,
+                        "ack_deliver_runtime_error"
+                    );
+                }
+                Ok(Err(_)) => {
+                    // Dropped oneshot — runtime abandoned the reply.
+                    if let Some((_, sender_tx)) =
+                        state.clients.read().await.get(from_identity)
+                    {
+                        let frame = crate::m4_adapters::build_ws_error_frame(
+                            &msg_id,
+                            crate::m4_adapters::WsErrorKind::Internal,
+                        )
+                        .to_string();
+                        let _ = sender_tx.send(frame);
+                    }
+                    tracing::warn!(
+                        msg_id = %msg_id,
+                        conn_id = conn_id,
+                        "ack_deliver_reply_dropped"
+                    );
+                }
+                Err(_) => {
+                    // Deadline elapsed.
+                    if let Some((_, sender_tx)) =
+                        state.clients.read().await.get(from_identity)
+                    {
+                        let frame = crate::m4_adapters::build_ws_error_frame(
+                            &msg_id,
+                            crate::m4_adapters::WsErrorKind::Timeout,
+                        )
+                        .to_string();
+                        let _ = sender_tx.send(frame);
+                    }
+                    tracing::warn!(
+                        msg_id = %msg_id,
+                        conn_id = conn_id,
+                        "ack_deliver_reply_timeout"
+                    );
+                }
             }
         }
         Some("typing") => {

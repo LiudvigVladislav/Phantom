@@ -34,6 +34,17 @@ services:
     image: phantom-relay:latest
     container_name: phantom-relay
     restart: unless-stopped
+    # PR-2 M4-4 round-1 REDLINE P1-1: `docker stop` and `docker compose
+    # down` default to SIGTERM followed by SIGKILL after 10s. The relay's
+    # M4-4 shutdown contract (v4.2.1 §1) is a 45s absolute deadline
+    # measured from signal — listener drain + sweep scheduler join +
+    # worker drain. If Compose kills the container after 10s, the drain
+    # never gets to run and the 45s contract is fiction in production.
+    # Set a grace period comfortably above the deadline (60s > 45s) so
+    # SIGKILL only fires as a last resort AFTER our own FATAL branch
+    # already ran. Overridable per operator via a compose override file
+    # if a specific deploy wants a different budget.
+    stop_grace_period: 60s
     env_file:
       - .env
     # Production: no PUBLIC host port binding. Caddy reaches the relay on the

@@ -48,7 +48,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    envelope::Envelope,
     push::wake_offline_recipient,
     state::{AppState, RateEntry},
 };
@@ -749,16 +748,6 @@ pub struct RestEnvelope {
     pub seq_mac: String,
 }
 
-impl RestEnvelope {
-    fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now >= self.expires_at
-    }
-}
-
 // ── Store-mirror helpers (used by BOTH WS and REST send/ack paths) ───────────
 //
 // PR-D0r review fix (2026-05-16): originally `rest_send` wrote to both
@@ -782,129 +771,12 @@ impl RestEnvelope {
 /// Per-recipient capacity is enforced exactly the same way as the inline
 /// write in `rest_send` previously did: a dedup retain on `envelope_id`
 /// followed by a length check against `config.max_envelopes_per_recipient`.
-pub async fn mirror_envelope_to_rest_store(
-    state: &AppState,
-    to: &str,
-    envelope_id: &str,
-    sealed_sender: &str,
-    payload: &str,
-    sequence_ts: u64,
-    expires_at: u64,
-) -> Option<u64> {
-    // Trek 2 Stage 1.x review fix — `envelope_id` reaches this helper
-    // from both REST `/relay/send` (validated upstream) and WS Send
-    // (validated upstream as of the same review). A defense-in-depth
-    // check here means an oversized id from a future caller cannot
-    // reach `compute_seq_mac` and panic the relay; we log and skip the
-    // mirror instead. Returning `None` signals "no MAC produced, no
-    // mirror written"; the WS store entry is still authoritative for
-    // recipients on the WS path.
-    if envelope_id.len() > crate::seq_mac::ENVELOPE_ID_MAX_BYTES {
-        tracing::error!(
-            event            = "mirror_envelope_id_too_long",
-            envelope_id_len  = envelope_id.len(),
-            envelope_id_max  = crate::seq_mac::ENVELOPE_ID_MAX_BYTES,
-            "envelope_id exceeds seq_mac u16-BE length-prefix capacity — \
-             upstream guard missed; mirror skipped to avoid panic on \
-             compute_seq_mac",
-        );
-        return None;
-    }
-
-    let seq = state.rest_seq.next(to).await;
-    // Trek 2 Stage 1 Q5 lock — quantize `sequence_ts` to the nearest
-    // 60-second boundary on the ONE shared storage path so both REST
-    // `/relay/send` and WS send (which both flow through this helper)
-    // produce identical reduced-precision timestamps in the stored
-    // RestEnvelope. Server-side, unconditional — the relay does not
-    // trust the client to pre-quantize (Q7 of security-reviewer).
-    let sequence_ts = quantize_sequence_ts_to_60s(sequence_ts);
-
-    // Trek 2 Stage 1.x Lock-1 — compute the `seq_mac` integrity tag at
-    // STORE time over the canonical
-    // `(identity_hex, seq, envelope_id, sequence_ts)` tuple and persist
-    // it in the `seq_mac` column on `RestEnvelope`. The poll-response
-    // path (`drain_eligible`) reads this column verbatim — it does NOT
-    // recompute the MAC at response time.
-    //
-    // Why store-time and not response-time: response-time computation
-    // would HMAC over whatever the DB returns, including already-
-    // corrupted values; a client receiving such a MAC would verify
-    // successfully and consume the corrupted envelope. Store-time
-    // computation creates a persistent integrity anchor — any
-    // subsequent mutation to `envelope_id`, `seq`, or `sequence_ts`
-    // without also recomputing this column produces a mismatch when
-    // the client verifies on receive.
-    //
-    // Per-identity verify key derivation goes through the relay-side
-    // root key; the root key never leaves this process. The same
-    // derived key is published to the client in
-    // `SessionResponse.seq_mac_verify_key` (see `rest_session`) so the
-    // client can verify on receive.
-    let verify_key = state.config.seq_mac_key.derive_verify_key(to);
-    let seq_mac_bytes = match verify_key.compute_seq_mac(to, seq, envelope_id, sequence_ts) {
-        Ok(b) => b,
-        Err(err) => {
-            // Unreachable in steady state — the upstream length check
-            // above plus the REST/WS request-boundary guards already
-            // reject oversized envelope_ids. But the contract here is
-            // "never panic on client-controlled input"; log and skip.
-            tracing::error!(
-                event            = "mirror_compute_seq_mac_failed",
-                envelope_id_len  = envelope_id.len(),
-                error            = %err,
-                "compute_seq_mac returned Err inside the mirror — \
-                 mirror skipped (defense-in-depth, should be unreachable)",
-            );
-            return None;
-        }
-    };
-    let seq_mac = crate::seq_mac::seq_mac_to_hex(&seq_mac_bytes);
-
-    let rest_env = RestEnvelope {
-        id: envelope_id.to_string(),
-        from: String::new(),
-        sealed_sender: sealed_sender.to_string(),
-        payload: payload.to_string(),
-        sequence_ts,
-        seq,
-        expires_at,
-        seq_mac,
-    };
-    let mut rest_store = state.rest_store.write().await;
-    let queue = rest_store.entry(to.to_string()).or_default();
-    // Dedup by envelope id (idempotency at the mirror layer too).
-    queue.retain(|e: &RestEnvelope| !e.is_expired() && e.id != envelope_id);
-    if queue.len() < state.config.max_envelopes_per_recipient {
-        queue.push(rest_env);
-    } else {
-        tracing::warn!(
-            envelope_id = %envelope_id,
-            cap         = state.config.max_envelopes_per_recipient,
-            "rest_store at capacity — mirror dropped"
-        );
-    }
-    Some(seq)
-}
-
-/// Remove an envelope from `state.rest_store` for `recipient` — the
-/// counterpart to [`mirror_envelope_to_rest_store`]. Called when an ACK
-/// arrives over EITHER transport so the recipient's REST poll does not
-/// re-deliver an already-processed envelope. Idempotent (removing a
-/// non-existent entry is a no-op).
-pub async fn remove_envelope_from_rest_store(
-    state: &AppState,
-    recipient: &str,
-    envelope_id: &str,
-) -> bool {
-    let mut rest_store = state.rest_store.write().await;
-    let Some(queue) = rest_store.get_mut(recipient) else {
-        return false;
-    };
-    let before = queue.len();
-    queue.retain(|e| e.id != envelope_id);
-    before != queue.len()
-}
+// PR-2 M4-2b atomic activation: `mirror_envelope_to_rest_store` and
+// `remove_envelope_from_rest_store` were deleted. Every mutation of
+// `state.rest_store` / `state.store` now routes through the
+// `WorkerRuntime` via `runtime.try_send(RestOp::Send | Ack | Sweep)`,
+// which owns the disk write, the active_index / tombstone_dedup
+// updates, and the ledger transitions atomically.
 
 // ── AppState extension ────────────────────────────────────────────────────────
 //
@@ -1462,39 +1334,29 @@ pub async fn poll_hold_loop(
 /// Also purges expired envelopes from the queue as a side-effect — the
 /// existing handler did this each call, so the long-poll path preserves
 /// the same TTL-enforcement cadence.
+/// **PR-2 M4-2b atomic activation**: poll paths are strictly
+/// read-only. TTL expiry (which used to run here as
+/// `queue.retain(|e| !e.is_expired())`) moves to
+/// `runtime.try_send(RestOp::Sweep)` — dispatched from M4-3's
+/// scheduler. This function only clones eligible envelopes;
+/// no store mutation happens on the poll code path.
 async fn drain_eligible(
     state: &Arc<AppState>,
     recipient: &str,
     since_seq: u64,
 ) -> Option<(Vec<PollEnvelope>, bool)> {
-    let mut rest_store = state.rest_store.write().await;
-    let queue = rest_store.entry(recipient.to_string()).or_default();
-    queue.retain(|e| !e.is_expired());
-    let eligible: Vec<&RestEnvelope> = queue.iter().filter(|e| e.seq > since_seq).collect();
-    if eligible.is_empty() {
-        return None;
-    }
-    let more = eligible.len() > POLL_MAX_ENVELOPES;
-    let batch: Vec<PollEnvelope> = eligible
-        .into_iter()
-        .take(POLL_MAX_ENVELOPES)
-        .map(|e| PollEnvelope {
-            id: e.id.clone(),
-            from: e.from.clone(),
-            sealed_sender: e.sealed_sender.clone(),
-            payload: e.payload.clone(),
-            sequence_ts: e.sequence_ts,
-            seq: e.seq,
-            // Trek 2 Stage 1.x Lock-1 — read the stored MAC verbatim;
-            // store-time computation is the persistent integrity anchor.
-            // Recomputing here would silently re-sign over whatever the
-            // DB currently returns, collapsing the DB-tamper scope to
-            // "tamper between drain and wire" — a far narrower threat
-            // than the wording on `PollEnvelope::seq_mac` promises.
-            seq_mac: e.seq_mac.clone(),
-        })
-        .collect();
-    Some((batch, more))
+    let rest_store = state.rest_store.read().await;
+    let queue = rest_store.get(recipient)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    crate::m4_adapters::read_eligible_from_snapshot(
+        queue.as_slice(),
+        since_seq,
+        now,
+        POLL_MAX_ENVELOPES,
+    )
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -2083,57 +1945,130 @@ pub async fn rest_send(
             .into_response();
     }
 
-    // Persist to the shared envelope store (extend existing in-memory store).
-    // The `from` field stays empty because the relay never inspects sender
-    // identity; the `sealed_sender` blob is what the recipient unseals to
-    // recover it. PR-D0r review fix (2026-05-16): `sealed_sender` from the
-    // request body is now propagated end-to-end through both stores and the
-    // live-delivery JSON so sealed-mode messages decrypt correctly on the
-    // recipient.
-    let envelope = Envelope::new(
+    // ── PR-2 M4-2b atomic activation: dispatch through the runtime ──
+    //
+    // Empty `sealed_sender` is rejected at the handler layer (Gate #4)
+    // BEFORE `runtime.try_send` so the runtime's ingress-hardening
+    // check never fires from this path in production.
+    if req.sealed_sender.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "sealed_sender required" })),
+        )
+            .into_response();
+    }
+
+    let now_epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let candidate = crate::m4_adapters::build_send_candidate(
         req.envelope_id.clone(),
-        req.to.clone(),
-        String::new(),
         req.sealed_sender.clone(),
         req.payload.clone(),
+        req.sequence_ts,
+        now_epoch_secs,
         state.config.envelope_ttl_secs,
     );
 
-    // Mirror into the REST poll store via the shared helper so a recipient
-    // on REST polling always sees the same envelope as a WS-reconnect client.
-    // `None` here means the defense-in-depth guard inside the helper
-    // detected an oversized envelope_id (already rejected upstream). The
-    // request still completes — only the REST mirror is skipped.
-    let mirrored_seq = mirror_envelope_to_rest_store(
-        &state,
-        &req.to,
-        &req.envelope_id,
-        &req.sealed_sender,
-        &req.payload,
-        req.sequence_ts,
-        envelope.expires_at,
-    )
-    .await;
-
-    // Trek 2 Stage 1 — wake any in-flight `/relay/poll` long-poll waiter
-    // for this recipient. Best-effort: if no waiter exists (offline /
-    // short-poll client), this is a no-op and the envelope is picked up
-    // on the next poll cycle. Read-lock-only to keep the send path hot.
-    let _ = state.notify_recipient(&req.to).await;
-
-    // Also persist in the shared WS store so /ws reconnects see the same
-    // envelope as a REST poller.
-    {
-        let mut store = state.store.write().await;
-        let queue = store.entry(req.to.clone()).or_default();
-        queue.retain(|e| !e.is_expired() && e.id != req.envelope_id);
-        if queue.len() < state.config.max_envelopes_per_recipient {
-            queue.push(envelope);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = state.runtime().try_send(crate::rest_workers::RestOp::Send {
+        recipient: req.to.clone(),
+        candidate,
+        reply: reply_tx,
+    }) {
+        let shape = crate::m4_adapters::runtime_send_error_to_http(&e);
+        return (
+            axum::http::StatusCode::from_u16(shape.status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(serde_json::json!({ "error": shape.message })),
+        )
+            .into_response();
+    }
+    let outcome = match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(_)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "reply channel dropped" })),
+            )
+                .into_response();
         }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({ "error": "runtime reply deadline exceeded" })),
+            )
+                .into_response();
+        }
+    };
+    let send_outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            let shape = crate::m4_adapters::send_error_to_http(&e);
+            return (
+                axum::http::StatusCode::from_u16(shape.status).unwrap_or(StatusCode::BAD_REQUEST),
+                Json(serde_json::json!({ "error": shape.message })),
+            )
+                .into_response();
+        }
+    };
+
+    // ── PR-2 M4-2b round-3 REDLINE: split replay semantics ──
+    //
+    // Round-1's fix collapsed Queued and Tombstone replay into
+    // the same "skip delivery" branch. Round-3 (architect P1)
+    // splits them by `SendDisposition`:
+    //
+    //   * TombstoneReplay — recipient already Acked. Do not
+    //     re-deliver; the sender's idempotency contract is
+    //     satisfied by returning 200 with the prior seq.
+    //   * QueuedReplay — record is still Queued, awaiting
+    //     recipient ack. Re-run notify + live-delivery + push
+    //     best-effort so a prior handler timeout or dropped-
+    //     oneshot doesn't leave the recipient's live WS
+    //     session or offline push permanently un-notified.
+    //     Still return 200 (replay status) so the sender sees
+    //     the idempotency contract honoured.
+    //   * Fresh — first-ever commit. Standard notify + live +
+    //     push, return 201.
+    match send_outcome.disposition {
+        crate::rest_workers::SendDisposition::TombstoneReplay => {
+            tracing::info!(
+                event       = "rest_send_tombstone_replay",
+                envelope_id = %req.envelope_id,
+                from        = %&sender_identity[..8.min(sender_identity.len())],
+                to          = %&req.to[..8.min(req.to.len())],
+                seq         = send_outcome.seq,
+            );
+            let resp_json = serde_json::json!({ "ok": 1 });
+            state
+                .rest_idempotency
+                .put(&sender_identity, &idem_key, body_hash, 200, resp_json.clone())
+                .await;
+            return (StatusCode::OK, Json(resp_json)).into_response();
+        }
+        crate::rest_workers::SendDisposition::QueuedReplay => {
+            // Fall through to notify + live-delivery + push
+            // below, but return 200 at the end (not 201).
+            tracing::info!(
+                event       = "rest_send_queued_replay",
+                envelope_id = %req.envelope_id,
+                from        = %&sender_identity[..8.min(sender_identity.len())],
+                to          = %&req.to[..8.min(req.to.len())],
+                seq         = send_outcome.seq,
+                "re-running notify + live-delivery + push best-effort",
+            );
+        }
+        crate::rest_workers::SendDisposition::Fresh => { /* fresh below */ }
     }
 
-    // Live delivery via WS if recipient is currently online. The WS client
-    // expects `sealedSender` in the deliver frame for sealed-mode messages.
+    // Fresh commit or QueuedReplay — proceed with notify +
+    // live-delivery + push (best-effort in the replay case).
+
+    // Trek 2 Stage 1 — wake any in-flight `/relay/poll` long-poll waiter.
+    let _ = state.notify_recipient(&req.to).await;
+
+    // Live delivery via WS if recipient is currently online.
     let deliver = serde_json::json!({
         "type":         "deliver",
         "from":         "",
@@ -2150,30 +2085,43 @@ pub async fn rest_send(
             false
         }
     };
-
     if !delivered {
         wake_offline_recipient(Arc::clone(&state), req.to.clone());
     }
 
+    let is_replay = matches!(
+        send_outcome.disposition,
+        crate::rest_workers::SendDisposition::QueuedReplay
+    );
+
     tracing::info!(
-        event       = "rest_send_accepted",
+        event       = if is_replay { "rest_send_queued_replay_delivered" } else { "rest_send_accepted" },
         envelope_id = %req.envelope_id,
         from        = %&sender_identity[..8.min(sender_identity.len())],
         to          = %&req.to[..8.min(req.to.len())],
         size_b      = body.len(),
-        seq         = mirrored_seq.unwrap_or(0),
-        mirrored    = mirrored_seq.is_some(),
+        seq         = send_outcome.seq,
+        idempotent_replay = is_replay,
     );
 
     let resp_json = serde_json::json!({ "ok": 1 });
-
-    // Store in idempotency cache (TTL 24h, LRU cap 10K per identity).
+    let status_code = if is_replay {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let cache_status = status_code.as_u16();
     state
         .rest_idempotency
-        .put(&sender_identity, &idem_key, body_hash, 201, resp_json.clone())
+        .put(
+            &sender_identity,
+            &idem_key,
+            body_hash,
+            cache_status,
+            resp_json.clone(),
+        )
         .await;
-
-    (StatusCode::CREATED, Json(resp_json)).into_response()
+    (status_code, Json(resp_json)).into_response()
 }
 
 /// GET /relay/poll?since_seq=<n>
@@ -2512,39 +2460,62 @@ pub async fn rest_ack_deliver(
         envelope_id = %req.id,
     );
 
-    // Remove from REST-specific store.
-    let removed_rest = {
-        let mut rest_store = state.rest_store.write().await;
-        if let Some(queue) = rest_store.get_mut(&recipient_identity) {
-            let before = queue.len();
-            queue.retain(|e| e.id != req.id);
-            before != queue.len()
-        } else {
-            false
+    // ── PR-2 M4-2b atomic activation: dispatch through the runtime ──
+    //
+    // `runtime.try_send(RestOp::Ack)` owns the on-disk tombstone
+    // write + RAM store cleanup + active_index / tombstone_dedup
+    // updates. The pre-M4 wire is preserved: every success
+    // (Acked, Idempotent replay, NotFound) maps to 200 with
+    // `{"ok":1}` per `ack_outcome_to_http`.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = state.runtime().try_send(crate::rest_workers::RestOp::Ack {
+        recipient: recipient_identity.clone(),
+        envelope_id: req.id.clone(),
+        reply: reply_tx,
+    }) {
+        let shape = crate::m4_adapters::runtime_send_error_to_http(&e);
+        return (
+            axum::http::StatusCode::from_u16(shape.status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(serde_json::json!({ "error": shape.message })),
+        )
+            .into_response();
+    }
+    let outcome = match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(_)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "reply channel dropped" })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({ "error": "runtime reply deadline exceeded" })),
+            )
+                .into_response();
         }
     };
-
-    // Also remove from shared WS store (so WS reconnect doesn't redeliver).
-    {
-        let mut store = state.store.write().await;
-        if let Some(queue) = store.get_mut(&recipient_identity) {
-            queue.retain(|e| e.id != req.id);
+    match outcome {
+        Ok(ack_outcome) => {
+            let ok_shape = crate::m4_adapters::ack_outcome_to_http(&ack_outcome);
+            (
+                axum::http::StatusCode::from_u16(ok_shape.status).unwrap_or(StatusCode::OK),
+                Json(serde_json::json!({ "ok": 1 })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let shape = crate::m4_adapters::ack_error_to_http(&e);
+            (
+                axum::http::StatusCode::from_u16(shape.status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(serde_json::json!({ "error": shape.message })),
+            )
+                .into_response()
         }
     }
-
-    if removed_rest {
-        tracing::info!(
-            event       = "rest_ack_deliver_removed",
-            envelope_id = %req.id,
-        );
-    } else {
-        tracing::debug!(
-            event       = "rest_ack_deliver_already_removed",
-            envelope_id = %req.id,
-        );
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({ "ok": 1 }))).into_response()
 }
 
 // ── Time helpers ──────────────────────────────────────────────────────────────

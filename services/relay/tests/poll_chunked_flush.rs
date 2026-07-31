@@ -67,7 +67,6 @@ use phantom_relay::rest_fallback::{
 };
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -76,7 +75,7 @@ use tower::ServiceExt;
 fn build_app_with_chunked_flush(poll_chunked_flush: bool) -> axum::Router {
     let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
     cfg.poll_chunked_flush = poll_chunked_flush;
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 

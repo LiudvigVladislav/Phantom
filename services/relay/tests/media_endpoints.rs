@@ -23,7 +23,6 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer, Signature, SigningKey};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tower::ServiceExt;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -33,7 +32,7 @@ fn build_app() -> axum::Router {
 }
 
 fn build_app_with_config(cfg: phantom_relay::config::RelayConfig) -> axum::Router {
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 
