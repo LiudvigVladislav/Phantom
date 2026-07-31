@@ -1041,6 +1041,17 @@ pub(crate) fn check_preflight_covers_runtime(
     violations
 }
 
+/// **PR-2 M6-1**: single source of truth for both the preflight
+/// and the runtime RAM-budget defaults. Value calibrated by
+/// PR-2 M5b Mac/Docker benchmark against `--memory 512m`
+/// (worst-case scenario `small-broad`, observed ratio 4.4908×,
+/// cgroup peak was limiting probe): a 128 MiB safety margin
+/// yields a candidate budget of 84.37 MiB, floored to a
+/// conservative 16 MiB step. See
+/// `docs/adr/ADR-027-relay-queue-durability-and-ram-budget.md`
+/// (M6-3) for the calibration record.
+const DEFAULT_RELAY_RAM_BUDGET_BYTES: u64 = 80 * 1024 * 1024;
+
 /// **M4-2b round-2 P0-1**: preflight cap defaults. Chosen at
 /// the same values as the runtime cap defaults below so the
 /// `preflight >= runtime` invariant holds when the operator
@@ -1049,12 +1060,13 @@ pub(crate) fn check_preflight_covers_runtime(
 /// Envs (fail-closed on malformed / non-UTF-8):
 ///   * `RELAY_PREFLIGHT_MAX_ENVELOPES`  (default 100_000)
 ///   * `RELAY_PREFLIGHT_MAX_BYTES`      (default 384 MiB)
-///   * `RELAY_PREFLIGHT_RAM_BUDGET`     (default 384 MiB)
+///   * `RELAY_PREFLIGHT_RAM_BUDGET`     (default 80 MiB —
+///     `DEFAULT_RELAY_RAM_BUDGET_BYTES`, PR-2 M6-1)
 fn preflight_caps_from_env() -> boot_loader::PreflightCaps {
     boot_loader::PreflightCaps {
         max_envelopes: parse_u64_env("RELAY_PREFLIGHT_MAX_ENVELOPES", 100_000),
         max_bytes: parse_u64_env("RELAY_PREFLIGHT_MAX_BYTES", 384 * 1024 * 1024),
-        ram_budget: parse_u64_env("RELAY_PREFLIGHT_RAM_BUDGET", 384 * 1024 * 1024),
+        ram_budget: parse_u64_env("RELAY_PREFLIGHT_RAM_BUDGET", DEFAULT_RELAY_RAM_BUDGET_BYTES),
     }
 }
 
@@ -1100,12 +1112,17 @@ fn ownership_from_env() -> boot_loader::OwnershipExpectation {
 /// Envs (fail-closed on malformed / non-UTF-8):
 ///   * `RELAY_QUEUE_MAX_ENVELOPES`     (default 100_000)
 ///   * `RELAY_QUEUE_MAX_BYTES`         (default 384 MiB)
-///   * `RELAY_QUEUE_RAM_BUDGET_BYTES`  (default 384 MiB, under 512 MiB)
+///   * `RELAY_QUEUE_RAM_BUDGET_BYTES`  (default 80 MiB —
+///     `DEFAULT_RELAY_RAM_BUDGET_BYTES`, PR-2 M6-1; well
+///     under the 512 MiB compose ceiling)
 fn capacity_caps_from_env() -> capacity_ledger::CapacityCaps {
     capacity_ledger::CapacityCaps {
         max_envelopes: parse_u64_env("RELAY_QUEUE_MAX_ENVELOPES", 100_000),
         max_bytes: parse_u64_env("RELAY_QUEUE_MAX_BYTES", 384 * 1024 * 1024),
-        ram_budget: parse_u64_env("RELAY_QUEUE_RAM_BUDGET_BYTES", 384 * 1024 * 1024),
+        ram_budget: parse_u64_env(
+            "RELAY_QUEUE_RAM_BUDGET_BYTES",
+            DEFAULT_RELAY_RAM_BUDGET_BYTES,
+        ),
     }
 }
 
@@ -1197,14 +1214,19 @@ mod tests {
     #[serial]
     fn preflight_caps_defaults_are_below_compose_ceiling() {
         // Fail-closed defaults chosen deliberately below the
-        // compose-file 512 MiB memory ceiling.
+        // compose-file 512 MiB memory ceiling. PR-2 M6-1
+        // recalibrated `ram_budget` to
+        // `DEFAULT_RELAY_RAM_BUDGET_BYTES` (80 MiB) — pinning it
+        // in this test guards against a silent revert to the
+        // pre-M6 384 MiB default the measurement rejected.
         std::env::remove_var("RELAY_PREFLIGHT_MAX_ENVELOPES");
         std::env::remove_var("RELAY_PREFLIGHT_MAX_BYTES");
         std::env::remove_var("RELAY_PREFLIGHT_RAM_BUDGET");
         let caps = preflight_caps_from_env();
         assert_eq!(caps.max_envelopes, 100_000);
         assert_eq!(caps.max_bytes, 384 * 1024 * 1024);
-        assert_eq!(caps.ram_budget, 384 * 1024 * 1024);
+        assert_eq!(caps.ram_budget, DEFAULT_RELAY_RAM_BUDGET_BYTES);
+        assert_eq!(caps.ram_budget, 83_886_080);
         assert!(
             caps.ram_budget < 512 * 1024 * 1024,
             "ram_budget must stay below 512 MiB compose ceiling"
@@ -1229,13 +1251,19 @@ mod tests {
     #[test]
     #[serial]
     fn capacity_caps_defaults_are_below_compose_ceiling() {
+        // PR-2 M6-1: runtime `ram_budget` now shares the M5b-
+        // calibrated `DEFAULT_RELAY_RAM_BUDGET_BYTES` with the
+        // preflight parser. The literal byte-count is pinned in
+        // parallel with the constant so a future accidental
+        // change to the constant surfaces in this test.
         std::env::remove_var("RELAY_QUEUE_MAX_ENVELOPES");
         std::env::remove_var("RELAY_QUEUE_MAX_BYTES");
         std::env::remove_var("RELAY_QUEUE_RAM_BUDGET_BYTES");
         let caps = capacity_caps_from_env();
         assert_eq!(caps.max_envelopes, 100_000);
         assert_eq!(caps.max_bytes, 384 * 1024 * 1024);
-        assert_eq!(caps.ram_budget, 384 * 1024 * 1024);
+        assert_eq!(caps.ram_budget, DEFAULT_RELAY_RAM_BUDGET_BYTES);
+        assert_eq!(caps.ram_budget, 83_886_080);
         assert!(
             caps.ram_budget < 512 * 1024 * 1024,
             "ram_budget must stay below 512 MiB compose ceiling"

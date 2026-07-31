@@ -116,6 +116,23 @@ services:
       # prekeys.jsonl to. MUST match the volume target above. See
       # `docs/tracks/rc-relay-state-dir-repair.md` §5.2.
       RELAY_STATE_DIR: /var/phantom
+      # RC-RELAY-QUEUE-DURABILITY PR-2 M6-1: RAM-budget defaults pinned
+      # explicitly rather than left to code defaults. Value 83886080
+      # (80 MiB) calibrated by PR-2 M5b Mac/Docker benchmark under the
+      # `--memory 512m` cgroup limit above (see
+      # `docs/adr/ADR-027-relay-queue-durability-and-ram-budget.md` for
+      # the calibration record; re-calibration procedure in
+      # `docs/tracks/rc-relay-queue-ram-recalibration.md`). Both keys
+      # must move together and equal
+      # `DEFAULT_RELAY_RAM_BUDGET_BYTES` in `services/relay/src/main.rs`;
+      # the CI `ram-budget-invariants` gate (M6-2, deploy-lint.yml)
+      # asserts the three-way equality end-to-end via
+      # `docker compose config --format json`. The pre-M6 384 MiB
+      # default was rejected by measurement (worst scenario
+      # `small-broad` observed ratio 4.4908×, cgroup peak was the
+      # limiting probe).
+      RELAY_QUEUE_RAM_BUDGET_BYTES: "83886080"
+      RELAY_PREFLIGHT_RAM_BUDGET: "83886080"
     # RC-RELAY-STATE-DIR-REPAIR Ops-PR: memory ceiling on the relay
     # container. Two reasons:
     #   1. Bounded RAM growth. A hypothetical leak or a large queue

@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Willen LLC
 
 use serde::{Deserialize, Serialize};
+
+// `Deserialize` and `Serialize` remain in use by `Envelope`
+// itself; the round-1 REDLINE removed only the three legacy
+// DTO wrappers built on top of the base type.
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A stored envelope — ciphertext only, relay never inspects payload.
@@ -56,29 +60,14 @@ impl Envelope {
     }
 }
 
-/// Request body for POST /send
-#[derive(Debug, Deserialize)]
-pub struct SendRequest {
-    pub id: String,
-    pub to: String,
-    /// Empty string for sealed-sender messages.
-    #[serde(default)]
-    pub from: String,
-    /// Opaque sealed-sender blob (base64). Mutually exclusive with `from`.
-    /// The relay stores this verbatim without inspection.
-    #[serde(default)]
-    pub sealed_sender: String,
-    pub payload: String,
-}
-
-/// Response body for GET /fetch/:recipient
-#[derive(Debug, Serialize)]
-pub struct FetchResponse {
-    pub envelopes: Vec<Envelope>,
-}
-
-/// Response body for DELETE /ack/:id
-#[derive(Debug, Serialize)]
-pub struct AckResponse {
-    pub acknowledged: String,
-}
+// PR-2 M6-3 round-1 REDLINE P1-1: the legacy admin-token-guarded
+// POST /send / GET /fetch/:recipient / DELETE /ack/:id endpoints
+// were removed together with their handler fns in
+// `services/relay/src/routes.rs`. The three DTO types
+// (`SendRequest` / `FetchResponse` / `AckResponse`) that they
+// carried are gone with them; nothing else in the crate uses
+// them. The primary transport paths are the WS handler
+// (`handle_socket`) and the REST fallback endpoints
+// (`/relay/session`, `/relay/send`, `/relay/poll`,
+// `/relay/ack-deliver`) which route through the shard-worker
+// runtime.
