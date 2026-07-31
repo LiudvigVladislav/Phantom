@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# PR-2 M6-2 -- relay code invariants gate.
+#
+# Runs `scripts/relay_invariants.py` (five scoped tripwires:
+# I1 tempfile policy, I2 store-mutation, I3 Rust-vs-compose
+# equality, I4 bench-harness leak, I5 env-reference coverage)
+# plus its unittest suite. See scripts/tests/test_relay_invariants.py
+# for the fixture set.
+#
+# The docker-compose-normalised ram-budget check lives in the
+# separate `ram-budget-invariants` job of deploy-lint.yml; both
+# jobs must be green before a PR touching either surface can
+# merge (branch protection ruleset).
+#
+# Paths filter mirrors the relay.yml / deploy-lint.yml pattern:
+# PR trigger fires unconditionally so the required status check
+# always reports; the internal `changes` step short-circuits to
+# a green success if the diff touches nothing this gate cares
+# about.
+
+name: Relay invariants
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'services/relay/src/**'
+      - 'services/relay/Dockerfile'
+      - 'services/relay/Cargo.toml'
+      - 'deploy/**'
+      - 'docs/operations/relay-env-reference.md'
+      - 'scripts/relay_invariants.py'
+      - 'scripts/tests/test_relay_invariants.py'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: relay-invariants-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  relay-invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect relay-invariants-relevant changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$base" "$head" -- \
+                'services/relay/src/**' \
+                'services/relay/Dockerfile' \
+                'services/relay/Cargo.toml' \
+                'deploy/**' \
+                'docs/operations/relay-env-reference.md' \
+                'scripts/relay_invariants.py' \
+                'scripts/tests/test_relay_invariants.py' \
+                '.github/workflows/**' \
+                | grep -q .; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No relay-invariants-relevant changes -- skipping."
+            fi
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python 3.11
+        if: steps.changes.outputs.relevant == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run invariant unit tests
+        if: steps.changes.outputs.relevant == 'true'
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python -m unittest discover -s scripts/tests -v
+
+      - name: Run invariant checks against repo baseline
+        if: steps.changes.outputs.relevant == 'true'
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python scripts/relay_invariants.py

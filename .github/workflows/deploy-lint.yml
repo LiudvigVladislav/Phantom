@@ -641,3 +641,136 @@ jobs:
           [ "$ACTUAL_STATE" = "10001:10001:750" ] \
             || { echo "::error::/var/phantom = $ACTUAL_STATE, expected 10001:10001:750"; exit 1; }
           echo "OK: image-level smoke passed"
+
+  # PR-2 M6-2 -- ram-budget invariants (docker-compose normalised).
+  #
+  # Uses `docker compose config --format json` on the operator's
+  # host to expand env-vars, resolve YAML anchors, and normalise
+  # `memory: 512M` into the canonical shape docker-compose
+  # ultimately hands to the container runtime. Stronger than the
+  # regex sweep in the sister `relay-invariants.yml` I3 because it
+  # covers `.env` interpolation and future overrides.
+  #
+  # Fail-loud on: docker missing, compose config non-zero exit,
+  # either RAM budget env absent, either value != 83886080,
+  # relay memory limit != 536870912 (512 MiB).
+  #
+  # No Buildx required -- `docker compose` on ubuntu-latest is
+  # sufficient for `config --format json` (v2 compose plugin
+  # preinstalled since 2023).
+  ram-budget-invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect ram-budget-invariants-relevant changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$base" "$head" -- \
+                'deploy/docker-compose.yml' \
+                'services/relay/src/main.rs' \
+                '.github/workflows/deploy-lint.yml' \
+                | grep -q .; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No ram-budget-invariants-relevant changes -- skipping."
+            fi
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify docker compose is available
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::docker CLI missing on runner"
+            exit 2
+          fi
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "::error::docker compose plugin missing on runner"
+            exit 2
+          fi
+          docker --version
+          docker compose version
+
+      - name: Ram-budget three-way equality (compose normalised)
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          # Extract the Rust constant expression from main.rs.
+          CONST_LINE=$(grep -E '^\s*const\s+DEFAULT_RELAY_RAM_BUDGET_BYTES\s*:\s*u64' services/relay/src/main.rs || true)
+          if [ -z "$CONST_LINE" ]; then
+            echo "::error::DEFAULT_RELAY_RAM_BUDGET_BYTES const missing in services/relay/src/main.rs"
+            exit 1
+          fi
+          RUST_EXPR=$(printf '%s' "$CONST_LINE" | sed -E 's/^.*=\s*([^;]+);.*/\1/' | tr -d '_')
+          if ! printf '%s' "$RUST_EXPR" | grep -Eq '^[[:space:]]*[0-9]+([[:space:]]*\*[[:space:]]*[0-9]+)*[[:space:]]*$'; then
+            echo "::error::DEFAULT_RELAY_RAM_BUDGET_BYTES expr $RUST_EXPR is not a plain int*int*... chain"
+            exit 1
+          fi
+          RUST_VAL=$(awk -v e="$RUST_EXPR" 'BEGIN{n=1; c=split(e, a, "*"); for (i=1; i<=c; i++) n *= a[i]+0; print n}')
+          echo "Rust const DEFAULT_RELAY_RAM_BUDGET_BYTES = $RUST_VAL"
+
+          # Normalise compose (variable expansion + anchor
+          # resolution). jq extracts the three fields we care
+          # about; missing fields resolve to jq's `null` string.
+          COMPOSE_JSON=$(docker compose -f deploy/docker-compose.yml config --format json)
+
+          QUEUE_ENV=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.environment.RELAY_QUEUE_RAM_BUDGET_BYTES // "MISSING"')
+          PREFLIGHT_ENV=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.environment.RELAY_PREFLIGHT_RAM_BUDGET // "MISSING"')
+          MEMORY_LIMIT=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.deploy.resources.limits.memory // "MISSING"')
+
+          echo "compose RELAY_QUEUE_RAM_BUDGET_BYTES = $QUEUE_ENV"
+          echo "compose RELAY_PREFLIGHT_RAM_BUDGET   = $PREFLIGHT_ENV"
+          echo "compose relay memory limit           = $MEMORY_LIMIT"
+
+          for pair in "RELAY_QUEUE_RAM_BUDGET_BYTES:$QUEUE_ENV" "RELAY_PREFLIGHT_RAM_BUDGET:$PREFLIGHT_ENV"; do
+            name="${pair%%:*}"
+            val="${pair#*:}"
+            if [ "$val" = "MISSING" ]; then
+              echo "::error::compose does not set $name"
+              exit 1
+            fi
+            if [ "$val" != "$RUST_VAL" ]; then
+              echo "::error::compose $name=$val != Rust constant=$RUST_VAL"
+              exit 1
+            fi
+          done
+
+          # Compose keeps the raw `memory: 512M` string in the
+          # deploy.resources shape as of docker-compose v2 --
+          # normalise to bytes and strict-compare to 512 MiB.
+          if [ "$MEMORY_LIMIT" = "MISSING" ]; then
+            echo "::error::compose does not set services.relay.deploy.resources.limits.memory"
+            exit 1
+          fi
+          MEMORY_BYTES=$(awk -v s="$MEMORY_LIMIT" '
+            BEGIN {
+              n = length(s)
+              suf = toupper(substr(s, n, 1))
+              if (suf ~ /[0-9]/) { print s+0; exit }
+              base = substr(s, 1, n-1) + 0
+              if (suf == "B") { print base }
+              else if (suf == "K") { print base * 1024 }
+              else if (suf == "M") { print base * 1024 * 1024 }
+              else if (suf == "G") { print base * 1024 * 1024 * 1024 }
+              else                 { print "BAD" }
+            }
+          ')
+          if [ "$MEMORY_BYTES" = "BAD" ]; then
+            echo "::error::relay memory limit '$MEMORY_LIMIT' unparseable"
+            exit 1
+          fi
+          if [ "$MEMORY_BYTES" != "536870912" ]; then
+            echo "::error::relay memory limit=$MEMORY_BYTES != 536870912 (512 MiB); PR-2 M5b calibration is invalid outside this shape"
+            exit 1
+          fi
+          echo "OK: three-way equality holds (Rust const == compose env == $RUST_VAL; container memory limit == $MEMORY_BYTES)"

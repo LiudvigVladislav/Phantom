@@ -4,7 +4,10 @@
 use crate::{
     auth::{AuthError, NONCE_LEN},
     envelope::*,
-    error::RelayError,
+    // `error::RelayError` was consumed only by the legacy
+    // `/send` / `/fetch/:recipient` / `/ack/:id` handlers
+    // that PR-2 M6-3 round-1 P1-1 removed; other handlers
+    // in this file surface errors via `IntoResponse` shims.
     media::{download_chunk, download_chunk_v3, upload_chunk, upload_chunk_v3},
     prekeys::{
         ConsumeError, DeleteError, OneTimePreKeyPublicBundle, PreKeyBundle, PreKeyStatus, PublishError,
@@ -51,9 +54,16 @@ pub fn router(state: Arc<AppState>) -> Router {
     let http_routes = Router::new()
         .route("/health",             get(health))
         .route("/auth/challenge",     get(auth_challenge))
-        .route("/send",               post(send_envelope))
-        .route("/fetch/{recipient}",  get(fetch_envelopes))
-        .route("/ack/{id}",           delete(ack_envelope))
+        // PR-2 M6-3 round-1 REDLINE P1-1: the legacy admin-
+        // token-guarded POST /send / GET /fetch/:recipient /
+        // DELETE /ack/:id endpoints were removed together
+        // with their handlers. Those handlers wrote directly
+        // to `state.store` (four of the five known writer
+        // sites in this file), bypassing the shard-worker
+        // actor path M3b/M4 introduced. The primary user-
+        // facing paths are `handle_socket` (WS) and the
+        // `/relay/*` REST fallback endpoints below; both
+        // route through the runtime.
         .route("/report",             post(submit_report))
         .route("/admin/reports",      get(admin_list_reports))
         .route("/admin/block",        post(admin_block_key))
@@ -551,11 +561,29 @@ async fn handle_socket(mut socket: WebSocket, identity: String, state: Arc<AppSt
         // The client deduplicates on the messages.id PRIMARY KEY (INSERT OR
         // IGNORE), so a recipient that successfully processed an envelope on
         // a prior session simply ignores the duplicate on reconnect.
+        //
+        // PR-2 M6-3 round-1 REDLINE P1-1: this path is READ-ONLY.
+        // Prior shape used `store.entry(...).or_default()` +
+        // `queue.retain(|e| !e.is_expired())` under a write guard,
+        // silently pruning expired envelopes as a reconnect side
+        // effect. Expiry compaction is now the sole responsibility
+        // of the M4-3 background sweep scheduler running on the
+        // shard-worker actors; the reconnect flush filters expired
+        // items out of the delivery list without mutating the
+        // shared Arc. Removing the mutation drops the last of the
+        // four `state.store.write()` sites this file used to hold.
         let queued: Vec<Envelope> = {
-            let mut store = state.store.write().await;
-            let queue = store.entry(identity.clone()).or_default();
-            queue.retain(|e| !e.is_expired());
-            queue.clone()
+            let store = state.store.read().await;
+            store
+                .get(&identity)
+                .map(|queue| {
+                    queue
+                        .iter()
+                        .filter(|e| !e.is_expired())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         if !queued.is_empty() {
             tracing::info!(id = %&identity[..identity.len().min(16)], conn_id = conn_id, count = queued.len(), "flushing queued envelopes (retained until ack-deliver)");
@@ -1605,97 +1633,17 @@ async fn slow_post_diag(
         .into_response()
 }
 
-async fn send_envelope(
-    Query(params): Query<HashMap<String, String>>,
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SendRequest>,
-) -> Result<impl IntoResponse, RelayError> {
-    if !check_admin_token(&params, &state) {
-        return Err(RelayError::BadRequest("unauthorized".into()));
-    }
-    // `from` is optional for sealed-sender messages; one of `from` or
-    // `sealed_sender` must be present so the envelope is attributable for
-    // abuse-response purposes (the relay stores neither for sealed messages
-    // — the sealed blob is opaque — but empty envelopes are useless).
-    let is_sealed = !req.sealed_sender.is_empty();
-    if req.id.is_empty() || req.to.is_empty() || (!is_sealed && req.from.is_empty()) {
-        return Err(RelayError::BadRequest(
-            "id and to are required; either from or sealedSender must be present".into(),
-        ));
-    }
-    if req.payload.len() > state.config.max_payload_bytes {
-        return Err(RelayError::PayloadTooLarge);
-    }
-
-    let envelope_from = if is_sealed {
-        String::new()
-    } else {
-        req.from
-    };
-    let envelope = Envelope::new(
-        req.id,
-        req.to.clone(),
-        envelope_from,
-        req.sealed_sender,
-        req.payload,
-        state.config.envelope_ttl_secs,
-    );
-
-    let mut store = state.store.write().await;
-    let queue = store.entry(req.to).or_default();
-    queue.retain(|e| !e.is_expired());
-
-    if queue.len() >= state.config.max_envelopes_per_recipient {
-        return Err(RelayError::QuotaExceeded);
-    }
-
-    let id = envelope.id.clone();
-    queue.push(envelope);
-    tracing::debug!(message_id = %id, "envelope stored via REST");
-
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "id": id }))))
-}
-
-async fn fetch_envelopes(
-    Query(params): Query<HashMap<String, String>>,
-    State(state): State<Arc<AppState>>,
-    Path(recipient): Path<String>,
-) -> impl IntoResponse {
-    if !check_admin_token(&params, &state) {
-        return Json(FetchResponse { envelopes: vec![] }).into_response();
-    }
-    let mut store = state.store.write().await;
-    let queue = store.entry(recipient).or_default();
-    queue.retain(|e| !e.is_expired());
-    let envelopes: Vec<Envelope> = queue.clone();
-    Json(FetchResponse { envelopes }).into_response()
-}
-
-async fn ack_envelope(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, RelayError> {
-    if !check_admin_token(&params, &state) {
-        return Err(RelayError::BadRequest("unauthorized".into()));
-    }
-    let recipient = params
-        .get("recipient")
-        .ok_or_else(|| RelayError::BadRequest("recipient query param required".into()))?
-        .clone();
-
-    let mut store = state.store.write().await;
-    let queue = store.get_mut(&recipient).ok_or(RelayError::NotFound)?;
-    let before = queue.len();
-    queue.retain(|e| e.id != id);
-
-    if queue.len() == before {
-        return Err(RelayError::NotFound);
-    }
-
-    tracing::debug!(message_id = %id, "envelope acknowledged");
-    Ok((StatusCode::OK, Json(AckResponse { acknowledged: id })))
-}
+// PR-2 M6-3 round-1 REDLINE P1-1: `send_envelope` / `fetch_envelopes`
+// / `ack_envelope` handler fns removed. They were legacy admin-token-
+// guarded REST endpoints predating the shard-worker actor cutover
+// (M3b/M4); each wrote directly to `state.store.write()`, bypassing
+// the per-recipient serialisation contract that `WorkerRuntime`
+// owns. No tests, no in-tree consumers, and the primary transport
+// paths (`handle_socket` WS + `/relay/*` REST fallback) both route
+// through the runtime. The route registrations at the top of this
+// file are gone with them, and the corresponding DTO types
+// (`SendRequest` / `FetchResponse` / `AckResponse`) are gone from
+// `services/relay/src/envelope.rs`.
 
 // ── Abuse report ──────────────────────────────────────────────────────────────
 
