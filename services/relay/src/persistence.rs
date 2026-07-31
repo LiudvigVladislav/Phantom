@@ -328,7 +328,7 @@ pub fn write_record(path: &Path, rec: &PersistedRecord) -> std::io::Result<()> {
             format!("serialized record size {observed} exceeds cap {cap}"),
         ),
     })?;
-    write_record_bytes(path, &serialized)
+    write_record_bytes(path, &serialized, WriteFault::None)
 }
 
 /// Write an already-serialised [`SerializedRecord`] atomically.
@@ -344,11 +344,91 @@ pub fn write_record(path: &Path, rec: &PersistedRecord) -> std::io::Result<()> {
 pub(crate) fn write_record_bytes(
     path: &Path,
     serialized: &SerializedRecord,
+    fault: WriteFault,
 ) -> std::io::Result<()> {
+    // **M3b-2b-ii amendment round-1**: per-call fault seam.
+    // Was a global `static AtomicBool` — the M3b-2b-ii
+    // self-catch moved it to a per-`ActorContext` field, but the
+    // reviewer flagged that variant as bypassing the production
+    // `io::Result -> AckError` mapping (the ctx check
+    // short-circuited BEFORE this function). The reshaped seam
+    // now flows through the wrapper's normal Err surface, so
+    // callers exercise the exact same `.map_err(...)` branch
+    // the production code walks.
+    match fault {
+        WriteFault::None => {}
+        #[cfg(test)]
+        WriteFault::ForceIoError => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "forced write_record_bytes failure (per-call test seam)",
+            ));
+        }
+    }
     if let Some(parent) = path.parent() {
         atomic_write::create_dir_all_durable(parent)?;
     }
     atomic_write::write_atomic(path, serialized.as_bytes())
+}
+
+/// **M3b-2b-ii amendment round-1**: per-call fault injection
+/// input for [`write_record_bytes`]. In production callers
+/// pass [`WriteFault::None`] — the enum body compiles to a
+/// zero-branch match. Under `#[cfg(test)]` a caller may pass
+/// [`WriteFault::ForceIoError`] to drive the same
+/// `io::Result::Err` path a real disk failure would produce,
+/// exercising the caller's typed-error mapping (e.g.
+/// `AckError::Persistence(io_err)`) end-to-end.
+///
+/// The variant lives here instead of on `ActorContext` so the
+/// wrapper's contract is self-contained: a caller sees "opt-in
+/// per-call fault" without also needing a mutable context.
+pub(crate) enum WriteFault {
+    None,
+    #[cfg(test)]
+    ForceIoError,
+}
+
+/// **M3b-3a round-2** (REDLINE P1): durable-unlink wrapper
+/// with a per-call fault seam symmetric to
+/// [`write_record_bytes`] + [`WriteFault`]. Production always
+/// passes [`RemoveFault::None`] and the call inlines to a plain
+/// `std::fs::remove_file`. Under `#[cfg(test)]` a caller may
+/// pass [`RemoveFault::ForceIoError`] to drive the same
+/// `io::Result::Err` path a real fs failure would produce, so
+/// callers exercise their typed-error mapping (e.g.
+/// `SweepError::Persistence(io_err)`) end-to-end.
+///
+/// The seam refuses BEFORE calling `fs::remove_file`, so the
+/// canonical file is guaranteed byte-identical after an
+/// Err — a real `remove_file` `Err(NotFound)` from a racing
+/// external delete would leave the file gone by definition, so
+/// this seam is a STRICTER simulator than a natural race and
+/// still surfaces via the same `io::Result::Err` shape.
+pub(crate) fn remove_record_file(
+    path: &Path,
+    fault: RemoveFault,
+) -> std::io::Result<()> {
+    match fault {
+        RemoveFault::None => {}
+        #[cfg(test)]
+        RemoveFault::ForceIoError => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "forced remove_record_file failure (per-call test seam)",
+            ));
+        }
+    }
+    std::fs::remove_file(path)
+}
+
+/// **M3b-3a round-2** (REDLINE P1): per-call fault injection
+/// input for [`remove_record_file`]. Same rationale + variant
+/// gating as [`WriteFault`].
+pub(crate) enum RemoveFault {
+    None,
+    #[cfg(test)]
+    ForceIoError,
 }
 
 /// Compact summary of a per-file walk pass over `queue/**`. Used

@@ -335,6 +335,13 @@ pub struct BootLoaderResult {
     walk: WalkStats,
     was_first_install: bool,
     state_dir: PathBuf,
+    /// **PR-2 M3b-2a**: the tombstone-dedup horizon captured
+    /// at boot from [`BootConfig::tombstone`]. M3b-2's `do_ack`
+    /// computes `dedup_until = now + horizon_secs` using this
+    /// value; carrying it through `BootLoaderResult` keeps it
+    /// bound to the same boot proof as `state_dir` and the
+    /// generation.
+    tombstone_config: crate::tombstone_config::TombstoneConfig,
 }
 
 impl BootLoaderResult {
@@ -364,20 +371,33 @@ impl BootLoaderResult {
         &self.state_dir
     }
 
-    /// Consume `self` into `(meta, records, walk, was_first_install,
-    /// state_dir)`. Used by
-    /// [`crate::rest_workers::WorkerRuntimeSpec::from_boot`] so
-    /// the runtime can move the records into its seeded stores
-    /// without paying a clone cost.
+    /// **M3b-2a**: tombstone-dedup horizon captured at boot.
+    pub fn tombstone_config(&self) -> &crate::tombstone_config::TombstoneConfig {
+        &self.tombstone_config
+    }
+
+    /// Consume `self` into `(meta, records, walk,
+    /// was_first_install, state_dir, tombstone_config)`. Used
+    /// by [`crate::rest_workers::WorkerRuntimeSpec::from_boot`]
+    /// so the runtime can move the records into its seeded
+    /// stores without paying a clone cost.
     pub(crate) fn into_parts(
         self,
-    ) -> (QueueMeta, Vec<LoadedRecord>, WalkStats, bool, PathBuf) {
+    ) -> (
+        QueueMeta,
+        Vec<LoadedRecord>,
+        WalkStats,
+        bool,
+        PathBuf,
+        crate::tombstone_config::TombstoneConfig,
+    ) {
         (
             self.meta,
             self.records,
             self.walk,
             self.was_first_install,
             self.state_dir,
+            self.tombstone_config,
         )
     }
 
@@ -409,6 +429,12 @@ impl BootLoaderResult {
             walk,
             was_first_install,
             state_dir,
+            // Deterministic default for tests. Real production
+            // boot uses [`BootConfig::tombstone`].
+            tombstone_config: crate::tombstone_config::TombstoneConfig::from_secs(
+                172_800,
+            )
+            .expect("48h horizon is a valid TombstoneConfig"),
         }
     }
 }
@@ -663,6 +689,7 @@ pub fn boot(cfg: &BootConfig) -> Result<BootLoaderResult, BootError> {
         walk: walk_stats,
         was_first_install,
         state_dir: cfg.state_dir.clone(),
+        tombstone_config: cfg.tombstone,
     })
 }
 
