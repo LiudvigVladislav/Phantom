@@ -145,17 +145,41 @@ private fun Row(caption: String, content: @Composable () -> Unit) {
     }
 }
 
-// ── Button matrix — 3 variants × 4 states = 12 cells ────────────────────────
+// ── Button matrix — 3 variants × 4 states, split into 2 goldens ─────────────
+//
+// Round-3 REDLINE P1-3: the previous single `ShowcaseButtonMatrix`
+// composable produced 12 cells stacked vertically (~72 dp each with
+// caption + spacing), which overflowed the Pixel 5 viewport and
+// Paparazzi's ~1000 px PNG-height ceiling. Ghost/pressed and
+// Ghost/disabled were silently clipped (independent pixel-scan confirmed
+// active pixels at y=999). Split into two halves matching the icon-audit
+// pattern:
+//
+//   ShowcaseButtonMatrixA — Primary + Secondary (8 cells, ~576 dp content)
+//   ShowcaseButtonMatrixB — Ghost                (4 cells, ~288 dp content)
+//
+// Both fit comfortably in Paparazzi's viewport. The single legacy
+// `ShowcaseButtonMatrix` is kept as a compatibility alias that calls
+// ShowcaseButtonMatrixA so the pre-existing PhantomButtonSnapshotTest
+// entry point does not silently vanish; the accompanying snapshot test
+// bumps to two methods to cover both halves.
+
+private val ButtonVariantsA: List<Pair<String, PhantomButtonVariant>> = listOf(
+    "Primary"   to PhantomButtonVariant.Primary,
+    "Secondary" to PhantomButtonVariant.Secondary,
+)
+
+private val ButtonVariantsB: List<Pair<String, PhantomButtonVariant>> = listOf(
+    "Ghost"     to PhantomButtonVariant.Ghost,
+)
 
 @Composable
-fun ShowcaseButtonMatrix() {
+private fun ButtonMatrixForVariants(
+    variants: List<Pair<String, PhantomButtonVariant>>,
+) {
     DesignV2SurfaceFrame(width = 360) {
         Column {
-            listOf(
-                "Primary"   to PhantomButtonVariant.Primary,
-                "Secondary" to PhantomButtonVariant.Secondary,
-                "Ghost"     to PhantomButtonVariant.Ghost,
-            ).forEach { (label, variant) ->
+            variants.forEach { (label, variant) ->
                 Row("$label / normal") {
                     PhantomButton(text = "Continue", onClick = {}, variant = variant)
                 }
@@ -187,6 +211,12 @@ fun ShowcaseButtonMatrix() {
         }
     }
 }
+
+@Composable
+fun ShowcaseButtonMatrixA() = ButtonMatrixForVariants(ButtonVariantsA)
+
+@Composable
+fun ShowcaseButtonMatrixB() = ButtonMatrixForVariants(ButtonVariantsB)
 
 // ── Input matrix — 5 cells (default, focused, error, disabled, mono) ────────
 
@@ -666,16 +696,104 @@ fun ShowcaseIconAudit(icons: List<Pair<String, Int>>) {
     }
 }
 
-// ── Stress golden — narrow width + long strings ────────────────────────────
+// ── Onboarding V2 — full-screen previews (Commit 2 of Onboarding track) ───
 
 /**
- * Stress composable — narrow width forces truncation / wrap decisions;
- * long strings verify no unexpected clipping; combined with a large
- * `fontScale` at the Paparazzi test site (see the stress test) it also
- * checks accessibility scaling.
+ * Full-screen composables for the Onboarding V2 flow's real steps
+ * (Welcome + How) plus the preserved Terms gate. Rendered at the actual
+ * Pixel-5 viewport (411 dp × 891 dp) so the goldens capture the same
+ * layout the user will see.
+ *
+ * All three go through [phantom.android.screens.onboarding.v2.OnboardingV2HostFrame]
+ * — the SAME frame the runtime uses — with a hard-coded
+ * `topInset = 24.dp` matching the Pixel 5 status bar height. That way
+ * the Paparazzi golden reflects the on-device layout including the
+ * status-bar area (P1-2 REDLINE fix: showcase previously skipped
+ * `windowInsetsPadding` entirely and produced goldens whose Back-pill
+ * position diverged from the on-device runtime by the status-bar
+ * height).
+ *
+ * Terms is a pre-flow gate that lives outside the frame (its own
+ * status-bar padding via `windowInsetsPadding(WindowInsets.statusBars)`
+ * in TermsScreenV2 itself — which returns zero in Paparazzi, so the
+ * golden matches "no chrome" render; that's OK because Terms is
+ * preserved from the old flow and its layout has been previously
+ * approved).
+ *
+ * Stubs (Identity / Privacy / Permissions / FinaleConfirmation) are NOT
+ * showcased here — their placeholder body is uninteresting for a
+ * golden; they land as real goldens in Commits 3-5.
  */
+
+private const val SHOWCASE_STATUS_BAR_INSET_DP = 24  // Pixel 5 default
+
 @Composable
-fun ShowcaseStress() {
+fun ShowcaseOnboardingTermsV2() {
+    // Round-3 REDLINE P2-4: pass the same hard-coded status-bar inset
+    // to Terms as we do to the other steps (Welcome / How via the host
+    // frame). Runtime computes the real inset;
+    // Paparazzi (this showcase) receives zero from `WindowInsets.statusBars`
+    // so we inject 24.dp to match the Pixel 5 device profile.
+    Box(modifier = Modifier.fillMaxWidth()) {
+        phantom.android.screens.onboarding.v2.TermsScreenV2(
+            onAccept = {},
+            topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingWelcomeV2() {
+    // Uses the SAME host frame as the runtime, with a hard-coded status
+    // bar inset (see class KDoc). currentStep=Welcome → chrome hidden.
+    phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
+        currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.Welcome,
+        topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+        onBackClick = {},
+        edgeSwipeBackEnabled = false,
+        onEdgeSwipeBack = {},
+        toastMessage = null,
+        onToastDismiss = {},
+    ) {
+        phantom.android.screens.onboarding.v2.steps.WelcomeStepV2(onContinueClick = {})
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingHowV2() {
+    // currentStep=How → frame renders "STEP 1 OF 4" top bar. Step dots
+    // at position 0 are rendered INSIDE HowStepV2 above its CTA per
+    // REDLINE P1-3 (not a frame-level overlay).
+    phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
+        currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.How,
+        topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+        onBackClick = {},
+        edgeSwipeBackEnabled = true,
+        onEdgeSwipeBack = {},
+        toastMessage = null,
+        onToastDismiss = {},
+    ) {
+        phantom.android.screens.onboarding.v2.steps.HowStepV2(
+            dotsIndex = phantom.android.screens.onboarding.v2.OnboardingStepV2.How.dotsIndex,
+            onContinueClick = {},
+        )
+    }
+}
+
+// ── Stress goldens — narrow width + long strings, split A + B ──────────────
+//
+// Round-3 REDLINE P1-3: previous single `ShowcaseStress` composable's
+// last row ("Segmented, cramped") landed on y=999 of the PNG under
+// fontScale=2.0 — content-touched the encoder ceiling. Split into two
+// halves so each fits safely inside Paparazzi's viewport.
+//
+// A: first three text-heavy rows (Long button, Long placeholder,
+//    Long value + error) — the ones whose fontScale-2.0 growth is
+//    most likely to overflow.
+// B: remaining two chip / segmented rows.
+
+@Composable
+fun ShowcaseStressA() {
     DesignV2SurfaceFrame(width = 220) {
         Column {
             Row("Long primary button label") {
@@ -700,6 +818,14 @@ fun ShowcaseStress() {
                     useMonoFont = true,
                 )
             }
+        }
+    }
+}
+
+@Composable
+fun ShowcaseStressB() {
+    DesignV2SurfaceFrame(width = 220) {
+        Column {
             Row("Filter chip row (overflow)") {
                 androidx.compose.foundation.layout.Row(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),

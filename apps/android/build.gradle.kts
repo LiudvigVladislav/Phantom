@@ -1040,6 +1040,56 @@ dependencies {
 }
 
 // --------------------------------------------------------------------------
+// Paparazzi determinism via CONDITIONAL per-class JVM isolation
+// (Onboarding Commit 2 round-2 REDLINE P1-2, 2026-08-01)
+// --------------------------------------------------------------------------
+// Diagnostic evidence for the pixel-drift leak (see the prior handoff of
+// Commit 2 amend 3): full-shelf `recordPaparazziDebug` and full-shelf
+// `verifyPaparazziDebug` are separate Gradle tasks each spawning their
+// own test JVM. Under the "full context" (many test classes loaded per
+// JVM), the record JVM and verify JVM diverge in class-load / JIT /
+// font-cache / LayoutLib-session initialisation state in a stable but
+// non-identical way between the two tasks, producing sub-percent pixel
+// drift on 6 goldens (0.014..0.470 %). In isolation (only one test
+// class per JVM) the divergence disappears entirely — the
+// `record isolated → verify isolated` experiment returned GREEN for
+// the representative failing class.
+//
+// The fix: fork a fresh test JVM per class, but ONLY when a Paparazzi
+// task is scheduled in the current Gradle invocation. Round-1 REDLINE
+// initially set `unitTests.all { forkEvery=1; maxParallelForks=1 }`
+// unconditionally, which also isolated semantics + transport + other
+// non-snapshot tests. Architect P1-2 (round 2): scope the isolation
+// strictly to Paparazzi's tasks so a plain
+// `./gradlew testDebugUnitTest` (semantics, transport, WsLifecycle,
+// etc.) keeps its previous non-isolated, potentially faster forking
+// shape and does not hide leaks between "regular" unit-test classes.
+//
+// Mechanism: `gradle.taskGraph.whenReady { ... }` fires after Gradle
+// has resolved the task graph but before task execution begins. If any
+// scheduled task's name starts with `recordPaparazzi` or
+// `verifyPaparazzi`, apply `forkEvery = 1L; maxParallelForks = 1` to
+// every `Test` task (both the Paparazzi task variants and the
+// underlying `testDebugUnitTest` they depend on). Otherwise, leave
+// the default forking behaviour untouched.
+//
+// `maxParallelForks = 1` keeps forks sequential — parallel forks would
+// reintroduce another class of nondeterminism (LayoutLib global-state
+// contention) and defeat the fix.
+gradle.taskGraph.whenReady {
+    val paparazziInGraph = allTasks.any { task ->
+        val n = task.name
+        n.startsWith("recordPaparazzi") || n.startsWith("verifyPaparazzi")
+    }
+    if (paparazziInGraph) {
+        tasks.withType(org.gradle.api.tasks.testing.Test::class.java).configureEach {
+            setForkEvery(1L)
+            maxParallelForks = 1
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // verifyR8StripsTestSeams — path-2 step 2 ProGuard narrowing verifier
 // --------------------------------------------------------------------------
 // Fails the release build if R8's `mapping.txt` shows that a forbidden
