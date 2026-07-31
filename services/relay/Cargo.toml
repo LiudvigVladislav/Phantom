@@ -37,6 +37,20 @@ socket2 = { version = "0.5", features = ["all"] }
 # instead of racing writes with an already-running relay. Cross-platform:
 # fcntl(F_SETLK) on Unix, LockFileEx on Windows.
 fs2 = "0.4"
+# RC-RELAY-QUEUE-DURABILITY PR-2 M1 §2 / §9 (locked design v4.2 B-5 + v4.1
+# V-P0-6): parking_lot::RwLock backs the WorkerPool state machine
+# (Running → Closing → Closed) with nanosecond critical sections; the
+# GlobalCapacityGate uses a parking_lot::Mutex because CapacityReservation
+# needs synchronous Drop-time rollback that a tokio::sync::Mutex would
+# force through .await. Already present transitively in Cargo.lock; this
+# entry only promotes it to a direct dependency because M1 imports the API.
+parking_lot = "0.12"
+# RC-RELAY-QUEUE-DURABILITY PR-2 M1 §2 (locked design v4 §2 V-1 +
+# v4.1 §2 Q1 boot-random): SipHasher13 with a pair of boot-random
+# 64-bit keys backs the `worker_for(recipient)` shard router. Boot-random
+# keys close the shard-flood attack surface without coupling shard
+# assignment to any operational rotation event.
+siphasher = "1"
 
 [dev-dependencies]
 tokio-test = { workspace = true }

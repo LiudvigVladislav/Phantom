@@ -928,12 +928,14 @@ dependencies = [
  "hex",
  "hmac",
  "lru",
+ "parking_lot",
  "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
  "serial_test",
  "sha2",
+ "siphasher",
  "socket2 0.5.10",
  "subtle",
  "tempfile",
@@ -1452,6 +1454,12 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
