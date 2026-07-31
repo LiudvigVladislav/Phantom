@@ -471,6 +471,75 @@ fun ShowcaseIconContactSheet() {
     }
 }
 
+// ── Icon side-by-side audit — every icon at 24dp AND 48dp ─────────────────
+
+/**
+ * Audit view catching SVG→AVD conversion regressions that only surface at
+ * different scale. Each row: icon name (mono, small) | 24dp render on
+ * Surface | 48dp render on Surface. Bug that hides at 24dp (a mis-scaled
+ * stroke that reads as "1px difference") explodes visibly at 48dp.
+ *
+ * NOT redundant with `ShowcaseIconContactSheet` — that one shows every icon
+ * at ONE scale in a compact grid; this one is the diagnostic view.
+ */
+@Composable
+fun ShowcaseIconAudit() {
+    DesignV2SurfaceFrame(width = 300) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Dv2Icons.forEach { (name, resId) ->
+                androidx.compose.foundation.layout.Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(
+                        text = name,
+                        color = DesignV2Tokens.Colors.TextTertiary,
+                        style = TextStyle(
+                            fontFamily = DesignV2FontMono,
+                            fontSize = 10.sp,
+                            lineHeight = 12.sp,
+                        ),
+                        modifier = Modifier.width(120.dp),
+                    )
+                    // 24dp cell (production render size for most usages).
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .background(DesignV2Tokens.Colors.Surface)
+                            .padding(8.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            painter = painterResource(resId),
+                            contentDescription = null,
+                            tint = DesignV2Tokens.Colors.Cyan,
+                            modifier = Modifier.size(24.dp),
+                        )
+                    }
+                    // 48dp cell (magnifies sub-pixel conversion errors).
+                    Box(
+                        modifier = Modifier
+                            .size(64.dp)
+                            .background(DesignV2Tokens.Colors.Surface)
+                            .padding(8.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            painter = painterResource(resId),
+                            contentDescription = null,
+                            tint = DesignV2Tokens.Colors.Cyan,
+                            modifier = Modifier.size(48.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Stress golden — narrow width + long strings ────────────────────────────
 
 /**

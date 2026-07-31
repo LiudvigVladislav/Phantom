@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     Converted from design_handoff_phantom_messenger/assets/icons/send.svg
-    (Lucide-style 24×24 stroke, currentColor). Stroke stays #FFFFFF so
-    Compose Icon(tint=...) applies via SrcIn at the consumer site.
-    Consumers: Icon(painter = painterResource(R.drawable.ic_dv2_send),
-                    tint = DesignV2Tokens.Colors.<role>).
+    (Lucide-style 24×24 stroke, currentColor). Consumers:
+      Icon(painter = painterResource(R.drawable.ic_dv2_send),
+           tint = DesignV2Tokens.Colors.<role>)
+
+    Converter v2 (2026-07-31): invariant-culture number formatting,
+    per-primitive fill/stroke resolution, near-zero <line> → filled dot.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
