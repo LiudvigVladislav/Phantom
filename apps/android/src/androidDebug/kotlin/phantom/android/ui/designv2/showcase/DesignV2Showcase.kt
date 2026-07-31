@@ -241,6 +241,104 @@ fun ShowcaseInputMatrix() {
     }
 }
 
+// ── Input slots matrix — 4 cells (leading / trailing / both / error-vs-trailing) ─
+
+@Composable
+fun ShowcaseInputSlotsMatrix() {
+    DesignV2SurfaceFrame(width = 360) {
+        Column {
+            Row("Leading only (@ prefix)") {
+                PhantomInput(
+                    value = "alice",
+                    onValueChange = {},
+                    useMonoFont = true,
+                    leadingContent = {
+                        Text(
+                            text = "@",
+                            color = DesignV2Tokens.Colors.TextTertiary,
+                            style = TextStyle(
+                                fontFamily = DesignV2FontMono,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Normal,
+                            ),
+                        )
+                    },
+                )
+            }
+            Row("Trailing only (status icon)") {
+                PhantomInput(
+                    value = "alice",
+                    onValueChange = {},
+                    useMonoFont = true,
+                    trailingContent = {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_dv2_confirm),
+                            contentDescription = null,
+                            tint = DesignV2Tokens.Colors.Success,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    },
+                )
+            }
+            Row("Both slots (username field)") {
+                PhantomInput(
+                    value = "alice",
+                    onValueChange = {},
+                    useMonoFont = true,
+                    helperText = "Handle format is valid.",
+                    leadingContent = {
+                        Text(
+                            text = "@",
+                            color = DesignV2Tokens.Colors.TextTertiary,
+                            style = TextStyle(
+                                fontFamily = DesignV2FontMono,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Normal,
+                            ),
+                        )
+                    },
+                    trailingContent = {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_dv2_confirm),
+                            contentDescription = null,
+                            tint = DesignV2Tokens.Colors.Success,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    },
+                )
+            }
+            Row("Error + custom trailing (block icon replaces alert)") {
+                PhantomInput(
+                    value = "ab",
+                    onValueChange = {},
+                    isError = true,
+                    helperText = "A little longer — at least 3 characters.",
+                    useMonoFont = true,
+                    leadingContent = {
+                        Text(
+                            text = "@",
+                            color = DesignV2Tokens.Colors.TextTertiary,
+                            style = TextStyle(
+                                fontFamily = DesignV2FontMono,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Normal,
+                            ),
+                        )
+                    },
+                    trailingContent = {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_dv2_block),
+                            contentDescription = null,
+                            tint = DesignV2Tokens.Colors.Error,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    },
+                )
+            }
+        }
+    }
+}
+
 // ── Toggle matrix — 4 cells (on / off / disabled-on / disabled-off) ─────────
 
 @Composable
@@ -410,6 +508,29 @@ val Dv2Icons: List<Pair<String, Int>> = listOf(
     "send"             to R.drawable.ic_dv2_send,
     "settings"         to R.drawable.ic_dv2_settings,
     "verified_shield"  to R.drawable.ic_dv2_verified_shield,
+)
+
+/**
+ * The 10 net-new Onboarding-track drawables added in Commit 1 of the
+ * Onboarding redesign. Kept separate from [Dv2Icons] so the Onboarding audit
+ * golden focuses on just the new surface (10 rows × ~72dp ≈ 720dp, well
+ * under Paparazzi's ~1000px PNG ceiling — one golden covers them all).
+ *
+ * Any post-Commit-1 addition to the Onboarding icon set MUST land here so
+ * the audit golden catches regressions in the converter v3 dashing bake-in
+ * and per-primitive fill/stroke resolution.
+ */
+val Dv2OnboardingIcons: List<Pair<String, Int>> = listOf(
+    "block"            to R.drawable.ic_dv2_block,
+    "copy"             to R.drawable.ic_dv2_copy,
+    "ed25519_key"      to R.drawable.ic_dv2_ed25519_key,
+    "ghost"            to R.drawable.ic_dv2_ghost,
+    "ghost_signal"     to R.drawable.ic_dv2_ghost_signal,
+    "notify_off"       to R.drawable.ic_dv2_notify_off,
+    "notify_on"        to R.drawable.ic_dv2_notify_on,
+    "phantom_premium"  to R.drawable.ic_dv2_phantom_premium,
+    "privacy"          to R.drawable.ic_dv2_privacy,
+    "standard"         to R.drawable.ic_dv2_standard,
 )
 
 @Composable

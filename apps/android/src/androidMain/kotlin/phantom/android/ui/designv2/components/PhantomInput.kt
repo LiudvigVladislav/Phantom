@@ -58,6 +58,21 @@ import phantom.android.ui.designv2.DesignV2Tokens
  * a caller decision — the composable draws the ring but does not compute
  * whether the value is valid.
  *
+ * [leadingContent] and [trailingContent] are generic composable slots that
+ * render inside the input's outer box, flanking the text/placeholder area.
+ * Existing callers pass neither and get the original single-column layout.
+ * Onboarding's username field uses [leadingContent] for the `@` glyph +
+ * hairline divider and [trailingContent] for a validity status icon; other
+ * consumers can use the same slots for anything shaped like an icon-sized
+ * adornment (e.g. a currency symbol, unit label, or clear-value button).
+ *
+ * Slot vs [isError] icon precedence: when [isError] is true AND
+ * [trailingContent] is null, the built-in `(!)` alert icon renders on the
+ * right — original behaviour preserved. When [trailingContent] is provided,
+ * the built-in alert icon is suppressed and the caller's slot content owns
+ * the trailing area (semantics still carry the error description via the
+ * [helperText] channel — the visual is delegated).
+ *
  * Touch-target height: 48dp minimum, even though the visual box is 44dp per
  * handoff — internal padding brings it up. Wraps BasicTextField (foundation)
  * so we don't inherit Material's TextField chrome.
@@ -73,6 +88,8 @@ fun PhantomInput(
     enabled: Boolean = true,
     useMonoFont: Boolean = false,
     keyboardType: KeyboardType = KeyboardType.Text,
+    leadingContent: (@Composable () -> Unit)? = null,
+    trailingContent: (@Composable () -> Unit)? = null,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -127,6 +144,10 @@ fun PhantomInput(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth(),
             ) {
+                if (leadingContent != null) {
+                    leadingContent()
+                    Spacer(Modifier.width(8.dp))
+                }
                 Box(modifier = Modifier.weight(1f)) {
                     if (value.isEmpty() && placeholder != null) {
                         Text(text = placeholder, style = placeholderStyle)
@@ -143,7 +164,10 @@ fun PhantomInput(
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
-                if (isError) {
+                if (trailingContent != null) {
+                    Spacer(Modifier.width(8.dp))
+                    trailingContent()
+                } else if (isError) {
                     Spacer(Modifier.width(8.dp))
                     Icon(
                         painter = painterResource(R.drawable.ic_dv2_alert),

@@ -8,20 +8,30 @@ import app.cash.paparazzi.Paparazzi
 import org.junit.Rule
 import org.junit.Test
 import phantom.android.ui.designv2.showcase.Dv2Icons
+import phantom.android.ui.designv2.showcase.Dv2OnboardingIcons
 import phantom.android.ui.designv2.showcase.ShowcaseIconAudit
 
 /**
- * Icon side-by-side audit goldens — each of 21 dv2 drawables rendered at 24dp
- * AND 48dp on a Surface background, tinted Cyan.
+ * Icon side-by-side audit goldens — every dv2 drawable rendered at 24dp AND
+ * 48dp on a Surface background, tinted Cyan.
  *
- * Split into two goldens (A = first half, B = second half) because 21 rows at
- * ~72dp per row overflow Paparazzi's default Pixel 5 viewport (~891dp) AND its
- * ~1000px PNG-height ceiling. An earlier single-golden variant silently
- * clipped the last 9 rows (verified by comparison against the source SVG
- * list). The split ensures every row is fully rendered in one of the two
- * PNGs; ordering matches `Dv2Icons` (alphabetical).
+ * Split into three goldens because Paparazzi's default Pixel 5 viewport is
+ * ~891dp tall and the PNG encoder tops out around 1000px in height. An
+ * earlier single-golden variant of the F2b batch silently clipped the last
+ * 9 rows (verified against the source SVG list). The splits below keep every
+ * row fully rendered:
  *
- * Reviewer workflow: open both PNGs side-by-side with
+ *   - `icon_audit_a_first_half`   : first 11 of the 21 F2b drawables
+ *     (`Dv2Icons` alphabetical).
+ *   - `icon_audit_b_second_half`  : remaining 10 F2b drawables.
+ *   - `icon_audit_onboarding`     : the 10 net-new Onboarding drawables from
+ *     Commit 1 of the Onboarding track (`Dv2OnboardingIcons` alphabetical).
+ *     10 rows fit comfortably in one golden — under the ~1000px ceiling by a
+ *     wide margin. Per architect lock (2026-08-01 Commit 1 clarifications
+ *     §4): "не собирать одним листом на 31 иконку … в Commit 1 проверять
+ *     только 10 новых onboarding-иконок в 24/48 dp".
+ *
+ * Reviewer workflow: open the three PNGs side-by-side with
  * `scratchpad/icon-audit-svg-source.html` to A/B-verify each row against
  * the source SVG at 24 px and 48 px.
  */
@@ -39,5 +49,10 @@ class PhantomIconAuditSnapshotTest {
     fun icon_audit_b_second_half() {
         val half = (Dv2Icons.size + 1) / 2
         paparazzi.snapshot { ShowcaseIconAudit(Dv2Icons.subList(half, Dv2Icons.size)) }
+    }
+
+    @Test
+    fun icon_audit_onboarding() {
+        paparazzi.snapshot { ShowcaseIconAudit(Dv2OnboardingIcons) }
     }
 }

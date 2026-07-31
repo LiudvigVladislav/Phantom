@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/privacy.svg
+    (Lucide-style 24×24 stroke, currentColor). Consumers:
+      Icon(painter = painterResource(R.drawable.ic_dv2_privacy),
+           tint = DesignV2Tokens.Colors.<role>)
+
+    Converter v3 (2026-08-01): invariant-culture number formatting,
+    per-primitive fill/stroke resolution, near-zero <line> → filled dot,
+    dashed <circle> → arc-segment chain (AVD has no strokeDashArray).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M7,11 H17 A2,2 0 0 1 19,13 V18 A2,2 0 0 1 17,20 H7 A2,2 0 0 1 5,18 V13 A2,2 0 0 1 7,11 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M8 11V7a4 4 0 0 1 8 0v4"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M10.85,14.8 a1.15,1.15 0 1 0 2.3,0 a1.15,1.15 0 1 0 -2.3,0 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M12 15.9V17.6"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>
