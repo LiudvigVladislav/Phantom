@@ -644,24 +644,39 @@ jobs:
 
   # PR-2 M6-2 -- ram-budget invariants (docker-compose normalised).
   #
-  # Uses `docker compose config --no-env-resolution --format json`
-  # to resolve YAML anchors and normalise `memory: 512M` into the
-  # canonical shape docker-compose ultimately hands to the
-  # container runtime, WITHOUT reading `deploy/.env` (which is a
-  # production-only file that is intentionally not committed and
-  # therefore absent in the CI checkout). Any `${VAR:-default}`
-  # interpolation the compose file uses stays as its literal
-  # string in the output; the jq queries below check only the
-  # explicit RAM-budget env fields and the memory limit, none of
-  # which are variable-substituted, so `--no-env-resolution` does
-  # not change the verdict. Stronger than the regex sweep in the
-  # sister `relay-invariants.yml` I3 because it still exercises
-  # anchor resolution and default-value merging that a raw YAML
-  # walk would miss.
+  # Runs `docker compose config --no-env-resolution --format json`
+  # against `deploy/docker-compose.yml` to obtain a canonical JSON
+  # projection (YAML anchor resolution + `memory: 512M` -> byte-
+  # count merging) that a jq walk can strict-compare against the
+  # Rust constant and the 512 MiB container limit. Stronger than
+  # the regex sweep in the sister `relay-invariants.yml` I3
+  # because it exercises anchor resolution and default-value
+  # merging that a raw YAML walk would miss.
   #
-  # Fail-loud on: docker missing, compose config non-zero exit,
-  # either RAM budget env absent, either value != 83886080,
-  # relay memory limit != 536870912 (512 MiB).
+  # Two production-file coupling issues the check has to route
+  # around on CI, both handled in the step below:
+  #   (1) `--no-env-resolution` skips `${VAR:-default}`
+  #       interpolation but DOES NOT skip existence checks on
+  #       `env_file:` entries. The compose file references
+  #       `deploy/.env`, which is a production-only side file
+  #       that is intentionally not committed and therefore
+  #       absent on the CI runner.
+  #   (2) The three fields the jq queries read (both RAM budget
+  #       env vars and the relay memory limit) are LITERAL in
+  #       the compose YAML -- no `${VAR}` expansion -- so a
+  #       missing / empty `.env` cannot influence their values,
+  #       and skipping env resolution does not weaken the check.
+  # The step below refuses to run if `deploy/.env` unexpectedly
+  # already exists in the checkout (would indicate a leaked
+  # production secret), then materialises an EMPTY file to
+  # satisfy the compose engine's existence check, and traps
+  # `rm -f` on EXIT so the placeholder never leaks between
+  # steps.
+  #
+  # Fail-loud on: docker missing, `deploy/.env` unexpectedly
+  # committed, compose config non-zero exit, either RAM budget
+  # env absent, either value != 83886080, relay memory limit
+  # != 536870912 (512 MiB).
   #
   # No Buildx required -- `docker compose` on ubuntu-latest is
   # sufficient for `config --format json` (v2 compose plugin
@@ -727,15 +742,39 @@ jobs:
           RUST_VAL=$(awk -v e="$RUST_EXPR" 'BEGIN{n=1; c=split(e, a, "*"); for (i=1; i<=c; i++) n *= a[i]+0; print n}')
           echo "Rust const DEFAULT_RELAY_RAM_BUDGET_BYTES = $RUST_VAL"
 
-          # Normalise compose (variable expansion + anchor
-          # resolution). jq extracts the three fields we care
-          # about; missing fields resolve to jq's `null` string.
-          # `--no-env-resolution` keeps `docker compose` from
-          # trying to load `deploy/.env` (a production-only file
-          # that is intentionally absent in the CI checkout).
-          # See the block comment on this job for the full
-          # rationale; the fields this check reads are literal
-          # in the compose YAML, so skipping resolution is safe.
+          # Normalise compose (anchor resolution + `memory: 512M`
+          # -> byte-count merging). jq extracts the three fields
+          # we care about; missing fields resolve to jq's `null`
+          # string.
+          #
+          # `--no-env-resolution` disables `${VAR:-default}`
+          # interpolation but DOES NOT skip the compose engine's
+          # existence check on `env_file:` entries. The compose
+          # file references `deploy/.env` as an env_file, and
+          # `deploy/.env` is a production-only side file that is
+          # intentionally not committed and therefore absent on
+          # the CI runner. Without a placeholder the compose
+          # invocation exits non-zero on `deploy/.env not found`
+          # BEFORE jq ever runs.
+          #
+          # The safety pre-check refuses to proceed if
+          # `deploy/.env` unexpectedly appears in a CI checkout
+          # (would indicate an accidental commit of production
+          # secrets). We then create an EMPTY file that satisfies
+          # the compose existence check without providing any
+          # value, and the `trap` on EXIT removes it whether the
+          # step succeeds or fails so no residue leaks between
+          # steps. The three fields the jq queries read are
+          # literal in the compose YAML (no `${VAR}` expansion),
+          # so an empty env file changes nothing about the
+          # verdict.
+          if [ -e deploy/.env ]; then
+            echo "::error::deploy/.env unexpectedly exists in CI checkout -- production secrets must not be committed"
+            exit 1
+          fi
+          : > deploy/.env
+          trap 'rm -f deploy/.env' EXIT
+
           COMPOSE_JSON=$(docker compose -f deploy/docker-compose.yml \
             config --no-env-resolution --format json)
 
