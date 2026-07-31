@@ -82,6 +82,10 @@ fn build_spec_via_real_boot(
     dir: &TempDir,
     fatal_tx: broadcast::Sender<FatalReason>,
 ) -> Result<WorkerRuntimeSpec, SpecError> {
+    // **M3b-1 round-1 F1**: the public `from_boot` captures its
+    // own `SystemTime::now()` — integration tests exercise the
+    // real production path against a fresh state dir (empty
+    // records → no compaction touches the clock at all).
     let boot_result = boot(&boot_config(dir)).expect("boot must succeed");
     let key = Arc::new(SeqMacRootKey::from_bytes(TEST_MAC_KEY_BYTES));
     WorkerRuntimeSpec::from_boot(boot_result, 8, key, caps(), fatal_tx)
@@ -101,7 +105,9 @@ async fn spawn_worker_runtime_is_reachable_from_external_crate_via_real_boot() {
     // Fresh boot: no seeded records, no tombstones.
     assert!(runtime.rest_store().read().await.is_empty());
     assert!(runtime.store().read().await.is_empty());
-    assert_eq!(runtime.tombstone_count(), 0);
+    assert_eq!(runtime.tombstone_dedup_count(), 0);
+    assert_eq!(runtime.active_entry_count(), 0);
+    assert_eq!(runtime.boot_seed_stats(), Default::default());
     let snap = runtime.capacity().snapshot();
     assert_eq!(snap.active_envelopes, 0);
     assert_eq!(snap.active_bytes, 0);

@@ -272,6 +272,31 @@ fn fatal_post_rename_failure(path: &Path, parent: &Path, err: &io::Error) -> ! {
 /// On Unix a failure to fsync a directory is treated the same as
 /// a failure to create it: returned as `Err` to the caller (this
 /// path is NOT post-rename; no state is committed yet).
+/// Fsync `dir` so any recently-changed directory metadata
+/// (renames INTO, unlinks FROM, dir creates) becomes durable.
+///
+/// **PR-2 M3b-1**: boot compaction and sweep must invoke this
+/// after `fs::remove_file` so the unlink actually reaches the
+/// disk before we claim the record is reclaimed. Also used by
+/// [`write_atomic`] and [`create_dir_all_durable`] internally.
+///
+/// On Unix the idiom is `File::open(dir) + sync_all()`. On
+/// Windows the standard library does not expose a directory
+/// fsync, so this call reduces to a metadata read as a
+/// no-op-shaped placeholder — production runs on Linux.
+pub fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let handle = fs::File::open(dir)?;
+        handle.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::metadata(dir)?;
+        Ok(())
+    }
+}
+
 pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
     // Collect the ancestor chain up to the first existing dir
     // (inclusive). The first existing dir must also be fsynced
