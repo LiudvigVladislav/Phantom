@@ -21,3 +21,12 @@ pub mod seq_mac;
 pub mod state;
 pub mod t2_diag;
 pub mod diag_poll_shape;
+
+// RC-RELAY-QUEUE-DURABILITY PR-2 M1 — shard-worker fundamentals.
+// These modules are public but not yet wired into main.rs / axum
+// handlers; the existing in-memory HashMap path remains
+// authoritative until PR-2 M3 migrates the five mutation sites.
+pub mod capacity_ledger;
+pub mod failpoints;
+pub mod rest_workers;
+pub mod worker_pool;
