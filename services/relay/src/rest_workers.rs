@@ -1097,6 +1097,17 @@ async fn do_send(
         return Err(SendError::Persistence(io_err));
     }
 
+    // **M5a-2 SIGKILL failpoint** — record has passed through
+    // `write_atomic` (staging → fsync → rename → parent-fsync all
+    // returned Ok); RAM projections (rest_store, store,
+    // active_index) + ledger commit are NOT yet applied. SIGKILL
+    // invariant: the record is present at `disk_path` after
+    // SIGKILL and boot replay recovers it as
+    // `PersistedRecord::Queued`; the ledger seeds from disk
+    // truth so no drift. SIGKILL only proves the absence of
+    // user-space teardown — no power-loss claim.
+    crate::failpoint!("send.after_disk_commit_before_ram_commit");
+
     // (8+9+10) canonical two-store lock order — v4.1 V-P0-7 +
     // v4.2.1 §5 + M3b-1 round-8 corrective #6 lock order
     // `rest_store → store → active_index → tombstones`. `do_send`
@@ -1538,6 +1549,22 @@ async fn do_ack(
     // (12) --- durable commit boundary ---
     // From here: NO .await, NO AckError, NO Result-based
     // recovery. Any failure → fatal_ack_invariant("post_commit").
+
+    // **M5a-2 SIGKILL failpoint** — tombstone bytes have passed
+    // through `write_atomic` (the Queued record's canonical file
+    // now holds AckedTombstone bytes on disk); ledger transition
+    // + dedup insert + active/RAM removal have NOT yet fired.
+    // SIGKILL invariant: after SIGKILL the on-disk record at the
+    // canonical path parses as `PersistedRecord::AckedTombstone`;
+    // boot replay recovers the tombstone into `tombstone_dedup`,
+    // and a subsequent Send with the same envelope_id gets
+    // `TombstoneReplay` disposition (idempotent). The USER-SPACE
+    // abort variant of this same boundary is already covered by
+    // the `TEST_FORCE_ACK_POST_COMMIT_FATAL` seam below; this
+    // failpoint adds the KERNEL-level SIGKILL variant. SIGKILL
+    // only proves the absence of user-space teardown — no
+    // power-loss claim.
+    crate::failpoint!("ack.after_tombstone_disk_commit_before_ledger_and_ram_commit");
 
     // Test seam for the reboot-replay subprocess test — fires
     // AFTER write_record_bytes and BEFORE the ledger / RAM
@@ -2079,6 +2106,20 @@ async fn sweep_one(
                 return Err(SweepError::Persistence(e));
             }
 
+            // **M5a-2 SIGKILL failpoint** — file unlinked from
+            // canonical path via `remove_record_file` Ok; the
+            // paired parent-dir fsync has NOT yet issued, and
+            // neither has the ledger release / RAM removal.
+            // SIGKILL invariant here (Queued branch):
+            //   * `path` is absent after SIGKILL, and the ledger
+            //     seeds from disk truth on the next boot so no
+            //     drift lands.
+            // SIGKILL only proves the absence of user-space
+            // teardown; no claim about kernel-level power-loss
+            // durability. The paired `fsync_dir` below is what
+            // closes that window, and SIGKILL cannot emulate it.
+            crate::failpoint!("sweep.after_unlink_before_parent_fsync");
+
             // (6) Parent-dir fsync — post remove_file Ok.
             if let Some(parent) = record_path.parent() {
                 if let Err(e) = crate::atomic_write::fsync_dir(parent) {
@@ -2093,6 +2134,20 @@ async fn sweep_one(
             }
 
             // --- durable-unlink boundary ---
+
+            // **M5a-2 SIGKILL failpoint** — disk state has
+            // committed to the unlink (post-`fsync_dir`); ledger
+            // release + RAM store removals have NOT yet applied.
+            // SIGKILL invariant here (Queued branch): `path` is
+            // absent after SIGKILL; boot replay observes the
+            // missing record and the ledger seeds from disk
+            // truth so no drift. The USER-SPACE abort variant of
+            // this same boundary is covered by
+            // `TEST_FORCE_SWEEP_POST_UNLINK_FATAL` below; this
+            // failpoint adds the KERNEL-level SIGKILL variant.
+            // SIGKILL only proves the absence of user-space
+            // teardown — no power-loss claim.
+            crate::failpoint!("sweep.after_parent_fsync_before_ledger_and_ram_release");
 
             // M3b-3b test seam for the reboot-replay subprocess
             // test — fires AFTER fsync_dir (durably unlinked)
@@ -2192,6 +2247,19 @@ async fn sweep_one(
             ) {
                 return Err(SweepError::Persistence(e));
             }
+
+            // **M5a-2 SIGKILL failpoint** — Tombstone branch;
+            // shares the name with the Queued branch's
+            // pre-parent-fsync barrier. Two separate M5a-3
+            // subprocess runs are required (Queued variant +
+            // Tombstone variant) — one child cannot prove both
+            // branches, since a single seeding shape only reaches
+            // one of them. Same replacement-safe invariant as
+            // the Queued branch: `path` is absent after SIGKILL;
+            // ledger seeds from disk truth on next boot. No
+            // power-loss claim.
+            crate::failpoint!("sweep.after_unlink_before_parent_fsync");
+
             if let Some(parent) = record_path.parent() {
                 if let Err(e) = crate::atomic_write::fsync_dir(parent) {
                     fatal_sweep_invariant(
@@ -2205,6 +2273,16 @@ async fn sweep_one(
             }
 
             // --- durable-unlink boundary ---
+
+            // **M5a-2 SIGKILL failpoint** — Tombstone branch;
+            // shares the name with the Queued branch's
+            // post-parent-fsync barrier. Two separate M5a-3
+            // subprocess runs are required (Queued variant +
+            // Tombstone variant). Invariant: `path` is absent
+            // after SIGKILL; boot replay observes the missing
+            // record; ledger + tombstone_dedup seed from disk
+            // truth so no drift. No power-loss claim.
+            crate::failpoint!("sweep.after_parent_fsync_before_ledger_and_ram_release");
 
             // M3b-3b test seam — symmetric copy of the Queued
             // branch's seam. Round-1 REDLINE flagged that the
@@ -4128,6 +4206,22 @@ fn boot_compact_expired(
                 cause: e,
             }
         })?;
+
+        // **M5a-2 SIGKILL failpoint** — an expired record has
+        // been `remove_file`'d during boot compaction; the paired
+        // parent-dir fsync has NOT yet issued. SIGKILL invariant:
+        // the boot process dies before it can seed anything into
+        // the runtime, so no user-visible drift is possible. On
+        // the FOLLOWING boot the compaction pass is idempotent
+        // by construction — either the entry is already absent
+        // (no-op) or it re-appears in the walker set and is
+        // swept again by the same `expires_at <= now` /
+        // `dedup_until <= now` predicate. SIGKILL only proves
+        // the absence of user-space teardown — no power-loss
+        // claim; the paired `fsync_dir` below closes the
+        // kernel-level window and SIGKILL cannot emulate it.
+        crate::failpoint!("boot.after_compaction_unlink_before_parent_fsync");
+
         if let Some(parent) = loaded.path.parent() {
             crate::atomic_write::fsync_dir(parent).map_err(|e| {
                 SpecError::BootCompactionFailed {

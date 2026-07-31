@@ -178,13 +178,57 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // (2) Write payload.
     tmp.as_file_mut().write_all(bytes)?;
 
+    // **M5a-2 SIGKILL failpoint** — payload written into the
+    // staging tempfile; the file fsync has NOT yet been issued
+    // and the atomic rename has NOT yet run. `write_atomic` is
+    // used both for FRESH writes (target absent) and REPLACEMENT
+    // writes (queue-meta / Queued → AckedTombstone). SIGKILL
+    // invariants at this line:
+    //   * target absent  → `path` remains absent after SIGKILL;
+    //     the staging tempfile is unlinked by boot's staging
+    //     sweep on the next start.
+    //   * target exists  → the PRE-EXISTING canonical bytes at
+    //     `path` remain BYTE-IDENTICAL; the staging tempfile
+    //     is unlinked by boot's staging sweep.
+    // SIGKILL only proves the absence of user-space teardown —
+    // no claim about kernel cache / power-loss durability.
+    crate::failpoint!("atomic.after_write_before_file_fsync");
+
     // (3) Fsync the tempfile so the payload hits durable storage
     // BEFORE the rename commits.
     tmp.as_file_mut().sync_all()?;
 
+    // **M5a-2 SIGKILL failpoint** — tempfile bytes have been
+    // through `sync_all` but still live under the staging name;
+    // the atomic rename has NOT yet run. Same replacement-safe
+    // invariants as the pre-fsync barrier above:
+    //   * target absent  → `path` remains absent; boot's staging
+    //     sweep unlinks the tempfile.
+    //   * target exists  → PRE-EXISTING canonical bytes at
+    //     `path` remain BYTE-IDENTICAL; boot's staging sweep
+    //     unlinks the tempfile.
+    // SIGKILL only proves the absence of user-space teardown.
+    crate::failpoint!("atomic.after_file_fsync_before_rename");
+
     // (4) Atomic rename. From this line on, the new content is
     // visible under `path` on disk.
     tmp.persist(path).map_err(|persist_err| persist_err.error)?;
+
+    // **M5a-2 SIGKILL failpoint** — rename has committed; the
+    // NEW bytes are visible under `path`. The paired parent-dir
+    // fsync has NOT yet issued, and neither has the RAM / ledger
+    // commit. SIGKILL invariants at this line:
+    //   * `path` is present and its bytes parse cleanly as the
+    //     new record (no torn write, no partial content) —
+    //     `sync_all` in step (3) already flushed the file itself
+    //     before the rename;
+    //   * no `.staging-*` sibling remains under the parent
+    //     directory (the `persist` consumed the tempfile handle).
+    // SIGKILL only proves the absence of user-space teardown —
+    // this comment makes NO claim about kernel-level power-loss
+    // durability, which the paired `fsync_dir` in step (5) is
+    // what closes and which SIGKILL cannot emulate.
+    crate::failpoint!("atomic.after_rename_before_parent_fsync");
 
     // (5) Parent-directory fsync. Post-rename failure is FATAL —
     // see doc comment for rationale.

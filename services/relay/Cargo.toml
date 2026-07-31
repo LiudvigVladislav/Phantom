@@ -63,6 +63,19 @@ parking_lot = "0.12"
 # assignment to any operational rotation event.
 siphasher = "1"
 
+# RC-RELAY-QUEUE-DURABILITY PR-2 M5b: the queue-ram-budget benchmark
+# binary is gated behind an opt-in Cargo feature so a bare `cargo
+# build --release` cannot accidentally ship it into the production
+# image. The feature toggles nothing in the library; it exists only
+# to satisfy `required-features` on the `[[bin]]` entry below.
+[features]
+queue-ram-budget-bench = []
+
+[[bin]]
+name = "queue_ram_budget_bench"
+path = "bench/queue_ram_budget/main.rs"
+required-features = ["queue-ram-budget-bench"]
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 tower = { workspace = true, features = ["util"] }
