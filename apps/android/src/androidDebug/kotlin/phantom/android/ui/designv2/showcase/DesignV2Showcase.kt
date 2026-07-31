@@ -481,12 +481,17 @@ fun ShowcaseIconContactSheet() {
  *
  * NOT redundant with `ShowcaseIconContactSheet` — that one shows every icon
  * at ONE scale in a compact grid; this one is the diagnostic view.
+ *
+ * Split into two halves because 21 rows × ~72dp = 1512dp of vertical content,
+ * which overflows Paparazzi's default Pixel 5 viewport (~891dp) AND its
+ * ~1000px PNG-height ceiling. Each half fits comfortably; the split is on
+ * `Dv2Icons` alphabetical order.
  */
 @Composable
-fun ShowcaseIconAudit() {
+fun ShowcaseIconAudit(icons: List<Pair<String, Int>>) {
     DesignV2SurfaceFrame(width = 300) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            Dv2Icons.forEach { (name, resId) ->
+            icons.forEach { (name, resId) ->
                 androidx.compose.foundation.layout.Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
