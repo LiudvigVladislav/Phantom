@@ -30,3 +30,14 @@ pub mod capacity_ledger;
 pub mod failpoints;
 pub mod rest_workers;
 pub mod worker_pool;
+
+// RC-RELAY-QUEUE-DURABILITY PR-2 M2 — persistence layer + boot
+// loader. Same pub-but-unused principle: M4 wires them into
+// main.rs / AppState. Locked design v4 §7-§8, v4.1 §5 L-N7/N11/
+// N12, v4.2 §1 B-1 + §3 B-3, v4.2.2 §2, v4.2.3 §1/§4.
+pub mod atomic_write;
+pub mod body_hash;
+pub mod boot_loader;
+pub mod persistence;
+pub mod queue_meta;
+pub mod tombstone_config;
