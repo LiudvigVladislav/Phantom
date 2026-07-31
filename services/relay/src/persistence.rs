@@ -218,6 +218,88 @@ pub fn read_record(path: &Path) -> Result<PersistedRecord, RecordReadError> {
     Ok(rec)
 }
 
+/// Errors returned by [`SerializedRecord::serialize`] — a typed
+/// carrier so callers preserve the actual observed size on the
+/// oversize path (PR-2 M3a round-4 F3).
+///
+/// Pre-round-4 [`SerializedRecord::serialize`] returned bare
+/// `io::Result<Self>`, which forced callers to invent an
+/// `observed_bytes: 0` on the oversize branch — swallowing the
+/// only diagnostic that lets HTTP/log mapping report a real
+/// number. The typed enum keeps that number all the way to the
+/// send-error surface.
+#[derive(Debug)]
+pub(crate) enum SerializeRecordError {
+    /// `serde_json::to_vec` refused the input.
+    Serde(serde_json::Error),
+    /// Serialised buffer exceeded [`MAX_RECORD_BYTES`]. Both
+    /// counts are known and preserved.
+    TooLarge { observed: u64, cap: u64 },
+}
+
+impl std::fmt::Display for SerializeRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SerializeRecordError::Serde(e) => write!(f, "serialize serde error: {e}"),
+            SerializeRecordError::TooLarge { observed, cap } => {
+                write!(f, "serialized record size {observed} exceeds cap {cap}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SerializeRecordError {}
+
+/// Opaque canonical-byte carrier for a [`PersistedRecord`].
+///
+/// **PR-2 M3a round-3 F5**: closes the "any bytes reach disk" hole
+/// left by the round-2 `write_record_bytes(path, &[u8])` shape.
+/// The only way to obtain a `SerializedRecord` is
+/// [`SerializedRecord::serialize`], which runs the schema/size
+/// checks itself; a future caller cannot hand
+/// `write_record_bytes` an arbitrary or malformed buffer that a
+/// later boot would refuse. Construction is `pub(crate)`, so
+/// external crates cannot even attempt to build one.
+#[derive(Debug)]
+pub(crate) struct SerializedRecord {
+    bytes: Vec<u8>,
+}
+
+impl SerializedRecord {
+    /// Serialise a record to the canonical wire form and enforce
+    /// the [`MAX_RECORD_BYTES`] cap in one step. Returns the byte
+    /// buffer as an opaque carrier that
+    /// [`write_record_bytes`] can hand to atomic write.
+    ///
+    /// **Round-4 F3**: signature now returns
+    /// [`SerializeRecordError`] instead of `io::Error`; the
+    /// `TooLarge` variant preserves the observed byte count so
+    /// send-path error surfaces do not have to synthesise a fake
+    /// `observed_bytes: 0`.
+    pub(crate) fn serialize(rec: &PersistedRecord) -> Result<Self, SerializeRecordError> {
+        let bytes = serde_json::to_vec(rec).map_err(SerializeRecordError::Serde)?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(SerializeRecordError::TooLarge {
+                observed: bytes.len() as u64,
+                cap: MAX_RECORD_BYTES,
+            });
+        }
+        Ok(Self { bytes })
+    }
+
+    /// The canonical byte length. The send path uses this value
+    /// to size the capacity reservation AND (via
+    /// [`SerializedRecord::as_bytes`]) the on-disk write, so the
+    /// two footprints are byte-identical by construction.
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Write a record atomically (M3 send/ack path).
 ///
 /// Creates parent directories if needed — the boot loader
@@ -231,23 +313,42 @@ pub fn read_record(path: &Path) -> Result<PersistedRecord, RecordReadError> {
 /// FIRST record written into a fresh recipient dir could have
 /// been lost after a crash even though the record's own
 /// `write_atomic` file+parent fsync returned success.
+///
+/// Convenience wrapper that serialises `rec` and delegates to
+/// [`write_record_bytes`]. Callers that need the serialised
+/// footprint before writing (e.g. to size a capacity reservation
+/// under PR-2 M3a F5) should call [`SerializedRecord::serialize`]
+/// + [`write_record_bytes`] directly so the record is serialised
+/// exactly once.
 pub fn write_record(path: &Path, rec: &PersistedRecord) -> std::io::Result<()> {
+    let serialized = SerializedRecord::serialize(rec).map_err(|e| match e {
+        SerializeRecordError::Serde(err) => std::io::Error::new(std::io::ErrorKind::Other, err),
+        SerializeRecordError::TooLarge { observed, cap } => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("serialized record size {observed} exceeds cap {cap}"),
+        ),
+    })?;
+    write_record_bytes(path, &serialized)
+}
+
+/// Write an already-serialised [`SerializedRecord`] atomically.
+///
+/// **Round-3 amendment**: signature is `pub(crate)` and accepts
+/// the opaque [`SerializedRecord`] instead of `&[u8]`, so a
+/// future caller cannot slip an unchecked buffer past the
+/// schema/size validation performed inside
+/// [`SerializedRecord::serialize`]. Combined with the sole
+/// serialisation site in [`crate::rest_workers::do_send`] this
+/// closes the "same bytes reach ledger AND disk" contract at the
+/// type level.
+pub(crate) fn write_record_bytes(
+    path: &Path,
+    serialized: &SerializedRecord,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         atomic_write::create_dir_all_durable(parent)?;
     }
-    let bytes =
-        serde_json::to_vec(rec).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "serialized record size {} exceeds cap {}",
-                bytes.len(),
-                MAX_RECORD_BYTES
-            ),
-        ));
-    }
-    atomic_write::write_atomic(path, &bytes)
+    atomic_write::write_atomic(path, serialized.as_bytes())
 }
 
 /// Compact summary of a per-file walk pass over `queue/**`. Used

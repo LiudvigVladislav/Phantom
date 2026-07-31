@@ -309,21 +309,108 @@ impl LoadedRecord {
 /// - Rebuild the in-memory tombstone dedup table from every
 ///   `AckedTombstone` record.
 /// - Expose `meta.boot_generation` for the seq assembler.
+/// Boot outcome handed to M4 wiring.
+///
+/// **PR-2 M3a round-6 F1**: all fields are PRIVATE. External
+/// crates access boot state through read-only accessors
+/// ([`BootLoaderResult::meta`], [`BootLoaderResult::records`],
+/// [`BootLoaderResult::walk`],
+/// [`BootLoaderResult::was_first_install`],
+/// [`BootLoaderResult::state_dir`]) and cannot mutate the boot
+/// state after `boot()` returns. Combined with `#[non_exhaustive]`
+/// this makes the type a real opaque boot proof.
+///
+/// **Round-7 F3**: the sole construction path is [`boot`]
+/// itself. The round-6 `__for_test_only` factory was removed —
+/// external tests build a real boot result by calling
+/// [`boot`] against a prepared temp directory, so no test-only
+/// symbol survives in the production binary AND the standard
+/// `cargo test` run exercises the cross-crate boundary
+/// without needing a `--features test-support` flag.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct BootLoaderResult {
-    /// Post-boot meta with the freshly-written phase=Ready and
-    /// (on normal boot) bumped `boot_generation`.
-    pub meta: QueueMeta,
-    /// Every record that survived preflight + replay, tagged
-    /// with recipient + path + disk_bytes.
-    pub records: Vec<LoadedRecord>,
-    /// Walk stats (used to seed capacity counters). The
-    /// `queued_records` / `tombstone_records` fields are filled
-    /// during replay (round-1 M2 P0 #4 amendment).
-    pub walk: WalkStats,
+    meta: QueueMeta,
+    records: Vec<LoadedRecord>,
+    walk: WalkStats,
+    was_first_install: bool,
+    state_dir: PathBuf,
+}
+
+impl BootLoaderResult {
+    /// Post-boot meta.
+    pub fn meta(&self) -> &QueueMeta {
+        &self.meta
+    }
+
+    /// Every record that survived preflight + replay.
+    pub fn records(&self) -> &[LoadedRecord] {
+        &self.records
+    }
+
+    /// Walk stats (used to seed capacity counters).
+    pub fn walk(&self) -> &WalkStats {
+        &self.walk
+    }
+
     /// `true` on fresh-install / complete-init rows; `false` on
-    /// normal boot. Operators use this for boot-time observation.
-    pub was_first_install: bool,
+    /// normal boot.
+    pub fn was_first_install(&self) -> bool {
+        self.was_first_install
+    }
+
+    /// State directory this boot ran against.
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+
+    /// Consume `self` into `(meta, records, walk, was_first_install,
+    /// state_dir)`. Used by
+    /// [`crate::rest_workers::WorkerRuntimeSpec::from_boot`] so
+    /// the runtime can move the records into its seeded stores
+    /// without paying a clone cost.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (QueueMeta, Vec<LoadedRecord>, WalkStats, bool, PathBuf) {
+        (
+            self.meta,
+            self.records,
+            self.walk,
+            self.was_first_install,
+            self.state_dir,
+        )
+    }
+
+    /// **Round-7 F3 internal helper**: construct a
+    /// `BootLoaderResult` for the LIBRARY's own tests.
+    ///
+    /// - `#[cfg(test)]` gates this out of both production and
+    ///   integration test binaries — only the lib's own
+    ///   `cargo test` run compiles it, so a `cargo build
+    ///   --release` cannot even reference the symbol.
+    /// - `pub(crate)` scopes it to the same crate — external
+    ///   crates cannot see it regardless of features.
+    ///
+    /// Integration tests (`services/relay/tests/*.rs` — separate
+    /// binary crates) call [`boot`] directly against a
+    /// prepared state dir instead, so the cross-crate boundary
+    /// is exercised through the real production path.
+    #[cfg(test)]
+    pub(crate) fn for_lib_test(
+        meta: QueueMeta,
+        records: Vec<LoadedRecord>,
+        walk: WalkStats,
+        was_first_install: bool,
+        state_dir: PathBuf,
+    ) -> Self {
+        Self {
+            meta,
+            records,
+            walk,
+            was_first_install,
+            state_dir,
+        }
+    }
 }
 
 // ─── Error surface ───────────────────────────────────────────────────────
@@ -390,7 +477,8 @@ impl std::fmt::Display for BootError {
             BootError::BudgetExceeded { reason } => write!(f, "boot budget exceeded: {reason}"),
             BootError::GenerationSaturation { current } => write!(
                 f,
-                "boot generation would overflow on bump: current={current} (u32::MAX)"
+                "boot generation at or past the 24-bit seq-namespace cap: current={current}, cap={} (2^24-1). Operator must reset state or archive to reclaim a fresh generation space.",
+                queue_meta::MAX_BOOT_GENERATION
             ),
             BootError::SeqMacKeyMismatch {
                 meta_fingerprint,
@@ -526,7 +614,17 @@ pub fn boot(cfg: &BootConfig) -> Result<BootLoaderResult, BootError> {
             (promoted, true)
         }
         BootAction::NormalBoot(prior) => {
-            // Bump generation with `checked_add` (v4 §13 Q1).
+            // Bump generation, capped at `MAX_BOOT_GENERATION`
+            // (locked v4 §13 Q1 + PR-2 M3a round-1 review F2).
+            // A generation `>= 2^24` shifted by 40 would collide
+            // with a lower-generation namespace via u64 wrap and
+            // silently reuse seqs. Refuse-boot exit 4 forces
+            // ops to reset state or archive before continuing.
+            if prior.boot_generation >= queue_meta::MAX_BOOT_GENERATION {
+                return Err(BootError::GenerationSaturation {
+                    current: prior.boot_generation,
+                });
+            }
             let next_generation =
                 prior
                     .boot_generation
@@ -564,6 +662,7 @@ pub fn boot(cfg: &BootConfig) -> Result<BootLoaderResult, BootError> {
         records,
         walk: walk_stats,
         was_first_install,
+        state_dir: cfg.state_dir.clone(),
     })
 }
 
@@ -1475,21 +1574,45 @@ mod tests {
     }
 
     #[test]
-    fn generation_saturation_returns_exit_4() {
-        // Manually plant a meta at u32::MAX; second boot must
-        // refuse rather than wrap around.
+    fn generation_saturation_returns_exit_4_at_24_bit_cap() {
+        // Plant a meta AT the 2^24-1 cap; the next boot must
+        // refuse rather than advance past the seq-space budget.
+        // Locked v4 §13 Q1 + PR-2 M3a round-1 review F2.
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("queue")).unwrap();
         let meta = QueueMeta {
             version: META_VERSION,
             phase: Phase::Ready,
-            boot_generation: u32::MAX,
+            boot_generation: queue_meta::MAX_BOOT_GENERATION,
             seq_mac_key_fingerprint: "0123456789abcdef".into(),
         };
         queue_meta::write_meta(dir.path(), &meta).unwrap();
         let cfg = sample_cfg(dir.path().to_path_buf());
         let err = boot(&cfg).unwrap_err();
-        assert!(matches!(err, BootError::GenerationSaturation { current } if current == u32::MAX));
+        assert!(matches!(
+            err,
+            BootError::GenerationSaturation { current }
+                if current == queue_meta::MAX_BOOT_GENERATION
+        ));
+        assert_eq!(err.exit_code(), EXIT_GENERATION_SATURATION);
+    }
+
+    #[test]
+    fn generation_saturation_still_refuses_above_the_cap() {
+        // Defence-in-depth: a meta planted ABOVE the cap
+        // (hostile / corrupted meta file) must still refuse-boot.
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("queue")).unwrap();
+        let meta = QueueMeta {
+            version: META_VERSION,
+            phase: Phase::Ready,
+            boot_generation: queue_meta::MAX_BOOT_GENERATION + 1,
+            seq_mac_key_fingerprint: "0123456789abcdef".into(),
+        };
+        queue_meta::write_meta(dir.path(), &meta).unwrap();
+        let cfg = sample_cfg(dir.path().to_path_buf());
+        let err = boot(&cfg).unwrap_err();
+        assert!(matches!(err, BootError::GenerationSaturation { .. }));
         assert_eq!(err.exit_code(), EXIT_GENERATION_SATURATION);
     }
 

@@ -34,6 +34,18 @@ pub const META_FILENAME: &str = "queue-meta.v1";
 /// a different value → refuse-boot exit 3.
 pub const META_VERSION: u16 = 2;
 
+/// Maximum permitted value of [`QueueMeta::boot_generation`]
+/// (locked v4 §13 Q1 + PR-2 M3a round-1 review F2). Seq assembly
+/// is `(u64::from(boot_generation) << 40) | counter`; the counter
+/// consumes the low 40 bits, leaving 24 bits for the generation.
+///
+/// A generation `>= 2^24` shifted by 40 overflows the u64 space
+/// and collides with a lower-generation namespace, silently
+/// reusing seqs. The bump path in the boot loader must refuse to
+/// advance past this ceiling with refuse-boot exit 4
+/// (`EXIT_GENERATION_SATURATION`).
+pub const MAX_BOOT_GENERATION: u32 = (1u32 << 24) - 1;
+
 /// Phase field values (locked v4 §7 + v4.1 §5 L-N12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
