@@ -644,12 +644,20 @@ jobs:
 
   # PR-2 M6-2 -- ram-budget invariants (docker-compose normalised).
   #
-  # Uses `docker compose config --format json` on the operator's
-  # host to expand env-vars, resolve YAML anchors, and normalise
-  # `memory: 512M` into the canonical shape docker-compose
-  # ultimately hands to the container runtime. Stronger than the
-  # regex sweep in the sister `relay-invariants.yml` I3 because it
-  # covers `.env` interpolation and future overrides.
+  # Uses `docker compose config --no-env-resolution --format json`
+  # to resolve YAML anchors and normalise `memory: 512M` into the
+  # canonical shape docker-compose ultimately hands to the
+  # container runtime, WITHOUT reading `deploy/.env` (which is a
+  # production-only file that is intentionally not committed and
+  # therefore absent in the CI checkout). Any `${VAR:-default}`
+  # interpolation the compose file uses stays as its literal
+  # string in the output; the jq queries below check only the
+  # explicit RAM-budget env fields and the memory limit, none of
+  # which are variable-substituted, so `--no-env-resolution` does
+  # not change the verdict. Stronger than the regex sweep in the
+  # sister `relay-invariants.yml` I3 because it still exercises
+  # anchor resolution and default-value merging that a raw YAML
+  # walk would miss.
   #
   # Fail-loud on: docker missing, compose config non-zero exit,
   # either RAM budget env absent, either value != 83886080,
@@ -722,7 +730,14 @@ jobs:
           # Normalise compose (variable expansion + anchor
           # resolution). jq extracts the three fields we care
           # about; missing fields resolve to jq's `null` string.
-          COMPOSE_JSON=$(docker compose -f deploy/docker-compose.yml config --format json)
+          # `--no-env-resolution` keeps `docker compose` from
+          # trying to load `deploy/.env` (a production-only file
+          # that is intentionally absent in the CI checkout).
+          # See the block comment on this job for the full
+          # rationale; the fields this check reads are literal
+          # in the compose YAML, so skipping resolution is safe.
+          COMPOSE_JSON=$(docker compose -f deploy/docker-compose.yml \
+            config --no-env-resolution --format json)
 
           QUEUE_ENV=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.environment.RELAY_QUEUE_RAM_BUDGET_BYTES // "MISSING"')
           PREFLIGHT_ENV=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.environment.RELAY_PREFLIGHT_RAM_BUDGET // "MISSING"')
