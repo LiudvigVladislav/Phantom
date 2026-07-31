@@ -215,6 +215,36 @@ pub struct AppState {
     pub blocklist_persist_success: AtomicU64,
     pub push_tokens_persist_failed: AtomicU64,
     pub push_tokens_persist_success: AtomicU64,
+
+    // ── PR-2 M4-2b atomic activation: mandatory runtime handle ───────────────
+    //
+    // Constructor-injected. No `Option`. Every M4-2b Send/Ack/Sweep
+    // dispatch routes through `runtime.try_send(RestOp::...)` and
+    // the `store` / `rest_store` fields above are the runtime's own
+    // `Arc` handles (round-2 F1 pre-widening was designed for
+    // exactly this handoff).
+    pub runtime: std::sync::Arc<crate::rest_workers::WorkerRuntime>,
+
+    // ── PR-2 M4-2a round-1 REDLINE (P1) test-only lifetime guard ─────────────
+    //
+    // Owned `TempDir` that keeps a test-created `state_dir`
+    // (and any files inside it) alive for the lifetime of
+    // `AppState`. Set by [`build_test_app_state`] when the
+    // helper creates a fresh directory; `None` in production
+    // (where `state_dir` is an operator-supplied absolute
+    // path) and also `None` when a test supplies its own
+    // absolute `cfg.state_dir` (helper preserves it so
+    // round-trip tests like `state_persistence` reuse the
+    // SAME dir across two AppState instances).
+    //
+    // Field is `pub(crate)` — external test callers get their
+    // `Arc<AppState>` back from `build_test_app_state` and
+    // never need to touch this. The M4-2a round-0 shape
+    // returned `(Arc<AppState>, TempDir)` and let the caller
+    // hold the lease, which broke inside every test helper
+    // that returned a `Router` because `_dir` dropped at the
+    // helper's function return.
+    pub(crate) _test_state_dir_guard: Option<tempfile::TempDir>,
 }
 
 /// Joined absolute paths for the three `state.rs`-owned append-log files.
@@ -238,7 +268,18 @@ impl StatePaths {
 }
 
 impl AppState {
-    pub fn new(config: RelayConfig) -> Self {
+    /// **PR-2 M4-2b atomic activation**: constructor is
+    /// mandatory-injection. `runtime` is required; `store` and
+    /// `rest_store` are populated from the runtime's own Arc
+    /// handles (round-2 F1 pre-widening designed for this
+    /// exact handoff).
+    ///
+    /// Tests use [`build_test_app_state`] which internally
+    /// boots a minimal runtime over a per-state `TempDir`.
+    pub fn new(
+        config: RelayConfig,
+        runtime: std::sync::Arc<crate::rest_workers::WorkerRuntime>,
+    ) -> Self {
         // RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1: compute state-file paths
         // from the injected `state_dir` before spinning up sub-stores.
         let state_paths = StatePaths::from_state_dir(&config.state_dir);
@@ -258,9 +299,14 @@ impl AppState {
             .build()
             .expect("reqwest::Client::build with default rustls should not fail");
         let prekeys = PreKeyStore::new(&config.state_dir);
+        // PR-2 M4-2b: `store` and `rest_store` are the runtime's own
+        // Arc handles, not fresh maps. Round-2 F1 pre-widened both to
+        // `Arc<RwLock<..>>` for exactly this swap.
+        let store = runtime.store();
+        let rest_store = runtime.rest_store();
         Self {
             config,
-            store: Arc::new(RwLock::new(HashMap::new())),
+            store,
             clients: RwLock::new(HashMap::new()),
             conn_counter: AtomicU64::new(0),
             rate_limiter: RwLock::new(HashMap::new()),
@@ -275,7 +321,7 @@ impl AppState {
             rest_tokens: RestTokenStore::new(),
             rest_session_cache: SessionChallengeCache::new(),
             rest_idempotency: IdempotencyCache::new(),
-            rest_store: Arc::new(RwLock::new(HashMap::new())),
+            rest_store,
             rest_seq: SeqCounter::new(),
             // Trek 2 Stage 1 long-poll
             notifiers: RwLock::new(HashMap::new()),
@@ -290,7 +336,19 @@ impl AppState {
             blocklist_persist_success: AtomicU64::new(0),
             push_tokens_persist_failed: AtomicU64::new(0),
             push_tokens_persist_success: AtomicU64::new(0),
+            runtime,
+            // Production always None. `build_test_app_state`
+            // sets Some(dir) when the helper owns the
+            // per-state hermetic directory.
+            _test_state_dir_guard: None,
         }
+    }
+
+    /// **PR-2 M4-2b**: mandatory accessor for the runtime handle.
+    /// No panic possible — the field is non-optional.
+    #[inline]
+    pub fn runtime(&self) -> &std::sync::Arc<crate::rest_workers::WorkerRuntime> {
+        &self.runtime
     }
 
     /// Seed the in-memory signing-key bindings from the disk-replayed
@@ -754,4 +812,107 @@ pub fn state_dir_preflight(cfg: &RelayConfig) -> std::fs::File {
     );
 
     lock_file
+}
+
+/// **PR-2 M4-2a test helper** (round-1 REDLINE reshape):
+/// build an `Arc<AppState>` for integration tests. Returns a
+/// bare `Arc<AppState>` — the `TempDir` lease (when the
+/// helper creates one) lives INSIDE the state as
+/// `_test_state_dir_guard`, so integration builders that
+/// return just a `Router` cannot accidentally drop the
+/// lease before the first request.
+///
+/// **Directory strategy** (round-1 REDLINE fix):
+///
+///   * If `cfg.state_dir` is an **absolute** path, use it
+///     verbatim. The helper creates no TempDir. This is what
+///     `state_persistence` round-trip tests rely on — two
+///     back-to-back `build_test_app_state` calls with the
+///     SAME absolute path exercise the disk-load-back replay
+///     contract.
+///   * Otherwise (default `PathBuf::from(".")` from
+///     `RelayConfig::from_env_for_test`, or any relative
+///     path), the helper creates a fresh `TempDir`, assigns
+///     `cfg.state_dir = dir.path().to_path_buf()`, and stores
+///     the `TempDir` in `AppState._test_state_dir_guard` so
+///     it drops when the state does. This gives every
+///     axum-test-router build its own hermetic state_dir
+///     without cross-test contamination on the append-log
+///     files.
+///
+/// **M4-2a semantics**: `AppState.runtime` is `None` — the
+/// legacy shape. Body change to spawn a runtime lands in
+/// M4-2b; the signature stays the same, so no test file
+/// re-edit is needed then either.
+///
+/// Kept as a plain `pub fn` (not `#[cfg(test)]`) because
+/// tests live in a separate crate.
+pub fn build_test_app_state(mut cfg: RelayConfig) -> std::sync::Arc<AppState> {
+    let owned_dir: Option<tempfile::TempDir> = if cfg.state_dir.is_absolute() {
+        // Caller supplied their own absolute path — round-trip
+        // semantics depend on us NOT overriding it.
+        None
+    } else {
+        // Default / relative — build a hermetic per-state
+        // TempDir, redirect cfg.state_dir at it, keep the
+        // guard so the dir outlives the state.
+        let dir = tempfile::TempDir::new().expect("TempDir::new in test");
+        cfg.state_dir = dir.path().to_path_buf();
+        Some(dir)
+    };
+
+    // PR-2 M4-2b: helper body now spawns a real runtime so
+    // AppState.runtime is a live `Arc<WorkerRuntime>`. Boot
+    // uses `cfg.state_dir` as the on-disk queue root; the
+    // per-state TempDir (when the helper owns one) keeps
+    // that dir alive alongside the runtime.
+    let mac_key = cfg.seq_mac_key.clone();
+    // Bootstrap `queue/` + queue-meta if the caller didn't do it.
+    std::fs::create_dir_all(cfg.state_dir.join("queue"))
+        .expect("create queue subdir in test state_dir");
+    let meta_path = cfg.state_dir.join(crate::queue_meta::META_FILENAME);
+    if !meta_path.exists() {
+        let meta = crate::queue_meta::QueueMeta {
+            version: crate::queue_meta::META_VERSION,
+            phase: crate::queue_meta::Phase::Ready,
+            boot_generation: 1,
+            seq_mac_key_fingerprint: mac_key.fingerprint(),
+        };
+        crate::queue_meta::write_meta(&cfg.state_dir, &meta)
+            .expect("write initial queue-meta in test");
+    }
+
+    let boot_cfg = crate::boot_loader::BootConfig {
+        state_dir: cfg.state_dir.clone(),
+        caps: crate::boot_loader::PreflightCaps::for_tests(),
+        tombstone: crate::tombstone_config::TombstoneConfig::from_secs(172_800)
+            .expect("172_800 fits horizon cap"),
+        current_seq_mac_key_fingerprint: mac_key.fingerprint(),
+        ownership: crate::boot_loader::OwnershipExpectation::permissive_for_tests(),
+    };
+    let boot_result = crate::boot_loader::boot(&boot_cfg).expect("test boot() must succeed");
+    let (fatal_tx, _fatal_rx) = tokio::sync::broadcast::channel::<
+        crate::rest_workers::FatalReason,
+    >(16);
+    let caps = crate::capacity_ledger::CapacityCaps {
+        max_envelopes: 100_000,
+        max_bytes: 100 * 1024 * 1024,
+        ram_budget: 100 * 1024 * 1024,
+    };
+    let spec = crate::rest_workers::WorkerRuntimeSpec::from_boot(
+        boot_result,
+        cfg.max_envelopes_per_recipient,
+        std::sync::Arc::clone(&mac_key),
+        caps,
+        fatal_tx,
+    )
+    .expect("test WorkerRuntimeSpec::from_boot must succeed");
+    let runtime = std::sync::Arc::new(
+        crate::rest_workers::spawn_worker_runtime(spec)
+            .expect("test spawn_worker_runtime must succeed"),
+    );
+
+    let mut state = AppState::new(cfg, runtime);
+    state._test_state_dir_guard = owned_dir;
+    std::sync::Arc::new(state)
 }

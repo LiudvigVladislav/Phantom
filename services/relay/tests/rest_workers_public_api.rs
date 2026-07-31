@@ -117,6 +117,114 @@ async fn spawn_worker_runtime_is_reachable_from_external_crate_via_real_boot() {
 }
 
 #[tokio::test]
+async fn fresh_install_first_send_uses_nonzero_seq_visible_after_initial_cursor() {
+    // Mac/Docker E2E caught the production-only boundary: a real fresh
+    // install starts at boot_generation=0, while the older test fixtures
+    // planted generation=1. Counter zero therefore produced seq=0, which
+    // `/relay/poll?since_seq=0` can never return (`seq > since_seq`).
+    let dir = TempDir::new().unwrap();
+    let (fatal_tx, _fatal_rx) = broadcast::channel::<FatalReason>(64);
+    let spec = build_spec_via_real_boot(&dir, fatal_tx).expect("fresh boot spec");
+    let runtime = spawn_worker_runtime(spec).expect("fresh runtime spawn");
+
+    let recipient = "ab".repeat(32);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    runtime
+        .try_send(RestOp::Send {
+            recipient: recipient.clone(),
+            candidate: SendCandidate {
+                id: "fresh-first-seq".into(),
+                sealed_sender: "sealed".into(),
+                payload: "payload".into(),
+                sequence_ts: 1_700_000_000_000,
+                expires_at: u64::MAX,
+            },
+            reply: reply_tx,
+        })
+        .expect("dispatch first fresh-install send");
+
+    let outcome = reply_rx.await.expect("worker reply").expect("send succeeds");
+    assert_eq!(outcome.seq, 1, "zero is reserved for the initial poll cursor");
+    assert!(outcome.seq > 0, "first record must be visible after since_seq=0");
+
+    let stored = runtime.rest_store();
+    let guard = stored.read().await;
+    let record = guard
+        .get(&recipient)
+        .and_then(|records| records.first())
+        .expect("first record seeded into poll store");
+    assert_eq!(record.seq, outcome.seq);
+    drop(guard);
+
+    runtime.close();
+    let outcomes = runtime
+        .drain_handles(Duration::from_secs(5))
+        .await
+        .expect("clean drain");
+    assert!(outcomes.iter().all(|outcome| outcome.is_clean()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_created_queue_tree_passes_hardened_restart_preflight() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let (fatal_tx, _fatal_rx) = broadcast::channel::<FatalReason>(64);
+    let spec = build_spec_via_real_boot(&dir, fatal_tx).expect("fresh boot spec");
+    let runtime = spawn_worker_runtime(spec).expect("fresh runtime spawn");
+
+    let recipient = "ab".repeat(32);
+    let envelope_id = "restart-mode-contract";
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    runtime
+        .try_send(RestOp::Send {
+            recipient: recipient.clone(),
+            candidate: SendCandidate {
+                id: envelope_id.into(),
+                sealed_sender: "sealed".into(),
+                payload: "payload".into(),
+                sequence_ts: 1_700_000_000_000,
+                expires_at: u64::MAX,
+            },
+            reply: reply_tx,
+        })
+        .expect("dispatch durable send");
+    reply_rx.await.expect("worker reply").expect("send succeeds");
+
+    runtime.close();
+    let outcomes = runtime
+        .drain_handles(Duration::from_secs(5))
+        .await
+        .expect("clean drain");
+    assert!(outcomes.iter().all(|outcome| outcome.is_clean()));
+    drop(runtime);
+
+    let queue = dir.path().join("queue");
+    let shard = queue.join("ab");
+    let recipient_dir = shard.join(&recipient);
+    for path in [&queue, &shard, &recipient_dir] {
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o027,
+            0,
+            "{} mode {mode:#o} violates the production restart policy",
+            path.display()
+        );
+    }
+
+    let mut restart_config = boot_config(&dir);
+    restart_config.ownership = OwnershipExpectation {
+        expected_uid: None,
+        expected_gid: None,
+        mode_forbidden: 0o027,
+    };
+    let replay = boot(&restart_config).expect("hardened restart boot must accept its own tree");
+    assert_eq!(replay.records().len(), 1);
+    assert_eq!(replay.records()[0].record.id(), envelope_id);
+}
+
+#[tokio::test]
 async fn spawn_worker_runtime_rejects_out_of_range_boot_generation_from_external_crate() {
     // For this one we need a meta whose boot_generation is out of
     // range. `boot()` would refuse it directly (via

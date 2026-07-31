@@ -40,6 +40,15 @@ use std::path::Path;
 
 use tempfile::Builder as TempBuilder;
 
+/// Requested Unix mode for every newly-created state subtree directory.
+///
+/// The process umask may remove additional permissions, but can never widen
+/// this mode. In particular, a normal `0022` umask must not turn queue,
+/// shard, or recipient directories into `0755`: production boot rejects all
+/// world bits through `RELAY_MODE_FORBIDDEN=0027`.
+#[cfg(unix)]
+const DURABLE_STATE_DIR_MODE: u32 = 0o750;
+
 // Round-3 M2 P2 #3: the fault-injection seam and its atomic
 // primitives are gated behind `#[cfg(test)]` so they do NOT
 // compile into the release binary at all. Prior amendments
@@ -315,10 +324,22 @@ pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
         }
     }
 
-    // Perform the standard create_dir_all first so every level
-    // exists on disk. The remainder of this function fsyncs the
-    // parents to make the metadata durable.
-    fs::create_dir_all(path)?;
+    // Apply the restrictive mode at mkdir time, avoiding a fail-open
+    // `mkdir 0755 -> chmod 0750` window. The process umask may only make
+    // the resulting mode stricter.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(DURABLE_STATE_DIR_MODE);
+        builder.create(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)?;
+    }
 
     // Fsync each dir in the chain we identified (bottom-up).
     // On Unix File::open(dir) + sync_all() is the idiomatic
@@ -517,6 +538,27 @@ mod tests {
     fn create_dir_all_durable_on_existing_dir_is_ok() {
         let dir = TempDir::new().unwrap();
         create_dir_all_durable(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_durable_new_chain_satisfies_hardened_mode_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let shard = dir.path().join("queue").join("ab");
+        let recipient = shard.join("ab".repeat(32));
+        create_dir_all_durable(&recipient).unwrap();
+
+        for path in [dir.path().join("queue"), shard, recipient] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode & 0o027,
+                0,
+                "{} mode {mode:#o} violates RELAY_MODE_FORBIDDEN=0027",
+                path.display()
+            );
+        }
     }
 
     // ─── Round-2 M2 P1 #3 subprocess abort test ──────────────

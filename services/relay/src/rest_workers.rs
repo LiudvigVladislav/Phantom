@@ -116,9 +116,15 @@ pub const REST_WORKER_MPSC_BUFFER: usize = 128;
 // ─── Seq assembly constants (locked v4 §13 Q1 + F2 amendment) ─────────
 
 /// Counter half of the seq assembly (locked v4 §13 Q1). Values
-/// `< COUNTER_LIMIT` are issuable; hitting the limit trips sticky
-/// saturation via [`next_seq`].
+/// `1..COUNTER_LIMIT` are issuable; counter `0` is reserved because
+/// REST clients use `since_seq=0` as the initial cursor and polling
+/// returns only records whose `seq > since_seq`.
 pub const SEQ_COUNTER_LIMIT: u64 = 1u64 << 40;
+
+/// First issuable counter value. Reserving zero prevents the first send
+/// of a fresh-install generation (`boot_generation == 0`) from becoming
+/// permanently invisible to `/relay/poll?since_seq=0`.
+const SEQ_COUNTER_INITIAL: u64 = 1;
 
 /// Conservative additive per-projection struct overhead used by
 /// the RAM estimator (F4 amendment). Covers `Vec`/`String` headers,
@@ -149,14 +155,48 @@ pub struct SendCandidate {
     pub expires_at: u64,
 }
 
-/// Success outcome of [`do_send`]. `idempotent_replay=true` means
-/// the same `envelope_id + body_hash` was already Queued; the
-/// prior `seq` is returned and no disk/RAM/ledger mutation
-/// happened.
+/// **PR-2 M4-2b round-3 REDLINE**: typed disposition for a
+/// `do_send` success. Splits the round-2 boolean
+/// `idempotent_replay` into three cases so handlers can pick
+/// distinct delivery paths for each:
+///
+///   * `Fresh` — brand-new record. Handler MUST fire
+///     notify + live-delivery + push.
+///   * `QueuedReplay` — same `(recipient, envelope_id, body_hash)`
+///     was already Queued (still awaiting ack). Handler MUST
+///     re-fire notify + live-delivery + push best-effort: the
+///     runtime already persisted, but a prior handler timeout
+///     or dropped-oneshot means the recipient may never have
+///     been notified. Return HTTP 200 (replay status).
+///   * `TombstoneReplay` — same id was already Acked. Do NOT
+///     re-fire delivery — the recipient has confirmed receipt.
+///     Return HTTP 200 (replay status) so the sender's
+///     idempotency contract is satisfied.
+///
+/// The pre-M4 shape treated both replay cases identically
+/// (never re-delivering) which created a liveness hole for
+/// the queued case: a worker that persisted + missed the
+/// 5s reply deadline left the message durable but the
+/// recipient's live WS session unaware and offline push
+/// unfired. `QueuedReplay` closes that hole while still
+/// preserving replay-idempotence at the disk layer (the
+/// runtime returns the prior `seq`, no double-persist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendDisposition {
+    Fresh,
+    QueuedReplay,
+    TombstoneReplay,
+}
+
+/// Success outcome of [`do_send`]. `disposition` carries the
+/// typed intent; `idempotent_replay` is derived
+/// (`disposition != Fresh`) and kept as a public field so
+/// pre-round-3 callers don't need to change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendOutcome {
     pub seq: u64,
     pub idempotent_replay: bool,
+    pub disposition: SendDisposition,
 }
 
 /// Domain-layer error surface of [`do_send`]. M4 handlers map each
@@ -950,9 +990,14 @@ async fn do_send(
         Ok(None) => { /* new send — proceed */ }
         Ok(Some(prior)) => {
             if body_hash == prior.stored_body_hash {
+                let disposition = match prior.source {
+                    PriorRecordSource::Queued => SendDisposition::QueuedReplay,
+                    PriorRecordSource::Tombstoned => SendDisposition::TombstoneReplay,
+                };
                 return Ok(SendOutcome {
                     seq: prior.seq,
                     idempotent_replay: true,
+                    disposition,
                 });
             }
             return Err(SendError::EnvelopeIdReusedWithDivergentBody {
@@ -1155,6 +1200,7 @@ async fn do_send(
     Ok(SendOutcome {
         seq,
         idempotent_replay: false,
+        disposition: SendDisposition::Fresh,
     })
 }
 
@@ -2616,13 +2662,26 @@ fn fatal_sweep_invariant(
     std::process::abort();
 }
 
-/// **M3b-1 round-3 F1**: prior-record identity a positive
-/// consistency check returns to `do_send` so it can compare the
-/// incoming candidate against the persisted state.
+/// **M3b-1 round-3 F1** + **M4-2b round-3 REDLINE**: prior-
+/// record identity a positive consistency check returns to
+/// `do_send`. `source` carries which projection the record
+/// came from so `do_send` can surface the right
+/// [`SendDisposition`] to the handler.
 #[derive(Debug)]
 struct PriorRecord {
     seq: u64,
     stored_body_hash: String,
+    source: PriorRecordSource,
+}
+
+/// **PR-2 M4-2b round-3 REDLINE**: which durable projection a
+/// `PriorRecord` was pulled from. Passes through to
+/// [`SendDisposition`] so the handler can distinguish "still
+/// awaiting recipient ack" from "already acked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorRecordSource {
+    Queued,
+    Tombstoned,
 }
 
 /// **M3b-1 round-3 F1**: opaque drift diagnostic. Rendered into
@@ -3093,11 +3152,13 @@ fn check_pre_write_consistency(
             Ok(Some(PriorRecord {
                 seq: rest.seq,
                 stored_body_hash,
+                source: PriorRecordSource::Queued,
             }))
         }
         ConsistentRecordState::Tombstoned { entry } => Ok(Some(PriorRecord {
             seq: entry.seq,
             stored_body_hash: entry.body_hash.clone(),
+            source: PriorRecordSource::Tombstoned,
         })),
     }
 }
@@ -3222,6 +3283,16 @@ impl ActiveRecordIndex {
             .unwrap_or(0)
     }
 
+    /// **PR-2 M4-3**: snapshot the set of recipients that have
+    /// at least one entry in the index. Used by the sweep
+    /// scheduler's per-recipient dispatch loop. Cloning happens
+    /// under a short read guard — the returned `Vec` is owned
+    /// by the caller and the guard is released before the
+    /// caller iterates.
+    pub(crate) fn recipient_keys(&self) -> Vec<String> {
+        self.inner.read().keys().cloned().collect()
+    }
+
     /// Snapshot the meta for one `(recipient, id)`. Used by
     /// M3b-2 `do_ack`.
     #[allow(dead_code)] // M3b-2 wires this in
@@ -3288,6 +3359,14 @@ impl TombstoneDedupTable {
             .get(recipient)
             .map(|m| m.len())
             .unwrap_or(0)
+    }
+
+    /// **PR-2 M4-3**: snapshot the set of recipients that have
+    /// at least one tombstone entry. Symmetric with
+    /// [`ActiveRecordIndex::recipient_keys`]. Used by the sweep
+    /// scheduler.
+    pub(crate) fn recipient_keys(&self) -> Vec<String> {
+        self.inner.read().keys().cloned().collect()
     }
 
     #[allow(dead_code)] // M3b-2 wires this in
@@ -4518,6 +4597,70 @@ impl WorkerRuntime {
         self.tombstone_dedup.count()
     }
 
+    /// **PR-2 M4-3**: union of recipient keys across the two
+    /// durable projections (`active_index` + `tombstone_dedup`),
+    /// deduplicated. Used by the sweep scheduler's per-recipient
+    /// dispatch loop so raw indices never leave the runtime.
+    ///
+    /// Cloning happens under each index's short read guard —
+    /// both guards drop before this fn returns. The returned
+    /// `Vec` is owned by the caller; the sweep scheduler
+    /// iterates over it without holding any runtime lock.
+    ///
+    /// A recipient with zero live queue + zero tombstones is
+    /// absent from the result — nothing to sweep. A recipient
+    /// with entries in ONE projection but not the other still
+    /// appears exactly once.
+    pub fn recipient_snapshot(&self) -> Vec<String> {
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in self.active_index.recipient_keys() {
+            set.insert(r);
+        }
+        for r in self.tombstone_dedup.recipient_keys() {
+            set.insert(r);
+        }
+        set.into_iter().collect()
+    }
+
+    /// **PR-2 M4-3 round-1 REDLINE**: same union as
+    /// [`WorkerRuntime::recipient_snapshot`] but the recipients
+    /// are bucketed by owning shard, so the sweep scheduler can
+    /// run different shards in parallel without accidentally
+    /// stacking two ops on the same shard-worker's mpsc queue.
+    ///
+    /// The returned `Vec` has exactly [`REST_WORKER_COUNT`]
+    /// entries; index `i` carries every recipient whose
+    /// [`worker_for`] hash resolves to shard `i`. Empty inner
+    /// vecs are legal — that shard currently has no queued or
+    /// tombstoned recipients.
+    ///
+    /// Rationale: `do_sweep` is actor-serialized *per shard*,
+    /// but different shards are independent workers. The
+    /// round-0 M4-3 loop dispatched sequentially across ALL
+    /// recipients, giving the whole scheduler a
+    /// head-of-line-blocking shape — a single wedged shard held
+    /// up healthy shards, and a 100 k-recipient population
+    /// implied an ~11-day per-tick worst case. Bucketing by
+    /// shard lets the scheduler fan out to bounded concurrent
+    /// shards while preserving the per-shard sequential
+    /// contract `do_sweep` relies on.
+    pub fn recipient_snapshot_by_shard(&self) -> Vec<Vec<String>> {
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in self.active_index.recipient_keys() {
+            set.insert(r);
+        }
+        for r in self.tombstone_dedup.recipient_keys() {
+            set.insert(r);
+        }
+        let mut buckets: Vec<Vec<String>> =
+            (0..REST_WORKER_COUNT).map(|_| Vec::new()).collect();
+        for recipient in set {
+            let shard = worker_for(&recipient, self.worker_hash_key);
+            buckets[shard].push(recipient);
+        }
+        buckets
+    }
+
     /// **M3b-2a**: dedup horizon captured at boot. Read-only —
     /// M4 wiring cannot substitute a different horizon after
     /// spawn.
@@ -4599,7 +4742,7 @@ pub fn spawn_worker_runtime(spec: WorkerRuntimeSpec) -> Result<WorkerRuntime, Sp
         });
     }
 
-    let seq_counter = Arc::new(AtomicU64::new(0));
+    let seq_counter = Arc::new(AtomicU64::new(SEQ_COUNTER_INITIAL));
 
     let mut senders = Vec::with_capacity(REST_WORKER_COUNT);
     let mut receivers = Vec::with_capacity(REST_WORKER_COUNT);
@@ -4730,7 +4873,7 @@ mod tests {
             state_dir: dir_path.to_path_buf(),
             max_envelopes_per_recipient: TEST_PER_RECIPIENT_CAP,
             boot_generation: 1,
-            seq_counter: Arc::new(AtomicU64::new(0)),
+            seq_counter: Arc::new(AtomicU64::new(SEQ_COUNTER_INITIAL)),
             seq_mac_root_key: Arc::new(SeqMacRootKey::from_bytes(TEST_MAC_KEY)),
             active_index: Arc::new(ActiveRecordIndex::new()),
             tombstone_dedup: Arc::new(TombstoneDedupTable::new()),
@@ -4841,7 +4984,10 @@ mod tests {
         let (ctx, _tx) = build_ctx(&dir);
         let a = next_seq(&ctx).unwrap();
         let b = next_seq(&ctx).unwrap();
-        assert_eq!(a, u64::from(ctx.boot_generation) << 40);
+        assert_eq!(
+            a,
+            (u64::from(ctx.boot_generation) << 40) | SEQ_COUNTER_INITIAL
+        );
         assert_eq!(b, a + 1);
     }
 
@@ -7965,6 +8111,202 @@ mod tests {
         }
     }
 
+    // ─── M4-3: recipient_snapshot() unit tests ───────────────
+
+    #[test]
+    fn recipient_keys_empty_returns_empty_vec() {
+        let active = ActiveRecordIndex::new();
+        let tomb = TombstoneDedupTable::new();
+        assert!(active.recipient_keys().is_empty());
+        assert!(tomb.recipient_keys().is_empty());
+    }
+
+    #[test]
+    fn recipient_keys_returns_populated_recipients() {
+        let active = ActiveRecordIndex::new();
+        let meta = ActiveEntryMeta {
+            path: std::path::PathBuf::from("/tmp/x"),
+            seq: 1,
+            body_hash: "a".repeat(64),
+            expires_at: 1_720_000_000,
+            disk_bytes: 100,
+            ram_bytes: record_ram_estimate(100),
+        };
+        active
+            .try_insert_new("recipient-a", "id-1".into(), meta.clone())
+            .expect("insert a");
+        active
+            .try_insert_new("recipient-b", "id-2".into(), meta.clone())
+            .expect("insert b");
+        let mut keys = active.recipient_keys();
+        keys.sort();
+        assert_eq!(keys, vec!["recipient-a".to_string(), "recipient-b".to_string()]);
+    }
+
+    fn spawn_test_runtime_for_snapshot() -> WorkerRuntime {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("queue")).unwrap();
+        let key = SeqMacRootKey::from_bytes(TEST_MAC_KEY);
+        let meta = QueueMeta {
+            version: META_VERSION,
+            phase: crate::queue_meta::Phase::Ready,
+            boot_generation: 1,
+            seq_mac_key_fingerprint: key.fingerprint(),
+        };
+        crate::queue_meta::write_meta(dir.path(), &meta).unwrap();
+        let boot_cfg = crate::boot_loader::BootConfig {
+            state_dir: dir.path().to_path_buf(),
+            caps: crate::boot_loader::PreflightCaps::for_tests(),
+            tombstone: crate::tombstone_config::TombstoneConfig::from_secs(172_800).unwrap(),
+            current_seq_mac_key_fingerprint: key.fingerprint(),
+            ownership: crate::boot_loader::OwnershipExpectation::permissive_for_tests(),
+        };
+        let boot_result = crate::boot_loader::boot(&boot_cfg).expect("boot OK");
+        let (fatal_tx, _fatal_rx) = broadcast::channel::<FatalReason>(16);
+        let spec = WorkerRuntimeSpec::from_boot(
+            boot_result,
+            8,
+            Arc::new(SeqMacRootKey::from_bytes(TEST_MAC_KEY)),
+            caps(),
+            fatal_tx,
+        )
+        .expect("from_boot OK");
+        let runtime = spawn_worker_runtime(spec).expect("spawn OK");
+        // Leak the TempDir intentionally — this is a small
+        // synthetic runtime for a synchronous snapshot test; it
+        // doesn't do any disk I/O beyond boot, and the OS-level
+        // cleanup on process exit reclaims the dir.
+        std::mem::forget(dir);
+        runtime
+    }
+
+    #[tokio::test]
+    async fn recipient_snapshot_empty_runtime_returns_empty_vec() {
+        let runtime = spawn_test_runtime_for_snapshot();
+        assert!(runtime.recipient_snapshot().is_empty());
+        runtime.close();
+        let _ = runtime.drain_handles(std::time::Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn recipient_snapshot_only_queued_projection_returns_recipient_once() {
+        let runtime = spawn_test_runtime_for_snapshot();
+        let meta = ActiveEntryMeta {
+            path: std::path::PathBuf::from("/tmp/x"),
+            seq: 1,
+            body_hash: "a".repeat(64),
+            expires_at: 1_720_000_000,
+            disk_bytes: 100,
+            ram_bytes: record_ram_estimate(100),
+        };
+        runtime
+            .active_index()
+            .try_insert_new("recipient-q", "id".into(), meta)
+            .expect("insert");
+        let snap = runtime.recipient_snapshot();
+        assert_eq!(snap, vec!["recipient-q".to_string()]);
+        runtime.close();
+        let _ = runtime.drain_handles(std::time::Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn recipient_snapshot_only_tombstone_projection_returns_recipient_once() {
+        let runtime = spawn_test_runtime_for_snapshot();
+        let entry = TombstoneEntry {
+            path: std::path::PathBuf::from("/tmp/x"),
+            seq: 1,
+            body_hash: "a".repeat(64),
+            dedup_until: 1_720_000_000,
+            disk_bytes: 100,
+            ram_bytes: record_ram_estimate(100),
+        };
+        runtime
+            .tombstone_dedup()
+            .try_insert_new("recipient-t", "id".into(), entry)
+            .expect("insert");
+        let snap = runtime.recipient_snapshot();
+        assert_eq!(snap, vec!["recipient-t".to_string()]);
+        runtime.close();
+        let _ = runtime.drain_handles(std::time::Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn recipient_snapshot_union_dedupes_recipients_present_in_both_projections() {
+        let runtime = spawn_test_runtime_for_snapshot();
+        // Same recipient key in both projections — snapshot MUST
+        // return it exactly once (no duplicate sweep dispatch).
+        let meta = ActiveEntryMeta {
+            path: std::path::PathBuf::from("/tmp/x"),
+            seq: 1,
+            body_hash: "a".repeat(64),
+            expires_at: 1_720_000_000,
+            disk_bytes: 100,
+            ram_bytes: record_ram_estimate(100),
+        };
+        let entry = TombstoneEntry {
+            path: std::path::PathBuf::from("/tmp/y"),
+            seq: 2,
+            body_hash: "b".repeat(64),
+            dedup_until: 1_720_000_000,
+            disk_bytes: 200,
+            ram_bytes: record_ram_estimate(200),
+        };
+        runtime
+            .active_index()
+            .try_insert_new("shared-recipient", "id-a".into(), meta)
+            .expect("active insert");
+        runtime
+            .tombstone_dedup()
+            .try_insert_new("shared-recipient", "id-b".into(), entry)
+            .expect("tomb insert");
+        let snap = runtime.recipient_snapshot();
+        assert_eq!(
+            snap,
+            vec!["shared-recipient".to_string()],
+            "shared recipient must appear exactly once"
+        );
+        runtime.close();
+        let _ = runtime.drain_handles(std::time::Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn recipient_snapshot_disjoint_projections_returns_union() {
+        let runtime = spawn_test_runtime_for_snapshot();
+        let meta = ActiveEntryMeta {
+            path: std::path::PathBuf::from("/tmp/x"),
+            seq: 1,
+            body_hash: "a".repeat(64),
+            expires_at: 1_720_000_000,
+            disk_bytes: 100,
+            ram_bytes: record_ram_estimate(100),
+        };
+        let entry = TombstoneEntry {
+            path: std::path::PathBuf::from("/tmp/y"),
+            seq: 2,
+            body_hash: "b".repeat(64),
+            dedup_until: 1_720_000_000,
+            disk_bytes: 200,
+            ram_bytes: record_ram_estimate(200),
+        };
+        runtime
+            .active_index()
+            .try_insert_new("only-queued", "id-a".into(), meta)
+            .expect("active insert");
+        runtime
+            .tombstone_dedup()
+            .try_insert_new("only-tomb", "id-b".into(), entry)
+            .expect("tomb insert");
+        let mut snap = runtime.recipient_snapshot();
+        snap.sort();
+        assert_eq!(
+            snap,
+            vec!["only-queued".to_string(), "only-tomb".to_string()],
+            "both disjoint recipients must appear once each"
+        );
+        runtime.close();
+        let _ = runtime.drain_handles(std::time::Duration::from_secs(5)).await;
+    }
+
     #[tokio::test]
     async fn spawn_worker_runtime_creates_pool_and_closes_cleanly() {
         let dir = build_state_dir();
@@ -8973,6 +9315,12 @@ mod tests {
         // Round-2 F1 companion (positive path): rest_store and
         // active_index both agree on the prior record → normal
         // replay result, no fatal, no disk mutation.
+        //
+        // M4-2b round-3 REDLINE addition: the outcome must
+        // surface `SendDisposition::QueuedReplay` (not Tombstone
+        // replay) so the handler re-runs notify + live-delivery
+        // + push best-effort — the message is still awaiting
+        // recipient ack.
         let dir = build_state_dir();
         let (ctx, _tx) = build_ctx(&dir);
         let candidate = sample_candidate("env-idem");
@@ -8985,6 +9333,11 @@ mod tests {
             .unwrap();
         assert!(second.idempotent_replay);
         assert_eq!(second.seq, first.seq);
+        assert_eq!(
+            second.disposition,
+            SendDisposition::QueuedReplay,
+            "still-Queued record must surface QueuedReplay so handler re-runs delivery"
+        );
         assert_eq!(ctx.capacity.snapshot(), snap_after_first);
     }
 
@@ -9046,6 +9399,11 @@ mod tests {
         // must return the PRIOR seq with `idempotent_replay=true`.
         // The client sees an identical reply — no double delivery,
         // no new send.
+        //
+        // M4-2b round-3 REDLINE addition: the outcome must
+        // surface `SendDisposition::TombstoneReplay` (distinct
+        // from QueuedReplay) so the handler skips re-delivery —
+        // the recipient has already acked.
         let dir = build_state_dir();
         let (ctx, _tx) = build_ctx(&dir);
         let candidate = sample_candidate("env-tomb-replay");
@@ -9063,6 +9421,11 @@ mod tests {
             .expect("tombstoned replay is Ok");
         assert!(outcome.idempotent_replay);
         assert_eq!(outcome.seq, acked_seq);
+        assert_eq!(
+            outcome.disposition,
+            SendDisposition::TombstoneReplay,
+            "already-Acked record must surface TombstoneReplay so handler skips re-delivery"
+        );
         // No disk mutation, no ledger mutation — same shape as
         // the queued-replay idempotent path.
         assert_eq!(ctx.capacity.snapshot(), snap_before);

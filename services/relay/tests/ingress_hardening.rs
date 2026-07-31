@@ -28,14 +28,13 @@ use axum::http::{Request, StatusCode};
 use ed25519_dalek::{Signer, Signature, SigningKey};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tower::ServiceExt;
 
 // ── Helpers (mirrors rest_fallback_endpoints.rs) ────────────────────────────
 
 fn build_app() -> axum::Router {
     let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 
@@ -133,11 +132,16 @@ async fn call_send_raw(
 
 /// Build a `/relay/send` JSON body with the given envelope_id + `to`.
 fn send_body(envelope_id: &str, to: &str) -> String {
+    // PR-2 M4-2b atomic activation: sealed_sender is now mandatory
+    // (Gate #4 rejects empty sealed_sender at the handler layer
+    // with 400 BEFORE runtime dispatch). Every ingress-hardening
+    // test body now includes a non-empty sealed_sender.
     json!({
-        "envelope_id": envelope_id,
-        "to":          to,
-        "payload":     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "sequence_ts": 1_700_000_000_000_u64,
+        "envelope_id":   envelope_id,
+        "to":            to,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
+        "payload":       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sequence_ts":   1_700_000_000_000_u64,
     })
     .to_string()
 }

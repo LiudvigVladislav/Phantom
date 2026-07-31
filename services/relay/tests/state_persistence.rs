@@ -56,7 +56,16 @@ fn cfg_with_state_dir(dir: &std::path::Path) -> RelayConfig {
 }
 
 fn build_router(cfg: RelayConfig) -> (axum::Router, Arc<AppState>) {
-    let state = Arc::new(AppState::new(cfg));
+    // The `cfg` passed here always has an absolute
+    // `state_dir` (test helpers construct it via
+    // `cfg_with_state_dir(tmpdir)`), so
+    // `build_test_app_state` uses the caller's dir
+    // verbatim and does NOT create its own TempDir — the
+    // caller's TempDir remains the single lease and the
+    // round-trip semantics of this test file (two
+    // AppState instances against the SAME dir) are
+    // preserved.
+    let state = phantom_relay::state::build_test_app_state(cfg);
     let router = routes::router(Arc::clone(&state));
     (router, state)
 }

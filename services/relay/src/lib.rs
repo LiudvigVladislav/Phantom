@@ -41,3 +41,25 @@ pub mod boot_loader;
 pub mod persistence;
 pub mod queue_meta;
 pub mod tombstone_config;
+
+// RC-RELAY-QUEUE-DURABILITY PR-2 M4-1 — plumbing without runtime
+// activation. Ships pure adapter functions the M4-2 atomic cutover
+// will call. `main.rs` does NOT yet boot the runtime; every
+// function here is unit-tested against synthetic inputs without
+// spawning a WorkerRuntime.
+pub mod m4_adapters;
+
+// RC-RELAY-QUEUE-DURABILITY PR-2 M4-3 round-1 REDLINE — durable
+// sweep scheduler. Extracted from `main.rs` so the tick pass is
+// unit-testable end-to-end (via `run_sweep_tick`) and so the
+// scheduler runs shards concurrently instead of serialising across
+// the whole recipient population.
+pub mod sweep_scheduler;
+
+// RC-RELAY-QUEUE-DURABILITY PR-2 M4-4 — internal loopback health
+// surface + unified shutdown classifier. Kept in two separate modules
+// so the pure classifier (`shutdown`) is testable without a runtime,
+// and the axum router (`health_listener`) is testable via
+// `ServiceExt::oneshot` without a real TCP bind.
+pub mod health_listener;
+pub mod shutdown;

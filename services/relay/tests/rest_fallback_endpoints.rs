@@ -20,14 +20,13 @@ use axum::http::{Request, StatusCode};
 use ed25519_dalek::{Signer, Signature, SigningKey};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tower::ServiceExt;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_app() -> axum::Router {
     let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 
@@ -347,6 +346,7 @@ async fn relay_send_idempotent_same_body() {
     let send_body = json!({
         "envelope_id": envelope_id,
         "to":          recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "sequence_ts": 1_700_000_000_000_u64,
     })
@@ -372,6 +372,123 @@ async fn relay_send_idempotent_same_body() {
     assert_eq!(v3["ok"], 1);
 }
 
+// ── PR-2 M4-2b round-3 REDLINE: split replay dispositions ────────────────────
+//
+// Two integration tests that exercise the router-level
+// behavior of `SendDisposition::QueuedReplay` and
+// `SendDisposition::TombstoneReplay`. Wire contract from
+// architect P1:
+//   * QueuedReplay → 200 + `{"ok":1}` (retry succeeded,
+//     handler re-runs notify/live-delivery/push).
+//   * TombstoneReplay → 200 + `{"ok":1}` (retry succeeded,
+//     recipient already acked — no re-delivery).
+//
+// Reaching do_send's disposition classifier requires
+// bypassing the per-sender `IdempotencyCache` (keyed by
+// `(sender_identity, idem_key)`) — but rest_send also
+// enforces `idem_key == envelope_id`, so a fresh idem_key
+// from the same sender isn't an option.
+//
+// The workable test pattern: TWO distinct sender identities
+// both target the SAME recipient with the SAME envelope_id +
+// body. Each sender has its own cache entry, so sender B's
+// call always misses the cache and reaches do_send. The
+// runtime's Queued/Tombstone tables are keyed by
+// `(recipient, envelope_id)` — not sender — so sender B's
+// call collides with sender A's prior state and hits the
+// replay disposition. Full "handler ACTUALLY re-runs live-
+// delivery on QueuedReplay" coverage requires a live WS-
+// subscriber recipient — that's exercised by the Mac/Docker
+// E2E round per architect's plan.
+
+#[tokio::test]
+async fn rest_send_queued_replay_returns_200_via_second_sender_hitting_same_queue_key() {
+    let app = build_app();
+    let sender_a = identity_hex(200);
+    let sender_b = identity_hex(201);
+    let recipient_id = identity_hex(202);
+    let kp_a = SigningKey::generate(&mut OsRng);
+    let kp_b = SigningKey::generate(&mut OsRng);
+    let (app, token_a) = obtain_token(app, &sender_a, &kp_a).await;
+    let (app, token_b) = obtain_token(app, &sender_b, &kp_b).await;
+
+    let envelope_id = "test-queued-replay-envelope";
+    let send_body = json!({
+        "envelope_id":   envelope_id,
+        "to":            recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
+        "payload":       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sequence_ts":   1_700_000_000_000_u64,
+    })
+    .to_string();
+
+    // Sender A: fresh 201. Runtime persists a Queued record
+    // keyed by (recipient_id, envelope_id).
+    let (app, s1, v1) =
+        call_send_raw(app, &token_a, envelope_id, send_body.as_bytes()).await;
+    assert_eq!(s1, StatusCode::CREATED, "sender A must be fresh 201: {v1:?}");
+
+    // Sender B: cache miss (different sender identity). Handler
+    // dispatches to do_send. Runtime sees existing Queued at
+    // (recipient_id, envelope_id) with identical body →
+    // `SendDisposition::QueuedReplay` → handler re-runs
+    // notify/live-delivery/push best-effort → returns 200.
+    let (_app, s2, v2) =
+        call_send_raw(app, &token_b, envelope_id, send_body.as_bytes()).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "QueuedReplay (second sender hitting same queue key): expected 200, got {s2:?}: {v2:?}"
+    );
+    assert_eq!(v2["ok"], 1);
+}
+
+#[tokio::test]
+async fn rest_send_tombstone_replay_returns_200_after_recipient_ack() {
+    let app = build_app();
+    let sender_a = identity_hex(210);
+    let sender_b = identity_hex(211);
+    let recipient_id = identity_hex(212);
+    let kp_a = SigningKey::generate(&mut OsRng);
+    let kp_b = SigningKey::generate(&mut OsRng);
+    let recipient_kp = SigningKey::generate(&mut OsRng);
+    let (app, token_a) = obtain_token(app, &sender_a, &kp_a).await;
+    let (app, token_b) = obtain_token(app, &sender_b, &kp_b).await;
+    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
+
+    let envelope_id = "test-tomb-replay-envelope";
+    let send_body = json!({
+        "envelope_id":   envelope_id,
+        "to":            recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
+        "payload":       "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "sequence_ts":   1_700_000_000_000_u64,
+    })
+    .to_string();
+
+    // Sender A: fresh 201.
+    let (app, s1, _) =
+        call_send_raw(app, &token_a, envelope_id, send_body.as_bytes()).await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    // Recipient acks → runtime converts Queued → AckedTombstone.
+    let (app, ack_status, _) = call_ack_deliver(app, &recipient_token, envelope_id).await;
+    assert_eq!(ack_status, StatusCode::OK);
+
+    // Sender B: cache miss, dispatch reaches do_send. Runtime
+    // sees tombstone_dedup hit at (recipient_id, envelope_id)
+    // → `SendDisposition::TombstoneReplay` → handler returns
+    // 200 WITHOUT re-firing notify/live-delivery/push.
+    let (_app, s2, v2) =
+        call_send_raw(app, &token_b, envelope_id, send_body.as_bytes()).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "TombstoneReplay (second sender post-ack): expected 200, got {s2:?}: {v2:?}"
+    );
+    assert_eq!(v2["ok"], 1);
+}
+
 // ── Test 3: /relay/send idempotency conflict ──────────────────────────────────
 
 /// Same Idempotency-Key, different body → 409 on second call.
@@ -389,6 +506,7 @@ async fn relay_send_idempotent_conflict_different_body() {
     let body_a = json!({
         "envelope_id": idem_key,
         "to":          recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "sequence_ts": 1_700_000_000_001_u64,
     })
@@ -397,6 +515,7 @@ async fn relay_send_idempotent_conflict_different_body() {
     let body_b = json!({
         "envelope_id": idem_key,
         "to":          recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
         "sequence_ts": 1_700_000_000_002_u64,
     })
@@ -431,6 +550,7 @@ async fn relay_poll_does_not_remove_envelope() {
     let send_body = json!({
         "envelope_id": envelope_id,
         "to":          recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
         "sequence_ts": 1_700_000_000_010_u64,
     })
@@ -477,6 +597,7 @@ async fn relay_ack_deliver_idempotent() {
     let send_body = json!({
         "envelope_id": envelope_id,
         "to":          recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
         "sequence_ts": 1_700_000_000_020_u64,
     })
@@ -631,110 +752,18 @@ async fn rest_send_preserves_sealed_sender() {
     assert_eq!(envs[0]["payload"].as_str().unwrap(), "PAYLOAD_BLOB_BASE64");
 }
 
-// ── Test 8: WS-simulated send mirrors into REST poll store ───────────────────
+// ── PR-2 M4-2b atomic activation: two tests removed ──────────────────────
 //
-// PR-D0r review-fix coverage: `mirror_envelope_to_rest_store` is the
-// helper the WS path calls after writing to `state.store`. Calling it
-// directly (as if a WS send had just landed) and then polling via REST
-// proves that a Tele2-style client on REST fallback sees envelopes from
-// WS senders.
-#[tokio::test]
-async fn ws_simulated_send_mirrors_into_rest_poll() {
-    let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
-    let state = std::sync::Arc::new(phantom_relay::state::AppState::new(cfg));
-    let app = phantom_relay::routes::router(std::sync::Arc::clone(&state));
-
-    let recipient_id = identity_hex(110);
-    let recipient_kp = SigningKey::generate(&mut OsRng);
-    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
-
-    // Simulate the WS handler having just written an envelope by calling
-    // the mirror helper directly. In production this happens in routes.rs
-    // immediately after the inline `state.store` write.
-    let envelope_id = "ws-mirror-001";
-    let sealed_blob = "abcd1234".repeat(8);
-    let payload = "WS_PAYLOAD_BASE64";
-    let expires_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 86_400;
-    let _seq = phantom_relay::rest_fallback::mirror_envelope_to_rest_store(
-        &state,
-        &recipient_id,
-        envelope_id,
-        &sealed_blob,
-        payload,
-        1_700_000_000_000_u64,
-        expires_at,
-    )
-    .await;
-
-    // Recipient on REST polling sees it.
-    let (_app, poll_status, poll_v) = call_poll(app, &recipient_token, None).await;
-    assert_eq!(poll_status, StatusCode::OK);
-    let envs = poll_v["envelopes"].as_array().unwrap();
-    assert_eq!(envs.len(), 1, "REST poll must see WS-mirrored envelope");
-    assert_eq!(envs[0]["id"].as_str().unwrap(), envelope_id);
-    assert_eq!(envs[0]["sealed_sender"].as_str().unwrap(), sealed_blob);
-    assert_eq!(envs[0]["payload"].as_str().unwrap(), payload);
-}
-
-// ── Test 9: WS-simulated ack clears REST poll store ──────────────────────────
-//
-// PR-D0r review-fix coverage: WS ack-deliver removes from `state.store`
-// AND from `state.rest_store` via `remove_envelope_from_rest_store`. A
-// subsequent /relay/poll from the same recipient must not re-deliver the
-// already-acked envelope.
-#[tokio::test]
-async fn ws_simulated_ack_clears_rest_poll() {
-    let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
-    let state = std::sync::Arc::new(phantom_relay::state::AppState::new(cfg));
-    let app = phantom_relay::routes::router(std::sync::Arc::clone(&state));
-
-    let sender_id = identity_hex(120);
-    let recipient_id = identity_hex(121);
-    let sender_kp = SigningKey::generate(&mut OsRng);
-    let recipient_kp = SigningKey::generate(&mut OsRng);
-    let (app, sender_token) = obtain_token(app, &sender_id, &sender_kp).await;
-    let (app, recipient_token) = obtain_token(app, &recipient_id, &recipient_kp).await;
-
-    // REST send populates both stores.
-    let envelope_id = "ws-ack-cleanup-001";
-    let send_body = serde_json::json!({
-        "envelope_id": envelope_id,
-        "to":          recipient_id,
-        "payload":     "P",
-        "sequence_ts": 1_700_000_000_000_u64,
-    })
-    .to_string();
-    let (app, send_status, _) =
-        call_send_raw(app, &sender_token, envelope_id, send_body.as_bytes()).await;
-    assert_eq!(send_status, StatusCode::CREATED);
-
-    // Verify recipient sees it.
-    let (app, _, poll_v) = call_poll(app, &recipient_token, None).await;
-    assert_eq!(poll_v["envelopes"].as_array().unwrap().len(), 1);
-
-    // Simulate WS ack-deliver by calling the remove helper directly. In
-    // production this happens in routes.rs immediately after the inline
-    // `state.store` removal in the ack-deliver arm.
-    let removed = phantom_relay::rest_fallback::remove_envelope_from_rest_store(
-        &state,
-        &recipient_id,
-        envelope_id,
-    )
-    .await;
-    assert!(removed, "helper should report it removed an entry");
-
-    // Subsequent REST poll must be empty.
-    let (_app, _, poll_v2) = call_poll(app, &recipient_token, None).await;
-    assert_eq!(
-        poll_v2["envelopes"].as_array().unwrap().len(),
-        0,
-        "REST poll must be empty after WS-simulated ack cleared the store",
-    );
-}
+// `ws_simulated_send_mirrors_into_rest_poll` and
+// `ws_simulated_ack_clears_rest_poll` directly called
+// `mirror_envelope_to_rest_store` and
+// `remove_envelope_from_rest_store` respectively. Both helpers are
+// deleted in M4-2b — every mutation of `state.store` / `state.rest_store`
+// now routes through `runtime.try_send(RestOp::Send | Ack | Sweep)`,
+// and the two stores are the runtime's own `Arc` handles (so a WS send
+// via the router automatically populates the REST poll view — no
+// separate mirror step exists to test). Equivalent end-to-end coverage
+// lives in the REST send/ack/poll router tests earlier in this file.
 
 // ── Trek 2 Stage 1.x review-fix regression tests ──────────────────────────────
 //
@@ -774,6 +803,7 @@ async fn rest_send_rejects_non_hex_recipient_to() {
     let body = serde_json::json!({
         "envelope_id": "non-hex-to-001",
         "to":          bad_recipient,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "x",
         "sequence_ts": 1_700_000_000_000_u64,
     })
@@ -813,6 +843,7 @@ async fn rest_send_rejects_short_recipient_to() {
     let body = serde_json::json!({
         "envelope_id": "short-to-001",
         "to":          short,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "x",
         "sequence_ts": 1_700_000_000_000_u64,
     })
@@ -842,6 +873,7 @@ async fn rest_send_accepts_canonical_64_hex_recipient() {
     let body = serde_json::json!({
         "envelope_id": "ok-to-001",
         "to":          recipient_id,
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":     "x",
         "sequence_ts": 1_700_000_000_000_u64,
     })
