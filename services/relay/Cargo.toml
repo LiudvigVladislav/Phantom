@@ -37,6 +37,17 @@ socket2 = { version = "0.5", features = ["all"] }
 # instead of racing writes with an already-running relay. Cross-platform:
 # fcntl(F_SETLK) on Unix, LockFileEx on Windows.
 fs2 = "0.4"
+# RC-RELAY-QUEUE-DURABILITY PR-2 M2 (locked design v4 §13 Q7): the
+# tempfile crate backs the atomic-write primitive used by
+# queue_meta and persistence — NamedTempFile creates a directory-
+# scoped file with a randomised name, keeping the same-filesystem
+# invariant needed for a POSIX rename to be atomic. Was dev-only
+# through PR-1b; promoted to a runtime dependency here because
+# on-disk state now writes via NamedTempFile + persist(). M6 will
+# add the CI grep-gate against bare `NamedTempFile::new()` (which
+# lands in `env::temp_dir()`) and against `env::temp_dir()` direct
+# usage so operators cannot accidentally write outside state_dir.
+tempfile = "3"
 # RC-RELAY-QUEUE-DURABILITY PR-2 M1 §2 / §9 (locked design v4.2 B-5 + v4.1
 # V-P0-6): parking_lot::RwLock backs the WorkerPool state machine
 # (Running → Closing → Closed) with nanosecond critical sections; the
@@ -56,11 +67,12 @@ siphasher = "1"
 tokio-test = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
-# RC-RELAY-STATE-DIR-REPAIR PR-1a §7.1: integration tests inject a
-# tempdir into RelayConfig.state_dir rather than reaching for env::set_var,
-# which races between parallel test workers. Restricted to dev-dependencies
-# so the runtime binary never links tempfile.
-tempfile = "3"
+# NB (RC-RELAY-QUEUE-DURABILITY PR-2 M2): the `tempfile` dev-dep
+# entry that previously lived here has been promoted to a
+# runtime `[dependencies]` entry above so both integration tests
+# and the production binary link the same version. Cargo merges
+# the two edges automatically; keeping only the prod entry is
+# both correct and less noisy.
 # PR-0 A-5: config_boot.rs mutates RELAY_STATE_DIR to exercise the
 # absolute+no-ParentDir validation. `serial_test` serialises those
 # cases across the shared process env — belt-and-braces on top of the
