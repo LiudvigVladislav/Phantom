@@ -69,8 +69,16 @@ pub struct AbuseReport {
 /// In-memory store for Alpha-0.
 pub struct AppState {
     pub config: RelayConfig,
-    /// recipient_public_key_hex → queue of offline envelopes
-    pub store: RwLock<HashMap<String, Vec<Envelope>>>,
+    /// recipient_public_key_hex → queue of offline envelopes.
+    ///
+    /// Wrapped in `Arc<RwLock<..>>` (RC-RELAY-QUEUE-DURABILITY PR-2
+    /// M3a round-2 review F1) so the shard-worker pool
+    /// ([`crate::rest_workers::ActorContext`]) can hold a
+    /// zero-copy shared owner via `Arc::clone(&state.store)`.
+    /// Every existing call site keeps working because `Arc<T>`
+    /// derefs to `T`, so `state.store.write().await` reads
+    /// identically to the pre-refactor bare-lock form.
+    pub store: Arc<RwLock<HashMap<String, Vec<Envelope>>>>,
     /// identity_hex → (connection_id, sender channel) for live WebSocket clients.
     /// connection_id is a monotonically increasing u64 minted at connect time.
     /// Cleanup only removes the entry if the stored connection_id matches, so a
@@ -139,7 +147,7 @@ pub struct AppState {
     /// Carries the monotonic `seq` counter that /relay/poll uses for
     /// resume (?since_seq=). Shares envelope IDs with `store` so
     /// /relay/ack-deliver removes from both simultaneously.
-    pub rest_store: RwLock<HashMap<String, Vec<RestEnvelope>>>,
+    pub rest_store: Arc<RwLock<HashMap<String, Vec<RestEnvelope>>>>,
     /// Monotonic per-recipient sequence counter for REST poll resume.
     pub rest_seq: SeqCounter,
 
@@ -252,7 +260,7 @@ impl AppState {
         let prekeys = PreKeyStore::new(&config.state_dir);
         Self {
             config,
-            store: RwLock::new(HashMap::new()),
+            store: Arc::new(RwLock::new(HashMap::new())),
             clients: RwLock::new(HashMap::new()),
             conn_counter: AtomicU64::new(0),
             rate_limiter: RwLock::new(HashMap::new()),
@@ -267,7 +275,7 @@ impl AppState {
             rest_tokens: RestTokenStore::new(),
             rest_session_cache: SessionChallengeCache::new(),
             rest_idempotency: IdempotencyCache::new(),
-            rest_store: RwLock::new(HashMap::new()),
+            rest_store: Arc::new(RwLock::new(HashMap::new())),
             rest_seq: SeqCounter::new(),
             // Trek 2 Stage 1 long-poll
             notifiers: RwLock::new(HashMap::new()),

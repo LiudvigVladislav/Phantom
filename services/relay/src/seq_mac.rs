@@ -27,7 +27,7 @@
 //! the root directly.
 
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -141,6 +141,23 @@ impl SeqMacRootKey {
     /// in `RelayConfig` and by any unit tests with byte-pinned vectors.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
+    }
+
+    /// Compute the 16-character lowercase-hex fingerprint of the root
+    /// key material — the FIRST 16 chars of `sha256(bytes)`. Locked
+    /// v4 §13 Q2 boot-time contract: this is the shape written into
+    /// [`crate::queue_meta::QueueMeta::seq_mac_key_fingerprint`] at
+    /// boot and re-checked on normal boot.
+    ///
+    /// PR-2 M3a round-5 F2: also used by
+    /// [`crate::rest_workers::WorkerRuntimeSpec::from_boot`] to
+    /// verify that the running root key matches the boot-time meta,
+    /// so a wiring accident (or hostile drop-in) cannot spawn a
+    /// worker fleet whose seq-MACs would fail verification against
+    /// the persisted `PersistedRecord::seq_mac` values.
+    pub fn fingerprint(&self) -> String {
+        let hash = Sha256::digest(&self.0[..]);
+        hex::encode(&hash[..8])
     }
 
     /// Parse from a 64-character hex string (case-insensitive). Returns
